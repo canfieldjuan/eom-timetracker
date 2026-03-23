@@ -1649,6 +1649,150 @@ def admin_download_report(
     return FileResponse(str(target_path), media_type="application/pdf", filename=filename)
 
 
+def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Optional[int]) -> Dict[str, Any]:
+    now = utc_now()
+    local_now = to_local(now)
+
+    if date_str:
+        try:
+            ref_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format, use YYYY-MM-DD")
+    else:
+        ref_date = local_now.date()
+
+    if period == "day":
+        start_date = ref_date
+        end_date = ref_date
+    elif period == "week":
+        days_since_sunday = (ref_date.weekday() + 1) % 7
+        start_date = ref_date - timedelta(days=days_since_sunday)
+        end_date = start_date + timedelta(days=6)
+    elif period == "month":
+        start_date = ref_date.replace(day=1)
+        if start_date.month == 12:
+            end_date = start_date.replace(year=start_date.year + 1, month=1, day=1) - timedelta(days=1)
+        else:
+            end_date = start_date.replace(month=start_date.month + 1, day=1) - timedelta(days=1)
+    elif period == "year":
+        start_date = ref_date.replace(month=1, day=1)
+        end_date = ref_date.replace(month=12, day=31)
+    else:
+        raise HTTPException(status_code=400, detail="period must be day, week, month, or year")
+
+    timesheet_data = load_timesheets()
+    employees_data = load_employees()
+    emp_names = {emp["id"]: emp["name"] for emp in employees_data["employees"]}
+
+    rows = []
+    emp_totals: Dict[int, Dict[str, Any]] = {}
+
+    for entry in timesheet_data["entries"]:
+        if entry.get("clockOut") is None:
+            continue
+        ci_str = str(entry.get("clockIn", "")).strip()
+        if not ci_str:
+            continue
+        try:
+            ci_dt = parse_utc_iso(ci_str)
+        except ValueError:
+            continue
+
+        entry_date = to_local(ci_dt).date()
+        if not (start_date <= entry_date <= end_date):
+            continue
+
+        emp_id = int(entry.get("employeeId", 0))
+        if employee_id and emp_id != employee_id:
+            continue
+
+        emp_name = emp_names.get(emp_id, str(entry.get("employeeName", f"Employee {emp_id}")))
+        hours = float(entry.get("totalHours", 0) or 0)
+
+        try:
+            co_dt = parse_utc_iso(str(entry["clockOut"]))
+            co_display = local_clock_string(co_dt)
+        except (ValueError, KeyError):
+            co_display = "—"
+
+        rows.append({
+            "employeeId": emp_id,
+            "employeeName": emp_name,
+            "date": entry_date.strftime("%Y-%m-%d"),
+            "dateLabel": to_local(ci_dt).strftime("%a, %b %-d"),
+            "clockIn": local_clock_string(ci_dt),
+            "clockOut": co_display,
+            "hours": round(hours, 2),
+            "location": entry.get("location", ""),
+        })
+
+        if emp_id not in emp_totals:
+            emp_totals[emp_id] = {"employeeId": emp_id, "employeeName": emp_name, "totalHours": 0.0, "totalShifts": 0}
+        emp_totals[emp_id]["totalHours"] += hours
+        emp_totals[emp_id]["totalShifts"] += 1
+
+    rows.sort(key=lambda r: (r["employeeName"].lower(), r["date"], r["clockIn"]))
+    summary = sorted(emp_totals.values(), key=lambda e: e["employeeName"].lower())
+    for s in summary:
+        s["totalHours"] = round(s["totalHours"], 2)
+
+    return {
+        "success": True,
+        "period": period,
+        "startDate": start_date.strftime("%Y-%m-%d"),
+        "endDate": end_date.strftime("%Y-%m-%d"),
+        "rows": rows,
+        "summary": summary,
+        "totalHours": round(sum(s["totalHours"] for s in summary), 2),
+        "totalShifts": sum(s["totalShifts"] for s in summary),
+    }
+
+
+@app.get("/api/admin/reports/hours")
+def admin_reports_hours(
+    request: Request,
+    period: str = "week",
+    date: Optional[str] = None,
+    employee_id: Optional[int] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    return _compute_hours_report(period, date, employee_id)
+
+
+@app.get("/api/admin/reports/hours/export")
+def admin_reports_hours_export(
+    request: Request,
+    period: str = "week",
+    date: Optional[str] = None,
+    employee_id: Optional[int] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> StreamingResponse:
+    data = _compute_hours_report(period, date, employee_id)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["EOM Hours Report"])
+    w.writerow(["Period", data["period"], "From", data["startDate"], "To", data["endDate"]])
+    w.writerow(["Total Hours", data["totalHours"], "Total Shifts", data["totalShifts"]])
+    w.writerow([])
+    w.writerow(["Employee", "Date", "Clock In", "Clock Out", "Hours", "Location"])
+    for r in data["rows"]:
+        w.writerow([r["employeeName"], r["dateLabel"], r["clockIn"], r["clockOut"], f'{r["hours"]:.2f}', r["location"]])
+    w.writerow([])
+    w.writerow(["Summary by Employee"])
+    w.writerow(["Employee", "Total Shifts", "Total Hours"])
+    for s in data["summary"]:
+        w.writerow([s["employeeName"], s["totalShifts"], f'{s["totalHours"]:.2f}'])
+
+    buf.seek(0)
+    filename = f"eom_hours_{period}_{data['startDate']}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
 def load_settings() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {"laborPctTarget": 35.0}
     data = read_json_file(SETTINGS_FILE, defaults)
