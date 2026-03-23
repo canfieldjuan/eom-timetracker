@@ -1893,11 +1893,35 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
 
         hours = float(entry.get("totalHours", 0) or 0)
         location = entry.get("location", "")
-        customer = location_customers.get(location) or location or "Unknown"
+        resolved_location = location  # the address key used for rate lookups
+
+        # Try direct customer name lookup first
+        customer = location_customers.get(location)
+
+        # For GPS-only entries (e.g. "GPS 39.64190,-88.47910"), reverse-match to a
+        # pinned location so we can surface the customer name
+        if not customer and location.startswith("GPS "):
+            try:
+                parts = location[4:].split(",")
+                gps_lat, gps_lng = float(parts[0].strip()), float(parts[1].strip())
+                matched_loc = find_nearest_location(gps_lat, gps_lng, timesheet_data)
+                if matched_loc:
+                    resolved_location = matched_loc
+                    customer = location_customers.get(matched_loc) or matched_loc
+            except (ValueError, IndexError):
+                pass
+
+        # Final fallback
+        if not customer:
+            if location and not location.startswith("GPS ") and location not in ("Unknown", ""):
+                customer = location
+            else:
+                customer = "Unmatched Location"
+
         emp_id = int(entry.get("employeeId", 0))
 
-        rate = location_rates.get(location)
-        rate_type = location_rate_types.get(location, "per_visit")
+        rate = location_rates.get(resolved_location)
+        rate_type = location_rate_types.get(resolved_location, "per_visit")
         if rate is not None:
             revenue = rate * hours if rate_type == "hourly" else rate
         else:
@@ -1908,7 +1932,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         date_key = entry_date.strftime("%Y-%m-%d")
 
         if customer not in customer_agg:
-            customer_agg[customer] = {"customer": customer, "location": location, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
+            customer_agg[customer] = {"customer": customer, "location": resolved_location, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
         customer_agg[customer]["visits"] += 1
         customer_agg[customer]["hours"] += hours
         customer_agg[customer]["revenue"] += revenue
