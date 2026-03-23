@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -206,6 +207,29 @@ def parse_allowed_ips(value: Optional[str]) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+LOCATION_MATCH_RADIUS_M = 50  # ~165 feet
+
+
+def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    R = 6_371_000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin(math.radians(lat2 - lat1) / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2) * math.sin(math.radians(lng2 - lng1) / 2) ** 2)
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def find_nearest_location(lat: float, lng: float, timesheet_data: Dict[str, Any]) -> Optional[str]:
+    coords = timesheet_data.get("location_coords", {})
+    best_name, best_dist = None, float("inf")
+    for name, c in coords.items():
+        d = haversine_m(lat, lng, c["lat"], c["lng"])
+        if d < best_dist:
+            best_name, best_dist = name, d
+    if best_name and best_dist <= LOCATION_MATCH_RADIUS_M:
+        return best_name
+    return None
+
+
 def validate_schedule(start_hour: int, end_hour: int) -> None:
     if start_hour < 0 or start_hour > 23:
         raise RuntimeError("ACCESS_START_HOUR must be between 0 and 23")
@@ -308,6 +332,19 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
     else:
         locations = DEFAULT_LOCATIONS[:]
 
+    raw_coords = raw_data.get("location_coords")
+    location_coords: Dict[str, Dict[str, float]] = {}
+    if isinstance(raw_coords, dict):
+        for name, coords in raw_coords.items():
+            if isinstance(coords, dict):
+                try:
+                    location_coords[str(name)] = {
+                        "lat": float(coords["lat"]),
+                        "lng": float(coords["lng"]),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    pass
+
     raw_next_id = raw_data.get("nextId")
     try:
         next_id = int(raw_next_id)
@@ -317,7 +354,7 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
     if next_id <= max_id:
         next_id = max_id + 1
 
-    return {"entries": entries, "nextId": next_id, "locations": locations}
+    return {"entries": entries, "nextId": next_id, "locations": locations, "location_coords": location_coords}
 
 
 def load_employees() -> Dict[str, Any]:
@@ -781,7 +818,7 @@ class RegisterRequest(BaseModel):
 
 
 class ClockInRequest(BaseModel):
-    location: str = Field(min_length=1)
+    location: str = ""
     notes: str = ""
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -976,12 +1013,8 @@ def clock_in(
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
-    location = payload.location.strip()
     notes = payload.notes.strip()
-    if not location:
-        append_access_log(request, "CLOCK_IN_FAILED", False, "Missing location")
-        raise HTTPException(status_code=400, detail="Location is required")
-
+    has_gps = payload.latitude is not None and payload.longitude is not None
     now_utc = utc_now()
     work_date = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
 
@@ -989,6 +1022,13 @@ def clock_in(
         existing_open = get_open_entry(timesheet_data["entries"], employee["id"])
         if existing_open and not is_stale_open_entry(existing_open, now_utc):
             return False, "Already clocked in"
+
+        # Auto-match location from GPS; fall back to provided string or GPS coords
+        if has_gps:
+            matched = find_nearest_location(payload.latitude, payload.longitude, timesheet_data)
+            location = matched or payload.location.strip() or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+        else:
+            location = payload.location.strip() or "Unknown"
 
         entry_id = int(timesheet_data["nextId"])
         entry = {
@@ -1005,11 +1045,8 @@ def clock_in(
             "clockInGps": None,
             "clockOutGps": None,
         }
-        if payload.latitude is not None and payload.longitude is not None:
-            entry["clockInGps"] = {
-                "lat": payload.latitude,
-                "lng": payload.longitude,
-            }
+        if has_gps:
+            entry["clockInGps"] = {"lat": payload.latitude, "lng": payload.longitude}
         timesheet_data["entries"].append(entry)
         timesheet_data["nextId"] = entry_id + 1
         return True, entry
@@ -1145,7 +1182,7 @@ def timesheet_locations(
 ) -> Dict[str, Any]:
     payload = load_timesheets()
     append_access_log(request, "LOCATIONS_SUCCESS", True, "Locations fetched")
-    return {"success": True, "locations": payload["locations"]}
+    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"]}
 
 
 @app.put("/api/admin/locations")
@@ -1157,15 +1194,29 @@ def admin_update_locations(
     raw = payload.get("locations")
     if not isinstance(raw, list):
         raise HTTPException(status_code=400, detail="locations must be a list")
-    locations = [str(loc).strip() for loc in raw if str(loc).strip()]
+
+    locations = []
+    location_coords: Dict[str, Dict[str, float]] = {}
+    for item in raw:
+        if isinstance(item, dict) and item.get("name", "").strip():
+            name = str(item["name"]).strip()
+            locations.append(name)
+            if item.get("lat") is not None and item.get("lng") is not None:
+                try:
+                    location_coords[name] = {"lat": float(item["lat"]), "lng": float(item["lng"])}
+                except (TypeError, ValueError):
+                    pass
+        elif isinstance(item, str) and item.strip():
+            locations.append(item.strip())
 
     def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
         data["locations"] = locations
+        data["location_coords"] = location_coords
         return True, locations
 
     update_timesheets(mutator)
-    append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations")
-    return {"success": True, "locations": locations}
+    append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations, {len(location_coords)} with coords")
+    return {"success": True, "locations": locations, "location_coords": location_coords}
 
 
 @app.get("/api/timesheet/current-status")
