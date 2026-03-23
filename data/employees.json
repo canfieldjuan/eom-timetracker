@@ -1,0 +1,23 @@
+{
+  "employees": [
+    {
+      "id": 1,
+      "name": "Juan Canfield",
+      "password": "$2b$10$yTk9Emxez9kFjk8CtUYPTezNy1bzTjy4k5bFqn2/K9JbgZdRdegA2",
+      "active": true,
+      "role": "admin",
+      "created": "2026-03-23T00:00:00Z",
+      "lastLogin": "2026-03-23T16:47:21Z"
+    },
+    {
+      "id": 2,
+      "name": "Caritina Gomez",
+      "password": "$2b$10$9yuXRgFfEP/9qwCGZLxE2Of1igyZwZgiAgytT1CQb/48ep975FYOu",
+      "active": true,
+      "role": "employee",
+      "created": "2026-03-23T14:34:21Z",
+      "lastLogin": "2026-03-23T16:04:03Z"
+    }
+  ],
+  "nextId": 3
+}

@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: eom-timetracker
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r ../requirements.txt
+    startCommand: python time_tracker_api.py
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: TIMEZONE
+        value: America/Chicago
+      - key: ENV
+        value: production
+      - key: DATA_DIR
+        value: /opt/render/project/data
+      - key: TRUST_PROXY
+        value: "true"
+      - key: ACCESS_START_HOUR
+        value: "6"
+      - key: ACCESS_END_HOUR
+        value: "22"
+    disk:
+      name: eom-data
+      mountPath: /opt/render/project/data
+      sizeGB: 1

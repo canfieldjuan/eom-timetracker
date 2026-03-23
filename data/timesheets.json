@@ -1,0 +1,46 @@
+{
+  "entries": [
+    {
+      "id": 1,
+      "employeeId": 1,
+      "employeeName": "Juan Canfield",
+      "location": "Office Maids 101, Effingham",
+      "clockIn": "2026-03-23T14:32:19Z",
+      "clockOut": "2026-03-23T14:32:23Z",
+      "totalHours": 0.0,
+      "notes": "",
+      "date": "2026-03-23",
+      "timezone": "America/Chicago"
+    },
+    {
+      "id": 2,
+      "employeeId": 1,
+      "employeeName": "Juan Canfield",
+      "location": "Office Maids 101, Effingham",
+      "clockIn": "2026-03-23T14:32:31Z",
+      "clockOut": "2026-03-23T14:32:39Z",
+      "totalHours": 0.0,
+      "notes": "",
+      "date": "2026-03-23",
+      "timezone": "America/Chicago"
+    },
+    {
+      "id": 3,
+      "employeeId": 2,
+      "employeeName": "Caritina Gomez",
+      "location": "Office Maids 101, Effingham",
+      "clockIn": "2026-03-23T14:40:22Z",
+      "clockOut": "2026-03-23T16:09:44Z",
+      "totalHours": 1.49,
+      "notes": "",
+      "date": "2026-03-23",
+      "timezone": "America/Chicago"
+    }
+  ],
+  "nextId": 4,
+  "locations": [
+    "Office Maids 101, Effingham",
+    "Office Maids 102, Effingham",
+    "Office Maids 103, Effingham"
+  ]
+}
