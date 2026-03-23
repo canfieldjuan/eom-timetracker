@@ -1065,6 +1065,86 @@ def admin_list_employees(
     return {"success": True, "employees": rows}
 
 
+@app.get("/api/admin/employees/{employee_id}/hours")
+def admin_employee_hours(
+    employee_id: int,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    employees_data = load_employees()
+    emp = next((e for e in employees_data["employees"] if e["id"] == employee_id), None)
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    timesheet_data = load_timesheets()
+    now = utc_now()
+
+    days_since_monday = now.weekday()
+    week_start = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    today_str = local_date_string(now)
+
+    emp_entries = [e for e in timesheet_data["entries"] if e.get("employeeId") == employee_id]
+
+    today_hours = 0.0
+    weekly_hours = 0.0
+    monthly_hours = 0.0
+    yearly_hours = 0.0
+    all_time_hours = 0.0
+    shifts: List[Dict[str, Any]] = []
+
+    for entry in emp_entries:
+        clock_in_str = str(entry.get("clockIn", "")).strip()
+        if not clock_in_str:
+            continue
+        try:
+            clock_in_dt = parse_utc_iso(clock_in_str)
+        except ValueError:
+            continue
+
+        total = entry_hours(entry, now)
+        entry_date = local_date_string(clock_in_dt)
+
+        all_time_hours += total
+        if clock_in_dt >= year_start:
+            yearly_hours += total
+        if clock_in_dt >= month_start:
+            monthly_hours += total
+        if clock_in_dt >= week_start:
+            weekly_hours += total
+        if entry_date == today_str:
+            today_hours += total
+
+        clock_out_display = "Active"
+        if entry.get("clockOut"):
+            try:
+                clock_out_display = local_clock_string(parse_utc_iso(str(entry["clockOut"])))
+            except ValueError:
+                pass
+
+        shifts.append({
+            "date": entry_date,
+            "clockIn": local_clock_string(clock_in_dt),
+            "clockOut": clock_out_display,
+            "hours": round(total, 2),
+            "location": entry.get("location", ""),
+        })
+
+    shifts.sort(key=lambda x: (x["date"], x["clockIn"]), reverse=True)
+    return {
+        "success": True,
+        "employeeId": employee_id,
+        "employeeName": emp["name"],
+        "todayHours": round(today_hours, 2),
+        "weeklyHours": round(weekly_hours, 2),
+        "monthlyHours": round(monthly_hours, 2),
+        "yearlyHours": round(yearly_hours, 2),
+        "allTimeHours": round(all_time_hours, 2),
+        "shifts": shifts[:50],
+    }
+
+
 @app.post("/api/timesheet/clock-in")
 def clock_in(
     payload: ClockInRequest,
@@ -1180,6 +1260,8 @@ def my_timesheet_hours(
     week_start = (now - timedelta(days=days_since_monday)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     today_str = local_date_string(now)
 
     my_entries = [
@@ -1189,6 +1271,8 @@ def my_timesheet_hours(
 
     weekly_hours = 0.0
     today_hours = 0.0
+    monthly_hours = 0.0
+    yearly_hours = 0.0
     recent_shifts: List[Dict[str, Any]] = []
 
     for entry in my_entries:
@@ -1207,6 +1291,10 @@ def my_timesheet_hours(
             weekly_hours += total
         if entry_date == today_str:
             today_hours += total
+        if clock_in_dt >= month_start:
+            monthly_hours += total
+        if clock_in_dt >= year_start:
+            yearly_hours += total
 
         clock_out_display = "Active"
         if entry.get("clockOut"):
@@ -1223,13 +1311,15 @@ def my_timesheet_hours(
             "location": entry.get("location", ""),
         })
 
-    recent_shifts.sort(key=lambda x: x["date"], reverse=True)
+    recent_shifts.sort(key=lambda x: (x["date"], x["clockIn"]), reverse=True)
     append_access_log(request, "MY_HOURS_SUCCESS", True, f"Employee: {current_employee['name']}")
     return {
         "success": True,
-        "weeklyHours": round(weekly_hours, 2),
         "todayHours": round(today_hours, 2),
-        "recentShifts": recent_shifts[:10],
+        "weeklyHours": round(weekly_hours, 2),
+        "monthlyHours": round(monthly_hours, 2),
+        "yearlyHours": round(yearly_hours, 2),
+        "recentShifts": recent_shifts[:30],
     }
 
 
