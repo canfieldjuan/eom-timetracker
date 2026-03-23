@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
 import os
@@ -23,7 +25,7 @@ import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -35,6 +37,7 @@ BACKEND_DIR = BASE_DIR / "backend"
 
 EMPLOYEES_FILE = DATA_DIR / "employees.json"
 TIMESHEETS_FILE = DATA_DIR / "timesheets.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
 
 DEFAULT_LOCATIONS = [
     "Office Maids 101, Effingham",
@@ -265,6 +268,12 @@ def normalize_employees(raw_data: Any) -> Dict[str, Any]:
             if not name or not password_hash:
                 continue
 
+            try:
+                raw_rate = item.get("hourlyRate")
+                hourly_rate = float(raw_rate) if raw_rate is not None else None
+            except (TypeError, ValueError):
+                hourly_rate = None
+
             employee = {
                 "id": employee_id,
                 "name": name,
@@ -273,6 +282,7 @@ def normalize_employees(raw_data: Any) -> Dict[str, Any]:
                 "role": str(item.get("role", "employee")),
                 "created": item.get("created"),
                 "lastLogin": item.get("lastLogin"),
+                "hourlyRate": hourly_rate,
             }
             employees.append(employee)
             max_id = max(max_id, employee_id)
@@ -352,6 +362,23 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
             if isinstance(name, str) and isinstance(customer, str) and customer.strip():
                 location_customers[name] = customer.strip()
 
+    raw_rates = raw_data.get("location_rates")
+    location_rates: Dict[str, float] = {}
+    if isinstance(raw_rates, dict):
+        for name, rate in raw_rates.items():
+            if isinstance(name, str):
+                try:
+                    location_rates[name] = float(rate)
+                except (TypeError, ValueError):
+                    pass
+
+    raw_rate_types = raw_data.get("location_rate_types")
+    location_rate_types: Dict[str, str] = {}
+    if isinstance(raw_rate_types, dict):
+        for name, rtype in raw_rate_types.items():
+            if isinstance(name, str) and rtype in ("per_visit", "hourly"):
+                location_rate_types[name] = rtype
+
     raw_next_id = raw_data.get("nextId")
     try:
         next_id = int(raw_next_id)
@@ -361,7 +388,7 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
     if next_id <= max_id:
         next_id = max_id + 1
 
-    return {"entries": entries, "nextId": next_id, "locations": locations, "location_coords": location_coords, "location_customers": location_customers}
+    return {"entries": entries, "nextId": next_id, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types}
 
 
 def load_employees() -> Dict[str, Any]:
@@ -1016,6 +1043,19 @@ def admin_update_employee(
         raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
     hashed_password = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt(10)).decode() if new_password else None
 
+    new_hourly_rate = None
+    if "hourlyRate" in payload:
+        raw_rate = payload["hourlyRate"]
+        if raw_rate is not None:
+            try:
+                new_hourly_rate = float(raw_rate)
+                if new_hourly_rate < 0:
+                    raise HTTPException(status_code=400, detail="Hourly rate cannot be negative")
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Invalid hourly rate")
+        else:
+            new_hourly_rate = None
+
     def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
         emp = find_employee_by_id(employees_data["employees"], employee_id)
         if not emp:
@@ -1026,7 +1066,9 @@ def admin_update_employee(
             emp["active"] = bool(payload["active"])
         if hashed_password:
             emp["password"] = hashed_password
-        return True, {"id": emp["id"], "name": emp["name"], "role": emp["role"], "active": emp["active"]}
+        if "hourlyRate" in payload:
+            emp["hourlyRate"] = new_hourly_rate
+        return True, {"id": emp["id"], "name": emp["name"], "role": emp["role"], "active": emp["active"], "hourlyRate": emp.get("hourlyRate")}
 
     ok, result = update_employees(mutator)
     if not ok:
@@ -1066,6 +1108,7 @@ def admin_list_employees(
             "totalHours": round(total_hours, 2),
             "totalShifts": len(emp_entries),
             "lastGps": last_gps,
+            "hourlyRate": emp.get("hourlyRate"),
         })
 
     append_access_log(request, "ADMIN_EMPLOYEES", True, f"{len(rows)} employees")
@@ -1076,6 +1119,7 @@ def admin_list_employees(
 def admin_employee_hours(
     employee_id: int,
     request: Request,
+    week_offset: int = 0,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     employees_data = load_employees()
@@ -1139,6 +1183,53 @@ def admin_employee_hours(
         })
 
     shifts.sort(key=lambda x: (x["date"], x["clockIn"]), reverse=True)
+
+    # Build weekly grid (Sun–Sat) for the requested week
+    days_since_sunday = (now.weekday() + 1) % 7
+    this_sunday_utc = (now - timedelta(days=days_since_sunday)).replace(hour=0, minute=0, second=0, microsecond=0)
+    grid_sunday_utc = this_sunday_utc + timedelta(weeks=week_offset)
+    grid_saturday_utc = grid_sunday_utc + timedelta(days=6, hours=23, minutes=59, seconds=59)
+
+    shifts_by_date: Dict[str, list] = {}
+    for entry in emp_entries:
+        ci_str = str(entry.get("clockIn", "")).strip()
+        if not ci_str:
+            continue
+        try:
+            ci_dt = parse_utc_iso(ci_str)
+        except ValueError:
+            continue
+        if not (grid_sunday_utc <= ci_dt <= grid_saturday_utc):
+            continue
+        d_str = local_date_string(ci_dt)
+        co_disp = "Active"
+        if entry.get("clockOut"):
+            try:
+                co_disp = local_clock_string(parse_utc_iso(str(entry["clockOut"])))
+            except ValueError:
+                pass
+        shifts_by_date.setdefault(d_str, []).append({
+            "clockIn": local_clock_string(ci_dt),
+            "clockOut": co_disp,
+            "hours": round(entry_hours(entry, now), 2),
+            "location": entry.get("location", ""),
+        })
+
+    week_grid = []
+    week_total = 0.0
+    for i in range(7):
+        day_utc = grid_sunday_utc + timedelta(days=i)
+        d_str = local_date_string(day_utc)
+        day_shifts = shifts_by_date.get(d_str, [])
+        day_hours = round(sum(s["hours"] for s in day_shifts), 2)
+        week_total += day_hours
+        week_grid.append({
+            "date": d_str,
+            "dayLabel": to_local(day_utc).strftime("%a, %b %-d"),
+            "shifts": day_shifts,
+            "totalHours": day_hours,
+        })
+
     return {
         "success": True,
         "employeeId": employee_id,
@@ -1148,6 +1239,10 @@ def admin_employee_hours(
         "monthlyHours": round(monthly_hours, 2),
         "yearlyHours": round(yearly_hours, 2),
         "allTimeHours": round(all_time_hours, 2),
+        "weekGrid": week_grid,
+        "weekTotal": round(week_total, 2),
+        "weekOffset": week_offset,
+        "weekStartDate": local_date_string(grid_sunday_utc),
         "shifts": shifts[:50],
     }
 
@@ -1337,7 +1432,7 @@ def timesheet_locations(
 ) -> Dict[str, Any]:
     payload = load_timesheets()
     append_access_log(request, "LOCATIONS_SUCCESS", True, "Locations fetched")
-    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"], "location_customers": payload["location_customers"]}
+    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"], "location_customers": payload["location_customers"], "location_rates": payload["location_rates"], "location_rate_types": payload["location_rate_types"]}
 
 
 @app.put("/api/admin/locations")
@@ -1353,6 +1448,8 @@ def admin_update_locations(
     locations = []
     location_coords: Dict[str, Dict[str, float]] = {}
     location_customers: Dict[str, str] = {}
+    location_rates: Dict[str, float] = {}
+    location_rate_types: Dict[str, str] = {}
     for item in raw:
         if isinstance(item, dict) and item.get("name", "").strip():
             name = str(item["name"]).strip()
@@ -1364,6 +1461,13 @@ def admin_update_locations(
                     pass
             if item.get("customer", "").strip():
                 location_customers[name] = str(item["customer"]).strip()
+            if item.get("rate") is not None:
+                try:
+                    location_rates[name] = float(item["rate"])
+                except (TypeError, ValueError):
+                    pass
+            if item.get("rateType") in ("per_visit", "hourly"):
+                location_rate_types[name] = item["rateType"]
         elif isinstance(item, str) and item.strip():
             locations.append(item.strip())
 
@@ -1371,11 +1475,13 @@ def admin_update_locations(
         data["locations"] = locations
         data["location_coords"] = location_coords
         data["location_customers"] = location_customers
+        data["location_rates"] = location_rates
+        data["location_rate_types"] = location_rate_types
         return True, locations
 
     update_timesheets(mutator)
     append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations, {len(location_coords)} with coords")
-    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers}
+    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types}
 
 
 @app.get("/api/timesheet/current-status")
@@ -1541,6 +1647,223 @@ def admin_download_report(
 
     append_access_log(request, "REPORT_DOWNLOAD", True, filename)
     return FileResponse(str(target_path), media_type="application/pdf", filename=filename)
+
+
+def load_settings() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {"laborPctTarget": 35.0}
+    data = read_json_file(SETTINGS_FILE, defaults)
+    if not isinstance(data, dict):
+        return dict(defaults)
+    for k, v in defaults.items():
+        if k not in data:
+            data[k] = v
+    return data
+
+
+@app.get("/api/admin/settings")
+def admin_get_settings(
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    return {"success": True, **load_settings()}
+
+
+@app.put("/api/admin/settings")
+def admin_update_settings(
+    payload: Dict[str, Any],
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    settings = load_settings()
+    if "laborPctTarget" in payload:
+        try:
+            val = float(payload["laborPctTarget"])
+            if not (0 < val < 100):
+                raise HTTPException(status_code=400, detail="laborPctTarget must be between 0 and 100")
+            settings["laborPctTarget"] = round(val, 2)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid laborPctTarget")
+    write_json_atomic(SETTINGS_FILE, settings)
+    return {"success": True, **settings}
+
+
+def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
+    now = utc_now()
+    local_now = to_local(now)
+
+    if date_str:
+        try:
+            ref_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format, use YYYY-MM-DD")
+    else:
+        ref_date = local_now.date()
+
+    if period == "day":
+        start_date = ref_date
+        end_date = ref_date
+    elif period == "week":
+        days_since_sunday = (ref_date.weekday() + 1) % 7
+        start_date = ref_date - timedelta(days=days_since_sunday)
+        end_date = start_date + timedelta(days=6)
+    elif period == "month":
+        start_date = ref_date.replace(day=1)
+        if start_date.month == 12:
+            end_date = start_date.replace(year=start_date.year + 1, month=1, day=1) - timedelta(days=1)
+        else:
+            end_date = start_date.replace(month=start_date.month + 1, day=1) - timedelta(days=1)
+    else:
+        raise HTTPException(status_code=400, detail="period must be day, week, or month")
+
+    timesheet_data = load_timesheets()
+    employees_data = load_employees()
+    settings = load_settings()
+
+    location_customers = timesheet_data.get("location_customers", {})
+    location_rates = timesheet_data.get("location_rates", {})
+    location_rate_types = timesheet_data.get("location_rate_types", {})
+
+    emp_rates: Dict[int, float] = {}
+    for emp in employees_data["employees"]:
+        rate = emp.get("hourlyRate")
+        if rate is not None:
+            emp_rates[emp["id"]] = float(rate)
+
+    customer_agg: Dict[str, Dict[str, Any]] = {}
+    day_agg: Dict[str, Dict[str, Any]] = {}
+
+    for entry in timesheet_data["entries"]:
+        if entry.get("clockOut") is None:
+            continue
+        ci_str = str(entry.get("clockIn", "")).strip()
+        if not ci_str:
+            continue
+        try:
+            ci_dt = parse_utc_iso(ci_str)
+        except ValueError:
+            continue
+
+        entry_date = to_local(ci_dt).date()
+        if not (start_date <= entry_date <= end_date):
+            continue
+
+        hours = float(entry.get("totalHours", 0) or 0)
+        location = entry.get("location", "")
+        customer = location_customers.get(location) or location or "Unknown"
+        emp_id = int(entry.get("employeeId", 0))
+
+        rate = location_rates.get(location)
+        rate_type = location_rate_types.get(location, "per_visit")
+        if rate is not None:
+            revenue = rate * hours if rate_type == "hourly" else rate
+        else:
+            revenue = 0.0
+
+        emp_rate = emp_rates.get(emp_id)
+        labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
+        date_key = entry_date.strftime("%Y-%m-%d")
+
+        if customer not in customer_agg:
+            customer_agg[customer] = {"customer": customer, "location": location, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
+        customer_agg[customer]["visits"] += 1
+        customer_agg[customer]["hours"] += hours
+        customer_agg[customer]["revenue"] += revenue
+        customer_agg[customer]["laborCost"] += labor_cost
+
+        if date_key not in day_agg:
+            day_agg[date_key] = {"date": date_key, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
+        day_agg[date_key]["visits"] += 1
+        day_agg[date_key]["hours"] += hours
+        day_agg[date_key]["revenue"] += revenue
+        day_agg[date_key]["laborCost"] += labor_cost
+
+    def _finalize(d: Dict[str, Any]) -> Dict[str, Any]:
+        rev = d["revenue"]
+        lc = d["laborCost"]
+        lp = round(lc / rev * 100, 1) if rev > 0 else None
+        return {**d, "hours": round(d["hours"], 2), "revenue": round(rev, 2), "laborCost": round(lc, 2), "laborPct": lp, "netProfit": round(rev - lc, 2)}
+
+    by_customer = sorted([_finalize(c) for c in customer_agg.values()], key=lambda x: x["revenue"], reverse=True)
+    by_day = sorted([_finalize(d) for d in day_agg.values()], key=lambda x: x["date"])
+
+    total_rev = sum(c["revenue"] for c in by_customer)
+    total_lc = sum(c["laborCost"] for c in by_customer)
+    total_hours = round(sum(c["hours"] for c in by_customer), 2)
+    total_visits = sum(c["visits"] for c in by_customer)
+
+    return {
+        "success": True,
+        "period": period,
+        "startDate": start_date.strftime("%Y-%m-%d"),
+        "endDate": end_date.strftime("%Y-%m-%d"),
+        "laborPctTarget": settings["laborPctTarget"],
+        "summary": {
+            "revenue": round(total_rev, 2),
+            "laborCost": round(total_lc, 2),
+            "laborPct": round(total_lc / total_rev * 100, 1) if total_rev > 0 else None,
+            "netProfit": round(total_rev - total_lc, 2),
+            "hours": total_hours,
+            "visits": total_visits,
+        },
+        "byCustomer": by_customer,
+        "byDay": by_day,
+    }
+
+
+@app.get("/api/admin/analytics")
+def admin_analytics(
+    request: Request,
+    period: str = "week",
+    date: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    return _compute_analytics(period, date)
+
+
+@app.get("/api/admin/analytics/export")
+def admin_analytics_export(
+    request: Request,
+    period: str = "week",
+    date: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> StreamingResponse:
+    data = _compute_analytics(period, date)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    s = data["summary"]
+
+    w.writerow(["EOM Analytics Export"])
+    w.writerow(["Period", data["period"], "From", data["startDate"], "To", data["endDate"]])
+    w.writerow(["Revenue", f'${s["revenue"]:.2f}', "Labor Cost", f'${s["laborCost"]:.2f}',
+                "Labor %", f'{s["laborPct"]}%' if s["laborPct"] is not None else "N/A",
+                "Net Profit", f'${s["netProfit"]:.2f}', "Target", f'{data["laborPctTarget"]}%'])
+    w.writerow([])
+
+    w.writerow(["By Customer"])
+    w.writerow(["Customer", "Location", "Visits", "Hours", "Revenue", "Labor Cost", "Labor %", "Net Profit"])
+    for c in data["byCustomer"]:
+        w.writerow([c["customer"], c["location"], c["visits"], f'{c["hours"]:.2f}',
+                    f'${c["revenue"]:.2f}', f'${c["laborCost"]:.2f}',
+                    f'{c["laborPct"]}%' if c["laborPct"] is not None else "N/A",
+                    f'${c["netProfit"]:.2f}'])
+    w.writerow([])
+
+    w.writerow(["By Day"])
+    w.writerow(["Date", "Visits", "Hours", "Revenue", "Labor Cost", "Labor %", "Net Profit"])
+    for d in data["byDay"]:
+        w.writerow([d["date"], d["visits"], f'{d["hours"]:.2f}',
+                    f'${d["revenue"]:.2f}', f'${d["laborCost"]:.2f}',
+                    f'{d["laborPct"]}%' if d["laborPct"] is not None else "N/A",
+                    f'${d["netProfit"]:.2f}'])
+
+    buf.seek(0)
+    filename = f"eom_analytics_{period}_{data['startDate']}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 if __name__ == "__main__":
