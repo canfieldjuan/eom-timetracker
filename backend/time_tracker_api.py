@@ -345,6 +345,13 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
                 except (KeyError, TypeError, ValueError):
                     pass
 
+    raw_customers = raw_data.get("location_customers")
+    location_customers: Dict[str, str] = {}
+    if isinstance(raw_customers, dict):
+        for name, customer in raw_customers.items():
+            if isinstance(name, str) and isinstance(customer, str) and customer.strip():
+                location_customers[name] = customer.strip()
+
     raw_next_id = raw_data.get("nextId")
     try:
         next_id = int(raw_next_id)
@@ -354,7 +361,7 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
     if next_id <= max_id:
         next_id = max_id + 1
 
-    return {"entries": entries, "nextId": next_id, "locations": locations, "location_coords": location_coords}
+    return {"entries": entries, "nextId": next_id, "locations": locations, "location_coords": location_coords, "location_customers": location_customers}
 
 
 def load_employees() -> Dict[str, Any]:
@@ -1233,7 +1240,7 @@ def timesheet_locations(
 ) -> Dict[str, Any]:
     payload = load_timesheets()
     append_access_log(request, "LOCATIONS_SUCCESS", True, "Locations fetched")
-    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"]}
+    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"], "location_customers": payload["location_customers"]}
 
 
 @app.put("/api/admin/locations")
@@ -1248,6 +1255,7 @@ def admin_update_locations(
 
     locations = []
     location_coords: Dict[str, Dict[str, float]] = {}
+    location_customers: Dict[str, str] = {}
     for item in raw:
         if isinstance(item, dict) and item.get("name", "").strip():
             name = str(item["name"]).strip()
@@ -1257,17 +1265,20 @@ def admin_update_locations(
                     location_coords[name] = {"lat": float(item["lat"]), "lng": float(item["lng"])}
                 except (TypeError, ValueError):
                     pass
+            if item.get("customer", "").strip():
+                location_customers[name] = str(item["customer"]).strip()
         elif isinstance(item, str) and item.strip():
             locations.append(item.strip())
 
     def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
         data["locations"] = locations
         data["location_coords"] = location_coords
+        data["location_customers"] = location_customers
         return True, locations
 
     update_timesheets(mutator)
     append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations, {len(location_coords)} with coords")
-    return {"success": True, "locations": locations, "location_coords": location_coords}
+    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers}
 
 
 @app.get("/api/timesheet/current-status")
