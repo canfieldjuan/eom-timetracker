@@ -1148,6 +1148,26 @@ def timesheet_locations(
     return {"success": True, "locations": payload["locations"]}
 
 
+@app.put("/api/admin/locations")
+def admin_update_locations(
+    payload: Dict[str, Any],
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    raw = payload.get("locations")
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="locations must be a list")
+    locations = [str(loc).strip() for loc in raw if str(loc).strip()]
+
+    def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
+        data["locations"] = locations
+        return True, locations
+
+    update_timesheets(mutator)
+    append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations")
+    return {"success": True, "locations": locations}
+
+
 @app.get("/api/timesheet/current-status")
 def timesheet_current_status(
     request: Request,
