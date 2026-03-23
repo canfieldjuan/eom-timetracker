@@ -970,6 +970,35 @@ def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]:
     return {"success": True, "employee": result}
 
 
+@app.patch("/api/admin/employees/{employee_id}")
+def admin_update_employee(
+    employee_id: int,
+    payload: Dict[str, Any],
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    allowed_roles = {"admin", "employee"}
+    new_role = payload.get("role", "").strip().lower()
+    if new_role and new_role not in allowed_roles:
+        raise HTTPException(status_code=400, detail=f"Role must be one of: {', '.join(allowed_roles)}")
+
+    def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        emp = find_employee_by_id(employees_data["employees"], employee_id)
+        if not emp:
+            return False, "Employee not found"
+        if new_role:
+            emp["role"] = new_role
+        if "active" in payload:
+            emp["active"] = bool(payload["active"])
+        return True, {"id": emp["id"], "name": emp["name"], "role": emp["role"], "active": emp["active"]}
+
+    ok, result = update_employees(mutator)
+    if not ok:
+        raise HTTPException(status_code=404, detail=str(result))
+    append_access_log(request, "EMPLOYEE_UPDATED", True, f"id={employee_id} {payload}")
+    return {"success": True, "employee": result}
+
+
 @app.get("/api/admin/employees")
 def admin_list_employees(
     request: Request,
