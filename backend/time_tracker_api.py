@@ -858,6 +858,23 @@ validate_schedule(ACCESS_START_HOUR, ACCESS_END_HOUR)
 ALLOWED_DAYS = parse_allowed_days(os.getenv("ALLOWED_DAYS"))
 ALLOWED_IPS = parse_allowed_ips(os.getenv("ALLOWED_IPS"))
 TRUST_PROXY = parse_bool(os.getenv("TRUST_PROXY"), False)
+BOOTSTRAP_ADMIN_IDS = [
+    int(x) for x in os.getenv("BOOTSTRAP_ADMIN_IDS", "").split(",") if x.strip().isdigit()
+]
+
+
+def apply_bootstrap_admins() -> None:
+    if not BOOTSTRAP_ADMIN_IDS:
+        return
+    def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        changed = False
+        for emp in employees_data["employees"]:
+            if emp["id"] in BOOTSTRAP_ADMIN_IDS and emp.get("role") != "admin":
+                emp["role"] = "admin"
+                changed = True
+        return changed, None
+    update_employees(mutator)
+
 
 app = FastAPI(title="EOM Time Tracker API", version="2.0.0")
 app.add_middleware(
@@ -887,6 +904,11 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
     first_error = exc.errors()[0] if exc.errors() else {}
     message = first_error.get("msg", "Invalid request payload")
     return JSONResponse(status_code=422, content={"success": False, "error": message})
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    apply_bootstrap_admins()
 
 
 @app.get("/api/health")
