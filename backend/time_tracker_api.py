@@ -1201,7 +1201,7 @@ def clock_in(
         append_access_log(request, "CLOCK_IN_FAILED", False, str(result))
         raise HTTPException(status_code=400, detail=str(result))
 
-    append_access_log(request, "CLOCK_IN_SUCCESS", True, f"Employee: {employee['name']} at {location}")
+    append_access_log(request, "CLOCK_IN_SUCCESS", True, f"Employee: {employee['name']} at {result.get('location', '')}")
     return {"success": True, "entry": result}
 
 
