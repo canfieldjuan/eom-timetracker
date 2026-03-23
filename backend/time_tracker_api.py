@@ -1011,6 +1011,11 @@ def admin_update_employee(
     if new_role and new_role not in allowed_roles:
         raise HTTPException(status_code=400, detail=f"Role must be one of: {', '.join(allowed_roles)}")
 
+    new_password = payload.get("password", "").strip()
+    if new_password and len(new_password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    hashed_password = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt(10)).decode() if new_password else None
+
     def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
         emp = find_employee_by_id(employees_data["employees"], employee_id)
         if not emp:
@@ -1019,6 +1024,8 @@ def admin_update_employee(
             emp["role"] = new_role
         if "active" in payload:
             emp["active"] = bool(payload["active"])
+        if hashed_password:
+            emp["password"] = hashed_password
         return True, {"id": emp["id"], "name": emp["name"], "role": emp["role"], "active": emp["active"]}
 
     ok, result = update_employees(mutator)
