@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import calendar
 import csv
 import io
 import json
@@ -376,7 +377,7 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
     location_rate_types: Dict[str, str] = {}
     if isinstance(raw_rate_types, dict):
         for name, rtype in raw_rate_types.items():
-            if isinstance(name, str) and rtype in ("per_visit", "hourly"):
+            if isinstance(name, str) and rtype in ("per_visit", "hourly", "monthly"):
                 location_rate_types[name] = rtype
 
     raw_types = raw_data.get("location_types")
@@ -1474,7 +1475,7 @@ def admin_update_locations(
                     location_rates[name] = float(item["rate"])
                 except (TypeError, ValueError):
                     pass
-            if item.get("rateType") in ("per_visit", "hourly"):
+            if item.get("rateType") in ("per_visit", "hourly", "monthly"):
                 location_rate_types[name] = item["rateType"]
             if item.get("type") in ("Residential", "Commercial"):
                 location_types[name] = item["type"]
@@ -1884,6 +1885,9 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         if rate is not None:
             emp_rates[emp["id"]] = float(rate)
 
+    days_in_period = (end_date - start_date).days + 1
+    monthly_customers_credited: set = set()
+
     customer_agg: Dict[str, Dict[str, Any]] = {}
     day_agg: Dict[str, Dict[str, Any]] = {}
 
@@ -1934,7 +1938,18 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         rate = location_rates.get(resolved_location)
         rate_type = location_rate_types.get(resolved_location, "per_visit")
         if rate is not None:
-            revenue = rate * hours if rate_type == "hourly" else rate
+            if rate_type == "hourly":
+                revenue = rate * hours
+            elif rate_type == "monthly":
+                # Flat monthly fee — prorate by period length, credit once per customer
+                if customer not in monthly_customers_credited:
+                    days_in_month = calendar.monthrange(entry_date.year, entry_date.month)[1]
+                    revenue = round(rate * min(days_in_period / days_in_month, 1.0), 2)
+                    monthly_customers_credited.add(customer)
+                else:
+                    revenue = 0.0
+            else:  # per_visit
+                revenue = rate
         else:
             revenue = 0.0
 

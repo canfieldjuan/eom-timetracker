@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Batch import 29 customers into the EOM timetracker.
+Batch import 45 customers (29 residential + 16 commercial) into the EOM timetracker.
 
 Usage:
     python batch_import_customers.py --url https://eom-timetracker.onrender.com \
@@ -52,6 +52,23 @@ CUSTOMERS = [
     {"customer": "Rachel Collins",         "address": "203 N Herrin St, Teutopolis, IL 62467, USA",            "type": "Residential"},
     {"customer": "Tahira Kohli",           "address": "708 E Evergreen Ave, Effingham, IL 62401, USA",         "type": "Residential"},
     {"customer": "Teresa Carpenter",       "address": "705 Park Hills Dr, Effingham, IL 62401, USA",           "type": "Residential"},
+    # ── Commercial ──────────────────────────────────────────────────────────────
+    {"customer": "AKRA Builders",                    "address": "14590 County Rd 1600 E, Teutopolis, IL 62467, USA",       "type": "Commercial", "rate": 160.00,  "rateType": "per_visit"},
+    {"customer": "Anthony Acres Resort",             "address": "15286 Resort Rd, Effingham, IL 62401, USA",               "type": "Commercial", "rate": 32.00,   "rateType": "hourly"},
+    {"customer": "Brookstone Estates",               "address": "1101 N Maple St, Effingham, IL 62401",                    "type": "Commercial", "rate": 30.00,   "rateType": "hourly"},
+    {"customer": "Bruce Lustig",                     "address": "921 E Fayette Ave, Effingham, IL 62401, USA",             "type": "Commercial", "rate": 140.00,  "rateType": "per_visit"},
+    {"customer": "Canarm Inc.",                      "address": "709 E Main St, Teutopolis, IL 62467, USA",                "type": "Commercial", "rate": 115.00,  "rateType": "per_visit"},
+    {"customer": "David Boyer / McCarthy Improvement", "address": "104 N 2nd St, Effingham, IL 62401, USA",               "type": "Commercial", "rate": 125.00,  "rateType": "per_visit"},
+    {"customer": "Firefly Grill",                    "address": "1810 Ave of Mid-America, Effingham, IL 62401, USA",       "type": "Commercial", "rate": 27.00,   "rateType": "hourly"},
+    {"customer": "Heartland Human Services",         "address": "1200 N 4th St, Effingham, IL 62401, USA",                "type": "Commercial", "rate": 109.00,  "rateType": "per_visit"},
+    {"customer": "Kinder Morgan",                    "address": "2513 N 2125 St, St Elmo, IL 62458, USA",                 "type": "Commercial", "rate": 247.50,  "rateType": "per_visit"},
+    {"customer": "Lincare",                          "address": "700 N Henrietta St, Effingham, IL 62401, USA",            "type": "Commercial", "rate": 300.00,  "rateType": "monthly"},
+    {"customer": "MediaCom",                         "address": "107 S Henrietta St, Effingham, IL 62401, USA",            "type": "Commercial", "rate": 55.00,   "rateType": "per_visit"},
+    {"customer": "Menards",                          "address": "1100 Avenue of Mid-America, Effingham, IL 62401, USA",    "type": "Commercial", "rate": 48.00,   "rateType": "per_visit"},
+    {"customer": "Mid Illinois Concrete",            "address": "1300 S Commerce St, Effingham, IL 62401, USA",            "type": "Commercial", "rate": 125.00,  "rateType": "per_visit"},
+    {"customer": "Mid Illinois Concrete - Pike & Raney", "address": "1310 Pike Ave, Effingham, IL 62401, USA",            "type": "Commercial", "rate": 100.00,  "rateType": "per_visit"},
+    {"customer": "The American Red Cross",           "address": "603 Eden Ave, Effingham, IL 62401, USA",                  "type": "Commercial", "rate": 97.00,   "rateType": "per_visit"},
+    {"customer": "Wente Plumbing & Fire Protection", "address": "1700 S Raney St, Effingham, IL 62401, USA",              "type": "Commercial", "rate": 120.00,  "rateType": "per_visit"},
 ]
 
 
@@ -101,8 +118,8 @@ def main():
             "type": c["type"],
             "lat": coords[0] if coords else None,
             "lng": coords[1] if coords else None,
-            "rate": None,
-            "rateType": "per_visit",
+            "rate": c.get("rate"),
+            "rateType": c.get("rateType", "per_visit"),
         }
         if coords:
             print(f"    → {coords[0]:.5f}, {coords[1]:.5f}")
