@@ -379,6 +379,13 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
             if isinstance(name, str) and rtype in ("per_visit", "hourly"):
                 location_rate_types[name] = rtype
 
+    raw_types = raw_data.get("location_types")
+    location_types: Dict[str, str] = {}
+    if isinstance(raw_types, dict):
+        for name, ltype in raw_types.items():
+            if isinstance(name, str) and ltype in ("Residential", "Commercial"):
+                location_types[name] = ltype
+
     raw_next_id = raw_data.get("nextId")
     try:
         next_id = int(raw_next_id)
@@ -388,7 +395,7 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
     if next_id <= max_id:
         next_id = max_id + 1
 
-    return {"entries": entries, "nextId": next_id, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types}
+    return {"entries": entries, "nextId": next_id, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types}
 
 
 def load_employees() -> Dict[str, Any]:
@@ -1432,7 +1439,7 @@ def timesheet_locations(
 ) -> Dict[str, Any]:
     payload = load_timesheets()
     append_access_log(request, "LOCATIONS_SUCCESS", True, "Locations fetched")
-    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"], "location_customers": payload["location_customers"], "location_rates": payload["location_rates"], "location_rate_types": payload["location_rate_types"]}
+    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"], "location_customers": payload["location_customers"], "location_rates": payload["location_rates"], "location_rate_types": payload["location_rate_types"], "location_types": payload["location_types"]}
 
 
 @app.put("/api/admin/locations")
@@ -1450,6 +1457,7 @@ def admin_update_locations(
     location_customers: Dict[str, str] = {}
     location_rates: Dict[str, float] = {}
     location_rate_types: Dict[str, str] = {}
+    location_types: Dict[str, str] = {}
     for item in raw:
         if isinstance(item, dict) and item.get("name", "").strip():
             name = str(item["name"]).strip()
@@ -1468,6 +1476,8 @@ def admin_update_locations(
                     pass
             if item.get("rateType") in ("per_visit", "hourly"):
                 location_rate_types[name] = item["rateType"]
+            if item.get("type") in ("Residential", "Commercial"):
+                location_types[name] = item["type"]
         elif isinstance(item, str) and item.strip():
             locations.append(item.strip())
 
@@ -1477,11 +1487,12 @@ def admin_update_locations(
         data["location_customers"] = location_customers
         data["location_rates"] = location_rates
         data["location_rate_types"] = location_rate_types
+        data["location_types"] = location_types
         return True, locations
 
     update_timesheets(mutator)
     append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations, {len(location_coords)} with coords")
-    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types}
+    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types}
 
 
 @app.get("/api/timesheet/current-status")
