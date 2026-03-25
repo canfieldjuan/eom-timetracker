@@ -2337,6 +2337,182 @@ def admin_analytics_export(
     )
 
 
+@app.get("/api/admin/analytics/customer/{customer_name}")
+def admin_analytics_customer(
+    customer_name: str,
+    request: Request,
+    weeks: int = 12,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Return per-visit history + weekly trend for a single customer over the last N weeks."""
+    now = utc_now()
+    local_now = to_local(now)
+    ref_date = local_now.date()
+
+    days_since_sunday = (ref_date.weekday() + 1) % 7
+    current_week_start = ref_date - timedelta(days=days_since_sunday)
+    start_date = current_week_start - timedelta(weeks=max(weeks - 1, 0))
+    end_date = ref_date
+
+    timesheet_data = load_timesheets()
+    employees_data = load_employees()
+    settings = load_settings()
+
+    location_customers = timesheet_data.get("location_customers", {})
+    location_rates = timesheet_data.get("location_rates", {})
+    location_rate_types = timesheet_data.get("location_rate_types", {})
+
+    emp_names: Dict[int, str] = {e["id"]: e["name"] for e in employees_data["employees"]}
+    emp_rates: Dict[int, float] = {}
+    for emp in employees_data["employees"]:
+        rate = emp.get("hourlyRate")
+        if rate is not None:
+            emp_rates[emp["id"]] = float(rate)
+
+    def _resolve_loc(location: str) -> Tuple[str, str]:
+        resolved = location
+        customer = location_customers.get(location)
+        if not customer and location.startswith("GPS "):
+            try:
+                parts = location[4:].split(",")
+                gps_lat, gps_lng = float(parts[0].strip()), float(parts[1].strip())
+                matched = find_nearest_location(gps_lat, gps_lng, timesheet_data)
+                if matched:
+                    resolved = matched
+                    customer = location_customers.get(matched) or matched
+            except (ValueError, IndexError):
+                pass
+        if not customer:
+            customer = location if (location and not location.startswith("GPS ") and location not in ("Unknown", "")) else "Unmatched Location"
+        return resolved, customer
+
+    def _calc_revenue(resolved_location: str, cust: str, hours: float, entry_date: Any, is_visit: bool, monthly_credited: set) -> float:
+        rate = location_rates.get(resolved_location)
+        rate_type = location_rate_types.get(resolved_location, "per_visit")
+        if rate is None:
+            return 0.0
+        if rate_type == "hourly":
+            return float(rate) * hours
+        elif rate_type == "monthly":
+            month_key = f"{entry_date.year}-{entry_date.month}-{cust}"
+            if month_key not in monthly_credited:
+                monthly_credited.add(month_key)
+                return float(rate)
+            return 0.0
+        else:  # per_visit
+            return float(rate) if is_visit else 0.0
+
+    visits_list: List[Dict[str, Any]] = []
+    week_agg: Dict[str, Dict[str, Any]] = {}
+    monthly_credited: set = set()
+
+    for entry in timesheet_data["entries"]:
+        if entry.get("clockOut") is None:
+            continue
+        ci_str = str(entry.get("clockIn", "")).strip()
+        if not ci_str:
+            continue
+        try:
+            ci_dt = parse_utc_iso(ci_str)
+        except ValueError:
+            continue
+
+        entry_date = to_local(ci_dt).date()
+        if not (start_date <= entry_date <= end_date):
+            continue
+
+        emp_id = int(entry.get("employeeId", 0))
+        emp_name = emp_names.get(emp_id, f"Employee {emp_id}")
+        emp_rate = emp_rates.get(emp_id)
+
+        days_since_sunday_entry = (entry_date.weekday() + 1) % 7
+        week_start = entry_date - timedelta(days=days_since_sunday_entry)
+        week_key = week_start.strftime("%Y-%m-%d")
+
+        def _record(resolved_location: str, cust: str, hours: float, is_visit: bool) -> None:
+            if cust != customer_name:
+                return
+            revenue = _calc_revenue(resolved_location, cust, hours, entry_date, is_visit, monthly_credited)
+            labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
+            lp = round(labor_cost / revenue * 100, 1) if revenue > 0 else None
+            visits_list.append({
+                "date": entry_date.strftime("%Y-%m-%d"),
+                "weekStart": week_key,
+                "employee": emp_name,
+                "hours": round(hours, 2),
+                "revenue": round(revenue, 2),
+                "laborCost": round(labor_cost, 2),
+                "laborPct": lp,
+                "netProfit": round(revenue - labor_cost, 2),
+            })
+            if week_key not in week_agg:
+                week_agg[week_key] = {"weekStart": week_key, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
+            if is_visit:
+                week_agg[week_key]["visits"] += 1
+            week_agg[week_key]["hours"] += hours
+            week_agg[week_key]["revenue"] += revenue
+            week_agg[week_key]["laborCost"] += labor_cost
+
+        visits = entry.get("visits") or []
+        if visits:
+            try:
+                co_dt = parse_utc_iso(str(entry["clockOut"]))
+            except (ValueError, KeyError):
+                continue
+            for j, visit in enumerate(visits):
+                try:
+                    v_arrival = parse_utc_iso(str(visit["arrivalTime"]))
+                except (ValueError, KeyError):
+                    continue
+                next_time = co_dt
+                if j + 1 < len(visits):
+                    try:
+                        next_time = parse_utc_iso(str(visits[j + 1]["arrivalTime"]))
+                    except (ValueError, KeyError):
+                        pass
+                v_hours = max((next_time - v_arrival).total_seconds() / 3600, 0.0)
+                resolved_location, cust = _resolve_loc(visit.get("location", ""))
+                _record(resolved_location, cust, v_hours, is_visit=True)
+        else:
+            hours = float(entry.get("totalHours", 0) or 0)
+            resolved_location, cust = _resolve_loc(entry.get("location", ""))
+            _record(resolved_location, cust, hours, is_visit=True)
+
+    def _fin_week(w: Dict[str, Any]) -> Dict[str, Any]:
+        rev = w["revenue"]
+        lc = w["laborCost"]
+        lp = round(lc / rev * 100, 1) if rev > 0 else None
+        return {**w, "hours": round(w["hours"], 2), "revenue": round(rev, 2),
+                "laborCost": round(lc, 2), "laborPct": lp, "netProfit": round(rev - lc, 2)}
+
+    visits_list_sorted = sorted(visits_list, key=lambda x: x["date"], reverse=True)
+    by_week = sorted([_fin_week(w) for w in week_agg.values()], key=lambda x: x["weekStart"])
+
+    total_rev = sum(v["revenue"] for v in visits_list)
+    total_lc = sum(v["laborCost"] for v in visits_list)
+    total_hours = round(sum(v["hours"] for v in visits_list), 2)
+    total_visits = len(visits_list)
+
+    return {
+        "success": True,
+        "customer": customer_name,
+        "weeks": weeks,
+        "startDate": start_date.strftime("%Y-%m-%d"),
+        "endDate": end_date.strftime("%Y-%m-%d"),
+        "laborPctTarget": settings["laborPctTarget"],
+        "summary": {
+            "visits": total_visits,
+            "hours": total_hours,
+            "revenue": round(total_rev, 2),
+            "laborCost": round(total_lc, 2),
+            "laborPct": round(total_lc / total_rev * 100, 1) if total_rev > 0 else None,
+            "netProfit": round(total_rev - total_lc, 2),
+        },
+        "byVisit": visits_list_sorted,
+        "byWeek": by_week,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
 
