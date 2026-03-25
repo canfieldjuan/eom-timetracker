@@ -1610,6 +1610,38 @@ def admin_update_locations(
     return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies}
 
 
+@app.patch("/api/admin/locations/pin")
+def admin_patch_location_pin(
+    payload: Dict[str, Any],
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    location = str(payload.get("location", "")).strip()
+    lat = payload.get("lat")
+    lng = payload.get("lng")
+    if not location:
+        raise HTTPException(status_code=400, detail="location required")
+    if lat is None or lng is None:
+        raise HTTPException(status_code=400, detail="lat and lng required")
+    try:
+        lat, lng = float(lat), float(lng)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="lat and lng must be numbers")
+
+    def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
+        if location not in data.get("locations", []):
+            return False, "Location not found"
+        data.setdefault("location_coords", {})[location] = {"lat": lat, "lng": lng}
+        return True, None
+
+    ok, err = update_timesheets(mutator)
+    if not ok:
+        raise HTTPException(status_code=400, detail=str(err))
+
+    append_access_log(request, "LOCATION_PIN_SET", True, f"Pin set for: {location}")
+    return {"success": True}
+
+
 @app.get("/api/timesheet/current-status")
 def timesheet_current_status(
     request: Request,
