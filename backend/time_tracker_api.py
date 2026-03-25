@@ -1150,6 +1150,7 @@ def admin_employee_hours(
         raise HTTPException(status_code=404, detail="Employee not found")
 
     timesheet_data = load_timesheets()
+    location_customers = timesheet_data.get("location_customers", {})
     now = utc_now()
 
     days_since_monday = now.weekday()
@@ -1196,12 +1197,14 @@ def admin_employee_hours(
             except ValueError:
                 pass
 
+        loc = entry.get("location", "")
         shifts.append({
             "date": entry_date,
             "clockIn": local_clock_string(clock_in_dt),
             "clockOut": clock_out_display,
             "hours": round(total, 2),
-            "location": entry.get("location", ""),
+            "location": loc,
+            "customer": location_customers.get(loc, ""),
         })
 
     shifts.sort(key=lambda x: (x["date"], x["clockIn"]), reverse=True)
@@ -1236,6 +1239,7 @@ def admin_employee_hours(
                 co_iso = to_local(parse_utc_iso(str(entry["clockOut"]))).strftime("%Y-%m-%dT%H:%M")
             except ValueError:
                 pass
+        loc = entry.get("location", "")
         shifts_by_date.setdefault(d_str, []).append({
             "id": entry["id"],
             "clockIn": local_clock_string(ci_dt),
@@ -1243,7 +1247,8 @@ def admin_employee_hours(
             "clockOut": co_disp,
             "clockOutIso": co_iso,
             "hours": round(entry_hours(entry, now), 2),
-            "location": entry.get("location", ""),
+            "location": loc,
+            "customer": location_customers.get(loc, ""),
             "isActive": entry.get("clockOut") is None,
         })
 
