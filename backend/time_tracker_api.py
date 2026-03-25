@@ -554,7 +554,8 @@ def _row_to_entry(row: Dict[str, Any], visits: List[Dict[str, Any]]) -> Dict[str
 
 def _load_timesheets_from_db() -> Dict[str, Any]:
     loc_rows = db.query_all(
-        "SELECT address, customer_name, location_type, rate, rate_type, frequency, lat, lng "
+        "SELECT address, customer_name, location_type, rate, rate_type, "
+        "frequency, lat, lng, expected_hours "
         "FROM locations WHERE active = true ORDER BY id"
     )
     locations: List[str] = [r["address"] for r in loc_rows]
@@ -564,6 +565,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
     location_rate_types: Dict[str, str] = {}
     location_types: Dict[str, str] = {}
     location_frequencies: Dict[str, str] = {}
+    location_expected_hours: Dict[str, float] = {}
 
     for r in loc_rows:
         addr = r["address"]
@@ -579,6 +581,8 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
             location_types[addr] = r["location_type"]
         if r.get("frequency"):
             location_frequencies[addr] = r["frequency"]
+        if r.get("expected_hours") is not None:
+            location_expected_hours[addr] = float(r["expected_hours"])
 
     visit_rows = db.query_all(
         """
@@ -619,6 +623,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
         "location_rate_types": location_rate_types,
         "location_types": location_types,
         "location_frequencies": location_frequencies,
+        "location_expected_hours": location_expected_hours,
     }
 
 
@@ -637,16 +642,17 @@ def _save_timesheets_to_db(
             cur.execute(
                 """
                 INSERT INTO locations
-                  (address, customer_name, location_type, rate, rate_type, frequency, lat, lng)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                  (address, customer_name, location_type, rate, rate_type, frequency, lat, lng, expected_hours)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (address) DO UPDATE SET
-                    customer_name = EXCLUDED.customer_name,
-                    location_type = EXCLUDED.location_type,
-                    rate          = EXCLUDED.rate,
-                    rate_type     = EXCLUDED.rate_type,
-                    frequency     = EXCLUDED.frequency,
-                    lat           = EXCLUDED.lat,
-                    lng           = EXCLUDED.lng
+                    customer_name  = EXCLUDED.customer_name,
+                    location_type  = EXCLUDED.location_type,
+                    rate           = EXCLUDED.rate,
+                    rate_type      = EXCLUDED.rate_type,
+                    frequency      = EXCLUDED.frequency,
+                    lat            = EXCLUDED.lat,
+                    lng            = EXCLUDED.lng,
+                    expected_hours = EXCLUDED.expected_hours
                 RETURNING id
                 """,
                 (
@@ -658,6 +664,7 @@ def _save_timesheets_to_db(
                     timesheet_data.get("location_frequencies", {}).get(addr),
                     c.get("lat"),
                     c.get("lng"),
+                    timesheet_data.get("location_expected_hours", {}).get(addr),
                 ),
             )
             addr_to_id[addr] = cur.fetchone()[0]
@@ -1304,6 +1311,13 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
     return JSONResponse(status_code=422, content={"success": False, "error": message})
 
 
+def _ensure_schema_migrations() -> None:
+    """Idempotent schema additions for existing deployments."""
+    db.execute(
+        "ALTER TABLE locations ADD COLUMN IF NOT EXISTS expected_hours NUMERIC(6,2)"
+    )
+
+
 def _auto_migrate_if_empty() -> None:
     """Run JSON→PostgreSQL migration if the employees table is empty."""
     result = db.query_one("SELECT COUNT(*) AS n FROM employees")
@@ -1331,6 +1345,7 @@ def startup_event() -> None:
     if not database_url:
         raise RuntimeError("DATABASE_URL env var not set")
     db.init_pool(database_url)
+    _ensure_schema_migrations()
     _auto_migrate_if_empty()
     apply_bootstrap_admins()
 
@@ -1977,7 +1992,7 @@ def timesheet_locations(
 ) -> Dict[str, Any]:
     payload = load_timesheets()
     append_access_log(request, "LOCATIONS_SUCCESS", True, "Locations fetched")
-    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"], "location_customers": payload["location_customers"], "location_rates": payload["location_rates"], "location_rate_types": payload["location_rate_types"], "location_types": payload["location_types"], "location_frequencies": payload["location_frequencies"]}
+    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"], "location_customers": payload["location_customers"], "location_rates": payload["location_rates"], "location_rate_types": payload["location_rate_types"], "location_types": payload["location_types"], "location_frequencies": payload["location_frequencies"], "location_expected_hours": payload.get("location_expected_hours", {})}
 
 
 @app.put("/api/admin/locations")
@@ -1997,6 +2012,7 @@ def admin_update_locations(
     location_rate_types: Dict[str, str] = {}
     location_types: Dict[str, str] = {}
     location_frequencies: Dict[str, str] = {}
+    location_expected_hours: Dict[str, float] = {}
     for item in raw:
         if isinstance(item, dict) and item.get("name", "").strip():
             name = str(item["name"]).strip()
@@ -2019,6 +2035,11 @@ def admin_update_locations(
                 location_types[name] = item["type"]
             if isinstance(item.get("frequency"), str) and item["frequency"].strip():
                 location_frequencies[name] = item["frequency"].strip()
+            if item.get("expectedHours") is not None:
+                try:
+                    location_expected_hours[name] = float(item["expectedHours"])
+                except (TypeError, ValueError):
+                    pass
         elif isinstance(item, str) and item.strip():
             locations.append(item.strip())
 
@@ -2030,11 +2051,12 @@ def admin_update_locations(
         data["location_rate_types"] = location_rate_types
         data["location_types"] = location_types
         data["location_frequencies"] = location_frequencies
+        data["location_expected_hours"] = location_expected_hours
         return True, locations
 
     update_timesheets(mutator)
     append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations, {len(location_coords)} with coords")
-    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies}
+    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies, "location_expected_hours": location_expected_hours}
 
 
 @app.patch("/api/admin/locations/pin")
@@ -2451,8 +2473,11 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             end_date = start_date.replace(year=start_date.year + 1, month=1, day=1) - timedelta(days=1)
         else:
             end_date = start_date.replace(month=start_date.month + 1, day=1) - timedelta(days=1)
+    elif period == "all":
+        start_date = None  # type: ignore[assignment]
+        end_date = None    # type: ignore[assignment]
     else:
-        raise HTTPException(status_code=400, detail="period must be day, week, or month")
+        raise HTTPException(status_code=400, detail="period must be day, week, month, or all")
 
     timesheet_data = load_timesheets()
     employees_data = load_employees()
@@ -2461,6 +2486,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     location_customers = timesheet_data.get("location_customers", {})
     location_rates = timesheet_data.get("location_rates", {})
     location_rate_types = timesheet_data.get("location_rate_types", {})
+    location_expected_hours = timesheet_data.get("location_expected_hours", {})
 
     emp_rates: Dict[int, float] = {}
     for emp in employees_data["employees"]:
@@ -2514,10 +2540,19 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         emp_rate = emp_rates.get(emp_id)
         labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
 
+        exp_h = location_expected_hours.get(resolved_location)
+
         if customer not in customer_agg:
-            customer_agg[customer] = {"customer": customer, "location": resolved_location, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
+            customer_agg[customer] = {
+                "customer": customer, "location": resolved_location,
+                "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0,
+                "expectedHours": 0.0, "_hasExpected": False,
+            }
         if is_visit:
             customer_agg[customer]["visits"] += 1
+            if exp_h is not None:
+                customer_agg[customer]["expectedHours"] += exp_h
+                customer_agg[customer]["_hasExpected"] = True
         customer_agg[customer]["hours"] += hours
         customer_agg[customer]["revenue"] += revenue
         customer_agg[customer]["laborCost"] += labor_cost
@@ -2542,7 +2577,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             continue
 
         entry_date = to_local(ci_dt).date()
-        if not (start_date <= entry_date <= end_date):
+        if start_date is not None and not (start_date <= entry_date <= end_date):
             continue
 
         emp_id = int(entry.get("employeeId", 0))
@@ -2580,8 +2615,26 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     def _finalize(d: Dict[str, Any]) -> Dict[str, Any]:
         rev = d["revenue"]
         lc = d["laborCost"]
+        actual_h = round(d["hours"], 2)
         lp = round(lc / rev * 100, 1) if rev > 0 else None
-        return {**d, "hours": round(d["hours"], 2), "revenue": round(rev, 2), "laborCost": round(lc, 2), "laborPct": lp, "netProfit": round(rev - lc, 2)}
+        net = round(rev - lc, 2)
+        gross_margin = round(net / rev * 100, 1) if rev > 0 else None
+        has_exp = d.get("_hasExpected", False)
+        exp_h = round(d.get("expectedHours", 0.0), 2) if has_exp else None
+        variance = round(exp_h - actual_h, 2) if exp_h is not None else None
+        return {
+            "customer": d["customer"],
+            "location": d["location"],
+            "visits": d["visits"],
+            "hours": actual_h,
+            "revenue": round(rev, 2),
+            "laborCost": round(lc, 2),
+            "laborPct": lp,
+            "netProfit": net,
+            "grossMarginPct": gross_margin,
+            "expectedHours": exp_h,
+            "varianceHours": variance,
+        }
 
     by_customer = sorted([_finalize(c) for c in customer_agg.values()], key=lambda x: x["revenue"], reverse=True)
     by_day = sorted([_finalize(d) for d in day_agg.values()], key=lambda x: x["date"])
@@ -2594,19 +2647,40 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     return {
         "success": True,
         "period": period,
-        "startDate": start_date.strftime("%Y-%m-%d"),
-        "endDate": end_date.strftime("%Y-%m-%d"),
+        "startDate": start_date.strftime("%Y-%m-%d") if start_date else None,
+        "endDate": end_date.strftime("%Y-%m-%d") if end_date else None,
         "laborPctTarget": settings["laborPctTarget"],
         "summary": {
             "revenue": round(total_rev, 2),
             "laborCost": round(total_lc, 2),
             "laborPct": round(total_lc / total_rev * 100, 1) if total_rev > 0 else None,
             "netProfit": round(total_rev - total_lc, 2),
+            "grossMarginPct": round((total_rev - total_lc) / total_rev * 100, 1) if total_rev > 0 else None,
             "hours": total_hours,
             "visits": total_visits,
         },
         "byCustomer": by_customer,
         "byDay": by_day,
+    }
+
+
+@app.get("/api/admin/analytics/customers")
+def admin_analytics_customers(
+    request: Request,
+    period: str = "all",
+    date: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Customer profitability table. period=all (default) returns all-time data."""
+    data = _compute_analytics(period, date)
+    return {
+        "success": True,
+        "period": data["period"],
+        "startDate": data["startDate"],
+        "endDate": data["endDate"],
+        "laborPctTarget": data["laborPctTarget"],
+        "summary": data["summary"],
+        "customers": data["byCustomer"],
     }
 
 

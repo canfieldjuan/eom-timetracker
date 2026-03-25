@@ -23,9 +23,10 @@ CREATE TABLE locations (
     rate          NUMERIC(8, 2),
     rate_type     TEXT NOT NULL DEFAULT 'per_visit'
                       CHECK (rate_type IN ('per_visit', 'hourly', 'monthly')),
-    frequency     TEXT,
-    lat           NUMERIC(10, 7),
-    lng           NUMERIC(10, 7),
+    frequency       TEXT,
+    expected_hours  NUMERIC(6, 2),
+    lat             NUMERIC(10, 7),
+    lng             NUMERIC(10, 7),
     active        BOOLEAN NOT NULL DEFAULT true,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
