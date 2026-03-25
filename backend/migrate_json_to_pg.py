@@ -22,7 +22,8 @@ import psycopg2.extras
 
 BACKEND_DIR = Path(__file__).resolve().parent
 BASE_DIR = BACKEND_DIR.parent
-DATA_DIR = BASE_DIR / "data"
+_data_dir_env = os.environ.get("DATA_DIR", "")
+DATA_DIR = Path(_data_dir_env) if _data_dir_env else BASE_DIR / "data"
 
 EMPLOYEES_FILE = DATA_DIR / "employees.json"
 TIMESHEETS_FILE = DATA_DIR / "timesheets.json"
