@@ -691,8 +691,10 @@ def build_public_current_status() -> List[Dict[str, Any]]:
         visits = entry.get("visits") or []
         last_visit = visits[-1] if visits else None
         loc = last_visit["location"] if last_visit else str(entry.get("location", ""))
-        gps = last_visit.get("gps") if last_visit else entry.get("clockInGps")
         customer = (last_visit.get("customer") or _resolve_customer(loc, location_customers)) if last_visit else _resolve_customer(loc, location_customers)
+        # Best available GPS: walk visits newest-first for one with coords, fall back to clock-in GPS
+        last_gps_visit = next((v for v in reversed(visits) if isinstance(v.get("gps"), dict)), None)
+        gps = last_gps_visit["gps"] if last_gps_visit else entry.get("clockInGps")
 
         visit_rows = []
         for v in visits:
