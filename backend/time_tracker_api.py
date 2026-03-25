@@ -2637,7 +2637,21 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         }
 
     by_customer = sorted([_finalize(c) for c in customer_agg.values()], key=lambda x: x["revenue"], reverse=True)
-    by_day = sorted([_finalize(d) for d in day_agg.values()], key=lambda x: x["date"])
+    by_day = sorted(
+        [
+            {
+                "date": d["date"],
+                "visits": d["visits"],
+                "hours": round(d["hours"], 2),
+                "revenue": round(d["revenue"], 2),
+                "laborCost": round(d["laborCost"], 2),
+                "laborPct": round(d["laborCost"] / d["revenue"] * 100, 1) if d["revenue"] > 0 else None,
+                "netProfit": round(d["revenue"] - d["laborCost"], 2),
+            }
+            for d in day_agg.values()
+        ],
+        key=lambda x: x["date"],
+    )
 
     total_rev = sum(c["revenue"] for c in by_customer)
     total_lc = sum(c["laborCost"] for c in by_customer)
