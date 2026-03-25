@@ -322,6 +322,18 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
             if entry_id <= 0 or employee_id <= 0:
                 continue
 
+            raw_visits = item.get("visits")
+            visits: List[Dict[str, Any]] = []
+            if isinstance(raw_visits, list):
+                for v in raw_visits:
+                    if isinstance(v, dict) and v.get("arrivalTime"):
+                        visits.append({
+                            "arrivalTime": str(v["arrivalTime"]),
+                            "location": str(v.get("location", "")),
+                            "customer": str(v.get("customer", "")),
+                            "gps": v.get("gps") if isinstance(v.get("gps"), dict) else None,
+                        })
+
             entry = {
                 "id": entry_id,
                 "employeeId": employee_id,
@@ -335,6 +347,7 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
                 "timezone": str(item.get("timezone", "")).strip(),
                 "clockInGps": item.get("clockInGps") if isinstance(item.get("clockInGps"), dict) else None,
                 "clockOutGps": item.get("clockOutGps") if isinstance(item.get("clockOutGps"), dict) else None,
+                "visits": visits,
             }
             entries.append(entry)
             max_id = max(max_id, entry_id)
@@ -675,7 +688,11 @@ def build_public_current_status() -> List[Dict[str, Any]]:
         except ValueError:
             continue
 
-        loc = str(entry.get("location", ""))
+        visits = entry.get("visits") or []
+        last_visit = visits[-1] if visits else None
+        loc = last_visit["location"] if last_visit else str(entry.get("location", ""))
+        gps = last_visit.get("gps") if last_visit else entry.get("clockInGps")
+        customer = (last_visit.get("customer") or _resolve_customer(loc, location_customers)) if last_visit else _resolve_customer(loc, location_customers)
         rows.append(
             {
                 "id": int(entry.get("employeeId", 0)),
@@ -684,8 +701,9 @@ def build_public_current_status() -> List[Dict[str, Any]]:
                 "hoursWorked": f"{entry_hours(entry, now):.2f}",
                 "notes": str(entry.get("notes", "")),
                 "location": loc,
-                "customer": _resolve_customer(loc, location_customers),
-                "clockInGps": entry.get("clockInGps"),
+                "customer": customer,
+                "clockInGps": gps,
+                "visitCount": len(visits),
             }
         )
 
@@ -1248,6 +1266,20 @@ def admin_employee_hours(
             except ValueError:
                 pass
         loc = entry.get("location", "")
+        raw_visits = entry.get("visits") or []
+        visit_rows = []
+        for j, v in enumerate(raw_visits):
+            if not isinstance(v, dict) or not v.get("arrivalTime"):
+                continue
+            try:
+                v_arr = parse_utc_iso(str(v["arrivalTime"]))
+            except ValueError:
+                continue
+            visit_rows.append({
+                "arrivalTime": local_clock_string(v_arr),
+                "location": v.get("location", ""),
+                "customer": v.get("customer", ""),
+            })
         shifts_by_date.setdefault(d_str, []).append({
             "id": entry["id"],
             "clockIn": local_clock_string(ci_dt),
@@ -1258,6 +1290,7 @@ def admin_employee_hours(
             "location": loc,
             "customer": location_customers.get(loc, ""),
             "isActive": entry.get("clockOut") is None,
+            "visits": visit_rows,
         })
 
     week_grid = []
@@ -1395,6 +1428,58 @@ def clock_out(
         f"Employee: {employee['name']}, Hours: {result.get('totalHours', 0)}",
     )
     return {"success": True, "entry": result}
+
+
+@app.post("/api/timesheet/visit")
+def log_visit(
+    payload: ClockInRequest,
+    request: Request,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Auto-log an arrival at a new location during an active shift."""
+    has_gps = payload.latitude is not None and payload.longitude is not None
+    now_utc = utc_now()
+
+    def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
+        if not open_entry or is_stale_open_entry(open_entry, now_utc):
+            return False, "Not currently clocked in"
+
+        if has_gps:
+            matched = find_nearest_location(payload.latitude, payload.longitude, timesheet_data)
+            location = matched or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+        else:
+            location = str(payload.location or "").strip() or "Unknown"
+
+        customer = timesheet_data.get("location_customers", {}).get(location, "")
+
+        # Avoid duplicate: skip if location matches the most recent visit
+        existing_visits = open_entry.get("visits") or []
+        if existing_visits and existing_visits[-1].get("location") == location:
+            return False, "already_at_location"
+
+        visit = {
+            "arrivalTime": to_utc_iso(now_utc),
+            "location": location,
+            "customer": customer,
+            "gps": {"lat": payload.latitude, "lng": payload.longitude} if has_gps else None,
+        }
+
+        if not isinstance(open_entry.get("visits"), list):
+            open_entry["visits"] = []
+        open_entry["visits"].append(visit)
+
+        return True, {"visit": visit, "entryId": open_entry["id"]}
+
+    ok, result = update_timesheets(mutator)
+    if not ok:
+        if result == "already_at_location":
+            return {"success": True, "alreadyHere": True}
+        raise HTTPException(status_code=400, detail=str(result))
+
+    append_access_log(request, "VISIT_LOGGED", True,
+                      f"Employee: {employee['name']} arrived at {result['visit']['location']}")
+    return {"success": True, "alreadyHere": False, **result}
 
 
 @app.patch("/api/admin/entries/{entry_id}")
@@ -2041,6 +2126,62 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     customer_agg: Dict[str, Dict[str, Any]] = {}
     day_agg: Dict[str, Dict[str, Any]] = {}
 
+    def _resolve_loc(location: str) -> Tuple[str, str]:
+        """Return (resolved_location, customer) for a location string."""
+        resolved = location
+        customer = location_customers.get(location)
+        if not customer and location.startswith("GPS "):
+            try:
+                parts = location[4:].split(",")
+                gps_lat, gps_lng = float(parts[0].strip()), float(parts[1].strip())
+                matched = find_nearest_location(gps_lat, gps_lng, timesheet_data)
+                if matched:
+                    resolved = matched
+                    customer = location_customers.get(matched) or matched
+            except (ValueError, IndexError):
+                pass
+        if not customer:
+            customer = location if (location and not location.startswith("GPS ") and location not in ("Unknown", "")) else "Unmatched Location"
+        return resolved, customer
+
+    def _aggregate(customer: str, resolved_location: str, hours: float, emp_id: int,
+                   entry_date: Any, date_key: str, is_visit: bool) -> None:
+        rate = location_rates.get(resolved_location)
+        rate_type = location_rate_types.get(resolved_location, "per_visit")
+        if rate is not None:
+            if rate_type == "hourly":
+                revenue = rate * hours
+            elif rate_type == "monthly":
+                if customer not in monthly_customers_credited:
+                    days_in_month = calendar.monthrange(entry_date.year, entry_date.month)[1]
+                    revenue = round(rate * min(days_in_period / days_in_month, 1.0), 2)
+                    monthly_customers_credited.add(customer)
+                else:
+                    revenue = 0.0
+            else:  # per_visit
+                revenue = rate if is_visit else 0.0
+        else:
+            revenue = 0.0
+
+        emp_rate = emp_rates.get(emp_id)
+        labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
+
+        if customer not in customer_agg:
+            customer_agg[customer] = {"customer": customer, "location": resolved_location, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
+        if is_visit:
+            customer_agg[customer]["visits"] += 1
+        customer_agg[customer]["hours"] += hours
+        customer_agg[customer]["revenue"] += revenue
+        customer_agg[customer]["laborCost"] += labor_cost
+
+        if date_key not in day_agg:
+            day_agg[date_key] = {"date": date_key, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
+        if is_visit:
+            day_agg[date_key]["visits"] += 1
+        day_agg[date_key]["hours"] += hours
+        day_agg[date_key]["revenue"] += revenue
+        day_agg[date_key]["laborCost"] += labor_cost
+
     for entry in timesheet_data["entries"]:
         if entry.get("clockOut") is None:
             continue
@@ -2056,70 +2197,37 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         if not (start_date <= entry_date <= end_date):
             continue
 
-        hours = float(entry.get("totalHours", 0) or 0)
-        location = entry.get("location", "")
-        resolved_location = location  # the address key used for rate lookups
-
-        # Try direct customer name lookup first
-        customer = location_customers.get(location)
-
-        # For GPS-only entries (e.g. "GPS 39.64190,-88.47910"), reverse-match to a
-        # pinned location so we can surface the customer name
-        if not customer and location.startswith("GPS "):
-            try:
-                parts = location[4:].split(",")
-                gps_lat, gps_lng = float(parts[0].strip()), float(parts[1].strip())
-                matched_loc = find_nearest_location(gps_lat, gps_lng, timesheet_data)
-                if matched_loc:
-                    resolved_location = matched_loc
-                    customer = location_customers.get(matched_loc) or matched_loc
-            except (ValueError, IndexError):
-                pass
-
-        # Final fallback
-        if not customer:
-            if location and not location.startswith("GPS ") and location not in ("Unknown", ""):
-                customer = location
-            else:
-                customer = "Unmatched Location"
-
         emp_id = int(entry.get("employeeId", 0))
-
-        rate = location_rates.get(resolved_location)
-        rate_type = location_rate_types.get(resolved_location, "per_visit")
-        if rate is not None:
-            if rate_type == "hourly":
-                revenue = rate * hours
-            elif rate_type == "monthly":
-                # Flat monthly fee — prorate by period length, credit once per customer
-                if customer not in monthly_customers_credited:
-                    days_in_month = calendar.monthrange(entry_date.year, entry_date.month)[1]
-                    revenue = round(rate * min(days_in_period / days_in_month, 1.0), 2)
-                    monthly_customers_credited.add(customer)
-                else:
-                    revenue = 0.0
-            else:  # per_visit
-                revenue = rate
-        else:
-            revenue = 0.0
-
-        emp_rate = emp_rates.get(emp_id)
-        labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
         date_key = entry_date.strftime("%Y-%m-%d")
 
-        if customer not in customer_agg:
-            customer_agg[customer] = {"customer": customer, "location": resolved_location, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
-        customer_agg[customer]["visits"] += 1
-        customer_agg[customer]["hours"] += hours
-        customer_agg[customer]["revenue"] += revenue
-        customer_agg[customer]["laborCost"] += labor_cost
-
-        if date_key not in day_agg:
-            day_agg[date_key] = {"date": date_key, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
-        day_agg[date_key]["visits"] += 1
-        day_agg[date_key]["hours"] += hours
-        day_agg[date_key]["revenue"] += revenue
-        day_agg[date_key]["laborCost"] += labor_cost
+        visits = entry.get("visits") or []
+        if visits:
+            # Multi-stop: distribute hours across each visit segment
+            try:
+                co_dt = parse_utc_iso(str(entry["clockOut"]))
+            except (ValueError, KeyError):
+                continue
+            for j, visit in enumerate(visits):
+                try:
+                    v_arrival = parse_utc_iso(str(visit["arrivalTime"]))
+                except (ValueError, KeyError):
+                    continue
+                next_time = co_dt
+                if j + 1 < len(visits):
+                    try:
+                        next_time = parse_utc_iso(str(visits[j + 1]["arrivalTime"]))
+                    except (ValueError, KeyError):
+                        pass
+                visit_hours = max((next_time - v_arrival).total_seconds() / 3600, 0.0)
+                v_loc = visit.get("location", "")
+                resolved_location, customer = _resolve_loc(v_loc)
+                _aggregate(customer, resolved_location, visit_hours, emp_id, entry_date, date_key, is_visit=True)
+        else:
+            # Legacy / single-location shift
+            hours = float(entry.get("totalHours", 0) or 0)
+            location = entry.get("location", "")
+            resolved_location, customer = _resolve_loc(location)
+            _aggregate(customer, resolved_location, hours, emp_id, entry_date, date_key, is_visit=True)
 
     def _finalize(d: Dict[str, Any]) -> Dict[str, Any]:
         rev = d["revenue"]
