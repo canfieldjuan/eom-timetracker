@@ -881,6 +881,11 @@ class ClockOutRequest(BaseModel):
     longitude: Optional[float] = None
 
 
+class EntryAdjustRequest(BaseModel):
+    clockIn: Optional[str] = None   # "YYYY-MM-DDTHH:MM" local time
+    clockOut: Optional[str] = None  # "YYYY-MM-DDTHH:MM" local time, or "" to clear
+
+
 class ReportGenerateRequest(BaseModel):
     month: int = Field(ge=1, le=12)
     year: int = Field(ge=2000, le=2100)
@@ -1225,11 +1230,21 @@ def admin_employee_hours(
                 co_disp = local_clock_string(parse_utc_iso(str(entry["clockOut"])))
             except ValueError:
                 pass
+        co_iso = None
+        if entry.get("clockOut"):
+            try:
+                co_iso = to_local(parse_utc_iso(str(entry["clockOut"]))).strftime("%Y-%m-%dT%H:%M")
+            except ValueError:
+                pass
         shifts_by_date.setdefault(d_str, []).append({
+            "id": entry["id"],
             "clockIn": local_clock_string(ci_dt),
+            "clockInIso": to_local(ci_dt).strftime("%Y-%m-%dT%H:%M"),
             "clockOut": co_disp,
+            "clockOutIso": co_iso,
             "hours": round(entry_hours(entry, now), 2),
             "location": entry.get("location", ""),
+            "isActive": entry.get("clockOut") is None,
         })
 
     week_grid = []
@@ -1363,6 +1378,73 @@ def clock_out(
         True,
         f"Employee: {employee['name']}, Hours: {result.get('totalHours', 0)}",
     )
+    return {"success": True, "entry": result}
+
+
+@app.patch("/api/admin/entries/{entry_id}")
+def admin_adjust_entry(
+    entry_id: int,
+    payload: EntryAdjustRequest,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    def parse_local_dt(s: str) -> datetime:
+        return datetime.strptime(s.strip()[:16], "%Y-%m-%dT%H:%M").replace(tzinfo=APP_TIMEZONE)
+
+    def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        entry = next((e for e in timesheet_data["entries"] if e["id"] == entry_id), None)
+        if not entry:
+            return False, "Entry not found"
+
+        new_ci_utc: Optional[datetime] = None
+        new_co_utc: Optional[datetime] = None
+
+        if payload.clockIn:
+            try:
+                new_ci_utc = parse_local_dt(payload.clockIn).astimezone(timezone.utc)
+            except ValueError:
+                return False, "Invalid clockIn — use YYYY-MM-DDTHH:MM"
+
+        if payload.clockOut is not None:
+            if payload.clockOut.strip() == "":
+                # Clear clock-out → make shift active again
+                entry["clockOut"] = None
+                entry["totalHours"] = 0.0
+            else:
+                try:
+                    new_co_utc = parse_local_dt(payload.clockOut).astimezone(timezone.utc)
+                except ValueError:
+                    return False, "Invalid clockOut — use YYYY-MM-DDTHH:MM"
+
+        # Apply clock-in change
+        if new_ci_utc is not None:
+            entry["clockIn"] = to_utc_iso(new_ci_utc)
+            entry["date"] = new_ci_utc.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d")
+
+        # Apply clock-out change
+        if new_co_utc is not None:
+            ci_utc = parse_utc_iso(str(entry["clockIn"]))
+            if new_co_utc <= ci_utc:
+                return False, "Clock-out must be after clock-in"
+            entry["clockOut"] = to_utc_iso(new_co_utc)
+            entry["totalHours"] = round((new_co_utc - ci_utc).total_seconds() / 3600, 2)
+        elif new_ci_utc is not None and entry.get("clockOut"):
+            # Recalculate hours after clock-in shift
+            try:
+                co_utc = parse_utc_iso(str(entry["clockOut"]))
+                if co_utc <= new_ci_utc:
+                    return False, "Clock-out must be after clock-in"
+                entry["totalHours"] = round((co_utc - new_ci_utc).total_seconds() / 3600, 2)
+            except ValueError:
+                pass
+
+        return True, entry
+
+    ok, result = update_timesheets(mutator)
+    if not ok:
+        raise HTTPException(status_code=400, detail=str(result))
+
+    append_access_log(request, "ENTRY_ADJUSTED", True, f"Entry {entry_id} adjusted by admin")
     return {"success": True, "entry": result}
 
 
