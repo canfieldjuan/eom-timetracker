@@ -653,8 +653,14 @@ def build_dashboard_hours_data() -> Dict[str, Any]:
     return {"employees": employee_rows, "summary": summary}
 
 
+def _resolve_customer(location: str, location_customers: Dict[str, str]) -> str:
+    """Return the customer name for a location address, or empty string if not found."""
+    return location_customers.get(location, "")
+
+
 def build_public_current_status() -> List[Dict[str, Any]]:
     timesheet_data = load_timesheets()
+    location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
     now = utc_now()
 
     rows: List[Dict[str, Any]] = []
@@ -669,6 +675,7 @@ def build_public_current_status() -> List[Dict[str, Any]]:
         except ValueError:
             continue
 
+        loc = str(entry.get("location", ""))
         rows.append(
             {
                 "id": int(entry.get("employeeId", 0)),
@@ -676,7 +683,8 @@ def build_public_current_status() -> List[Dict[str, Any]]:
                 "clockedInAt": local_clock_string(clock_in_time),
                 "hoursWorked": f"{entry_hours(entry, now):.2f}",
                 "notes": str(entry.get("notes", "")),
-                "location": str(entry.get("location", "")),
+                "location": loc,
+                "customer": _resolve_customer(loc, location_customers),
                 "clockInGps": entry.get("clockInGps"),
             }
         )
@@ -1333,7 +1341,10 @@ def clock_in(
         append_access_log(request, "CLOCK_IN_FAILED", False, str(result))
         raise HTTPException(status_code=400, detail=str(result))
 
-    append_access_log(request, "CLOCK_IN_SUCCESS", True, f"Employee: {employee['name']} at {result.get('location', '')}")
+    loc = result.get("location", "")
+    location_customers: Dict[str, str] = load_timesheets().get("location_customers", {})
+    result["customer"] = _resolve_customer(loc, location_customers)
+    append_access_log(request, "CLOCK_IN_SUCCESS", True, f"Employee: {employee['name']} at {loc}")
     return {"success": True, "entry": result}
 
 
@@ -1459,6 +1470,7 @@ def my_timesheet_hours(
     current_employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     timesheet_data = load_timesheets()
+    location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
     employee_id = current_employee["id"]
     now = utc_now()
 
@@ -1509,12 +1521,14 @@ def my_timesheet_hours(
             except ValueError:
                 pass
 
+        loc = entry.get("location", "")
         recent_shifts.append({
             "date": entry_date,
             "clockIn": local_clock_string(clock_in_dt),
             "clockOut": clock_out_display,
             "hours": round(total, 2),
-            "location": entry.get("location", ""),
+            "location": loc,
+            "customer": _resolve_customer(loc, location_customers),
         })
 
     recent_shifts.sort(key=lambda x: (x["date"], x["clockIn"]), reverse=True)
@@ -1606,6 +1620,7 @@ def timesheet_current_status(
         {
             "employeeName": row["name"],
             "location": row["location"],
+            "customer": row.get("customer", ""),
             "clockInTime": row["clockedInAt"],
             "hoursWorked": row["hoursWorked"],
             "notes": row["notes"],
@@ -1793,6 +1808,7 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
         raise HTTPException(status_code=400, detail="period must be day, week, month, or year")
 
     timesheet_data = load_timesheets()
+    location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
     employees_data = load_employees()
     emp_names = {emp["id"]: emp["name"] for emp in employees_data["employees"]}
 
@@ -1827,6 +1843,7 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
         except (ValueError, KeyError):
             co_display = "—"
 
+        loc = entry.get("location", "")
         rows.append({
             "employeeId": emp_id,
             "employeeName": emp_name,
@@ -1835,7 +1852,8 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
             "clockIn": local_clock_string(ci_dt),
             "clockOut": co_display,
             "hours": round(hours, 2),
-            "location": entry.get("location", ""),
+            "location": loc,
+            "customer": _resolve_customer(loc, location_customers),
         })
 
         if emp_id not in emp_totals:
