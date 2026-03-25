@@ -693,6 +693,22 @@ def build_public_current_status() -> List[Dict[str, Any]]:
         loc = last_visit["location"] if last_visit else str(entry.get("location", ""))
         gps = last_visit.get("gps") if last_visit else entry.get("clockInGps")
         customer = (last_visit.get("customer") or _resolve_customer(loc, location_customers)) if last_visit else _resolve_customer(loc, location_customers)
+
+        visit_rows = []
+        for v in visits:
+            if not isinstance(v, dict) or not v.get("arrivalTime"):
+                continue
+            try:
+                v_arr = parse_utc_iso(str(v["arrivalTime"]))
+                visit_rows.append({
+                    "arrivalTime": local_clock_string(v_arr),
+                    "location": v.get("location", ""),
+                    "customer": v.get("customer", ""),
+                    "gps": v.get("gps") if isinstance(v.get("gps"), dict) else None,
+                })
+            except ValueError:
+                pass
+
         rows.append(
             {
                 "id": int(entry.get("employeeId", 0)),
@@ -703,7 +719,7 @@ def build_public_current_status() -> List[Dict[str, Any]]:
                 "location": loc,
                 "customer": customer,
                 "clockInGps": gps,
-                "visitCount": len(visits),
+                "visits": visit_rows,
             }
         )
 
@@ -1742,6 +1758,7 @@ def timesheet_current_status(
             "hoursWorked": row["hoursWorked"],
             "notes": row["notes"],
             "clockInGps": row.get("clockInGps"),
+            "visits": row.get("visits", []),
         }
         for row in rows
     ]
