@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 import bcrypt
 import jwt
+import db
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -421,30 +422,325 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
     return {"entries": entries, "nextId": next_id, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies}
 
 
+# ─── PostgreSQL-backed data layer ────────────────────────────────────────────
+
+def _row_to_employee(row: Dict[str, Any]) -> Dict[str, Any]:
+    rate = row.get("hourly_rate")
+    created = row.get("created_at")
+    last_login = row.get("last_login_at")
+    return {
+        "id":         row["id"],
+        "name":       row["name"],
+        "password":   row["password_hash"],
+        "active":     row["active"],
+        "role":       row["role"],
+        "hourlyRate": float(rate) if rate is not None else None,
+        "created":    to_utc_iso(created) if created else None,
+        "lastLogin":  to_utc_iso(last_login) if last_login else None,
+    }
+
+
+def _load_employees_from_db() -> Dict[str, Any]:
+    rows = db.query_all(
+        "SELECT id, name, password_hash, active, role, hourly_rate, created_at, last_login_at "
+        "FROM employees ORDER BY id"
+    )
+    employees = [_row_to_employee(r) for r in rows]
+    max_id = max((e["id"] for e in employees), default=0)
+    return {"employees": employees, "nextId": max_id + 1}
+
+
+def _save_employees_to_db(employees_data: Dict[str, Any], pre_ids: set) -> None:
+    """Upsert employees. Updates in-memory dicts with DB-assigned IDs for new employees."""
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        for emp in employees_data.get("employees", []):
+            if emp["id"] not in pre_ids:
+                cur.execute(
+                    """
+                    INSERT INTO employees
+                      (name, password_hash, active, role, hourly_rate, last_login_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (name) DO UPDATE SET
+                        password_hash = EXCLUDED.password_hash,
+                        active        = EXCLUDED.active,
+                        role          = EXCLUDED.role,
+                        hourly_rate   = EXCLUDED.hourly_rate,
+                        last_login_at = EXCLUDED.last_login_at
+                    RETURNING id
+                    """,
+                    (
+                        emp["name"],
+                        emp["password"],
+                        emp.get("active", True),
+                        emp.get("role", "employee"),
+                        emp.get("hourlyRate"),
+                        emp.get("lastLogin"),
+                    ),
+                )
+                emp["id"] = cur.fetchone()[0]
+            else:
+                cur.execute(
+                    """
+                    UPDATE employees SET
+                        password_hash = %s,
+                        active        = %s,
+                        role          = %s,
+                        hourly_rate   = %s,
+                        last_login_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        emp["password"],
+                        emp.get("active", True),
+                        emp.get("role", "employee"),
+                        emp.get("hourlyRate"),
+                        emp.get("lastLogin"),
+                        emp["id"],
+                    ),
+                )
+        cur.execute(
+            "SELECT setval('employees_id_seq', COALESCE(MAX(id), 1)) FROM employees"
+        )
+
+
 def load_employees() -> Dict[str, Any]:
-    return normalize_employees(read_json_file(EMPLOYEES_FILE, {"employees": [], "nextId": 1}))
+    return _load_employees_from_db()
 
 
 def save_employees(employees_data: Dict[str, Any]) -> None:
-    normalized = normalize_employees(employees_data)
     with EMPLOYEE_WRITE_LOCK:
-        with process_file_lock(EMPLOYEES_FILE):
-            write_json_atomic(EMPLOYEES_FILE, normalized)
+        pre_ids: set = set()  # treat all as inserts (name conflict → update)
+        _save_employees_to_db(employees_data, pre_ids)
 
 
 def update_employees(mutator) -> Tuple[bool, Any]:
     with EMPLOYEE_WRITE_LOCK:
-        with process_file_lock(EMPLOYEES_FILE):
-            employees_data = load_employees()
-            ok, payload = mutator(employees_data)
-            if ok:
-                write_json_atomic(EMPLOYEES_FILE, normalize_employees(employees_data))
-            return ok, payload
+        employees_data = _load_employees_from_db()
+        pre_ids = {emp["id"] for emp in employees_data["employees"]}
+        ok, payload = mutator(employees_data)
+        if ok:
+            _save_employees_to_db(employees_data, pre_ids)
+        return ok, payload
+
+
+def _row_to_visit(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "arrivalTime": to_utc_iso(row["arrival_time"]) if row.get("arrival_time") else "",
+        "location":    row["location"] or "",
+        "customer":    row["customer_name"] or "",
+        "gps":         row["gps"],
+    }
+
+
+def _row_to_entry(row: Dict[str, Any], visits: List[Dict[str, Any]]) -> Dict[str, Any]:
+    co = row.get("clock_out")
+    return {
+        "id":           row["id"],
+        "employeeId":   row["employee_id"],
+        "employeeName": row["employee_name"] or "",
+        "location":     row["location"] or "",
+        "clockIn":      to_utc_iso(row["clock_in"]) if row.get("clock_in") else "",
+        "clockOut":     to_utc_iso(co) if co else None,
+        "totalHours":   float(row["total_hours"] or 0),
+        "notes":        row["notes"] or "",
+        "date":         str(row["local_date"]) if row.get("local_date") else "",
+        "timezone":     row["timezone"] or "America/Chicago",
+        "clockInGps":   row["clock_in_gps"],
+        "clockOutGps":  row["clock_out_gps"],
+        "visits":       visits,
+    }
+
+
+def _load_timesheets_from_db() -> Dict[str, Any]:
+    loc_rows = db.query_all(
+        "SELECT address, customer_name, location_type, rate, rate_type, frequency, lat, lng "
+        "FROM locations WHERE active = true ORDER BY id"
+    )
+    locations: List[str] = [r["address"] for r in loc_rows]
+    location_coords: Dict[str, Dict[str, float]] = {}
+    location_customers: Dict[str, str] = {}
+    location_rates: Dict[str, float] = {}
+    location_rate_types: Dict[str, str] = {}
+    location_types: Dict[str, str] = {}
+    location_frequencies: Dict[str, str] = {}
+
+    for r in loc_rows:
+        addr = r["address"]
+        if r.get("lat") is not None and r.get("lng") is not None:
+            location_coords[addr] = {"lat": float(r["lat"]), "lng": float(r["lng"])}
+        if r.get("customer_name"):
+            location_customers[addr] = r["customer_name"]
+        if r.get("rate") is not None:
+            location_rates[addr] = float(r["rate"])
+        if r.get("rate_type"):
+            location_rate_types[addr] = r["rate_type"]
+        if r.get("location_type"):
+            location_types[addr] = r["location_type"]
+        if r.get("frequency"):
+            location_frequencies[addr] = r["frequency"]
+
+    visit_rows = db.query_all(
+        """
+        SELECT v.shift_id, COALESCE(l.address, '') AS location,
+               v.customer_name, v.arrival_time, v.gps
+        FROM visits v
+        LEFT JOIN locations l ON v.location_id = l.id
+        ORDER BY v.shift_id, v.arrival_time
+        """
+    )
+    visits_by_shift: Dict[int, List[Dict[str, Any]]] = {}
+    for r in visit_rows:
+        visits_by_shift.setdefault(r["shift_id"], []).append(_row_to_visit(r))
+
+    shift_rows = db.query_all(
+        """
+        SELECT s.id, s.employee_id, e.name AS employee_name,
+               COALESCE(l.address, '') AS location,
+               s.clock_in, s.clock_out, s.total_hours,
+               s.notes, s.local_date, s.timezone,
+               s.clock_in_gps, s.clock_out_gps
+        FROM shifts s
+        JOIN employees e ON s.employee_id = e.id
+        LEFT JOIN locations l ON s.location_id = l.id
+        ORDER BY s.id
+        """
+    )
+    entries = [_row_to_entry(r, visits_by_shift.get(r["id"], [])) for r in shift_rows]
+    max_id = max((e["id"] for e in entries), default=0)
+
+    return {
+        "entries": entries,
+        "nextId": max_id + 1,
+        "locations": locations,
+        "location_coords": location_coords,
+        "location_customers": location_customers,
+        "location_rates": location_rates,
+        "location_rate_types": location_rate_types,
+        "location_types": location_types,
+        "location_frequencies": location_frequencies,
+    }
+
+
+def _save_timesheets_to_db(
+    timesheet_data: Dict[str, Any],
+    pre_shift_ids: set,
+    pre_visit_counts: Dict[int, int],
+) -> None:
+    """Upsert locations, shifts, and new visits. Updates in-memory entry IDs for new shifts."""
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+
+        addr_to_id: Dict[str, int] = {}
+        for addr in timesheet_data.get("locations", []):
+            c = timesheet_data.get("location_coords", {}).get(addr, {})
+            cur.execute(
+                """
+                INSERT INTO locations
+                  (address, customer_name, location_type, rate, rate_type, frequency, lat, lng)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (address) DO UPDATE SET
+                    customer_name = EXCLUDED.customer_name,
+                    location_type = EXCLUDED.location_type,
+                    rate          = EXCLUDED.rate,
+                    rate_type     = EXCLUDED.rate_type,
+                    frequency     = EXCLUDED.frequency,
+                    lat           = EXCLUDED.lat,
+                    lng           = EXCLUDED.lng
+                RETURNING id
+                """,
+                (
+                    addr,
+                    timesheet_data.get("location_customers", {}).get(addr),
+                    timesheet_data.get("location_types", {}).get(addr),
+                    timesheet_data.get("location_rates", {}).get(addr),
+                    timesheet_data.get("location_rate_types", {}).get(addr, "per_visit"),
+                    timesheet_data.get("location_frequencies", {}).get(addr),
+                    c.get("lat"),
+                    c.get("lng"),
+                ),
+            )
+            addr_to_id[addr] = cur.fetchone()[0]
+
+        for entry in timesheet_data.get("entries", []):
+            loc_id = addr_to_id.get(entry.get("location", ""))
+            is_new = entry["id"] not in pre_shift_ids
+
+            if is_new:
+                cur.execute(
+                    """
+                    INSERT INTO shifts
+                      (employee_id, location_id, clock_in, clock_out, total_hours,
+                       notes, local_date, timezone, clock_in_gps, clock_out_gps)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        entry["employeeId"],
+                        loc_id,
+                        entry.get("clockIn"),
+                        entry.get("clockOut"),
+                        entry.get("totalHours"),
+                        entry.get("notes", ""),
+                        entry.get("date") or None,
+                        entry.get("timezone", "America/Chicago"),
+                        json.dumps(entry["clockInGps"]) if entry.get("clockInGps") else None,
+                        json.dumps(entry["clockOutGps"]) if entry.get("clockOutGps") else None,
+                    ),
+                )
+                entry["id"] = cur.fetchone()[0]
+            else:
+                cur.execute(
+                    """
+                    UPDATE shifts SET
+                        location_id   = %s,
+                        clock_out     = %s,
+                        total_hours   = %s,
+                        notes         = %s,
+                        local_date    = %s,
+                        timezone      = %s,
+                        clock_in_gps  = %s,
+                        clock_out_gps = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        loc_id,
+                        entry.get("clockOut"),
+                        entry.get("totalHours"),
+                        entry.get("notes", ""),
+                        entry.get("date") or None,
+                        entry.get("timezone", "America/Chicago"),
+                        json.dumps(entry["clockInGps"]) if entry.get("clockInGps") else None,
+                        json.dumps(entry["clockOutGps"]) if entry.get("clockOutGps") else None,
+                        entry["id"],
+                    ),
+                )
+
+            # Insert only visits appended since last load
+            existing_count = pre_visit_counts.get(entry["id"], 0)
+            for visit in entry.get("visits", [])[existing_count:]:
+                v_loc_id = addr_to_id.get(visit.get("location", ""))
+                cur.execute(
+                    """
+                    INSERT INTO visits (shift_id, location_id, customer_name, arrival_time, gps)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        entry["id"],
+                        v_loc_id,
+                        visit.get("customer") or None,
+                        visit.get("arrivalTime"),
+                        json.dumps(visit["gps"]) if visit.get("gps") else None,
+                    ),
+                )
+
+        cur.execute(
+            "SELECT setval('shifts_id_seq', COALESCE(MAX(id), 1)) FROM shifts"
+        )
 
 
 def load_timesheets() -> Dict[str, Any]:
-    default_value = {"entries": [], "nextId": 1, "locations": DEFAULT_LOCATIONS}
-    return normalize_timesheets(read_json_file(TIMESHEETS_FILE, default_value))
+    return _load_timesheets_from_db()
 
 
 def get_open_entry(entries: List[Dict[str, Any]], employee_id: int) -> Optional[Dict[str, Any]]:
@@ -495,16 +791,18 @@ def close_stale_open_entries(timesheet_data: Dict[str, Any], reference_time: dat
 
 def update_timesheets(mutator) -> Tuple[bool, Any]:
     with TIMESHEET_WRITE_LOCK:
-        with process_file_lock(TIMESHEETS_FILE):
-            timesheet_data = load_timesheets()
-            changed = False
-            if AUTO_CLOSE_STALE_SHIFTS:
-                changed = close_stale_open_entries(timesheet_data, utc_now())
+        timesheet_data = _load_timesheets_from_db()
+        pre_shift_ids = {e["id"] for e in timesheet_data["entries"]}
+        pre_visit_counts = {e["id"]: len(e.get("visits", [])) for e in timesheet_data["entries"]}
 
-            ok, payload = mutator(timesheet_data)
-            if ok or changed:
-                write_json_atomic(TIMESHEETS_FILE, normalize_timesheets(timesheet_data))
-            return ok, payload
+        changed = False
+        if AUTO_CLOSE_STALE_SHIFTS:
+            changed = close_stale_open_entries(timesheet_data, utc_now())
+
+        ok, payload = mutator(timesheet_data)
+        if ok or changed:
+            _save_timesheets_to_db(timesheet_data, pre_shift_ids, pre_visit_counts)
+        return ok, payload
 
 
 def find_employee_by_name(employees: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
@@ -1006,8 +1304,34 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
     return JSONResponse(status_code=422, content={"success": False, "error": message})
 
 
+def _auto_migrate_if_empty() -> None:
+    """Run JSON→PostgreSQL migration if the employees table is empty."""
+    result = db.query_one("SELECT COUNT(*) AS n FROM employees")
+    if result and result["n"] > 0:
+        return
+    if not EMPLOYEES_FILE.exists() or not TIMESHEETS_FILE.exists():
+        return
+    migrate_script = BACKEND_DIR / "migrate_json_to_pg.py"
+    if not migrate_script.exists():
+        return
+    database_url = os.getenv("DATABASE_URL", "")
+    completed = subprocess.run(
+        [sys.executable, str(migrate_script), "--db-url", database_url],
+        capture_output=True, text=True, cwd=str(BASE_DIR),
+    )
+    if completed.returncode != 0:
+        print(f"[auto-migrate] ERROR:\n{completed.stderr}", flush=True)
+    else:
+        print(f"[auto-migrate] Done:\n{completed.stdout}", flush=True)
+
+
 @app.on_event("startup")
 def startup_event() -> None:
+    database_url = os.getenv("DATABASE_URL", "")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL env var not set")
+    db.init_pool(database_url)
+    _auto_migrate_if_empty()
     apply_bootstrap_admins()
 
 
@@ -2061,9 +2385,8 @@ def admin_reports_hours_export(
 
 def load_settings() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {"laborPctTarget": 35.0}
-    data = read_json_file(SETTINGS_FILE, defaults)
-    if not isinstance(data, dict):
-        return dict(defaults)
+    rows = db.query_all("SELECT key, value FROM settings")
+    data: Dict[str, Any] = {r["key"]: r["value"] for r in rows}
     for k, v in defaults.items():
         if k not in data:
             data[k] = v
@@ -2093,7 +2416,13 @@ def admin_update_settings(
             settings["laborPctTarget"] = round(val, 2)
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Invalid laborPctTarget")
-    write_json_atomic(SETTINGS_FILE, settings)
+    db.execute(
+        """
+        INSERT INTO settings (key, value) VALUES (%s, %s::jsonb)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        ("laborPctTarget", json.dumps(settings["laborPctTarget"])),
+    )
     return {"success": True, **settings}
 
 
