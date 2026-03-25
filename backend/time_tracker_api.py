@@ -2406,6 +2406,39 @@ def admin_analytics_customer(
     week_agg: Dict[str, Dict[str, Any]] = {}
     monthly_credited: set = set()
 
+    def _record(
+        resolved_location: str,
+        cust: str,
+        hours: float,
+        is_visit: bool,
+        entry_date: Any,
+        week_key: str,
+        emp_name: str,
+        emp_rate: Any,
+    ) -> None:
+        if cust != customer_name:
+            return
+        revenue = _calc_revenue(resolved_location, cust, hours, entry_date, is_visit, monthly_credited)
+        labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
+        lp = round(labor_cost / revenue * 100, 1) if revenue > 0 else None
+        visits_list.append({
+            "date": entry_date.strftime("%Y-%m-%d"),
+            "weekStart": week_key,
+            "employee": emp_name,
+            "hours": round(hours, 2),
+            "revenue": round(revenue, 2),
+            "laborCost": round(labor_cost, 2),
+            "laborPct": lp,
+            "netProfit": round(revenue - labor_cost, 2),
+        })
+        if week_key not in week_agg:
+            week_agg[week_key] = {"weekStart": week_key, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
+        if is_visit:
+            week_agg[week_key]["visits"] += 1
+        week_agg[week_key]["hours"] += hours
+        week_agg[week_key]["revenue"] += revenue
+        week_agg[week_key]["laborCost"] += labor_cost
+
     for entry in timesheet_data["entries"]:
         if entry.get("clockOut") is None:
             continue
@@ -2429,30 +2462,6 @@ def admin_analytics_customer(
         week_start = entry_date - timedelta(days=days_since_sunday_entry)
         week_key = week_start.strftime("%Y-%m-%d")
 
-        def _record(resolved_location: str, cust: str, hours: float, is_visit: bool) -> None:
-            if cust != customer_name:
-                return
-            revenue = _calc_revenue(resolved_location, cust, hours, entry_date, is_visit, monthly_credited)
-            labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
-            lp = round(labor_cost / revenue * 100, 1) if revenue > 0 else None
-            visits_list.append({
-                "date": entry_date.strftime("%Y-%m-%d"),
-                "weekStart": week_key,
-                "employee": emp_name,
-                "hours": round(hours, 2),
-                "revenue": round(revenue, 2),
-                "laborCost": round(labor_cost, 2),
-                "laborPct": lp,
-                "netProfit": round(revenue - labor_cost, 2),
-            })
-            if week_key not in week_agg:
-                week_agg[week_key] = {"weekStart": week_key, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
-            if is_visit:
-                week_agg[week_key]["visits"] += 1
-            week_agg[week_key]["hours"] += hours
-            week_agg[week_key]["revenue"] += revenue
-            week_agg[week_key]["laborCost"] += labor_cost
-
         visits = entry.get("visits") or []
         if visits:
             try:
@@ -2472,11 +2481,11 @@ def admin_analytics_customer(
                         pass
                 v_hours = max((next_time - v_arrival).total_seconds() / 3600, 0.0)
                 resolved_location, cust = _resolve_loc(visit.get("location", ""))
-                _record(resolved_location, cust, v_hours, is_visit=True)
+                _record(resolved_location, cust, v_hours, True, entry_date, week_key, emp_name, emp_rate)
         else:
-            hours = float(entry.get("totalHours", 0) or 0)
+            e_hours = float(entry.get("totalHours", 0) or 0)
             resolved_location, cust = _resolve_loc(entry.get("location", ""))
-            _record(resolved_location, cust, hours, is_visit=True)
+            _record(resolved_location, cust, e_hours, True, entry_date, week_key, emp_name, emp_rate)
 
     def _fin_week(w: Dict[str, Any]) -> Dict[str, Any]:
         rev = w["revenue"]
