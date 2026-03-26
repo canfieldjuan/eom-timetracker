@@ -1281,6 +1281,15 @@ class JobLinkShiftsRequest(BaseModel):
     shiftIds: List[int]
 
 
+VALID_NON_PRODUCTIVE_TYPES = ("drive_time", "waiting", "supply_run", "rework", "lockout", "other")
+
+
+class ShiftCategorizeRequest(BaseModel):
+    timeCategory: str  # "productive" or "non_productive"
+    nonProductiveType: Optional[str] = None
+    notes: Optional[str] = None
+
+
 load_local_env()
 
 JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
@@ -1379,6 +1388,12 @@ def _ensure_schema_migrations() -> None:
     )
     db.execute(
         "ALTER TABLE locations ADD COLUMN IF NOT EXISTS min_margin_pct NUMERIC(5,2)"
+    )
+    db.execute(
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS time_category TEXT NOT NULL DEFAULT 'productive'"
+    )
+    db.execute(
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS non_productive_type TEXT"
     )
 
 
@@ -2541,6 +2556,185 @@ def admin_update_settings(
             (key, json.dumps(settings[key])),
         )
     return {"success": True, **settings}
+
+
+# ---------------------------------------------------------------------------
+# Time Categorization & Waste Tracking — Phase 7
+# ---------------------------------------------------------------------------
+
+@app.patch("/api/admin/shifts/{shift_id}/categorize")
+def admin_categorize_shift(
+    shift_id: int,
+    payload: ShiftCategorizeRequest,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Categorize a shift as productive or non-productive."""
+    if payload.timeCategory not in ("productive", "non_productive"):
+        raise HTTPException(status_code=400, detail="timeCategory must be 'productive' or 'non_productive'")
+
+    npt = None
+    if payload.timeCategory == "non_productive":
+        if not payload.nonProductiveType or payload.nonProductiveType not in VALID_NON_PRODUCTIVE_TYPES:
+            raise HTTPException(status_code=400, detail=f"nonProductiveType required, must be one of: {', '.join(VALID_NON_PRODUCTIVE_TYPES)}")
+        npt = payload.nonProductiveType
+        if not payload.notes or not payload.notes.strip():
+            raise HTTPException(status_code=400, detail="Notes required when categorizing as non-productive")
+
+    shift = db.query_one("SELECT id FROM shifts WHERE id = %s", (shift_id,))
+    if not shift:
+        raise HTTPException(status_code=404, detail="Shift not found")
+
+    if payload.notes and payload.notes.strip():
+        db.execute(
+            "UPDATE shifts SET time_category = %s, non_productive_type = %s, notes = %s WHERE id = %s",
+            (payload.timeCategory, npt, payload.notes.strip(), shift_id),
+        )
+    else:
+        db.execute(
+            "UPDATE shifts SET time_category = %s, non_productive_type = %s WHERE id = %s",
+            (payload.timeCategory, npt, shift_id),
+        )
+
+    append_access_log(request, "SHIFT_CATEGORIZED", True, f"Shift {shift_id}: {payload.timeCategory}/{npt}")
+    return {"success": True, "shiftId": shift_id, "timeCategory": payload.timeCategory, "nonProductiveType": npt}
+
+
+@app.get("/api/admin/analytics/waste")
+def admin_waste_analysis(
+    request: Request,
+    period: str = "month",
+    date: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Waste rollups by customer and employee, plus repeat cause identification."""
+    now = utc_now()
+    local_now = to_local(now)
+    if date:
+        try:
+            ref_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+    else:
+        ref_date = local_now.date()
+
+    if period == "day":
+        start_date = ref_date
+        end_date = ref_date
+    elif period == "week":
+        days_since_sunday = (ref_date.weekday() + 1) % 7
+        start_date = ref_date - timedelta(days=days_since_sunday)
+        end_date = start_date + timedelta(days=6)
+    elif period == "month":
+        start_date = ref_date.replace(day=1)
+        if start_date.month == 12:
+            end_date = start_date.replace(year=start_date.year + 1, month=1, day=1) - timedelta(days=1)
+        else:
+            end_date = start_date.replace(month=start_date.month + 1, day=1) - timedelta(days=1)
+    elif period == "all":
+        start_date = None  # type: ignore[assignment]
+        end_date = None  # type: ignore[assignment]
+    else:
+        raise HTTPException(status_code=400, detail="period must be day, week, month, or all")
+
+    date_clause = ""
+    params: list = []
+    if start_date is not None:
+        date_clause = "AND s.local_date >= %s AND s.local_date <= %s"
+        params = [start_date, end_date]
+
+    rows = db.query_all(
+        f"""
+        SELECT s.id, s.employee_id, e.name AS employee_name,
+               COALESCE(l.customer_name, COALESCE(l.address, '')) AS customer,
+               s.total_hours, s.time_category, s.non_productive_type,
+               s.notes, s.local_date, e.hourly_rate
+        FROM shifts s
+        JOIN employees e ON s.employee_id = e.id
+        LEFT JOIN locations l ON s.location_id = l.id
+        WHERE s.clock_out IS NOT NULL AND s.time_category = 'non_productive'
+        {date_clause}
+        ORDER BY s.local_date DESC
+        """,
+        tuple(params),
+    )
+
+    by_customer: Dict[str, Dict[str, Any]] = {}
+    by_employee: Dict[str, Dict[str, Any]] = {}
+    by_cause: Dict[str, Dict[str, Any]] = {}
+    total_waste_hours = 0.0
+    total_waste_cost = 0.0
+
+    for r in rows:
+        hours = float(r["total_hours"] or 0)
+        rate = float(r["hourly_rate"]) if r.get("hourly_rate") is not None else 0.0
+        cost = rate * hours
+        npt = r["non_productive_type"] or "other"
+        cust = r["customer"] or "Unknown"
+        emp = r["employee_name"]
+
+        total_waste_hours += hours
+        total_waste_cost += cost
+
+        if cust not in by_customer:
+            by_customer[cust] = {"customer": cust, "hours": 0.0, "cost": 0.0, "incidents": 0, "causes": {}}
+        by_customer[cust]["hours"] += hours
+        by_customer[cust]["cost"] += cost
+        by_customer[cust]["incidents"] += 1
+        by_customer[cust]["causes"][npt] = by_customer[cust]["causes"].get(npt, 0) + 1
+
+        if emp not in by_employee:
+            by_employee[emp] = {"employee": emp, "hours": 0.0, "cost": 0.0, "incidents": 0, "causes": {}}
+        by_employee[emp]["hours"] += hours
+        by_employee[emp]["cost"] += cost
+        by_employee[emp]["incidents"] += 1
+        by_employee[emp]["causes"][npt] = by_employee[emp]["causes"].get(npt, 0) + 1
+
+        if npt not in by_cause:
+            by_cause[npt] = {"cause": npt, "hours": 0.0, "cost": 0.0, "incidents": 0, "customers": set(), "employees": set()}
+        by_cause[npt]["hours"] += hours
+        by_cause[npt]["cost"] += cost
+        by_cause[npt]["incidents"] += 1
+        by_cause[npt]["customers"].add(cust)
+        by_cause[npt]["employees"].add(emp)
+
+    def _round_agg(d: Dict[str, Any]) -> Dict[str, Any]:
+        d["hours"] = round(d["hours"], 2)
+        d["cost"] = round(d["cost"], 2)
+        return d
+
+    customer_list = sorted([_round_agg(v) for v in by_customer.values()], key=lambda x: x["cost"], reverse=True)
+    employee_list = sorted([_round_agg(v) for v in by_employee.values()], key=lambda x: x["cost"], reverse=True)
+    cause_list = sorted(
+        [
+            {
+                "cause": v["cause"],
+                "hours": round(v["hours"], 2),
+                "cost": round(v["cost"], 2),
+                "incidents": v["incidents"],
+                "customerCount": len(v["customers"]),
+                "employeeCount": len(v["employees"]),
+            }
+            for v in by_cause.values()
+        ],
+        key=lambda x: x["incidents"],
+        reverse=True,
+    )
+
+    return {
+        "success": True,
+        "period": period,
+        "startDate": str(start_date) if start_date else None,
+        "endDate": str(end_date) if end_date else None,
+        "summary": {
+            "totalWasteHours": round(total_waste_hours, 2),
+            "totalWasteCost": round(total_waste_cost, 2),
+            "totalIncidents": len(rows),
+        },
+        "byCustomer": customer_list,
+        "byEmployee": employee_list,
+        "byCause": cause_list,
+    }
 
 
 # ---------------------------------------------------------------------------

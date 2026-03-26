@@ -61,6 +61,11 @@ CREATE TABLE shifts (
     clock_in_gps  JSONB,
     clock_out_gps JSONB,
     job_id        INTEGER REFERENCES jobs(id),
+    time_category     TEXT NOT NULL DEFAULT 'productive'
+                          CHECK (time_category IN ('productive', 'non_productive')),
+    non_productive_type TEXT
+                          CHECK (non_productive_type IS NULL OR non_productive_type IN
+                                 ('drive_time', 'waiting', 'supply_run', 'rework', 'lockout', 'other')),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
