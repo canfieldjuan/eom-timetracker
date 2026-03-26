@@ -1244,6 +1244,30 @@ class ReportGenerateRequest(BaseModel):
     use_mock_data: bool = False
 
 
+class JobCreateRequest(BaseModel):
+    customerName: str
+    scheduledDate: str  # YYYY-MM-DD
+    expectedHours: Optional[float] = None
+    revenue: Optional[float] = None
+    notes: str = ""
+    status: str = "scheduled"
+    locationId: Optional[int] = None
+
+
+class JobUpdateRequest(BaseModel):
+    customerName: Optional[str] = None
+    scheduledDate: Optional[str] = None  # YYYY-MM-DD
+    expectedHours: Optional[float] = None
+    revenue: Optional[float] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None
+    locationId: Optional[int] = None
+
+
+class JobLinkShiftsRequest(BaseModel):
+    shiftIds: List[int]
+
+
 load_local_env()
 
 JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
@@ -1316,6 +1340,27 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE locations ADD COLUMN IF NOT EXISTS expected_hours NUMERIC(6,2)"
     )
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id              SERIAL PRIMARY KEY,
+            location_id     INTEGER REFERENCES locations(id),
+            customer_name   TEXT NOT NULL,
+            scheduled_date  DATE NOT NULL,
+            expected_hours  NUMERIC(6, 2),
+            revenue         NUMERIC(10, 2),
+            notes           TEXT NOT NULL DEFAULT '',
+            status          TEXT NOT NULL DEFAULT 'scheduled'
+                                CHECK (status IN ('scheduled', 'in_progress', 'completed', 'cancelled')),
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute(
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS job_id INTEGER REFERENCES jobs(id)"
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_date ON jobs(scheduled_date)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_customer ON jobs(customer_name)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_shifts_job_id ON shifts(job_id)")
 
 
 def _auto_migrate_if_empty() -> None:
@@ -2446,6 +2491,392 @@ def admin_update_settings(
         ("laborPctTarget", json.dumps(settings["laborPctTarget"])),
     )
     return {"success": True, **settings}
+
+
+# ---------------------------------------------------------------------------
+# Jobs (service visits) — Phase 3
+# ---------------------------------------------------------------------------
+
+def _job_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "locationId": row.get("location_id"),
+        "customerName": row["customer_name"],
+        "scheduledDate": str(row["scheduled_date"]),
+        "expectedHours": float(row["expected_hours"]) if row.get("expected_hours") is not None else None,
+        "revenue": float(row["revenue"]) if row.get("revenue") is not None else None,
+        "notes": row["notes"] or "",
+        "status": row["status"],
+        "createdAt": to_utc_iso(row["created_at"]) if row.get("created_at") else None,
+    }
+
+
+@app.post("/api/admin/jobs")
+def admin_create_job(
+    payload: JobCreateRequest,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    customer = payload.customerName.strip()
+    if not customer:
+        raise HTTPException(status_code=400, detail="customerName is required")
+    try:
+        scheduled = datetime.strptime(payload.scheduledDate, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="scheduledDate must be YYYY-MM-DD")
+    if payload.status not in ("scheduled", "in_progress", "completed", "cancelled"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    location_id = payload.locationId
+    if location_id is None:
+        loc = db.query_one(
+            "SELECT id FROM locations WHERE customer_name = %s AND active = true LIMIT 1",
+            (customer,),
+        )
+        if loc:
+            location_id = loc["id"]
+
+    row = db.query_one(
+        """
+        INSERT INTO jobs (location_id, customer_name, scheduled_date, expected_hours, revenue, notes, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *
+        """,
+        (location_id, customer, scheduled, payload.expectedHours, payload.revenue,
+         payload.notes, payload.status),
+    )
+    append_access_log(request, "JOB_CREATED", True, f"Job {row['id']} for {customer}")
+    return {"success": True, "job": _job_row_to_dict(row)}
+
+
+@app.get("/api/admin/jobs")
+def admin_list_jobs(
+    request: Request,
+    status: Optional[str] = None,
+    customer: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    clauses = []
+    params: list = []
+    if status:
+        clauses.append("j.status = %s")
+        params.append(status)
+    if customer:
+        clauses.append("j.customer_name = %s")
+        params.append(customer)
+    if start_date:
+        clauses.append("j.scheduled_date >= %s")
+        params.append(start_date)
+    if end_date:
+        clauses.append("j.scheduled_date <= %s")
+        params.append(end_date)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = db.query_all(
+        f"SELECT * FROM jobs j {where} ORDER BY j.scheduled_date DESC, j.id DESC",
+        tuple(params),
+    )
+    return {"success": True, "jobs": [_job_row_to_dict(r) for r in rows]}
+
+
+@app.get("/api/admin/jobs/{job_id}")
+def admin_get_job(
+    job_id: int,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    row = db.query_one("SELECT * FROM jobs WHERE id = %s", (job_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    shift_rows = db.query_all(
+        """
+        SELECT s.id, s.employee_id, e.name AS employee_name,
+               s.clock_in, s.clock_out, s.total_hours, s.notes
+        FROM shifts s
+        JOIN employees e ON s.employee_id = e.id
+        WHERE s.job_id = %s
+        ORDER BY s.clock_in
+        """,
+        (job_id,),
+    )
+
+    emp_rates: Dict[int, float] = {}
+    for sr in shift_rows:
+        if sr["employee_id"] not in emp_rates:
+            emp = db.query_one("SELECT hourly_rate FROM employees WHERE id = %s", (sr["employee_id"],))
+            if emp and emp["hourly_rate"] is not None:
+                emp_rates[sr["employee_id"]] = float(emp["hourly_rate"])
+
+    shifts = []
+    total_hours = 0.0
+    total_labor = 0.0
+    for sr in shift_rows:
+        h = float(sr["total_hours"] or 0)
+        rate = emp_rates.get(sr["employee_id"])
+        lc = (rate * h) if rate is not None else 0.0
+        total_hours += h
+        total_labor += lc
+        shifts.append({
+            "shiftId": sr["id"],
+            "employeeId": sr["employee_id"],
+            "employeeName": sr["employee_name"],
+            "clockIn": to_utc_iso(sr["clock_in"]) if sr["clock_in"] else None,
+            "clockOut": to_utc_iso(sr["clock_out"]) if sr["clock_out"] else None,
+            "hours": round(h, 2),
+            "laborCost": round(lc, 2),
+            "notes": sr["notes"] or "",
+        })
+
+    job = _job_row_to_dict(row)
+    rev = job["revenue"] or 0.0
+    net = round(rev - total_labor, 2)
+    job["shifts"] = shifts
+    job["totalHours"] = round(total_hours, 2)
+    job["totalLaborCost"] = round(total_labor, 2)
+    job["netProfit"] = net
+    job["grossMarginPct"] = round(net / rev * 100, 1) if rev > 0 else None
+    job["laborPct"] = round(total_labor / rev * 100, 1) if rev > 0 else None
+    job["varianceHours"] = round((job["expectedHours"] or 0) - total_hours, 2) if job["expectedHours"] is not None else None
+
+    return {"success": True, "job": job}
+
+
+@app.put("/api/admin/jobs/{job_id}")
+def admin_update_job(
+    job_id: int,
+    payload: JobUpdateRequest,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    existing = db.query_one("SELECT * FROM jobs WHERE id = %s", (job_id,))
+    if not existing:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    sets = []
+    params: list = []
+    if payload.customerName is not None:
+        sets.append("customer_name = %s")
+        params.append(payload.customerName.strip())
+    if payload.scheduledDate is not None:
+        try:
+            datetime.strptime(payload.scheduledDate, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="scheduledDate must be YYYY-MM-DD")
+        sets.append("scheduled_date = %s")
+        params.append(payload.scheduledDate)
+    if payload.expectedHours is not None:
+        sets.append("expected_hours = %s")
+        params.append(payload.expectedHours)
+    if payload.revenue is not None:
+        sets.append("revenue = %s")
+        params.append(payload.revenue)
+    if payload.notes is not None:
+        sets.append("notes = %s")
+        params.append(payload.notes)
+    if payload.status is not None:
+        if payload.status not in ("scheduled", "in_progress", "completed", "cancelled"):
+            raise HTTPException(status_code=400, detail="Invalid status")
+        sets.append("status = %s")
+        params.append(payload.status)
+    if payload.locationId is not None:
+        sets.append("location_id = %s")
+        params.append(payload.locationId)
+
+    if not sets:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    params.append(job_id)
+    row = db.query_one(
+        f"UPDATE jobs SET {', '.join(sets)} WHERE id = %s RETURNING *",
+        tuple(params),
+    )
+    append_access_log(request, "JOB_UPDATED", True, f"Job {job_id}")
+    return {"success": True, "job": _job_row_to_dict(row)}
+
+
+@app.post("/api/admin/jobs/{job_id}/shifts")
+def admin_link_shifts_to_job(
+    job_id: int,
+    payload: JobLinkShiftsRequest,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Link one or more shifts to a job."""
+    existing = db.query_one("SELECT id FROM jobs WHERE id = %s", (job_id,))
+    if not existing:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    linked = 0
+    for sid in payload.shiftIds:
+        shift = db.query_one("SELECT id FROM shifts WHERE id = %s", (sid,))
+        if shift:
+            db.execute("UPDATE shifts SET job_id = %s WHERE id = %s", (job_id, sid))
+            linked += 1
+
+    append_access_log(request, "JOB_SHIFTS_LINKED", True, f"Job {job_id}: {linked} shifts linked")
+    return {"success": True, "jobId": job_id, "linkedCount": linked}
+
+
+@app.delete("/api/admin/jobs/{job_id}/shifts/{shift_id}")
+def admin_unlink_shift_from_job(
+    job_id: int,
+    shift_id: int,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Unlink a shift from a job."""
+    db.execute("UPDATE shifts SET job_id = NULL WHERE id = %s AND job_id = %s", (shift_id, job_id))
+    append_access_log(request, "JOB_SHIFT_UNLINKED", True, f"Job {job_id}: shift {shift_id} unlinked")
+    return {"success": True}
+
+
+@app.post("/api/admin/jobs/auto-link")
+def admin_auto_link_jobs(
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Auto-link unlinked shifts to jobs by matching customer + date."""
+    jobs = db.query_all(
+        """
+        SELECT j.id, j.customer_name, j.scheduled_date, l.address
+        FROM jobs j
+        LEFT JOIN locations l ON j.location_id = l.id
+        WHERE j.status != 'cancelled'
+        """
+    )
+
+    location_customers = {
+        r["address"]: r["customer_name"]
+        for r in db.query_all("SELECT address, customer_name FROM locations WHERE customer_name IS NOT NULL")
+    }
+
+    unlinked = db.query_all(
+        """
+        SELECT s.id, s.local_date, COALESCE(l.address, '') AS location
+        FROM shifts s
+        LEFT JOIN locations l ON s.location_id = l.id
+        WHERE s.job_id IS NULL AND s.clock_out IS NOT NULL
+        """
+    )
+
+    linked = 0
+    for shift in unlinked:
+        shift_customer = location_customers.get(shift["location"], shift["location"])
+        shift_date = shift["local_date"]
+        if not shift_date:
+            continue
+        for job in jobs:
+            if job["customer_name"] == shift_customer and job["scheduled_date"] == shift_date:
+                db.execute("UPDATE shifts SET job_id = %s WHERE id = %s", (job["id"], shift["id"]))
+                linked += 1
+                break
+
+    append_access_log(request, "JOBS_AUTO_LINKED", True, f"{linked} shifts auto-linked")
+    return {"success": True, "linkedCount": linked}
+
+
+@app.get("/api/admin/jobs/profitability")
+def admin_jobs_profitability(
+    request: Request,
+    status: Optional[str] = None,
+    customer: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Job-level profitability report with per-job hours, labor cost, revenue, profit, margin."""
+    clauses = []
+    params: list = []
+    if status:
+        clauses.append("j.status = %s")
+        params.append(status)
+    if customer:
+        clauses.append("j.customer_name = %s")
+        params.append(customer)
+    if start_date:
+        clauses.append("j.scheduled_date >= %s")
+        params.append(start_date)
+    if end_date:
+        clauses.append("j.scheduled_date <= %s")
+        params.append(end_date)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    rows = db.query_all(
+        f"""
+        SELECT j.id, j.customer_name, j.scheduled_date, j.expected_hours,
+               j.revenue, j.status, j.notes,
+               COALESCE(SUM(s.total_hours), 0) AS actual_hours,
+               COUNT(DISTINCT s.employee_id) AS employee_count,
+               COUNT(s.id) AS shift_count
+        FROM jobs j
+        LEFT JOIN shifts s ON s.job_id = j.id AND s.clock_out IS NOT NULL
+        {where}
+        GROUP BY j.id
+        ORDER BY j.scheduled_date DESC, j.id DESC
+        """,
+        tuple(params),
+    )
+
+    emp_rates: Dict[int, float] = {
+        r["id"]: float(r["hourly_rate"])
+        for r in db.query_all("SELECT id, hourly_rate FROM employees WHERE hourly_rate IS NOT NULL")
+    }
+
+    jobs_out = []
+    total_rev = 0.0
+    total_labor = 0.0
+    total_hours = 0.0
+    for r in rows:
+        shift_details = db.query_all(
+            "SELECT employee_id, total_hours FROM shifts WHERE job_id = %s AND clock_out IS NOT NULL",
+            (r["id"],),
+        )
+        labor_cost = sum(
+            emp_rates.get(sd["employee_id"], 0.0) * float(sd["total_hours"] or 0)
+            for sd in shift_details
+        )
+        rev = float(r["revenue"] or 0)
+        hours = float(r["actual_hours"] or 0)
+        net = round(rev - labor_cost, 2)
+        exp_h = float(r["expected_hours"]) if r["expected_hours"] is not None else None
+
+        jobs_out.append({
+            "jobId": r["id"],
+            "customerName": r["customer_name"],
+            "scheduledDate": str(r["scheduled_date"]),
+            "status": r["status"],
+            "expectedHours": exp_h,
+            "actualHours": round(hours, 2),
+            "varianceHours": round(exp_h - hours, 2) if exp_h is not None else None,
+            "revenue": round(rev, 2),
+            "laborCost": round(labor_cost, 2),
+            "netProfit": net,
+            "grossMarginPct": round(net / rev * 100, 1) if rev > 0 else None,
+            "laborPct": round(labor_cost / rev * 100, 1) if rev > 0 else None,
+            "employeeCount": r["employee_count"],
+            "shiftCount": r["shift_count"],
+        })
+
+        total_rev += rev
+        total_labor += labor_cost
+        total_hours += hours
+
+    total_net = round(total_rev - total_labor, 2)
+    return {
+        "success": True,
+        "summary": {
+            "jobCount": len(jobs_out),
+            "totalRevenue": round(total_rev, 2),
+            "totalLaborCost": round(total_labor, 2),
+            "totalNetProfit": total_net,
+            "grossMarginPct": round(total_net / total_rev * 100, 1) if total_rev > 0 else None,
+            "totalHours": round(total_hours, 2),
+        },
+        "jobs": jobs_out,
+    }
 
 
 def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:

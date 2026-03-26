@@ -31,6 +31,20 @@ CREATE TABLE locations (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Jobs (service visits / scheduled work at a customer)
+CREATE TABLE jobs (
+    id              SERIAL PRIMARY KEY,
+    location_id     INTEGER REFERENCES locations(id),
+    customer_name   TEXT NOT NULL,
+    scheduled_date  DATE NOT NULL,
+    expected_hours  NUMERIC(6, 2),
+    revenue         NUMERIC(10, 2),
+    notes           TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'scheduled'
+                        CHECK (status IN ('scheduled', 'in_progress', 'completed', 'cancelled')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Shifts (time entries)
 CREATE TABLE shifts (
     id            SERIAL PRIMARY KEY,
@@ -44,6 +58,7 @@ CREATE TABLE shifts (
     timezone      TEXT NOT NULL DEFAULT 'America/Chicago',
     clock_in_gps  JSONB,
     clock_out_gps JSONB,
+    job_id        INTEGER REFERENCES jobs(id),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -75,3 +90,8 @@ CREATE INDEX idx_shifts_location_id ON shifts(location_id);
 CREATE INDEX idx_visits_shift_id    ON visits(shift_id);
 CREATE INDEX idx_visits_arrival     ON visits(arrival_time);
 CREATE INDEX idx_visits_location_id ON visits(location_id);
+CREATE INDEX idx_jobs_location_id    ON jobs(location_id);
+CREATE INDEX idx_jobs_scheduled_date ON jobs(scheduled_date);
+CREATE INDEX idx_jobs_customer       ON jobs(customer_name);
+CREATE INDEX idx_jobs_status         ON jobs(status);
+CREATE INDEX idx_shifts_job_id       ON shifts(job_id);
