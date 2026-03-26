@@ -3257,6 +3257,71 @@ def admin_analytics(
     return _compute_analytics(period, date)
 
 
+@app.get("/api/admin/dashboard")
+def admin_dashboard(
+    request: Request,
+    date: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Single dashboard endpoint: daily/weekly/monthly cards + rankings + overruns + flags."""
+    day_data = _compute_analytics("day", date)
+    week_data = _compute_analytics("week", date)
+    month_data = _compute_analytics("month", date)
+
+    settings = load_settings()
+
+    def _card(data: Dict[str, Any], label: str) -> Dict[str, Any]:
+        s = data["summary"]
+        rplh = round(s["revenue"] / s["hours"], 2) if s["hours"] > 0 else None
+        return {
+            "period": label,
+            "startDate": data["startDate"],
+            "endDate": data["endDate"],
+            "revenue": s["revenue"],
+            "laborCost": s["laborCost"],
+            "laborPct": s["laborPct"],
+            "netProfit": s["netProfit"],
+            "grossMarginPct": s["grossMarginPct"],
+            "hours": s["hours"],
+            "visits": s["visits"],
+            "rplh": rplh,
+        }
+
+    # Top/bottom 5 by net profit (from month data for meaningful ranking)
+    customers = month_data["byCustomer"]
+    by_profit = sorted(customers, key=lambda c: c["netProfit"], reverse=True)
+    top5 = by_profit[:5]
+    bottom5 = sorted(customers, key=lambda c: c["netProfit"])[:5]
+
+    # Biggest hour overruns
+    overruns = [
+        c for c in customers
+        if c.get("varianceHours") is not None and c["varianceHours"] < 0
+    ]
+    overruns.sort(key=lambda c: c["varianceHours"])  # most negative first
+    top_overruns = overruns[:10]
+
+    # Flagged summary from month data
+    flag_counts: Dict[str, int] = {}
+    for c in customers:
+        f = c.get("flag", "Healthy")
+        flag_counts[f] = flag_counts.get(f, 0) + 1
+
+    return {
+        "success": True,
+        "cards": {
+            "daily": _card(day_data, "day"),
+            "weekly": _card(week_data, "week"),
+            "monthly": _card(month_data, "month"),
+        },
+        "topCustomers": top5,
+        "bottomCustomers": bottom5,
+        "overruns": top_overruns,
+        "flagCounts": flag_counts,
+        "laborPctTarget": settings["laborPctTarget"],
+    }
+
+
 @app.get("/api/admin/analytics/export")
 def admin_analytics_export(
     request: Request,
