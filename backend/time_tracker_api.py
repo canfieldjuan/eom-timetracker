@@ -666,8 +666,8 @@ def _save_timesheets_to_db(
                     lat              = EXCLUDED.lat,
                     lng              = EXCLUDED.lng,
                     expected_hours   = EXCLUDED.expected_hours,
-                    target_labor_pct = EXCLUDED.target_labor_pct,
-                    min_margin_pct   = EXCLUDED.min_margin_pct
+                    target_labor_pct = COALESCE(EXCLUDED.target_labor_pct, locations.target_labor_pct),
+                    min_margin_pct   = COALESCE(EXCLUDED.min_margin_pct, locations.min_margin_pct)
                 RETURNING id
                 """,
                 (
@@ -1272,7 +1272,7 @@ class ReportGenerateRequest(BaseModel):
 
 
 class JobCreateRequest(BaseModel):
-    customerName: str
+    customerName: str = Field(min_length=1)
     scheduledDate: str  # YYYY-MM-DD
     expectedHours: Optional[float] = None
     revenue: Optional[float] = None
@@ -1306,7 +1306,7 @@ class ShiftCategorizeRequest(BaseModel):
 
 class ScheduleEntryRequest(BaseModel):
     employeeId: int
-    customerName: str
+    customerName: str = Field(min_length=1)
     weekStart: str  # YYYY-MM-DD (must be a Sunday)
     scheduledHours: float
     notes: str = ""
@@ -1858,6 +1858,10 @@ def clock_in(
             "timezone": TIMEZONE_NAME,
             "clockInGps": None,
             "clockOutGps": None,
+            "jobId": None,
+            "timeCategory": "productive",
+            "nonProductiveType": None,
+            "visits": [],
         }
         if has_gps:
             entry["clockInGps"] = {"lat": payload.latitude, "lng": payload.longitude}
@@ -2600,14 +2604,18 @@ def admin_update_settings(
         "grossMarginMin", "grossMarginFix", "grossMarginDrop",
         "hourOverrunWatch", "hourOverrunFix", "rplhMin",
     ]
+    changed_keys = []
     for key in numeric_keys:
         if key in payload:
             try:
                 val = float(payload[key])
+                if val < 0:
+                    raise HTTPException(status_code=400, detail=f"{key} cannot be negative")
                 settings[key] = round(val, 2)
+                changed_keys.append(key)
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail=f"Invalid {key}")
-    for key in numeric_keys:
+    for key in changed_keys:
         db.execute(
             """
             INSERT INTO settings (key, value) VALUES (%s, %s::jsonb)
@@ -2636,6 +2644,8 @@ def admin_create_schedule(
         ws = datetime.strptime(payload.weekStart, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(status_code=400, detail="weekStart must be YYYY-MM-DD")
+    if payload.scheduledHours < 0:
+        raise HTTPException(status_code=400, detail="scheduledHours cannot be negative")
     # Normalize to Sunday
     days_since_sunday = (ws.weekday() + 1) % 7
     week_start = ws - timedelta(days=days_since_sunday)
@@ -3058,10 +3068,12 @@ def admin_waste_analysis(
     by_cause: Dict[str, Dict[str, Any]] = {}
     total_waste_hours = 0.0
     total_waste_cost = 0.0
+    missing_rate_count = 0
 
     for r in rows:
         hours = float(r["total_hours"] or 0)
-        rate = float(r["hourly_rate"]) if r.get("hourly_rate") is not None else 0.0
+        has_rate = r.get("hourly_rate") is not None
+        rate = float(r["hourly_rate"]) if has_rate else 0.0
         cost = rate * hours
         npt = r["non_productive_type"] or "other"
         cust = r["customer"] or "Unknown"
@@ -3069,6 +3081,8 @@ def admin_waste_analysis(
 
         total_waste_hours += hours
         total_waste_cost += cost
+        if not has_rate:
+            missing_rate_count += 1
 
         if cust not in by_customer:
             by_customer[cust] = {"customer": cust, "hours": 0.0, "cost": 0.0, "incidents": 0, "causes": {}}
@@ -3124,6 +3138,7 @@ def admin_waste_analysis(
             "totalWasteHours": round(total_waste_hours, 2),
             "totalWasteCost": round(total_waste_cost, 2),
             "totalIncidents": len(rows),
+            "missingRateCount": missing_rate_count,
         },
         "byCustomer": customer_list,
         "byEmployee": employee_list,
@@ -3202,11 +3217,17 @@ def admin_pricing_recommendations(
         pct_increase = round(revenue_gap / actual_revenue * 100, 1) if revenue_gap is not None and actual_revenue > 0 else None
 
         # Suggested new per-visit price
-        suggested_per_visit = None
-        if required_revenue is not None and visits > 0 and rate_type == "per_visit":
-            suggested_per_visit = round(required_revenue / visits, 2)
-
         needs_increase = revenue_gap is not None and revenue_gap > 0
+
+        # Calculate suggested rate based on rate type
+        suggested_rate = current_rate
+        if needs_increase and required_revenue is not None:
+            if rate_type == "per_visit" and visits > 0:
+                suggested_rate = round(required_revenue / visits, 2)
+            elif rate_type == "hourly" and actual_hours > 0:
+                suggested_rate = round(required_revenue / actual_hours, 2)
+            elif rate_type == "monthly" and required_revenue > 0:
+                suggested_rate = round(required_revenue, 2)
 
         rec = {
             "customer": customer,
@@ -3222,7 +3243,7 @@ def admin_pricing_recommendations(
             "requiredRevenue": required_revenue,
             "revenueGap": revenue_gap if needs_increase else 0,
             "pctIncrease": pct_increase if needs_increase else 0,
-            "suggestedPerVisitPrice": suggested_per_visit if needs_increase else current_rate,
+            "suggestedRate": suggested_rate,
             "visits": visits,
             "hours": actual_hours,
             "flag": c.get("flag", "Healthy"),
@@ -3282,6 +3303,10 @@ def admin_create_job(
         raise HTTPException(status_code=400, detail="scheduledDate must be YYYY-MM-DD")
     if payload.status not in ("scheduled", "in_progress", "completed", "cancelled"):
         raise HTTPException(status_code=400, detail="Invalid status")
+    if payload.expectedHours is not None and payload.expectedHours < 0:
+        raise HTTPException(status_code=400, detail="expectedHours cannot be negative")
+    if payload.revenue is not None and payload.revenue < 0:
+        raise HTTPException(status_code=400, detail="revenue cannot be negative")
 
     location_id = payload.locationId
     if location_id is None:
@@ -3371,8 +3396,10 @@ def admin_auto_link_jobs(
         shift_date = shift["local_date"]
         if not shift_date:
             continue
+        shift_cust_norm = shift_customer.strip().lower() if shift_customer else ""
         for job in jobs:
-            if job["customer_name"] == shift_customer and job["scheduled_date"] == shift_date:
+            job_cust_norm = job["customer_name"].strip().lower() if job["customer_name"] else ""
+            if job_cust_norm == shift_cust_norm and job["scheduled_date"] == shift_date:
                 db.execute("UPDATE shifts SET job_id = %s WHERE id = %s", (job["id"], shift["id"]))
                 linked += 1
                 break
@@ -3570,9 +3597,13 @@ def admin_update_job(
         sets.append("scheduled_date = %s")
         params.append(payload.scheduledDate)
     if payload.expectedHours is not None:
+        if payload.expectedHours < 0:
+            raise HTTPException(status_code=400, detail="expectedHours cannot be negative")
         sets.append("expected_hours = %s")
         params.append(payload.expectedHours)
     if payload.revenue is not None:
+        if payload.revenue < 0:
+            raise HTTPException(status_code=400, detail="revenue cannot be negative")
         sets.append("revenue = %s")
         params.append(payload.revenue)
     if payload.notes is not None:
@@ -3681,7 +3712,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         if rate is not None:
             emp_rates[emp["id"]] = float(rate)
 
-    days_in_period = (end_date - start_date).days + 1
+    days_in_period = (end_date - start_date).days + 1 if (start_date and end_date) else 365
     monthly_customers_credited: set = set()
 
     customer_agg: Dict[str, Dict[str, Any]] = {}
@@ -3840,17 +3871,27 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                 reasons.append(f"Overrun {overrun}h >= {watch_thresh}h (watch)")
                 severity = max(severity, 1)
 
+        has_overrun = False
         if rplh is not None:
             rplh_min = settings.get("rplhMin", 25.0)
             if rplh < rplh_min:
                 reasons.append(f"RPLH ${rplh:.2f} < ${rplh_min:.2f}")
-                severity = max(severity, max(1, severity))
+                severity = max(severity, 1)
 
-        flag_map = {0: "Healthy", 1: "Watch", 2: "Raise Price", 3: "Drop"}
-        if severity == 2 and labor_pct is not None and labor_pct >= settings.get("laborPctFix", 55.0):
-            flag = "Fix"
+        if severity == 0:
+            flag = "Healthy"
+        elif severity == 3:
+            flag = "Drop"
+        elif severity == 1:
+            flag = "Watch"
         else:
-            flag = flag_map[severity]
+            # severity == 2: distinguish Fix (internal) vs Raise Price (pricing)
+            labor_triggered = labor_pct is not None and labor_pct >= settings.get("laborPctFix", 55.0)
+            overrun_triggered = variance is not None and variance < 0 and abs(variance) >= settings.get("hourOverrunFix", 2.0)
+            if labor_triggered or overrun_triggered:
+                flag = "Fix"
+            else:
+                flag = "Raise Price"
         return flag, reasons
 
     def _finalize(d: Dict[str, Any]) -> Dict[str, Any]:
