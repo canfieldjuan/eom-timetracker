@@ -25,6 +25,8 @@ CREATE TABLE locations (
                       CHECK (rate_type IN ('per_visit', 'hourly', 'monthly')),
     frequency       TEXT,
     expected_hours  NUMERIC(6, 2),
+    target_labor_pct  NUMERIC(5, 2),
+    min_margin_pct    NUMERIC(5, 2),
     lat             NUMERIC(10, 7),
     lng             NUMERIC(10, 7),
     active        BOOLEAN NOT NULL DEFAULT true,

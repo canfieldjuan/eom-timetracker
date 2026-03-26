@@ -555,7 +555,7 @@ def _row_to_entry(row: Dict[str, Any], visits: List[Dict[str, Any]]) -> Dict[str
 def _load_timesheets_from_db() -> Dict[str, Any]:
     loc_rows = db.query_all(
         "SELECT address, customer_name, location_type, rate, rate_type, "
-        "frequency, lat, lng, expected_hours "
+        "frequency, lat, lng, expected_hours, target_labor_pct, min_margin_pct "
         "FROM locations WHERE active = true ORDER BY id"
     )
     locations: List[str] = [r["address"] for r in loc_rows]
@@ -566,6 +566,8 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
     location_types: Dict[str, str] = {}
     location_frequencies: Dict[str, str] = {}
     location_expected_hours: Dict[str, float] = {}
+    location_target_labor: Dict[str, float] = {}
+    location_min_margin: Dict[str, float] = {}
 
     for r in loc_rows:
         addr = r["address"]
@@ -583,6 +585,10 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
             location_frequencies[addr] = r["frequency"]
         if r.get("expected_hours") is not None:
             location_expected_hours[addr] = float(r["expected_hours"])
+        if r.get("target_labor_pct") is not None:
+            location_target_labor[addr] = float(r["target_labor_pct"])
+        if r.get("min_margin_pct") is not None:
+            location_min_margin[addr] = float(r["min_margin_pct"])
 
     visit_rows = db.query_all(
         """
@@ -624,6 +630,8 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
         "location_types": location_types,
         "location_frequencies": location_frequencies,
         "location_expected_hours": location_expected_hours,
+        "location_target_labor": location_target_labor,
+        "location_min_margin": location_min_margin,
     }
 
 
@@ -642,17 +650,20 @@ def _save_timesheets_to_db(
             cur.execute(
                 """
                 INSERT INTO locations
-                  (address, customer_name, location_type, rate, rate_type, frequency, lat, lng, expected_hours)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                  (address, customer_name, location_type, rate, rate_type, frequency, lat, lng,
+                   expected_hours, target_labor_pct, min_margin_pct)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (address) DO UPDATE SET
-                    customer_name  = EXCLUDED.customer_name,
-                    location_type  = EXCLUDED.location_type,
-                    rate           = EXCLUDED.rate,
-                    rate_type      = EXCLUDED.rate_type,
-                    frequency      = EXCLUDED.frequency,
-                    lat            = EXCLUDED.lat,
-                    lng            = EXCLUDED.lng,
-                    expected_hours = EXCLUDED.expected_hours
+                    customer_name    = EXCLUDED.customer_name,
+                    location_type    = EXCLUDED.location_type,
+                    rate             = EXCLUDED.rate,
+                    rate_type        = EXCLUDED.rate_type,
+                    frequency        = EXCLUDED.frequency,
+                    lat              = EXCLUDED.lat,
+                    lng              = EXCLUDED.lng,
+                    expected_hours   = EXCLUDED.expected_hours,
+                    target_labor_pct = EXCLUDED.target_labor_pct,
+                    min_margin_pct   = EXCLUDED.min_margin_pct
                 RETURNING id
                 """,
                 (
@@ -665,6 +676,8 @@ def _save_timesheets_to_db(
                     c.get("lat"),
                     c.get("lng"),
                     timesheet_data.get("location_expected_hours", {}).get(addr),
+                    timesheet_data.get("location_target_labor", {}).get(addr),
+                    timesheet_data.get("location_min_margin", {}).get(addr),
                 ),
             )
             addr_to_id[addr] = cur.fetchone()[0]
@@ -1361,6 +1374,12 @@ def _ensure_schema_migrations() -> None:
     db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_customer ON jobs(customer_name)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_shifts_job_id ON shifts(job_id)")
+    db.execute(
+        "ALTER TABLE locations ADD COLUMN IF NOT EXISTS target_labor_pct NUMERIC(5,2)"
+    )
+    db.execute(
+        "ALTER TABLE locations ADD COLUMN IF NOT EXISTS min_margin_pct NUMERIC(5,2)"
+    )
 
 
 def _auto_migrate_if_empty() -> None:
@@ -2058,6 +2077,8 @@ def admin_update_locations(
     location_types: Dict[str, str] = {}
     location_frequencies: Dict[str, str] = {}
     location_expected_hours: Dict[str, float] = {}
+    location_target_labor: Dict[str, float] = {}
+    location_min_margin: Dict[str, float] = {}
     for item in raw:
         if isinstance(item, dict) and item.get("name", "").strip():
             name = str(item["name"]).strip()
@@ -2085,6 +2106,16 @@ def admin_update_locations(
                     location_expected_hours[name] = float(item["expectedHours"])
                 except (TypeError, ValueError):
                     pass
+            if item.get("targetLaborPct") is not None:
+                try:
+                    location_target_labor[name] = float(item["targetLaborPct"])
+                except (TypeError, ValueError):
+                    pass
+            if item.get("minMarginPct") is not None:
+                try:
+                    location_min_margin[name] = float(item["minMarginPct"])
+                except (TypeError, ValueError):
+                    pass
         elif isinstance(item, str) and item.strip():
             locations.append(item.strip())
 
@@ -2097,11 +2128,13 @@ def admin_update_locations(
         data["location_types"] = location_types
         data["location_frequencies"] = location_frequencies
         data["location_expected_hours"] = location_expected_hours
+        data["location_target_labor"] = location_target_labor
+        data["location_min_margin"] = location_min_margin
         return True, locations
 
     update_timesheets(mutator)
     append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations, {len(location_coords)} with coords")
-    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies, "location_expected_hours": location_expected_hours}
+    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies, "location_expected_hours": location_expected_hours, "location_target_labor": location_target_labor, "location_min_margin": location_min_margin}
 
 
 @app.patch("/api/admin/locations/pin")
@@ -2508,6 +2541,124 @@ def admin_update_settings(
             (key, json.dumps(settings[key])),
         )
     return {"success": True, **settings}
+
+
+# ---------------------------------------------------------------------------
+# Pricing Recommendations — Phase 6
+# ---------------------------------------------------------------------------
+
+@app.get("/api/admin/analytics/pricing")
+def admin_pricing_recommendations(
+    request: Request,
+    period: str = "month",
+    date: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Calculate required revenue and suggested price changes per customer."""
+    data = _compute_analytics(period, date)
+    settings = load_settings()
+    timesheet_data = load_timesheets()
+
+    location_customers = timesheet_data.get("location_customers", {})
+    location_rates = timesheet_data.get("location_rates", {})
+    location_rate_types = timesheet_data.get("location_rate_types", {})
+    location_target_labor = timesheet_data.get("location_target_labor", {})
+    location_min_margin = timesheet_data.get("location_min_margin", {})
+
+    # Build reverse map: customer_name -> location address
+    customer_to_loc: Dict[str, str] = {}
+    for addr, cust in location_customers.items():
+        customer_to_loc[cust] = addr
+
+    default_target_labor = settings.get("laborPctTarget", 35.0)
+    default_min_margin = settings.get("grossMarginMin", 30.0)
+
+    recommendations = []
+    for c in data["byCustomer"]:
+        customer = c["customer"]
+        loc = customer_to_loc.get(customer, c.get("location", ""))
+
+        target_labor = location_target_labor.get(loc, default_target_labor)
+        min_margin = location_min_margin.get(loc, default_min_margin)
+        current_rate = location_rates.get(loc)
+        rate_type = location_rate_types.get(loc, "per_visit")
+
+        actual_labor_cost = c["laborCost"]
+        actual_revenue = c["revenue"]
+        actual_hours = c["hours"]
+        visits = c["visits"]
+
+        # Required revenue to hit target labor %
+        # target_labor% = laborCost / requiredRevenue * 100
+        # requiredRevenue = laborCost / (target_labor% / 100)
+        required_rev_labor = round(actual_labor_cost / (target_labor / 100), 2) if target_labor > 0 else None
+
+        # Required revenue to hit minimum margin %
+        # min_margin% = (rev - laborCost) / rev * 100
+        # rev * min_margin/100 = rev - laborCost
+        # rev * (1 - min_margin/100) = laborCost
+        # rev = laborCost / (1 - min_margin/100)
+        required_rev_margin = round(actual_labor_cost / (1 - min_margin / 100), 2) if min_margin < 100 else None
+
+        # Use the higher of the two as the target
+        required_revenue = None
+        if required_rev_labor is not None and required_rev_margin is not None:
+            required_revenue = max(required_rev_labor, required_rev_margin)
+        elif required_rev_labor is not None:
+            required_revenue = required_rev_labor
+        elif required_rev_margin is not None:
+            required_revenue = required_rev_margin
+
+        # Calculate suggested increase
+        revenue_gap = round(required_revenue - actual_revenue, 2) if required_revenue is not None and actual_revenue > 0 else None
+        pct_increase = round(revenue_gap / actual_revenue * 100, 1) if revenue_gap is not None and actual_revenue > 0 else None
+
+        # Suggested new per-visit price
+        suggested_per_visit = None
+        if required_revenue is not None and visits > 0 and rate_type == "per_visit":
+            suggested_per_visit = round(required_revenue / visits, 2)
+
+        needs_increase = revenue_gap is not None and revenue_gap > 0
+
+        rec = {
+            "customer": customer,
+            "location": loc,
+            "rateType": rate_type,
+            "currentRate": current_rate,
+            "targetLaborPct": target_labor,
+            "minMarginPct": min_margin,
+            "actualRevenue": actual_revenue,
+            "actualLaborCost": actual_labor_cost,
+            "actualLaborPct": c["laborPct"],
+            "actualMarginPct": c["grossMarginPct"],
+            "requiredRevenue": required_revenue,
+            "revenueGap": revenue_gap if needs_increase else 0,
+            "pctIncrease": pct_increase if needs_increase else 0,
+            "suggestedPerVisitPrice": suggested_per_visit if needs_increase else current_rate,
+            "visits": visits,
+            "hours": actual_hours,
+            "flag": c.get("flag", "Healthy"),
+            "needsIncrease": needs_increase,
+        }
+        recommendations.append(rec)
+
+    # Sort: needs increase first, then by revenue gap descending
+    recommendations.sort(key=lambda r: (not r["needsIncrease"], -(r["revenueGap"] or 0)))
+
+    needs_action = [r for r in recommendations if r["needsIncrease"]]
+    return {
+        "success": True,
+        "period": data["period"],
+        "startDate": data["startDate"],
+        "endDate": data["endDate"],
+        "defaults": {
+            "targetLaborPct": default_target_labor,
+            "minMarginPct": default_min_margin,
+        },
+        "needsActionCount": len(needs_action),
+        "totalRevenueGap": round(sum(r["revenueGap"] or 0 for r in needs_action), 2),
+        "recommendations": recommendations,
+    }
 
 
 # ---------------------------------------------------------------------------
