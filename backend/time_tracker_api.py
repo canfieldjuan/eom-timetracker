@@ -2451,7 +2451,19 @@ def admin_reports_hours_export(
 
 
 def load_settings() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {"laborPctTarget": 35.0}
+    defaults: Dict[str, Any] = {
+        "laborPctTarget": 35.0,
+        # Phase 4: threshold settings
+        "laborPctWatch": 40.0,     # labor % above this = Watch
+        "laborPctFix": 55.0,       # labor % above this = Fix
+        "laborPctDrop": 70.0,      # labor % above this = Drop
+        "grossMarginMin": 30.0,    # margin below this = Watch
+        "grossMarginFix": 15.0,    # margin below this = Fix
+        "grossMarginDrop": 0.0,    # margin at or below this = Drop
+        "hourOverrunWatch": 0.5,   # hours over expected = Watch
+        "hourOverrunFix": 2.0,     # hours over expected = Fix
+        "rplhMin": 25.0,           # revenue per labor hour below this = flagged
+    }
     rows = db.query_all("SELECT key, value FROM settings")
     data: Dict[str, Any] = {r["key"]: r["value"] for r in rows}
     for k, v in defaults.items():
@@ -2475,21 +2487,26 @@ def admin_update_settings(
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     settings = load_settings()
-    if "laborPctTarget" in payload:
-        try:
-            val = float(payload["laborPctTarget"])
-            if not (0 < val < 100):
-                raise HTTPException(status_code=400, detail="laborPctTarget must be between 0 and 100")
-            settings["laborPctTarget"] = round(val, 2)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Invalid laborPctTarget")
-    db.execute(
-        """
-        INSERT INTO settings (key, value) VALUES (%s, %s::jsonb)
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """,
-        ("laborPctTarget", json.dumps(settings["laborPctTarget"])),
-    )
+    numeric_keys = [
+        "laborPctTarget", "laborPctWatch", "laborPctFix", "laborPctDrop",
+        "grossMarginMin", "grossMarginFix", "grossMarginDrop",
+        "hourOverrunWatch", "hourOverrunFix", "rplhMin",
+    ]
+    for key in numeric_keys:
+        if key in payload:
+            try:
+                val = float(payload[key])
+                settings[key] = round(val, 2)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"Invalid {key}")
+    for key in numeric_keys:
+        db.execute(
+            """
+            INSERT INTO settings (key, value) VALUES (%s, %s::jsonb)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            (key, json.dumps(settings[key])),
+        )
     return {"success": True, **settings}
 
 
@@ -3043,6 +3060,60 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             resolved_location, customer = _resolve_loc(location)
             _aggregate(customer, resolved_location, hours, emp_id, entry_date, date_key, is_visit=True)
 
+    def _classify(labor_pct, gross_margin, variance, rplh) -> Tuple[str, List[str]]:
+        """Return (flag, reasons) — flag is Healthy/Watch/Fix/Raise Price/Drop."""
+        reasons: List[str] = []
+        severity = 0  # 0=Healthy, 1=Watch, 2=Fix/Raise Price, 3=Drop
+
+        if labor_pct is not None:
+            if labor_pct >= settings.get("laborPctDrop", 70.0):
+                reasons.append(f"Labor % {labor_pct}% >= {settings.get('laborPctDrop', 70.0)}% (drop)")
+                severity = max(severity, 3)
+            elif labor_pct >= settings.get("laborPctFix", 55.0):
+                reasons.append(f"Labor % {labor_pct}% >= {settings.get('laborPctFix', 55.0)}% (fix)")
+                severity = max(severity, 2)
+            elif labor_pct >= settings.get("laborPctWatch", 40.0):
+                reasons.append(f"Labor % {labor_pct}% >= {settings.get('laborPctWatch', 40.0)}% (watch)")
+                severity = max(severity, 1)
+
+        if gross_margin is not None:
+            gm_drop = settings.get("grossMarginDrop", 0.0)
+            gm_fix = settings.get("grossMarginFix", 15.0)
+            gm_min = settings.get("grossMarginMin", 30.0)
+            if gross_margin <= gm_drop:
+                reasons.append(f"Margin {gross_margin}% <= {gm_drop}% (drop)")
+                severity = max(severity, 3)
+            elif gross_margin < gm_fix:
+                reasons.append(f"Margin {gross_margin}% < {gm_fix}% (fix)")
+                severity = max(severity, 2)
+            elif gross_margin < gm_min:
+                reasons.append(f"Margin {gross_margin}% < {gm_min}% (watch)")
+                severity = max(severity, 1)
+
+        if variance is not None and variance < 0:
+            overrun = abs(variance)
+            fix_thresh = settings.get("hourOverrunFix", 2.0)
+            watch_thresh = settings.get("hourOverrunWatch", 0.5)
+            if overrun >= fix_thresh:
+                reasons.append(f"Overrun {overrun}h >= {fix_thresh}h (fix)")
+                severity = max(severity, 2)
+            elif overrun >= watch_thresh:
+                reasons.append(f"Overrun {overrun}h >= {watch_thresh}h (watch)")
+                severity = max(severity, 1)
+
+        if rplh is not None:
+            rplh_min = settings.get("rplhMin", 25.0)
+            if rplh < rplh_min:
+                reasons.append(f"RPLH ${rplh:.2f} < ${rplh_min:.2f}")
+                severity = max(severity, max(1, severity))
+
+        flag_map = {0: "Healthy", 1: "Watch", 2: "Raise Price", 3: "Drop"}
+        if severity == 2 and labor_pct is not None and labor_pct >= settings.get("laborPctFix", 55.0):
+            flag = "Fix"
+        else:
+            flag = flag_map[severity]
+        return flag, reasons
+
     def _finalize(d: Dict[str, Any]) -> Dict[str, Any]:
         rev = d["revenue"]
         lc = d["laborCost"]
@@ -3053,6 +3124,8 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         has_exp = d.get("_hasExpected", False)
         exp_h = round(d.get("expectedHours", 0.0), 2) if has_exp else None
         variance = round(exp_h - actual_h, 2) if exp_h is not None else None
+        rplh = round(rev / actual_h, 2) if actual_h > 0 else None
+        flag, flag_reasons = _classify(lp, gross_margin, variance, rplh)
         return {
             "customer": d["customer"],
             "location": d["location"],
@@ -3065,6 +3138,9 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             "grossMarginPct": gross_margin,
             "expectedHours": exp_h,
             "varianceHours": variance,
+            "rplh": rplh,
+            "flag": flag,
+            "flagReasons": flag_reasons,
         }
 
     by_customer = sorted([_finalize(c) for c in customer_agg.values()], key=lambda x: x["revenue"], reverse=True)
@@ -3126,6 +3202,48 @@ def admin_analytics_customers(
         "laborPctTarget": data["laborPctTarget"],
         "summary": data["summary"],
         "customers": data["byCustomer"],
+    }
+
+
+@app.get("/api/admin/analytics/flagged")
+def admin_analytics_flagged(
+    request: Request,
+    period: str = "all",
+    date: Optional[str] = None,
+    flag: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Return only flagged (non-Healthy) customers, sorted by severity."""
+    data = _compute_analytics(period, date)
+    severity_order = {"Drop": 0, "Fix": 1, "Raise Price": 2, "Watch": 3, "Healthy": 4}
+    flagged = [c for c in data["byCustomer"] if c["flag"] != "Healthy"]
+    if flag:
+        flagged = [c for c in flagged if c["flag"] == flag]
+    flagged.sort(key=lambda c: (severity_order.get(c["flag"], 99), -(c.get("revenue") or 0)))
+    counts = {}
+    for c in data["byCustomer"]:
+        counts[c["flag"]] = counts.get(c["flag"], 0) + 1
+    settings = load_settings()
+    return {
+        "success": True,
+        "period": data["period"],
+        "startDate": data["startDate"],
+        "endDate": data["endDate"],
+        "thresholds": {
+            "laborPctTarget": settings["laborPctTarget"],
+            "laborPctWatch": settings["laborPctWatch"],
+            "laborPctFix": settings["laborPctFix"],
+            "laborPctDrop": settings["laborPctDrop"],
+            "grossMarginMin": settings["grossMarginMin"],
+            "grossMarginFix": settings["grossMarginFix"],
+            "grossMarginDrop": settings["grossMarginDrop"],
+            "hourOverrunWatch": settings["hourOverrunWatch"],
+            "hourOverrunFix": settings["hourOverrunFix"],
+            "rplhMin": settings["rplhMin"],
+        },
+        "flagCounts": counts,
+        "flaggedCount": len(flagged),
+        "customers": flagged,
     }
 
 
