@@ -1290,6 +1290,15 @@ class ShiftCategorizeRequest(BaseModel):
     notes: Optional[str] = None
 
 
+class ScheduleEntryRequest(BaseModel):
+    employeeId: int
+    customerName: str
+    weekStart: str  # YYYY-MM-DD (must be a Sunday)
+    scheduledHours: float
+    notes: str = ""
+    locationId: Optional[int] = None
+
+
 load_local_env()
 
 JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
@@ -1395,6 +1404,21 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS non_productive_type TEXT"
     )
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS schedules (
+            id              SERIAL PRIMARY KEY,
+            employee_id     INTEGER NOT NULL REFERENCES employees(id),
+            location_id     INTEGER REFERENCES locations(id),
+            customer_name   TEXT NOT NULL,
+            week_start      DATE NOT NULL,
+            scheduled_hours NUMERIC(6, 2) NOT NULL,
+            notes           TEXT NOT NULL DEFAULT '',
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (employee_id, customer_name, week_start)
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_week ON schedules(week_start)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_employee ON schedules(employee_id)")
 
 
 def _auto_migrate_if_empty() -> None:
@@ -2559,6 +2583,340 @@ def admin_update_settings(
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Scheduling & Forecasting — Phase 8
+# ---------------------------------------------------------------------------
+
+@app.post("/api/admin/schedules")
+def admin_create_schedule(
+    payload: ScheduleEntryRequest,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    customer = payload.customerName.strip()
+    if not customer:
+        raise HTTPException(status_code=400, detail="customerName is required")
+    try:
+        ws = datetime.strptime(payload.weekStart, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="weekStart must be YYYY-MM-DD")
+    # Normalize to Sunday
+    days_since_sunday = (ws.weekday() + 1) % 7
+    week_start = ws - timedelta(days=days_since_sunday)
+
+    location_id = payload.locationId
+    if location_id is None:
+        loc = db.query_one(
+            "SELECT id FROM locations WHERE customer_name = %s AND active = true LIMIT 1",
+            (customer,),
+        )
+        if loc:
+            location_id = loc["id"]
+
+    row = db.query_one(
+        """
+        INSERT INTO schedules (employee_id, location_id, customer_name, week_start, scheduled_hours, notes)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (employee_id, customer_name, week_start)
+        DO UPDATE SET scheduled_hours = EXCLUDED.scheduled_hours, notes = EXCLUDED.notes
+        RETURNING *
+        """,
+        (payload.employeeId, location_id, customer, week_start, payload.scheduledHours, payload.notes),
+    )
+    append_access_log(request, "SCHEDULE_CREATED", True, f"Schedule {row['id']}")
+    return {"success": True, "schedule": {
+        "id": row["id"], "employeeId": row["employee_id"], "customerName": row["customer_name"],
+        "weekStart": str(row["week_start"]), "scheduledHours": float(row["scheduled_hours"]),
+        "notes": row["notes"],
+    }}
+
+
+@app.get("/api/admin/schedules")
+def admin_list_schedules(
+    request: Request,
+    week_start: Optional[str] = None,
+    employee_id: Optional[int] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    clauses = []
+    params: list = []
+    if week_start:
+        clauses.append("sc.week_start = %s")
+        params.append(week_start)
+    if employee_id:
+        clauses.append("sc.employee_id = %s")
+        params.append(employee_id)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = db.query_all(
+        f"""
+        SELECT sc.*, e.name AS employee_name
+        FROM schedules sc
+        JOIN employees e ON sc.employee_id = e.id
+        {where}
+        ORDER BY sc.week_start DESC, e.name
+        """,
+        tuple(params),
+    )
+    return {"success": True, "schedules": [
+        {
+            "id": r["id"], "employeeId": r["employee_id"], "employeeName": r["employee_name"],
+            "customerName": r["customer_name"], "weekStart": str(r["week_start"]),
+            "scheduledHours": float(r["scheduled_hours"]), "notes": r["notes"],
+        }
+        for r in rows
+    ]}
+
+
+@app.get("/api/admin/analytics/schedule-vs-actual")
+def admin_schedule_vs_actual(
+    request: Request,
+    week_start: Optional[str] = None,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Compare scheduled vs actual hours per employee per customer for a given week."""
+    now = utc_now()
+    local_now = to_local(now)
+    if week_start:
+        try:
+            ws = datetime.strptime(week_start, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+    else:
+        days_since_sunday = (local_now.date().weekday() + 1) % 7
+        ws = local_now.date() - timedelta(days=days_since_sunday)
+
+    # Normalize to Sunday
+    days_since_sunday = (ws.weekday() + 1) % 7
+    ws = ws - timedelta(days=days_since_sunday)
+    we = ws + timedelta(days=6)
+
+    schedules = db.query_all(
+        """
+        SELECT sc.employee_id, e.name AS employee_name, sc.customer_name, sc.scheduled_hours
+        FROM schedules sc
+        JOIN employees e ON sc.employee_id = e.id
+        WHERE sc.week_start = %s
+        """,
+        (ws,),
+    )
+
+    location_customers = {
+        r["address"]: r["customer_name"]
+        for r in db.query_all("SELECT address, customer_name FROM locations WHERE customer_name IS NOT NULL")
+    }
+
+    actuals = db.query_all(
+        """
+        SELECT s.employee_id, e.name AS employee_name,
+               COALESCE(l.address, '') AS location,
+               COALESCE(SUM(s.total_hours), 0) AS actual_hours
+        FROM shifts s
+        JOIN employees e ON s.employee_id = e.id
+        LEFT JOIN locations l ON s.location_id = l.id
+        WHERE s.clock_out IS NOT NULL AND s.local_date >= %s AND s.local_date <= %s
+        GROUP BY s.employee_id, e.name, l.address
+        """,
+        (ws, we),
+    )
+
+    # Build actual hours by (employee_id, customer)
+    actual_map: Dict[Tuple[int, str], float] = {}
+    for a in actuals:
+        cust = location_customers.get(a["location"], a["location"])
+        key = (a["employee_id"], cust)
+        actual_map[key] = actual_map.get(key, 0) + float(a["actual_hours"] or 0)
+
+    comparisons = []
+    all_keys = set()
+    for sc in schedules:
+        key = (sc["employee_id"], sc["customer_name"])
+        all_keys.add(key)
+        scheduled = float(sc["scheduled_hours"])
+        actual = actual_map.get(key, 0.0)
+        drift = round(actual - scheduled, 2)
+        comparisons.append({
+            "employeeId": sc["employee_id"],
+            "employeeName": sc["employee_name"],
+            "customerName": sc["customer_name"],
+            "scheduledHours": round(scheduled, 2),
+            "actualHours": round(actual, 2),
+            "driftHours": drift,
+            "driftPct": round(drift / scheduled * 100, 1) if scheduled > 0 else None,
+        })
+
+    # Add actuals with no schedule
+    for (emp_id, cust), actual in actual_map.items():
+        if (emp_id, cust) not in all_keys:
+            emp_name = db.query_one("SELECT name FROM employees WHERE id = %s", (emp_id,))
+            comparisons.append({
+                "employeeId": emp_id,
+                "employeeName": emp_name["name"] if emp_name else f"Employee {emp_id}",
+                "customerName": cust,
+                "scheduledHours": 0,
+                "actualHours": round(actual, 2),
+                "driftHours": round(actual, 2),
+                "driftPct": None,
+            })
+
+    total_scheduled = sum(c["scheduledHours"] for c in comparisons)
+    total_actual = sum(c["actualHours"] for c in comparisons)
+
+    return {
+        "success": True,
+        "weekStart": str(ws),
+        "weekEnd": str(we),
+        "summary": {
+            "totalScheduled": round(total_scheduled, 2),
+            "totalActual": round(total_actual, 2),
+            "totalDrift": round(total_actual - total_scheduled, 2),
+            "driftPct": round((total_actual - total_scheduled) / total_scheduled * 100, 1) if total_scheduled > 0 else None,
+        },
+        "comparisons": sorted(comparisons, key=lambda c: abs(c["driftHours"]), reverse=True),
+    }
+
+
+@app.get("/api/admin/analytics/forecast")
+def admin_forecast(
+    request: Request,
+    weeks_ahead: int = 4,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Simple weekly staffing forecast based on recent actual hours and scheduled data."""
+    now = utc_now()
+    local_now = to_local(now)
+    today = local_now.date()
+    days_since_sunday = (today.weekday() + 1) % 7
+    current_week_start = today - timedelta(days=days_since_sunday)
+
+    # Look back 8 weeks for historical averages
+    lookback_start = current_week_start - timedelta(weeks=8)
+    lookback_end = current_week_start - timedelta(days=1)
+
+    timesheet_data = load_timesheets()
+    settings = load_settings()
+    location_customers = timesheet_data.get("location_customers", {})
+    location_rates = timesheet_data.get("location_rates", {})
+    location_rate_types = timesheet_data.get("location_rate_types", {})
+
+    # Historical actuals by customer per week
+    hist_rows = db.query_all(
+        """
+        SELECT COALESCE(l.customer_name, COALESCE(l.address, '')) AS customer,
+               s.local_date,
+               SUM(s.total_hours) AS hours,
+               s.employee_id,
+               e.hourly_rate
+        FROM shifts s
+        JOIN employees e ON s.employee_id = e.id
+        LEFT JOIN locations l ON s.location_id = l.id
+        WHERE s.clock_out IS NOT NULL AND s.local_date >= %s AND s.local_date <= %s
+        GROUP BY customer, s.local_date, s.employee_id, e.hourly_rate
+        """,
+        (lookback_start, lookback_end),
+    )
+
+    # Aggregate by customer weekly averages
+    customer_weekly: Dict[str, Dict[str, float]] = {}  # customer -> {week -> hours}
+    for r in hist_rows:
+        cust = r["customer"] or "Unknown"
+        d = r["local_date"]
+        ds = (d.weekday() + 1) % 7
+        wk = str(d - timedelta(days=ds))
+        if cust not in customer_weekly:
+            customer_weekly[cust] = {}
+        customer_weekly[cust][wk] = customer_weekly[cust].get(wk, 0) + float(r["hours"] or 0)
+
+    # Average hours per week per customer
+    customer_avg: Dict[str, float] = {}
+    for cust, weeks in customer_weekly.items():
+        if weeks:
+            customer_avg[cust] = round(sum(weeks.values()) / len(weeks), 2)
+
+    # Get avg labor rate
+    avg_rate_row = db.query_one("SELECT AVG(hourly_rate) AS avg_rate FROM employees WHERE hourly_rate IS NOT NULL AND active = true")
+    avg_labor_rate = float(avg_rate_row["avg_rate"]) if avg_rate_row and avg_rate_row["avg_rate"] else 15.0
+
+    # Build forecast for each future week
+    forecasts = []
+    for i in range(weeks_ahead):
+        forecast_week_start = current_week_start + timedelta(weeks=i)
+        forecast_week_end = forecast_week_start + timedelta(days=6)
+
+        # Check if we have schedules for this week
+        scheduled = db.query_all(
+            "SELECT customer_name, SUM(scheduled_hours) AS hours FROM schedules WHERE week_start = %s GROUP BY customer_name",
+            (forecast_week_start,),
+        )
+        scheduled_map = {s["customer_name"]: float(s["hours"]) for s in scheduled}
+
+        total_hours = 0.0
+        total_labor = 0.0
+        total_revenue = 0.0
+        by_customer = []
+
+        all_customers = set(customer_avg.keys()) | set(scheduled_map.keys())
+        for cust in all_customers:
+            # Use schedule if available, otherwise historical average
+            hours = scheduled_map.get(cust, customer_avg.get(cust, 0))
+            labor = hours * avg_labor_rate
+
+            # Estimate revenue from location rates
+            loc_addr = None
+            for addr, cn in location_customers.items():
+                if cn == cust:
+                    loc_addr = addr
+                    break
+            rev = 0.0
+            if loc_addr:
+                rate = location_rates.get(loc_addr)
+                rt = location_rate_types.get(loc_addr, "per_visit")
+                if rate is not None:
+                    if rt == "hourly":
+                        rev = rate * hours
+                    elif rt == "monthly":
+                        rev = rate / 4.33  # approximate weekly from monthly
+                    else:  # per_visit
+                        # estimate visits from hours and expected hours per visit
+                        exp_h = timesheet_data.get("location_expected_hours", {}).get(loc_addr)
+                        if exp_h and exp_h > 0:
+                            est_visits = hours / exp_h
+                        else:
+                            est_visits = 1
+                        rev = rate * est_visits
+
+            total_hours += hours
+            total_labor += labor
+            total_revenue += rev
+            by_customer.append({
+                "customer": cust,
+                "forecastHours": round(hours, 2),
+                "source": "schedule" if cust in scheduled_map else "historical",
+                "estLaborCost": round(labor, 2),
+                "estRevenue": round(rev, 2),
+            })
+
+        net = round(total_revenue - total_labor, 2)
+        forecasts.append({
+            "weekStart": str(forecast_week_start),
+            "weekEnd": str(forecast_week_end),
+            "totalHours": round(total_hours, 2),
+            "estLaborCost": round(total_labor, 2),
+            "estRevenue": round(total_revenue, 2),
+            "estNetProfit": net,
+            "estMarginPct": round(net / total_revenue * 100, 1) if total_revenue > 0 else None,
+            "estLaborPct": round(total_labor / total_revenue * 100, 1) if total_revenue > 0 else None,
+            "byCustomer": sorted(by_customer, key=lambda c: c["forecastHours"], reverse=True),
+        })
+
+    return {
+        "success": True,
+        "weeksAhead": weeks_ahead,
+        "avgLaborRate": round(avg_labor_rate, 2),
+        "laborPctTarget": settings.get("laborPctTarget", 35.0),
+        "forecasts": forecasts,
+    }
+
+
 # Time Categorization & Waste Tracking — Phase 7
 # ---------------------------------------------------------------------------
 

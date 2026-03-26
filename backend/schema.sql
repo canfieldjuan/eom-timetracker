@@ -80,6 +80,22 @@ CREATE TABLE visits (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Schedules (planned hours per employee per customer per week)
+CREATE TABLE schedules (
+    id              SERIAL PRIMARY KEY,
+    employee_id     INTEGER NOT NULL REFERENCES employees(id),
+    location_id     INTEGER REFERENCES locations(id),
+    customer_name   TEXT NOT NULL,
+    week_start      DATE NOT NULL,
+    scheduled_hours NUMERIC(6, 2) NOT NULL,
+    notes           TEXT NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (employee_id, customer_name, week_start)
+);
+
+CREATE INDEX idx_schedules_week ON schedules(week_start);
+CREATE INDEX idx_schedules_employee ON schedules(employee_id);
+
 -- Settings (key-value)
 CREATE TABLE settings (
     key   TEXT PRIMARY KEY,
