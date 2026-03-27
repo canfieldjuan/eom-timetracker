@@ -212,7 +212,8 @@ def parse_allowed_ips(value: Optional[str]) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
-LOCATION_MATCH_RADIUS_M = 50  # ~165 feet
+LOCATION_MATCH_RADIUS_DEFAULT_M = 50
+LOCATION_MATCH_RADIUS_M = LOCATION_MATCH_RADIUS_DEFAULT_M
 
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -422,7 +423,7 @@ def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
     return {"entries": entries, "nextId": next_id, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies}
 
 
-# ─── PostgreSQL-backed data layer ────────────────────────────────────────────
+# --- PostgreSQL-backed data layer --------------------------------------------
 
 def _row_to_employee(row: Dict[str, Any]) -> Dict[str, Any]:
     rate = row.get("hourly_rate")
@@ -510,7 +511,7 @@ def load_employees() -> Dict[str, Any]:
 
 def save_employees(employees_data: Dict[str, Any]) -> None:
     with EMPLOYEE_WRITE_LOCK:
-        pre_ids: set = set()  # treat all as inserts (name conflict → update)
+        pre_ids: set = set()  # treat all as inserts (name conflict -> update)
         _save_employees_to_db(employees_data, pre_ids)
 
 
@@ -533,7 +534,20 @@ def _row_to_visit(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _row_to_entry(row: Dict[str, Any], visits: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _row_to_departure(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "departureTime": to_utc_iso(row["departure_time"]) if row.get("departure_time") else "",
+        "location":      row["location"] or "",
+        "customer":      row["customer_name"] or "",
+        "gps":           row["gps"],
+    }
+
+
+def _row_to_entry(
+    row: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    departures: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     co = row.get("clock_out")
     return {
         "id":           row["id"],
@@ -552,6 +566,7 @@ def _row_to_entry(row: Dict[str, Any], visits: List[Dict[str, Any]]) -> Dict[str
         "timeCategory": row.get("time_category", "productive"),
         "nonProductiveType": row.get("non_productive_type"),
         "visits":       visits,
+        "departures":   departures,
     }
 
 
@@ -606,6 +621,19 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
     for r in visit_rows:
         visits_by_shift.setdefault(r["shift_id"], []).append(_row_to_visit(r))
 
+    departure_rows = db.query_all(
+        """
+        SELECT d.shift_id, COALESCE(l.address, '') AS location,
+               d.customer_name, d.departure_time, d.gps
+        FROM departures d
+        LEFT JOIN locations l ON d.location_id = l.id
+        ORDER BY d.shift_id, d.departure_time
+        """
+    )
+    departures_by_shift: Dict[int, List[Dict[str, Any]]] = {}
+    for r in departure_rows:
+        departures_by_shift.setdefault(r["shift_id"], []).append(_row_to_departure(r))
+
     shift_rows = db.query_all(
         """
         SELECT s.id, s.employee_id, e.name AS employee_name,
@@ -620,7 +648,14 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
         ORDER BY s.id
         """
     )
-    entries = [_row_to_entry(r, visits_by_shift.get(r["id"], [])) for r in shift_rows]
+    entries = [
+        _row_to_entry(
+            r,
+            visits_by_shift.get(r["id"], []),
+            departures_by_shift.get(r["id"], []),
+        )
+        for r in shift_rows
+    ]
     max_id = max((e["id"] for e in entries), default=0)
 
     return {
@@ -643,8 +678,9 @@ def _save_timesheets_to_db(
     timesheet_data: Dict[str, Any],
     pre_shift_ids: set,
     pre_visit_counts: Dict[int, int],
+    pre_departure_counts: Dict[int, int],
 ) -> None:
-    """Upsert locations, shifts, and new visits. Updates in-memory entry IDs for new shifts."""
+    """Upsert locations, shifts, and new child events. Updates in-memory entry IDs for new shifts."""
     with db.get_conn() as conn:
         cur = conn.cursor()
 
@@ -768,6 +804,23 @@ def _save_timesheets_to_db(
                     ),
                 )
 
+            existing_departure_count = pre_departure_counts.get(entry["id"], 0)
+            for departure in entry.get("departures", [])[existing_departure_count:]:
+                d_loc_id = addr_to_id.get(departure.get("location", ""))
+                cur.execute(
+                    """
+                    INSERT INTO departures (shift_id, location_id, customer_name, departure_time, gps)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        entry["id"],
+                        d_loc_id,
+                        departure.get("customer") or None,
+                        departure.get("departureTime"),
+                        json.dumps(departure["gps"]) if departure.get("gps") else None,
+                    ),
+                )
+
         cur.execute(
             "SELECT setval('shifts_id_seq', COALESCE(MAX(id), 1)) FROM shifts"
         )
@@ -828,6 +881,7 @@ def update_timesheets(mutator) -> Tuple[bool, Any]:
         timesheet_data = _load_timesheets_from_db()
         pre_shift_ids = {e["id"] for e in timesheet_data["entries"]}
         pre_visit_counts = {e["id"]: len(e.get("visits", [])) for e in timesheet_data["entries"]}
+        pre_departure_counts = {e["id"]: len(e.get("departures", [])) for e in timesheet_data["entries"]}
 
         changed = False
         if AUTO_CLOSE_STALE_SHIFTS:
@@ -835,7 +889,7 @@ def update_timesheets(mutator) -> Tuple[bool, Any]:
 
         ok, payload = mutator(timesheet_data)
         if ok or changed:
-            _save_timesheets_to_db(timesheet_data, pre_shift_ids, pre_visit_counts)
+            _save_timesheets_to_db(timesheet_data, pre_shift_ids, pre_visit_counts, pre_departure_counts)
         return ok, payload
 
 
@@ -1021,12 +1075,29 @@ def build_public_current_status() -> List[Dict[str, Any]]:
             continue
 
         visits = entry.get("visits") or []
-        last_visit = visits[-1] if visits else None
-        loc = last_visit["location"] if last_visit else str(entry.get("location", ""))
-        customer = (last_visit.get("customer") or _resolve_customer(loc, location_customers)) if last_visit else _resolve_customer(loc, location_customers)
-        # Best available GPS: walk visits newest-first for one with coords, fall back to clock-in GPS
+        departures = entry.get("departures") or []
+        active_visit = get_active_visit(entry)
+        last_departure = departures[-1] if departures else None
+        if active_visit:
+            loc = active_visit.get("location", "")
+            customer = active_visit.get("customer") or _resolve_customer(loc, location_customers)
+        elif last_departure:
+            loc = last_departure.get("location", "") or str(entry.get("location", ""))
+            customer = last_departure.get("customer") or _resolve_customer(loc, location_customers)
+        else:
+            loc = str(entry.get("location", ""))
+            customer = _resolve_customer(loc, location_customers)
+        # Best available GPS: active visit, latest departure, latest visit, then clock-in GPS
+        last_departure_gps = next((d for d in reversed(departures) if isinstance(d.get("gps"), dict)), None)
         last_gps_visit = next((v for v in reversed(visits) if isinstance(v.get("gps"), dict)), None)
-        gps = last_gps_visit["gps"] if last_gps_visit else entry.get("clockInGps")
+        if active_visit and isinstance(active_visit.get("gps"), dict):
+            gps = active_visit["gps"]
+        elif last_departure_gps:
+            gps = last_departure_gps["gps"]
+        elif last_gps_visit:
+            gps = last_gps_visit["gps"]
+        else:
+            gps = entry.get("clockInGps")
 
         visit_rows = []
         for v in visits:
@@ -1043,6 +1114,21 @@ def build_public_current_status() -> List[Dict[str, Any]]:
             except ValueError:
                 pass
 
+        departure_rows = []
+        for d in departures:
+            if not isinstance(d, dict) or not d.get("departureTime"):
+                continue
+            try:
+                d_time = parse_utc_iso(str(d["departureTime"]))
+                departure_rows.append({
+                    "departureTime": local_clock_string(d_time),
+                    "location": d.get("location", ""),
+                    "customer": d.get("customer", ""),
+                    "gps": d.get("gps") if isinstance(d.get("gps"), dict) else None,
+                })
+            except ValueError:
+                pass
+
         rows.append(
             {
                 "id": int(entry.get("employeeId", 0)),
@@ -1054,6 +1140,13 @@ def build_public_current_status() -> List[Dict[str, Any]]:
                 "customer": customer,
                 "clockInGps": gps,
                 "visits": visit_rows,
+                "departures": departure_rows,
+                "activeVisit": {
+                    "location": active_visit.get("location", ""),
+                    "customer": active_visit.get("customer", ""),
+                    "gps": active_visit.get("gps") if isinstance(active_visit.get("gps"), dict) else None,
+                } if active_visit else None,
+                "canDepart": active_visit is not None,
             }
         )
 
@@ -1257,6 +1350,12 @@ class ClockOutRequest(BaseModel):
     longitude: Optional[float] = None
 
 
+class DepartRequest(BaseModel):
+    notes: str = ""
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+
 class EntryAdjustRequest(BaseModel):
     clockIn: Optional[str] = None   # "YYYY-MM-DDTHH:MM" local time
     clockOut: Optional[str] = None  # "YYYY-MM-DDTHH:MM" local time, or "" to clear
@@ -1325,6 +1424,7 @@ APP_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 TOKEN_TTL_HOURS = parse_int(os.getenv("TOKEN_TTL_HOURS"), 12)
 MAX_ACTIVE_SHIFT_HOURS = float(os.getenv("MAX_ACTIVE_SHIFT_HOURS", "24"))
 AUTO_CLOSE_STALE_SHIFTS = parse_bool(os.getenv("AUTO_CLOSE_STALE_SHIFTS"), True)
+LOCATION_MATCH_RADIUS_M = parse_int(os.getenv("LOCATION_MATCH_RADIUS_M"), LOCATION_MATCH_RADIUS_DEFAULT_M)
 
 ACCESS_START_HOUR = parse_int(os.getenv("ACCESS_START_HOUR"), 8)
 ACCESS_END_HOUR = parse_int(os.getenv("ACCESS_END_HOUR"), 18)
@@ -1335,6 +1435,25 @@ TRUST_PROXY = parse_bool(os.getenv("TRUST_PROXY"), False)
 BOOTSTRAP_ADMIN_IDS = [
     int(x) for x in os.getenv("BOOTSTRAP_ADMIN_IDS", "").split(",") if x.strip().isdigit()
 ]
+
+# ---------------------------------------------------------------------------
+# Business-rule defaults — single source of truth for all threshold settings.
+# These seed the `settings` DB table on first boot and serve as in-code
+# fallbacks if a key is somehow absent from the DB.
+# ---------------------------------------------------------------------------
+_SETTINGS_DEFAULTS: Dict[str, Any] = {
+    "laborPctTarget":    35.0,   # target labor % of revenue
+    "laborPctWatch":     40.0,   # labor % above this = Watch flag
+    "laborPctFix":       55.0,   # labor % above this = Fix flag
+    "laborPctDrop":      70.0,   # labor % above this = Drop flag
+    "grossMarginMin":    30.0,   # gross margin % below this = Watch
+    "grossMarginFix":    15.0,   # gross margin % below this = Fix
+    "grossMarginDrop":    0.0,   # gross margin % at/below this = Drop
+    "hourOverrunWatch":   0.5,   # hours over expected = Watch
+    "hourOverrunFix":     2.0,   # hours over expected = Fix
+    "rplhMin":           25.0,   # revenue per labor hour below this = flagged
+    "laborRateFallback": 15.0,   # avg labor rate used when no employee rates are set
+}
 
 
 def apply_bootstrap_admins() -> None:
@@ -1431,27 +1550,29 @@ def _ensure_schema_migrations() -> None:
             UNIQUE (employee_id, customer_name, week_start)
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS departures (
+            id             SERIAL PRIMARY KEY,
+            shift_id       INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+            location_id    INTEGER REFERENCES locations(id),
+            customer_name  TEXT,
+            departure_time TIMESTAMPTZ NOT NULL,
+            gps            JSONB,
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_week ON schedules(week_start)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_employee ON schedules(employee_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_departures_shift_id ON departures(shift_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_departures_time ON departures(departure_time)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_departures_location_id ON departures(location_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_shifts_time_cat ON shifts(time_category)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_shifts_clock_out ON shifts(clock_out)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_locations_active ON locations(active)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_employees_active ON employees(active)")
 
     # Seed threshold defaults if not already in settings
-    threshold_defaults = {
-        "laborPctTarget": 35.0,
-        "laborPctWatch": 40.0,
-        "laborPctFix": 55.0,
-        "laborPctDrop": 70.0,
-        "grossMarginMin": 30.0,
-        "grossMarginFix": 15.0,
-        "grossMarginDrop": 0.0,
-        "hourOverrunWatch": 0.5,
-        "hourOverrunFix": 2.0,
-        "rplhMin": 25.0,
-    }
-    for key, default_val in threshold_defaults.items():
+    for key, default_val in _SETTINGS_DEFAULTS.items():
         db.execute(
             """
             INSERT INTO settings (key, value) VALUES (%s, %s::jsonb)
@@ -1462,7 +1583,7 @@ def _ensure_schema_migrations() -> None:
 
 
 def _auto_migrate_if_empty() -> None:
-    """Run JSON→PostgreSQL migration if the employees table is empty."""
+    """Run JSON->PostgreSQL migration if the employees table is empty."""
     result = db.query_one("SELECT COUNT(*) AS n FROM employees")
     if result and result["n"] > 0:
         return
@@ -1735,7 +1856,7 @@ def admin_employee_hours(
 
     shifts.sort(key=lambda x: (x["date"], x["clockIn"]), reverse=True)
 
-    # Build weekly grid (Sun–Sat) for the requested week
+    # Build weekly grid (Sun-Sat) for the requested week
     days_since_sunday = (now.weekday() + 1) % 7
     this_sunday_utc = (now - timedelta(days=days_since_sunday)).replace(hour=0, minute=0, second=0, microsecond=0)
     grid_sunday_utc = this_sunday_utc + timedelta(weeks=week_offset)
@@ -1951,7 +2072,7 @@ def log_visit(
 
         if has_gps:
             matched = find_nearest_location(payload.latitude, payload.longitude, timesheet_data)
-            location = matched or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+            location = matched or str(payload.location or "").strip() or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
         else:
             location = str(payload.location or "").strip() or "Unknown"
 
@@ -1959,7 +2080,8 @@ def log_visit(
 
         # Avoid duplicate: skip if location matches the most recent visit
         existing_visits = open_entry.get("visits") or []
-        if existing_visits and existing_visits[-1].get("location") == location:
+        active_visit = get_active_visit(open_entry)
+        if active_visit and active_visit.get("location") == location:
             return False, "already_at_location"
 
         visit = {
@@ -1986,6 +2108,72 @@ def log_visit(
     return {"success": True, "alreadyHere": False, **result}
 
 
+def get_active_visit(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    visits = entry.get("visits") or []
+    if not visits:
+        return None
+
+    departures = entry.get("departures") or []
+    if len(departures) >= len(visits):
+        return None
+
+    last_visit = visits[-1]
+    arrival_time = str(last_visit.get("arrivalTime", "")).strip()
+    return last_visit if arrival_time else None
+
+
+@app.post("/api/timesheet/depart")
+def depart_location(
+    payload: Optional[DepartRequest],
+    request: Request,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    now_utc = utc_now()
+
+    def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
+        if not open_entry or is_stale_open_entry(open_entry, now_utc):
+            return False, "Not currently clocked in"
+
+        active_visit = get_active_visit(open_entry)
+        if not active_visit:
+            return False, "No active arrival to depart from"
+
+        departure = {
+            "departureTime": to_utc_iso(now_utc),
+            "location": active_visit.get("location", ""),
+            "customer": active_visit.get("customer", ""),
+            "gps": None,
+        }
+        if payload and payload.latitude is not None and payload.longitude is not None:
+            departure["gps"] = {
+                "lat": payload.latitude,
+                "lng": payload.longitude,
+            }
+
+        if not isinstance(open_entry.get("departures"), list):
+            open_entry["departures"] = []
+        open_entry["departures"].append(departure)
+
+        if payload and payload.notes and not str(open_entry.get("notes", "")).strip():
+            open_entry["notes"] = payload.notes.strip()
+
+        return True, {"departure": departure, "entryId": open_entry["id"]}
+
+    ok, result = update_timesheets(mutator)
+    if not ok:
+        append_access_log(request, "DEPARTURE_FAILED", False, str(result))
+        raise HTTPException(status_code=400, detail=str(result))
+
+    append_access_log(
+        request,
+        "DEPARTURE_LOGGED",
+        True,
+        f"Employee: {employee['name']} departed {result['departure']['location']}",
+    )
+    return {"success": True, **result}
+
+
 @app.patch("/api/admin/entries/{entry_id}")
 def admin_adjust_entry(
     entry_id: int,
@@ -2008,18 +2196,18 @@ def admin_adjust_entry(
             try:
                 new_ci_utc = parse_local_dt(payload.clockIn).astimezone(timezone.utc)
             except ValueError:
-                return False, "Invalid clockIn — use YYYY-MM-DDTHH:MM"
+                return False, "Invalid clockIn - use YYYY-MM-DDTHH:MM"
 
         if payload.clockOut is not None:
             if payload.clockOut.strip() == "":
-                # Clear clock-out → make shift active again
+                # Clear clock-out -> make shift active again
                 entry["clockOut"] = None
                 entry["totalHours"] = 0.0
             else:
                 try:
                     new_co_utc = parse_local_dt(payload.clockOut).astimezone(timezone.utc)
                 except ValueError:
-                    return False, "Invalid clockOut — use YYYY-MM-DDTHH:MM"
+                    return False, "Invalid clockOut - use YYYY-MM-DDTHH:MM"
 
         # Apply clock-in change
         if new_ci_utc is not None:
@@ -2139,7 +2327,7 @@ def timesheet_locations(
 ) -> Dict[str, Any]:
     payload = load_timesheets()
     append_access_log(request, "LOCATIONS_SUCCESS", True, "Locations fetched")
-    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"], "location_customers": payload["location_customers"], "location_rates": payload["location_rates"], "location_rate_types": payload["location_rate_types"], "location_types": payload["location_types"], "location_frequencies": payload["location_frequencies"], "location_expected_hours": payload.get("location_expected_hours", {})}
+    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"], "location_customers": payload["location_customers"], "location_rates": payload["location_rates"], "location_rate_types": payload["location_rate_types"], "location_types": payload["location_types"], "location_frequencies": payload["location_frequencies"], "location_expected_hours": payload.get("location_expected_hours", {}), "locationMatchRadiusM": LOCATION_MATCH_RADIUS_M}
 
 
 @app.put("/api/admin/locations")
@@ -2268,6 +2456,9 @@ def timesheet_current_status(
             "notes": row["notes"],
             "clockInGps": row.get("clockInGps"),
             "visits": row.get("visits", []),
+            "departures": row.get("departures", []),
+            "activeVisit": row.get("activeVisit"),
+            "canDepart": row.get("canDepart", False),
         }
         for row in rows
     ]
@@ -2484,7 +2675,7 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
             co_dt = parse_utc_iso(str(entry["clockOut"]))
             co_display = local_clock_string(co_dt)
         except (ValueError, KeyError):
-            co_display = "—"
+            co_display = "-"
 
         loc = entry.get("location", "")
         rows.append({
@@ -2567,19 +2758,7 @@ def admin_reports_hours_export(
 
 
 def load_settings() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "laborPctTarget": 35.0,
-        # Phase 4: threshold settings
-        "laborPctWatch": 40.0,     # labor % above this = Watch
-        "laborPctFix": 55.0,       # labor % above this = Fix
-        "laborPctDrop": 70.0,      # labor % above this = Drop
-        "grossMarginMin": 30.0,    # margin below this = Watch
-        "grossMarginFix": 15.0,    # margin below this = Fix
-        "grossMarginDrop": 0.0,    # margin at or below this = Drop
-        "hourOverrunWatch": 0.5,   # hours over expected = Watch
-        "hourOverrunFix": 2.0,     # hours over expected = Fix
-        "rplhMin": 25.0,           # revenue per labor hour below this = flagged
-    }
+    defaults: Dict[str, Any] = _SETTINGS_DEFAULTS.copy()
     rows = db.query_all("SELECT key, value FROM settings")
     data: Dict[str, Any] = {r["key"]: r["value"] for r in rows}
     for k, v in defaults.items():
@@ -2632,7 +2811,7 @@ def admin_update_settings(
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Scheduling & Forecasting — Phase 8
+# Scheduling & Forecasting - Phase 8
 # ---------------------------------------------------------------------------
 
 @app.post("/api/admin/schedules")
@@ -2900,7 +3079,7 @@ def admin_forecast(
 
     # Get avg labor rate
     avg_rate_row = db.query_one("SELECT AVG(hourly_rate) AS avg_rate FROM employees WHERE hourly_rate IS NOT NULL AND active = true")
-    avg_labor_rate = float(avg_rate_row["avg_rate"]) if avg_rate_row and avg_rate_row["avg_rate"] else 15.0
+    avg_labor_rate = float(avg_rate_row["avg_rate"]) if avg_rate_row and avg_rate_row["avg_rate"] else _SETTINGS_DEFAULTS["laborRateFallback"]
 
     # Build forecast for each future week
     forecasts = []
@@ -2978,12 +3157,12 @@ def admin_forecast(
         "success": True,
         "weeksAhead": weeks_ahead,
         "avgLaborRate": round(avg_labor_rate, 2),
-        "laborPctTarget": settings.get("laborPctTarget", 35.0),
+        "laborPctTarget": settings.get("laborPctTarget", _SETTINGS_DEFAULTS["laborPctTarget"]),
         "forecasts": forecasts,
     }
 
 
-# Time Categorization & Waste Tracking — Phase 7
+# Time Categorization & Waste Tracking - Phase 7
 # ---------------------------------------------------------------------------
 
 @app.patch("/api/admin/shifts/{shift_id}/categorize")
@@ -3168,7 +3347,7 @@ def admin_waste_analysis(
 
 
 # ---------------------------------------------------------------------------
-# Pricing Recommendations — Phase 6
+# Pricing Recommendations - Phase 6
 # ---------------------------------------------------------------------------
 
 @app.get("/api/admin/analytics/pricing")
@@ -3194,8 +3373,8 @@ def admin_pricing_recommendations(
     for addr, cust in location_customers.items():
         customer_to_loc[cust] = addr
 
-    default_target_labor = settings.get("laborPctTarget", 35.0)
-    default_min_margin = settings.get("grossMarginMin", 30.0)
+    default_target_labor = settings.get("laborPctTarget", _SETTINGS_DEFAULTS["laborPctTarget"])
+    default_min_margin = settings.get("grossMarginMin", _SETTINGS_DEFAULTS["grossMarginMin"])
 
     recommendations = []
     for c in data["byCustomer"]:
@@ -3292,7 +3471,7 @@ def admin_pricing_recommendations(
 
 
 # ---------------------------------------------------------------------------
-# Jobs (service visits) — Phase 3
+# Jobs (service visits) - Phase 3
 # ---------------------------------------------------------------------------
 
 def _job_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -3767,6 +3946,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
 
     days_in_period = (end_date - start_date).days + 1 if (start_date and end_date) else 365
     monthly_customers_credited: set = set()
+    visited_customer_dates: set = set()  # (customer, date_key) - dedup multi-employee same-day visits
 
     customer_agg: Dict[str, Dict[str, Any]] = {}
     day_agg: Dict[str, Dict[str, Any]] = {}
@@ -3791,20 +3971,29 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
 
     def _aggregate(customer: str, resolved_location: str, hours: float, emp_id: int,
                    entry_date: Any, date_key: str, is_visit: bool) -> None:
+        # Determine first-arrival: deduplicates multi-employee same-day visits
+        visit_key = (customer, date_key)
+        is_new_visit = is_visit and visit_key not in visited_customer_dates
+        if is_new_visit:
+            visited_customer_dates.add(visit_key)
+
         rate = location_rates.get(resolved_location)
         rate_type = location_rate_types.get(resolved_location, "per_visit")
         if rate is not None:
             if rate_type == "hourly":
+                # Per-employee, per-hour: scales correctly with number of workers sent
                 revenue = rate * hours
             elif rate_type == "monthly":
-                if customer not in monthly_customers_credited:
+                # Credit once per customer per calendar month (handles multi-month periods)
+                month_key = (customer, f"{entry_date.year}-{entry_date.month:02d}")
+                if month_key not in monthly_customers_credited:
                     days_in_month = calendar.monthrange(entry_date.year, entry_date.month)[1]
                     revenue = round(rate * min(days_in_period / days_in_month, 1.0), 2)
-                    monthly_customers_credited.add(customer)
+                    monthly_customers_credited.add(month_key)
                 else:
                     revenue = 0.0
-            else:  # per_visit
-                revenue = rate if is_visit else 0.0
+            else:  # per_visit: credit once per customer per day
+                revenue = rate if is_new_visit else 0.0
         else:
             revenue = 0.0
 
@@ -3819,7 +4008,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                 "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0,
                 "expectedHours": 0.0, "_hasExpected": False,
             }
-        if is_visit:
+        if is_new_visit:
             customer_agg[customer]["visits"] += 1
             if exp_h is not None:
                 customer_agg[customer]["expectedHours"] += exp_h
@@ -3830,7 +4019,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
 
         if date_key not in day_agg:
             day_agg[date_key] = {"date": date_key, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
-        if is_visit:
+        if is_new_visit:
             day_agg[date_key]["visits"] += 1
         day_agg[date_key]["hours"] += hours
         day_agg[date_key]["revenue"] += revenue
@@ -3839,6 +4028,8 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     for entry in timesheet_data["entries"]:
         if entry.get("clockOut") is None:
             continue
+        if entry.get("timeCategory") == "non_productive":
+            continue  # non-productive time belongs in waste analytics, not customer analytics
         ci_str = str(entry.get("clockIn", "")).strip()
         if not ci_str:
             continue
@@ -3884,25 +4075,29 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             _aggregate(customer, resolved_location, hours, emp_id, entry_date, date_key, is_visit=True)
 
     def _classify(labor_pct, gross_margin, variance, rplh) -> Tuple[str, List[str]]:
-        """Return (flag, reasons) — flag is Healthy/Watch/Fix/Raise Price/Drop."""
+        """Return (flag, reasons) - flag is Healthy/Watch/Fix/Raise Price/Drop."""
         reasons: List[str] = []
         severity = 0  # 0=Healthy, 1=Watch, 2=Fix/Raise Price, 3=Drop
 
+        lp_drop  = settings.get("laborPctDrop",  _SETTINGS_DEFAULTS["laborPctDrop"])
+        lp_fix   = settings.get("laborPctFix",   _SETTINGS_DEFAULTS["laborPctFix"])
+        lp_watch = settings.get("laborPctWatch", _SETTINGS_DEFAULTS["laborPctWatch"])
+
         if labor_pct is not None:
-            if labor_pct >= settings.get("laborPctDrop", 70.0):
-                reasons.append(f"Labor % {labor_pct}% >= {settings.get('laborPctDrop', 70.0)}% (drop)")
+            if labor_pct >= lp_drop:
+                reasons.append(f"Labor % {labor_pct}% >= {lp_drop}% (drop)")
                 severity = max(severity, 3)
-            elif labor_pct >= settings.get("laborPctFix", 55.0):
-                reasons.append(f"Labor % {labor_pct}% >= {settings.get('laborPctFix', 55.0)}% (fix)")
+            elif labor_pct >= lp_fix:
+                reasons.append(f"Labor % {labor_pct}% >= {lp_fix}% (fix)")
                 severity = max(severity, 2)
-            elif labor_pct >= settings.get("laborPctWatch", 40.0):
-                reasons.append(f"Labor % {labor_pct}% >= {settings.get('laborPctWatch', 40.0)}% (watch)")
+            elif labor_pct >= lp_watch:
+                reasons.append(f"Labor % {labor_pct}% >= {lp_watch}% (watch)")
                 severity = max(severity, 1)
 
         if gross_margin is not None:
-            gm_drop = settings.get("grossMarginDrop", 0.0)
-            gm_fix = settings.get("grossMarginFix", 15.0)
-            gm_min = settings.get("grossMarginMin", 30.0)
+            gm_drop = settings.get("grossMarginDrop", _SETTINGS_DEFAULTS["grossMarginDrop"])
+            gm_fix  = settings.get("grossMarginFix",  _SETTINGS_DEFAULTS["grossMarginFix"])
+            gm_min  = settings.get("grossMarginMin",  _SETTINGS_DEFAULTS["grossMarginMin"])
             if gross_margin <= gm_drop:
                 reasons.append(f"Margin {gross_margin}% <= {gm_drop}% (drop)")
                 severity = max(severity, 3)
@@ -3915,8 +4110,8 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
 
         if variance is not None and variance < 0:
             overrun = abs(variance)
-            fix_thresh = settings.get("hourOverrunFix", 2.0)
-            watch_thresh = settings.get("hourOverrunWatch", 0.5)
+            fix_thresh   = settings.get("hourOverrunFix",   _SETTINGS_DEFAULTS["hourOverrunFix"])
+            watch_thresh = settings.get("hourOverrunWatch", _SETTINGS_DEFAULTS["hourOverrunWatch"])
             if overrun >= fix_thresh:
                 reasons.append(f"Overrun {overrun}h >= {fix_thresh}h (fix)")
                 severity = max(severity, 2)
@@ -3926,7 +4121,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
 
         has_overrun = False
         if rplh is not None:
-            rplh_min = settings.get("rplhMin", 25.0)
+            rplh_min = settings.get("rplhMin", _SETTINGS_DEFAULTS["rplhMin"])
             if rplh < rplh_min:
                 reasons.append(f"RPLH ${rplh:.2f} < ${rplh_min:.2f}")
                 severity = max(severity, 1)
@@ -3939,8 +4134,8 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             flag = "Watch"
         else:
             # severity == 2: distinguish Fix (internal) vs Raise Price (pricing)
-            labor_triggered = labor_pct is not None and labor_pct >= settings.get("laborPctFix", 55.0)
-            overrun_triggered = variance is not None and variance < 0 and abs(variance) >= settings.get("hourOverrunFix", 2.0)
+            labor_triggered   = labor_pct is not None and labor_pct >= lp_fix
+            overrun_triggered = variance is not None and variance < 0 and abs(variance) >= settings.get("hourOverrunFix", _SETTINGS_DEFAULTS["hourOverrunFix"])
             if labor_triggered or overrun_triggered:
                 flag = "Fix"
             else:
@@ -4250,7 +4445,7 @@ def admin_analytics_customer(
             customer = location if (location and not location.startswith("GPS ") and location not in ("Unknown", "")) else "Unmatched Location"
         return resolved, customer
 
-    def _calc_revenue(resolved_location: str, cust: str, hours: float, entry_date: Any, is_visit: bool, monthly_credited: set) -> float:
+    def _calc_revenue(resolved_location: str, cust: str, hours: float, entry_date: Any, is_visit: bool, monthly_credited: set, date_key: str) -> float:
         rate = location_rates.get(resolved_location)
         rate_type = location_rate_types.get(resolved_location, "per_visit")
         if rate is None:
@@ -4258,13 +4453,17 @@ def admin_analytics_customer(
         if rate_type == "hourly":
             return float(rate) * hours
         elif rate_type == "monthly":
-            month_key = f"{entry_date.year}-{entry_date.month}-{cust}"
+            month_key = (cust, f"{entry_date.year}-{entry_date.month:02d}")
             if month_key not in monthly_credited:
                 monthly_credited.add(month_key)
                 return float(rate)
             return 0.0
-        else:  # per_visit
-            return float(rate) if is_visit else 0.0
+        else:  # per_visit: credit once per location per day across all employees
+            visit_key = (resolved_location, date_key)
+            if is_visit and visit_key not in visited_for_revenue:
+                visited_for_revenue.add(visit_key)
+                return float(rate)
+            return 0.0
 
     visits_list: List[Dict[str, Any]] = []
     week_agg: Dict[str, Dict[str, Any]] = {}
@@ -4279,10 +4478,11 @@ def admin_analytics_customer(
         week_key: str,
         emp_name: str,
         emp_rate: Any,
+        date_key: str,
     ) -> None:
         if cust != customer_name:
             return
-        revenue = _calc_revenue(resolved_location, cust, hours, entry_date, is_visit, monthly_credited)
+        revenue = _calc_revenue(resolved_location, cust, hours, entry_date, is_visit, monthly_credited, date_key)
         labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
         lp = round(labor_cost / revenue * 100, 1) if revenue > 0 else None
         visits_list.append({
@@ -4303,9 +4503,12 @@ def admin_analytics_customer(
         week_agg[week_key]["revenue"] += revenue
         week_agg[week_key]["laborCost"] += labor_cost
 
+    visited_for_revenue: set = set()  # (resolved_location, date_key) — dedup per_visit in detail view
     for entry in timesheet_data["entries"]:
         if entry.get("clockOut") is None:
             continue
+        if entry.get("timeCategory") == "non_productive":
+            continue  # non-productive time belongs in waste analytics, not customer analytics
         ci_str = str(entry.get("clockIn", "")).strip()
         if not ci_str:
             continue
@@ -4325,6 +4528,7 @@ def admin_analytics_customer(
         days_since_sunday_entry = (entry_date.weekday() + 1) % 7
         week_start = entry_date - timedelta(days=days_since_sunday_entry)
         week_key = week_start.strftime("%Y-%m-%d")
+        date_key = entry_date.strftime("%Y-%m-%d")
 
         visits = entry.get("visits") or []
         if visits:
@@ -4345,11 +4549,11 @@ def admin_analytics_customer(
                         pass
                 v_hours = max((next_time - v_arrival).total_seconds() / 3600, 0.0)
                 resolved_location, cust = _resolve_loc(visit.get("location", ""))
-                _record(resolved_location, cust, v_hours, True, entry_date, week_key, emp_name, emp_rate)
+                _record(resolved_location, cust, v_hours, True, entry_date, week_key, emp_name, emp_rate, date_key)
         else:
             e_hours = float(entry.get("totalHours", 0) or 0)
             resolved_location, cust = _resolve_loc(entry.get("location", ""))
-            _record(resolved_location, cust, e_hours, True, entry_date, week_key, emp_name, emp_rate)
+            _record(resolved_location, cust, e_hours, True, entry_date, week_key, emp_name, emp_rate, date_key)
 
     def _fin_week(w: Dict[str, Any]) -> Dict[str, Any]:
         rev = w["revenue"]

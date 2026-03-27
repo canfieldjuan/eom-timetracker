@@ -80,6 +80,17 @@ CREATE TABLE visits (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Departures (explicit leaving events during a shift)
+CREATE TABLE departures (
+    id             SERIAL PRIMARY KEY,
+    shift_id       INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+    location_id    INTEGER REFERENCES locations(id),
+    customer_name  TEXT,
+    departure_time TIMESTAMPTZ NOT NULL,
+    gps            JSONB,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Schedules (planned hours per employee per customer per week)
 CREATE TABLE schedules (
     id              SERIAL PRIMARY KEY,
@@ -113,6 +124,9 @@ CREATE INDEX idx_shifts_location_id ON shifts(location_id);
 CREATE INDEX idx_visits_shift_id    ON visits(shift_id);
 CREATE INDEX idx_visits_arrival     ON visits(arrival_time);
 CREATE INDEX idx_visits_location_id ON visits(location_id);
+CREATE INDEX idx_departures_shift_id ON departures(shift_id);
+CREATE INDEX idx_departures_time     ON departures(departure_time);
+CREATE INDEX idx_departures_location_id ON departures(location_id);
 CREATE INDEX idx_jobs_location_id    ON jobs(location_id);
 CREATE INDEX idx_jobs_scheduled_date ON jobs(scheduled_date);
 CREATE INDEX idx_jobs_customer       ON jobs(customer_name);
