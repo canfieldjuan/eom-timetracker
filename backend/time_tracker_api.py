@@ -224,16 +224,53 @@ def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def find_nearest_location(lat: float, lng: float, timesheet_data: Dict[str, Any]) -> Optional[str]:
+def find_nearest_location_match(lat: float, lng: float, timesheet_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     coords = timesheet_data.get("location_coords", {})
     best_name, best_dist = None, float("inf")
     for name, c in coords.items():
         d = haversine_m(lat, lng, c["lat"], c["lng"])
         if d < best_dist:
             best_name, best_dist = name, d
-    if best_name and best_dist <= LOCATION_MATCH_RADIUS_M:
-        return best_name
+    if not best_name:
+        return None
+    return {
+        "location": best_name,
+        "distanceM": best_dist,
+        "withinRadius": best_dist <= LOCATION_MATCH_RADIUS_M,
+    }
+
+
+def find_nearest_location(lat: float, lng: float, timesheet_data: Dict[str, Any]) -> Optional[str]:
+    nearest = find_nearest_location_match(lat, lng, timesheet_data)
+    if nearest and nearest["withinRadius"]:
+        return str(nearest["location"])
     return None
+
+
+def build_gps_meta(
+    timesheet_data: Dict[str, Any],
+    latitude: Optional[float],
+    longitude: Optional[float],
+    override_reason: str = "",
+    override_detail: str = "",
+) -> Optional[Dict[str, Any]]:
+    reason = str(override_reason or "").strip()
+    detail = str(override_detail or "").strip()
+    nearest = None
+    if latitude is not None and longitude is not None:
+        nearest = find_nearest_location_match(latitude, longitude, timesheet_data)
+
+    if not nearest and not reason and not detail:
+        return None
+
+    return {
+        "override": bool(reason),
+        "overrideReason": reason,
+        "overrideDetail": detail,
+        "matchedLocation": str(nearest["location"]) if nearest else "",
+        "distanceM": round(float(nearest["distanceM"]), 2) if nearest else None,
+        "withinRadius": bool(nearest["withinRadius"]) if nearest else None,
+    }
 
 
 def validate_schedule(start_hour: int, end_hour: int) -> None:
@@ -528,18 +565,20 @@ def update_employees(mutator) -> Tuple[bool, Any]:
 def _row_to_visit(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "arrivalTime": to_utc_iso(row["arrival_time"]) if row.get("arrival_time") else "",
-        "location":    row["location"] or "",
+        "location":    row.get("location") or row.get("location_label") or "",
         "customer":    row["customer_name"] or "",
         "gps":         row["gps"],
+        "gpsMeta":     row.get("gps_meta"),
     }
 
 
 def _row_to_departure(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "departureTime": to_utc_iso(row["departure_time"]) if row.get("departure_time") else "",
-        "location":      row["location"] or "",
+        "location":      row.get("location") or row.get("location_label") or "",
         "customer":      row["customer_name"] or "",
         "gps":           row["gps"],
+        "gpsMeta":       row.get("gps_meta"),
     }
 
 
@@ -553,7 +592,7 @@ def _row_to_entry(
         "id":           row["id"],
         "employeeId":   row["employee_id"],
         "employeeName": row["employee_name"] or "",
-        "location":     row["location"] or "",
+        "location":     row.get("location") or row.get("location_label") or "",
         "clockIn":      to_utc_iso(row["clock_in"]) if row.get("clock_in") else "",
         "clockOut":     to_utc_iso(co) if co else None,
         "totalHours":   float(row["total_hours"] or 0),
@@ -561,7 +600,9 @@ def _row_to_entry(
         "date":         str(row["local_date"]) if row.get("local_date") else "",
         "timezone":     row["timezone"] or "America/Chicago",
         "clockInGps":   row["clock_in_gps"],
+        "clockInGpsMeta": row.get("clock_in_gps_meta"),
         "clockOutGps":  row["clock_out_gps"],
+        "clockOutGpsMeta": row.get("clock_out_gps_meta"),
         "jobId":        row.get("job_id"),
         "timeCategory": row.get("time_category", "productive"),
         "nonProductiveType": row.get("non_productive_type"),
@@ -611,7 +652,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
     visit_rows = db.query_all(
         """
         SELECT v.shift_id, COALESCE(l.address, '') AS location,
-               v.customer_name, v.arrival_time, v.gps
+               v.location_label, v.customer_name, v.arrival_time, v.gps, v.gps_meta
         FROM visits v
         LEFT JOIN locations l ON v.location_id = l.id
         ORDER BY v.shift_id, v.arrival_time
@@ -624,7 +665,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
     departure_rows = db.query_all(
         """
         SELECT d.shift_id, COALESCE(l.address, '') AS location,
-               d.customer_name, d.departure_time, d.gps
+               d.location_label, d.customer_name, d.departure_time, d.gps, d.gps_meta
         FROM departures d
         LEFT JOIN locations l ON d.location_id = l.id
         ORDER BY d.shift_id, d.departure_time
@@ -638,9 +679,11 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
         """
         SELECT s.id, s.employee_id, e.name AS employee_name,
                COALESCE(l.address, '') AS location,
+               s.location_label,
                s.clock_in, s.clock_out, s.total_hours,
                s.notes, s.local_date, s.timezone,
-               s.clock_in_gps, s.clock_out_gps,
+               s.clock_in_gps, s.clock_in_gps_meta,
+               s.clock_out_gps, s.clock_out_gps_meta,
                s.job_id, s.time_category, s.non_productive_type
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
@@ -730,15 +773,17 @@ def _save_timesheets_to_db(
                 cur.execute(
                     """
                     INSERT INTO shifts
-                      (employee_id, location_id, clock_in, clock_out, total_hours,
-                       notes, local_date, timezone, clock_in_gps, clock_out_gps,
+                      (employee_id, location_id, location_label, clock_in, clock_out, total_hours,
+                       notes, local_date, timezone, clock_in_gps, clock_in_gps_meta,
+                       clock_out_gps, clock_out_gps_meta,
                        job_id, time_category, non_productive_type)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
                         entry["employeeId"],
                         loc_id,
+                        entry.get("location", ""),
                         entry.get("clockIn"),
                         entry.get("clockOut"),
                         entry.get("totalHours"),
@@ -746,7 +791,9 @@ def _save_timesheets_to_db(
                         entry.get("date") or None,
                         entry.get("timezone", "America/Chicago"),
                         json.dumps(entry["clockInGps"]) if entry.get("clockInGps") else None,
+                        json.dumps(entry["clockInGpsMeta"]) if entry.get("clockInGpsMeta") else None,
                         json.dumps(entry["clockOutGps"]) if entry.get("clockOutGps") else None,
+                        json.dumps(entry["clockOutGpsMeta"]) if entry.get("clockOutGpsMeta") else None,
                         entry.get("jobId"),
                         entry.get("timeCategory", "productive"),
                         entry.get("nonProductiveType"),
@@ -758,13 +805,16 @@ def _save_timesheets_to_db(
                     """
                     UPDATE shifts SET
                         location_id         = %s,
+                        location_label      = %s,
                         clock_out           = %s,
                         total_hours         = %s,
                         notes               = %s,
                         local_date          = %s,
                         timezone            = %s,
                         clock_in_gps        = %s,
+                        clock_in_gps_meta   = %s,
                         clock_out_gps       = %s,
+                        clock_out_gps_meta  = %s,
                         job_id              = %s,
                         time_category       = %s,
                         non_productive_type = %s
@@ -772,13 +822,16 @@ def _save_timesheets_to_db(
                     """,
                     (
                         loc_id,
+                        entry.get("location", ""),
                         entry.get("clockOut"),
                         entry.get("totalHours"),
                         entry.get("notes", ""),
                         entry.get("date") or None,
                         entry.get("timezone", "America/Chicago"),
                         json.dumps(entry["clockInGps"]) if entry.get("clockInGps") else None,
+                        json.dumps(entry["clockInGpsMeta"]) if entry.get("clockInGpsMeta") else None,
                         json.dumps(entry["clockOutGps"]) if entry.get("clockOutGps") else None,
+                        json.dumps(entry["clockOutGpsMeta"]) if entry.get("clockOutGpsMeta") else None,
                         entry.get("jobId"),
                         entry.get("timeCategory", "productive"),
                         entry.get("nonProductiveType"),
@@ -792,15 +845,17 @@ def _save_timesheets_to_db(
                 v_loc_id = addr_to_id.get(visit.get("location", ""))
                 cur.execute(
                     """
-                    INSERT INTO visits (shift_id, location_id, customer_name, arrival_time, gps)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO visits (shift_id, location_id, location_label, customer_name, arrival_time, gps, gps_meta)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         entry["id"],
                         v_loc_id,
+                        visit.get("location", ""),
                         visit.get("customer") or None,
                         visit.get("arrivalTime"),
                         json.dumps(visit["gps"]) if visit.get("gps") else None,
+                        json.dumps(visit["gpsMeta"]) if visit.get("gpsMeta") else None,
                     ),
                 )
 
@@ -809,15 +864,17 @@ def _save_timesheets_to_db(
                 d_loc_id = addr_to_id.get(departure.get("location", ""))
                 cur.execute(
                     """
-                    INSERT INTO departures (shift_id, location_id, customer_name, departure_time, gps)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO departures (shift_id, location_id, location_label, customer_name, departure_time, gps, gps_meta)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         entry["id"],
                         d_loc_id,
+                        departure.get("location", ""),
                         departure.get("customer") or None,
                         departure.get("departureTime"),
                         json.dumps(departure["gps"]) if departure.get("gps") else None,
+                        json.dumps(departure["gpsMeta"]) if departure.get("gpsMeta") else None,
                     ),
                 )
 
@@ -1110,6 +1167,7 @@ def build_public_current_status() -> List[Dict[str, Any]]:
                     "location": v.get("location", ""),
                     "customer": v.get("customer", ""),
                     "gps": v.get("gps") if isinstance(v.get("gps"), dict) else None,
+                    "gpsMeta": v.get("gpsMeta") if isinstance(v.get("gpsMeta"), dict) else None,
                 })
             except ValueError:
                 pass
@@ -1125,6 +1183,7 @@ def build_public_current_status() -> List[Dict[str, Any]]:
                     "location": d.get("location", ""),
                     "customer": d.get("customer", ""),
                     "gps": d.get("gps") if isinstance(d.get("gps"), dict) else None,
+                    "gpsMeta": d.get("gpsMeta") if isinstance(d.get("gpsMeta"), dict) else None,
                 })
             except ValueError:
                 pass
@@ -1145,6 +1204,7 @@ def build_public_current_status() -> List[Dict[str, Any]]:
                     "location": active_visit.get("location", ""),
                     "customer": active_visit.get("customer", ""),
                     "gps": active_visit.get("gps") if isinstance(active_visit.get("gps"), dict) else None,
+                    "gpsMeta": active_visit.get("gpsMeta") if isinstance(active_visit.get("gpsMeta"), dict) else None,
                 } if active_visit else None,
                 "canDepart": active_visit is not None,
             }
@@ -1342,18 +1402,24 @@ class ClockInRequest(BaseModel):
     notes: str = ""
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    gpsOverrideReason: str = ""
+    gpsOverrideDetail: str = ""
 
 
 class ClockOutRequest(BaseModel):
     notes: str = ""
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    gpsOverrideReason: str = ""
+    gpsOverrideDetail: str = ""
 
 
 class DepartRequest(BaseModel):
     notes: str = ""
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    gpsOverrideReason: str = ""
+    gpsOverrideDetail: str = ""
 
 
 class EntryAdjustRequest(BaseModel):
@@ -1437,7 +1503,7 @@ BOOTSTRAP_ADMIN_IDS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Business-rule defaults — single source of truth for all threshold settings.
+# Business-rule defaults - single source of truth for all threshold settings.
 # These seed the `settings` DB table on first boot and serve as in-code
 # fallbacks if a key is somehow absent from the DB.
 # ---------------------------------------------------------------------------
@@ -1537,6 +1603,21 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS non_productive_type TEXT"
     )
+    db.execute(
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS location_label TEXT NOT NULL DEFAULT ''"
+    )
+    db.execute(
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS clock_in_gps_meta JSONB"
+    )
+    db.execute(
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS clock_out_gps_meta JSONB"
+    )
+    db.execute(
+        "ALTER TABLE visits ADD COLUMN IF NOT EXISTS gps_meta JSONB"
+    )
+    db.execute(
+        "ALTER TABLE visits ADD COLUMN IF NOT EXISTS location_label TEXT NOT NULL DEFAULT ''"
+    )
     db.execute("""
         CREATE TABLE IF NOT EXISTS schedules (
             id              SERIAL PRIMARY KEY,
@@ -1555,12 +1636,20 @@ def _ensure_schema_migrations() -> None:
             id             SERIAL PRIMARY KEY,
             shift_id       INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
             location_id    INTEGER REFERENCES locations(id),
+            location_label TEXT NOT NULL DEFAULT '',
             customer_name  TEXT,
             departure_time TIMESTAMPTZ NOT NULL,
             gps            JSONB,
+            gps_meta       JSONB,
             created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+    db.execute(
+        "ALTER TABLE departures ADD COLUMN IF NOT EXISTS location_label TEXT NOT NULL DEFAULT ''"
+    )
+    db.execute(
+        "ALTER TABLE departures ADD COLUMN IF NOT EXISTS gps_meta JSONB"
+    )
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_week ON schedules(week_start)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_employee ON schedules(employee_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_departures_shift_id ON departures(shift_id)")
@@ -1982,7 +2071,9 @@ def clock_in(
             "date": work_date,
             "timezone": TIMEZONE_NAME,
             "clockInGps": None,
+            "clockInGpsMeta": None,
             "clockOutGps": None,
+            "clockOutGpsMeta": None,
             "jobId": None,
             "timeCategory": "productive",
             "nonProductiveType": None,
@@ -1990,6 +2081,13 @@ def clock_in(
         }
         if has_gps:
             entry["clockInGps"] = {"lat": payload.latitude, "lng": payload.longitude}
+        entry["clockInGpsMeta"] = build_gps_meta(
+            timesheet_data,
+            payload.latitude,
+            payload.longitude,
+            payload.gpsOverrideReason,
+            payload.gpsOverrideDetail,
+        )
         timesheet_data["entries"].append(entry)
         timesheet_data["nextId"] = entry_id + 1
         return True, entry
@@ -2038,6 +2136,13 @@ def clock_out(
                 "lat": payload.latitude,
                 "lng": payload.longitude,
             }
+        open_entry["clockOutGpsMeta"] = build_gps_meta(
+            timesheet_data,
+            payload.latitude if payload else None,
+            payload.longitude if payload else None,
+            payload.gpsOverrideReason if payload else "",
+            payload.gpsOverrideDetail if payload else "",
+        )
 
         return True, open_entry
 
@@ -2089,6 +2194,13 @@ def log_visit(
             "location": location,
             "customer": customer,
             "gps": {"lat": payload.latitude, "lng": payload.longitude} if has_gps else None,
+            "gpsMeta": build_gps_meta(
+                timesheet_data,
+                payload.latitude,
+                payload.longitude,
+                payload.gpsOverrideReason,
+                payload.gpsOverrideDetail,
+            ),
         }
 
         if not isinstance(open_entry.get("visits"), list):
@@ -2144,6 +2256,13 @@ def depart_location(
             "location": active_visit.get("location", ""),
             "customer": active_visit.get("customer", ""),
             "gps": None,
+            "gpsMeta": build_gps_meta(
+                timesheet_data,
+                payload.latitude if payload else None,
+                payload.longitude if payload else None,
+                payload.gpsOverrideReason if payload else "",
+                payload.gpsOverrideDetail if payload else "",
+            ),
         }
         if payload and payload.latitude is not None and payload.longitude is not None:
             departure["gps"] = {
@@ -2455,6 +2574,7 @@ def timesheet_current_status(
             "hoursWorked": row["hoursWorked"],
             "notes": row["notes"],
             "clockInGps": row.get("clockInGps"),
+            "clockInGpsMeta": row.get("clockInGpsMeta"),
             "visits": row.get("visits", []),
             "departures": row.get("departures", []),
             "activeVisit": row.get("activeVisit"),
@@ -3202,6 +3322,78 @@ def admin_categorize_shift(
 
     append_access_log(request, "SHIFT_CATEGORIZED", True, f"Shift {shift_id}: {payload.timeCategory}/{npt}")
     return {"success": True, "shiftId": shift_id, "timeCategory": payload.timeCategory, "nonProductiveType": npt}
+
+
+@app.get("/api/admin/analytics/unmatched-shifts")
+def admin_unmatched_shifts(
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Return all distinct location strings used in shifts that don't match any registered location."""
+    timesheet_data = load_timesheets()
+    registered = set(timesheet_data.get("locations", []))
+    location_customers = timesheet_data.get("location_customers", {})
+
+    rows = db.query_all(
+        """
+        SELECT s.id, s.clock_in, s.clock_out, s.total_hours,
+               l.address AS location_address,
+               e.name AS employee_name,
+               s.time_category, s.non_productive_type, s.notes
+        FROM shifts s
+        LEFT JOIN locations l ON l.id = s.location_id
+        LEFT JOIN employees e ON e.id = s.employee_id
+        WHERE s.clock_out IS NOT NULL
+          AND s.time_category = 'productive'
+        ORDER BY s.clock_in DESC
+        """
+    )
+
+    # Group by location string and find those not matching any registered location
+    location_groups: Dict[str, Any] = {}
+    for r in rows:
+        loc = r["location_address"] or ""
+        is_matched = loc in registered or loc in location_customers
+        if is_matched:
+            continue
+        if loc not in location_groups:
+            location_groups[loc] = {
+                "location": loc or "(no location)",
+                "shifts": 0,
+                "hours": 0.0,
+                "employees": set(),
+                "firstSeen": None,
+                "lastSeen": None,
+            }
+        g = location_groups[loc]
+        g["shifts"] += 1
+        g["hours"] += float(r["total_hours"] or 0)
+        g["employees"].add(r["employee_name"] or "Unknown")
+        date_str = to_utc_iso(r["clock_in"])[:10] if r["clock_in"] else None
+        if date_str:
+            if g["firstSeen"] is None or date_str < g["firstSeen"]:
+                g["firstSeen"] = date_str
+            if g["lastSeen"] is None or date_str > g["lastSeen"]:
+                g["lastSeen"] = date_str
+
+    groups = []
+    for g in sorted(location_groups.values(), key=lambda x: -x["hours"]):
+        groups.append({
+            "location": g["location"],
+            "shifts": g["shifts"],
+            "hours": round(g["hours"], 2),
+            "employees": sorted(g["employees"]),
+            "firstSeen": g["firstSeen"],
+            "lastSeen": g["lastSeen"],
+        })
+
+    return {
+        "success": True,
+        "totalUnmatchedShifts": sum(g["shifts"] for g in groups),
+        "totalUnmatchedHours": round(sum(g["hours"] for g in groups), 2),
+        "registeredLocations": sorted(registered),
+        "groups": groups,
+    }
 
 
 @app.get("/api/admin/analytics/waste")
@@ -4503,7 +4695,7 @@ def admin_analytics_customer(
         week_agg[week_key]["revenue"] += revenue
         week_agg[week_key]["laborCost"] += labor_cost
 
-    visited_for_revenue: set = set()  # (resolved_location, date_key) — dedup per_visit in detail view
+    visited_for_revenue: set = set()  # (resolved_location, date_key) - dedup per_visit in detail view
     for entry in timesheet_data["entries"]:
         if entry.get("clockOut") is None:
             continue
