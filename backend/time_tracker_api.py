@@ -3839,6 +3839,11 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     for entry in timesheet_data["entries"]:
         if entry.get("clockOut") is None:
             continue
+        # Job-linked shifts are evaluated in job profitability endpoints. Exclude
+        # them from customer analytics to avoid attributing the same labor to two
+        # different revenue models (location rates vs job revenue).
+        if entry.get("jobId") is not None:
+            continue
         ci_str = str(entry.get("clockIn", "")).strip()
         if not ci_str:
             continue
