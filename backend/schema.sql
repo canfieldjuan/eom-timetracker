@@ -25,10 +25,26 @@ CREATE TABLE locations (
                       CHECK (rate_type IN ('per_visit', 'hourly', 'monthly')),
     frequency       TEXT,
     expected_hours  NUMERIC(6, 2),
+    target_labor_pct  NUMERIC(5, 2),
+    min_margin_pct    NUMERIC(5, 2),
     lat             NUMERIC(10, 7),
     lng             NUMERIC(10, 7),
     active        BOOLEAN NOT NULL DEFAULT true,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Jobs (service visits / scheduled work at a customer)
+CREATE TABLE jobs (
+    id              SERIAL PRIMARY KEY,
+    location_id     INTEGER REFERENCES locations(id),
+    customer_name   TEXT NOT NULL,
+    scheduled_date  DATE NOT NULL,
+    expected_hours  NUMERIC(6, 2),
+    revenue         NUMERIC(10, 2),
+    notes           TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'scheduled'
+                        CHECK (status IN ('scheduled', 'in_progress', 'completed', 'cancelled')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Shifts (time entries)
@@ -44,6 +60,12 @@ CREATE TABLE shifts (
     timezone      TEXT NOT NULL DEFAULT 'America/Chicago',
     clock_in_gps  JSONB,
     clock_out_gps JSONB,
+    job_id        INTEGER REFERENCES jobs(id),
+    time_category     TEXT NOT NULL DEFAULT 'productive'
+                          CHECK (time_category IN ('productive', 'non_productive')),
+    non_productive_type TEXT
+                          CHECK (non_productive_type IS NULL OR non_productive_type IN
+                                 ('drive_time', 'waiting', 'supply_run', 'rework', 'lockout', 'other')),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -57,6 +79,33 @@ CREATE TABLE visits (
     gps           JSONB,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Departures (explicit leaving events during a shift)
+CREATE TABLE departures (
+    id             SERIAL PRIMARY KEY,
+    shift_id       INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+    location_id    INTEGER REFERENCES locations(id),
+    customer_name  TEXT,
+    departure_time TIMESTAMPTZ NOT NULL,
+    gps            JSONB,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Schedules (planned hours per employee per customer per week)
+CREATE TABLE schedules (
+    id              SERIAL PRIMARY KEY,
+    employee_id     INTEGER NOT NULL REFERENCES employees(id),
+    location_id     INTEGER REFERENCES locations(id),
+    customer_name   TEXT NOT NULL,
+    week_start      DATE NOT NULL,
+    scheduled_hours NUMERIC(6, 2) NOT NULL,
+    notes           TEXT NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (employee_id, customer_name, week_start)
+);
+
+CREATE INDEX idx_schedules_week ON schedules(week_start);
+CREATE INDEX idx_schedules_employee ON schedules(employee_id);
 
 -- Settings (key-value)
 CREATE TABLE settings (
@@ -75,3 +124,15 @@ CREATE INDEX idx_shifts_location_id ON shifts(location_id);
 CREATE INDEX idx_visits_shift_id    ON visits(shift_id);
 CREATE INDEX idx_visits_arrival     ON visits(arrival_time);
 CREATE INDEX idx_visits_location_id ON visits(location_id);
+CREATE INDEX idx_departures_shift_id ON departures(shift_id);
+CREATE INDEX idx_departures_time     ON departures(departure_time);
+CREATE INDEX idx_departures_location_id ON departures(location_id);
+CREATE INDEX idx_jobs_location_id    ON jobs(location_id);
+CREATE INDEX idx_jobs_scheduled_date ON jobs(scheduled_date);
+CREATE INDEX idx_jobs_customer       ON jobs(customer_name);
+CREATE INDEX idx_jobs_status         ON jobs(status);
+CREATE INDEX idx_shifts_job_id       ON shifts(job_id);
+CREATE INDEX idx_shifts_time_cat     ON shifts(time_category);
+CREATE INDEX idx_shifts_clock_out    ON shifts(clock_out);
+CREATE INDEX idx_locations_active    ON locations(active);
+CREATE INDEX idx_employees_active    ON employees(active);
