@@ -118,3 +118,7 @@ CREATE INDEX idx_jobs_scheduled_date ON jobs(scheduled_date);
 CREATE INDEX idx_jobs_customer       ON jobs(customer_name);
 CREATE INDEX idx_jobs_status         ON jobs(status);
 CREATE INDEX idx_shifts_job_id       ON shifts(job_id);
+CREATE INDEX idx_shifts_time_cat     ON shifts(time_category);
+CREATE INDEX idx_shifts_clock_out    ON shifts(clock_out);
+CREATE INDEX idx_locations_active    ON locations(active);
+CREATE INDEX idx_employees_active    ON employees(active);

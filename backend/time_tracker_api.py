@@ -1433,6 +1433,10 @@ def _ensure_schema_migrations() -> None:
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_week ON schedules(week_start)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_employee ON schedules(employee_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_shifts_time_cat ON shifts(time_category)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_shifts_clock_out ON shifts(clock_out)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_locations_active ON locations(active)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_employees_active ON employees(active)")
 
     # Seed threshold defaults if not already in settings
     threshold_defaults = {
@@ -2713,6 +2717,22 @@ def admin_list_schedules(
     ]}
 
 
+@app.delete("/api/admin/schedules/{schedule_id}")
+def admin_delete_schedule(
+    schedule_id: int,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Delete a schedule entry."""
+    existing = db.query_one("SELECT id FROM schedules WHERE id = %s", (schedule_id,))
+    if not existing:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+
+    db.execute("DELETE FROM schedules WHERE id = %s", (schedule_id,))
+    append_access_log(request, "SCHEDULE_DELETED", True, f"Schedule {schedule_id}")
+    return {"success": True, "scheduleId": schedule_id}
+
+
 @app.get("/api/admin/analytics/schedule-vs-actual")
 def admin_schedule_vs_actual(
     request: Request,
@@ -2985,20 +3005,21 @@ def admin_categorize_shift(
         if not payload.notes or not payload.notes.strip():
             raise HTTPException(status_code=400, detail="Notes required when categorizing as non-productive")
 
-    shift = db.query_one("SELECT id FROM shifts WHERE id = %s", (shift_id,))
-    if not shift:
-        raise HTTPException(status_code=404, detail="Shift not found")
+    with TIMESHEET_WRITE_LOCK:
+        shift = db.query_one("SELECT id FROM shifts WHERE id = %s", (shift_id,))
+        if not shift:
+            raise HTTPException(status_code=404, detail="Shift not found")
 
-    if payload.notes and payload.notes.strip():
-        db.execute(
-            "UPDATE shifts SET time_category = %s, non_productive_type = %s, notes = %s WHERE id = %s",
-            (payload.timeCategory, npt, payload.notes.strip(), shift_id),
-        )
-    else:
-        db.execute(
-            "UPDATE shifts SET time_category = %s, non_productive_type = %s WHERE id = %s",
-            (payload.timeCategory, npt, shift_id),
-        )
+        if payload.notes and payload.notes.strip():
+            db.execute(
+                "UPDATE shifts SET time_category = %s, non_productive_type = %s, notes = %s WHERE id = %s",
+                (payload.timeCategory, npt, payload.notes.strip(), shift_id),
+            )
+        else:
+            db.execute(
+                "UPDATE shifts SET time_category = %s, non_productive_type = %s WHERE id = %s",
+                (payload.timeCategory, npt, shift_id),
+            )
 
     append_access_log(request, "SHIFT_CATEGORIZED", True, f"Shift {shift_id}: {payload.timeCategory}/{npt}")
     return {"success": True, "shiftId": shift_id, "timeCategory": payload.timeCategory, "nonProductiveType": npt}
@@ -3390,19 +3411,22 @@ def admin_auto_link_jobs(
         """
     )
 
-    linked = 0
-    for shift in unlinked:
-        shift_customer = location_customers.get(shift["location"], shift["location"])
-        shift_date = shift["local_date"]
-        if not shift_date:
-            continue
-        shift_cust_norm = shift_customer.strip().lower() if shift_customer else ""
-        for job in jobs:
-            job_cust_norm = job["customer_name"].strip().lower() if job["customer_name"] else ""
-            if job_cust_norm == shift_cust_norm and job["scheduled_date"] == shift_date:
-                db.execute("UPDATE shifts SET job_id = %s WHERE id = %s", (job["id"], shift["id"]))
-                linked += 1
-                break
+    with TIMESHEET_WRITE_LOCK:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                linked = 0
+                for shift in unlinked:
+                    shift_customer = location_customers.get(shift["location"], shift["location"])
+                    shift_date = shift["local_date"]
+                    if not shift_date:
+                        continue
+                    shift_cust_norm = shift_customer.strip().lower() if shift_customer else ""
+                    for job in jobs:
+                        job_cust_norm = job["customer_name"].strip().lower() if job["customer_name"] else ""
+                        if job_cust_norm == shift_cust_norm and job["scheduled_date"] == shift_date:
+                            cur.execute("UPDATE shifts SET job_id = %s WHERE id = %s", (job["id"], shift["id"]))
+                            linked += 1
+                            break
 
     append_access_log(request, "JOBS_AUTO_LINKED", True, f"{linked} shifts auto-linked")
     return {"success": True, "linkedCount": linked}
@@ -3456,19 +3480,29 @@ def admin_jobs_profitability(
         for r in db.query_all("SELECT id, hourly_rate FROM employees WHERE hourly_rate IS NOT NULL")
     }
 
+    # Batch-load all shift details for matched jobs in one query (avoids N+1)
+    job_ids = [r["id"] for r in rows]
+    labor_by_job: Dict[int, float] = {jid: 0.0 for jid in job_ids}
+    if job_ids:
+        all_shifts = db.query_all(
+            """
+            SELECT job_id, employee_id, total_hours
+            FROM shifts
+            WHERE job_id = ANY(%s) AND clock_out IS NOT NULL
+            """,
+            (job_ids,),
+        )
+        for sd in all_shifts:
+            labor_by_job[sd["job_id"]] += (
+                emp_rates.get(sd["employee_id"], 0.0) * float(sd["total_hours"] or 0)
+            )
+
     jobs_out = []
     total_rev = 0.0
     total_labor = 0.0
     total_hours = 0.0
     for r in rows:
-        shift_details = db.query_all(
-            "SELECT employee_id, total_hours FROM shifts WHERE job_id = %s AND clock_out IS NOT NULL",
-            (r["id"],),
-        )
-        labor_cost = sum(
-            emp_rates.get(sd["employee_id"], 0.0) * float(sd["total_hours"] or 0)
-            for sd in shift_details
-        )
+        labor_cost = labor_by_job.get(r["id"], 0.0)
         rev = float(r["revenue"] or 0)
         hours = float(r["actual_hours"] or 0)
         net = round(rev - labor_cost, 2)
@@ -3523,7 +3557,8 @@ def admin_get_job(
     shift_rows = db.query_all(
         """
         SELECT s.id, s.employee_id, e.name AS employee_name,
-               s.clock_in, s.clock_out, s.total_hours, s.notes
+               s.clock_in, s.clock_out, s.total_hours, s.notes,
+               e.hourly_rate
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
         WHERE s.job_id = %s
@@ -3532,19 +3567,12 @@ def admin_get_job(
         (job_id,),
     )
 
-    emp_rates: Dict[int, float] = {}
-    for sr in shift_rows:
-        if sr["employee_id"] not in emp_rates:
-            emp = db.query_one("SELECT hourly_rate FROM employees WHERE id = %s", (sr["employee_id"],))
-            if emp and emp["hourly_rate"] is not None:
-                emp_rates[sr["employee_id"]] = float(emp["hourly_rate"])
-
     shifts = []
     total_hours = 0.0
     total_labor = 0.0
     for sr in shift_rows:
         h = float(sr["total_hours"] or 0)
-        rate = emp_rates.get(sr["employee_id"])
+        rate = float(sr["hourly_rate"]) if sr["hourly_rate"] is not None else None
         lc = (rate * h) if rate is not None else 0.0
         total_hours += h
         total_labor += lc
@@ -3630,6 +3658,27 @@ def admin_update_job(
     return {"success": True, "job": _job_row_to_dict(row)}
 
 
+@app.delete("/api/admin/jobs/{job_id}")
+def admin_delete_job(
+    job_id: int,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Delete a job. Unlinks any associated shifts first."""
+    existing = db.query_one("SELECT id FROM jobs WHERE id = %s", (job_id,))
+    if not existing:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    with TIMESHEET_WRITE_LOCK:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE shifts SET job_id = NULL WHERE job_id = %s", (job_id,))
+                cur.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
+
+    append_access_log(request, "JOB_DELETED", True, f"Job {job_id}")
+    return {"success": True, "jobId": job_id}
+
+
 @app.post("/api/admin/jobs/{job_id}/shifts")
 def admin_link_shifts_to_job(
     job_id: int,
@@ -3642,12 +3691,15 @@ def admin_link_shifts_to_job(
     if not existing:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    linked = 0
-    for sid in payload.shiftIds:
-        shift = db.query_one("SELECT id FROM shifts WHERE id = %s", (sid,))
-        if shift:
-            db.execute("UPDATE shifts SET job_id = %s WHERE id = %s", (job_id, sid))
-            linked += 1
+    with TIMESHEET_WRITE_LOCK:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                linked = 0
+                for sid in payload.shiftIds:
+                    cur.execute("SELECT id FROM shifts WHERE id = %s", (sid,))
+                    if cur.fetchone():
+                        cur.execute("UPDATE shifts SET job_id = %s WHERE id = %s", (job_id, sid))
+                        linked += 1
 
     append_access_log(request, "JOB_SHIFTS_LINKED", True, f"Job {job_id}: {linked} shifts linked")
     return {"success": True, "jobId": job_id, "linkedCount": linked}
@@ -3661,7 +3713,8 @@ def admin_unlink_shift_from_job(
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     """Unlink a shift from a job."""
-    db.execute("UPDATE shifts SET job_id = NULL WHERE id = %s AND job_id = %s", (shift_id, job_id))
+    with TIMESHEET_WRITE_LOCK:
+        db.execute("UPDATE shifts SET job_id = NULL WHERE id = %s AND job_id = %s", (shift_id, job_id))
     append_access_log(request, "JOB_SHIFT_UNLINKED", True, f"Job {job_id}: shift {shift_id} unlinked")
     return {"success": True}
 
