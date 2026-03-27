@@ -3758,6 +3758,25 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     location_rates = timesheet_data.get("location_rates", {})
     location_rate_types = timesheet_data.get("location_rate_types", {})
     location_expected_hours = timesheet_data.get("location_expected_hours", {})
+    revenue_job_ids: set[int] = set()
+
+    linked_job_ids: set[int] = set()
+    for entry in timesheet_data.get("entries", []):
+        job_id = entry.get("jobId")
+        if job_id is None:
+            continue
+        try:
+            linked_job_ids.add(int(job_id))
+        except (TypeError, ValueError):
+            continue
+    if linked_job_ids:
+        revenue_job_ids = {
+            int(row["id"])
+            for row in db.query_all(
+                "SELECT id FROM jobs WHERE id = ANY(%s) AND revenue IS NOT NULL",
+                (sorted(linked_job_ids),),
+            )
+        }
 
     emp_rates: Dict[int, float] = {}
     for emp in employees_data["employees"]:
@@ -3850,6 +3869,14 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         entry_date = to_local(ci_dt).date()
         if start_date is not None and not (start_date <= entry_date <= end_date):
             continue
+
+        job_id = entry.get("jobId")
+        if job_id is not None:
+            try:
+                if int(job_id) in revenue_job_ids:
+                    continue
+            except (TypeError, ValueError):
+                pass
 
         emp_id = int(entry.get("employeeId", 0))
         date_key = entry_date.strftime("%Y-%m-%d")
