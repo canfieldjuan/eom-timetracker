@@ -273,6 +273,72 @@ def build_gps_meta(
     }
 
 
+def require_gps_override(
+    timesheet_data: Dict[str, Any],
+    latitude: Optional[float],
+    longitude: Optional[float],
+    override_reason: str = "",
+) -> Optional[str]:
+    if str(override_reason or "").strip():
+        return None
+
+    if latitude is None or longitude is None:
+        return None
+
+    nearest = find_nearest_location_match(latitude, longitude, timesheet_data)
+    if nearest and not nearest["withinRadius"]:
+        distance_m = round(float(nearest["distanceM"]))
+        return (
+            f"GPS is {distance_m}m from the nearest saved site "
+            f"({nearest['location']}). Add an override reason to continue."
+        )
+
+    return None
+
+
+def _format_gps_exception(source: str, meta: Any) -> Optional[str]:
+    if not isinstance(meta, dict) or not meta.get("override"):
+        return None
+    parts = [source]
+    reason = str(meta.get("overrideReason", "")).strip()
+    if reason:
+        parts.append(reason)
+    distance = meta.get("distanceM")
+    matched_location = str(meta.get("matchedLocation", "")).strip()
+    if distance is not None:
+        try:
+            dist_label = f"{round(float(distance))}m"
+        except (TypeError, ValueError):
+            dist_label = ""
+        if dist_label and matched_location:
+            parts.append(f"{dist_label} from {matched_location}")
+        elif dist_label:
+            parts.append(dist_label)
+    detail = str(meta.get("overrideDetail", "")).strip()
+    if detail:
+        parts.append(detail)
+    return " - ".join(part for part in parts if part)
+
+
+def collect_entry_gps_exceptions(entry: Dict[str, Any]) -> List[str]:
+    exceptions: List[str] = []
+    first = _format_gps_exception("clock_in", entry.get("clockInGpsMeta"))
+    if first:
+        exceptions.append(first)
+    for idx, visit in enumerate(entry.get("visits") or [], start=1):
+        formatted = _format_gps_exception(f"arrival_{idx}", visit.get("gpsMeta"))
+        if formatted:
+            exceptions.append(formatted)
+    for idx, departure in enumerate(entry.get("departures") or [], start=1):
+        formatted = _format_gps_exception(f"departure_{idx}", departure.get("gpsMeta"))
+        if formatted:
+            exceptions.append(formatted)
+    last = _format_gps_exception("clock_out", entry.get("clockOutGpsMeta"))
+    if last:
+        exceptions.append(last)
+    return exceptions
+
+
 def validate_schedule(start_hour: int, end_hour: int) -> None:
     if start_hour < 0 or start_hour > 23:
         raise RuntimeError("ACCESS_START_HOUR must be between 0 and 23")
@@ -858,6 +924,12 @@ def _save_timesheets_to_db(
                         json.dumps(visit["gpsMeta"]) if visit.get("gpsMeta") else None,
                     ),
                 )
+                # Auto-link shift to the first registered location visited
+                if v_loc_id:
+                    cur.execute(
+                        "UPDATE shifts SET location_id = %s WHERE id = %s AND location_id IS NULL",
+                        (v_loc_id, entry["id"]),
+                    )
 
             existing_departure_count = pre_departure_counts.get(entry["id"], 0)
             for departure in entry.get("departures", [])[existing_departure_count:]:
@@ -2051,6 +2123,15 @@ def clock_in(
         if existing_open and not is_stale_open_entry(existing_open, now_utc):
             return False, "Already clocked in"
 
+        override_error = require_gps_override(
+            timesheet_data,
+            payload.latitude,
+            payload.longitude,
+            payload.gpsOverrideReason,
+        )
+        if override_error:
+            return False, override_error
+
         # Auto-match location from GPS; fall back to provided string or GPS coords
         if has_gps:
             matched = find_nearest_location(payload.latitude, payload.longitude, timesheet_data)
@@ -2118,6 +2199,15 @@ def clock_out(
         if not open_entry or is_stale_open_entry(open_entry, now_utc):
             return False, "Not currently clocked in"
 
+        override_error = require_gps_override(
+            timesheet_data,
+            payload.latitude if payload else None,
+            payload.longitude if payload else None,
+            payload.gpsOverrideReason if payload else "",
+        )
+        if override_error:
+            return False, override_error
+
         try:
             clock_in_time = parse_utc_iso(str(open_entry.get("clockIn", "")))
         except ValueError:
@@ -2174,6 +2264,15 @@ def log_visit(
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
         if not open_entry or is_stale_open_entry(open_entry, now_utc):
             return False, "Not currently clocked in"
+
+        override_error = require_gps_override(
+            timesheet_data,
+            payload.latitude,
+            payload.longitude,
+            payload.gpsOverrideReason,
+        )
+        if override_error:
+            return False, override_error
 
         if has_gps:
             matched = find_nearest_location(payload.latitude, payload.longitude, timesheet_data)
@@ -2246,6 +2345,15 @@ def depart_location(
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
         if not open_entry or is_stale_open_entry(open_entry, now_utc):
             return False, "Not currently clocked in"
+
+        override_error = require_gps_override(
+            timesheet_data,
+            payload.latitude if payload else None,
+            payload.longitude if payload else None,
+            payload.gpsOverrideReason if payload else "",
+        )
+        if override_error:
+            return False, override_error
 
         active_visit = get_active_visit(open_entry)
         if not active_visit:
@@ -2730,7 +2838,7 @@ def admin_download_report(
     return FileResponse(str(target_path), media_type="application/pdf", filename=filename)
 
 
-def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Optional[int]) -> Dict[str, Any]:
+def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Optional[int], exceptions_only: bool = False) -> Dict[str, Any]:
     now = utc_now()
     local_now = to_local(now)
 
@@ -2798,6 +2906,9 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
             co_display = "-"
 
         loc = entry.get("location", "")
+        gps_exceptions = collect_entry_gps_exceptions(entry)
+        if exceptions_only and not gps_exceptions:
+            continue
         rows.append({
             "employeeId": emp_id,
             "employeeName": emp_name,
@@ -2808,6 +2919,8 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
             "hours": round(hours, 2),
             "location": loc,
             "customer": _resolve_customer(loc, location_customers),
+            "gpsExceptions": gps_exceptions,
+            "gpsExceptionsText": "; ".join(gps_exceptions),
         })
 
         if emp_id not in emp_totals:
@@ -2825,10 +2938,13 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
         "period": period,
         "startDate": start_date.strftime("%Y-%m-%d"),
         "endDate": end_date.strftime("%Y-%m-%d"),
+        "exceptionsOnly": exceptions_only,
         "rows": rows,
         "summary": summary,
         "totalHours": round(sum(s["totalHours"] for s in summary), 2),
         "totalShifts": sum(s["totalShifts"] for s in summary),
+        "totalGpsExceptionShifts": sum(1 for r in rows if r["gpsExceptions"]),
+        "totalGpsExceptions": sum(len(r["gpsExceptions"]) for r in rows),
     }
 
 
@@ -2838,9 +2954,10 @@ def admin_reports_hours(
     period: str = "week",
     date: Optional[str] = None,
     employee_id: Optional[int] = None,
+    exceptions_only: bool = False,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    return _compute_hours_report(period, date, employee_id)
+    return _compute_hours_report(period, date, employee_id, exceptions_only)
 
 
 @app.get("/api/admin/reports/hours/export")
@@ -2849,9 +2966,10 @@ def admin_reports_hours_export(
     period: str = "week",
     date: Optional[str] = None,
     employee_id: Optional[int] = None,
+    exceptions_only: bool = False,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> StreamingResponse:
-    data = _compute_hours_report(period, date, employee_id)
+    data = _compute_hours_report(period, date, employee_id, exceptions_only)
 
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -2859,9 +2977,9 @@ def admin_reports_hours_export(
     w.writerow(["Period", data["period"], "From", data["startDate"], "To", data["endDate"]])
     w.writerow(["Total Hours", data["totalHours"], "Total Shifts", data["totalShifts"]])
     w.writerow([])
-    w.writerow(["Employee", "Date", "Clock In", "Clock Out", "Hours", "Location"])
+    w.writerow(["Employee", "Date", "Clock In", "Clock Out", "Hours", "Location", "GPS Exceptions"])
     for r in data["rows"]:
-        w.writerow([r["employeeName"], r["dateLabel"], r["clockIn"], r["clockOut"], f'{r["hours"]:.2f}', r["location"]])
+        w.writerow([r["employeeName"], r["dateLabel"], r["clockIn"], r["clockOut"], f'{r["hours"]:.2f}', r["location"], r.get("gpsExceptionsText", "")])
     w.writerow([])
     w.writerow(["Summary by Employee"])
     w.writerow(["Employee", "Total Shifts", "Total Hours"])
@@ -3329,71 +3447,81 @@ def admin_unmatched_shifts(
     request: Request,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    """Return all distinct location strings used in shifts that don't match any registered location."""
+    """Return individual productive shifts with no location assigned, plus all registered locations for the assignment dropdown."""
     timesheet_data = load_timesheets()
-    registered = set(timesheet_data.get("locations", []))
     location_customers = timesheet_data.get("location_customers", {})
 
     rows = db.query_all(
         """
         SELECT s.id, s.clock_in, s.clock_out, s.total_hours,
-               l.address AS location_address,
-               e.name AS employee_name,
-               s.time_category, s.non_productive_type, s.notes
+               s.local_date, s.notes,
+               e.name AS employee_name
         FROM shifts s
-        LEFT JOIN locations l ON l.id = s.location_id
         LEFT JOIN employees e ON e.id = s.employee_id
         WHERE s.clock_out IS NOT NULL
           AND s.time_category = 'productive'
+          AND s.location_id IS NULL
         ORDER BY s.clock_in DESC
         """
     )
 
-    # Group by location string and find those not matching any registered location
-    location_groups: Dict[str, Any] = {}
+    shifts = []
     for r in rows:
-        loc = r["location_address"] or ""
-        is_matched = loc in registered or loc in location_customers
-        if is_matched:
-            continue
-        if loc not in location_groups:
-            location_groups[loc] = {
-                "location": loc or "(no location)",
-                "shifts": 0,
-                "hours": 0.0,
-                "employees": set(),
-                "firstSeen": None,
-                "lastSeen": None,
-            }
-        g = location_groups[loc]
-        g["shifts"] += 1
-        g["hours"] += float(r["total_hours"] or 0)
-        g["employees"].add(r["employee_name"] or "Unknown")
-        date_str = to_utc_iso(r["clock_in"])[:10] if r["clock_in"] else None
-        if date_str:
-            if g["firstSeen"] is None or date_str < g["firstSeen"]:
-                g["firstSeen"] = date_str
-            if g["lastSeen"] is None or date_str > g["lastSeen"]:
-                g["lastSeen"] = date_str
-
-    groups = []
-    for g in sorted(location_groups.values(), key=lambda x: -x["hours"]):
-        groups.append({
-            "location": g["location"],
-            "shifts": g["shifts"],
-            "hours": round(g["hours"], 2),
-            "employees": sorted(g["employees"]),
-            "firstSeen": g["firstSeen"],
-            "lastSeen": g["lastSeen"],
+        local_date = str(r["local_date"]) if r["local_date"] else (to_utc_iso(r["clock_in"])[:10] if r["clock_in"] else "")
+        shifts.append({
+            "id":           r["id"],
+            "date":         local_date,
+            "clockIn":      to_utc_iso(r["clock_in"]) if r["clock_in"] else None,
+            "clockOut":     to_utc_iso(r["clock_out"]) if r["clock_out"] else None,
+            "hours":        round(float(r["total_hours"] or 0), 2),
+            "employee":     r["employee_name"] or "Unknown",
+            "notes":        r["notes"] or "",
         })
+
+    # Build location options: address -> customer name
+    loc_rows = db.query_all(
+        "SELECT address, customer_name FROM locations WHERE active = true ORDER BY customer_name, address"
+    )
+    locations = [
+        {"address": r["address"], "customerName": r["customer_name"] or r["address"]}
+        for r in loc_rows
+    ]
 
     return {
         "success": True,
-        "totalUnmatchedShifts": sum(g["shifts"] for g in groups),
-        "totalUnmatchedHours": round(sum(g["hours"] for g in groups), 2),
-        "registeredLocations": sorted(registered),
-        "groups": groups,
+        "totalShifts": len(shifts),
+        "totalHours": round(sum(s["hours"] for s in shifts), 2),
+        "shifts": shifts,
+        "locations": locations,
     }
+
+
+@app.patch("/api/admin/shifts/{shift_id}/location")
+def admin_assign_shift_location(
+    shift_id: int,
+    payload: Dict[str, Any],
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Assign a registered location to a shift that has none."""
+    address = (payload.get("address") or "").strip()
+    if not address:
+        raise HTTPException(status_code=400, detail="address is required")
+
+    loc = db.query_one("SELECT id FROM locations WHERE address = %s AND active = true", (address,))
+    if not loc:
+        raise HTTPException(status_code=404, detail="Location not found or inactive")
+
+    existing = db.query_one("SELECT id FROM shifts WHERE id = %s", (shift_id,))
+    if not existing:
+        raise HTTPException(status_code=404, detail="Shift not found")
+
+    db.execute(
+        "UPDATE shifts SET location_id = %s WHERE id = %s",
+        (loc["id"], shift_id),
+    )
+    append_access_log(request, "SHIFT_LOCATION_ASSIGNED", True, f"Shift {shift_id} -> {address}")
+    return {"success": True, "shiftId": shift_id, "address": address, "locationId": loc["id"]}
 
 
 @app.get("/api/admin/analytics/waste")
