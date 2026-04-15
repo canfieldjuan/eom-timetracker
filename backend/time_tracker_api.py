@@ -448,14 +448,7 @@ def load_timesheets() -> Dict[str, Any]:
 
 
 def get_open_entry(entries: List[Dict[str, Any]], employee_id: int) -> Optional[Dict[str, Any]]:
-    open_entries = [
-        entry for entry in entries if entry.get("employeeId") == employee_id and entry.get("clockOut") is None
-    ]
-    if not open_entries:
-        return None
-
-    open_entries.sort(key=lambda item: item.get("clockIn", ""), reverse=True)
-    return open_entries[0]
+    return latest_open_entry(entries, employee_id)
 
 
 def is_stale_open_entry(entry: Dict[str, Any], reference_time: datetime) -> bool:
@@ -471,6 +464,26 @@ def is_stale_open_entry(entry: Dict[str, Any], reference_time: datetime) -> bool
     return elapsed_hours > MAX_ACTIVE_SHIFT_HOURS
 
 
+def _close_open_entry(entry: Dict[str, Any], closed_at: datetime, marker: str) -> bool:
+    try:
+        started_at = parse_utc_iso(str(entry.get("clockIn", "")))
+    except ValueError:
+        return False
+
+    if closed_at < started_at:
+        closed_at = started_at
+
+    duration_hours = max((closed_at - started_at).total_seconds() / 3600, 0.0)
+    entry["clockOut"] = to_utc_iso(closed_at)
+    entry["totalHours"] = round(min(duration_hours, MAX_ACTIVE_SHIFT_HOURS), 2)
+
+    notes = str(entry.get("notes", "")).strip()
+    if marker not in notes:
+        entry["notes"] = f"{notes} {marker}".strip()
+
+    return True
+
+
 def close_stale_open_entries(timesheet_data: Dict[str, Any], reference_time: datetime) -> bool:
     changed = False
     marker = "[auto-closed stale shift]"
@@ -481,14 +494,50 @@ def close_stale_open_entries(timesheet_data: Dict[str, Any], reference_time: dat
 
         started_at = parse_utc_iso(str(entry.get("clockIn", "")))
         closed_at = started_at + timedelta(hours=MAX_ACTIVE_SHIFT_HOURS)
-        entry["clockOut"] = to_utc_iso(closed_at)
-        entry["totalHours"] = round(MAX_ACTIVE_SHIFT_HOURS, 2)
+        changed = _close_open_entry(entry, closed_at, marker) or changed
 
-        notes = str(entry.get("notes", "")).strip()
-        if marker not in notes:
-            entry["notes"] = f"{notes} {marker}".strip()
+    return changed
 
-        changed = True
+
+def reconcile_overlapping_open_entries(timesheet_data: Dict[str, Any], reference_time: datetime) -> bool:
+    """Ensure each employee has at most one active open shift."""
+    open_entries_by_employee: Dict[int, List[Tuple[datetime, int]]] = {}
+    changed = False
+    marker = "[auto-closed overlapping open shift]"
+
+    entries = timesheet_data.get("entries", [])
+    for index, entry in enumerate(entries):
+        if entry.get("clockOut") is not None:
+            continue
+        try:
+            employee_id = int(entry.get("employeeId", 0))
+            clock_in = parse_utc_iso(str(entry.get("clockIn", "")))
+        except (ValueError, TypeError):
+            continue
+
+        if employee_id <= 0:
+            continue
+
+        open_entries_by_employee.setdefault(employee_id, []).append((clock_in, index))
+
+    for entry_indexes in open_entries_by_employee.values():
+        if len(entry_indexes) <= 1:
+            continue
+
+        # Keep only the most recently started open entry active.
+        open_entries_by_employee_list = sorted(entry_indexes, key=lambda item: item[0], reverse=True)
+        for older_position in range(1, len(open_entries_by_employee_list)):
+            older_index = open_entries_by_employee_list[older_position][1]
+            newer_index = open_entries_by_employee_list[older_position - 1][1]
+            older_entry = entries[older_index]
+            newer_entry = entries[newer_index]
+            try:
+                newer_clock_in = parse_utc_iso(str(newer_entry.get("clockIn", "")))
+            except ValueError:
+                newer_clock_in = reference_time
+
+            if _close_open_entry(older_entry, newer_clock_in, marker):
+                changed = True
 
     return changed
 
@@ -500,6 +549,7 @@ def update_timesheets(mutator) -> Tuple[bool, Any]:
             changed = False
             if AUTO_CLOSE_STALE_SHIFTS:
                 changed = close_stale_open_entries(timesheet_data, utc_now())
+            changed = reconcile_overlapping_open_entries(timesheet_data, utc_now()) or changed
 
             ok, payload = mutator(timesheet_data)
             if ok or changed:
@@ -859,6 +909,25 @@ def enforce_dashboard_access(request: Request) -> Optional[JSONResponse]:
 
 
 def parse_report_path(stdout_text: str) -> str:
+    patterns = (
+        r"Report (?:available|generated) at:\s*(.+\.pdf)",
+        r"Report path:\s*(.+\.pdf)",
+        r"Report saved to:\s*(.+\.pdf)",
+    )
+
+    for line in stdout_text.splitlines():
+        for pattern in patterns:
+            match = re.search(pattern, line, flags=re.IGNORECASE)
+            if not match:
+                continue
+
+            path_text = match.group(1).strip()
+            if path_text:
+                return path_text
+
+        if line.strip().lower().endswith(".pdf"):
+            return line.strip().split(" ", 1)[-1]
+
     for line in stdout_text.splitlines():
         if "Report available at:" in line:
             return line.split("Report available at:", 1)[1].strip()
@@ -1356,7 +1425,7 @@ def clock_in(
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
         existing_open = get_open_entry(timesheet_data["entries"], employee["id"])
-        if existing_open and not is_stale_open_entry(existing_open, now_utc):
+        if existing_open:
             return False, "Already clocked in"
 
         # Auto-match location from GPS; fall back to provided string or GPS coords
@@ -1410,7 +1479,7 @@ def clock_out(
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
+        if not open_entry:
             return False, "Not currently clocked in"
 
         try:
@@ -1460,7 +1529,7 @@ def log_visit(
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
+        if not open_entry:
             return False, "Not currently clocked in"
 
         if has_gps:
@@ -1576,14 +1645,15 @@ def my_timesheet_hours(
     location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
     employee_id = current_employee["id"]
     now = utc_now()
+    now_local = to_local(now)
 
-    days_since_monday = now.weekday()
-    week_start = (now - timedelta(days=days_since_monday)).replace(
+    days_since_monday = now_local.weekday()
+    week_start = (now_local - timedelta(days=days_since_monday)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    today_str = local_date_string(now)
+    month_start = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    year_start = now_local.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    today_str = local_date_string(now_local)
 
     my_entries = [
         e for e in timesheet_data.get("entries", [])
@@ -1605,17 +1675,18 @@ def my_timesheet_hours(
         except ValueError:
             continue
 
-        total = float(entry.get("totalHours") or 0)
-        entry_date = local_date_string(clock_in_dt)
+        total = entry_hours(entry, now)
+        entry_date = to_local(clock_in_dt).strftime("%Y-%m-%d")
+        entry_local_dt = to_local(clock_in_dt)
 
-        if clock_in_dt >= week_start:
+        if entry_local_dt >= week_start:
             weekly_hours += total
+        if entry_local_dt >= month_start:
+            monthly_hours += total
+        if entry_local_dt >= year_start:
+            yearly_hours += total
         if entry_date == today_str:
             today_hours += total
-        if clock_in_dt >= month_start:
-            monthly_hours += total
-        if clock_in_dt >= year_start:
-            yearly_hours += total
 
         clock_out_display = "Active"
         if entry.get("clockOut"):
@@ -1881,11 +1952,47 @@ def admin_generate_report(
         }
 
     report_path = parse_report_path(stdout_text)
+    report_path = report_path.strip().strip("'\"")
+    if not report_path:
+        append_access_log(request, "REPORT_GENERATION_FAILED", False, "No report path returned by generator")
+        return {
+            "success": False,
+            "error": "Report generation failed",
+            "details": (stderr_text or stdout_text).strip(),
+            "exitCode": completed.returncode,
+        }
+
+    absolute_report_path = Path(report_path)
+    if not absolute_report_path.is_absolute():
+        absolute_report_path = (BASE_DIR / report_path).resolve()
+    if not absolute_report_path.exists() or not absolute_report_path.is_file():
+        append_access_log(
+            request,
+            "REPORT_GENERATION_FAILED",
+            False,
+            f"Report file not found: {absolute_report_path}",
+        )
+        return {
+            "success": False,
+            "error": "Report generation failed",
+            "details": f"Report file not found: {absolute_report_path}",
+            "exitCode": completed.returncode,
+        }
+
+    if not absolute_report_path.is_relative_to(REPORTS_DIR.resolve()):
+        append_access_log(request, "REPORT_GENERATION_FAILED", False, "Report path outside reports directory")
+        return {
+            "success": False,
+            "error": "Report generation failed",
+            "details": "Unsafe report path returned by generator",
+            "exitCode": completed.returncode,
+        }
+
     append_access_log(request, "REPORT_GENERATION_SUCCESS", True, f"Generated: {report_path}")
     return {
         "success": True,
         "message": "Report generated successfully",
-        "reportPath": report_path,
+        "reportPath": str(absolute_report_path.relative_to(REPORTS_DIR.resolve())),
         "output": stdout_text,
         "emailSent": payload.send_email and len(payload.emails) > 0,
     }
@@ -2145,6 +2252,25 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     customer_agg: Dict[str, Dict[str, Any]] = {}
     day_agg: Dict[str, Dict[str, Any]] = {}
 
+    def _segment_entry_hours(start_utc: datetime, end_utc: datetime):
+        if end_utc <= start_utc:
+            return
+
+        cursor = start_utc
+        while cursor < end_utc:
+            local_cursor = to_local(cursor)
+            next_midnight_local = (local_cursor + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            next_midnight = next_midnight_local.astimezone(timezone.utc)
+            segment_end = min(end_utc, next_midnight)
+
+            segment_hours = max((segment_end - cursor).total_seconds() / 3600, 0.0)
+            if segment_hours > 0:
+                yield local_cursor.date(), segment_hours
+
+            cursor = segment_end
+
     def _resolve_loc(location: str) -> Tuple[str, str]:
         """Return (resolved_location, customer) for a location string."""
         resolved = location
@@ -2163,8 +2289,19 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             customer = location if (location and not location.startswith("GPS ") and location not in ("Unknown", "")) else "Unmatched Location"
         return resolved, customer
 
-    def _aggregate(customer: str, resolved_location: str, hours: float, emp_id: int,
-                   entry_date: Any, date_key: str, is_visit: bool) -> None:
+    def _aggregate(
+        customer: str,
+        resolved_location: str,
+        hours: float,
+        emp_id: int,
+        entry_date: Any,
+        date_key: str,
+        is_visit: bool,
+        count_visit: bool = True,
+    ) -> None:
+        if not is_visit:
+            count_visit = False
+
         rate = location_rates.get(resolved_location)
         rate_type = location_rate_types.get(resolved_location, "per_visit")
         if rate is not None:
@@ -2178,7 +2315,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                 else:
                     revenue = 0.0
             else:  # per_visit
-                revenue = rate if is_visit else 0.0
+                revenue = rate if count_visit else 0.0
         else:
             revenue = 0.0
 
@@ -2187,7 +2324,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
 
         if customer not in customer_agg:
             customer_agg[customer] = {"customer": customer, "location": resolved_location, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
-        if is_visit:
+        if count_visit:
             customer_agg[customer]["visits"] += 1
         customer_agg[customer]["hours"] += hours
         customer_agg[customer]["revenue"] += revenue
@@ -2195,7 +2332,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
 
         if date_key not in day_agg:
             day_agg[date_key] = {"date": date_key, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
-        if is_visit:
+        if count_visit:
             day_agg[date_key]["visits"] += 1
         day_agg[date_key]["hours"] += hours
         day_agg[date_key]["revenue"] += revenue
@@ -2212,20 +2349,21 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         except ValueError:
             continue
 
-        entry_date = to_local(ci_dt).date()
-        if not (start_date <= entry_date <= end_date):
+        try:
+            co_dt = parse_utc_iso(str(entry["clockOut"]))
+        except (ValueError, KeyError):
+            continue
+
+        if co_dt < ci_dt:
             continue
 
         emp_id = int(entry.get("employeeId", 0))
-        date_key = entry_date.strftime("%Y-%m-%d")
+        location = entry.get("location", "")
+        resolved_location, customer = _resolve_loc(location)
 
         visits = entry.get("visits") or []
         if visits:
             # Multi-stop: distribute hours across each visit segment
-            try:
-                co_dt = parse_utc_iso(str(entry["clockOut"]))
-            except (ValueError, KeyError):
-                continue
             for j, visit in enumerate(visits):
                 try:
                     v_arrival = parse_utc_iso(str(visit["arrivalTime"]))
@@ -2237,16 +2375,39 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                         next_time = parse_utc_iso(str(visits[j + 1]["arrivalTime"]))
                     except (ValueError, KeyError):
                         pass
-                visit_hours = max((next_time - v_arrival).total_seconds() / 3600, 0.0)
                 v_loc = visit.get("location", "")
-                resolved_location, customer = _resolve_loc(v_loc)
-                _aggregate(customer, resolved_location, visit_hours, emp_id, entry_date, date_key, is_visit=True)
+                resolved_location, visit_customer = _resolve_loc(v_loc)
+
+                for segment_position, (segment_date, segment_hours) in enumerate(_segment_entry_hours(v_arrival, next_time)):
+                    if not (start_date <= segment_date <= end_date):
+                        continue
+                    date_key = segment_date.strftime("%Y-%m-%d")
+                    _aggregate(
+                        visit_customer,
+                        resolved_location,
+                        segment_hours,
+                        emp_id,
+                        segment_date,
+                        date_key,
+                        is_visit=True,
+                        count_visit=(segment_position == 0),
+                    )
         else:
             # Legacy / single-location shift
-            hours = float(entry.get("totalHours", 0) or 0)
-            location = entry.get("location", "")
-            resolved_location, customer = _resolve_loc(location)
-            _aggregate(customer, resolved_location, hours, emp_id, entry_date, date_key, is_visit=True)
+            for segment_position, (segment_date, segment_hours) in enumerate(_segment_entry_hours(ci_dt, co_dt)):
+                if not (start_date <= segment_date <= end_date):
+                    continue
+                date_key = segment_date.strftime("%Y-%m-%d")
+                _aggregate(
+                    customer,
+                    resolved_location,
+                    segment_hours,
+                    emp_id,
+                    segment_date,
+                    date_key,
+                    is_visit=True,
+                    count_visit=(segment_position == 0),
+                )
 
     def _finalize(d: Dict[str, Any]) -> Dict[str, Any]:
         rev = d["revenue"]

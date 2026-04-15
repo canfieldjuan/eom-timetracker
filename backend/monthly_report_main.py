@@ -7,7 +7,8 @@ import json
 import os
 import argparse
 from datetime import datetime, timedelta
-from typing import Dict, Any, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -15,7 +16,67 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from report_generator import MonthlyReportGenerator
 from email_service import EmailService
 
-def load_employee_data_from_files(month: int, year: int) -> Dict[str, Any]:
+
+def _read_json(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+            if isinstance(payload, dict):
+                return payload
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _build_monthly_summary(employees: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_hours = 0.0
+    total_overtime = 0.0
+    top_employee = "N/A"
+    top_hours = 0.0
+
+    for employee in employees:
+        emp_hours = round(sum(shift.get("hours", 0) for shift in employee.get("shifts", [])), 2)
+        total_hours += emp_hours
+        if emp_hours > top_hours:
+            top_hours = emp_hours
+            top_employee = f"{employee.get('name', 'Unknown')} ({top_hours:.1f}h)"
+        if emp_hours > 40:
+            total_overtime += emp_hours - 40
+
+    total_employees = len(employees)
+    return {
+        "total_employees": total_employees,
+        "total_hours": round(total_hours, 2),
+        "avg_hours": round(total_hours / total_employees, 2) if total_employees else 0.0,
+        "overtime_hours": round(total_overtime, 2),
+        "top_employee": top_employee,
+    }
+
+
+def _coerce_month_entry(entry: Dict[str, Any], month: int, year: int) -> Optional[Tuple[datetime, datetime, int, str, float]]:
+    clock_in_text = str(entry.get("clockIn", "")).strip()
+    clock_out_text = str(entry.get("clockOut", "")).strip()
+    if not clock_in_text or not clock_out_text:
+        return None
+
+    try:
+        clock_in = datetime.fromisoformat(clock_in_text.replace("Z", "+00:00"))
+        clock_out = datetime.fromisoformat(clock_out_text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    if clock_in.year != year or clock_in.month != month:
+        return None
+    if clock_out <= clock_in:
+        return None
+
+    employee_id = int(entry.get("employeeId", 0))
+    employee_name = str(entry.get("employeeName", f"Employee {employee_id}"))
+    hours = round((clock_out - clock_in).total_seconds() / 3600, 2)
+    return clock_in, clock_out, employee_id, employee_name, hours
+
+
+def load_employee_data_from_files(month: int, year: int) -> Optional[Dict[str, Any]]:
     """Load employee timesheet data directly from JSON files for the specified month."""
     from pathlib import Path
 
@@ -31,29 +92,17 @@ def load_employee_data_from_files(month: int, year: int) -> Dict[str, Any]:
         print(f"Timesheets file not found: {timesheets_file}")
         return None
 
-    with open(timesheets_file, "r", encoding="utf-8") as f:
-        timesheet_data = json.load(f)
+    timesheet_data = _read_json(str(timesheets_file))
 
     entries = timesheet_data.get("entries", [])
     employees_map: Dict[int, Dict[str, Any]] = {}
 
     for entry in entries:
-        clock_in_str = entry.get("clockIn", "")
-        clock_out_str = entry.get("clockOut")
-        if not clock_in_str or not clock_out_str:
-            continue
-        try:
-            clock_in = datetime.fromisoformat(clock_in_str.replace("Z", "+00:00"))
-            clock_out = datetime.fromisoformat(clock_out_str.replace("Z", "+00:00"))
-        except ValueError:
+        parsed = _coerce_month_entry(entry, month, year)
+        if not parsed:
             continue
 
-        if clock_in.month != month or clock_in.year != year:
-            continue
-
-        hours = round((clock_out - clock_in).total_seconds() / 3600, 2)
-        emp_id = int(entry.get("employeeId", 0))
-        emp_name = str(entry.get("employeeName", f"Employee {emp_id}"))
+        clock_in, clock_out, emp_id, emp_name, hours = parsed
 
         if emp_id not in employees_map:
             employees_map[emp_id] = {"id": emp_id, "name": emp_name, "shifts": []}
@@ -66,15 +115,11 @@ def load_employee_data_from_files(month: int, year: int) -> Dict[str, Any]:
         })
 
     employees = sorted(employees_map.values(), key=lambda e: e["name"].lower())
-    total_hours = sum(sum(s["hours"] for s in emp["shifts"]) for emp in employees)
+    summary = _build_monthly_summary(employees)
 
     return {
         "employees": employees,
-        "summary": {
-            "totalEmployees": len(employees),
-            "totalHours": total_hours,
-            "averageHours": total_hours / len(employees) if employees else 0,
-        },
+        "summary": summary,
     }
 
 def load_mock_monthly_data(month: int, year: int) -> Dict[str, Any]:
@@ -123,23 +168,21 @@ def load_mock_monthly_data(month: int, year: int) -> Dict[str, Any]:
         emp["shifts"] = shifts
     
     # Calculate summary
-    total_hours = sum(
-        sum(shift["hours"] for shift in emp["shifts"])
-        for emp in employees
-    )
-    
+    summary = _build_monthly_summary(employees)
+
     return {
         "employees": employees,
-        "summary": {
-            "totalEmployees": len(employees),
-            "totalHours": total_hours,
-            "averageHours": total_hours / len(employees)
-        }
+        "summary": summary,
     }
 
-def generate_report(month: int, year: int, company_name: str = "Your Company", 
-                   output_dir: str = None, use_mock_data: bool = False) -> str:
-    """Generate monthly report and return the file path"""
+def generate_report(
+    month: int,
+    year: int,
+    company_name: str = "Your Company",
+    output_dir: str = None,
+    use_mock_data: bool = False,
+) -> tuple[Optional[str], Dict[str, Any]]:
+    """Generate monthly report and return the file path + summary."""
     
     print(f"Generating monthly report for {month}/{year}...")
     
@@ -153,10 +196,10 @@ def generate_report(month: int, year: int, company_name: str = "Your Company",
     
     if not employee_data:
         print("Failed to load employee data")
-        return None
+        return None, {}
     if not employee_data.get("employees"):
         print(f"No completed shifts found for {month}/{year}")
-        return None
+        return None, {}
     
     # Initialize report generator
     reports_dir = output_dir or "reports"
@@ -167,15 +210,22 @@ def generate_report(month: int, year: int, company_name: str = "Your Company",
         employee_data, month, year, company_name
     )
     
+    summary = employee_data.get("summary", {})
     if report_path:
         print(f"Report generated successfully: {report_path}")
     else:
         print("Report generation failed")
     
-    return report_path
+    return report_path, summary
 
-def send_report(report_path: str, recipient_emails: List[str], 
-               month: int, year: int, config: Dict[str, Any] = None) -> bool:
+def send_report(
+    report_path: str,
+    recipient_emails: List[str],
+    month: int,
+    year: int,
+    config: Dict[str, Any] = None,
+    summary_data: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Send the report via email"""
     
     if not report_path or not os.path.exists(report_path):
@@ -196,31 +246,25 @@ def send_report(report_path: str, recipient_emails: List[str],
         print("Email configuration invalid")
         return False
     
-    # Calculate summary data for email
-    try:
-        # We would ideally pass the employee data here, but for now just basic info
-        summary_data = {
-            "total_employees": 5,  # This would come from the actual data
-            "total_hours": 850.0,
-            "avg_hours": 170.0,
-            "overtime_hours": 25.0,
-            "top_employee": "John Smith (185.5h)"
-        }
-        
-        success = email_service.send_monthly_report(
-            recipient_emails, report_path, month, year, summary_data
-        )
-        
-        if success:
-            print("Report sent successfully!")
-        else:
-            print("Failed to send report")
-        
-        return success
-        
-    except Exception as e:
-        print(f"Email sending failed: {e}")
-        return False
+    success = email_service.send_monthly_report(
+        recipient_emails,
+        report_path,
+        month,
+        year,
+        summary_data=summary_data or {
+            "total_employees": "N/A",
+            "total_hours": "N/A",
+            "avg_hours": "N/A",
+            "overtime_hours": "N/A",
+            "top_employee": "N/A",
+        },
+    )
+
+    if success:
+        print("Report sent successfully!")
+    else:
+        print("Failed to send report")
+    return success
 
 def main():
     """Main function with command line interface"""
@@ -268,14 +312,10 @@ def main():
         print("Error: Month must be between 1 and 12")
         sys.exit(1)
     
-    # Load configuration
-    config = {}
-    if args.config and os.path.exists(args.config):
-        with open(args.config, 'r') as f:
-            config = json.load(f)
+    config = _read_json(args.config) if args.config else {}
     
     # Generate report
-    report_path = generate_report(
+    report_path, summary_data = generate_report(
         month, year, args.company, args.output_dir, args.mock_data
     )
     
@@ -285,7 +325,14 @@ def main():
     
     # Send email if requested
     if not args.no_email and args.email:
-        success = send_report(report_path, args.email, month, year, config)
+        success = send_report(
+            report_path=report_path,
+            recipient_emails=args.email,
+            month=month,
+            year=year,
+            config=config,
+            summary_data=summary_data,
+        )
         if not success:
             print("Report generated but email sending failed")
             sys.exit(1)
