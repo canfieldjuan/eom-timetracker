@@ -2806,12 +2806,47 @@ def admin_generate_report(
             "exitCode": completed.returncode,
         }
 
-    report_path = parse_report_path(stdout_text)
-    append_access_log(request, "REPORT_GENERATION_SUCCESS", True, f"Generated: {report_path}")
+    report_path = parse_report_path(stdout_text).strip().strip("'\"")
+    if not report_path:
+        append_access_log(request, "REPORT_GENERATION_FAILED", False, "No report path returned by generator")
+        return {
+            "success": False,
+            "error": "Report generation failed",
+            "details": (stderr_text or stdout_text).strip(),
+            "exitCode": completed.returncode,
+        }
+
+    absolute_report_path = Path(report_path)
+    if not absolute_report_path.is_absolute():
+        absolute_report_path = (BASE_DIR / report_path).resolve()
+    if not absolute_report_path.exists() or not absolute_report_path.is_file():
+        append_access_log(
+            request,
+            "REPORT_GENERATION_FAILED",
+            False,
+            f"Report file not found: {absolute_report_path}",
+        )
+        return {
+            "success": False,
+            "error": "Report generation failed",
+            "details": f"Report file not found: {absolute_report_path}",
+            "exitCode": completed.returncode,
+        }
+
+    if not absolute_report_path.is_relative_to(REPORTS_DIR.resolve()):
+        append_access_log(request, "REPORT_GENERATION_FAILED", False, "Report path outside reports directory")
+        return {
+            "success": False,
+            "error": "Report generation failed",
+            "details": "Unsafe report path returned by generator",
+            "exitCode": completed.returncode,
+        }
+
+    append_access_log(request, "REPORT_GENERATION_SUCCESS", True, f"Generated: {absolute_report_path}")
     return {
         "success": True,
         "message": "Report generated successfully",
-        "reportPath": report_path,
+        "reportPath": str(absolute_report_path),
         "output": stdout_text,
         "emailSent": payload.send_email and len(payload.emails) > 0,
     }

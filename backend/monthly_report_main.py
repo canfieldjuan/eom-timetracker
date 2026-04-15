@@ -15,6 +15,58 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from report_generator import MonthlyReportGenerator
 from email_service import EmailService
 
+
+def _calculate_email_summary(employee_data: Dict[str, Any]) -> Dict[str, Any]:
+    employees = employee_data.get("employees", []) if isinstance(employee_data, dict) else []
+    total_employees = len(employees)
+
+    total_hours = 0.0
+    top_employee_name = ""
+    top_employee_hours = 0.0
+
+    # Overtime: weekly hours above 40h per employee (Mon-Sun weeks via ISO week).
+    overtime_hours = 0.0
+    for emp in employees:
+        shifts = emp.get("shifts", []) if isinstance(emp, dict) else []
+        emp_total_hours = 0.0
+        weekly_totals: Dict[tuple[int, int], float] = {}
+
+        for shift in shifts:
+            if not isinstance(shift, dict):
+                continue
+            hours = float(shift.get("hours", 0) or 0)
+            emp_total_hours += hours
+            date_str = str(shift.get("date", "") or "").strip()
+            if date_str:
+                try:
+                    dt = datetime.strptime(date_str, "%Y-%m-%d")
+                    key = dt.isocalendar()[:2]  # (iso_year, iso_week)
+                except ValueError:
+                    key = None
+                if key:
+                    weekly_totals[key] = weekly_totals.get(key, 0.0) + hours
+
+        for week_hours in weekly_totals.values():
+            overtime_hours += max(0.0, week_hours - 40.0)
+
+        name = str(emp.get("name", "") or "").strip()
+        if emp_total_hours > top_employee_hours and name:
+            top_employee_hours = emp_total_hours
+            top_employee_name = name
+
+        total_hours += emp_total_hours
+
+    avg_hours = (total_hours / total_employees) if total_employees else 0.0
+    top_employee = f"{top_employee_name} ({top_employee_hours:.1f}h)" if top_employee_name else ""
+
+    return {
+        "total_employees": total_employees,
+        "total_hours": total_hours,
+        "avg_hours": avg_hours,
+        "overtime_hours": overtime_hours,
+        "top_employee": top_employee,
+    }
+
 def load_employee_data_from_files(month: int, year: int) -> Dict[str, Any]:
     """Load employee timesheet data directly from JSON files for the specified month."""
     from pathlib import Path
@@ -196,16 +248,13 @@ def send_report(report_path: str, recipient_emails: List[str],
         print("Email configuration invalid")
         return False
     
-    # Calculate summary data for email
     try:
-        # We would ideally pass the employee data here, but for now just basic info
-        summary_data = {
-            "total_employees": 5,  # This would come from the actual data
-            "total_hours": 850.0,
-            "avg_hours": 170.0,
-            "overtime_hours": 25.0,
-            "top_employee": "John Smith (185.5h)"
-        }
+        use_mock_data = bool((config or {}).get("_mock_data", False))
+        if use_mock_data:
+            employee_data = load_mock_monthly_data(month, year)
+        else:
+            employee_data = load_employee_data_from_files(month, year) or {}
+        summary_data = _calculate_email_summary(employee_data)
         
         success = email_service.send_monthly_report(
             recipient_emails, report_path, month, year, summary_data
@@ -273,6 +322,8 @@ def main():
     if args.config and os.path.exists(args.config):
         with open(args.config, 'r') as f:
             config = json.load(f)
+    config = dict(config or {})
+    config["_mock_data"] = bool(args.mock_data)
     
     # Generate report
     report_path = generate_report(
