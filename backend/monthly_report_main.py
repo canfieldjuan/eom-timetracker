@@ -245,18 +245,18 @@ def send_report(
     if not email_service.test_email_configuration():
         print("Email configuration invalid")
         return False
-    
+
     success = email_service.send_monthly_report(
         recipient_emails,
         report_path,
         month,
         year,
         summary_data=summary_data or {
-            "total_employees": "N/A",
-            "total_hours": "N/A",
-            "avg_hours": "N/A",
-            "overtime_hours": "N/A",
-            "top_employee": "N/A",
+            "total_employees": 0,
+            "total_hours": 0.0,
+            "avg_hours": 0.0,
+            "overtime_hours": 0.0,
+            "top_employee": "",
         },
     )
 

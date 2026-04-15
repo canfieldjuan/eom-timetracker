@@ -1322,7 +1322,7 @@ def admin_employee_hours(
 
     shifts.sort(key=lambda x: (x["date"], x["clockIn"]), reverse=True)
 
-    # Build weekly grid (Sun–Sat) for the requested week
+    # Build weekly grid (Sun-Sat) for the requested week
     days_since_sunday = (now.weekday() + 1) % 7
     this_sunday_utc = (now - timedelta(days=days_since_sunday)).replace(hour=0, minute=0, second=0, microsecond=0)
     grid_sunday_utc = this_sunday_utc + timedelta(weeks=week_offset)
@@ -1591,18 +1591,18 @@ def admin_adjust_entry(
             try:
                 new_ci_utc = parse_local_dt(payload.clockIn).astimezone(timezone.utc)
             except ValueError:
-                return False, "Invalid clockIn — use YYYY-MM-DDTHH:MM"
+                return False, "Invalid clockIn - use YYYY-MM-DDTHH:MM"
 
         if payload.clockOut is not None:
             if payload.clockOut.strip() == "":
-                # Clear clock-out → make shift active again
+                # Clear clock-out - make shift active again
                 entry["clockOut"] = None
                 entry["totalHours"] = 0.0
             else:
                 try:
                     new_co_utc = parse_local_dt(payload.clockOut).astimezone(timezone.utc)
                 except ValueError:
-                    return False, "Invalid clockOut — use YYYY-MM-DDTHH:MM"
+                    return False, "Invalid clockOut - use YYYY-MM-DDTHH:MM"
 
         # Apply clock-in change
         if new_ci_utc is not None:
@@ -1992,7 +1992,7 @@ def admin_generate_report(
     return {
         "success": True,
         "message": "Report generated successfully",
-        "reportPath": str(absolute_report_path.relative_to(REPORTS_DIR.resolve())),
+        "reportPath": str(absolute_report_path),
         "output": stdout_text,
         "emailSent": payload.send_email and len(payload.emails) > 0,
     }
@@ -2084,7 +2084,7 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
             co_dt = parse_utc_iso(str(entry["clockOut"]))
             co_display = local_clock_string(co_dt)
         except (ValueError, KeyError):
-            co_display = "—"
+            co_display = "-"
 
         loc = entry.get("location", "")
         rows.append({

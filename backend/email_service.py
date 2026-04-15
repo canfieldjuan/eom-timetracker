@@ -14,8 +14,8 @@ class EmailService:
     def __init__(self, config: Dict[str, Any] = None):
         self.config = config or {}
         self.resend_api_key = self.config.get("resend_api_key", os.getenv("RESEND_API_KEY"))
-        self.from_email = self.config.get("from_email", os.getenv("RESEND_FROM_EMAIL", "reports@yourcompany.com"))
-        self.company_name = self.config.get("company_name", "Your Company")
+        self.from_email = self.config.get("from_email") or os.getenv("RESEND_FROM_EMAIL")
+        self.company_name = self.config.get("company_name") or os.getenv("RESEND_FROM_NAME", "")
     
     def send_monthly_report(self, recipient_emails: List[str],
                           report_path: str, month: int, year: int,
@@ -92,22 +92,22 @@ class EmailService:
         """Create HTML email for monthly report"""
         
         summary_data = summary_data or {}
-        total_employees = summary_data.get("total_employees", "N/A")
-        total_hours = summary_data.get("total_hours", "N/A")
-        avg_hours = summary_data.get("avg_hours", "N/A")
-        overtime_hours = summary_data.get("overtime_hours", "N/A")
-        top_employee = summary_data.get("top_employee", "N/A")
+        total_employees = summary_data.get("total_employees", 0)
+        total_hours = summary_data.get("total_hours", 0)
+        avg_hours = summary_data.get("avg_hours", 0)
+        overtime_hours = summary_data.get("overtime_hours", 0)
+        top_employee = summary_data.get("top_employee", "")
         total_revenue = summary_data.get("total_revenue")
         net_profit = summary_data.get("net_profit")
 
         def _fmt_currency(value: Any) -> str:
             if isinstance(value, (int, float)):
                 return f"${value:,.2f}"
-            return "N/A"
+            return "$0.00"
 
-        total_hours_text = f"{total_hours:.1f}" if isinstance(total_hours, (int, float)) else str(total_hours)
-        avg_hours_text = f"{avg_hours:.1f}" if isinstance(avg_hours, (int, float)) else str(avg_hours)
-        overtime_text = f"{overtime_hours:.1f}" if isinstance(overtime_hours, (int, float)) else str(overtime_hours)
+        total_hours_text = f"{total_hours:.1f}" if isinstance(total_hours, (int, float)) else "0.0"
+        avg_hours_text = f"{avg_hours:.1f}" if isinstance(avg_hours, (int, float)) else "0.0"
+        overtime_text = f"{overtime_hours:.1f}" if isinstance(overtime_hours, (int, float)) else "0.0"
         
         return f"""
         <!DOCTYPE html>
@@ -265,7 +265,7 @@ class EmailService:
             # This will fail but we just want to check if credentials are valid
             test_data = {
                 "from": self.from_email,
-                "to": ["test@example.com"],
+                "to": [self.from_email],
                 "subject": "Test",
                 "html": "Test"
             }
