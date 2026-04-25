@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address, ip_network
@@ -872,6 +873,7 @@ def _save_timesheets_to_db(
                     UPDATE shifts SET
                         location_id         = %s,
                         location_label      = %s,
+                        clock_in            = %s,
                         clock_out           = %s,
                         total_hours         = %s,
                         notes               = %s,
@@ -889,6 +891,7 @@ def _save_timesheets_to_db(
                     (
                         loc_id,
                         entry.get("location", ""),
+                        entry.get("clockIn"),
                         entry.get("clockOut"),
                         entry.get("totalHours"),
                         entry.get("notes", ""),
@@ -1044,6 +1047,71 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
         return bcrypt.checkpw(plain_password.encode("utf-8"), password_hash.encode("utf-8"))
     except ValueError:
         return False
+
+
+# Pre-computed dummy hash used to equalise the wall-clock time of a login
+# attempt against an unknown name with one against an existing user. Without
+# this, an attacker can enumerate valid usernames by timing the response.
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(
+    b"timing-attack-mitigation-dummy", bcrypt.gensalt(10)
+).decode()
+
+
+# Sliding-window per-IP rate limiter. In-memory and per-worker; redeploys
+# reset state and multi-worker setups don't coordinate. Acceptable for the
+# single-instance Render deployment. For horizontal scale, replace with a
+# Redis-backed implementation.
+_RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMIT_BUCKETS: Dict[str, "deque[float]"] = {}
+
+
+def _rate_limit_check(
+    request: Request,
+    *,
+    key_prefix: str,
+    max_calls: int,
+    window_seconds: int,
+) -> None:
+    """Raise HTTPException(429) when the per-IP call rate for the given
+    key_prefix exceeds max_calls within window_seconds."""
+    if max_calls <= 0 or window_seconds <= 0:
+        return  # disabled
+
+    client_ip = get_client_ip(request)
+    key = f"{key_prefix}:{client_ip}"
+    now = time.monotonic()
+    cutoff = now - window_seconds
+
+    with _RATE_LIMIT_LOCK:
+        bucket = _RATE_LIMIT_BUCKETS.get(key)
+        if bucket is None:
+            bucket = deque()
+            _RATE_LIMIT_BUCKETS[key] = bucket
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= max_calls:
+            retry_after = max(1, int(bucket[0] + window_seconds - now) + 1)
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests; try again later",
+                headers={"Retry-After": str(retry_after)},
+            )
+        bucket.append(now)
+        if len(_RATE_LIMIT_BUCKETS) > RATE_LIMIT_BUCKET_SOFT_CAP:
+            _rate_limit_evict_expired(cutoff)
+
+
+def _rate_limit_evict_expired(cutoff: float) -> None:
+    """Drop buckets whose entries are all past the cutoff. Caller must hold
+    _RATE_LIMIT_LOCK."""
+    stale: List[str] = []
+    for k, b in _RATE_LIMIT_BUCKETS.items():
+        while b and b[0] < cutoff:
+            b.popleft()
+        if not b:
+            stale.append(k)
+    for k in stale:
+        del _RATE_LIMIT_BUCKETS[k]
 
 
 def create_auth_token(employee_id: int, employee_name: str, role: str = "employee") -> str:
@@ -1469,29 +1537,35 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=4)
 
 
+MAX_LOCATION_LEN            = parse_int(os.getenv("MAX_LOCATION_LEN"),            500)
+MAX_NOTES_LEN               = parse_int(os.getenv("MAX_NOTES_LEN"),               2000)
+MAX_GPS_OVERRIDE_REASON_LEN = parse_int(os.getenv("MAX_GPS_OVERRIDE_REASON_LEN"), 200)
+MAX_GPS_OVERRIDE_DETAIL_LEN = parse_int(os.getenv("MAX_GPS_OVERRIDE_DETAIL_LEN"), 500)
+
+
 class ClockInRequest(BaseModel):
-    location: str = ""
-    notes: str = ""
+    location: str = Field(default="", max_length=MAX_LOCATION_LEN)
+    notes: str = Field(default="", max_length=MAX_NOTES_LEN)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    gpsOverrideReason: str = ""
-    gpsOverrideDetail: str = ""
+    gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
+    gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
 class ClockOutRequest(BaseModel):
-    notes: str = ""
+    notes: str = Field(default="", max_length=MAX_NOTES_LEN)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    gpsOverrideReason: str = ""
-    gpsOverrideDetail: str = ""
+    gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
+    gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
 class DepartRequest(BaseModel):
-    notes: str = ""
+    notes: str = Field(default="", max_length=MAX_NOTES_LEN)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    gpsOverrideReason: str = ""
-    gpsOverrideDetail: str = ""
+    gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
+    gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
 class EntryAdjustRequest(BaseModel):
@@ -1502,7 +1576,7 @@ class EntryAdjustRequest(BaseModel):
 class ReportGenerateRequest(BaseModel):
     month: int = Field(ge=1, le=12)
     year: int = Field(ge=2000, le=2100)
-    emails: List[str] = []
+    emails: List[str] = Field(default=[])
     company_name: str = "Effingham Office Maids"
     send_email: bool = False
     use_mock_data: bool = False
@@ -1574,6 +1648,17 @@ BOOTSTRAP_ADMIN_IDS = [
     int(x) for x in os.getenv("BOOTSTRAP_ADMIN_IDS", "").split(",") if x.strip().isdigit()
 ]
 
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+ALLOWED_ORIGIN_REGEX = (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip() or None
+MAX_REPORT_RECIPIENTS = parse_int(os.getenv("MAX_REPORT_RECIPIENTS"), 50)
+MAX_REPORT_EMAIL_LEN = parse_int(os.getenv("MAX_REPORT_EMAIL_LEN"), 320)
+
+LOGIN_RATE_LIMIT_MAX        = parse_int(os.getenv("LOGIN_RATE_LIMIT_MAX"),        10)
+LOGIN_RATE_LIMIT_WINDOW_S   = parse_int(os.getenv("LOGIN_RATE_LIMIT_WINDOW_S"),   60)
+REGISTER_RATE_LIMIT_MAX     = parse_int(os.getenv("REGISTER_RATE_LIMIT_MAX"),      3)
+REGISTER_RATE_LIMIT_WINDOW_S = parse_int(os.getenv("REGISTER_RATE_LIMIT_WINDOW_S"), 300)
+RATE_LIMIT_BUCKET_SOFT_CAP  = parse_int(os.getenv("RATE_LIMIT_BUCKET_SOFT_CAP"), 10000)
+
 # ---------------------------------------------------------------------------
 # Business-rule defaults - single source of truth for all threshold settings.
 # These seed the `settings` DB table on first boot and serve as in-code
@@ -1608,12 +1693,26 @@ def apply_bootstrap_admins() -> None:
 
 
 app = FastAPI(title="EOM Time Tracker API", version="2.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+_cors_kwargs: Dict[str, Any] = {
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if ALLOWED_ORIGINS or ALLOWED_ORIGIN_REGEX:
+    if ALLOWED_ORIGINS:
+        _cors_kwargs["allow_origins"] = ALLOWED_ORIGINS
+    if ALLOWED_ORIGIN_REGEX:
+        _cors_kwargs["allow_origin_regex"] = ALLOWED_ORIGIN_REGEX
+else:
+    print(
+        "[security] WARNING: ALLOWED_ORIGINS / ALLOWED_ORIGIN_REGEX are not set; "
+        "falling back to allow_origins=['*']. Set ALLOWED_ORIGINS to your "
+        "frontend origin(s) for production.",
+        flush=True,
+    )
+    _cors_kwargs["allow_origins"] = ["*"]
+
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 
 @app.middleware("http")
@@ -1627,7 +1726,11 @@ async def private_network_access_middleware(request: Request, call_next):
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
     detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
-    return JSONResponse(status_code=exc.status_code, content={"success": False, "error": detail})
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "error": detail},
+        headers=exc.headers,
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -1791,6 +1894,12 @@ def health_check(request: Request) -> Dict[str, Any]:
 
 @app.post("/api/auth/login")
 def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
+    _rate_limit_check(
+        request,
+        key_prefix="login",
+        max_calls=LOGIN_RATE_LIMIT_MAX,
+        window_seconds=LOGIN_RATE_LIMIT_WINDOW_S,
+    )
     employee_name = payload.name.strip()
     password = payload.password
     if not employee_name or not password:
@@ -1799,7 +1908,13 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
 
     def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
         employee = find_employee_by_name(employees_data["employees"], employee_name)
-        if not employee or not verify_password(password, employee["password"]):
+        if not employee:
+            # Burn the same bcrypt budget we would for a real user so the
+            # wall-clock response time does not reveal that the username is
+            # unknown.
+            verify_password(password, _DUMMY_PASSWORD_HASH)
+            return False, None
+        if not verify_password(password, employee["password"]):
             return False, None
 
         employee["lastLogin"] = to_utc_iso(utc_now())
@@ -1821,6 +1936,12 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
 
 @app.post("/api/auth/register")
 def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]:
+    _rate_limit_check(
+        request,
+        key_prefix="register",
+        max_calls=REGISTER_RATE_LIMIT_MAX,
+        window_seconds=REGISTER_RATE_LIMIT_WINDOW_S,
+    )
     employee_name = payload.name.strip()
     password = payload.password
     if not employee_name or not password:
@@ -1915,30 +2036,59 @@ def admin_list_employees(
     if employee.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    employees_data = load_employees()
-    timesheet_data = load_timesheets()
-    now = utc_now()
+    aggregate_rows = db.query_all(
+        """
+        WITH shift_stats AS (
+            SELECT
+                s.employee_id,
+                SUM(
+                    CASE
+                        WHEN s.clock_out IS NOT NULL
+                            THEN GREATEST(0.0, EXTRACT(EPOCH FROM (s.clock_out - s.clock_in)) / 3600.0)
+                        ELSE GREATEST(0.0, LEAST(%s, EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0))
+                    END
+                ) AS total_hours,
+                COUNT(*) AS total_shifts
+            FROM shifts s
+            GROUP BY s.employee_id
+        ),
+        last_shift AS (
+            SELECT DISTINCT ON (s.employee_id)
+                s.employee_id,
+                COALESCE(s.clock_in_gps, s.clock_out_gps) AS last_gps
+            FROM shifts s
+            ORDER BY s.employee_id, s.clock_in DESC
+        )
+        SELECT
+            e.id, e.name, e.role, e.active, e.hourly_rate,
+            e.created_at, e.last_login_at,
+            COALESCE(ss.total_hours, 0) AS total_hours,
+            COALESCE(ss.total_shifts, 0) AS total_shifts,
+            ls.last_gps
+        FROM employees e
+        LEFT JOIN shift_stats ss ON ss.employee_id = e.id
+        LEFT JOIN last_shift  ls ON ls.employee_id = e.id
+        ORDER BY e.id
+        """,
+        (MAX_ACTIVE_SHIFT_HOURS,),
+    )
+
     rows = []
-
-    for emp in employees_data["employees"]:
-        emp_entries = [e for e in timesheet_data["entries"] if e.get("employeeId") == emp["id"]]
-        total_hours = sum(entry_hours(e, now) for e in emp_entries)
-        last_entry = max(emp_entries, key=lambda e: e.get("clockIn", ""), default=None)
-        last_gps = None
-        if last_entry:
-            last_gps = last_entry.get("clockInGps") or last_entry.get("clockOutGps")
-
+    for r in aggregate_rows:
+        rate = r.get("hourly_rate")
+        created = r.get("created_at")
+        last_login = r.get("last_login_at")
         rows.append({
-            "id": emp["id"],
-            "name": emp["name"],
-            "role": emp.get("role", "employee"),
-            "active": emp.get("active", True),
-            "created": emp.get("created"),
-            "lastLogin": emp.get("lastLogin"),
-            "totalHours": round(total_hours, 2),
-            "totalShifts": len(emp_entries),
-            "lastGps": last_gps,
-            "hourlyRate": emp.get("hourlyRate"),
+            "id":          r["id"],
+            "name":        r["name"],
+            "role":        r.get("role", "employee"),
+            "active":      r["active"],
+            "created":     to_utc_iso(created) if created else None,
+            "lastLogin":   to_utc_iso(last_login) if last_login else None,
+            "totalHours":  round(float(r.get("total_hours") or 0), 2),
+            "totalShifts": int(r.get("total_shifts") or 0),
+            "lastGps":     r.get("last_gps"),
+            "hourlyRate":  float(rate) if rate is not None else None,
         })
 
     append_access_log(request, "ADMIN_EMPLOYEES", True, f"{len(rows)} employees")
@@ -2443,7 +2593,10 @@ def admin_adjust_entry(
 
         # Apply clock-out change
         if new_co_utc is not None:
-            ci_utc = parse_utc_iso(str(entry["clockIn"]))
+            try:
+                ci_utc = parse_utc_iso(str(entry["clockIn"]))
+            except ValueError:
+                return False, "Existing clock-in is malformed; adjust clockIn first"
             if new_co_utc <= ci_utc:
                 return False, "Clock-out must be after clock-in"
             entry["clockOut"] = to_utc_iso(new_co_utc)
@@ -2506,7 +2659,7 @@ def my_timesheet_hours(
         except ValueError:
             continue
 
-        total = float(entry.get("totalHours") or 0)
+        total = entry_hours(entry, now)
         entry_date = local_date_string(clock_in_dt)
 
         if clock_in_dt >= week_start:
@@ -2748,12 +2901,25 @@ def admin_logs_by_date(
     return {"success": True, "date": date_text, "logs": read_access_logs_for_date(date_text)}
 
 
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 @app.post("/api/admin/generate-report")
 def admin_generate_report(
     payload: ReportGenerateRequest,
     request: Request,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
+
+    if payload.send_email and payload.emails:
+        if len(payload.emails) > MAX_REPORT_RECIPIENTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Too many recipients (max {MAX_REPORT_RECIPIENTS})",
+            )
+        for email in payload.emails:
+            if not isinstance(email, str) or len(email) > MAX_REPORT_EMAIL_LEN or not _EMAIL_PATTERN.match(email):
+                raise HTTPException(status_code=400, detail=f"Invalid email: {email[:64]!r}")
 
     append_access_log(request, "REPORT_GENERATION_STARTED", True, f"Month: {payload.month}/{payload.year}")
 
@@ -2798,21 +2964,32 @@ def admin_generate_report(
     stderr_text = completed.stderr or ""
 
     if completed.returncode != 0:
+        # Log full subprocess output server-side for debugging, but do NOT
+        # return it to the client: stderr can carry tracebacks, file paths,
+        # or values pulled from environment variables (e.g. DB DSN parts).
+        print(
+            f"[report-gen] exit={completed.returncode}\n"
+            f"  stdout: {stdout_text}\n  stderr: {stderr_text}",
+            flush=True,
+        )
         append_access_log(request, "REPORT_GENERATION_FAILED", False, f"Exit code: {completed.returncode}")
         return {
             "success": False,
             "error": "Report generation failed",
-            "details": (stderr_text or stdout_text).strip(),
             "exitCode": completed.returncode,
         }
 
     report_path = parse_report_path(stdout_text).strip().strip("'\"")
     if not report_path:
+        print(
+            f"[report-gen] no report path in stdout\n"
+            f"  stdout: {stdout_text}\n  stderr: {stderr_text}",
+            flush=True,
+        )
         append_access_log(request, "REPORT_GENERATION_FAILED", False, "No report path returned by generator")
         return {
             "success": False,
             "error": "Report generation failed",
-            "details": (stderr_text or stdout_text).strip(),
             "exitCode": completed.returncode,
         }
 
@@ -3768,7 +3945,7 @@ def admin_pricing_recommendations(
             required_revenue = required_rev_margin
 
         # Calculate suggested increase
-        revenue_gap = round(required_revenue - actual_revenue, 2) if required_revenue is not None and actual_revenue > 0 else None
+        revenue_gap = round(required_revenue - actual_revenue, 2) if required_revenue is not None else None
         pct_increase = round(revenue_gap / actual_revenue * 100, 1) if revenue_gap is not None and actual_revenue > 0 else None
 
         # Suggested new per-visit price
@@ -3958,8 +4135,12 @@ def admin_auto_link_jobs(
                     for job in jobs:
                         job_cust_norm = job["customer_name"].strip().lower() if job["customer_name"] else ""
                         if job_cust_norm == shift_cust_norm and job["scheduled_date"] == shift_date:
-                            cur.execute("UPDATE shifts SET job_id = %s WHERE id = %s", (job["id"], shift["id"]))
-                            linked += 1
+                            cur.execute(
+                                "UPDATE shifts SET job_id = %s WHERE id = %s AND job_id IS NULL",
+                                (job["id"], shift["id"]),
+                            )
+                            if cur.rowcount > 0:
+                                linked += 1
                             break
 
     append_access_log(request, "JOBS_AUTO_LINKED", True, f"{linked} shifts auto-linked")

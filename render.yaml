@@ -24,6 +24,16 @@ services:
         fromDatabase:
           name: eom-timetracker-db
           property: connectionString
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
+      - key: RESEND_FROM_NAME
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: ALLOWED_ORIGIN_REGEX
+        sync: false
     disk:
       name: eom-data
       mountPath: /opt/render/project/data

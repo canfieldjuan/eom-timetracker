@@ -3,6 +3,7 @@
 
 import base64
 import os
+import traceback
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -60,6 +61,7 @@ class EmailService:
 
         except Exception as e:
             print(f"Email error: {e}")
+            traceback.print_exc()
             return False
 
     def _send_single_email(
@@ -95,6 +97,7 @@ class EmailService:
 
         except Exception as e:
             print(f"Email error for {email}: {e}")
+            traceback.print_exc()
             return False
 
     def _create_monthly_report_email(
@@ -298,5 +301,6 @@ class EmailService:
 
         except Exception as e:
             print(f"Email configuration test failed: {e}")
+            traceback.print_exc()
             return False
 
