@@ -2478,7 +2478,10 @@ def admin_adjust_entry(
 
         # Apply clock-out change
         if new_co_utc is not None:
-            ci_utc = parse_utc_iso(str(entry["clockIn"]))
+            try:
+                ci_utc = parse_utc_iso(str(entry["clockIn"]))
+            except ValueError:
+                return False, "Existing clock-in is malformed; adjust clockIn first"
             if new_co_utc <= ci_utc:
                 return False, "Clock-out must be after clock-in"
             entry["clockOut"] = to_utc_iso(new_co_utc)
@@ -3803,7 +3806,7 @@ def admin_pricing_recommendations(
             required_revenue = required_rev_margin
 
         # Calculate suggested increase
-        revenue_gap = round(required_revenue - actual_revenue, 2) if required_revenue is not None and actual_revenue > 0 else None
+        revenue_gap = round(required_revenue - actual_revenue, 2) if required_revenue is not None else None
         pct_increase = round(revenue_gap / actual_revenue * 100, 1) if revenue_gap is not None and actual_revenue > 0 else None
 
         # Suggested new per-visit price
