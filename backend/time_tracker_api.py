@@ -1726,7 +1726,11 @@ async def private_network_access_middleware(request: Request, call_next):
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
     detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
-    return JSONResponse(status_code=exc.status_code, content={"success": False, "error": detail})
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "error": detail},
+        headers=exc.headers,
+    )
 
 
 @app.exception_handler(RequestValidationError)
