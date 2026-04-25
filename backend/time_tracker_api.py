@@ -1469,29 +1469,35 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=4)
 
 
+MAX_LOCATION_LEN            = parse_int(os.getenv("MAX_LOCATION_LEN"),            500)
+MAX_NOTES_LEN               = parse_int(os.getenv("MAX_NOTES_LEN"),               2000)
+MAX_GPS_OVERRIDE_REASON_LEN = parse_int(os.getenv("MAX_GPS_OVERRIDE_REASON_LEN"), 200)
+MAX_GPS_OVERRIDE_DETAIL_LEN = parse_int(os.getenv("MAX_GPS_OVERRIDE_DETAIL_LEN"), 500)
+
+
 class ClockInRequest(BaseModel):
-    location: str = ""
-    notes: str = ""
+    location: str = Field(default="", max_length=MAX_LOCATION_LEN)
+    notes: str = Field(default="", max_length=MAX_NOTES_LEN)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    gpsOverrideReason: str = ""
-    gpsOverrideDetail: str = ""
+    gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
+    gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
 class ClockOutRequest(BaseModel):
-    notes: str = ""
+    notes: str = Field(default="", max_length=MAX_NOTES_LEN)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    gpsOverrideReason: str = ""
-    gpsOverrideDetail: str = ""
+    gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
+    gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
 class DepartRequest(BaseModel):
-    notes: str = ""
+    notes: str = Field(default="", max_length=MAX_NOTES_LEN)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    gpsOverrideReason: str = ""
-    gpsOverrideDetail: str = ""
+    gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
+    gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
 class EntryAdjustRequest(BaseModel):
@@ -1915,30 +1921,59 @@ def admin_list_employees(
     if employee.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    employees_data = load_employees()
-    timesheet_data = load_timesheets()
-    now = utc_now()
+    aggregate_rows = db.query_all(
+        """
+        WITH shift_stats AS (
+            SELECT
+                s.employee_id,
+                SUM(
+                    CASE
+                        WHEN s.clock_out IS NOT NULL
+                            THEN GREATEST(0.0, EXTRACT(EPOCH FROM (s.clock_out - s.clock_in)) / 3600.0)
+                        ELSE GREATEST(0.0, LEAST(%s, EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0))
+                    END
+                ) AS total_hours,
+                COUNT(*) AS total_shifts
+            FROM shifts s
+            GROUP BY s.employee_id
+        ),
+        last_shift AS (
+            SELECT DISTINCT ON (s.employee_id)
+                s.employee_id,
+                COALESCE(s.clock_in_gps, s.clock_out_gps) AS last_gps
+            FROM shifts s
+            ORDER BY s.employee_id, s.clock_in DESC
+        )
+        SELECT
+            e.id, e.name, e.role, e.active, e.hourly_rate,
+            e.created_at, e.last_login_at,
+            COALESCE(ss.total_hours, 0) AS total_hours,
+            COALESCE(ss.total_shifts, 0) AS total_shifts,
+            ls.last_gps
+        FROM employees e
+        LEFT JOIN shift_stats ss ON ss.employee_id = e.id
+        LEFT JOIN last_shift  ls ON ls.employee_id = e.id
+        ORDER BY e.id
+        """,
+        (MAX_ACTIVE_SHIFT_HOURS,),
+    )
+
     rows = []
-
-    for emp in employees_data["employees"]:
-        emp_entries = [e for e in timesheet_data["entries"] if e.get("employeeId") == emp["id"]]
-        total_hours = sum(entry_hours(e, now) for e in emp_entries)
-        last_entry = max(emp_entries, key=lambda e: e.get("clockIn", ""), default=None)
-        last_gps = None
-        if last_entry:
-            last_gps = last_entry.get("clockInGps") or last_entry.get("clockOutGps")
-
+    for r in aggregate_rows:
+        rate = r.get("hourly_rate")
+        created = r.get("created_at")
+        last_login = r.get("last_login_at")
         rows.append({
-            "id": emp["id"],
-            "name": emp["name"],
-            "role": emp.get("role", "employee"),
-            "active": emp.get("active", True),
-            "created": emp.get("created"),
-            "lastLogin": emp.get("lastLogin"),
-            "totalHours": round(total_hours, 2),
-            "totalShifts": len(emp_entries),
-            "lastGps": last_gps,
-            "hourlyRate": emp.get("hourlyRate"),
+            "id":          r["id"],
+            "name":        r["name"],
+            "role":        r.get("role", "employee"),
+            "active":      r["active"],
+            "created":     to_utc_iso(created) if created else None,
+            "lastLogin":   to_utc_iso(last_login) if last_login else None,
+            "totalHours":  round(float(r.get("total_hours") or 0), 2),
+            "totalShifts": int(r.get("total_shifts") or 0),
+            "lastGps":     r.get("last_gps"),
+            "hourlyRate":  float(rate) if rate is not None else None,
         })
 
     append_access_log(request, "ADMIN_EMPLOYEES", True, f"{len(rows)} employees")
