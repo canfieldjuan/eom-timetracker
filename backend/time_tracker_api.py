@@ -2541,7 +2541,7 @@ def my_timesheet_hours(
         except ValueError:
             continue
 
-        total = float(entry.get("totalHours") or 0)
+        total = entry_hours(entry, now)
         entry_date = local_date_string(clock_in_dt)
 
         if clock_in_dt >= week_start:
@@ -3993,8 +3993,12 @@ def admin_auto_link_jobs(
                     for job in jobs:
                         job_cust_norm = job["customer_name"].strip().lower() if job["customer_name"] else ""
                         if job_cust_norm == shift_cust_norm and job["scheduled_date"] == shift_date:
-                            cur.execute("UPDATE shifts SET job_id = %s WHERE id = %s", (job["id"], shift["id"]))
-                            linked += 1
+                            cur.execute(
+                                "UPDATE shifts SET job_id = %s WHERE id = %s AND job_id IS NULL",
+                                (job["id"], shift["id"]),
+                            )
+                            if cur.rowcount > 0:
+                                linked += 1
                             break
 
     append_access_log(request, "JOBS_AUTO_LINKED", True, f"{linked} shifts auto-linked")

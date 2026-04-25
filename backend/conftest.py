@@ -147,18 +147,15 @@ def location_id():
 
 
 @pytest.fixture(scope="session")
-def completed_shift_id(client, auth, employee_id, location_id):
-    """Create and clock-out a shift, return its ID."""
-    ci = client.post("/api/timesheet/clock-in", headers=auth, json={
-        "employeeId": employee_id,
+def completed_shift_id(client, emp_auth, employee_id, location_id):
+    """Create and clock-out a shift owned by the employee, return its ID."""
+    ci = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
         "location": "123 Main St, Effingham",
-        "timezone": "America/Chicago",
     })
     assert ci.status_code == 200, ci.text
     entry_id = ci.json()["entry"]["id"]
 
-    co = client.post("/api/timesheet/clock-out", headers=auth, json={
-        "employeeId": employee_id,
+    co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
         "notes": "test shift",
     })
     assert co.status_code == 200, co.text

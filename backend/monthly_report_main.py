@@ -8,12 +8,16 @@ import os
 import argparse
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
+from zoneinfo import ZoneInfo
 
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from report_generator import MonthlyReportGenerator
 from email_service import EmailService
+
+REPORT_TIMEZONE_NAME = os.getenv("TIMEZONE", "America/Chicago")
+REPORT_TIMEZONE = ZoneInfo(REPORT_TIMEZONE_NAME)
 
 
 def _calculate_email_summary(employee_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -100,7 +104,10 @@ def load_employee_data_from_files(month: int, year: int) -> Dict[str, Any]:
         except ValueError:
             continue
 
-        if clock_in.month != month or clock_in.year != year:
+        clock_in_local = clock_in.astimezone(REPORT_TIMEZONE)
+        clock_out_local = clock_out.astimezone(REPORT_TIMEZONE)
+
+        if clock_in_local.month != month or clock_in_local.year != year:
             continue
 
         hours = round((clock_out - clock_in).total_seconds() / 3600, 2)
@@ -111,9 +118,9 @@ def load_employee_data_from_files(month: int, year: int) -> Dict[str, Any]:
             employees_map[emp_id] = {"id": emp_id, "name": emp_name, "shifts": []}
 
         employees_map[emp_id]["shifts"].append({
-            "date": clock_in.strftime("%Y-%m-%d"),
-            "startTime": clock_in.strftime("%H:%M"),
-            "endTime": clock_out.strftime("%H:%M"),
+            "date": clock_in_local.strftime("%Y-%m-%d"),
+            "startTime": clock_in_local.strftime("%H:%M"),
+            "endTime": clock_out_local.strftime("%H:%M"),
             "hours": hours,
         })
 
