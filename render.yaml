@@ -30,6 +30,10 @@ services:
         sync: false
       - key: RESEND_FROM_NAME
         sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: ALLOWED_ORIGIN_REGEX
+        sync: false
     disk:
       name: eom-data
       mountPath: /opt/render/project/data

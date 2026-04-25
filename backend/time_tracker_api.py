@@ -1046,6 +1046,14 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
         return False
 
 
+# Pre-computed dummy hash used to equalise the wall-clock time of a login
+# attempt against an unknown name with one against an existing user. Without
+# this, an attacker can enumerate valid usernames by timing the response.
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(
+    b"timing-attack-mitigation-dummy", bcrypt.gensalt(10)
+).decode()
+
+
 def create_auth_token(employee_id: int, employee_name: str, role: str = "employee") -> str:
     now = utc_now()
     payload = {
@@ -1508,7 +1516,7 @@ class EntryAdjustRequest(BaseModel):
 class ReportGenerateRequest(BaseModel):
     month: int = Field(ge=1, le=12)
     year: int = Field(ge=2000, le=2100)
-    emails: List[str] = []
+    emails: List[str] = Field(default=[])
     company_name: str = "Effingham Office Maids"
     send_email: bool = False
     use_mock_data: bool = False
@@ -1580,6 +1588,11 @@ BOOTSTRAP_ADMIN_IDS = [
     int(x) for x in os.getenv("BOOTSTRAP_ADMIN_IDS", "").split(",") if x.strip().isdigit()
 ]
 
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+ALLOWED_ORIGIN_REGEX = (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip() or None
+MAX_REPORT_RECIPIENTS = parse_int(os.getenv("MAX_REPORT_RECIPIENTS"), 50)
+MAX_REPORT_EMAIL_LEN = parse_int(os.getenv("MAX_REPORT_EMAIL_LEN"), 320)
+
 # ---------------------------------------------------------------------------
 # Business-rule defaults - single source of truth for all threshold settings.
 # These seed the `settings` DB table on first boot and serve as in-code
@@ -1614,12 +1627,26 @@ def apply_bootstrap_admins() -> None:
 
 
 app = FastAPI(title="EOM Time Tracker API", version="2.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+_cors_kwargs: Dict[str, Any] = {
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if ALLOWED_ORIGINS or ALLOWED_ORIGIN_REGEX:
+    if ALLOWED_ORIGINS:
+        _cors_kwargs["allow_origins"] = ALLOWED_ORIGINS
+    if ALLOWED_ORIGIN_REGEX:
+        _cors_kwargs["allow_origin_regex"] = ALLOWED_ORIGIN_REGEX
+else:
+    print(
+        "[security] WARNING: ALLOWED_ORIGINS / ALLOWED_ORIGIN_REGEX are not set; "
+        "falling back to allow_origins=['*']. Set ALLOWED_ORIGINS to your "
+        "frontend origin(s) for production.",
+        flush=True,
+    )
+    _cors_kwargs["allow_origins"] = ["*"]
+
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 
 @app.middleware("http")
@@ -1805,7 +1832,13 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
 
     def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
         employee = find_employee_by_name(employees_data["employees"], employee_name)
-        if not employee or not verify_password(password, employee["password"]):
+        if not employee:
+            # Burn the same bcrypt budget we would for a real user so the
+            # wall-clock response time does not reveal that the username is
+            # unknown.
+            verify_password(password, _DUMMY_PASSWORD_HASH)
+            return False, None
+        if not verify_password(password, employee["password"]):
             return False, None
 
         employee["lastLogin"] = to_utc_iso(utc_now())
@@ -2786,12 +2819,25 @@ def admin_logs_by_date(
     return {"success": True, "date": date_text, "logs": read_access_logs_for_date(date_text)}
 
 
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 @app.post("/api/admin/generate-report")
 def admin_generate_report(
     payload: ReportGenerateRequest,
     request: Request,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
+
+    if payload.send_email and payload.emails:
+        if len(payload.emails) > MAX_REPORT_RECIPIENTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Too many recipients (max {MAX_REPORT_RECIPIENTS})",
+            )
+        for email in payload.emails:
+            if not isinstance(email, str) or len(email) > MAX_REPORT_EMAIL_LEN or not _EMAIL_PATTERN.match(email):
+                raise HTTPException(status_code=400, detail=f"Invalid email: {email[:64]!r}")
 
     append_access_log(request, "REPORT_GENERATION_STARTED", True, f"Month: {payload.month}/{payload.year}")
 
@@ -2836,21 +2882,32 @@ def admin_generate_report(
     stderr_text = completed.stderr or ""
 
     if completed.returncode != 0:
+        # Log full subprocess output server-side for debugging, but do NOT
+        # return it to the client: stderr can carry tracebacks, file paths,
+        # or values pulled from environment variables (e.g. DB DSN parts).
+        print(
+            f"[report-gen] exit={completed.returncode}\n"
+            f"  stdout: {stdout_text}\n  stderr: {stderr_text}",
+            flush=True,
+        )
         append_access_log(request, "REPORT_GENERATION_FAILED", False, f"Exit code: {completed.returncode}")
         return {
             "success": False,
             "error": "Report generation failed",
-            "details": (stderr_text or stdout_text).strip(),
             "exitCode": completed.returncode,
         }
 
     report_path = parse_report_path(stdout_text).strip().strip("'\"")
     if not report_path:
+        print(
+            f"[report-gen] no report path in stdout\n"
+            f"  stdout: {stdout_text}\n  stderr: {stderr_text}",
+            flush=True,
+        )
         append_access_log(request, "REPORT_GENERATION_FAILED", False, "No report path returned by generator")
         return {
             "success": False,
             "error": "Report generation failed",
-            "details": (stderr_text or stdout_text).strip(),
             "exitCode": completed.returncode,
         }
 
