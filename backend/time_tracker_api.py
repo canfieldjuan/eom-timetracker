@@ -873,6 +873,7 @@ def _save_timesheets_to_db(
                     UPDATE shifts SET
                         location_id         = %s,
                         location_label      = %s,
+                        clock_in            = %s,
                         clock_out           = %s,
                         total_hours         = %s,
                         notes               = %s,
@@ -890,6 +891,7 @@ def _save_timesheets_to_db(
                     (
                         loc_id,
                         entry.get("location", ""),
+                        entry.get("clockIn"),
                         entry.get("clockOut"),
                         entry.get("totalHours"),
                         entry.get("notes", ""),
