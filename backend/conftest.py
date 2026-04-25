@@ -31,6 +31,8 @@ os.environ.setdefault("ALLOWED_IPS", "")
 os.environ.setdefault("TOKEN_TTL_HOURS", "12")
 os.environ.setdefault("MAX_ACTIVE_SHIFT_HOURS", "24")
 os.environ.setdefault("AUTO_CLOSE_STALE_SHIFTS", "false")
+os.environ.setdefault("LOGIN_RATE_LIMIT_MAX", "0")
+os.environ.setdefault("REGISTER_RATE_LIMIT_MAX", "0")
 
 SCHEMA_FILE = BACKEND_DIR / "schema.sql"
 

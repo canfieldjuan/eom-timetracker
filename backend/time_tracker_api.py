@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address, ip_network
@@ -1054,6 +1055,63 @@ _DUMMY_PASSWORD_HASH = bcrypt.hashpw(
 ).decode()
 
 
+# Sliding-window per-IP rate limiter. In-memory and per-worker; redeploys
+# reset state and multi-worker setups don't coordinate. Acceptable for the
+# single-instance Render deployment. For horizontal scale, replace with a
+# Redis-backed implementation.
+_RATE_LIMIT_LOCK = threading.Lock()
+_RATE_LIMIT_BUCKETS: Dict[str, "deque[float]"] = {}
+
+
+def _rate_limit_check(
+    request: Request,
+    *,
+    key_prefix: str,
+    max_calls: int,
+    window_seconds: int,
+) -> None:
+    """Raise HTTPException(429) when the per-IP call rate for the given
+    key_prefix exceeds max_calls within window_seconds."""
+    if max_calls <= 0 or window_seconds <= 0:
+        return  # disabled
+
+    client_ip = get_client_ip(request)
+    key = f"{key_prefix}:{client_ip}"
+    now = time.monotonic()
+    cutoff = now - window_seconds
+
+    with _RATE_LIMIT_LOCK:
+        bucket = _RATE_LIMIT_BUCKETS.get(key)
+        if bucket is None:
+            bucket = deque()
+            _RATE_LIMIT_BUCKETS[key] = bucket
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= max_calls:
+            retry_after = max(1, int(bucket[0] + window_seconds - now) + 1)
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests; try again later",
+                headers={"Retry-After": str(retry_after)},
+            )
+        bucket.append(now)
+        if len(_RATE_LIMIT_BUCKETS) > RATE_LIMIT_BUCKET_SOFT_CAP:
+            _rate_limit_evict_expired(cutoff)
+
+
+def _rate_limit_evict_expired(cutoff: float) -> None:
+    """Drop buckets whose entries are all past the cutoff. Caller must hold
+    _RATE_LIMIT_LOCK."""
+    stale: List[str] = []
+    for k, b in _RATE_LIMIT_BUCKETS.items():
+        while b and b[0] < cutoff:
+            b.popleft()
+        if not b:
+            stale.append(k)
+    for k in stale:
+        del _RATE_LIMIT_BUCKETS[k]
+
+
 def create_auth_token(employee_id: int, employee_name: str, role: str = "employee") -> str:
     now = utc_now()
     payload = {
@@ -1593,6 +1651,12 @@ ALLOWED_ORIGIN_REGEX = (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip() or None
 MAX_REPORT_RECIPIENTS = parse_int(os.getenv("MAX_REPORT_RECIPIENTS"), 50)
 MAX_REPORT_EMAIL_LEN = parse_int(os.getenv("MAX_REPORT_EMAIL_LEN"), 320)
 
+LOGIN_RATE_LIMIT_MAX        = parse_int(os.getenv("LOGIN_RATE_LIMIT_MAX"),        10)
+LOGIN_RATE_LIMIT_WINDOW_S   = parse_int(os.getenv("LOGIN_RATE_LIMIT_WINDOW_S"),   60)
+REGISTER_RATE_LIMIT_MAX     = parse_int(os.getenv("REGISTER_RATE_LIMIT_MAX"),      3)
+REGISTER_RATE_LIMIT_WINDOW_S = parse_int(os.getenv("REGISTER_RATE_LIMIT_WINDOW_S"), 300)
+RATE_LIMIT_BUCKET_SOFT_CAP  = parse_int(os.getenv("RATE_LIMIT_BUCKET_SOFT_CAP"), 10000)
+
 # ---------------------------------------------------------------------------
 # Business-rule defaults - single source of truth for all threshold settings.
 # These seed the `settings` DB table on first boot and serve as in-code
@@ -1824,6 +1888,12 @@ def health_check(request: Request) -> Dict[str, Any]:
 
 @app.post("/api/auth/login")
 def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
+    _rate_limit_check(
+        request,
+        key_prefix="login",
+        max_calls=LOGIN_RATE_LIMIT_MAX,
+        window_seconds=LOGIN_RATE_LIMIT_WINDOW_S,
+    )
     employee_name = payload.name.strip()
     password = payload.password
     if not employee_name or not password:
@@ -1860,6 +1930,12 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
 
 @app.post("/api/auth/register")
 def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]:
+    _rate_limit_check(
+        request,
+        key_prefix="register",
+        max_calls=REGISTER_RATE_LIMIT_MAX,
+        window_seconds=REGISTER_RATE_LIMIT_WINDOW_S,
+    )
     employee_name = payload.name.strip()
     password = payload.password
     if not employee_name or not password:
