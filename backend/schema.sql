@@ -1,4 +1,4 @@
--- EOM Employee Management — PostgreSQL Schema
+-- EOM Employee Management -- PostgreSQL Schema
 -- Run once against a fresh database
 
 -- Employees
@@ -49,35 +49,40 @@ CREATE TABLE jobs (
 
 -- Shifts (time entries)
 CREATE TABLE shifts (
-    id            SERIAL PRIMARY KEY,
-    employee_id   INTEGER NOT NULL REFERENCES employees(id),
-    location_id   INTEGER REFERENCES locations(id),
-    clock_in      TIMESTAMPTZ NOT NULL,
-    clock_out     TIMESTAMPTZ,
-    total_hours   NUMERIC(6, 2),
-    notes         TEXT NOT NULL DEFAULT '',
-    local_date    DATE,
-    timezone      TEXT NOT NULL DEFAULT 'America/Chicago',
-    clock_in_gps  JSONB,
-    clock_out_gps JSONB,
-    job_id        INTEGER REFERENCES jobs(id),
-    time_category     TEXT NOT NULL DEFAULT 'productive'
-                          CHECK (time_category IN ('productive', 'non_productive')),
+    id                  SERIAL PRIMARY KEY,
+    employee_id         INTEGER NOT NULL REFERENCES employees(id),
+    location_id         INTEGER REFERENCES locations(id),
+    location_label      TEXT NOT NULL DEFAULT '',
+    clock_in            TIMESTAMPTZ NOT NULL,
+    clock_out           TIMESTAMPTZ,
+    total_hours         NUMERIC(6, 2),
+    notes               TEXT NOT NULL DEFAULT '',
+    local_date          DATE,
+    timezone            TEXT NOT NULL DEFAULT 'America/Chicago',
+    clock_in_gps        JSONB,
+    clock_in_gps_meta   JSONB,
+    clock_out_gps       JSONB,
+    clock_out_gps_meta  JSONB,
+    job_id              INTEGER REFERENCES jobs(id),
+    time_category       TEXT NOT NULL DEFAULT 'productive'
+                            CHECK (time_category IN ('productive', 'non_productive')),
     non_productive_type TEXT
-                          CHECK (non_productive_type IS NULL OR non_productive_type IN
-                                 ('drive_time', 'waiting', 'supply_run', 'rework', 'lockout', 'other')),
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                            CHECK (non_productive_type IS NULL OR non_productive_type IN
+                                   ('drive_time', 'waiting', 'supply_run', 'rework', 'lockout', 'other')),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Visits (multi-stop tracking within a shift)
 CREATE TABLE visits (
-    id            SERIAL PRIMARY KEY,
-    shift_id      INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
-    location_id   INTEGER REFERENCES locations(id),
-    customer_name TEXT,
-    arrival_time  TIMESTAMPTZ NOT NULL,
-    gps           JSONB,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id             SERIAL PRIMARY KEY,
+    shift_id       INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+    location_id    INTEGER REFERENCES locations(id),
+    location_label TEXT NOT NULL DEFAULT '',
+    customer_name  TEXT,
+    arrival_time   TIMESTAMPTZ NOT NULL,
+    gps            JSONB,
+    gps_meta       JSONB,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Departures (explicit leaving events during a shift)
@@ -85,9 +90,11 @@ CREATE TABLE departures (
     id             SERIAL PRIMARY KEY,
     shift_id       INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
     location_id    INTEGER REFERENCES locations(id),
+    location_label TEXT NOT NULL DEFAULT '',
     customer_name  TEXT,
     departure_time TIMESTAMPTZ NOT NULL,
     gps            JSONB,
+    gps_meta       JSONB,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
