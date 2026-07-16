@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import calendar
 import csv
+import hashlib
+import hmac
 import io
 import inspect
 import json
@@ -26,6 +28,7 @@ from zoneinfo import ZoneInfo
 import bcrypt
 import jwt
 import db
+import psycopg2.extras
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -1594,6 +1597,33 @@ class EntryAdjustRequest(BaseModel):
     clockOut: Optional[str] = None  # "YYYY-MM-DDTHH:MM" local time, or "" to clear
 
 
+class DuplicateShiftResolutionRequest(BaseModel):
+    canonicalShiftId: int = Field(gt=0)
+    duplicateShiftIds: List[int] = Field(min_length=1, max_length=20)
+
+
+class StaleShiftClosureRequest(BaseModel):
+    shiftId: int = Field(gt=0)
+    clockOut: str = Field(min_length=16, max_length=40)
+
+
+class TimeDataCorrectionPlanRequest(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+    duplicateResolutions: List[DuplicateShiftResolutionRequest] = Field(
+        default_factory=list,
+        max_length=50,
+    )
+    staleShiftClosures: List[StaleShiftClosureRequest] = Field(
+        default_factory=list,
+        max_length=100,
+    )
+
+
+class TimeDataCorrectionApplyRequest(TimeDataCorrectionPlanRequest):
+    planToken: str = Field(min_length=64, max_length=64)
+    confirmation: str = Field(min_length=1, max_length=100)
+
+
 class ReportGenerateRequest(BaseModel):
     month: int = Field(ge=1, le=12)
     year: int = Field(ge=2000, le=2100)
@@ -1866,6 +1896,22 @@ def _ensure_schema_migrations() -> None:
     db.execute("CREATE INDEX IF NOT EXISTS idx_shifts_clock_out ON shifts(clock_out)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_locations_active ON locations(active)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_employees_active ON employees(active)")
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS time_data_correction_batches (
+            id                     BIGSERIAL PRIMARY KEY,
+            plan_token             TEXT NOT NULL UNIQUE,
+            applied_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            applied_by_name        TEXT NOT NULL,
+            reason                 TEXT NOT NULL,
+            snapshot               JSONB NOT NULL,
+            result                 JSONB NOT NULL,
+            created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_time_data_correction_batches_created "
+        "ON time_data_correction_batches(created_at)"
+    )
 
     # Seed threshold defaults if not already in settings
     for key, default_val in _SETTINGS_DEFAULTS.items():
@@ -3089,6 +3135,468 @@ def build_time_data_audit() -> Dict[str, Any]:
     }
 
 
+def _correction_query_all(
+    sql: str,
+    params: tuple = (),
+    cursor: Any = None,
+) -> List[Dict[str, Any]]:
+    if cursor is None:
+        return db.query_all(sql, params)
+    cursor.execute(sql, params)
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def _correction_shift_snapshots(
+    shift_ids: List[int],
+    cursor: Any = None,
+    lock_shifts: bool = False,
+) -> List[Dict[str, Any]]:
+    ids = sorted({int(value) for value in shift_ids})
+    if not ids:
+        return []
+
+    lock_clause = " FOR UPDATE OF s" if lock_shifts and cursor is not None else ""
+    shift_rows = _correction_query_all(
+        """
+        SELECT
+            s.id,
+            s.employee_id,
+            e.name AS employee_name,
+            s.location_id,
+            COALESCE(l.address, s.location_label, '') AS effective_location,
+            s.location_label,
+            s.clock_in,
+            s.clock_out,
+            s.total_hours,
+            s.notes,
+            s.local_date,
+            s.timezone,
+            s.clock_in_gps,
+            s.clock_in_gps_meta,
+            s.clock_out_gps,
+            s.clock_out_gps_meta,
+            s.job_id,
+            s.time_category,
+            s.non_productive_type,
+            s.created_at
+        FROM shifts s
+        JOIN employees e ON e.id = s.employee_id
+        LEFT JOIN locations l ON l.id = s.location_id
+        WHERE s.id = ANY(%s)
+        ORDER BY s.id
+        """ + lock_clause,
+        (ids,),
+        cursor,
+    )
+    visit_rows = _correction_query_all(
+        """
+        SELECT
+            v.id,
+            v.shift_id,
+            v.location_id,
+            COALESCE(l.address, v.location_label, '') AS effective_location,
+            v.location_label,
+            v.customer_name,
+            v.arrival_time,
+            v.gps,
+            v.gps_meta,
+            v.created_at
+        FROM visits v
+        LEFT JOIN locations l ON l.id = v.location_id
+        WHERE v.shift_id = ANY(%s)
+        ORDER BY v.shift_id, v.arrival_time, v.id
+        """,
+        (ids,),
+        cursor,
+    )
+    departure_rows = _correction_query_all(
+        """
+        SELECT
+            d.id,
+            d.shift_id,
+            d.location_id,
+            COALESCE(l.address, d.location_label, '') AS effective_location,
+            d.location_label,
+            d.customer_name,
+            d.departure_time,
+            d.gps,
+            d.gps_meta,
+            d.created_at
+        FROM departures d
+        LEFT JOIN locations l ON l.id = d.location_id
+        WHERE d.shift_id = ANY(%s)
+        ORDER BY d.shift_id, d.departure_time, d.id
+        """,
+        (ids,),
+        cursor,
+    )
+
+    visits_by_shift: Dict[int, List[Dict[str, Any]]] = {}
+    for row in visit_rows:
+        visits_by_shift.setdefault(int(row["shift_id"]), []).append({
+            "id": int(row["id"]),
+            "shiftId": int(row["shift_id"]),
+            "locationId": int(row["location_id"]) if row.get("location_id") is not None else None,
+            "location": row.get("effective_location") or "",
+            "locationLabel": row.get("location_label") or "",
+            "customerName": row.get("customer_name") or "",
+            "arrivalTime": to_utc_iso(row["arrival_time"]),
+            "gps": row.get("gps"),
+            "gpsMeta": row.get("gps_meta"),
+            "createdAt": to_utc_iso(row["created_at"]),
+        })
+
+    departures_by_shift: Dict[int, List[Dict[str, Any]]] = {}
+    for row in departure_rows:
+        departures_by_shift.setdefault(int(row["shift_id"]), []).append({
+            "id": int(row["id"]),
+            "shiftId": int(row["shift_id"]),
+            "locationId": int(row["location_id"]) if row.get("location_id") is not None else None,
+            "location": row.get("effective_location") or "",
+            "locationLabel": row.get("location_label") or "",
+            "customerName": row.get("customer_name") or "",
+            "departureTime": to_utc_iso(row["departure_time"]),
+            "gps": row.get("gps"),
+            "gpsMeta": row.get("gps_meta"),
+            "createdAt": to_utc_iso(row["created_at"]),
+        })
+
+    snapshots = []
+    for row in shift_rows:
+        shift_id = int(row["id"])
+        snapshots.append({
+            "id": shift_id,
+            "employeeId": int(row["employee_id"]),
+            "employeeName": row["employee_name"],
+            "locationId": int(row["location_id"]) if row.get("location_id") is not None else None,
+            "location": row.get("effective_location") or "",
+            "locationLabel": row.get("location_label") or "",
+            "clockIn": to_utc_iso(row["clock_in"]),
+            "clockOut": to_utc_iso(row["clock_out"]) if row.get("clock_out") else None,
+            "totalHours": float(row["total_hours"]) if row.get("total_hours") is not None else None,
+            "notes": row.get("notes") or "",
+            "localDate": str(row["local_date"]) if row.get("local_date") else None,
+            "timezone": row.get("timezone") or TIMEZONE_NAME,
+            "clockInGps": row.get("clock_in_gps"),
+            "clockInGpsMeta": row.get("clock_in_gps_meta"),
+            "clockOutGps": row.get("clock_out_gps"),
+            "clockOutGpsMeta": row.get("clock_out_gps_meta"),
+            "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
+            "timeCategory": row.get("time_category") or "productive",
+            "nonProductiveType": row.get("non_productive_type"),
+            "createdAt": to_utc_iso(row["created_at"]),
+            "visits": visits_by_shift.get(shift_id, []),
+            "departures": departures_by_shift.get(shift_id, []),
+        })
+    return snapshots
+
+
+def _correction_metadata_signature(snapshot: Dict[str, Any]) -> str:
+    comparable = {
+        key: value
+        for key, value in snapshot.items()
+        if key not in {"id", "createdAt", "employeeName", "visits", "departures"}
+    }
+    comparable["visits"] = [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"id", "shiftId", "createdAt"}
+        }
+        for row in snapshot.get("visits", [])
+    ]
+    comparable["departures"] = [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"id", "shiftId", "createdAt"}
+        }
+        for row in snapshot.get("departures", [])
+    ]
+    return json.dumps(comparable, sort_keys=True, separators=(",", ":"))
+
+
+def _correction_richness_score(snapshot: Dict[str, Any]) -> int:
+    score = 10 * (len(snapshot.get("visits", [])) + len(snapshot.get("departures", [])))
+    score += 8 if snapshot.get("jobId") is not None else 0
+    score += 4 if str(snapshot.get("notes") or "").strip() else 0
+    score += 3 if snapshot.get("timeCategory") != "productive" else 0
+    score += sum(
+        1
+        for key in ("clockInGps", "clockInGpsMeta", "clockOutGps", "clockOutGpsMeta")
+        if snapshot.get(key)
+    )
+    return score
+
+
+def build_time_data_correction_inventory(
+    cursor: Any = None,
+    lock_shifts: bool = False,
+) -> Dict[str, Any]:
+    """Return correction candidates and their complete, recoverable metadata."""
+    duplicate_rows = _correction_query_all(
+        """
+        SELECT
+            e.id AS employee_id,
+            e.name AS employee_name,
+            COALESCE(l.address, s.location_label, '') AS location,
+            s.clock_in,
+            s.clock_out,
+            ARRAY_AGG(s.id ORDER BY s.id) AS shift_ids,
+            COUNT(*) AS copies
+        FROM shifts s
+        JOIN employees e ON e.id = s.employee_id
+        LEFT JOIN locations l ON l.id = s.location_id
+        GROUP BY
+            e.id,
+            e.name,
+            COALESCE(l.address, s.location_label, ''),
+            s.clock_in,
+            s.clock_out
+        HAVING COUNT(*) > 1
+        ORDER BY s.clock_in, e.name
+        """,
+        cursor=cursor,
+    )
+    stale_rows = _correction_query_all(
+        """
+        SELECT
+            s.id AS shift_id,
+            ROUND(
+                (EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0)::numeric,
+                2
+            ) AS age_hours
+        FROM shifts s
+        WHERE
+            s.clock_out IS NULL
+            AND s.clock_in < NOW() - (%s * INTERVAL '1 hour')
+        ORDER BY s.clock_in, s.id
+        """,
+        (MAX_ACTIVE_SHIFT_HOURS,),
+        cursor,
+    )
+
+    candidate_ids: List[int] = []
+    for row in duplicate_rows:
+        candidate_ids.extend(int(value) for value in row.get("shift_ids") or [])
+    candidate_ids.extend(int(row["shift_id"]) for row in stale_rows)
+    snapshots = _correction_shift_snapshots(
+        candidate_ids,
+        cursor=cursor,
+        lock_shifts=lock_shifts,
+    )
+    snapshot_by_id = {int(row["id"]): row for row in snapshots}
+
+    duplicate_groups = []
+    for row in duplicate_rows:
+        shift_ids = [int(value) for value in row.get("shift_ids") or []]
+        group_shifts = [snapshot_by_id[value] for value in shift_ids if value in snapshot_by_id]
+        recommended = max(
+            group_shifts,
+            key=lambda item: (_correction_richness_score(item), -int(item["id"])),
+        )
+        signatures = {_correction_metadata_signature(item) for item in group_shifts}
+        group_key = json.dumps(
+            {
+                "employeeId": int(row["employee_id"]),
+                "location": row.get("location") or "",
+                "clockIn": to_utc_iso(row["clock_in"]),
+                "clockOut": to_utc_iso(row["clock_out"]) if row.get("clock_out") else None,
+                "shiftIds": shift_ids,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        duplicate_groups.append({
+            "groupId": hashlib.sha256(group_key.encode("utf-8")).hexdigest()[:16],
+            "employeeId": int(row["employee_id"]),
+            "employeeName": row["employee_name"],
+            "location": row.get("location") or "",
+            "clockIn": to_utc_iso(row["clock_in"]),
+            "clockOut": to_utc_iso(row["clock_out"]) if row.get("clock_out") else None,
+            "shiftIds": shift_ids,
+            "copies": int(row["copies"]),
+            "recommendedCanonicalShiftId": int(recommended["id"]),
+            "metadataConsistent": len(signatures) == 1,
+            "shifts": group_shifts,
+        })
+
+    stale_open_shifts = []
+    for row in stale_rows:
+        shift_id = int(row["shift_id"])
+        snapshot = snapshot_by_id.get(shift_id)
+        if not snapshot:
+            continue
+        stale_open_shifts.append({
+            **snapshot,
+            "shiftId": shift_id,
+            "ageHours": float(row["age_hours"]),
+        })
+
+    version_material = {
+        "duplicateGroups": duplicate_groups,
+        "staleOpenShifts": [
+            {key: value for key, value in row.items() if key != "ageHours"}
+            for row in stale_open_shifts
+        ],
+    }
+    inventory_version = hashlib.sha256(
+        json.dumps(version_material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "success": True,
+        "databaseReadOnly": True,
+        "generatedAt": to_utc_iso(utc_now()),
+        "staleShiftThresholdHours": MAX_ACTIVE_SHIFT_HOURS,
+        "inventoryVersion": inventory_version,
+        "summary": {
+            "duplicateShiftGroups": len(duplicate_groups),
+            "duplicateExtraShifts": sum(row["copies"] - 1 for row in duplicate_groups),
+            "staleOpenShifts": len(stale_open_shifts),
+        },
+        "duplicateGroups": duplicate_groups,
+        "staleOpenShifts": stale_open_shifts,
+    }
+
+
+def _parse_correction_clock_out(value: str) -> datetime:
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Clock-out must be a valid ISO date and time",
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=APP_TIMEZONE)
+    return parsed.astimezone(timezone.utc)
+
+
+def _build_time_data_correction_plan(
+    payload: TimeDataCorrectionPlanRequest,
+    cursor: Any = None,
+    lock_shifts: bool = False,
+) -> Dict[str, Any]:
+    reason = payload.reason.strip()
+    if len(reason) < 10:
+        raise HTTPException(status_code=400, detail="Correction reason must be at least 10 characters")
+    if not payload.duplicateResolutions and not payload.staleShiftClosures:
+        raise HTTPException(status_code=400, detail="Select at least one correction")
+
+    inventory = build_time_data_correction_inventory(cursor=cursor, lock_shifts=lock_shifts)
+    group_by_ids = {
+        tuple(sorted(int(value) for value in group["shiftIds"])): group
+        for group in inventory["duplicateGroups"]
+    }
+    stale_by_id = {
+        int(row["shiftId"]): row
+        for row in inventory["staleOpenShifts"]
+    }
+
+    normalized_duplicates = []
+    delete_ids: set[int] = set()
+    selected_group_ids: set[int] = set()
+    for resolution in payload.duplicateResolutions:
+        canonical_id = int(resolution.canonicalShiftId)
+        duplicates = [int(value) for value in resolution.duplicateShiftIds]
+        if len(duplicates) != len(set(duplicates)):
+            raise HTTPException(status_code=400, detail="Duplicate shift IDs must be unique")
+        if canonical_id in duplicates:
+            raise HTTPException(status_code=400, detail="The canonical shift cannot also be deleted")
+        group_ids = tuple(sorted({canonical_id, *duplicates}))
+        group = group_by_ids.get(group_ids)
+        if not group:
+            raise HTTPException(
+                status_code=409,
+                detail="A duplicate group changed; reload the correction inventory",
+            )
+        if delete_ids.intersection(duplicates) or selected_group_ids.intersection(group_ids):
+            raise HTTPException(status_code=400, detail="A duplicate group was selected more than once")
+        delete_ids.update(duplicates)
+        selected_group_ids.update(group_ids)
+        normalized_duplicates.append({
+            "groupId": group["groupId"],
+            "employeeName": group["employeeName"],
+            "canonicalShiftId": canonical_id,
+            "duplicateShiftIds": sorted(duplicates),
+            "metadataConsistent": bool(group["metadataConsistent"]),
+        })
+
+    normalized_closures = []
+    closure_ids: set[int] = set()
+    now = utc_now()
+    for closure in payload.staleShiftClosures:
+        shift_id = int(closure.shiftId)
+        if shift_id in closure_ids:
+            raise HTTPException(status_code=400, detail="A stale shift was selected more than once")
+        if shift_id in delete_ids:
+            raise HTTPException(status_code=400, detail="A deleted duplicate cannot also be closed")
+        stale = stale_by_id.get(shift_id)
+        if not stale:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Shift {shift_id} is no longer an eligible stale open shift",
+            )
+        clock_out = _parse_correction_clock_out(closure.clockOut)
+        clock_in = parse_utc_iso(stale["clockIn"])
+        if clock_out <= clock_in:
+            raise HTTPException(status_code=400, detail=f"Shift {shift_id} clock-out must be after clock-in")
+        if clock_out > now + timedelta(minutes=5):
+            raise HTTPException(status_code=400, detail=f"Shift {shift_id} clock-out cannot be in the future")
+        closure_ids.add(shift_id)
+        normalized_closures.append({
+            "shiftId": shift_id,
+            "employeeName": stale["employeeName"],
+            "clockIn": stale["clockIn"],
+            "clockOut": to_utc_iso(clock_out),
+            "totalHours": round((clock_out - clock_in).total_seconds() / 3600.0, 2),
+        })
+
+    selected_snapshot_ids = sorted(selected_group_ids | closure_ids)
+    selected_snapshots = _correction_shift_snapshots(
+        selected_snapshot_ids,
+        cursor=cursor,
+        lock_shifts=lock_shifts,
+    )
+    if {int(row["id"]) for row in selected_snapshots} != set(selected_snapshot_ids):
+        raise HTTPException(status_code=409, detail="A selected shift changed or no longer exists")
+
+    normalized_duplicates.sort(key=lambda row: (row["canonicalShiftId"], row["duplicateShiftIds"]))
+    normalized_closures.sort(key=lambda row: row["shiftId"])
+    archive_snapshot = {
+        "inventoryVersion": inventory["inventoryVersion"],
+        "reason": reason,
+        "duplicateResolutions": normalized_duplicates,
+        "staleShiftClosures": normalized_closures,
+        "shiftsBefore": selected_snapshots,
+    }
+    token_material = json.dumps(archive_snapshot, sort_keys=True, separators=(",", ":"))
+    plan_token = hmac.new(
+        JWT_SECRET.encode("utf-8"),
+        token_material.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    delete_count = len(delete_ids)
+    close_count = len(normalized_closures)
+    duplicate_label = "DUPLICATE SHIFT" if delete_count == 1 else "DUPLICATE SHIFTS"
+    stale_label = "STALE SHIFT" if close_count == 1 else "STALE SHIFTS"
+    return {
+        "success": True,
+        "databaseReadOnly": True,
+        "planToken": plan_token,
+        "inventoryVersion": inventory["inventoryVersion"],
+        "confirmationPhrase": f"DELETE {delete_count} {duplicate_label} AND CLOSE {close_count} {stale_label}",
+        "summary": {
+            "duplicateShiftsToDelete": delete_count,
+            "staleShiftsToClose": close_count,
+        },
+        "duplicateResolutions": normalized_duplicates,
+        "staleShiftClosures": normalized_closures,
+        "_archiveSnapshot": archive_snapshot,
+    }
+
+
 @app.get("/api/admin/audits/time-data")
 def admin_time_data_audit(
     request: Request,
@@ -3104,6 +3612,189 @@ def admin_time_data_audit(
         "stale={staleOpenShifts}".format(**summary),
     )
     return result
+
+
+@app.get("/api/admin/corrections/time-data")
+def admin_time_data_correction_inventory(
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    result = build_time_data_correction_inventory()
+    append_access_log(
+        request,
+        "TIME_DATA_CORRECTION_INVENTORY",
+        True,
+        "duplicates={duplicateShiftGroups} stale={staleOpenShifts}".format(**result["summary"]),
+    )
+    return result
+
+
+@app.post("/api/admin/corrections/time-data/preview")
+def admin_time_data_correction_preview(
+    payload: TimeDataCorrectionPlanRequest,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    result = _build_time_data_correction_plan(payload)
+    result.pop("_archiveSnapshot", None)
+    append_access_log(
+        request,
+        "TIME_DATA_CORRECTION_PLAN",
+        True,
+        "delete={duplicateShiftsToDelete} close={staleShiftsToClose}".format(**result["summary"]),
+    )
+    return result
+
+
+@app.post("/api/admin/corrections/time-data/apply")
+def admin_apply_time_data_correction(
+    payload: TimeDataCorrectionApplyRequest,
+    request: Request,
+    current_admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    requested_ids = {
+        int(value)
+        for row in payload.duplicateResolutions
+        for value in [row.canonicalShiftId, *row.duplicateShiftIds]
+    }
+    requested_ids.update(int(row.shiftId) for row in payload.staleShiftClosures)
+
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if requested_ids:
+                cur.execute(
+                    "SELECT id FROM shifts WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
+                    (sorted(requested_ids),),
+                )
+                cur.fetchall()
+
+            plan = _build_time_data_correction_plan(payload, cursor=cur, lock_shifts=True)
+            if not hmac.compare_digest(payload.planToken, plan["planToken"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Correction plan is stale or does not match; preview it again",
+                )
+            if payload.confirmation != plan["confirmationPhrase"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Type the exact confirmation phrase: {plan['confirmationPhrase']}",
+                )
+
+            cur.execute(
+                """
+                INSERT INTO time_data_correction_batches (
+                    plan_token,
+                    applied_by_employee_id,
+                    applied_by_name,
+                    reason,
+                    snapshot,
+                    result
+                )
+                VALUES (%s, %s, %s, %s, %s::jsonb, '{}'::jsonb)
+                RETURNING id
+                """,
+                (
+                    plan["planToken"],
+                    int(current_admin["id"]),
+                    current_admin["name"],
+                    payload.reason.strip(),
+                    json.dumps(plan["_archiveSnapshot"], sort_keys=True),
+                ),
+            )
+            batch_id = int(cur.fetchone()["id"])
+
+            closed_shift_ids = []
+            for closure in plan["staleShiftClosures"]:
+                clock_out = parse_utc_iso(closure["clockOut"])
+                cur.execute(
+                    """
+                    UPDATE shifts
+                    SET
+                        clock_out = %s,
+                        total_hours = ROUND(
+                            (EXTRACT(EPOCH FROM (%s::timestamptz - clock_in)) / 3600.0)::numeric,
+                            2
+                        )
+                    WHERE id = %s AND clock_out IS NULL
+                    RETURNING id
+                    """,
+                    (clock_out, clock_out, closure["shiftId"]),
+                )
+                updated = cur.fetchone()
+                if not updated:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Shift {closure['shiftId']} changed before correction could be applied",
+                    )
+                closed_shift_ids.append(int(updated["id"]))
+
+            deleted_shift_ids = sorted(
+                int(value)
+                for row in plan["duplicateResolutions"]
+                for value in row["duplicateShiftIds"]
+            )
+            if deleted_shift_ids:
+                cur.execute(
+                    "DELETE FROM shifts WHERE id = ANY(%s) RETURNING id",
+                    (deleted_shift_ids,),
+                )
+                actually_deleted = sorted(int(row["id"]) for row in cur.fetchall())
+                if actually_deleted != deleted_shift_ids:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="A duplicate shift changed before correction could be applied",
+                    )
+
+            result = {
+                "deletedShiftIds": deleted_shift_ids,
+                "closedShiftIds": sorted(closed_shift_ids),
+            }
+            cur.execute(
+                "UPDATE time_data_correction_batches SET result = %s::jsonb WHERE id = %s",
+                (json.dumps(result, sort_keys=True), batch_id),
+            )
+
+    append_access_log(
+        request,
+        "TIME_DATA_CORRECTION_APPLIED",
+        True,
+        f"batch={batch_id} deleted={len(result['deletedShiftIds'])} closed={len(result['closedShiftIds'])}",
+    )
+    return {
+        "success": True,
+        "batchId": batch_id,
+        "archiveStored": True,
+        **result,
+    }
+
+
+@app.get("/api/admin/corrections/time-data/history")
+def admin_time_data_correction_history(
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    rows = db.query_all(
+        """
+        SELECT id, applied_by_name, reason, result, created_at
+        FROM time_data_correction_batches
+        ORDER BY created_at DESC, id DESC
+        LIMIT 50
+        """
+    )
+    append_access_log(request, "TIME_DATA_CORRECTION_HISTORY", True, f"rows={len(rows)}")
+    return {
+        "success": True,
+        "batches": [
+            {
+                "batchId": int(row["id"]),
+                "appliedBy": row["applied_by_name"],
+                "reason": row["reason"],
+                "result": row.get("result") or {},
+                "createdAt": to_utc_iso(row["created_at"]),
+            }
+            for row in rows
+        ],
+    }
 
 
 def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:
