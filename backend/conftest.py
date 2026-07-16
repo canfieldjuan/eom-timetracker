@@ -47,7 +47,8 @@ def _apply_schema(conn):
     """Drop and recreate all tables from schema.sql."""
     with conn.cursor() as cur:
         cur.execute("""
-            DROP TABLE IF EXISTS schedules, departures, visits, shifts, jobs, locations, employees, settings CASCADE
+            DROP TABLE IF EXISTS time_data_correction_batches, schedules, departures,
+                visits, shifts, jobs, locations, employees, settings CASCADE
         """)
     conn.commit()
     sql = SCHEMA_FILE.read_text()

@@ -120,6 +120,18 @@ CREATE TABLE settings (
     value JSONB NOT NULL
 );
 
+-- Recoverable before-images for explicitly confirmed time-data corrections.
+CREATE TABLE time_data_correction_batches (
+    id                     BIGSERIAL PRIMARY KEY,
+    plan_token             TEXT NOT NULL UNIQUE,
+    applied_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    applied_by_name        TEXT NOT NULL,
+    reason                 TEXT NOT NULL,
+    snapshot               JSONB NOT NULL,
+    result                 JSONB NOT NULL,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Seed default settings
 INSERT INTO settings (key, value) VALUES ('laborPctTarget', '35.0');
 
@@ -143,3 +155,5 @@ CREATE INDEX idx_shifts_time_cat     ON shifts(time_category);
 CREATE INDEX idx_shifts_clock_out    ON shifts(clock_out);
 CREATE INDEX idx_locations_active    ON locations(active);
 CREATE INDEX idx_employees_active    ON employees(active);
+CREATE INDEX idx_time_data_correction_batches_created
+    ON time_data_correction_batches(created_at);

@@ -120,6 +120,11 @@
             background: var(--primary-hover);
         }
 
+        button:disabled {
+            cursor: not-allowed;
+            opacity: 0.55;
+        }
+
         .btn-success {
             background: var(--success);
         }
@@ -235,6 +240,42 @@
             background: #f8fbff;
         }
 
+        .correction-card {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px;
+            margin-top: 8px;
+            background: #f8fbff;
+        }
+
+        .correction-card.warning {
+            background: var(--warn-bg);
+            border-color: var(--warn-border);
+        }
+
+        .inline-choice {
+            display: flex;
+            align-items: flex-start;
+            gap: 8px;
+            margin: 8px 0;
+            color: var(--text);
+            font-weight: 600;
+        }
+
+        .inline-choice input {
+            width: auto;
+            flex: 0 0 auto;
+            margin-top: 2px;
+        }
+
+        .confirmation-box {
+            border: 2px solid var(--danger);
+            border-radius: 10px;
+            padding: 10px;
+            margin-top: 10px;
+            background: #fff7f7;
+        }
+
         table {
             width: 100%;
             border-collapse: collapse;
@@ -336,6 +377,39 @@
             <div id="timeDataAuditMessage" class="message"></div>
             <p id="timeDataAuditSummary" class="meta">No audit loaded.</p>
             <div id="timeDataAuditDetails"></div>
+
+            <h3 style="margin-top: 16px;">Correction Review</h3>
+            <p class="meta">
+                Loads complete shift metadata, builds a read-only correction plan, and requires an exact
+                typed confirmation before any records can change. Deleted rows are archived first.
+            </p>
+            <button id="loadCorrectionInventoryButton" type="button">Load Correction Inventory</button>
+            <div id="correctionMessage" class="message"></div>
+            <p id="correctionSummary" class="meta">No correction inventory loaded.</p>
+            <div id="correctionInventory"></div>
+
+            <label for="correctionReason">Reason for this correction batch</label>
+            <textarea
+                id="correctionReason"
+                maxlength="500"
+                placeholder="Explain why these records are being corrected (minimum 10 characters)."
+            ></textarea>
+            <button id="buildCorrectionPlanButton" type="button" disabled>Build Read-Only Plan</button>
+
+            <div id="correctionPlanPanel" class="confirmation-box hidden">
+                <h3>Final Correction Plan</h3>
+                <div id="correctionPlanDetails"></div>
+                <label for="correctionConfirmation">Type the exact confirmation phrase shown above</label>
+                <input
+                    id="correctionConfirmation"
+                    type="text"
+                    autocomplete="off"
+                    spellcheck="false"
+                >
+                <button id="applyCorrectionPlanButton" class="btn-danger" type="button" disabled>
+                    Apply Confirmed Corrections
+                </button>
+            </div>
 
             <h3>Access Logs</h3>
             <div class="row">
@@ -540,7 +614,10 @@
             myStatus: null,
             dashboardHours: null,
             dashboardStatus: [],
-            dashboardTab: 'overview'
+            dashboardTab: 'overview',
+            correctionInventory: null,
+            correctionPlan: null,
+            correctionSelection: null
         };
 
         function defaultApiBaseUrl() {
@@ -1108,11 +1185,19 @@
             state.myStatus = null;
             state.dashboardHours = null;
             state.dashboardStatus = [];
+            state.correctionInventory = null;
+            state.correctionPlan = null;
+            state.correctionSelection = null;
 
             localStorage.removeItem(STORAGE_TOKEN);
             localStorage.removeItem(STORAGE_USER);
             renderAuthState();
             loadDashboard();
+            document.getElementById('correctionInventory').innerHTML = '';
+            document.getElementById('correctionSummary').textContent = 'No correction inventory loaded.';
+            document.getElementById('correctionReason').value = '';
+            document.getElementById('buildCorrectionPlanButton').disabled = true;
+            invalidateCorrectionPlan();
             clearMessage(document.getElementById('entryMessage'));
             hideGpsOverridePanel(true);
         }
@@ -1197,6 +1282,279 @@
                 setMessage(message, 'success', 'Read-only audit completed. No records were changed.');
             } catch (error) {
                 setMessage(message, 'error', error.message);
+            }
+        }
+
+        function formatCorrectionTimestamp(value) {
+            if (!value) {
+                return '-';
+            }
+            const parsed = new Date(value);
+            return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString();
+        }
+
+        function toLocalDateTimeInput(value) {
+            const parsed = new Date(value);
+            if (Number.isNaN(parsed.getTime())) {
+                return '';
+            }
+            const local = new Date(parsed.getTime() - parsed.getTimezoneOffset() * 60000);
+            return local.toISOString().slice(0, 16);
+        }
+
+        function invalidateCorrectionPlan() {
+            state.correctionPlan = null;
+            state.correctionSelection = null;
+            document.getElementById('correctionPlanPanel').classList.add('hidden');
+            document.getElementById('correctionPlanDetails').innerHTML = '';
+            document.getElementById('correctionConfirmation').value = '';
+            document.getElementById('applyCorrectionPlanButton').disabled = true;
+        }
+
+        function renderCorrectionInventory(payload) {
+            state.correctionInventory = payload;
+            invalidateCorrectionPlan();
+
+            const summary = payload.summary || {};
+            const summaryElement = document.getElementById('correctionSummary');
+            const inventoryElement = document.getElementById('correctionInventory');
+            const buildButton = document.getElementById('buildCorrectionPlanButton');
+            const duplicateGroups = Array.isArray(payload.duplicateGroups) ? payload.duplicateGroups : [];
+            const staleShifts = Array.isArray(payload.staleOpenShifts) ? payload.staleOpenShifts : [];
+
+            summaryElement.textContent = [
+                `Duplicate groups: ${summary.duplicateShiftGroups || 0}`,
+                `extra rows: ${summary.duplicateExtraShifts || 0}`,
+                `stale open shifts: ${summary.staleOpenShifts || 0}`
+            ].join(' | ');
+
+            const duplicateMarkup = duplicateGroups.map((group) => {
+                const groupId = escapeHtml(group.groupId);
+                const consistencyText = group.metadataConsistent
+                    ? 'Metadata matches across copies.'
+                    : 'Metadata differs. Review notes, GPS, jobs, visits, and departures before choosing.';
+                const shiftMarkup = (group.shifts || []).map((shift) => {
+                    const isRecommended = Number(shift.id) === Number(group.recommendedCanonicalShiftId);
+                    const gpsCount = [
+                        shift.clockInGps,
+                        shift.clockInGpsMeta,
+                        shift.clockOutGps,
+                        shift.clockOutGpsMeta
+                    ].filter(Boolean).length;
+                    return `
+                        <label class="inline-choice">
+                            <input
+                                type="radio"
+                                name="correction-canonical-${groupId}"
+                                value="${escapeHtml(shift.id)}"
+                                ${isRecommended ? 'checked' : ''}
+                            >
+                            <span>
+                                Keep shift ${escapeHtml(shift.id)}${isRecommended ? ' (recommended)' : ''}<br>
+                                <span class="meta">
+                                    Notes: ${escapeHtml(shift.notes || 'none')} |
+                                    Job: ${escapeHtml(shift.jobId ?? 'none')} |
+                                    Visits: ${escapeHtml((shift.visits || []).length)} |
+                                    Departures: ${escapeHtml((shift.departures || []).length)} |
+                                    GPS fields: ${escapeHtml(gpsCount)} |
+                                    Category: ${escapeHtml(shift.timeCategory || 'productive')}
+                                </span>
+                            </span>
+                        </label>
+                    `;
+                }).join('');
+                return `
+                    <div class="correction-card ${group.metadataConsistent ? '' : 'warning'}">
+                        <label class="inline-choice">
+                            <input id="correction-group-${groupId}" class="correction-group-select" type="checkbox">
+                            <span>
+                                Correct duplicate group ${groupId}: ${escapeHtml(group.employeeName)}<br>
+                                <span class="meta">
+                                    ${escapeHtml(group.location || 'No location')} |
+                                    ${escapeHtml(formatCorrectionTimestamp(group.clockIn))} to
+                                    ${escapeHtml(formatCorrectionTimestamp(group.clockOut))} |
+                                    shift IDs ${escapeHtml((group.shiftIds || []).join(', '))}
+                                </span>
+                            </span>
+                        </label>
+                        <p class="meta">${escapeHtml(consistencyText)}</p>
+                        ${shiftMarkup}
+                    </div>
+                `;
+            }).join('');
+
+            const staleMarkup = staleShifts.map((shift) => {
+                const shiftId = Number(shift.shiftId);
+                return `
+                    <div class="correction-card">
+                        <label class="inline-choice">
+                            <input
+                                id="correction-stale-${shiftId}"
+                                class="correction-stale-select"
+                                type="checkbox"
+                                data-shift-id="${escapeHtml(shiftId)}"
+                            >
+                            <span>
+                                Close shift ${escapeHtml(shiftId)} for ${escapeHtml(shift.employeeName)}<br>
+                                <span class="meta">
+                                    Opened ${escapeHtml(formatCorrectionTimestamp(shift.clockIn))} at
+                                    ${escapeHtml(shift.location || 'No location')} |
+                                    ${escapeHtml(shift.ageHours)} hours open
+                                </span>
+                            </span>
+                        </label>
+                        <label for="correction-clock-out-${shiftId}">Verified clock-out time</label>
+                        <input
+                            id="correction-clock-out-${shiftId}"
+                            class="correction-clock-out"
+                            type="datetime-local"
+                            min="${escapeHtml(toLocalDateTimeInput(shift.clockIn))}"
+                            disabled
+                        >
+                    </div>
+                `;
+            }).join('');
+
+            inventoryElement.innerHTML = `
+                ${duplicateGroups.length ? '<h3>Duplicate Groups</h3>' + duplicateMarkup : ''}
+                ${staleShifts.length ? '<h3 style="margin-top:12px;">Stale Open Shifts</h3>' + staleMarkup : ''}
+                ${!duplicateGroups.length && !staleShifts.length
+                    ? '<p class="meta">No correction candidates found.</p>'
+                    : ''}
+            `;
+            buildButton.disabled = duplicateGroups.length === 0 && staleShifts.length === 0;
+        }
+
+        function collectCorrectionSelection() {
+            const inventory = state.correctionInventory;
+            if (!inventory) {
+                throw new Error('Load the correction inventory first.');
+            }
+            const reason = document.getElementById('correctionReason').value.trim();
+            if (reason.length < 10) {
+                throw new Error('Enter a correction reason with at least 10 characters.');
+            }
+
+            const duplicateResolutions = [];
+            (inventory.duplicateGroups || []).forEach((group) => {
+                const selected = document.getElementById(`correction-group-${group.groupId}`);
+                if (!selected || !selected.checked) {
+                    return;
+                }
+                const canonicalInput = document.querySelector(
+                    `input[name="correction-canonical-${group.groupId}"]:checked`
+                );
+                if (!canonicalInput) {
+                    throw new Error(`Choose the shift to keep for duplicate group ${group.groupId}.`);
+                }
+                const canonicalShiftId = Number(canonicalInput.value);
+                duplicateResolutions.push({
+                    canonicalShiftId,
+                    duplicateShiftIds: (group.shiftIds || [])
+                        .map(Number)
+                        .filter((shiftId) => shiftId !== canonicalShiftId)
+                });
+            });
+
+            const staleShiftClosures = [];
+            (inventory.staleOpenShifts || []).forEach((shift) => {
+                const shiftId = Number(shift.shiftId);
+                const selected = document.getElementById(`correction-stale-${shiftId}`);
+                if (!selected || !selected.checked) {
+                    return;
+                }
+                const clockOut = document.getElementById(`correction-clock-out-${shiftId}`).value;
+                if (!clockOut) {
+                    throw new Error(`Enter a verified clock-out time for shift ${shiftId}.`);
+                }
+                staleShiftClosures.push({ shiftId, clockOut });
+            });
+
+            if (!duplicateResolutions.length && !staleShiftClosures.length) {
+                throw new Error('Select at least one duplicate group or stale shift.');
+            }
+            return { reason, duplicateResolutions, staleShiftClosures };
+        }
+
+        async function loadCorrectionInventory() {
+            const message = document.getElementById('correctionMessage');
+            clearMessage(message);
+            try {
+                const payload = await apiRequest('/admin/corrections/time-data', 'GET', null, true);
+                renderCorrectionInventory(payload);
+                setMessage(message, 'success', 'Read-only correction inventory loaded. No time records changed.');
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function buildCorrectionPlan() {
+            const message = document.getElementById('correctionMessage');
+            clearMessage(message);
+            invalidateCorrectionPlan();
+            try {
+                const selection = collectCorrectionSelection();
+                const plan = await apiRequest(
+                    '/admin/corrections/time-data/preview',
+                    'POST',
+                    selection,
+                    true
+                );
+                state.correctionSelection = selection;
+                state.correctionPlan = plan;
+                const inconsistentCount = (plan.duplicateResolutions || [])
+                    .filter((row) => !row.metadataConsistent).length;
+                document.getElementById('correctionPlanDetails').innerHTML = `
+                    <p><strong>Delete:</strong> ${escapeHtml(plan.summary.duplicateShiftsToDelete)} duplicate shifts</p>
+                    <p><strong>Close:</strong> ${escapeHtml(plan.summary.staleShiftsToClose)} stale shifts</p>
+                    ${inconsistentCount
+                        ? `<p class="meta">Warning: ${escapeHtml(inconsistentCount)} selected duplicate groups contain different metadata.</p>`
+                        : ''}
+                    <p><strong>Required phrase:</strong><br>${escapeHtml(plan.confirmationPhrase)}</p>
+                    <p class="meta">This plan is still read-only. Any data change requires the exact phrase below.</p>
+                `;
+                document.getElementById('correctionPlanPanel').classList.remove('hidden');
+                setMessage(message, 'success', 'Read-only correction plan built. Review it before confirming.');
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        function updateCorrectionApplyState() {
+            const typed = document.getElementById('correctionConfirmation').value;
+            const expected = state.correctionPlan ? state.correctionPlan.confirmationPhrase : '';
+            document.getElementById('applyCorrectionPlanButton').disabled = !expected || typed !== expected;
+        }
+
+        async function applyCorrectionPlan() {
+            const message = document.getElementById('correctionMessage');
+            clearMessage(message);
+            try {
+                if (!state.correctionPlan || !state.correctionSelection) {
+                    throw new Error('Build a fresh correction plan first.');
+                }
+                const confirmation = document.getElementById('correctionConfirmation').value;
+                if (confirmation !== state.correctionPlan.confirmationPhrase) {
+                    throw new Error('The confirmation phrase does not match.');
+                }
+                const result = await apiRequest('/admin/corrections/time-data/apply', 'POST', {
+                    ...state.correctionSelection,
+                    planToken: state.correctionPlan.planToken,
+                    confirmation
+                }, true);
+                const successText = `Correction batch ${result.batchId} applied and archived. ` +
+                    `Deleted ${result.deletedShiftIds.length}; closed ${result.closedShiftIds.length}.`;
+                state.correctionInventory = null;
+                invalidateCorrectionPlan();
+                await loadCorrectionInventory();
+                await loadTimeDataAudit();
+                await loadDashboard();
+                setMessage(message, 'success', successText);
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+                if (error.status === 409) {
+                    invalidateCorrectionPlan();
+                }
             }
         }
 
@@ -1361,6 +1719,24 @@
             }
         });
         document.getElementById('loadTimeDataAuditButton').addEventListener('click', loadTimeDataAudit);
+        document.getElementById('loadCorrectionInventoryButton').addEventListener('click', loadCorrectionInventory);
+        document.getElementById('buildCorrectionPlanButton').addEventListener('click', buildCorrectionPlan);
+        document.getElementById('applyCorrectionPlanButton').addEventListener('click', applyCorrectionPlan);
+        document.getElementById('correctionConfirmation').addEventListener('input', updateCorrectionApplyState);
+        document.getElementById('correctionReason').addEventListener('input', invalidateCorrectionPlan);
+        document.getElementById('correctionInventory').addEventListener('change', (event) => {
+            const target = event.target;
+            if (target && target.classList.contains('correction-stale-select')) {
+                const clockOut = document.getElementById(`correction-clock-out-${target.dataset.shiftId}`);
+                if (clockOut) {
+                    clockOut.disabled = !target.checked;
+                    if (!target.checked) {
+                        clockOut.value = '';
+                    }
+                }
+            }
+            invalidateCorrectionPlan();
+        });
         document.getElementById('loadAdminLogsButton').addEventListener('click', loadAdminLogs);
         document.getElementById('reportSendEmail').addEventListener('change', toggleReportEmailsSection);
         document.getElementById('generateReportButton').addEventListener('click', handleGenerateReport);
