@@ -35,6 +35,14 @@ jobs:
           cache: pip
           cache-dependency-path: backend/requirements*.txt
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check frontend JavaScript syntax
+        run: node backend/check_frontend_js.mjs
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
