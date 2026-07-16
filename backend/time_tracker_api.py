@@ -10,6 +10,7 @@ import hmac
 import io
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -22,20 +23,21 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address, ip_network
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import bcrypt
 import jwt
+import psycopg2
+import psycopg2.extras
 import requests
 import db
-import psycopg2.extras
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 _data_dir_env = os.environ.get("DATA_DIR", "")
@@ -59,6 +61,7 @@ JWT_ALGORITHM = "HS256"
 EMPLOYEE_WRITE_LOCK = threading.Lock()
 TIMESHEET_WRITE_LOCK = threading.Lock()
 ACCESS_LOG_WRITE_LOCK = threading.Lock()
+logger = logging.getLogger("eom.time_tracker")
 
 try:
     import fcntl
@@ -1659,20 +1662,33 @@ class JobLinkShiftsRequest(BaseModel):
     shiftIds: List[int]
 
 
+PositiveCents = Annotated[int, Field(strict=True, gt=0)]
+
+
 class ReceivablesAllocationRequest(BaseModel):
     invoice_id: UUID
-    amount_cents: int = Field(gt=0)
+    amount_cents: PositiveCents
 
 
 class ReceivablesPaymentRequest(BaseModel):
     contact_id: UUID
     payer_name: str = Field(min_length=1, max_length=256)
-    total_amount_cents: int = Field(gt=0)
+    total_amount_cents: PositiveCents
     payment_method: str = Field(pattern="^(check|ach|square)$")
     received_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
-    reference: Optional[str] = Field(default=None, max_length=256)
+    reference: str = Field(min_length=1, max_length=256)
     notes: Optional[str] = Field(default=None, max_length=2000)
     allocations: List[ReceivablesAllocationRequest] = Field(min_length=1, max_length=100)
+
+    @field_validator("reference")
+    @classmethod
+    def reference_must_identify_receipt(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(
+                "check number, ACH confirmation, or Square transaction ID is required"
+            )
+        return normalized
 
 
 class ReceivablesAdjustmentRequest(BaseModel):
@@ -1854,6 +1870,18 @@ def _atlas_receivables_request(
         raise HTTPException(
             status_code=502, detail="Receivables service returned an invalid response"
         ) from exc
+    if response.status_code in (401, 403):
+        # Browser-facing 401 is reserved for the EOM admin session. Forwarding
+        # an Atlas service-credential rejection would make the portal log out a
+        # valid admin and hide the real deployment/configuration failure.
+        logger.error(
+            "Atlas receivables service credential rejected status=%s",
+            response.status_code,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Receivables service authentication failed",
+        )
     if response.status_code >= 400:
         detail: Any = content.get("detail", content) if isinstance(content, dict) else content
         if isinstance(detail, dict):
@@ -1869,6 +1897,320 @@ def _atlas_receivables_request(
     return content
 
 
+def _receivables_operation_fingerprint(
+    operation: str,
+    method: str,
+    path: str,
+    payload: Optional[Dict[str, Any]],
+) -> str:
+    encoded = json.dumps(
+        {
+            "operation": operation,
+            "method": method.upper(),
+            "path": path,
+            "payload": payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _receivables_operation_identity(
+    operation: str,
+    path: str,
+    payload: Optional[Dict[str, Any]],
+    fingerprint: str,
+) -> str:
+    """Return the stable business identity used to reconcile retries.
+
+    Receipt references stay case-sensitive because ACH and Square identifiers
+    may be case-sensitive. Mutable form fields, including the received date,
+    are deliberately excluded: changing them after an ambiguous response must
+    not mint a second Atlas payment for the same referenced receipt.
+    """
+    if operation == "RECEIVABLES_PAYMENT_CREATE" and payload:
+        identity: Dict[str, Any] = {
+            "operation": operation,
+            "contact_id": str(payload.get("contact_id", "")),
+            "payment_method": str(payload.get("payment_method", "")).strip().lower(),
+            "reference": str(payload.get("reference", "")).strip(),
+        }
+    elif operation == "RECEIVABLES_DEPOSIT_CREATE" and payload:
+        identity = {
+            "operation": operation,
+            "payment_ids": sorted(str(item) for item in payload.get("payment_ids", [])),
+        }
+    else:
+        # Resource actions and allocation replacements remain independently
+        # repeatable when their full request changes.
+        identity = {"operation": operation, "path": path, "request": fingerprint}
+    encoded = json.dumps(
+        identity, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _reserve_receivables_operation(
+    *,
+    operation_identity: str,
+    fingerprint: str,
+    operation: str,
+    candidate_key: str,
+    actor: str,
+) -> Dict[str, Any]:
+    """Atomically create or recover the business-scoped retry identity."""
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # A receipt identity can have multiple historical generations
+                # after explicit voids. Serialize the active-generation check
+                # and insert so only one corrected request can replace a void.
+                cur.execute(
+                    """
+                    SELECT pg_advisory_xact_lock(hashtext(%s))
+                    """,
+                    (operation_identity,),
+                )
+
+                cur.execute(
+                    """
+                    SELECT attempt_id, operation_identity, request_fingerprint,
+                           operation, idempotency_key, state, response_body
+                    FROM receivables_operation_attempts
+                    WHERE operation_identity = %s
+                      AND state IN ('pending', 'resolved')
+                    ORDER BY attempt_id DESC
+                    LIMIT 1
+                    FOR UPDATE
+                    """,
+                    (operation_identity,),
+                )
+                active = cur.fetchone()
+                if active:
+                    cur.execute(
+                        """
+                        UPDATE receivables_operation_attempts
+                        SET last_attempt_by = %s, updated_at = NOW()
+                        WHERE attempt_id = %s
+                        """,
+                        (actor, active["attempt_id"]),
+                    )
+                    result = dict(active)
+                    if result["request_fingerprint"] != fingerprint:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "This receipt or deposit is already reserved with "
+                                "different details; reconcile the existing operation first"
+                            ),
+                        )
+                    return result
+
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM receivables_operation_attempts
+                    WHERE operation_identity = %s
+                      AND state = 'voided'
+                      AND request_fingerprint = %s
+                    LIMIT 1
+                    """,
+                    (operation_identity, fingerprint),
+                )
+                if cur.fetchone():
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "This exact receipt entry was voided and cannot be replayed; "
+                            "correct its details or add a correction note before re-entry"
+                        ),
+                    )
+
+                cur.execute(
+                    """
+                    INSERT INTO receivables_operation_attempts (
+                        operation_identity, request_fingerprint, operation,
+                        idempotency_key, created_by, last_attempt_by
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING attempt_id, operation_identity, request_fingerprint,
+                              operation, idempotency_key, state, response_body
+                    """,
+                    (
+                        operation_identity,
+                        fingerprint,
+                        operation,
+                        candidate_key,
+                        actor,
+                        actor,
+                    ),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise RuntimeError("Operation reservation returned no row")
+                return dict(row)
+    except psycopg2.errors.UniqueViolation as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency key already belongs to a different operation",
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not persist receivables operation identity")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Safe payment retry tracking is unavailable; Atlas was not called"
+            ),
+            headers={"Retry-After": "5"},
+        ) from exc
+
+
+def _resolve_receivables_operation(attempt_id: int, response_body: Any) -> None:
+    """Persist a confirmed Atlas response without invalidating that response."""
+    try:
+        db.execute(
+            """
+            UPDATE receivables_operation_attempts
+            SET state = 'resolved', response_body = %s::jsonb,
+                last_error = NULL, updated_at = NOW()
+            WHERE attempt_id = %s
+            """,
+            (json.dumps(response_body), attempt_id),
+        )
+    except Exception:
+        # The pending row and its Atlas key remain durable. A later retry will
+        # safely replay against Atlas and can repair the cached response.
+        logger.exception("Could not cache confirmed Atlas receivables response")
+
+
+def _note_receivables_operation_error(attempt_id: int, reason: str) -> None:
+    try:
+        db.execute(
+            """
+            UPDATE receivables_operation_attempts
+            SET last_error = %s, updated_at = NOW()
+            WHERE attempt_id = %s
+            """,
+            (reason[:1000], attempt_id),
+        )
+    except Exception:
+        logger.exception("Could not update pending receivables operation")
+
+
+def _release_rejected_receivables_operation(attempt_id: int) -> None:
+    """Release a definitively rejected request so corrected details may retry."""
+    try:
+        db.execute(
+            """
+            DELETE FROM receivables_operation_attempts
+            WHERE attempt_id = %s AND state = 'pending'
+            """,
+            (attempt_id,),
+        )
+    except Exception:
+        # Retaining the reservation fails safe: it blocks changed details rather
+        # than risking a duplicate financial operation.
+        logger.exception("Could not release rejected receivables operation")
+
+
+def _mark_payment_create_voided(payment_id: UUID, response_body: Any) -> None:
+    """Retire only the create generation Atlas confirms was voided."""
+    if not isinstance(response_body, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Atlas returned an invalid voided payment response",
+        )
+    if str(response_body.get("id", "")) != str(payment_id):
+        raise HTTPException(
+            status_code=502,
+            detail="Atlas returned the wrong payment after voiding",
+        )
+    if str(response_body.get("status", "")).lower() != "voided":
+        raise HTTPException(
+            status_code=502,
+            detail="Atlas did not confirm the payment was voided",
+        )
+
+    source = str(response_body.get("source", ""))
+    if source and source != "eom_admin":
+        # Payments created outside this proxy have no local create generation.
+        return
+    atlas_create_key = str(response_body.get("idempotency_key", "")).strip()
+    contact_id = str(response_body.get("contact_id", "")).strip()
+    payment_method = str(response_body.get("payment_method", "")).strip()
+    reference = str(response_body.get("reference", "")).strip()
+    if not all((atlas_create_key, contact_id, payment_method, reference)):
+        raise HTTPException(
+            status_code=502,
+            detail="Atlas void response cannot be reconciled to the original receipt",
+        )
+
+    operation_identity = _receivables_operation_identity(
+        "RECEIVABLES_PAYMENT_CREATE",
+        "/receivables/payments",
+        {
+            "contact_id": contact_id,
+            "payment_method": payment_method,
+            "reference": reference,
+        },
+        "",
+    )
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (operation_identity,),
+                )
+                cur.execute(
+                    """
+                    UPDATE receivables_operation_attempts
+                    SET state = 'voided', response_body = %s::jsonb,
+                        last_error = NULL, updated_at = NOW()
+                    WHERE operation_identity = %s
+                      AND operation = 'RECEIVABLES_PAYMENT_CREATE'
+                      AND idempotency_key = %s
+                      AND state IN ('pending', 'resolved')
+                    """,
+                    (
+                        json.dumps(response_body),
+                        operation_identity,
+                        atlas_create_key,
+                    ),
+                )
+                if cur.rowcount == 0:
+                    cur.execute(
+                        """
+                        SELECT state, operation_identity
+                        FROM receivables_operation_attempts
+                        WHERE operation = 'RECEIVABLES_PAYMENT_CREATE'
+                          AND idempotency_key = %s
+                        """,
+                        (atlas_create_key,),
+                    )
+                    existing = cur.fetchone()
+                    if existing and existing[0] in {"pending", "resolved"}:
+                        raise RuntimeError(
+                            "Atlas payment identity did not match its local create attempt"
+                        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not retire voided payment create identity")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Payment was voided, but correction tracking is unavailable; "
+                "retry the void before re-entering it"
+            ),
+            headers={"Retry-After": "5"},
+        ) from exc
+
+
 def _atlas_receivables_mutation(
     request: Request,
     audit_action: str,
@@ -1879,26 +2221,98 @@ def _atlas_receivables_mutation(
     *,
     payload: Optional[Dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    after_atlas_success: Optional[Callable[[Any], None]] = None,
 ) -> Any:
     """Proxy one financial mutation and record its actual upstream outcome."""
+    def audit_best_effort(allowed: bool, reason: str) -> None:
+        try:
+            append_access_log(request, audit_action, allowed, reason)
+        except Exception:
+            # Atlas is authoritative for the financial result. A local audit-file
+            # failure must never replace an upstream success or rejection.
+            logger.exception(
+                "Could not append receivables audit action=%s allowed=%s",
+                audit_action,
+                allowed,
+            )
+
+    if not idempotency_key:
+        raise HTTPException(status_code=422, detail="Idempotency key is required")
+    fingerprint = _receivables_operation_fingerprint(
+        audit_action, method, path, payload
+    )
+    operation_identity = _receivables_operation_identity(
+        audit_action, path, payload, fingerprint
+    )
+    try:
+        attempt = _reserve_receivables_operation(
+            operation_identity=operation_identity,
+            fingerprint=fingerprint,
+            operation=audit_action,
+            candidate_key=idempotency_key,
+            actor=str(admin["name"]),
+        )
+    except HTTPException as exc:
+        audit_best_effort(False, str(exc.detail))
+        raise
+
     try:
         result = _atlas_receivables_request(
             method,
             path,
             admin,
             payload=payload,
-            idempotency_key=idempotency_key,
+            idempotency_key=str(attempt["idempotency_key"]),
         )
     except HTTPException as exc:
         reason = exc.detail if isinstance(exc.detail, str) else "Atlas rejected request"
-        append_access_log(
-            request,
-            audit_action,
-            False,
+        _note_receivables_operation_error(
+            int(attempt["attempt_id"]),
             f"Atlas request failed ({exc.status_code}): {reason}",
         )
+        if exc.status_code < 500:
+            _release_rejected_receivables_operation(int(attempt["attempt_id"]))
+        audit_best_effort(
+            False, f"Atlas request failed ({exc.status_code}): {reason}"
+        )
         raise
-    append_access_log(request, audit_action, True, success_reason)
+
+    if audit_action == "RECEIVABLES_PAYMENT_CREATE" and isinstance(result, dict):
+        payment_status = str(result.get("status", "")).lower()
+        if payment_status == "voided":
+            try:
+                _mark_payment_create_voided(UUID(str(result.get("id", ""))), result)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Atlas returned an invalid voided payment response",
+                ) from exc
+            detail = (
+                "The original receipt was voided and cannot be replayed; "
+                "enter corrected details with a new attempt"
+            )
+            audit_best_effort(False, detail)
+            raise HTTPException(status_code=409, detail=detail)
+        if payment_status == "returned":
+            _resolve_receivables_operation(int(attempt["attempt_id"]), result)
+            detail = "The original receipt was returned and cannot be recorded again"
+            audit_best_effort(False, detail)
+            raise HTTPException(status_code=409, detail=detail)
+
+    if after_atlas_success:
+        try:
+            after_atlas_success(result)
+        except HTTPException as exc:
+            reason = exc.detail if isinstance(exc.detail, str) else "Local reconciliation failed"
+            _note_receivables_operation_error(
+                int(attempt["attempt_id"]),
+                f"Atlas accepted the request but local reconciliation failed: {reason}",
+            )
+            audit_best_effort(False, str(reason))
+            raise
+
+    _resolve_receivables_operation(int(attempt["attempt_id"]), result)
+    audit_best_effort(True, success_reason)
     return result
 
 
@@ -1936,6 +2350,102 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
 
 def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS receivables_operation_attempts (
+            attempt_id          BIGSERIAL PRIMARY KEY,
+            operation_identity  VARCHAR(64) NOT NULL,
+            request_fingerprint VARCHAR(64) NOT NULL,
+            operation           VARCHAR(96) NOT NULL,
+            idempotency_key     VARCHAR(128) NOT NULL UNIQUE,
+            state               VARCHAR(16) NOT NULL DEFAULT 'pending'
+                                    CHECK (state IN ('pending', 'resolved', 'voided')),
+            response_body       JSONB,
+            created_by          VARCHAR(128) NOT NULL,
+            last_attempt_by     VARCHAR(128) NOT NULL,
+            last_error          TEXT,
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute("""
+        ALTER TABLE receivables_operation_attempts
+            ADD COLUMN IF NOT EXISTS attempt_id BIGSERIAL;
+        ALTER TABLE receivables_operation_attempts
+            ALTER COLUMN attempt_id SET NOT NULL;
+
+        DO $$
+        DECLARE
+            primary_name TEXT;
+            primary_definition TEXT;
+        BEGIN
+            SELECT conname, pg_get_constraintdef(oid)
+            INTO primary_name, primary_definition
+            FROM pg_constraint
+            WHERE conrelid = 'receivables_operation_attempts'::regclass
+              AND contype = 'p'
+            LIMIT 1;
+
+            IF primary_name IS NOT NULL
+               AND primary_definition NOT LIKE '%%attempt_id%%' THEN
+                EXECUTE format(
+                    'ALTER TABLE receivables_operation_attempts DROP CONSTRAINT %%I',
+                    primary_name
+                );
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'receivables_operation_attempts'::regclass
+                  AND contype = 'p'
+            ) THEN
+                ALTER TABLE receivables_operation_attempts
+                    ADD CONSTRAINT receivables_operation_attempts_pkey
+                    PRIMARY KEY (attempt_id);
+            END IF;
+        END $$;
+
+        DO $$
+        DECLARE
+            state_constraint TEXT;
+            state_definition TEXT;
+        BEGIN
+            SELECT conname, pg_get_constraintdef(oid)
+            INTO state_constraint, state_definition
+            FROM pg_constraint
+            WHERE conrelid = 'receivables_operation_attempts'::regclass
+              AND contype = 'c'
+              AND pg_get_constraintdef(oid) LIKE '%%state%%'
+            LIMIT 1;
+
+            IF state_constraint IS NOT NULL
+               AND state_definition NOT LIKE '%%voided%%' THEN
+                EXECUTE format(
+                    'ALTER TABLE receivables_operation_attempts DROP CONSTRAINT %%I',
+                    state_constraint
+                );
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'receivables_operation_attempts'::regclass
+                  AND contype = 'c'
+                  AND pg_get_constraintdef(oid) LIKE '%%voided%%'
+            ) THEN
+                ALTER TABLE receivables_operation_attempts
+                    ADD CONSTRAINT receivables_operation_attempts_state_check
+                    CHECK (state IN ('pending', 'resolved', 'voided'));
+            END IF;
+        END $$;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            uq_receivables_operation_attempts_active_identity
+        ON receivables_operation_attempts(operation_identity)
+        WHERE state IN ('pending', 'resolved');
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_receivables_operation_attempts_state
+        ON receivables_operation_attempts(state, updated_at)
+    """)
     db.execute(
         "ALTER TABLE locations ADD COLUMN IF NOT EXISTS expected_hours NUMERIC(6,2)"
     )
@@ -2257,6 +2767,9 @@ def receivables_void_payment(
         admin,
         payload=payload.model_dump(mode="json"),
         idempotency_key=idempotency_key,
+        after_atlas_success=lambda result: _mark_payment_create_voided(
+            payment_id, result
+        ),
     )
 
 
