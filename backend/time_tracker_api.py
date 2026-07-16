@@ -6,6 +6,7 @@ from __future__ import annotations
 import calendar
 import csv
 import io
+import inspect
 import json
 import math
 import os
@@ -1719,6 +1720,11 @@ _cors_kwargs: Dict[str, Any] = {
     "allow_methods": ["*"],
     "allow_headers": ["*"],
 }
+if "allow_private_network" in inspect.signature(CORSMiddleware.__init__).parameters:
+    # Starlette 1.3+ rejects Private Network Access preflights unless this is
+    # explicitly enabled. Older supported releases do not expose the option,
+    # so the response middleware below remains the compatibility path there.
+    _cors_kwargs["allow_private_network"] = True
 if ALLOWED_ORIGINS or ALLOWED_ORIGIN_REGEX:
     if ALLOWED_ORIGINS:
         _cors_kwargs["allow_origins"] = ALLOWED_ORIGINS
@@ -1737,11 +1743,15 @@ else:
 @app.middleware("http")
 async def private_network_access_middleware(request: Request, call_next):
     response = await call_next(request)
-    if (
-        request.headers.get("access-control-request-private-network") == "true"
-        and response.headers.get("access-control-allow-origin")
-    ):
-        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    if request.headers.get("access-control-request-private-network") == "true":
+        if response.headers.get("access-control-allow-origin"):
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+        else:
+            # Newer Starlette versions add this header before determining that
+            # the request origin is forbidden. Do not advertise private-network
+            # access unless the same response also authorizes the origin.
+            if "access-control-allow-private-network" in response.headers:
+                del response.headers["access-control-allow-private-network"]
     return response
 
 
