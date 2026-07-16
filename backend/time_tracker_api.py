@@ -6,6 +6,7 @@ from __future__ import annotations
 import calendar
 import csv
 import io
+import inspect
 import json
 import math
 import os
@@ -37,6 +38,7 @@ DATA_DIR = Path(_data_dir_env) if _data_dir_env else BASE_DIR / "data"
 LOGS_DIR = DATA_DIR / "logs"
 REPORTS_DIR = DATA_DIR / "reports"
 BACKEND_DIR = BASE_DIR / "backend"
+FRONTEND_FILE = BACKEND_DIR / "timetracker-mobile.html"
 
 EMPLOYEES_FILE = DATA_DIR / "employees.json"
 TIMESHEETS_FILE = DATA_DIR / "timesheets.json"
@@ -1035,6 +1037,20 @@ def find_employee_by_name(employees: List[Dict[str, Any]], name: str) -> Optiona
     return None
 
 
+def find_any_employee_by_name(employees: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
+    """Find an employee regardless of active status.
+
+    Account creation must consider inactive employees too because the database
+    enforces unique names and re-registering must never silently reactivate or
+    overwrite an existing account.
+    """
+    lowered = name.strip().lower()
+    for employee in employees:
+        if employee.get("name", "").strip().lower() == lowered:
+            return employee
+    return None
+
+
 def find_employee_by_id(employees: List[Dict[str, Any]], employee_id: int) -> Optional[Dict[str, Any]]:
     for employee in employees:
         if employee.get("id") == employee_id:
@@ -1537,6 +1553,11 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=4)
 
 
+class AdminEmployeeCreateRequest(RegisterRequest):
+    role: str = "employee"
+    hourlyRate: Optional[float] = None
+
+
 MAX_LOCATION_LEN            = parse_int(os.getenv("MAX_LOCATION_LEN"),            500)
 MAX_NOTES_LEN               = parse_int(os.getenv("MAX_NOTES_LEN"),               2000)
 MAX_GPS_OVERRIDE_REASON_LEN = parse_int(os.getenv("MAX_GPS_OVERRIDE_REASON_LEN"), 200)
@@ -1650,6 +1671,7 @@ BOOTSTRAP_ADMIN_IDS = [
 
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 ALLOWED_ORIGIN_REGEX = (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip() or None
+ALLOW_PUBLIC_REGISTRATION = parse_bool(os.getenv("ALLOW_PUBLIC_REGISTRATION"), False)
 MAX_REPORT_RECIPIENTS = parse_int(os.getenv("MAX_REPORT_RECIPIENTS"), 50)
 MAX_REPORT_EMAIL_LEN = parse_int(os.getenv("MAX_REPORT_EMAIL_LEN"), 320)
 
@@ -1698,28 +1720,38 @@ _cors_kwargs: Dict[str, Any] = {
     "allow_methods": ["*"],
     "allow_headers": ["*"],
 }
+if "allow_private_network" in inspect.signature(CORSMiddleware.__init__).parameters:
+    # Starlette 1.3+ rejects Private Network Access preflights unless this is
+    # explicitly enabled. Older supported releases do not expose the option,
+    # so the response middleware below remains the compatibility path there.
+    _cors_kwargs["allow_private_network"] = True
 if ALLOWED_ORIGINS or ALLOWED_ORIGIN_REGEX:
     if ALLOWED_ORIGINS:
         _cors_kwargs["allow_origins"] = ALLOWED_ORIGINS
     if ALLOWED_ORIGIN_REGEX:
         _cors_kwargs["allow_origin_regex"] = ALLOWED_ORIGIN_REGEX
+    app.add_middleware(CORSMiddleware, **_cors_kwargs)
 else:
     print(
         "[security] WARNING: ALLOWED_ORIGINS / ALLOWED_ORIGIN_REGEX are not set; "
-        "falling back to allow_origins=['*']. Set ALLOWED_ORIGINS to your "
-        "frontend origin(s) for production.",
+        "cross-origin browser access is disabled. Set ALLOWED_ORIGINS to the "
+        "exact frontend origin(s) if cross-origin access is required.",
         flush=True,
     )
-    _cors_kwargs["allow_origins"] = ["*"]
-
-app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 
 @app.middleware("http")
 async def private_network_access_middleware(request: Request, call_next):
     response = await call_next(request)
     if request.headers.get("access-control-request-private-network") == "true":
-        response.headers["Access-Control-Allow-Private-Network"] = "true"
+        if response.headers.get("access-control-allow-origin"):
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+        else:
+            # Newer Starlette versions add this header before determining that
+            # the request origin is forbidden. Do not advertise private-network
+            # access unless the same response also authorizes the origin.
+            if "access-control-allow-private-network" in response.headers:
+                del response.headers["access-control-allow-private-network"]
     return response
 
 
@@ -1878,6 +1910,12 @@ def startup_event() -> None:
     apply_bootstrap_admins()
 
 
+@app.get("/", include_in_schema=False)
+@app.get("/timetracker-mobile.html", include_in_schema=False)
+def time_tracker_page() -> FileResponse:
+    return FileResponse(str(FRONTEND_FILE), media_type="text/html")
+
+
 @app.get("/api/health")
 def health_check(request: Request) -> Dict[str, Any]:
     append_access_log(request, "HEALTH_CHECK", True, "Public endpoint")
@@ -1934,6 +1972,48 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
     }
 
 
+def create_employee_account(
+    employee_name: str,
+    password: str,
+    role: str = "employee",
+    hourly_rate: Optional[float] = None,
+) -> Tuple[bool, Any]:
+    """Create an active employee without overwriting an existing account."""
+    normalized_name = employee_name.strip()
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(10)).decode("utf-8")
+
+    def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        existing = find_any_employee_by_name(employees_data["employees"], normalized_name)
+        if existing:
+            return False, "An account with that name already exists"
+
+        employee_id = int(employees_data["nextId"])
+        employee = {
+            "id": employee_id,
+            "name": normalized_name,
+            "password": hashed,
+            "active": True,
+            "role": role,
+            "hourlyRate": hourly_rate,
+            "created": to_utc_iso(utc_now()),
+            "lastLogin": None,
+        }
+        employees_data["employees"].append(employee)
+        employees_data["nextId"] = employee_id + 1
+        return True, employee
+
+    ok, result = update_employees(mutator)
+    if not ok:
+        return False, result
+    return True, {
+        "id": result["id"],
+        "name": result["name"],
+        "role": result["role"],
+        "active": result["active"],
+        "hourlyRate": result.get("hourlyRate"),
+    }
+
+
 @app.post("/api/auth/register")
 def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]:
     _rate_limit_check(
@@ -1942,38 +2022,49 @@ def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]:
         max_calls=REGISTER_RATE_LIMIT_MAX,
         window_seconds=REGISTER_RATE_LIMIT_WINDOW_S,
     )
+    if not ALLOW_PUBLIC_REGISTRATION:
+        append_access_log(request, "REGISTER_DISABLED", False, "Public registration is disabled")
+        raise HTTPException(status_code=403, detail="Public registration is disabled")
+
     employee_name = payload.name.strip()
     password = payload.password
     if not employee_name or not password:
         raise HTTPException(status_code=400, detail="Name and password are required")
 
-    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(10)).decode("utf-8")
-
-    def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        existing = find_employee_by_name(employees_data["employees"], employee_name)
-        if existing:
-            return False, "An account with that name already exists"
-
-        employee_id = int(employees_data["nextId"])
-        employee = {
-            "id": employee_id,
-            "name": employee_name,
-            "password": hashed,
-            "active": True,
-            "role": "employee",
-            "created": to_utc_iso(utc_now()),
-            "lastLogin": None,
-        }
-        employees_data["employees"].append(employee)
-        employees_data["nextId"] = employee_id + 1
-        return True, {"id": employee_id, "name": employee_name}
-
-    ok, result = update_employees(mutator)
+    ok, result = create_employee_account(employee_name, password)
     if not ok:
         append_access_log(request, "REGISTER_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
+        raise HTTPException(status_code=409, detail=str(result))
 
     append_access_log(request, "REGISTER_SUCCESS", True, f"New employee: {employee_name}")
+    return {"success": True, "employee": result}
+
+
+@app.post("/api/admin/employees")
+def admin_create_employee(
+    payload: AdminEmployeeCreateRequest,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    role = payload.role.strip().lower()
+    if role not in {"admin", "employee"}:
+        raise HTTPException(status_code=400, detail="Role must be admin or employee")
+
+    hourly_rate = payload.hourlyRate
+    if hourly_rate is not None and (not math.isfinite(hourly_rate) or hourly_rate < 0):
+        raise HTTPException(status_code=400, detail="Hourly rate must be a non-negative number")
+
+    ok, result = create_employee_account(
+        payload.name,
+        payload.password,
+        role=role,
+        hourly_rate=hourly_rate,
+    )
+    if not ok:
+        append_access_log(request, "ADMIN_EMPLOYEE_CREATE_FAILED", False, str(result))
+        raise HTTPException(status_code=409, detail=str(result))
+
+    append_access_log(request, "ADMIN_EMPLOYEE_CREATED", True, f"id={result['id']} role={role}")
     return {"success": True, "employee": result}
 
 
@@ -2024,7 +2115,8 @@ def admin_update_employee(
     ok, result = update_employees(mutator)
     if not ok:
         raise HTTPException(status_code=404, detail=str(result))
-    append_access_log(request, "EMPLOYEE_UPDATED", True, f"id={employee_id} {payload}")
+    changed_fields = ",".join(sorted(str(key) for key in payload))
+    append_access_log(request, "EMPLOYEE_UPDATED", True, f"id={employee_id} fields={changed_fields}")
     return {"success": True, "employee": result}
 
 
@@ -2823,9 +2915,11 @@ def admin_patch_location_pin(
 @app.get("/api/timesheet/current-status")
 def timesheet_current_status(
     request: Request,
-    _: Dict[str, Any] = Depends(get_current_employee),
+    employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     rows = build_public_current_status()
+    if employee.get("role") != "admin":
+        rows = [row for row in rows if int(row.get("id", 0)) == int(employee["id"])]
     response_rows = [
         {
             "employeeName": row["name"],
@@ -2848,7 +2942,10 @@ def timesheet_current_status(
 
 
 @app.get("/api/hours")
-def dashboard_hours(request: Request) -> Any:
+def dashboard_hours(
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
     denied_response = enforce_dashboard_access(request)
     if denied_response is not None:
         return denied_response
@@ -2858,7 +2955,10 @@ def dashboard_hours(request: Request) -> Any:
 
 
 @app.get("/api/current-status")
-def dashboard_current_status(request: Request) -> Any:
+def dashboard_current_status(
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
     denied_response = enforce_dashboard_access(request)
     if denied_response is not None:
         return denied_response
@@ -2870,6 +2970,140 @@ def dashboard_current_status(request: Request) -> Any:
         "count": len(rows),
         "timestamp": to_utc_iso(utc_now()),
     }
+
+
+def build_time_data_audit() -> Dict[str, Any]:
+    """Inspect shift integrity without mutating operational data."""
+    duplicate_rows = db.query_all(
+        """
+        SELECT
+            e.id AS employee_id,
+            e.name AS employee_name,
+            COALESCE(l.address, s.location_label, '') AS location,
+            s.clock_in,
+            s.clock_out,
+            ARRAY_AGG(s.id ORDER BY s.id) AS shift_ids,
+            COUNT(*) AS copies
+        FROM shifts s
+        JOIN employees e ON e.id = s.employee_id
+        LEFT JOIN locations l ON l.id = s.location_id
+        GROUP BY
+            e.id,
+            e.name,
+            COALESCE(l.address, s.location_label, ''),
+            s.clock_in,
+            s.clock_out
+        HAVING COUNT(*) > 1
+        ORDER BY s.clock_in, e.name
+        """
+    )
+    open_conflict_rows = db.query_all(
+        """
+        SELECT
+            e.id AS employee_id,
+            e.name AS employee_name,
+            ARRAY_AGG(s.id ORDER BY s.clock_in, s.id) AS shift_ids,
+            MIN(s.clock_in) AS oldest_clock_in,
+            MAX(s.clock_in) AS newest_clock_in,
+            COUNT(*) AS open_shift_count
+        FROM shifts s
+        JOIN employees e ON e.id = s.employee_id
+        WHERE s.clock_out IS NULL
+        GROUP BY e.id, e.name
+        HAVING COUNT(*) > 1
+        ORDER BY e.name
+        """
+    )
+    stale_rows = db.query_all(
+        """
+        SELECT
+            s.id AS shift_id,
+            e.id AS employee_id,
+            e.name AS employee_name,
+            COALESCE(l.address, s.location_label, '') AS location,
+            s.clock_in,
+            ROUND(
+                (EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0)::numeric,
+                2
+            ) AS age_hours
+        FROM shifts s
+        JOIN employees e ON e.id = s.employee_id
+        LEFT JOIN locations l ON l.id = s.location_id
+        WHERE
+            s.clock_out IS NULL
+            AND s.clock_in < NOW() - (%s * INTERVAL '1 hour')
+        ORDER BY s.clock_in, e.name
+        """,
+        (MAX_ACTIVE_SHIFT_HOURS,),
+    )
+
+    duplicate_groups = [
+        {
+            "employeeId": int(row["employee_id"]),
+            "employeeName": row["employee_name"],
+            "location": row.get("location") or "",
+            "clockIn": to_utc_iso(row["clock_in"]),
+            "clockOut": to_utc_iso(row["clock_out"]) if row.get("clock_out") else None,
+            "shiftIds": [int(value) for value in row.get("shift_ids") or []],
+            "copies": int(row["copies"]),
+        }
+        for row in duplicate_rows
+    ]
+    multiple_open_shift_employees = [
+        {
+            "employeeId": int(row["employee_id"]),
+            "employeeName": row["employee_name"],
+            "shiftIds": [int(value) for value in row.get("shift_ids") or []],
+            "openShiftCount": int(row["open_shift_count"]),
+            "oldestClockIn": to_utc_iso(row["oldest_clock_in"]),
+            "newestClockIn": to_utc_iso(row["newest_clock_in"]),
+        }
+        for row in open_conflict_rows
+    ]
+    stale_open_shifts = [
+        {
+            "shiftId": int(row["shift_id"]),
+            "employeeId": int(row["employee_id"]),
+            "employeeName": row["employee_name"],
+            "location": row.get("location") or "",
+            "clockIn": to_utc_iso(row["clock_in"]),
+            "ageHours": float(row["age_hours"]),
+        }
+        for row in stale_rows
+    ]
+
+    return {
+        "success": True,
+        "databaseReadOnly": True,
+        "generatedAt": to_utc_iso(utc_now()),
+        "staleShiftThresholdHours": MAX_ACTIVE_SHIFT_HOURS,
+        "summary": {
+            "duplicateShiftGroups": len(duplicate_groups),
+            "duplicateExtraShifts": sum(row["copies"] - 1 for row in duplicate_groups),
+            "employeesWithMultipleOpenShifts": len(multiple_open_shift_employees),
+            "staleOpenShifts": len(stale_open_shifts),
+        },
+        "duplicateShiftGroups": duplicate_groups,
+        "multipleOpenShiftEmployees": multiple_open_shift_employees,
+        "staleOpenShifts": stale_open_shifts,
+    }
+
+
+@app.get("/api/admin/audits/time-data")
+def admin_time_data_audit(
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    result = build_time_data_audit()
+    summary = result["summary"]
+    append_access_log(
+        request,
+        "TIME_DATA_AUDIT",
+        True,
+        "duplicates={duplicateShiftGroups} multiple_open={employeesWithMultipleOpenShifts} "
+        "stale={staleOpenShifts}".format(**summary),
+    )
+    return result
 
 
 def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:

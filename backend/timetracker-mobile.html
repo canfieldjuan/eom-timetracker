@@ -1,0 +1,1388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Firefly Time Tracker</title>
+    <style>
+        :root {
+            --bg: #eef2fa;
+            --panel: #ffffff;
+            --text: #1a2233;
+            --muted: #5a667a;
+            --border: #d7e0f0;
+            --primary: #1e5ed8;
+            --primary-hover: #174eb4;
+            --success: #14753a;
+            --danger: #b62d32;
+            --warn-bg: #fff4d6;
+            --warn-border: #ffdc88;
+            --warn-text: #7f5c00;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 14px;
+            min-height: 100vh;
+            font-family: "Segoe UI", Tahoma, Arial, sans-serif;
+            background: linear-gradient(180deg, #eef2fa, #e9effa);
+            color: var(--text);
+        }
+
+        .shell {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 14px;
+            box-shadow: 0 8px 22px rgba(0, 0, 0, 0.06);
+            margin-bottom: 12px;
+        }
+
+        h1, h2, h3 {
+            margin: 0 0 8px;
+        }
+
+        h1 {
+            font-size: 22px;
+        }
+
+        h2 {
+            font-size: 18px;
+        }
+
+        h3 {
+            font-size: 15px;
+        }
+
+        p {
+            margin: 6px 0;
+            color: var(--muted);
+        }
+
+        .meta {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .row > * {
+            flex: 1 1 180px;
+        }
+
+        label {
+            display: block;
+            margin: 10px 0 6px;
+            color: var(--muted);
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        input,
+        select,
+        textarea,
+        button {
+            width: 100%;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            font-size: 15px;
+            padding: 10px;
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 70px;
+        }
+
+        button {
+            border: none;
+            color: #ffffff;
+            background: var(--primary);
+            font-weight: 700;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+
+        button:hover {
+            background: var(--primary-hover);
+        }
+
+        .btn-success {
+            background: var(--success);
+        }
+
+        .btn-danger {
+            background: var(--danger);
+        }
+
+        .status-chip {
+            display: inline-block;
+            padding: 6px 10px;
+            border-radius: 20px;
+            border: 1px solid var(--border);
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .status-on {
+            color: var(--success);
+            background: #e7f6ea;
+        }
+
+        .status-off {
+            color: var(--danger);
+            background: #fdecee;
+        }
+
+        .access-chip {
+            display: inline-block;
+            padding: 6px 10px;
+            border-radius: 20px;
+            border: 1px solid var(--border);
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .access-ok {
+            color: var(--success);
+            background: #e7f6ea;
+        }
+
+        .access-denied {
+            color: var(--danger);
+            background: #fdecee;
+        }
+
+        .message {
+            display: none;
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 10px;
+            font-size: 14px;
+        }
+
+        .message.error {
+            display: block;
+            color: #8c171b;
+            background: #fdecee;
+            border: 1px solid #f2c5ca;
+        }
+
+        .message.success {
+            display: block;
+            color: #0f6c2e;
+            background: #e7f6ea;
+            border: 1px solid #bfe7cc;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .stat-card {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px;
+            background: #f7faff;
+        }
+
+        .stat-value {
+            font-size: 24px;
+            font-weight: 800;
+            color: var(--text);
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: var(--muted);
+            text-transform: uppercase;
+        }
+
+        .restricted {
+            background: var(--warn-bg);
+            border: 1px solid var(--warn-border);
+            color: var(--warn-text);
+            padding: 10px;
+            border-radius: 10px;
+            margin-top: 10px;
+        }
+
+        .worker-card {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px;
+            margin-top: 8px;
+            background: #f8fbff;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 8px;
+            font-size: 13px;
+        }
+
+        th,
+        td {
+            border-bottom: 1px solid var(--border);
+            text-align: left;
+            vertical-align: top;
+            padding: 8px;
+        }
+
+        th {
+            color: var(--muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            background: #f8fbff;
+        }
+
+        .hours-pill {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 999px;
+            background: #e7efff;
+            color: #214ca0;
+            font-weight: 700;
+            font-size: 12px;
+        }
+
+        .table-scroll {
+            overflow-x: auto;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 8px;
+            flex-wrap: wrap;
+        }
+
+        .tab-btn {
+            width: auto;
+            border: 1px solid var(--border);
+            background: #f4f7fe;
+            color: var(--text);
+            padding: 8px 12px;
+            font-size: 13px;
+            font-weight: 700;
+            margin: 0;
+        }
+
+        .tab-btn.active {
+            background: var(--primary);
+            color: #ffffff;
+            border-color: var(--primary);
+        }
+
+        .team-tab-panel {
+            margin-top: 10px;
+        }
+
+        @media (max-width: 700px) {
+            table {
+                font-size: 12px;
+            }
+
+            h1 {
+                font-size: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="shell">
+        <div class="panel">
+            <h1>Firefly Time Tracker</h1>
+            <p>Single-page app for employee timekeeping and team tracking.</p>
+
+            <label for="apiBaseUrl">API Base URL</label>
+            <div class="row">
+                <input id="apiBaseUrl" type="text" placeholder="http://server-ip:8000/api">
+                <button id="saveApiButton" type="button">Save API URL</button>
+            </div>
+            <p class="meta">For phone use, point this to your Python backend host and port.</p>
+        </div>
+
+        <div id="adminPanel" class="panel hidden">
+            <h2>Admin Tools</h2>
+            <p class="meta">Administrator login is required for every tool in this section.</p>
+
+            <h3>Time Data Audit</h3>
+            <p class="meta">Checks for duplicate and stale shifts without changing any time records.</p>
+            <button id="loadTimeDataAuditButton" type="button">Run Read-Only Audit</button>
+            <div id="timeDataAuditMessage" class="message"></div>
+            <p id="timeDataAuditSummary" class="meta">No audit loaded.</p>
+            <div id="timeDataAuditDetails"></div>
+
+            <h3>Access Logs</h3>
+            <div class="row">
+                <input id="adminLogDate" type="date">
+                <button id="loadAdminLogsButton" type="button">Load Logs</button>
+            </div>
+            <div id="adminLogsMessage" class="message"></div>
+            <p id="adminLogsSummary" class="meta"></p>
+            <div class="table-scroll">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Action</th>
+                            <th>Status</th>
+                            <th>Reason</th>
+                            <th>IP</th>
+                            <th>Endpoint</th>
+                        </tr>
+                    </thead>
+                    <tbody id="adminLogsTableBody">
+                        <tr><td colspan="6" class="meta">No logs loaded.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h3 style="margin-top: 14px;">Monthly Report</h3>
+            <label for="reportMonth">Month</label>
+            <input id="reportMonth" type="number" min="1" max="12">
+
+            <label for="reportYear">Year</label>
+            <input id="reportYear" type="number" min="2000" max="2100">
+
+            <label for="reportCompany">Company Name</label>
+            <input id="reportCompany" type="text" placeholder="Your Company">
+
+            <label style="display:flex; align-items:center; gap:8px; margin-top: 12px;">
+                <input id="reportUseMockData" type="checkbox" checked style="width:auto;">
+                Use mock data
+            </label>
+
+            <label style="display:flex; align-items:center; gap:8px; margin-top: 12px;">
+                <input id="reportSendEmail" type="checkbox" style="width:auto;">
+                Send email
+            </label>
+
+            <div id="reportEmailsSection" class="hidden">
+                <label for="reportEmails">Recipient Emails (comma separated)</label>
+                <textarea id="reportEmails" placeholder="manager@example.com, hr@example.com"></textarea>
+            </div>
+
+            <button id="generateReportButton" type="button">Generate Report</button>
+            <div id="reportMessage" class="message"></div>
+            <p id="reportDownloadWrap" class="meta hidden">
+                Download: <a id="reportDownloadLink" target="_blank" rel="noopener noreferrer">Open report PDF</a>
+            </p>
+        </div>
+
+        <div id="dashboardPanel" class="panel hidden">
+            <div class="row">
+                <div>
+                    <h2>Team Dashboard</h2>
+                    <span id="accessChip" class="access-chip access-denied">Access Unknown</span>
+                </div>
+                <div>
+                    <button id="refreshDashboardButton" type="button">Refresh Dashboard</button>
+                </div>
+            </div>
+
+            <div id="dashboardMessage" class="message"></div>
+            <div id="accessRestricted" class="restricted hidden"></div>
+
+            <div id="dashboardContent" class="hidden">
+                <div id="dashboardTabs" class="tabs">
+                    <button id="dashboardOverviewTab" class="tab-btn active" type="button" data-dashboard-tab="overview">Overview</button>
+                    <button id="dashboardLiveTab" class="tab-btn" type="button" data-dashboard-tab="live">Live Workers</button>
+                    <button id="dashboardHoursTab" class="tab-btn" type="button" data-dashboard-tab="hours">Employee Hours</button>
+                </div>
+
+                <div id="dashboardOverviewPanel" class="team-tab-panel">
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div id="statEmployees" class="stat-value">0</div>
+                            <div class="stat-label">Employees</div>
+                        </div>
+                        <div class="stat-card">
+                            <div id="statWorking" class="stat-value">0</div>
+                            <div class="stat-label">Currently Working</div>
+                        </div>
+                        <div class="stat-card">
+                            <div id="statHours" class="stat-value">0</div>
+                            <div class="stat-label">Weekly Hours</div>
+                        </div>
+                    </div>
+                    <p class="meta">Use tabs to review live workers and detailed weekly employee hours.</p>
+                </div>
+
+                <div id="dashboardLivePanel" class="team-tab-panel hidden">
+                    <h3>Currently Working</h3>
+                    <div id="publicWorkersList"></div>
+                </div>
+
+                <div id="dashboardHoursPanel" class="team-tab-panel hidden">
+                    <h3>Employee Hours Summary</h3>
+                    <div class="table-scroll">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Hours</th>
+                                    <th>Recent Shifts</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="hoursTableBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="loginPanel" class="panel">
+            <h2>Employee Login</h2>
+
+            <label for="employeeName">Name</label>
+            <input id="employeeName" type="text" placeholder="John Smith">
+
+            <label for="employeePassword">Password</label>
+            <input id="employeePassword" type="password" placeholder="Password">
+
+            <button id="loginButton" type="button">Login</button>
+            <div id="loginMessage" class="message"></div>
+        </div>
+
+        <div id="appPanel" class="hidden">
+            <div class="panel">
+                <div class="row">
+                    <div>
+                        <h2 id="welcomeTitle">Welcome</h2>
+                        <span id="statusChip" class="status-chip status-off">Not clocked in</span>
+                    </div>
+                    <div>
+                        <button id="logoutButton" class="btn-danger" type="button">Logout</button>
+                    </div>
+                </div>
+                <p id="statusDetails" class="meta"></p>
+            </div>
+
+            <div class="panel">
+                <h3>Time Entry</h3>
+
+                <label for="locationSelect">Location</label>
+                <select id="locationSelect"></select>
+
+                <label for="notesField">Notes</label>
+                <textarea id="notesField" placeholder="Optional notes"></textarea>
+
+                <div id="gpsOverridePanel" class="hidden">
+                    <label for="gpsOverrideReason">GPS Override Reason</label>
+                    <select id="gpsOverrideReason">
+                        <option value="">Select a reason</option>
+                        <option value="customer_request">Customer request</option>
+                        <option value="parking_access">Parking or building access</option>
+                        <option value="gps_signal">Weak GPS signal</option>
+                        <option value="other">Other</option>
+                    </select>
+
+                    <label for="gpsOverrideDetail">Override Details</label>
+                    <textarea id="gpsOverrideDetail" placeholder="Add the reason for the GPS override"></textarea>
+                    <div id="gpsOverridePrompt" class="meta" style="margin-top:6px;"></div>
+                </div>
+
+                <div class="row">
+                    <button id="clockInButton" class="btn-success" type="button">Clock In</button>
+                    <button id="arriveButton" type="button">Arrive</button>
+                    <button id="departButton" type="button">Depart</button>
+                    <button id="clockOutButton" class="btn-danger" type="button">Clock Out</button>
+                </div>
+                <div id="entryMessage" class="message"></div>
+            </div>
+
+            <div class="panel">
+                <div class="row">
+                    <h3>Live Worker Feed</h3>
+                    <button id="refreshWorkerFeedButton" type="button">Refresh</button>
+                </div>
+                <div id="workersList"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const STORAGE_API = 'firefly_api_base_url';
+        const STORAGE_TOKEN = 'firefly_token';
+        const STORAGE_USER = 'firefly_user';
+
+        const state = {
+            apiBaseUrl: '',
+            token: '',
+            user: null,
+            currentlyWorking: [],
+            myStatus: null,
+            dashboardHours: null,
+            dashboardStatus: [],
+            dashboardTab: 'overview'
+        };
+
+        function defaultApiBaseUrl() {
+            const queryParams = new URLSearchParams(window.location.search);
+            const fromQuery = queryParams.get('apiBaseUrl');
+            if (fromQuery) {
+                return fromQuery.replace(/\/+$/, '');
+            }
+
+            const fromStorage = localStorage.getItem(STORAGE_API);
+            if (fromStorage) {
+                return fromStorage.replace(/\/+$/, '');
+            }
+
+            if (window.location.protocol.startsWith('http')) {
+                return `${window.location.origin}/api`;
+            }
+
+            return 'http://127.0.0.1:8000/api';
+        }
+
+        function hasAdminSession() {
+            return Boolean(state.token && state.user && state.user.role === 'admin');
+        }
+
+        function setMessage(element, kind, text) {
+            element.className = `message ${kind}`;
+            element.textContent = text;
+        }
+
+        function clearMessage(element) {
+            element.className = 'message';
+            element.textContent = '';
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function currentDateIso() {
+            const now = new Date();
+            const year = now.getFullYear();
+            const month = String(now.getMonth() + 1).padStart(2, '0');
+            const day = String(now.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        }
+
+        function splitReportEmails(raw) {
+            return String(raw || '')
+                .split(',')
+                .map((email) => email.trim())
+                .filter((email) => email.length > 0);
+        }
+
+        async function apiRequest(path, method = 'GET', body = null, useAuth = false) {
+            const headers = { 'Content-Type': 'application/json' };
+            if (useAuth && state.token) {
+                headers.Authorization = `Bearer ${state.token}`;
+            }
+
+            const response = await fetch(`${state.apiBaseUrl}${path}`, {
+                method,
+                headers,
+                body: body ? JSON.stringify(body) : null
+            });
+
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok || payload.success === false) {
+                const message = payload.error || payload.detail || `Request failed (${response.status})`;
+                const error = new Error(message);
+                error.status = response.status;
+                error.payload = payload;
+                throw error;
+            }
+
+            return payload;
+        }
+
+        async function getCurrentCoordinates() {
+            if (!navigator.geolocation) {
+                throw new Error('This device does not support GPS location.');
+            }
+
+            return new Promise((resolve, reject) => {
+                navigator.geolocation.getCurrentPosition(
+                    (position) => {
+                        resolve({
+                            latitude: position.coords.latitude,
+                            longitude: position.coords.longitude
+                        });
+                    },
+                    (error) => {
+                        let message = 'Unable to get GPS location.';
+                        if (error && error.code === error.PERMISSION_DENIED) {
+                            message = 'Location permission was denied.';
+                        } else if (error && error.code === error.POSITION_UNAVAILABLE) {
+                            message = 'GPS location is unavailable.';
+                        } else if (error && error.code === error.TIMEOUT) {
+                            message = 'GPS location request timed out.';
+                        }
+                        reject(new Error(message));
+                    },
+                    {
+                        enableHighAccuracy: true,
+                        timeout: 15000,
+                        maximumAge: 0
+                    }
+                );
+            });
+        }
+
+        function readGpsOverrideFields() {
+            return {
+                reason: document.getElementById('gpsOverrideReason').value.trim(),
+                detail: document.getElementById('gpsOverrideDetail').value.trim()
+            };
+        }
+
+        function clearGpsOverrideFields() {
+            document.getElementById('gpsOverrideReason').value = '';
+            document.getElementById('gpsOverrideDetail').value = '';
+        }
+
+        function showGpsOverridePanel(promptText = '') {
+            document.getElementById('gpsOverridePanel').classList.remove('hidden');
+            document.getElementById('gpsOverridePrompt').textContent = promptText;
+        }
+
+        function hideGpsOverridePanel(resetFields = false) {
+            document.getElementById('gpsOverridePanel').classList.add('hidden');
+            document.getElementById('gpsOverridePrompt').textContent = '';
+            if (resetFields) {
+                clearGpsOverrideFields();
+            }
+        }
+
+        function shouldOfferGpsOverride(message) {
+            const text = String(message || '').toLowerCase();
+            return text.includes('override reason')
+                || text.includes('gps is ')
+                || text.includes('gps location')
+                || text.includes('location permission')
+                || text.includes('does not support gps');
+        }
+
+        function buildGpsOverridePrompt(message, usedCoords) {
+            const text = String(message || '').trim();
+            if (!usedCoords) {
+                return `${text} Select an override reason below to continue without GPS.`;
+            }
+            return text.replace(/add an override reason(?: in notes)? to continue\.?/i, 'Select an override reason below to continue.');
+        }
+
+        async function submitTimeEntryAction(path, body) {
+            const override = readGpsOverrideFields();
+            let coords = null;
+            let coordsError = null;
+
+            try {
+                coords = await getCurrentCoordinates();
+            } catch (error) {
+                coordsError = error;
+            }
+
+            const payload = { ...body };
+            if (coords) {
+                payload.latitude = coords.latitude;
+                payload.longitude = coords.longitude;
+            }
+            if (override.reason) {
+                payload.gpsOverrideReason = override.reason;
+            }
+            if (override.detail) {
+                payload.gpsOverrideDetail = override.detail;
+            }
+
+            if (!coords && !override.reason) {
+                showGpsOverridePanel(buildGpsOverridePrompt(coordsError ? coordsError.message : 'GPS is unavailable.', false));
+                throw coordsError || new Error('GPS is unavailable.');
+            }
+
+            try {
+                return await apiRequest(path, 'POST', payload, true);
+            } catch (error) {
+                if (shouldOfferGpsOverride(error.message)) {
+                    showGpsOverridePanel(buildGpsOverridePrompt(error.message, Boolean(coords)));
+                }
+                throw error;
+            }
+        }
+
+        function saveApiBaseUrl() {
+            const input = document.getElementById('apiBaseUrl');
+            const value = input.value.trim().replace(/\/+$/, '');
+            if (!value) {
+                return;
+            }
+            state.apiBaseUrl = value;
+            localStorage.setItem(STORAGE_API, value);
+        }
+
+        function renderAuthState() {
+            const hasSession = Boolean(state.token && state.user);
+            const isAdmin = hasAdminSession();
+            document.getElementById('loginPanel').classList.toggle('hidden', hasSession);
+            document.getElementById('appPanel').classList.toggle('hidden', !hasSession);
+            document.getElementById('adminPanel').classList.toggle('hidden', !isAdmin);
+            document.getElementById('dashboardPanel').classList.toggle('hidden', !isAdmin);
+
+            if (hasSession) {
+                document.getElementById('welcomeTitle').textContent = `Welcome, ${state.user.name}`;
+            }
+        }
+
+        function renderStatus() {
+            const chip = document.getElementById('statusChip');
+            const details = document.getElementById('statusDetails');
+            const clockInButton = document.getElementById('clockInButton');
+            const arriveButton = document.getElementById('arriveButton');
+            const departButton = document.getElementById('departButton');
+            const clockOutButton = document.getElementById('clockOutButton');
+
+            if (state.myStatus) {
+                chip.className = 'status-chip status-on';
+                chip.textContent = 'Clocked in';
+                const statusText = state.myStatus.canDepart ? 'On site' : 'In transit';
+                details.textContent = `Location: ${state.myStatus.location || '-'} | Status: ${statusText} | Started: ${state.myStatus.clockInTime || '-'}`;
+                clockInButton.disabled = true;
+                arriveButton.disabled = state.myStatus.canDepart;
+                departButton.disabled = !state.myStatus.canDepart;
+                clockOutButton.disabled = false;
+            } else {
+                chip.className = 'status-chip status-off';
+                chip.textContent = 'Not clocked in';
+                details.textContent = 'No active shift.';
+                clockInButton.disabled = false;
+                arriveButton.disabled = true;
+                departButton.disabled = true;
+                clockOutButton.disabled = true;
+            }
+        }
+
+        function renderWorkerFeed() {
+            const list = document.getElementById('workersList');
+            if (!state.currentlyWorking.length) {
+                list.innerHTML = '<p class="meta">No employees are currently clocked in.</p>';
+                return;
+            }
+
+            list.innerHTML = state.currentlyWorking.map((item) => `
+                <div class="worker-card">
+                    <div><strong>${escapeHtml(item.employeeName)}</strong></div>
+                    <div class="meta">Location: ${escapeHtml(item.location || '-')}</div>
+                    <div class="meta">Clock in: ${escapeHtml(item.clockInTime || '-')}</div>
+                    <div class="meta">Hours worked: ${escapeHtml(item.hoursWorked || '0')}</div>
+                    <div class="meta">Notes: ${escapeHtml(item.notes || '-')}</div>
+                </div>
+            `).join('');
+        }
+
+        function renderDashboardAccess(granted) {
+            const chip = document.getElementById('accessChip');
+            if (granted) {
+                chip.className = 'access-chip access-ok';
+                chip.textContent = 'Dashboard Access Granted';
+            } else {
+                chip.className = 'access-chip access-denied';
+                chip.textContent = 'Dashboard Access Restricted';
+            }
+        }
+
+        function showDashboardTab(tab) {
+            state.dashboardTab = (tab === 'live' || tab === 'hours') ? tab : 'overview';
+            renderDashboardTabContent();
+        }
+
+        function renderDashboardTabContent() {
+            const content = document.getElementById('dashboardContent');
+            const selectedTab = (state.dashboardTab === 'live' || state.dashboardTab === 'hours') ? state.dashboardTab : 'overview';
+            state.dashboardTab = selectedTab;
+
+            const isOverview = selectedTab === 'overview';
+            const isLive = selectedTab === 'live';
+            const isHours = selectedTab === 'hours';
+
+            document.querySelectorAll('#dashboardTabs .tab-btn').forEach((button) => {
+                const isActive = button.dataset.dashboardTab === selectedTab;
+                button.classList.toggle('active', isActive);
+                button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+            });
+
+            if (!content || content.classList.contains('hidden')) {
+                return;
+            }
+
+            document.getElementById('dashboardOverviewPanel').classList.toggle('hidden', !isOverview);
+            document.getElementById('dashboardLivePanel').classList.toggle('hidden', !isLive);
+            document.getElementById('dashboardHoursPanel').classList.toggle('hidden', !isHours);
+        }
+
+        function renderPublicWorkers() {
+            const list = document.getElementById('publicWorkersList');
+            if (!state.dashboardStatus.length) {
+                list.innerHTML = '<p class="meta">No employees currently working.</p>';
+                return;
+            }
+
+            list.innerHTML = state.dashboardStatus.map((item) => `
+                <div class="worker-card">
+                    <div><strong>${escapeHtml(item.name)}</strong></div>
+                    <div class="meta">Location: ${escapeHtml(item.location || '-')}</div>
+                    <div class="meta">Started: ${escapeHtml(item.clockedInAt || '-')}</div>
+                    <div class="meta">Hours worked: ${escapeHtml(item.hoursWorked || '0')}</div>
+                    <div class="meta">Notes: ${escapeHtml(item.notes || '-')}</div>
+                </div>
+            `).join('');
+        }
+
+        function renderHoursTable() {
+            const tableBody = document.getElementById('hoursTableBody');
+            const data = state.dashboardHours;
+            if (!data || !Array.isArray(data.employees) || !data.employees.length) {
+                tableBody.innerHTML = '<tr><td colspan="4" class="meta">No employee data available.</td></tr>';
+                return;
+            }
+
+            tableBody.innerHTML = data.employees.map((employee) => {
+                const shifts = Array.isArray(employee.shifts) ? employee.shifts : [];
+                const shiftText = shifts.slice(0, 3).map((shift) => {
+                    const hours = typeof shift.hours === 'number' ? shift.hours.toFixed(2) : shift.hours;
+                    return `${escapeHtml(shift.date)}: ${escapeHtml(shift.startTime)} - ${escapeHtml(shift.endTime)} (${escapeHtml(hours)}h)`;
+                }).join('<br>');
+
+                const statusText = employee.currentlyWorking ? 'Working' : 'Off duty';
+                return `
+                    <tr>
+                        <td><strong>${escapeHtml(employee.name)}</strong></td>
+                        <td><span class="hours-pill">${escapeHtml((employee.totalHours || 0).toFixed(2))}h</span></td>
+                        <td>${shiftText || '-'}</td>
+                        <td>${statusText}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderDashboardContent() {
+            const content = document.getElementById('dashboardContent');
+            const data = state.dashboardHours;
+            if (!data || !data.summary) {
+                content.classList.add('hidden');
+                return;
+            }
+
+            document.getElementById('statEmployees').textContent = data.summary.totalEmployees || 0;
+            document.getElementById('statWorking').textContent = state.dashboardStatus.length;
+            document.getElementById('statHours').textContent = (data.summary.totalHours || 0).toFixed(2);
+
+            renderPublicWorkers();
+            renderHoursTable();
+            content.classList.remove('hidden');
+            renderDashboardTabContent();
+        }
+
+        function showAccessRestricted(payload) {
+            const restricted = document.getElementById('accessRestricted');
+            const content = document.getElementById('dashboardContent');
+            const message = payload && payload.message ? payload.message : 'Dashboard access is restricted.';
+
+            let detail = message;
+            if (payload && payload.accessHours) {
+                detail += ` Access hours: ${payload.accessHours.start} - ${payload.accessHours.end} (${payload.accessHours.timezone}). Current time: ${payload.accessHours.currentTime}.`;
+            }
+
+            restricted.textContent = detail;
+            restricted.classList.remove('hidden');
+            content.classList.add('hidden');
+            renderDashboardAccess(false);
+        }
+
+        function clearAccessRestricted() {
+            const restricted = document.getElementById('accessRestricted');
+            restricted.textContent = '';
+            restricted.classList.add('hidden');
+        }
+
+        async function loadDashboard() {
+            const message = document.getElementById('dashboardMessage');
+            clearMessage(message);
+
+            if (!hasAdminSession()) {
+                clearAccessRestricted();
+                state.dashboardHours = null;
+                state.dashboardStatus = [];
+                renderDashboardTabContent();
+                renderDashboardAccess(false);
+                return;
+            }
+
+            try {
+                const [hoursPayload, statusPayload] = await Promise.all([
+                    apiRequest('/hours', 'GET', null, true),
+                    apiRequest('/current-status', 'GET', null, true)
+                ]);
+
+                clearAccessRestricted();
+                renderDashboardAccess(true);
+
+                state.dashboardHours = hoursPayload.data || hoursPayload;
+                state.dashboardStatus = Array.isArray(statusPayload.currentlyWorking) ? statusPayload.currentlyWorking : [];
+                renderDashboardContent();
+            } catch (error) {
+                state.dashboardHours = null;
+                state.dashboardStatus = [];
+                if (error.status === 403 && error.payload) {
+                    showAccessRestricted(error.payload);
+                } else {
+                    clearAccessRestricted();
+                }
+                renderDashboardTabContent();
+                renderDashboardAccess(false);
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function loadLocations() {
+            const data = await apiRequest('/timesheet/locations', 'GET', null, true);
+            const select = document.getElementById('locationSelect');
+            const options = Array.isArray(data.locations) ? data.locations : [];
+
+            if (!options.length) {
+                select.innerHTML = '<option value="">No locations configured</option>';
+                return;
+            }
+
+            select.innerHTML = options
+                .map((location) => `<option value="${escapeHtml(location)}">${escapeHtml(location)}</option>`)
+                .join('');
+        }
+
+        async function loadCurrentStatus() {
+            const data = await apiRequest('/timesheet/current-status', 'GET', null, true);
+            state.currentlyWorking = Array.isArray(data.currentlyWorking) ? data.currentlyWorking : [];
+            state.myStatus = state.currentlyWorking.find((item) => item.employeeName === state.user.name) || null;
+            renderStatus();
+            renderWorkerFeed();
+        }
+
+        async function refreshEmployeePanels() {
+            clearMessage(document.getElementById('entryMessage'));
+            await loadLocations();
+            await loadCurrentStatus();
+        }
+
+        async function handleLogin() {
+            const message = document.getElementById('loginMessage');
+            clearMessage(message);
+
+            try {
+                saveApiBaseUrl();
+                const name = document.getElementById('employeeName').value.trim();
+                const password = document.getElementById('employeePassword').value;
+                if (!name || !password) {
+                    throw new Error('Name and password are required');
+                }
+
+                const payload = await apiRequest('/auth/login', 'POST', { name, password }, false);
+                state.token = payload.token;
+                state.user = payload.employee;
+
+                localStorage.setItem(STORAGE_TOKEN, state.token);
+                localStorage.setItem(STORAGE_USER, JSON.stringify(state.user));
+
+                renderAuthState();
+                await refreshEmployeePanels();
+                await loadDashboard();
+                setMessage(message, 'success', 'Login successful.');
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function handleClockIn() {
+            const message = document.getElementById('entryMessage');
+            clearMessage(message);
+
+            try {
+                const location = document.getElementById('locationSelect').value;
+                const notes = document.getElementById('notesField').value.trim();
+                await submitTimeEntryAction('/timesheet/clock-in', { location, notes });
+                document.getElementById('notesField').value = '';
+                hideGpsOverridePanel(true);
+                await loadCurrentStatus();
+                await loadDashboard();
+                setMessage(message, 'success', 'Clock-in recorded.');
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function handleArrive() {
+            const message = document.getElementById('entryMessage');
+            clearMessage(message);
+
+            try {
+                const location = document.getElementById('locationSelect').value;
+                const notes = document.getElementById('notesField').value.trim();
+                const payload = await submitTimeEntryAction('/timesheet/visit', { location, notes });
+                document.getElementById('notesField').value = '';
+                hideGpsOverridePanel(true);
+                await loadCurrentStatus();
+                await loadDashboard();
+                setMessage(
+                    message,
+                    'success',
+                    payload.alreadyHere ? 'Already marked at this location.' : 'Arrival recorded.'
+                );
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function handleDepart() {
+            const message = document.getElementById('entryMessage');
+            clearMessage(message);
+
+            try {
+                const notes = document.getElementById('notesField').value.trim();
+                await submitTimeEntryAction('/timesheet/depart', { notes });
+                document.getElementById('notesField').value = '';
+                hideGpsOverridePanel(true);
+                await loadCurrentStatus();
+                await loadDashboard();
+                setMessage(message, 'success', 'Departure recorded.');
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function handleClockOut() {
+            const message = document.getElementById('entryMessage');
+            clearMessage(message);
+
+            try {
+                const notes = document.getElementById('notesField').value.trim();
+                await submitTimeEntryAction('/timesheet/clock-out', { notes });
+                document.getElementById('notesField').value = '';
+                hideGpsOverridePanel(true);
+                await loadCurrentStatus();
+                await loadDashboard();
+                setMessage(message, 'success', 'Clock-out recorded.');
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        function handleLogout() {
+            state.token = '';
+            state.user = null;
+            state.currentlyWorking = [];
+            state.myStatus = null;
+            state.dashboardHours = null;
+            state.dashboardStatus = [];
+
+            localStorage.removeItem(STORAGE_TOKEN);
+            localStorage.removeItem(STORAGE_USER);
+            renderAuthState();
+            loadDashboard();
+            clearMessage(document.getElementById('entryMessage'));
+            hideGpsOverridePanel(true);
+        }
+
+        function renderAdminLogs(logs) {
+            const tableBody = document.getElementById('adminLogsTableBody');
+            const summary = document.getElementById('adminLogsSummary');
+
+            if (!Array.isArray(logs) || !logs.length) {
+                tableBody.innerHTML = '<tr><td colspan="6" class="meta">No logs found for selected date.</td></tr>';
+                summary.textContent = '0 requests';
+                return;
+            }
+
+            const allowedCount = logs.filter((entry) => entry && entry.allowed).length;
+            summary.textContent = `${logs.length} requests, ${allowedCount} allowed, ${logs.length - allowedCount} denied`;
+
+            tableBody.innerHTML = logs.map((entry) => {
+                const timeText = entry && entry.timestamp
+                    ? new Date(entry.timestamp).toLocaleTimeString()
+                    : '-';
+                const statusText = entry && entry.allowed ? 'ALLOWED' : 'DENIED';
+                const reasonText = entry && entry.reason ? entry.reason : '-';
+                const ipText = entry && entry.clientIP ? entry.clientIP : '-';
+                const methodText = entry && entry.method ? entry.method : '-';
+                const endpointText = entry && entry.endpoint ? entry.endpoint : '-';
+                const actionText = entry && entry.action ? entry.action : '-';
+                return `
+                    <tr>
+                        <td>${escapeHtml(timeText)}</td>
+                        <td>${escapeHtml(actionText)}</td>
+                        <td>${escapeHtml(statusText)}</td>
+                        <td>${escapeHtml(reasonText)}</td>
+                        <td>${escapeHtml(ipText)}</td>
+                        <td>${escapeHtml(`${methodText} ${endpointText}`)}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        function renderTimeDataAudit(payload) {
+            const summary = payload.summary || {};
+            const summaryElement = document.getElementById('timeDataAuditSummary');
+            const detailsElement = document.getElementById('timeDataAuditDetails');
+            summaryElement.textContent = [
+                `Duplicate groups: ${summary.duplicateShiftGroups || 0}`,
+                `extra duplicate shifts: ${summary.duplicateExtraShifts || 0}`,
+                `employees with multiple open shifts: ${summary.employeesWithMultipleOpenShifts || 0}`,
+                `stale open shifts: ${summary.staleOpenShifts || 0}`
+            ].join(' | ');
+
+            const findings = [];
+            (payload.duplicateShiftGroups || []).forEach((row) => {
+                findings.push(
+                    `<div class="worker-card"><strong>Duplicate:</strong> ${escapeHtml(row.employeeName)} — ` +
+                    `${escapeHtml(row.location || 'No location')} — shift IDs ${escapeHtml(row.shiftIds.join(', '))}</div>`
+                );
+            });
+            (payload.multipleOpenShiftEmployees || []).forEach((row) => {
+                findings.push(
+                    `<div class="worker-card"><strong>Multiple open shifts:</strong> ${escapeHtml(row.employeeName)} — ` +
+                    `shift IDs ${escapeHtml(row.shiftIds.join(', '))}</div>`
+                );
+            });
+            (payload.staleOpenShifts || []).forEach((row) => {
+                findings.push(
+                    `<div class="worker-card"><strong>Stale open shift:</strong> ${escapeHtml(row.employeeName)} — ` +
+                    `${escapeHtml(row.ageHours)} hours — shift ID ${escapeHtml(row.shiftId)}</div>`
+                );
+            });
+            detailsElement.innerHTML = findings.length
+                ? findings.join('')
+                : '<p class="meta">No duplicate, conflicting-open, or stale shifts found.</p>';
+        }
+
+        async function loadTimeDataAudit() {
+            const message = document.getElementById('timeDataAuditMessage');
+            clearMessage(message);
+            try {
+                const payload = await apiRequest('/admin/audits/time-data', 'GET', null, true);
+                renderTimeDataAudit(payload);
+                setMessage(message, 'success', 'Read-only audit completed. No records were changed.');
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function loadAdminLogs() {
+            const message = document.getElementById('adminLogsMessage');
+            clearMessage(message);
+
+            try {
+                const date = document.getElementById('adminLogDate').value || currentDateIso();
+                const payload = await apiRequest(`/admin/logs/${date}`, 'GET', null, true);
+                renderAdminLogs(payload.logs || []);
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        function toggleReportEmailsSection() {
+            const enabled = document.getElementById('reportSendEmail').checked;
+            document.getElementById('reportEmailsSection').classList.toggle('hidden', !enabled);
+        }
+
+        async function handleGenerateReport() {
+            const message = document.getElementById('reportMessage');
+            const downloadWrap = document.getElementById('reportDownloadWrap');
+            const downloadLink = document.getElementById('reportDownloadLink');
+            clearMessage(message);
+            downloadWrap.classList.add('hidden');
+            downloadLink.removeAttribute('href');
+            delete downloadLink.dataset.filename;
+
+            try {
+                const month = Number.parseInt(document.getElementById('reportMonth').value, 10);
+                const year = Number.parseInt(document.getElementById('reportYear').value, 10);
+                const companyName = document.getElementById('reportCompany').value.trim() || 'Your Company';
+                const sendEmail = document.getElementById('reportSendEmail').checked;
+                const useMockData = document.getElementById('reportUseMockData').checked;
+                const emails = splitReportEmails(document.getElementById('reportEmails').value);
+
+                if (!Number.isInteger(month) || month < 1 || month > 12) {
+                    throw new Error('Month must be between 1 and 12.');
+                }
+                if (!Number.isInteger(year) || year < 2000 || year > 2100) {
+                    throw new Error('Year must be between 2000 and 2100.');
+                }
+                if (sendEmail && emails.length === 0) {
+                    throw new Error('Enter at least one email address or disable email sending.');
+                }
+
+                const payload = await apiRequest('/admin/generate-report', 'POST', {
+                    month,
+                    year,
+                    emails,
+                    company_name: companyName,
+                    send_email: sendEmail,
+                    use_mock_data: useMockData
+                }, true);
+
+                setMessage(message, 'success', 'Report generated successfully.');
+                if (payload.reportPath) {
+                    const filename = payload.reportPath.split(/[\\/]/).pop();
+                    if (filename) {
+                        downloadLink.href = '#';
+                        downloadLink.dataset.filename = filename;
+                        downloadWrap.classList.remove('hidden');
+                    }
+                }
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function downloadAdminReport(event) {
+            event.preventDefault();
+            const message = document.getElementById('reportMessage');
+            const filename = event.currentTarget.dataset.filename;
+            if (!filename) {
+                return;
+            }
+
+            try {
+                const response = await fetch(
+                    `${state.apiBaseUrl}/admin/download-report/${encodeURIComponent(filename)}`,
+                    { headers: { Authorization: `Bearer ${state.token}` } }
+                );
+                if (!response.ok) {
+                    const payload = await response.json().catch(() => ({}));
+                    throw new Error(payload.error || `Download failed (${response.status})`);
+                }
+
+                const blob = await response.blob();
+                const objectUrl = URL.createObjectURL(blob);
+                const anchor = document.createElement('a');
+                anchor.href = objectUrl;
+                anchor.download = filename;
+                document.body.appendChild(anchor);
+                anchor.click();
+                anchor.remove();
+                window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function bootstrap() {
+            state.apiBaseUrl = defaultApiBaseUrl();
+            document.getElementById('apiBaseUrl').value = state.apiBaseUrl;
+
+            const now = new Date();
+            document.getElementById('adminLogDate').value = currentDateIso();
+            document.getElementById('reportMonth').value = String(now.getMonth() + 1);
+            document.getElementById('reportYear').value = String(now.getFullYear());
+            document.getElementById('reportCompany').value = 'Your Company';
+
+            try {
+                const storedToken = localStorage.getItem(STORAGE_TOKEN) || '';
+                const storedUserText = localStorage.getItem(STORAGE_USER) || '';
+                if (storedToken && storedUserText) {
+                    state.token = storedToken;
+                    state.user = JSON.parse(storedUserText);
+                }
+            } catch (_) {
+                localStorage.removeItem(STORAGE_TOKEN);
+                localStorage.removeItem(STORAGE_USER);
+            }
+
+            renderAuthState();
+            await loadDashboard();
+
+            if (state.token && state.user) {
+                try {
+                    await refreshEmployeePanels();
+                } catch (error) {
+                    handleLogout();
+                    setMessage(document.getElementById('loginMessage'), 'error', error.message);
+                }
+            }
+        }
+
+        document.getElementById('saveApiButton').addEventListener('click', async () => {
+            saveApiBaseUrl();
+            setMessage(document.getElementById('loginMessage'), 'success', 'API URL saved.');
+            await loadDashboard();
+        });
+        document.getElementById('loginButton').addEventListener('click', handleLogin);
+        document.getElementById('clockInButton').addEventListener('click', handleClockIn);
+        document.getElementById('arriveButton').addEventListener('click', handleArrive);
+        document.getElementById('departButton').addEventListener('click', handleDepart);
+        document.getElementById('clockOutButton').addEventListener('click', handleClockOut);
+        document.getElementById('logoutButton').addEventListener('click', handleLogout);
+
+        document.getElementById('refreshDashboardButton').addEventListener('click', loadDashboard);
+        document.querySelectorAll('#dashboardTabs .tab-btn').forEach((button) => {
+            button.addEventListener('click', () => {
+                showDashboardTab(button.dataset.dashboardTab);
+            });
+        });
+        document.getElementById('refreshWorkerFeedButton').addEventListener('click', async () => {
+            try {
+                await loadCurrentStatus();
+            } catch (error) {
+                setMessage(document.getElementById('entryMessage'), 'error', error.message);
+            }
+        });
+        document.getElementById('loadTimeDataAuditButton').addEventListener('click', loadTimeDataAudit);
+        document.getElementById('loadAdminLogsButton').addEventListener('click', loadAdminLogs);
+        document.getElementById('reportSendEmail').addEventListener('change', toggleReportEmailsSection);
+        document.getElementById('generateReportButton').addEventListener('click', handleGenerateReport);
+        document.getElementById('reportDownloadLink').addEventListener('click', downloadAdminReport);
+
+        setInterval(async () => {
+            if (hasAdminSession()) {
+                await loadDashboard();
+            }
+        }, 5 * 60 * 1000);
+
+        setInterval(async () => {
+            if (state.token && state.user) {
+                try {
+                    await loadCurrentStatus();
+                } catch (_) {
+                    // Silent background refresh failure.
+                }
+            }
+        }, 30000);
+
+        bootstrap();
+    </script>
+</body>
+</html>

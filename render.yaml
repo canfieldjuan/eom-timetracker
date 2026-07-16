@@ -34,6 +34,8 @@ services:
         sync: false
       - key: ALLOWED_ORIGIN_REGEX
         sync: false
+      - key: ALLOW_PUBLIC_REGISTRATION
+        value: "false"
     disk:
       name: eom-data
       mountPath: /opt/render/project/data
