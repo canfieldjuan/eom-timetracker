@@ -43,6 +43,258 @@ class TestAuth:
         assert r.status_code == 403
 
 
+class _AtlasResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+
+class TestReceivablesProxy:
+    def test_requires_existing_admin_session(self, client, emp_auth):
+        response = client.get("/api/admin/receivables/open-invoices", headers=emp_auth)
+        assert response.status_code == 403
+
+    def test_missing_atlas_config_fails_only_receivables_route(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "")
+
+        response = client.get("/api/admin/receivables/open-invoices", headers=auth)
+
+        assert response.status_code == 503
+        assert "not configured" in response.json()["error"]
+        assert client.get("/api/health").status_code == 200
+
+    def test_forwards_service_token_and_server_derived_actor(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse([{"invoice_number": "INV-1"}])
+
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
+        monkeypatch.setattr(
+            api,
+            "ATLAS_RECEIVABLES_SERVICE_TOKEN",
+            "service-token-that-never-reaches-browser",
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+
+        response = client.get(
+            "/api/admin/receivables/open-invoices?search=Acme", headers=auth
+        )
+
+        assert response.status_code == 200
+        assert response.json() == [{"invoice_number": "INV-1"}]
+        method, url, kwargs = calls[0]
+        assert method == "GET"
+        assert url == "https://atlas.test/api/v1/receivables/open-invoices"
+        assert kwargs["headers"]["Authorization"] == (
+            "Bearer service-token-that-never-reaches-browser"
+        )
+        assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert kwargs["params"]["search"] == "Acme"
+
+    def test_forwards_idempotency_key_on_payment_write(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse({"id": "payment-1"}, status_code=201)
+
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api.requests, "request", fake_request)
+        headers = {**auth, "Idempotency-Key": "browser-payment-1"}
+
+        response = client.post(
+            "/api/admin/receivables/payments",
+            headers=headers,
+            json={
+                "contact_id": "11111111-1111-1111-1111-111111111111",
+                "payer_name": "Acme",
+                "total_amount_cents": 10_000,
+                "payment_method": "check",
+                "received_date": "2026-07-16",
+                "reference": "1024",
+                "allocations": [
+                    {
+                        "invoice_id": "22222222-2222-2222-2222-222222222222",
+                        "amount_cents": 7_500,
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        _method, _url, kwargs = calls[0]
+        assert kwargs["headers"]["Idempotency-Key"] == "browser-payment-1"
+        assert kwargs["json"]["total_amount_cents"] == 10_000
+
+    def test_upstream_outage_is_retryable_without_local_write(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+
+        def fail(*_args, **_kwargs):
+            raise api.requests.ConnectionError("offline")
+
+        monkeypatch.setattr(api.requests, "request", fail)
+
+        response = client.get("/api/admin/receivables/open-invoices", headers=auth)
+
+        assert response.status_code == 503
+        assert "retry" in response.json()["error"].lower()
+        assert response.headers["retry-after"] == "5"
+
+    def test_rejected_mutation_is_a_failed_audit_entry(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        audits = []
+
+        def fake_request(*_args, **_kwargs):
+            return _AtlasResponse(
+                {"detail": {"code": "conflict", "message": "Duplicate receipt"}},
+                status_code=409,
+            )
+
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api.requests, "request", fake_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        response = client.post(
+            "/api/admin/receivables/payments",
+            headers={**auth, "Idempotency-Key": "duplicate-payment"},
+            json={
+                "contact_id": "11111111-1111-1111-1111-111111111111",
+                "payer_name": "Acme",
+                "total_amount_cents": 10_000,
+                "payment_method": "check",
+                "received_date": "2026-07-16",
+                "allocations": [
+                    {
+                        "invoice_id": "22222222-2222-2222-2222-222222222222",
+                        "amount_cents": 10_000,
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"] == "Duplicate receipt"
+        assert audits == [
+            (
+                "RECEIVABLES_PAYMENT_CREATE",
+                False,
+                "Atlas request failed (409): Duplicate receipt",
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        ("method", "path", "body", "expected_action"),
+        [
+            (
+                "PUT",
+                "/api/admin/receivables/payments/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/allocations",
+                {
+                    "allocations": [
+                        {
+                            "invoice_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                            "amount_cents": 2500,
+                        }
+                    ],
+                    "reason": "Apply remainder",
+                },
+                "RECEIVABLES_PAYMENT_ALLOCATIONS_ADJUST",
+            ),
+            (
+                "POST",
+                "/api/admin/receivables/payments/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/return",
+                {"reason": "NSF"},
+                "RECEIVABLES_PAYMENT_RETURN",
+            ),
+            (
+                "POST",
+                "/api/admin/receivables/payments/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/void",
+                {"reason": "Entry error"},
+                "RECEIVABLES_PAYMENT_VOID",
+            ),
+            (
+                "POST",
+                "/api/admin/receivables/deposit-batches",
+                {
+                    "payment_ids": ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
+                    "deposit_date": "2026-07-16",
+                },
+                "RECEIVABLES_DEPOSIT_CREATE",
+            ),
+            (
+                "POST",
+                "/api/admin/receivables/deposit-batches/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/clear",
+                None,
+                "RECEIVABLES_DEPOSIT_CLEAR",
+            ),
+        ],
+    )
+    def test_each_financial_mutation_records_a_success_audit(
+        self, client, auth, monkeypatch, method, path, body, expected_action
+    ):
+        import time_tracker_api as api
+
+        audits = []
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: _AtlasResponse({"ok": True}),
+        )
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        response = client.request(
+            method,
+            path,
+            headers={**auth, "Idempotency-Key": "mutation-attempt-1"},
+            json=body,
+        )
+
+        assert response.status_code == 200
+        assert audits and audits[0][0] == expected_action
+        assert audits[0][1] is True
+
+
 class TestTimesheetGpsFlow:
     def test_timesheet_locations_exposes_match_radius(self, client, emp_auth):
         r = client.get("/api/timesheet/locations", headers=emp_auth)

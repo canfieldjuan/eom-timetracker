@@ -23,13 +23,15 @@ from datetime import datetime, timedelta, timezone
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import bcrypt
 import jwt
+import requests
 import db
 import psycopg2.extras
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -1657,6 +1659,37 @@ class JobLinkShiftsRequest(BaseModel):
     shiftIds: List[int]
 
 
+class ReceivablesAllocationRequest(BaseModel):
+    invoice_id: UUID
+    amount_cents: int = Field(gt=0)
+
+
+class ReceivablesPaymentRequest(BaseModel):
+    contact_id: UUID
+    payer_name: str = Field(min_length=1, max_length=256)
+    total_amount_cents: int = Field(gt=0)
+    payment_method: str = Field(pattern="^(check|ach|square)$")
+    received_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    reference: Optional[str] = Field(default=None, max_length=256)
+    notes: Optional[str] = Field(default=None, max_length=2000)
+    allocations: List[ReceivablesAllocationRequest] = Field(min_length=1, max_length=100)
+
+
+class ReceivablesAdjustmentRequest(BaseModel):
+    allocations: List[ReceivablesAllocationRequest] = Field(min_length=1, max_length=100)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class ReceivablesActionRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class ReceivablesDepositRequest(BaseModel):
+    payment_ids: List[UUID] = Field(min_length=1, max_length=500)
+    deposit_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    bank_reference: Optional[str] = Field(default=None, max_length=256)
+
+
 VALID_NON_PRODUCTIVE_TYPES = ("drive_time", "waiting", "supply_run", "rework", "lockout", "other")
 
 
@@ -1704,6 +1737,13 @@ ALLOWED_ORIGIN_REGEX = (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip() or None
 ALLOW_PUBLIC_REGISTRATION = parse_bool(os.getenv("ALLOW_PUBLIC_REGISTRATION"), False)
 MAX_REPORT_RECIPIENTS = parse_int(os.getenv("MAX_REPORT_RECIPIENTS"), 50)
 MAX_REPORT_EMAIL_LEN = parse_int(os.getenv("MAX_REPORT_EMAIL_LEN"), 320)
+ATLAS_RECEIVABLES_BASE_URL = os.getenv("ATLAS_RECEIVABLES_BASE_URL", "").strip().rstrip("/")
+ATLAS_RECEIVABLES_SERVICE_TOKEN = os.getenv(
+    "ATLAS_RECEIVABLES_SERVICE_TOKEN", ""
+).strip()
+ATLAS_RECEIVABLES_TIMEOUT_SECONDS = max(
+    1.0, float(os.getenv("ATLAS_RECEIVABLES_TIMEOUT_SECONDS", "10"))
+)
 
 LOGIN_RATE_LIMIT_MAX        = parse_int(os.getenv("LOGIN_RATE_LIMIT_MAX"),        10)
 LOGIN_RATE_LIMIT_WINDOW_S   = parse_int(os.getenv("LOGIN_RATE_LIMIT_WINDOW_S"),   60)
@@ -1768,6 +1808,98 @@ else:
         "exact frontend origin(s) if cross-origin access is required.",
         flush=True,
     )
+
+
+def _atlas_receivables_request(
+    method: str,
+    path: str,
+    admin: Dict[str, Any],
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
+) -> Any:
+    """Proxy a finance request without exposing Atlas credentials to browsers."""
+    if not ATLAS_RECEIVABLES_BASE_URL or not ATLAS_RECEIVABLES_SERVICE_TOKEN:
+        raise HTTPException(
+            status_code=503, detail="Receivables service is not configured"
+        )
+    if not path.startswith("/receivables/"):
+        raise RuntimeError("Invalid receivables proxy path")
+    headers = {
+        "Authorization": f"Bearer {ATLAS_RECEIVABLES_SERVICE_TOKEN}",
+        "X-EOM-Actor": str(admin["name"]),
+        "Accept": "application/json",
+    }
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    try:
+        response = requests.request(
+            method,
+            f"{ATLAS_RECEIVABLES_BASE_URL}{path}",
+            headers=headers,
+            json=payload,
+            params=params,
+            timeout=ATLAS_RECEIVABLES_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Receivables service is temporarily unavailable; retry this request",
+            headers={"Retry-After": "5"},
+        ) from exc
+    try:
+        content = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502, detail="Receivables service returned an invalid response"
+        ) from exc
+    if response.status_code >= 400:
+        detail: Any = content.get("detail", content) if isinstance(content, dict) else content
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("error") or "Receivables request failed"
+        if not isinstance(detail, str) or not detail.strip():
+            detail = "Receivables request failed"
+        headers = {"Retry-After": "5"} if response.status_code >= 500 else None
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=detail,
+            headers=headers,
+        )
+    return content
+
+
+def _atlas_receivables_mutation(
+    request: Request,
+    audit_action: str,
+    success_reason: str,
+    method: str,
+    path: str,
+    admin: Dict[str, Any],
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[str] = None,
+) -> Any:
+    """Proxy one financial mutation and record its actual upstream outcome."""
+    try:
+        result = _atlas_receivables_request(
+            method,
+            path,
+            admin,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+    except HTTPException as exc:
+        reason = exc.detail if isinstance(exc.detail, str) else "Atlas rejected request"
+        append_access_log(
+            request,
+            audit_action,
+            False,
+            f"Atlas request failed ({exc.status_code}): {reason}",
+        )
+        raise
+    append_access_log(request, audit_action, True, success_reason)
+    return result
 
 
 @app.middleware("http")
@@ -1974,6 +2106,213 @@ def health_check(request: Request) -> Dict[str, Any]:
             "timezone": TIMEZONE_NAME,
         },
     }
+
+
+@app.get("/api/admin/receivables/ready")
+def receivables_ready(
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    result = _atlas_receivables_request("GET", "/receivables/ready", admin)
+    append_access_log(request, "RECEIVABLES_READY", True, "Atlas checked")
+    return result
+
+
+@app.get("/api/admin/receivables/open-invoices")
+def receivables_open_invoices(
+    request: Request,
+    contact_id: Optional[str] = Query(default=None, max_length=64),
+    search: Optional[str] = Query(default=None, max_length=256),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    return _atlas_receivables_request(
+        "GET",
+        "/receivables/open-invoices",
+        admin,
+        params={"contact_id": contact_id, "search": search},
+    )
+
+
+@app.get("/api/admin/receivables/allocation-suggestions")
+def receivables_allocation_suggestions(
+    request: Request,
+    contact_id: str = Query(min_length=1, max_length=64),
+    total_amount_cents: int = Query(gt=0),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    return _atlas_receivables_request(
+        "GET",
+        "/receivables/allocation-suggestions",
+        admin,
+        params={
+            "contact_id": contact_id,
+            "total_amount_cents": total_amount_cents,
+        },
+    )
+
+
+@app.get("/api/admin/receivables/payments")
+def receivables_payments(
+    request: Request,
+    status_filter: Optional[str] = Query(default=None, alias="status", max_length=16),
+    search: Optional[str] = Query(default=None, max_length=256),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    return _atlas_receivables_request(
+        "GET",
+        "/receivables/payments",
+        admin,
+        params={
+            "status": status_filter,
+            "search": search,
+            "limit": limit,
+            "offset": offset,
+        },
+    )
+
+
+@app.post("/api/admin/receivables/payments")
+def receivables_create_payment(
+    payload: ReceivablesPaymentRequest,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    return _atlas_receivables_mutation(
+        request,
+        "RECEIVABLES_PAYMENT_CREATE",
+        "Receipt accepted by Atlas",
+        "POST",
+        "/receivables/payments",
+        admin,
+        payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.put("/api/admin/receivables/payments/{payment_id}/allocations")
+def receivables_adjust_payment(
+    payment_id: UUID,
+    payload: ReceivablesAdjustmentRequest,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    return _atlas_receivables_mutation(
+        request,
+        "RECEIVABLES_PAYMENT_ALLOCATIONS_ADJUST",
+        "Payment allocations adjusted in Atlas",
+        "PUT",
+        f"/receivables/payments/{payment_id}/allocations",
+        admin,
+        payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post("/api/admin/receivables/payments/{payment_id}/return")
+def receivables_return_payment(
+    payment_id: UUID,
+    payload: ReceivablesActionRequest,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    return _atlas_receivables_mutation(
+        request,
+        "RECEIVABLES_PAYMENT_RETURN",
+        "Payment returned in Atlas",
+        "POST",
+        f"/receivables/payments/{payment_id}/return",
+        admin,
+        payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post("/api/admin/receivables/payments/{payment_id}/void")
+def receivables_void_payment(
+    payment_id: UUID,
+    payload: ReceivablesActionRequest,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    return _atlas_receivables_mutation(
+        request,
+        "RECEIVABLES_PAYMENT_VOID",
+        "Payment voided in Atlas",
+        "POST",
+        f"/receivables/payments/{payment_id}/void",
+        admin,
+        payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.get("/api/admin/receivables/deposit-batches")
+def receivables_deposit_batches(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    return _atlas_receivables_request(
+        "GET",
+        "/receivables/deposit-batches",
+        admin,
+        params={"limit": limit},
+    )
+
+
+@app.post("/api/admin/receivables/deposit-batches")
+def receivables_create_deposit_batch(
+    payload: ReceivablesDepositRequest,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    return _atlas_receivables_mutation(
+        request,
+        "RECEIVABLES_DEPOSIT_CREATE",
+        "Deposit accepted by Atlas",
+        "POST",
+        "/receivables/deposit-batches",
+        admin,
+        payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post("/api/admin/receivables/deposit-batches/{batch_id}/clear")
+def receivables_clear_deposit_batch(
+    batch_id: UUID,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    return _atlas_receivables_mutation(
+        request,
+        "RECEIVABLES_DEPOSIT_CLEAR",
+        "Deposit cleared in Atlas",
+        "POST",
+        f"/receivables/deposit-batches/{batch_id}/clear",
+        admin,
+        idempotency_key=idempotency_key,
+    )
 
 
 @app.post("/api/auth/login")
