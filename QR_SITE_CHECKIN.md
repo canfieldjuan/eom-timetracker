@@ -13,8 +13,10 @@ source of paid time until those two workflows are intentionally joined.
 3. The employee signs in through the normal session if needed. Resolving the QR
    requires that session but does not request location.
 4. The employee taps **Check in**. Only then does the browser request one GPS
-   reading and submit `employeeId`, `siteId`, `scannedAt`, `latitude`,
-   `longitude`, and `accuracy`.
+   reading and submit `employeeId`, `siteId`, the signed QR `token`, `scannedAt`,
+   `latitude`, `longitude`, and `accuracy`. The server revalidates the current
+   token during this final write instead of trusting the earlier browser-side
+   resolve step.
 5. The server uses its own receipt time as the official check-in timestamp and
    returns `on_time`, `late`, or `needs_review`.
 

@@ -908,6 +908,7 @@
                 const payload = await apiRequest('/timesheet/site-check-in', 'POST', {
                     employeeId: state.user.id,
                     siteId: state.pendingSiteCheckIn.site.id,
+                    token: state.pendingSiteCheckIn.token,
                     scannedAt: state.pendingSiteCheckIn.scannedAt,
                     latitude: coords.latitude,
                     longitude: coords.longitude,

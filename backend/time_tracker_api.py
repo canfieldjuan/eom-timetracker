@@ -1788,6 +1788,7 @@ class SiteQrResolveRequest(BaseModel):
 class SiteCheckInRequest(BaseModel):
     employeeId: int = Field(gt=0)
     siteId: int = Field(gt=0)
+    token: str = Field(min_length=20, max_length=256)
     scannedAt: datetime
     latitude: float = Field(ge=-90, le=90, allow_inf_nan=False)
     longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
@@ -1818,6 +1819,11 @@ class SiteCheckInScheduleRequest(BaseModel):
 class SiteCheckInReviewRequest(BaseModel):
     decision: str = Field(pattern="^(approved|rejected)$")
     note: str = Field(min_length=3, max_length=500)
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def strip_review_note(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
 
 
 class ClockOutRequest(BaseModel):
@@ -3373,19 +3379,53 @@ def admin_site_check_in_qr(
         raise HTTPException(status_code=404, detail="Active site not found")
 
     nonce = str(site.get("check_in_token_nonce") or "")
-    rotated = bool(payload.rotate or not nonce)
-    if rotated:
-        nonce = secrets.token_urlsafe(18)
+    rotated = False
+    if payload.rotate:
+        candidate_nonce = secrets.token_urlsafe(18)
+        row = db.query_one(
+            """
+            UPDATE locations
+            SET check_in_token_nonce = %s, check_in_token_rotated_at = NOW()
+            WHERE id = %s AND active = true
+            RETURNING check_in_token_nonce, check_in_token_rotated_at
+            """,
+            (candidate_nonce, site_id),
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Active site not found")
+        nonce = str(row["check_in_token_nonce"])
+        site["check_in_token_rotated_at"] = row["check_in_token_rotated_at"]
+        rotated = True
+    elif not nonce:
+        candidate_nonce = secrets.token_urlsafe(18)
         row = db.query_one(
             """
             UPDATE locations
             SET check_in_token_nonce = %s, check_in_token_rotated_at = NOW()
             WHERE id = %s
-            RETURNING check_in_token_rotated_at
+              AND active = true
+              AND COALESCE(check_in_token_nonce, '') = ''
+            RETURNING check_in_token_nonce, check_in_token_rotated_at
             """,
-            (nonce, site_id),
+            (candidate_nonce, site_id),
         )
-        site["check_in_token_rotated_at"] = row["check_in_token_rotated_at"] if row else utc_now()
+        if row:
+            rotated = True
+        else:
+            row = db.query_one(
+                """
+                SELECT check_in_token_nonce, check_in_token_rotated_at
+                FROM locations
+                WHERE id = %s
+                  AND active = true
+                  AND COALESCE(check_in_token_nonce, '') <> ''
+                """,
+                (site_id,),
+            )
+        if not row:
+            raise HTTPException(status_code=404, detail="Active site not found")
+        nonce = str(row["check_in_token_nonce"])
+        site["check_in_token_rotated_at"] = row["check_in_token_rotated_at"]
 
     token = build_site_check_in_token(site_id, nonce)
     check_in_url = _site_check_in_url(request, token)
@@ -3449,16 +3489,15 @@ def record_site_check_in(
         )
         raise HTTPException(status_code=403, detail="employeeId must match the signed-in employee")
 
-    site = db.query_one(
-        """
-        SELECT id, address, lat, lng
-        FROM locations
-        WHERE id = %s AND active = true
-        """,
-        (payload.siteId,),
-    )
-    if not site:
-        raise HTTPException(status_code=404, detail="Active site not found")
+    site = _resolve_site_check_in_qr(payload.token)
+    if int(site["id"]) != int(payload.siteId):
+        append_access_log(
+            request,
+            "SITE_CHECK_IN_REJECTED",
+            False,
+            f"QR site {site['id']} did not match submitted site {payload.siteId}",
+        )
+        raise HTTPException(status_code=400, detail="siteId must match the scanned site QR")
 
     official_time = utc_now()
     geofence = evaluate_site_check_in_geofence(

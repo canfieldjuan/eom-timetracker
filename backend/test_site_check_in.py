@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -69,10 +71,23 @@ def create_arrival_schedule(
     return response.json()["schedule"]
 
 
-def site_check_in_payload(employee_id, location_id, *, scanned_at=None, **overrides):
+@pytest.fixture
+def site_qr_token(client, auth, location_id):
+    return create_site_qr(client, auth, location_id)["token"]
+
+
+def site_check_in_payload(
+    employee_id,
+    location_id,
+    token,
+    *,
+    scanned_at=None,
+    **overrides,
+):
     payload = {
         "employeeId": employee_id,
         "siteId": location_id,
+        "token": token,
         "scannedAt": (scanned_at or datetime.now(timezone.utc)).isoformat(),
         "latitude": SITE_LATITUDE,
         "longitude": SITE_LONGITUDE,
@@ -145,21 +160,104 @@ class TestSiteQr:
         )
         assert current.status_code == 200
 
+    def test_initial_qr_creation_is_idempotent_under_concurrent_requests(
+        self, client, auth, location_id, monkeypatch
+    ):
+        import time_tracker_api
+
+        original_query_one = time_tracker_api.db.query_one
+        initial_read_barrier = threading.Barrier(2)
+
+        def synchronized_query_one(sql, params=()):
+            row = original_query_one(sql, params)
+            normalized_sql = " ".join(sql.split())
+            if normalized_sql.startswith(
+                "SELECT id, address, customer_name, active, check_in_token_nonce,"
+            ):
+                initial_read_barrier.wait(timeout=10)
+            return row
+
+        monkeypatch.setattr(time_tracker_api.db, "query_one", synchronized_query_one)
+
+        def load_or_create_qr():
+            return client.post(
+                f"/api/admin/locations/{location_id}/check-in-qr",
+                headers=auth,
+                json={"rotate": False},
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = [
+                future.result(timeout=15)
+                for future in [executor.submit(load_or_create_qr) for _ in range(2)]
+            ]
+
+        assert all(response.status_code == 200 for response in responses)
+        payloads = [response.json() for response in responses]
+        assert len({payload["token"] for payload in payloads}) == 1
+        assert sorted(payload["rotated"] for payload in payloads) == [False, True]
+
 
 class TestSiteCheckInDecision:
     def test_session_employee_is_authoritative(
-        self, client, emp_auth, employee_id, location_id
+        self, client, emp_auth, employee_id, location_id, site_qr_token
     ):
         response = client.post(
             "/api/timesheet/site-check-in",
             headers=emp_auth,
-            json=site_check_in_payload(employee_id + 999, location_id),
+            json=site_check_in_payload(
+                employee_id + 999, location_id, site_qr_token
+            ),
         )
         assert response.status_code == 403
         assert "signed-in employee" in response.json()["error"]
 
+    def test_record_requires_matching_current_qr_token(
+        self, client, auth, emp_auth, employee_id, location_id, site_qr_token
+    ):
+        missing_token = site_check_in_payload(
+            employee_id, location_id, site_qr_token
+        )
+        missing_token.pop("token")
+        missing = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=missing_token,
+        )
+        assert missing.status_code == 422
+
+        mismatched_site = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id, location_id + 999, site_qr_token
+            ),
+        )
+        assert mismatched_site.status_code == 400
+        assert "scanned site QR" in mismatched_site.json()["error"]
+
+        rotated = create_site_qr(client, auth, location_id, rotate=True)
+        expired = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id, location_id, site_qr_token
+            ),
+        )
+        assert expired.status_code == 404
+        assert "expired" in expired.json()["error"]
+
+        current = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id, location_id, rotated["token"]
+            ),
+        )
+        assert current.status_code == 200, current.text
+
     def test_server_timestamp_and_exact_schedule_produce_on_time(
-        self, client, auth, emp_auth, employee_id, location_id
+        self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
         before = datetime.now(timezone.utc)
         create_arrival_schedule(
@@ -177,6 +275,7 @@ class TestSiteCheckInDecision:
             json=site_check_in_payload(
                 employee_id,
                 location_id,
+                site_qr_token,
                 scanned_at=device_scan,
             ),
         )
@@ -191,7 +290,7 @@ class TestSiteCheckInDecision:
         assert check_in["reviewStatus"] == "not_required"
 
     def test_after_grace_period_is_late(
-        self, client, auth, emp_auth, employee_id, location_id
+        self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
         create_arrival_schedule(
             client,
@@ -204,7 +303,7 @@ class TestSiteCheckInDecision:
         response = client.post(
             "/api/timesheet/site-check-in",
             headers=emp_auth,
-            json=site_check_in_payload(employee_id, location_id),
+            json=site_check_in_payload(employee_id, location_id, site_qr_token),
         )
         assert response.status_code == 200, response.text
         assert response.json()["checkIn"]["classification"] == "late"
@@ -233,6 +332,7 @@ class TestSiteCheckInDecision:
         emp_auth,
         employee_id,
         location_id,
+        site_qr_token,
         overrides,
         geofence_status,
         reason,
@@ -247,7 +347,9 @@ class TestSiteCheckInDecision:
         response = client.post(
             "/api/timesheet/site-check-in",
             headers=emp_auth,
-            json=site_check_in_payload(employee_id, location_id, **overrides),
+            json=site_check_in_payload(
+                employee_id, location_id, site_qr_token, **overrides
+            ),
         )
         assert response.status_code == 200, response.text
         check_in = response.json()["checkIn"]
@@ -257,12 +359,12 @@ class TestSiteCheckInDecision:
         assert check_in["reviewStatus"] == "pending"
 
     def test_missing_schedule_and_device_clock_skew_need_review(
-        self, client, auth, emp_auth, employee_id, location_id
+        self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
         missing_schedule = client.post(
             "/api/timesheet/site-check-in",
             headers=emp_auth,
-            json=site_check_in_payload(employee_id, location_id),
+            json=site_check_in_payload(employee_id, location_id, site_qr_token),
         )
         assert missing_schedule.status_code == 200, missing_schedule.text
         assert missing_schedule.json()["checkIn"]["classificationReason"] == "no_matching_schedule"
@@ -285,6 +387,7 @@ class TestSiteCheckInDecision:
             json=site_check_in_payload(
                 employee_id,
                 location_id,
+                site_qr_token,
                 scanned_at=datetime.now(timezone.utc) - timedelta(hours=1),
             ),
         )
@@ -292,9 +395,9 @@ class TestSiteCheckInDecision:
         assert skewed.json()["checkIn"]["classificationReason"] == "device_clock_skew"
 
     def test_retry_with_same_scan_evidence_is_idempotent(
-        self, client, emp_auth, employee_id, location_id
+        self, client, emp_auth, employee_id, location_id, site_qr_token
     ):
-        payload = site_check_in_payload(employee_id, location_id)
+        payload = site_check_in_payload(employee_id, location_id, site_qr_token)
         first = client.post(
             "/api/timesheet/site-check-in", headers=emp_auth, json=payload
         )
@@ -310,7 +413,7 @@ class TestSiteCheckInDecision:
 
 class TestSiteCheckInAdminReview:
     def test_schedule_list_delete_and_review_queue(
-        self, client, auth, emp_auth, employee_id, location_id
+        self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
         schedule = create_arrival_schedule(
             client,
@@ -332,7 +435,7 @@ class TestSiteCheckInAdminReview:
         check_in_response = client.post(
             "/api/timesheet/site-check-in",
             headers=emp_auth,
-            json=site_check_in_payload(employee_id, location_id),
+            json=site_check_in_payload(employee_id, location_id, site_qr_token),
         )
         check_in_id = check_in_response.json()["checkIn"]["id"]
         queue = client.get(
@@ -348,14 +451,22 @@ class TestSiteCheckInAdminReview:
         )
         assert forbidden.status_code == 403
 
+        blank_note = client.patch(
+            f"/api/admin/site-check-ins/{check_in_id}",
+            headers=auth,
+            json={"decision": "approved", "note": "   "},
+        )
+        assert blank_note.status_code == 422
+
         reviewed = client.patch(
             f"/api/admin/site-check-ins/{check_in_id}",
             headers=auth,
-            json={"decision": "approved", "note": "GPS evidence verified"},
+            json={"decision": "approved", "note": "  GPS evidence verified  "},
         )
         assert reviewed.status_code == 200, reviewed.text
         assert reviewed.json()["checkIn"]["reviewStatus"] == "approved"
         assert reviewed.json()["checkIn"]["reviewedBy"] == "Juan Canfield"
+        assert reviewed.json()["checkIn"]["reviewNote"] == "GPS evidence verified"
 
     def test_locations_publish_site_ids_and_policy(self, client, emp_auth, location_id):
         response = client.get("/api/timesheet/locations", headers=emp_auth)
@@ -377,4 +488,5 @@ def test_frontend_contains_scan_then_tap_contract():
     assert "'/timesheet/site-check-in/resolve'" in html
     assert "'/timesheet/site-check-in'" in html
     assert "await getCurrentCoordinates()" in html
+    assert "token: state.pendingSiteCheckIn.token" in html
     assert "scannedAt: state.pendingSiteCheckIn.scannedAt" in html
