@@ -1705,6 +1705,13 @@ class ReceivablesDepositRequest(BaseModel):
     deposit_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     bank_reference: Optional[str] = Field(default=None, max_length=256)
 
+    @field_validator("payment_ids")
+    @classmethod
+    def payment_ids_must_be_unique(cls, value: List[UUID]) -> List[UUID]:
+        if len(set(value)) != len(value):
+            raise ValueError("a payment may only appear once")
+        return value
+
 
 VALID_NON_PRODUCTIVE_TYPES = ("drive_time", "waiting", "supply_run", "rework", "lockout", "other")
 
@@ -1867,6 +1874,12 @@ def _atlas_receivables_request(
     try:
         content = response.json()
     except ValueError as exc:
+        if response.status_code >= 500:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail="Receivables service is temporarily unavailable; retry this request",
+                headers={"Retry-After": "5"},
+            ) from exc
         raise HTTPException(
             status_code=502, detail="Receivables service returned an invalid response"
         ) from exc
@@ -1895,6 +1908,20 @@ def _atlas_receivables_request(
             headers=headers,
         )
     return content
+
+
+def _canonicalize_receivables_payload(
+    operation: str,
+    payload: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if payload is None:
+        return None
+    canonical = dict(payload)
+    if operation == "RECEIVABLES_DEPOSIT_CREATE":
+        canonical["payment_ids"] = sorted(
+            str(item) for item in payload.get("payment_ids", [])
+        )
+    return canonical
 
 
 def _receivables_operation_fingerprint(
@@ -2238,6 +2265,7 @@ def _atlas_receivables_mutation(
 
     if not idempotency_key:
         raise HTTPException(status_code=422, detail="Idempotency key is required")
+    payload = _canonicalize_receivables_payload(audit_action, payload)
     fingerprint = _receivables_operation_fingerprint(
         audit_action, method, path, payload
     )

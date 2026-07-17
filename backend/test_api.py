@@ -6,6 +6,7 @@ Run:  cd backend && pytest -v
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Barrier, Event, Lock
 
 import pytest
@@ -55,7 +56,19 @@ class _AtlasResponse:
         return self._payload
 
 
+class _InvalidJsonAtlasResponse(_AtlasResponse):
+    def json(self):
+        raise ValueError("not json")
+
+
 class TestReceivablesProxy:
+    def test_runtime_requirements_pin_pydantic_v2(self):
+        requirements = (Path(__file__).parent / "requirements.txt").read_text(
+            encoding="utf-8"
+        )
+
+        assert "pydantic>=2.0.0,<3.0.0" in requirements
+
     @pytest.mark.parametrize("invalid", [True, False, 100.0, 100.5, "100", 0, -1])
     def test_payment_model_rejects_coercive_cent_values(self, invalid):
         import time_tracker_api as api
@@ -92,6 +105,18 @@ class TestReceivablesProxy:
                 }
             )
 
+    def test_deposit_model_rejects_duplicate_payment_ids(self):
+        import time_tracker_api as api
+
+        payment_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        with pytest.raises(ValueError, match="only appear once"):
+            api.ReceivablesDepositRequest.model_validate(
+                {
+                    "payment_ids": [payment_id, payment_id],
+                    "deposit_date": "2026-07-16",
+                }
+            )
+
     def test_requires_existing_admin_session(self, client, emp_auth):
         response = client.get("/api/admin/receivables/open-invoices", headers=emp_auth)
         assert response.status_code == 403
@@ -121,7 +146,9 @@ class TestReceivablesProxy:
             calls.append((method, url, kwargs))
             return _AtlasResponse([{"invoice_number": "INV-1"}])
 
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
         monkeypatch.setattr(
             api,
             "ATLAS_RECEIVABLES_SERVICE_TOKEN",
@@ -155,7 +182,9 @@ class TestReceivablesProxy:
             calls.append((method, url, kwargs))
             return _AtlasResponse({"id": "payment-1"}, status_code=201)
 
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
         monkeypatch.setattr(api.requests, "request", fake_request)
         headers = {**auth, "Idempotency-Key": "browser-payment-1"}
@@ -200,6 +229,28 @@ class TestReceivablesProxy:
         response = client.get("/api/admin/receivables/open-invoices", headers=auth)
 
         assert response.status_code == 503
+        assert "retry" in response.json()["error"].lower()
+        assert response.headers["retry-after"] == "5"
+
+    @pytest.mark.parametrize("atlas_status", [502, 503, 504])
+    def test_non_json_upstream_outage_preserves_retryable_status(
+        self, client, auth, monkeypatch, atlas_status
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: _InvalidJsonAtlasResponse(
+                None, status_code=atlas_status
+            ),
+        )
+
+        response = client.get("/api/admin/receivables/ready", headers=auth)
+
+        assert response.status_code == atlas_status
         assert "retry" in response.json()["error"].lower()
         assert response.headers["retry-after"] == "5"
 
@@ -294,6 +345,54 @@ class TestReceivablesProxy:
             """
         )
         assert attempt == {"state": "resolved", "idempotency_key": "browser-a-key"}
+
+    def test_deposit_retry_canonicalizes_payment_id_order(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+
+        def flaky_request(_method, _url, **kwargs):
+            calls.append((kwargs["headers"]["Idempotency-Key"], kwargs["json"]))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("response lost")
+            return _AtlasResponse({"id": "deposit-after-retry"}, status_code=201)
+
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+        monkeypatch.setattr(api, "append_access_log", lambda *_args, **_kwargs: None)
+        first_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        second_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        body = {
+            "payment_ids": [second_id, first_id],
+            "deposit_date": "2026-07-16",
+            "bank_reference": "bank-1",
+        }
+
+        first = client.post(
+            "/api/admin/receivables/deposit-batches",
+            headers={**auth, "Idempotency-Key": "deposit-browser-a"},
+            json=body,
+        )
+        second = client.post(
+            "/api/admin/receivables/deposit-batches",
+            headers={**auth, "Idempotency-Key": "deposit-browser-b"},
+            json={**body, "payment_ids": [first_id, second_id]},
+        )
+
+        assert first.status_code == 503
+        assert second.status_code == 200
+        assert second.json() == {"id": "deposit-after-retry"}
+        assert [key for key, _payload in calls] == [
+            "deposit-browser-a",
+            "deposit-browser-a",
+        ]
+        assert [payload["payment_ids"] for _key, payload in calls] == [
+            [first_id, second_id],
+            [first_id, second_id],
+        ]
 
     def test_void_blocks_stale_replay_and_allows_one_corrected_generation(
         self, client, auth, monkeypatch
