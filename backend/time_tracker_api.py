@@ -3101,7 +3101,8 @@ def _site_check_in_schedule_rule_row(rule_id: int) -> Optional[Dict[str, Any]]:
         """
         SELECT sr.id, sr.employee_id, e.name AS employee_name,
                sr.location_id, l.address AS site_name, sr.weekdays,
-               sr.local_start_time, sr.timezone, sr.starts_on, sr.ends_on,
+               sr.local_start_time, sr.timezone, sr.starts_on,
+               NULLIF(sr.ends_on, 'infinity'::date) AS ends_on,
                sr.grace_minutes, sr.active, sr.created_at, sr.updated_at
         FROM site_check_in_schedule_rules sr
         JOIN employees e ON e.id = sr.employee_id
@@ -3114,9 +3115,6 @@ def _site_check_in_schedule_rule_row(rule_id: int) -> Optional[Dict[str, Any]]:
 
 def _serialize_site_check_in_schedule_rule(row: Dict[str, Any]) -> Dict[str, Any]:
     ends_on = row.get("ends_on")
-    serialized_end = None
-    if ends_on is not None and getattr(ends_on, "year", 9999) < 9999:
-        serialized_end = ends_on.isoformat()
     return {
         "id": int(row["id"]),
         "employeeId": int(row["employee_id"]),
@@ -3127,7 +3125,7 @@ def _serialize_site_check_in_schedule_rule(row: Dict[str, Any]) -> Dict[str, Any
         "localStart": row["local_start_time"].strftime("%H:%M"),
         "timezone": str(row["timezone"]),
         "startsOn": row["starts_on"].isoformat(),
-        "endsOn": serialized_end,
+        "endsOn": ends_on.isoformat() if ends_on is not None else None,
         "graceMinutes": int(row["grace_minutes"]),
         "active": bool(row["active"]),
         "createdAt": to_utc_iso(row["created_at"]),
@@ -3949,7 +3947,8 @@ def admin_list_site_check_in_schedule_rules(
         f"""
         SELECT sr.id, sr.employee_id, e.name AS employee_name,
                sr.location_id, l.address AS site_name, sr.weekdays,
-               sr.local_start_time, sr.timezone, sr.starts_on, sr.ends_on,
+               sr.local_start_time, sr.timezone, sr.starts_on,
+               NULLIF(sr.ends_on, 'infinity'::date) AS ends_on,
                sr.grace_minutes, sr.active, sr.created_at, sr.updated_at
         FROM site_check_in_schedule_rules sr
         JOIN employees e ON e.id = sr.employee_id

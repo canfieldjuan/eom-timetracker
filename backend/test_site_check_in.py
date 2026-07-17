@@ -631,6 +631,37 @@ class TestRecurringSiteCheckInSchedules:
         assert history.status_code == 200
         assert history.json()["rules"][0]["active"] is False
 
+    def test_rule_api_distinguishes_open_end_from_literal_max_date(
+        self, client, auth, employee_id, location_id
+    ):
+        open_ended = create_recurring_schedule_rule(
+            client,
+            auth,
+            employee_id,
+            location_id,
+            weekdays=[0],
+            ends_on=None,
+        )
+        max_dated = create_recurring_schedule_rule(
+            client,
+            auth,
+            employee_id,
+            location_id,
+            weekdays=[1],
+            ends_on="9999-12-31",
+        )
+
+        assert open_ended["endsOn"] is None
+        assert max_dated["endsOn"] == "9999-12-31"
+
+        listed = client.get(
+            "/api/admin/site-check-in-schedule-rules", headers=auth
+        )
+        assert listed.status_code == 200
+        rules_by_id = {row["id"]: row for row in listed.json()["rules"]}
+        assert rules_by_id[open_ended["id"]]["endsOn"] is None
+        assert rules_by_id[max_dated["id"]]["endsOn"] == "9999-12-31"
+
 
 class TestSiteCheckInAdminReview:
     def test_schedule_list_delete_and_review_queue(
