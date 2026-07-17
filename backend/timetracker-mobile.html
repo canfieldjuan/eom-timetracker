@@ -152,6 +152,12 @@
             background: #fdecee;
         }
 
+        .status-review {
+            color: var(--warn-text);
+            background: var(--warn-bg);
+            border-color: var(--warn-border);
+        }
+
         .access-chip {
             display: inline-block;
             padding: 6px 10px;
@@ -612,6 +618,7 @@
             user: null,
             currentlyWorking: [],
             myStatus: null,
+            staleOpenShift: null,
             dashboardHours: null,
             dashboardStatus: [],
             dashboardTab: 'overview',
@@ -845,7 +852,18 @@
             const departButton = document.getElementById('departButton');
             const clockOutButton = document.getElementById('clockOutButton');
 
-            if (state.myStatus) {
+            if (state.staleOpenShift) {
+                const stale = state.staleOpenShift;
+                chip.className = 'status-chip status-review';
+                chip.textContent = 'Needs review';
+                details.textContent = `Shift ${stale.shiftId} started ${formatCorrectionTimestamp(stale.clockIn)} ` +
+                    `at ${stale.location || 'an unknown location'} and is missing a verified clock-out. ` +
+                    'Ask an administrator to correct it before recording more time.';
+                clockInButton.disabled = true;
+                arriveButton.disabled = true;
+                departButton.disabled = true;
+                clockOutButton.disabled = true;
+            } else if (state.myStatus) {
                 chip.className = 'status-chip status-on';
                 chip.textContent = 'Clocked in';
                 const statusText = state.myStatus.canDepart ? 'On site' : 'In transit';
@@ -863,6 +881,20 @@
                 departButton.disabled = true;
                 clockOutButton.disabled = true;
             }
+        }
+
+        function captureStaleShiftReview(error) {
+            const payload = error && error.payload;
+            const stale = payload && payload.code === 'STALE_SHIFT_REQUIRES_REVIEW'
+                ? payload.details && payload.details.staleOpenShift
+                : null;
+            if (!stale) {
+                return false;
+            }
+            state.myStatus = null;
+            state.staleOpenShift = stale;
+            renderStatus();
+            return true;
         }
 
         function renderWorkerFeed() {
@@ -1066,6 +1098,7 @@
             const data = await apiRequest('/timesheet/current-status', 'GET', null, true);
             state.currentlyWorking = Array.isArray(data.currentlyWorking) ? data.currentlyWorking : [];
             state.myStatus = state.currentlyWorking.find((item) => item.employeeName === state.user.name) || null;
+            state.staleOpenShift = data.staleOpenShift || null;
             renderStatus();
             renderWorkerFeed();
         }
@@ -1118,6 +1151,7 @@
                 await loadDashboard();
                 setMessage(message, 'success', 'Clock-in recorded.');
             } catch (error) {
+                captureStaleShiftReview(error);
                 setMessage(message, 'error', error.message);
             }
         }
@@ -1140,6 +1174,7 @@
                     payload.alreadyHere ? 'Already marked at this location.' : 'Arrival recorded.'
                 );
             } catch (error) {
+                captureStaleShiftReview(error);
                 setMessage(message, 'error', error.message);
             }
         }
@@ -1157,6 +1192,7 @@
                 await loadDashboard();
                 setMessage(message, 'success', 'Departure recorded.');
             } catch (error) {
+                captureStaleShiftReview(error);
                 setMessage(message, 'error', error.message);
             }
         }
@@ -1174,6 +1210,7 @@
                 await loadDashboard();
                 setMessage(message, 'success', 'Clock-out recorded.');
             } catch (error) {
+                captureStaleShiftReview(error);
                 setMessage(message, 'error', error.message);
             }
         }
@@ -1183,6 +1220,7 @@
             state.user = null;
             state.currentlyWorking = [];
             state.myStatus = null;
+            state.staleOpenShift = null;
             state.dashboardHours = null;
             state.dashboardStatus = [];
             state.correctionInventory = null;
@@ -1548,6 +1586,7 @@
                 invalidateCorrectionPlan();
                 await loadCorrectionInventory();
                 await loadTimeDataAudit();
+                await loadCurrentStatus();
                 await loadDashboard();
                 setMessage(message, 'success', successText);
             } catch (error) {

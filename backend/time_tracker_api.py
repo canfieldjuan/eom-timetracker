@@ -991,26 +991,73 @@ def is_stale_open_entry(entry: Dict[str, Any], reference_time: datetime) -> bool
     return elapsed_hours > MAX_ACTIVE_SHIFT_HOURS
 
 
-def close_stale_open_entries(timesheet_data: Dict[str, Any], reference_time: datetime) -> bool:
-    changed = False
-    marker = "[auto-closed stale shift]"
+def get_stale_open_entry(
+    entries: List[Dict[str, Any]],
+    employee_id: int,
+    reference_time: datetime,
+) -> Optional[Dict[str, Any]]:
+    stale_entries = [
+        entry
+        for entry in entries
+        if entry.get("employeeId") == employee_id
+        and is_stale_open_entry(entry, reference_time)
+    ]
+    if not stale_entries:
+        return None
 
-    for entry in timesheet_data.get("entries", []):
-        if not is_stale_open_entry(entry, reference_time):
-            continue
+    stale_entries.sort(
+        key=lambda item: (str(item.get("clockIn", "")), int(item.get("id", 0)))
+    )
+    return stale_entries[0]
 
+
+STALE_SHIFT_REVIEW_CODE = "STALE_SHIFT_REQUIRES_REVIEW"
+
+
+def stale_open_shift_summary(
+    entry: Dict[str, Any],
+    reference_time: datetime,
+) -> Optional[Dict[str, Any]]:
+    if not is_stale_open_entry(entry, reference_time):
+        return None
+
+    try:
         started_at = parse_utc_iso(str(entry.get("clockIn", "")))
-        closed_at = started_at + timedelta(hours=MAX_ACTIVE_SHIFT_HOURS)
-        entry["clockOut"] = to_utc_iso(closed_at)
-        entry["totalHours"] = round(MAX_ACTIVE_SHIFT_HOURS, 2)
+    except ValueError:
+        return None
 
-        notes = str(entry.get("notes", "")).strip()
-        if marker not in notes:
-            entry["notes"] = f"{notes} {marker}".strip()
+    return {
+        "shiftId": int(entry.get("id", 0)),
+        "clockIn": to_utc_iso(started_at),
+        "location": str(entry.get("location", "")),
+        "ageHours": round((reference_time - started_at).total_seconds() / 3600.0, 2),
+        "requiresAdminReview": True,
+    }
 
-        changed = True
 
-    return changed
+def stale_shift_review_failure(
+    entry: Dict[str, Any],
+    reference_time: datetime,
+) -> Dict[str, Any]:
+    summary = stale_open_shift_summary(entry, reference_time) or {
+        "shiftId": int(entry.get("id", 0)),
+        "requiresAdminReview": True,
+    }
+    shift_id = summary["shiftId"]
+    return {
+        "code": STALE_SHIFT_REVIEW_CODE,
+        "message": (
+            f"Shift {shift_id} is missing a verified clock-out. "
+            "Ask an administrator to review it before recording more time."
+        ),
+        "details": {"staleOpenShift": summary},
+    }
+
+
+def raise_timesheet_mutation_failure(result: Any) -> None:
+    if isinstance(result, dict) and result.get("code") == STALE_SHIFT_REVIEW_CODE:
+        raise HTTPException(status_code=409, detail=result)
+    raise HTTPException(status_code=400, detail=str(result))
 
 
 def update_timesheets(mutator) -> Tuple[bool, Any]:
@@ -1020,12 +1067,8 @@ def update_timesheets(mutator) -> Tuple[bool, Any]:
         pre_visit_counts = {e["id"]: len(e.get("visits", [])) for e in timesheet_data["entries"]}
         pre_departure_counts = {e["id"]: len(e.get("departures", [])) for e in timesheet_data["entries"]}
 
-        changed = False
-        if AUTO_CLOSE_STALE_SHIFTS:
-            changed = close_stale_open_entries(timesheet_data, utc_now())
-
         ok, payload = mutator(timesheet_data)
-        if ok or changed:
+        if ok:
             _save_timesheets_to_db(timesheet_data, pre_shift_ids, pre_visit_counts, pre_departure_counts)
         return ok, payload
 
@@ -1157,11 +1200,13 @@ def entry_hours(entry: Dict[str, Any], reference_time: datetime) -> float:
 
     clock_out_value = entry.get("clockOut")
     if clock_out_value is None:
+        if is_stale_open_entry(entry, reference_time):
+            return 0.0
         duration = reference_time - clock_in_time
         duration_hours = duration.total_seconds() / 3600
         if duration_hours < 0:
             return 0.0
-        return round(min(duration_hours, MAX_ACTIVE_SHIFT_HOURS), 2)
+        return round(duration_hours, 2)
 
     try:
         clock_out_time = parse_utc_iso(str(clock_out_value))
@@ -1235,6 +1280,8 @@ def build_dashboard_hours_data() -> Dict[str, Any]:
                     end_time = to_local(clock_out_time).strftime("%H:%M")
                 except ValueError:
                     end_time = "--:--"
+            elif is_stale_open_entry(entry, now):
+                end_time = "Needs review"
             else:
                 end_time = "--:--"
 
@@ -1273,8 +1320,10 @@ def _resolve_customer(location: str, location_customers: Dict[str, str]) -> str:
     return location_customers.get(location, "")
 
 
-def build_public_current_status() -> List[Dict[str, Any]]:
-    timesheet_data = load_timesheets()
+def build_public_current_status(
+    timesheet_data: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    timesheet_data = timesheet_data or load_timesheets()
     location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
     now = utc_now()
 
@@ -1686,7 +1735,6 @@ APP_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 
 TOKEN_TTL_HOURS = parse_int(os.getenv("TOKEN_TTL_HOURS"), 12)
 MAX_ACTIVE_SHIFT_HOURS = float(os.getenv("MAX_ACTIVE_SHIFT_HOURS", "24"))
-AUTO_CLOSE_STALE_SHIFTS = parse_bool(os.getenv("AUTO_CLOSE_STALE_SHIFTS"), True)
 LOCATION_MATCH_RADIUS_M = parse_int(os.getenv("LOCATION_MATCH_RADIUS_M"), LOCATION_MATCH_RADIUS_DEFAULT_M)
 
 ACCESS_START_HOUR = parse_int(os.getenv("ACCESS_START_HOUR"), 8)
@@ -1787,10 +1835,19 @@ async def private_network_access_middleware(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
-    detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
+    if isinstance(exc.detail, dict):
+        detail = str(exc.detail.get("message") or exc.detail.get("error") or "Request failed")
+        content: Dict[str, Any] = {"success": False, "error": detail}
+        if exc.detail.get("code"):
+            content["code"] = exc.detail["code"]
+        if isinstance(exc.detail.get("details"), dict):
+            content["details"] = exc.detail["details"]
+    else:
+        detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
+        content = {"success": False, "error": detail}
     return JSONResponse(
         status_code=exc.status_code,
-        content={"success": False, "error": detail},
+        content=content,
         headers=exc.headers,
     )
 
@@ -2183,7 +2240,9 @@ def admin_list_employees(
                     CASE
                         WHEN s.clock_out IS NOT NULL
                             THEN GREATEST(0.0, EXTRACT(EPOCH FROM (s.clock_out - s.clock_in)) / 3600.0)
-                        ELSE GREATEST(0.0, LEAST(%s, EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0))
+                        WHEN EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0 > %s
+                            THEN 0.0
+                        ELSE GREATEST(0.0, EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0)
                     END
                 ) AS total_hours,
                 COUNT(*) AS total_shifts
@@ -2286,7 +2345,7 @@ def admin_employee_hours(
         if entry_date == today_str:
             today_hours += total
 
-        clock_out_display = "Active"
+        clock_out_display = "Needs review" if is_stale_open_entry(entry, now) else "Active"
         if entry.get("clockOut"):
             try:
                 clock_out_display = local_clock_string(parse_utc_iso(str(entry["clockOut"])))
@@ -2323,7 +2382,7 @@ def admin_employee_hours(
         if not (grid_sunday_utc <= ci_dt <= grid_saturday_utc):
             continue
         d_str = local_date_string(ci_dt)
-        co_disp = "Active"
+        co_disp = "Needs review" if is_stale_open_entry(entry, now) else "Active"
         if entry.get("clockOut"):
             try:
                 co_disp = local_clock_string(parse_utc_iso(str(entry["clockOut"])))
@@ -2407,8 +2466,13 @@ def clock_in(
     work_date = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         existing_open = get_open_entry(timesheet_data["entries"], employee["id"])
-        if existing_open and not is_stale_open_entry(existing_open, now_utc):
+        if existing_open:
             return False, "Already clocked in"
 
         override_error = require_gps_override(
@@ -2464,7 +2528,7 @@ def clock_in(
     ok, result = update_timesheets(mutator)
     if not ok:
         append_access_log(request, "CLOCK_IN_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
+        raise_timesheet_mutation_failure(result)
 
     loc = result.get("location", "")
     location_customers: Dict[str, str] = load_timesheets().get("location_customers", {})
@@ -2483,8 +2547,13 @@ def clock_out(
     now_utc = utc_now()
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
+        if not open_entry:
             return False, "Not currently clocked in"
 
         override_error = require_gps_override(
@@ -2527,7 +2596,7 @@ def clock_out(
     ok, result = update_timesheets(mutator)
     if not ok:
         append_access_log(request, "CLOCK_OUT_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
+        raise_timesheet_mutation_failure(result)
 
     append_access_log(
         request,
@@ -2549,8 +2618,13 @@ def log_visit(
     now_utc = utc_now()
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
+        if not open_entry:
             return False, "Not currently clocked in"
 
         override_error = require_gps_override(
@@ -2600,7 +2674,7 @@ def log_visit(
     if not ok:
         if result == "already_at_location":
             return {"success": True, "alreadyHere": True}
-        raise HTTPException(status_code=400, detail=str(result))
+        raise_timesheet_mutation_failure(result)
 
     append_access_log(request, "VISIT_LOGGED", True,
                       f"Employee: {employee['name']} arrived at {result['visit']['location']}")
@@ -2630,8 +2704,13 @@ def depart_location(
     now_utc = utc_now()
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
+        if not open_entry:
             return False, "Not currently clocked in"
 
         override_error = require_gps_override(
@@ -2678,7 +2757,7 @@ def depart_location(
     ok, result = update_timesheets(mutator)
     if not ok:
         append_access_log(request, "DEPARTURE_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
+        raise_timesheet_mutation_failure(result)
 
     append_access_log(
         request,
@@ -2809,7 +2888,7 @@ def my_timesheet_hours(
         if clock_in_dt >= year_start:
             yearly_hours += total
 
-        clock_out_display = "Active"
+        clock_out_display = "Needs review" if is_stale_open_entry(entry, now) else "Active"
         if entry.get("clockOut"):
             try:
                 clock_out_display = local_clock_string(parse_utc_iso(str(entry["clockOut"])))
@@ -2963,9 +3042,23 @@ def timesheet_current_status(
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
-    rows = build_public_current_status()
+    timesheet_data = load_timesheets()
+    now_utc = utc_now()
+    own_stale_open = get_stale_open_entry(
+        timesheet_data.get("entries", []), int(employee["id"]), now_utc
+    )
+    rows = build_public_current_status(timesheet_data)
     if employee.get("role") != "admin":
-        rows = [row for row in rows if int(row.get("id", 0)) == int(employee["id"])]
+        rows = (
+            []
+            if own_stale_open
+            else [row for row in rows if int(row.get("id", 0)) == int(employee["id"])]
+        )
+    stale_open_shift = (
+        stale_open_shift_summary(own_stale_open, now_utc)
+        if own_stale_open
+        else None
+    )
     response_rows = [
         {
             "employeeName": row["name"],
@@ -2984,7 +3077,11 @@ def timesheet_current_status(
         for row in rows
     ]
     append_access_log(request, "CURRENT_STATUS_SUCCESS", True, f"{len(response_rows)} employees working")
-    return {"success": True, "currentlyWorking": response_rows}
+    return {
+        "success": True,
+        "currentlyWorking": response_rows,
+        "staleOpenShift": stale_open_shift,
+    }
 
 
 @app.get("/api/hours")
