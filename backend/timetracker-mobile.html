@@ -718,7 +718,8 @@
                     (position) => {
                         resolve({
                             latitude: position.coords.latitude,
-                            longitude: position.coords.longitude
+                            longitude: position.coords.longitude,
+                            accuracy: position.coords.accuracy
                         });
                     },
                     (error) => {
@@ -798,6 +799,7 @@
             if (coords) {
                 payload.latitude = coords.latitude;
                 payload.longitude = coords.longitude;
+                payload.accuracy = coords.accuracy;
             }
             if (override.reason) {
                 payload.gpsOverrideReason = override.reason;
@@ -955,6 +957,48 @@
             document.getElementById('dashboardHoursPanel').classList.toggle('hidden', !isHours);
         }
 
+        function renderGpsEvidence(item) {
+            const gps = item && item.clockInGps && typeof item.clockInGps === 'object'
+                ? item.clockInGps
+                : null;
+            const meta = item && item.clockInGpsMeta && typeof item.clockInGpsMeta === 'object'
+                ? item.clockInGpsMeta
+                : null;
+            const parts = [];
+
+            if (gps && Number.isFinite(Number(gps.lat)) && Number.isFinite(Number(gps.lng))) {
+                const lat = Number(gps.lat);
+                const lng = Number(gps.lng);
+                const mapUrl = `https://www.google.com/maps?q=${encodeURIComponent(`${lat},${lng}`)}`;
+                parts.push(`<a href="${mapUrl}" target="_blank" rel="noopener noreferrer">Map</a>`);
+
+                const rawAccuracy = gps.accuracy != null
+                    ? gps.accuracy
+                    : meta && meta.accuracyM;
+                if (Number.isFinite(Number(rawAccuracy))) {
+                    parts.push(`accuracy ±${Math.round(Number(rawAccuracy))}m`);
+                }
+            } else {
+                parts.push('no coordinates');
+            }
+
+            if (meta && meta.matchedLocation) {
+                const rawDistance = Number(meta.distanceM);
+                const distance = Number.isFinite(rawDistance) ? `${Math.round(rawDistance)}m from ` : '';
+                const radiusLabel = meta.withinRadius === true ? 'inside radius' : 'outside radius';
+                parts.push(`${distance}${escapeHtml(meta.matchedLocation)} (${radiusLabel})`);
+            } else if (gps) {
+                parts.push('no pinned-site match');
+            }
+
+            if (meta && meta.override) {
+                const reason = meta.overrideReason || 'reason recorded';
+                parts.push(`override: ${escapeHtml(reason)}`);
+            }
+
+            return `<div class="meta">Location evidence: ${parts.join(' | ')}</div>`;
+        }
+
         function renderPublicWorkers() {
             const list = document.getElementById('publicWorkersList');
             if (!state.dashboardStatus.length) {
@@ -966,6 +1010,7 @@
                 <div class="worker-card">
                     <div><strong>${escapeHtml(item.name)}</strong></div>
                     <div class="meta">Location: ${escapeHtml(item.location || '-')}</div>
+                    ${renderGpsEvidence(item)}
                     <div class="meta">Started: ${escapeHtml(item.clockedInAt || '-')}</div>
                     <div class="meta">Hours worked: ${escapeHtml(item.hoursWorked || '0')}</div>
                     <div class="meta">Notes: ${escapeHtml(item.notes || '-')}</div>

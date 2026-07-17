@@ -12,10 +12,13 @@ from datetime import datetime, timedelta
 import pytest
 
 
+SITE_GPS = {"latitude": 39.1203, "longitude": -88.54335}
+
+
 def _ensure_clocked_out(client, headers) -> None:
     """Best-effort cleanup: close any open shift for the auth'd user. Ignore
     errors (no-op when nothing is open)."""
-    client.post("/api/timesheet/clock-out", headers=headers, json={})
+    client.post("/api/timesheet/clock-out", headers=headers, json=SITE_GPS)
 
 
 # ===============================================================================
@@ -32,13 +35,13 @@ class TestAdminListEmployeesAggregation:
         ci = client.post(
             "/api/timesheet/clock-in",
             headers=emp_auth,
-            json={"location": "123 Main St, Effingham"},
+            json={"location": "123 Main St, Effingham", **SITE_GPS},
         )
         assert ci.status_code == 200, ci.text
         co = client.post(
             "/api/timesheet/clock-out",
             headers=emp_auth,
-            json={"notes": "regression-aggregate-closed"},
+            json={"notes": "regression-aggregate-closed", **SITE_GPS},
         )
         assert co.status_code == 200, co.text
 
@@ -65,7 +68,7 @@ class TestAdminListEmployeesAggregation:
         ci = client.post(
             "/api/timesheet/clock-in",
             headers=emp_auth,
-            json={"location": "123 Main St, Effingham"},
+            json={"location": "123 Main St, Effingham", **SITE_GPS},
         )
         assert ci.status_code == 200, ci.text
         entry_id = ci.json()["entry"]["id"]
@@ -102,7 +105,7 @@ class TestMyTimesheetHoursLiveCalc:
         ci = client.post(
             "/api/timesheet/clock-in",
             headers=emp_auth,
-            json={"location": "123 Main St, Effingham"},
+            json={"location": "123 Main St, Effingham", **SITE_GPS},
         )
         assert ci.status_code == 200, ci.text
         entry_id = ci.json()["entry"]["id"]
@@ -169,7 +172,7 @@ class TestAutoLinkPreservesManualLink:
         ci = client.post(
             "/api/timesheet/clock-in",
             headers=emp_auth,
-            json={"location": "123 Main St, Effingham"},
+            json={"location": "123 Main St, Effingham", **SITE_GPS},
         )
         assert ci.status_code == 200, ci.text
         shift_id = ci.json()["entry"]["id"]
@@ -177,7 +180,7 @@ class TestAutoLinkPreservesManualLink:
         co = client.post(
             "/api/timesheet/clock-out",
             headers=emp_auth,
-            json={"notes": "regression-autolink"},
+            json={"notes": "regression-autolink", **SITE_GPS},
         )
         assert co.status_code == 200, co.text
 

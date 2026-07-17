@@ -32,7 +32,11 @@ def test_employee_current_status_is_scoped_to_self(client, auth, emp_auth):
         admin_response = client.post(
             "/api/timesheet/clock-in",
             headers=auth,
-            json={"location": "123 Main St, Effingham"},
+            json={
+                "location": "123 Main St, Effingham",
+                "latitude": 39.1203,
+                "longitude": -88.54335,
+            },
         )
         assert admin_response.status_code == 200, admin_response.text
         admin_clocked_in = True
@@ -40,7 +44,11 @@ def test_employee_current_status_is_scoped_to_self(client, auth, emp_auth):
         employee_response = client.post(
             "/api/timesheet/clock-in",
             headers=emp_auth,
-            json={"location": "123 Main St, Effingham"},
+            json={
+                "location": "123 Main St, Effingham",
+                "latitude": 39.1203,
+                "longitude": -88.54335,
+            },
         )
         assert employee_response.status_code == 200, employee_response.text
         employee_clocked_in = True
@@ -58,9 +66,17 @@ def test_employee_current_status_is_scoped_to_self(client, auth, emp_auth):
         } == {"Juan Canfield", "Catalina Gomez"}
     finally:
         if employee_clocked_in:
-            client.post("/api/timesheet/clock-out", headers=emp_auth, json={"notes": "cleanup"})
+            client.post("/api/timesheet/clock-out", headers=emp_auth, json={
+                "notes": "cleanup",
+                "latitude": 39.1203,
+                "longitude": -88.54335,
+            })
         if admin_clocked_in:
-            client.post("/api/timesheet/clock-out", headers=auth, json={"notes": "cleanup"})
+            client.post("/api/timesheet/clock-out", headers=auth, json={
+                "notes": "cleanup",
+                "latitude": 39.1203,
+                "longitude": -88.54335,
+            })
 
 
 def test_public_registration_is_disabled(client):

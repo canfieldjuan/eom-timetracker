@@ -51,29 +51,187 @@ class TestTimesheetGpsFlow:
         assert "locationMatchRadiusM" in data
         assert data["locationMatchRadiusM"] > 0
 
-    def test_clock_in_accepts_gps(self, client, emp_auth):
+    def test_clock_in_accepts_gps(self, client, auth, emp_auth):
         r = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
             "location": "123 Main St, Effingham",
             "notes": "gps start",
             "latitude": 39.1201,
             "longitude": -88.5432,
+            "accuracy": 7.25,
         })
         assert r.status_code == 200, r.text
         entry = r.json()["entry"]
         assert entry["clockInGps"]["lat"] == pytest.approx(39.1201)
         assert entry["clockInGps"]["lng"] == pytest.approx(-88.5432)
+        assert entry["clockInGps"]["accuracy"] == pytest.approx(7.25)
+        assert entry["clockInGpsMeta"]["accuracyM"] == pytest.approx(7.25)
+        assert entry["clockInGpsMeta"]["withinRadius"] is True
+
+        status = client.get("/api/current-status", headers=auth)
+        assert status.status_code == 200, status.text
+        current = next(
+            row
+            for row in status.json()["currentlyWorking"]
+            if row["name"] == "Catalina Gomez"
+        )
+        assert current["clockInGps"]["accuracy"] == pytest.approx(7.25)
+        assert current["clockInGpsMeta"]["accuracyM"] == pytest.approx(7.25)
 
         r2 = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
             "notes": "cleanup",
             "latitude": 39.1205,
             "longitude": -88.5435,
+            "accuracy": 11.4,
         })
         assert r2.status_code == 200, r2.text
         assert r2.json()["entry"]["clockOutGps"]["lat"] == pytest.approx(39.1205)
+        assert r2.json()["entry"]["clockOutGps"]["accuracy"] == pytest.approx(11.4)
+
+    def test_server_requires_gps_or_explicit_override_for_every_time_action(
+        self,
+        client,
+        emp_auth,
+    ):
+        missing = client.post(
+            "/api/timesheet/clock-in",
+            headers=emp_auth,
+            json={"location": "123 Main St, Effingham"},
+        )
+        assert missing.status_code == 400, missing.text
+        assert "GPS location is required" in missing.json()["error"]
+
+        clock_in = client.post(
+            "/api/timesheet/clock-in",
+            headers=emp_auth,
+            json={
+                "location": "123 Main St, Effingham",
+                "gpsOverrideReason": "gps_signal",
+                "gpsOverrideDetail": "Indoor test fixture",
+            },
+        )
+        assert clock_in.status_code == 200, clock_in.text
+        assert clock_in.json()["entry"]["clockInGps"] is None
+        assert clock_in.json()["entry"]["clockInGpsMeta"]["override"] is True
+
+        for endpoint, payload in [
+            ("/api/timesheet/visit", {"location": "123 Main St, Effingham"}),
+            ("/api/timesheet/depart", {}),
+            ("/api/timesheet/clock-out", {}),
+        ]:
+            response = client.post(endpoint, headers=emp_auth, json=payload)
+            assert response.status_code == 400, (endpoint, response.text)
+            assert "GPS location is required" in response.json()["error"]
+
+        arrival = client.post(
+            "/api/timesheet/visit",
+            headers=emp_auth,
+            json={
+                "location": "123 Main St, Effingham",
+                "gpsOverrideReason": "gps_signal",
+            },
+        )
+        assert arrival.status_code == 200, arrival.text
+        assert arrival.json()["visit"]["gps"] is None
+        assert arrival.json()["visit"]["gpsMeta"]["override"] is True
+
+        departure = client.post(
+            "/api/timesheet/depart",
+            headers=emp_auth,
+            json={"gpsOverrideReason": "gps_signal"},
+        )
+        assert departure.status_code == 200, departure.text
+        assert departure.json()["departure"]["gps"] is None
+        assert departure.json()["departure"]["gpsMeta"]["override"] is True
+
+        clock_out = client.post(
+            "/api/timesheet/clock-out",
+            headers=emp_auth,
+            json={"gpsOverrideReason": "gps_signal", "notes": "cleanup"},
+        )
+        assert clock_out.status_code == 200, clock_out.text
+        assert clock_out.json()["entry"]["clockOutGps"] is None
+        assert clock_out.json()["entry"]["clockOutGpsMeta"]["override"] is True
+
+    def test_rejects_partial_or_invalid_coordinates(self, client, emp_auth):
+        partial = client.post(
+            "/api/timesheet/clock-in",
+            headers=emp_auth,
+            json={
+                "location": "123 Main St, Effingham",
+                "latitude": 39.1201,
+                "gpsOverrideReason": "gps_signal",
+            },
+        )
+        assert partial.status_code == 400, partial.text
+        assert partial.json()["error"] == "Latitude and longitude must be provided together."
+
+        invalid = client.post(
+            "/api/timesheet/clock-in",
+            headers=emp_auth,
+            json={
+                "location": "123 Main St, Effingham",
+                "latitude": 91,
+                "longitude": -88.5432,
+            },
+        )
+        assert invalid.status_code == 422, invalid.text
+
+    def test_outside_geofence_requires_logged_override(self, client, emp_auth):
+        outside = {
+            "location": "123 Main St, Effingham",
+            "latitude": 39.2201,
+            "longitude": -88.5432,
+            "accuracy": 9.5,
+        }
+        rejected = client.post(
+            "/api/timesheet/clock-in",
+            headers=emp_auth,
+            json=outside,
+        )
+        assert rejected.status_code == 400, rejected.text
+        assert "nearest saved site" in rejected.json()["error"]
+
+        accepted = client.post(
+            "/api/timesheet/clock-in",
+            headers=emp_auth,
+            json={**outside, "gpsOverrideReason": "parking_access"},
+        )
+        assert accepted.status_code == 200, accepted.text
+        meta = accepted.json()["entry"]["clockInGpsMeta"]
+        assert meta["override"] is True
+        assert meta["withinRadius"] is False
+        assert meta["distanceM"] > 50
+        assert meta["accuracyM"] == pytest.approx(9.5)
+
+        cleanup = client.post(
+            "/api/timesheet/clock-out",
+            headers=emp_auth,
+            json={"gpsOverrideReason": "parking_access", "notes": "cleanup"},
+        )
+        assert cleanup.status_code == 200, cleanup.text
+
+    def test_unpinned_sites_require_override(self):
+        import time_tracker_api as tta
+
+        error = tta.require_gps_override(
+            {"location_coords": {}},
+            39.1201,
+            -88.5432,
+        )
+        assert error is not None
+        assert "no saved site has a location pin" in error
+        assert tta.require_gps_override(
+            {"location_coords": {}},
+            39.1201,
+            -88.5432,
+            "gps_signal",
+        ) is None
 
     def test_depart_requires_active_arrival(self, client, emp_auth):
         ci = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
             "location": "123 Main St, Effingham",
+            "latitude": 39.1203,
+            "longitude": -88.54335,
         })
         assert ci.status_code == 200, ci.text
 
@@ -83,7 +241,11 @@ class TestTimesheetGpsFlow:
         })
         assert dep.status_code == 400, dep.text
 
-        co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={"notes": "cleanup"})
+        co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
+            "notes": "cleanup",
+            "latitude": 39.1203,
+            "longitude": -88.54335,
+        })
         assert co.status_code == 200, co.text
 
     def test_arrive_then_depart_updates_current_status(self, client, emp_auth):
