@@ -11,3 +11,13 @@ Duplicate groups require an explicit canonical shift. All other copies in that e
 Stale shifts require a verified clock-out time. The server rejects clock-outs before the original clock-in or in the future and recalculates total hours in the same transaction.
 
 Any selected-row change after preview invalidates the plan with HTTP 409. A failed validation, stale plan, archive failure, update failure, or delete failure rolls back the whole batch.
+
+## Stale-shift prevention contract
+
+An open shift older than `MAX_ACTIVE_SHIFT_HOURS` is unresolved payroll data, not a completed shift:
+
+- No employee or admin action silently invents a clock-out time for it.
+- It contributes zero calculated hours until an administrator supplies a verified clock-out through the correction workflow.
+- The employee status response identifies the unresolved shift, and the web app disables new time-entry actions with a **Needs review** message.
+- Clock-in, clock-out, arrival, and departure endpoints reject the unresolved state with HTTP 409 and `STALE_SHIFT_REQUIRES_REVIEW`.
+- Applying a verified correction removes the block and restores normal time-entry actions.

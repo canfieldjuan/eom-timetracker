@@ -264,14 +264,18 @@ def build_gps_meta(
     longitude: Optional[float],
     override_reason: str = "",
     override_detail: str = "",
+    accuracy: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     reason = str(override_reason or "").strip()
-    detail = str(override_detail or "").strip()
+    detail = str(override_detail or "").strip() if reason else ""
     nearest = None
+    accuracy_m = None
     if latitude is not None and longitude is not None:
         nearest = find_nearest_location_match(latitude, longitude, timesheet_data)
+        if accuracy is not None:
+            accuracy_m = round(float(accuracy), 2)
 
-    if not nearest and not reason and not detail:
+    if not nearest and not reason and not detail and accuracy_m is None:
         return None
 
     return {
@@ -281,7 +285,19 @@ def build_gps_meta(
         "matchedLocation": str(nearest["location"]) if nearest else "",
         "distanceM": round(float(nearest["distanceM"]), 2) if nearest else None,
         "withinRadius": bool(nearest["withinRadius"]) if nearest else None,
+        "accuracyM": accuracy_m,
     }
+
+
+def build_gps_point(
+    latitude: float,
+    longitude: float,
+    accuracy: Optional[float] = None,
+) -> Dict[str, float]:
+    point = {"lat": latitude, "lng": longitude}
+    if accuracy is not None:
+        point["accuracy"] = round(float(accuracy), 2)
+    return point
 
 
 def require_gps_override(
@@ -289,14 +305,31 @@ def require_gps_override(
     latitude: Optional[float],
     longitude: Optional[float],
     override_reason: str = "",
+    override_detail: str = "",
 ) -> Optional[str]:
-    if str(override_reason or "").strip():
+    has_latitude = latitude is not None
+    has_longitude = longitude is not None
+    if has_latitude != has_longitude:
+        return "Latitude and longitude must be provided together."
+
+    reason = str(override_reason or "").strip()
+    detail = str(override_detail or "").strip()
+    if detail and not reason:
+        return "GPS override details require an override reason."
+
+    if reason:
         return None
 
-    if latitude is None or longitude is None:
-        return None
+    if not has_latitude:
+        return "GPS location is required. Add an override reason to continue."
 
+    assert latitude is not None and longitude is not None
     nearest = find_nearest_location_match(latitude, longitude, timesheet_data)
+    if not nearest:
+        return (
+            "GPS location cannot be matched because no saved site has a location pin. "
+            "Add an override reason to continue."
+        )
     if nearest and not nearest["withinRadius"]:
         distance_m = round(float(nearest["distanceM"]))
         return (
@@ -996,26 +1029,73 @@ def is_stale_open_entry(entry: Dict[str, Any], reference_time: datetime) -> bool
     return elapsed_hours > MAX_ACTIVE_SHIFT_HOURS
 
 
-def close_stale_open_entries(timesheet_data: Dict[str, Any], reference_time: datetime) -> bool:
-    changed = False
-    marker = "[auto-closed stale shift]"
+def get_stale_open_entry(
+    entries: List[Dict[str, Any]],
+    employee_id: int,
+    reference_time: datetime,
+) -> Optional[Dict[str, Any]]:
+    stale_entries = [
+        entry
+        for entry in entries
+        if entry.get("employeeId") == employee_id
+        and is_stale_open_entry(entry, reference_time)
+    ]
+    if not stale_entries:
+        return None
 
-    for entry in timesheet_data.get("entries", []):
-        if not is_stale_open_entry(entry, reference_time):
-            continue
+    stale_entries.sort(
+        key=lambda item: (str(item.get("clockIn", "")), int(item.get("id", 0)))
+    )
+    return stale_entries[0]
 
+
+STALE_SHIFT_REVIEW_CODE = "STALE_SHIFT_REQUIRES_REVIEW"
+
+
+def stale_open_shift_summary(
+    entry: Dict[str, Any],
+    reference_time: datetime,
+) -> Optional[Dict[str, Any]]:
+    if not is_stale_open_entry(entry, reference_time):
+        return None
+
+    try:
         started_at = parse_utc_iso(str(entry.get("clockIn", "")))
-        closed_at = started_at + timedelta(hours=MAX_ACTIVE_SHIFT_HOURS)
-        entry["clockOut"] = to_utc_iso(closed_at)
-        entry["totalHours"] = round(MAX_ACTIVE_SHIFT_HOURS, 2)
+    except ValueError:
+        return None
 
-        notes = str(entry.get("notes", "")).strip()
-        if marker not in notes:
-            entry["notes"] = f"{notes} {marker}".strip()
+    return {
+        "shiftId": int(entry.get("id", 0)),
+        "clockIn": to_utc_iso(started_at),
+        "location": str(entry.get("location", "")),
+        "ageHours": round((reference_time - started_at).total_seconds() / 3600.0, 2),
+        "requiresAdminReview": True,
+    }
 
-        changed = True
 
-    return changed
+def stale_shift_review_failure(
+    entry: Dict[str, Any],
+    reference_time: datetime,
+) -> Dict[str, Any]:
+    summary = stale_open_shift_summary(entry, reference_time) or {
+        "shiftId": int(entry.get("id", 0)),
+        "requiresAdminReview": True,
+    }
+    shift_id = summary["shiftId"]
+    return {
+        "code": STALE_SHIFT_REVIEW_CODE,
+        "message": (
+            f"Shift {shift_id} is missing a verified clock-out. "
+            "Ask an administrator to review it before recording more time."
+        ),
+        "details": {"staleOpenShift": summary},
+    }
+
+
+def raise_timesheet_mutation_failure(result: Any) -> None:
+    if isinstance(result, dict) and result.get("code") == STALE_SHIFT_REVIEW_CODE:
+        raise HTTPException(status_code=409, detail=result)
+    raise HTTPException(status_code=400, detail=str(result))
 
 
 def update_timesheets(mutator) -> Tuple[bool, Any]:
@@ -1025,12 +1105,8 @@ def update_timesheets(mutator) -> Tuple[bool, Any]:
         pre_visit_counts = {e["id"]: len(e.get("visits", [])) for e in timesheet_data["entries"]}
         pre_departure_counts = {e["id"]: len(e.get("departures", [])) for e in timesheet_data["entries"]}
 
-        changed = False
-        if AUTO_CLOSE_STALE_SHIFTS:
-            changed = close_stale_open_entries(timesheet_data, utc_now())
-
         ok, payload = mutator(timesheet_data)
-        if ok or changed:
+        if ok:
             _save_timesheets_to_db(timesheet_data, pre_shift_ids, pre_visit_counts, pre_departure_counts)
         return ok, payload
 
@@ -1162,11 +1238,13 @@ def entry_hours(entry: Dict[str, Any], reference_time: datetime) -> float:
 
     clock_out_value = entry.get("clockOut")
     if clock_out_value is None:
+        if is_stale_open_entry(entry, reference_time):
+            return 0.0
         duration = reference_time - clock_in_time
         duration_hours = duration.total_seconds() / 3600
         if duration_hours < 0:
             return 0.0
-        return round(min(duration_hours, MAX_ACTIVE_SHIFT_HOURS), 2)
+        return round(duration_hours, 2)
 
     try:
         clock_out_time = parse_utc_iso(str(clock_out_value))
@@ -1240,6 +1318,8 @@ def build_dashboard_hours_data() -> Dict[str, Any]:
                     end_time = to_local(clock_out_time).strftime("%H:%M")
                 except ValueError:
                     end_time = "--:--"
+            elif is_stale_open_entry(entry, now):
+                end_time = "Needs review"
             else:
                 end_time = "--:--"
 
@@ -1278,8 +1358,10 @@ def _resolve_customer(location: str, location_customers: Dict[str, str]) -> str:
     return location_customers.get(location, "")
 
 
-def build_public_current_status() -> List[Dict[str, Any]]:
-    timesheet_data = load_timesheets()
+def build_public_current_status(
+    timesheet_data: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    timesheet_data = timesheet_data or load_timesheets()
     location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
     now = utc_now()
 
@@ -1308,17 +1390,25 @@ def build_public_current_status() -> List[Dict[str, Any]]:
         else:
             loc = str(entry.get("location", ""))
             customer = _resolve_customer(loc, location_customers)
-        # Best available GPS: active visit, latest departure, latest visit, then clock-in GPS
-        last_departure_gps = next((d for d in reversed(departures) if isinstance(d.get("gps"), dict)), None)
-        last_gps_visit = next((v for v in reversed(visits) if isinstance(v.get("gps"), dict)), None)
-        if active_visit and isinstance(active_visit.get("gps"), dict):
-            gps = active_visit["gps"]
-        elif last_departure_gps:
-            gps = last_departure_gps["gps"]
-        elif last_gps_visit:
-            gps = last_gps_visit["gps"]
+        # Surface the latest action's evidence even when it is override-only.
+        # Falling back only when GPS is absent can show stale coordinates and
+        # hide the exception that an administrator actually needs to review.
+        last_visit = visits[-1] if visits and isinstance(visits[-1], dict) else None
+        if active_visit:
+            evidence = active_visit
+        elif last_departure and isinstance(last_departure, dict):
+            evidence = last_departure
+        elif last_visit:
+            evidence = last_visit
+        else:
+            evidence = None
+
+        if evidence:
+            gps = evidence.get("gps") if isinstance(evidence.get("gps"), dict) else None
+            gps_meta = evidence.get("gpsMeta")
         else:
             gps = entry.get("clockInGps")
+            gps_meta = entry.get("clockInGpsMeta")
 
         visit_rows = []
         for v in visits:
@@ -1362,6 +1452,7 @@ def build_public_current_status() -> List[Dict[str, Any]]:
                 "location": loc,
                 "customer": customer,
                 "clockInGps": gps,
+                "clockInGpsMeta": gps_meta if isinstance(gps_meta, dict) else None,
                 "visits": visit_rows,
                 "departures": departure_rows,
                 "activeVisit": {
@@ -1575,24 +1666,27 @@ MAX_GPS_OVERRIDE_DETAIL_LEN = parse_int(os.getenv("MAX_GPS_OVERRIDE_DETAIL_LEN")
 class ClockInRequest(BaseModel):
     location: str = Field(default="", max_length=MAX_LOCATION_LEN)
     notes: str = Field(default="", max_length=MAX_NOTES_LEN)
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
 class ClockOutRequest(BaseModel):
     notes: str = Field(default="", max_length=MAX_NOTES_LEN)
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
 class DepartRequest(BaseModel):
     notes: str = Field(default="", max_length=MAX_NOTES_LEN)
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
@@ -1742,7 +1836,6 @@ APP_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 
 TOKEN_TTL_HOURS = parse_int(os.getenv("TOKEN_TTL_HOURS"), 12)
 MAX_ACTIVE_SHIFT_HOURS = float(os.getenv("MAX_ACTIVE_SHIFT_HOURS", "24"))
-AUTO_CLOSE_STALE_SHIFTS = parse_bool(os.getenv("AUTO_CLOSE_STALE_SHIFTS"), True)
 LOCATION_MATCH_RADIUS_M = parse_int(os.getenv("LOCATION_MATCH_RADIUS_M"), LOCATION_MATCH_RADIUS_DEFAULT_M)
 
 ACCESS_START_HOUR = parse_int(os.getenv("ACCESS_START_HOUR"), 8)
@@ -2361,10 +2454,19 @@ async def private_network_access_middleware(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
-    detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
+    if isinstance(exc.detail, dict):
+        detail = str(exc.detail.get("message") or exc.detail.get("error") or "Request failed")
+        content: Dict[str, Any] = {"success": False, "error": detail}
+        if exc.detail.get("code"):
+            content["code"] = exc.detail["code"]
+        if isinstance(exc.detail.get("details"), dict):
+            content["details"] = exc.detail["details"]
+    else:
+        detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
+        content = {"success": False, "error": detail}
     return JSONResponse(
         status_code=exc.status_code,
-        content={"success": False, "error": detail},
+        content=content,
         headers=exc.headers,
     )
 
@@ -3063,7 +3165,9 @@ def admin_list_employees(
                     CASE
                         WHEN s.clock_out IS NOT NULL
                             THEN GREATEST(0.0, EXTRACT(EPOCH FROM (s.clock_out - s.clock_in)) / 3600.0)
-                        ELSE GREATEST(0.0, LEAST(%s, EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0))
+                        WHEN EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0 > %s
+                            THEN 0.0
+                        ELSE GREATEST(0.0, EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0)
                     END
                 ) AS total_hours,
                 COUNT(*) AS total_shifts
@@ -3166,7 +3270,7 @@ def admin_employee_hours(
         if entry_date == today_str:
             today_hours += total
 
-        clock_out_display = "Active"
+        clock_out_display = "Needs review" if is_stale_open_entry(entry, now) else "Active"
         if entry.get("clockOut"):
             try:
                 clock_out_display = local_clock_string(parse_utc_iso(str(entry["clockOut"])))
@@ -3203,7 +3307,7 @@ def admin_employee_hours(
         if not (grid_sunday_utc <= ci_dt <= grid_saturday_utc):
             continue
         d_str = local_date_string(ci_dt)
-        co_disp = "Active"
+        co_disp = "Needs review" if is_stale_open_entry(entry, now) else "Active"
         if entry.get("clockOut"):
             try:
                 co_disp = local_clock_string(parse_utc_iso(str(entry["clockOut"])))
@@ -3287,8 +3391,13 @@ def clock_in(
     work_date = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         existing_open = get_open_entry(timesheet_data["entries"], employee["id"])
-        if existing_open and not is_stale_open_entry(existing_open, now_utc):
+        if existing_open:
             return False, "Already clocked in"
 
         override_error = require_gps_override(
@@ -3296,6 +3405,7 @@ def clock_in(
             payload.latitude,
             payload.longitude,
             payload.gpsOverrideReason,
+            payload.gpsOverrideDetail,
         )
         if override_error:
             return False, override_error
@@ -3329,13 +3439,17 @@ def clock_in(
             "visits": [],
         }
         if has_gps:
-            entry["clockInGps"] = {"lat": payload.latitude, "lng": payload.longitude}
+            assert payload.latitude is not None and payload.longitude is not None
+            entry["clockInGps"] = build_gps_point(
+                payload.latitude, payload.longitude, payload.accuracy
+            )
         entry["clockInGpsMeta"] = build_gps_meta(
             timesheet_data,
             payload.latitude,
             payload.longitude,
             payload.gpsOverrideReason,
             payload.gpsOverrideDetail,
+            payload.accuracy,
         )
         timesheet_data["entries"].append(entry)
         timesheet_data["nextId"] = entry_id + 1
@@ -3344,7 +3458,7 @@ def clock_in(
     ok, result = update_timesheets(mutator)
     if not ok:
         append_access_log(request, "CLOCK_IN_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
+        raise_timesheet_mutation_failure(result)
 
     loc = result.get("location", "")
     location_customers: Dict[str, str] = load_timesheets().get("location_customers", {})
@@ -3363,8 +3477,13 @@ def clock_out(
     now_utc = utc_now()
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
+        if not open_entry:
             return False, "Not currently clocked in"
 
         override_error = require_gps_override(
@@ -3372,6 +3491,7 @@ def clock_out(
             payload.latitude if payload else None,
             payload.longitude if payload else None,
             payload.gpsOverrideReason if payload else "",
+            payload.gpsOverrideDetail if payload else "",
         )
         if override_error:
             return False, override_error
@@ -3390,16 +3510,16 @@ def clock_out(
         if notes:
             open_entry["notes"] = notes
         if payload and payload.latitude is not None and payload.longitude is not None:
-            open_entry["clockOutGps"] = {
-                "lat": payload.latitude,
-                "lng": payload.longitude,
-            }
+            open_entry["clockOutGps"] = build_gps_point(
+                payload.latitude, payload.longitude, payload.accuracy
+            )
         open_entry["clockOutGpsMeta"] = build_gps_meta(
             timesheet_data,
             payload.latitude if payload else None,
             payload.longitude if payload else None,
             payload.gpsOverrideReason if payload else "",
             payload.gpsOverrideDetail if payload else "",
+            payload.accuracy if payload else None,
         )
 
         return True, open_entry
@@ -3407,7 +3527,7 @@ def clock_out(
     ok, result = update_timesheets(mutator)
     if not ok:
         append_access_log(request, "CLOCK_OUT_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
+        raise_timesheet_mutation_failure(result)
 
     append_access_log(
         request,
@@ -3429,8 +3549,13 @@ def log_visit(
     now_utc = utc_now()
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
+        if not open_entry:
             return False, "Not currently clocked in"
 
         override_error = require_gps_override(
@@ -3438,6 +3563,7 @@ def log_visit(
             payload.latitude,
             payload.longitude,
             payload.gpsOverrideReason,
+            payload.gpsOverrideDetail,
         )
         if override_error:
             return False, override_error
@@ -3460,13 +3586,16 @@ def log_visit(
             "arrivalTime": to_utc_iso(now_utc),
             "location": location,
             "customer": customer,
-            "gps": {"lat": payload.latitude, "lng": payload.longitude} if has_gps else None,
+            "gps": build_gps_point(
+                payload.latitude, payload.longitude, payload.accuracy
+            ) if has_gps else None,
             "gpsMeta": build_gps_meta(
                 timesheet_data,
                 payload.latitude,
                 payload.longitude,
                 payload.gpsOverrideReason,
                 payload.gpsOverrideDetail,
+                payload.accuracy,
             ),
         }
 
@@ -3480,7 +3609,7 @@ def log_visit(
     if not ok:
         if result == "already_at_location":
             return {"success": True, "alreadyHere": True}
-        raise HTTPException(status_code=400, detail=str(result))
+        raise_timesheet_mutation_failure(result)
 
     append_access_log(request, "VISIT_LOGGED", True,
                       f"Employee: {employee['name']} arrived at {result['visit']['location']}")
@@ -3510,8 +3639,13 @@ def depart_location(
     now_utc = utc_now()
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
+        if not open_entry:
             return False, "Not currently clocked in"
 
         override_error = require_gps_override(
@@ -3519,6 +3653,7 @@ def depart_location(
             payload.latitude if payload else None,
             payload.longitude if payload else None,
             payload.gpsOverrideReason if payload else "",
+            payload.gpsOverrideDetail if payload else "",
         )
         if override_error:
             return False, override_error
@@ -3538,13 +3673,13 @@ def depart_location(
                 payload.longitude if payload else None,
                 payload.gpsOverrideReason if payload else "",
                 payload.gpsOverrideDetail if payload else "",
+                payload.accuracy if payload else None,
             ),
         }
         if payload and payload.latitude is not None and payload.longitude is not None:
-            departure["gps"] = {
-                "lat": payload.latitude,
-                "lng": payload.longitude,
-            }
+            departure["gps"] = build_gps_point(
+                payload.latitude, payload.longitude, payload.accuracy
+            )
 
         if not isinstance(open_entry.get("departures"), list):
             open_entry["departures"] = []
@@ -3558,7 +3693,7 @@ def depart_location(
     ok, result = update_timesheets(mutator)
     if not ok:
         append_access_log(request, "DEPARTURE_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
+        raise_timesheet_mutation_failure(result)
 
     append_access_log(
         request,
@@ -3689,7 +3824,7 @@ def my_timesheet_hours(
         if clock_in_dt >= year_start:
             yearly_hours += total
 
-        clock_out_display = "Active"
+        clock_out_display = "Needs review" if is_stale_open_entry(entry, now) else "Active"
         if entry.get("clockOut"):
             try:
                 clock_out_display = local_clock_string(parse_utc_iso(str(entry["clockOut"])))
@@ -3740,6 +3875,7 @@ def admin_update_locations(
 
     locations = []
     location_coords: Dict[str, Dict[str, float]] = {}
+    location_pin_fields_present = set()
     location_customers: Dict[str, str] = {}
     location_rates: Dict[str, float] = {}
     location_rate_types: Dict[str, str] = {}
@@ -3752,6 +3888,8 @@ def admin_update_locations(
         if isinstance(item, dict) and item.get("name", "").strip():
             name = str(item["name"]).strip()
             locations.append(name)
+            if "lat" in item or "lng" in item:
+                location_pin_fields_present.add(name)
             if item.get("lat") is not None and item.get("lng") is not None:
                 try:
                     location_coords[name] = {"lat": float(item["lat"]), "lng": float(item["lng"])}
@@ -3789,6 +3927,21 @@ def admin_update_locations(
             locations.append(item.strip())
 
     def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
+        existing_coords = data.get("location_coords", {})
+        for name in locations:
+            if name in location_coords or name in location_pin_fields_present:
+                continue
+            existing = existing_coords.get(name) if isinstance(existing_coords, dict) else None
+            if not isinstance(existing, dict):
+                continue
+            try:
+                location_coords[name] = {
+                    "lat": float(existing["lat"]),
+                    "lng": float(existing["lng"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+
         data["locations"] = locations
         data["location_coords"] = location_coords
         data["location_customers"] = location_customers
@@ -3843,9 +3996,23 @@ def timesheet_current_status(
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
-    rows = build_public_current_status()
+    timesheet_data = load_timesheets()
+    now_utc = utc_now()
+    own_stale_open = get_stale_open_entry(
+        timesheet_data.get("entries", []), int(employee["id"]), now_utc
+    )
+    rows = build_public_current_status(timesheet_data)
     if employee.get("role") != "admin":
-        rows = [row for row in rows if int(row.get("id", 0)) == int(employee["id"])]
+        rows = (
+            []
+            if own_stale_open
+            else [row for row in rows if int(row.get("id", 0)) == int(employee["id"])]
+        )
+    stale_open_shift = (
+        stale_open_shift_summary(own_stale_open, now_utc)
+        if own_stale_open
+        else None
+    )
     response_rows = [
         {
             "employeeName": row["name"],
@@ -3864,7 +4031,11 @@ def timesheet_current_status(
         for row in rows
     ]
     append_access_log(request, "CURRENT_STATUS_SUCCESS", True, f"{len(response_rows)} employees working")
-    return {"success": True, "currentlyWorking": response_rows}
+    return {
+        "success": True,
+        "currentlyWorking": response_rows,
+        "staleOpenShift": stale_open_shift,
+    }
 
 
 @app.get("/api/hours")
