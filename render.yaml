@@ -36,6 +36,12 @@ services:
         sync: false
       - key: ALLOW_PUBLIC_REGISTRATION
         value: "false"
+      - key: ATLAS_RECEIVABLES_BASE_URL
+        sync: false
+      - key: ATLAS_RECEIVABLES_SERVICE_TOKEN
+        sync: false
+      - key: ATLAS_RECEIVABLES_TIMEOUT_SECONDS
+        value: "10"
     disk:
       name: eom-data
       mountPath: /opt/render/project/data

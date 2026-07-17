@@ -46,8 +46,9 @@ def _apply_schema(conn):
     """Drop and recreate all tables from schema.sql."""
     with conn.cursor() as cur:
         cur.execute("""
-            DROP TABLE IF EXISTS time_data_correction_batches, schedules, departures,
-                visits, shifts, jobs, locations, employees, settings CASCADE
+            DROP TABLE IF EXISTS receivables_operation_attempts,
+                time_data_correction_batches, schedules, departures, visits,
+                shifts, jobs, locations, employees, settings CASCADE
         """)
     conn.commit()
     sql = SCHEMA_FILE.read_text()
@@ -84,6 +85,16 @@ def _seed(conn):
             """,
         )
     conn.commit()
+
+
+@pytest.fixture(autouse=True)
+def clear_receivables_operation_attempts(setup_db):
+    """Keep operation replay records isolated between API test cases."""
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM receivables_operation_attempts")
+    conn.commit()
+    conn.close()
 
 
 # -- session-scoped fixtures ----------------------------------------------------

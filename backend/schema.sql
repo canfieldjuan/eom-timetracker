@@ -132,6 +132,29 @@ CREATE TABLE time_data_correction_batches (
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Durable business-scoped operation identity for Atlas money writes. The row
+-- survives browser/tab/admin changes and is resolved only after Atlas confirms
+-- the result, so an ambiguous retry cannot mint a second receipt. Payment
+-- identities intentionally reserve an exact customer/method/reference tuple.
+-- A confirmed void retires that generation: the exact retired request remains
+-- blocked as stale, while one corrected request with a fresh key may become the
+-- next active generation.
+CREATE TABLE receivables_operation_attempts (
+    attempt_id          BIGSERIAL PRIMARY KEY,
+    operation_identity  VARCHAR(64) NOT NULL,
+    request_fingerprint VARCHAR(64) NOT NULL,
+    operation           VARCHAR(96) NOT NULL,
+    idempotency_key     VARCHAR(128) NOT NULL UNIQUE,
+    state               VARCHAR(16) NOT NULL DEFAULT 'pending'
+                            CHECK (state IN ('pending', 'resolved', 'voided')),
+    response_body       JSONB,
+    created_by          VARCHAR(128) NOT NULL,
+    last_attempt_by     VARCHAR(128) NOT NULL,
+    last_error          TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Seed default settings
 INSERT INTO settings (key, value) VALUES ('laborPctTarget', '35.0');
 
@@ -157,3 +180,8 @@ CREATE INDEX idx_locations_active    ON locations(active);
 CREATE INDEX idx_employees_active    ON employees(active);
 CREATE INDEX idx_time_data_correction_batches_created
     ON time_data_correction_batches(created_at);
+CREATE INDEX idx_receivables_operation_attempts_state
+    ON receivables_operation_attempts(state, updated_at);
+CREATE UNIQUE INDEX uq_receivables_operation_attempts_active_identity
+    ON receivables_operation_attempts(operation_identity)
+    WHERE state IN ('pending', 'resolved');
