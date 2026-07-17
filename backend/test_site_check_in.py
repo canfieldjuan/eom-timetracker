@@ -22,6 +22,7 @@ def isolate_site_check_in_data(setup_db):
         conn = _raw_conn()
         with conn.cursor() as cur:
             cur.execute("DELETE FROM site_check_ins")
+            cur.execute("DELETE FROM site_check_in_schedule_rules")
             cur.execute("DELETE FROM site_check_in_schedules")
             cur.execute(
                 """
@@ -69,6 +70,35 @@ def create_arrival_schedule(
     )
     assert response.status_code == 200, response.text
     return response.json()["schedule"]
+
+
+def create_recurring_schedule_rule(
+    client,
+    auth,
+    employee_id,
+    location_id,
+    *,
+    weekdays,
+    local_start="07:00",
+    starts_on="2026-07-20",
+    ends_on=None,
+    grace_minutes=10,
+):
+    response = client.post(
+        "/api/admin/site-check-in-schedule-rules",
+        headers=auth,
+        json={
+            "employeeId": employee_id,
+            "siteId": location_id,
+            "weekdays": weekdays,
+            "localStart": local_start,
+            "startsOn": starts_on,
+            "endsOn": ends_on,
+            "graceMinutes": grace_minutes,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["rule"]
 
 
 @pytest.fixture
@@ -411,6 +441,228 @@ class TestSiteCheckInDecision:
         assert second.json()["duplicate"] is True
 
 
+class TestRecurringSiteCheckInSchedules:
+    def test_weekday_rule_computes_chicago_occurrence_and_classifies_on_time(
+        self,
+        client,
+        auth,
+        emp_auth,
+        employee_id,
+        location_id,
+        site_qr_token,
+        monkeypatch,
+    ):
+        rule = create_recurring_schedule_rule(
+            client,
+            auth,
+            employee_id,
+            location_id,
+            weekdays=[0, 1, 2, 3, 4],
+        )
+        official_time = datetime(2026, 7, 20, 12, 5, tzinfo=timezone.utc)
+        import time_tracker_api
+
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
+        response = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id,
+                location_id,
+                site_qr_token,
+                scanned_at=official_time,
+            ),
+        )
+        assert response.status_code == 200, response.text
+        check_in = response.json()["checkIn"]
+        assert check_in["classification"] == "on_time"
+        assert check_in["scheduleId"] is None
+        assert check_in["scheduleRuleId"] == rule["id"]
+        assert check_in["scheduledStart"] == "2026-07-20T12:00:00Z"
+
+    def test_rule_respects_grace_weekdays_and_exact_schedule_override(
+        self,
+        client,
+        auth,
+        emp_auth,
+        employee_id,
+        location_id,
+        site_qr_token,
+        monkeypatch,
+    ):
+        create_recurring_schedule_rule(
+            client,
+            auth,
+            employee_id,
+            location_id,
+            weekdays=[0],
+            grace_minutes=10,
+        )
+        import time_tracker_api
+
+        late_time = datetime(2026, 7, 20, 12, 11, tzinfo=timezone.utc)
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: late_time)
+        late = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id, location_id, site_qr_token, scanned_at=late_time
+            ),
+        )
+        assert late.status_code == 200, late.text
+        assert late.json()["checkIn"]["classification"] == "late"
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM site_check_ins")
+        conn.commit()
+        conn.close()
+
+        exact = create_arrival_schedule(
+            client,
+            auth,
+            employee_id,
+            location_id,
+            datetime(2026, 7, 20, 12, 30, tzinfo=timezone.utc),
+            grace_minutes=10,
+        )
+        override_time = datetime(2026, 7, 20, 12, 20, tzinfo=timezone.utc)
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: override_time)
+        overridden = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id, location_id, site_qr_token, scanned_at=override_time
+            ),
+        )
+        assert overridden.status_code == 200, overridden.text
+        check_in = overridden.json()["checkIn"]
+        assert check_in["classification"] == "on_time"
+        assert check_in["scheduleId"] == exact["id"]
+        assert check_in["scheduleRuleId"] is None
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM site_check_ins")
+            cur.execute("DELETE FROM site_check_in_schedules")
+        conn.commit()
+        conn.close()
+
+        off_day = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: off_day)
+        missing = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id, location_id, site_qr_token, scanned_at=off_day
+            ),
+        )
+        assert missing.status_code == 200, missing.text
+        assert missing.json()["checkIn"]["classificationReason"] == "no_matching_schedule"
+
+    def test_rule_admin_crud_is_validated_idempotent_and_soft_deleted(
+        self, client, auth, emp_auth, employee_id, location_id
+    ):
+        payload = {
+            "employeeId": employee_id,
+            "siteId": location_id,
+            "weekdays": [0, 1, 2, 3, 4],
+            "localStart": "07:00",
+            "startsOn": "2026-07-20",
+            "endsOn": None,
+            "graceMinutes": 10,
+        }
+        forbidden = client.post(
+            "/api/admin/site-check-in-schedule-rules",
+            headers=emp_auth,
+            json=payload,
+        )
+        assert forbidden.status_code == 403
+
+        duplicate_days = client.post(
+            "/api/admin/site-check-in-schedule-rules",
+            headers=auth,
+            json={**payload, "weekdays": [0, 0]},
+        )
+        assert duplicate_days.status_code == 422
+        backwards = client.post(
+            "/api/admin/site-check-in-schedule-rules",
+            headers=auth,
+            json={**payload, "endsOn": "2026-07-19"},
+        )
+        assert backwards.status_code == 400
+
+        first = client.post(
+            "/api/admin/site-check-in-schedule-rules", headers=auth, json=payload
+        )
+        assert first.status_code == 200, first.text
+        rule = first.json()["rule"]
+        assert rule["weekdays"] == [0, 1, 2, 3, 4]
+        assert rule["localStart"] == "07:00"
+        assert rule["timezone"] == "America/Chicago"
+        assert rule["endsOn"] is None
+
+        updated = client.post(
+            "/api/admin/site-check-in-schedule-rules",
+            headers=auth,
+            json={**payload, "graceMinutes": 15},
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["rule"]["id"] == rule["id"]
+        assert updated.json()["rule"]["graceMinutes"] == 15
+
+        active = client.get(
+            "/api/admin/site-check-in-schedule-rules", headers=auth
+        )
+        assert active.status_code == 200
+        assert [row["id"] for row in active.json()["rules"]] == [rule["id"]]
+
+        ended = client.delete(
+            f"/api/admin/site-check-in-schedule-rules/{rule['id']}", headers=auth
+        )
+        assert ended.status_code == 200
+        active_after = client.get(
+            "/api/admin/site-check-in-schedule-rules", headers=auth
+        )
+        assert active_after.json()["rules"] == []
+        history = client.get(
+            "/api/admin/site-check-in-schedule-rules?activeOnly=false", headers=auth
+        )
+        assert history.status_code == 200
+        assert history.json()["rules"][0]["active"] is False
+
+    def test_rule_api_distinguishes_open_end_from_literal_max_date(
+        self, client, auth, employee_id, location_id
+    ):
+        open_ended = create_recurring_schedule_rule(
+            client,
+            auth,
+            employee_id,
+            location_id,
+            weekdays=[0],
+            ends_on=None,
+        )
+        max_dated = create_recurring_schedule_rule(
+            client,
+            auth,
+            employee_id,
+            location_id,
+            weekdays=[1],
+            ends_on="9999-12-31",
+        )
+
+        assert open_ended["endsOn"] is None
+        assert max_dated["endsOn"] == "9999-12-31"
+
+        listed = client.get(
+            "/api/admin/site-check-in-schedule-rules", headers=auth
+        )
+        assert listed.status_code == 200
+        rules_by_id = {row["id"]: row for row in listed.json()["rules"]}
+        assert rules_by_id[open_ended["id"]]["endsOn"] is None
+        assert rules_by_id[max_dated["id"]]["endsOn"] == "9999-12-31"
+
+
 class TestSiteCheckInAdminReview:
     def test_schedule_list_delete_and_review_queue(
         self, client, auth, emp_auth, employee_id, location_id, site_qr_token
@@ -477,6 +729,7 @@ class TestSiteCheckInAdminReview:
             "geofenceRadiusM": 50,
             "maxAccuracyM": 100,
             "deviceClockSkewReviewSeconds": 600,
+            "scheduleTimezone": "America/Chicago",
             "offlineQueue": False,
         }
 
@@ -490,3 +743,6 @@ def test_frontend_contains_scan_then_tap_contract():
     assert "await getCurrentCoordinates()" in html
     assert "token: state.pendingSiteCheckIn.token" in html
     assert "scannedAt: state.pendingSiteCheckIn.scannedAt" in html
+    assert "saveRecurringSiteCheckInSchedule" in html
+    assert "'/admin/site-check-in-schedule-rules'" in html
+    assert "siteCheckInWeekday" in html

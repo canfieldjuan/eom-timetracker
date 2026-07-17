@@ -22,7 +22,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
@@ -1816,6 +1816,37 @@ class SiteCheckInScheduleRequest(BaseModel):
         return value.astimezone(timezone.utc)
 
 
+class SiteCheckInScheduleRuleRequest(BaseModel):
+    employeeId: int = Field(gt=0)
+    siteId: int = Field(gt=0)
+    weekdays: List[int] = Field(min_length=1, max_length=7)
+    localStart: clock_time
+    startsOn: date
+    endsOn: Optional[date] = None
+    graceMinutes: int = Field(default=10, ge=0, le=120)
+
+    @field_validator("weekdays")
+    @classmethod
+    def weekdays_must_be_unique_business_days(cls, value: List[int]) -> List[int]:
+        normalized = sorted(set(value))
+        if len(normalized) != len(value) or any(
+            day < 0 or day > 6 for day in normalized
+        ):
+            raise ValueError(
+                "weekdays must contain unique values from 0 (Monday) to 6 (Sunday)"
+            )
+        return normalized
+
+    @field_validator("localStart")
+    @classmethod
+    def local_start_must_use_minute_precision(cls, value: clock_time) -> clock_time:
+        if value.tzinfo is not None:
+            raise ValueError("localStart must not include a timezone")
+        if value.second or value.microsecond:
+            raise ValueError("localStart must use HH:MM precision")
+        return value
+
+
 class SiteCheckInReviewRequest(BaseModel):
     decision: str = Field(pattern="^(approved|rejected)$")
     note: str = Field(min_length=3, max_length=500)
@@ -2780,6 +2811,33 @@ def _ensure_schema_migrations() -> None:
         )
     """)
     db.execute("""
+        CREATE TABLE IF NOT EXISTS site_check_in_schedule_rules (
+            id               BIGSERIAL PRIMARY KEY,
+            employee_id      INTEGER NOT NULL REFERENCES employees(id),
+            location_id      INTEGER NOT NULL REFERENCES locations(id),
+            weekdays         SMALLINT[] NOT NULL,
+            local_start_time TIME NOT NULL,
+            timezone         TEXT NOT NULL,
+            starts_on        DATE NOT NULL,
+            ends_on          DATE NOT NULL DEFAULT 'infinity',
+            grace_minutes    INTEGER NOT NULL DEFAULT 10
+                                 CHECK (grace_minutes BETWEEN 0 AND 120),
+            active           BOOLEAN NOT NULL DEFAULT true,
+            created_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (
+                cardinality(weekdays) BETWEEN 1 AND 7
+                AND weekdays <@ ARRAY[0, 1, 2, 3, 4, 5, 6]::SMALLINT[]
+            ),
+            CHECK (ends_on >= starts_on),
+            UNIQUE (
+                employee_id, location_id, weekdays, local_start_time,
+                timezone, starts_on, ends_on
+            )
+        )
+    """)
+    db.execute("""
         CREATE TABLE IF NOT EXISTS site_check_ins (
             id                        BIGSERIAL PRIMARY KEY,
             employee_id               INTEGER NOT NULL REFERENCES employees(id),
@@ -2798,6 +2856,7 @@ def _ensure_schema_migrations() -> None:
                                           CHECK (classification IN ('on_time', 'late', 'needs_review')),
             classification_reason     VARCHAR(64) NOT NULL,
             schedule_id               BIGINT REFERENCES site_check_in_schedules(id) ON DELETE SET NULL,
+            schedule_rule_id          BIGINT REFERENCES site_check_in_schedule_rules(id) ON DELETE SET NULL,
             scheduled_start           TIMESTAMPTZ,
             grace_minutes             INTEGER,
             device_clock_skew_seconds NUMERIC(12, 2) NOT NULL,
@@ -2812,8 +2871,19 @@ def _ensure_schema_migrations() -> None:
         )
     """)
     db.execute("""
+        ALTER TABLE site_check_ins
+        ADD COLUMN IF NOT EXISTS schedule_rule_id
+            BIGINT REFERENCES site_check_in_schedule_rules(id) ON DELETE SET NULL
+    """)
+    db.execute("""
         CREATE INDEX IF NOT EXISTS idx_site_check_in_schedules_lookup
         ON site_check_in_schedules(employee_id, location_id, scheduled_start)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_site_check_in_schedule_rules_lookup
+        ON site_check_in_schedule_rules(
+            employee_id, location_id, active, starts_on, ends_on
+        )
     """)
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_site_check_ins_employee_time
@@ -3026,6 +3096,43 @@ def _serialize_site_check_in_schedule(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _site_check_in_schedule_rule_row(rule_id: int) -> Optional[Dict[str, Any]]:
+    return db.query_one(
+        """
+        SELECT sr.id, sr.employee_id, e.name AS employee_name,
+               sr.location_id, l.address AS site_name, sr.weekdays,
+               sr.local_start_time, sr.timezone, sr.starts_on,
+               NULLIF(sr.ends_on, 'infinity'::date) AS ends_on,
+               sr.grace_minutes, sr.active, sr.created_at, sr.updated_at
+        FROM site_check_in_schedule_rules sr
+        JOIN employees e ON e.id = sr.employee_id
+        JOIN locations l ON l.id = sr.location_id
+        WHERE sr.id = %s
+        """,
+        (rule_id,),
+    )
+
+
+def _serialize_site_check_in_schedule_rule(row: Dict[str, Any]) -> Dict[str, Any]:
+    ends_on = row.get("ends_on")
+    return {
+        "id": int(row["id"]),
+        "employeeId": int(row["employee_id"]),
+        "employeeName": str(row.get("employee_name") or ""),
+        "siteId": int(row["location_id"]),
+        "siteName": str(row.get("site_name") or ""),
+        "weekdays": [int(day) for day in row["weekdays"]],
+        "localStart": row["local_start_time"].strftime("%H:%M"),
+        "timezone": str(row["timezone"]),
+        "startsOn": row["starts_on"].isoformat(),
+        "endsOn": ends_on.isoformat() if ends_on is not None else None,
+        "graceMinutes": int(row["grace_minutes"]),
+        "active": bool(row["active"]),
+        "createdAt": to_utc_iso(row["created_at"]),
+        "updatedAt": to_utc_iso(row["updated_at"]),
+    }
+
+
 def _site_check_in_row(check_in_id: int) -> Optional[Dict[str, Any]]:
     return db.query_one(
         """
@@ -3062,6 +3169,7 @@ def _serialize_site_check_in(row: Dict[str, Any]) -> Dict[str, Any]:
         "classification": str(row["classification"]),
         "classificationReason": str(row["classification_reason"]),
         "scheduleId": int(row["schedule_id"]) if row.get("schedule_id") else None,
+        "scheduleRuleId": int(row["schedule_rule_id"]) if row.get("schedule_rule_id") else None,
         "scheduledStart": to_utc_iso(scheduled_start) if scheduled_start else None,
         "graceMinutes": int(row["grace_minutes"]) if row.get("grace_minutes") is not None else None,
         "deviceClockSkewSeconds": float(row["device_clock_skew_seconds"]),
@@ -3077,7 +3185,7 @@ def _matching_site_check_in_schedule(
     site_id: int,
     checked_in_at: datetime,
 ) -> Optional[Dict[str, Any]]:
-    return db.query_one(
+    exact_schedule = db.query_one(
         """
         SELECT id, scheduled_start, grace_minutes
         FROM site_check_in_schedules
@@ -3099,6 +3207,66 @@ def _matching_site_check_in_schedule(
             checked_in_at,
         ),
     )
+    if exact_schedule:
+        exact_schedule["schedule_rule_id"] = None
+        return exact_schedule
+
+    rules = db.query_all(
+        """
+        SELECT id, weekdays, local_start_time, timezone, starts_on, ends_on,
+               grace_minutes
+        FROM site_check_in_schedule_rules
+        WHERE employee_id = %s
+          AND location_id = %s
+          AND active = true
+        ORDER BY id
+        """,
+        (employee_id, site_id),
+    )
+    candidates: List[Tuple[float, int, datetime, int]] = []
+    for rule in rules:
+        try:
+            rule_zone = ZoneInfo(str(rule["timezone"]))
+        except (KeyError, ValueError):
+            logger.warning(
+                "Ignoring site check-in rule %s with invalid timezone",
+                rule.get("id"),
+            )
+            continue
+        local_date = checked_in_at.astimezone(rule_zone).date()
+        weekdays = {int(day) for day in rule["weekdays"]}
+        for day_offset in (-1, 0, 1):
+            candidate_date = local_date + timedelta(days=day_offset)
+            if candidate_date.weekday() not in weekdays:
+                continue
+            if candidate_date < rule["starts_on"] or candidate_date > rule["ends_on"]:
+                continue
+            local_start = datetime.combine(
+                candidate_date,
+                rule["local_start_time"],
+                tzinfo=rule_zone,
+            )
+            scheduled_start = local_start.astimezone(timezone.utc)
+            distance_seconds = abs((scheduled_start - checked_in_at).total_seconds())
+            if distance_seconds <= SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS * 3600:
+                candidates.append(
+                    (
+                        distance_seconds,
+                        int(rule["id"]),
+                        scheduled_start,
+                        int(rule["grace_minutes"]),
+                    )
+                )
+
+    if not candidates:
+        return None
+    _, rule_id, scheduled_start, grace_minutes = min(candidates)
+    return {
+        "id": None,
+        "schedule_rule_id": rule_id,
+        "scheduled_start": scheduled_start,
+        "grace_minutes": grace_minutes,
+    }
 
 
 def _classify_site_check_in(
@@ -3531,12 +3699,12 @@ def record_site_check_in(
                     device_scanned_at, latitude, longitude, accuracy_m,
                     geofence_radius_m, distance_m, geofence_status,
                     classification, classification_reason, schedule_id,
-                    scheduled_start, grace_minutes, device_clock_skew_seconds,
+                    schedule_rule_id, scheduled_start, grace_minutes, device_clock_skew_seconds,
                     review_status
                 )
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (employee_id, location_id, device_scanned_at)
                 DO NOTHING
@@ -3555,7 +3723,8 @@ def record_site_check_in(
                     geofence["status"],
                     classification,
                     reason,
-                    schedule["id"] if schedule else None,
+                    schedule.get("id") if schedule else None,
+                    schedule.get("schedule_rule_id") if schedule else None,
                     schedule["scheduled_start"] if schedule else None,
                     schedule["grace_minutes"] if schedule else None,
                     device_clock_skew_seconds,
@@ -3691,6 +3860,135 @@ def admin_delete_site_check_in_schedule(
         f"Schedule {schedule_id} by {admin['name']}",
     )
     return {"success": True, "scheduleId": schedule_id}
+
+
+@app.post("/api/admin/site-check-in-schedule-rules")
+def admin_create_site_check_in_schedule_rule(
+    payload: SiteCheckInScheduleRuleRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    if payload.endsOn is not None and payload.endsOn < payload.startsOn:
+        raise HTTPException(status_code=400, detail="endsOn must be on or after startsOn")
+    try:
+        ZoneInfo(TIMEZONE_NAME)
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(f"Configured timezone is invalid: {TIMEZONE_NAME}") from exc
+
+    target_employee = db.query_one(
+        "SELECT id FROM employees WHERE id = %s AND active = true",
+        (payload.employeeId,),
+    )
+    if not target_employee:
+        raise HTTPException(status_code=404, detail="Active employee not found")
+    site = db.query_one(
+        "SELECT id FROM locations WHERE id = %s AND active = true",
+        (payload.siteId,),
+    )
+    if not site:
+        raise HTTPException(status_code=404, detail="Active site not found")
+
+    inserted = db.query_one(
+        """
+        INSERT INTO site_check_in_schedule_rules (
+            employee_id, location_id, weekdays, local_start_time, timezone,
+            starts_on, ends_on, grace_minutes, active, created_by
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s,
+            COALESCE(%s, 'infinity'::date), %s, true, %s
+        )
+        ON CONFLICT (
+            employee_id, location_id, weekdays, local_start_time,
+            timezone, starts_on, ends_on
+        )
+        DO UPDATE SET grace_minutes = EXCLUDED.grace_minutes,
+                      active = true,
+                      created_by = EXCLUDED.created_by,
+                      updated_at = NOW()
+        RETURNING id
+        """,
+        (
+            payload.employeeId,
+            payload.siteId,
+            payload.weekdays,
+            payload.localStart,
+            TIMEZONE_NAME,
+            payload.startsOn,
+            payload.endsOn,
+            payload.graceMinutes,
+            int(admin["id"]),
+        ),
+    )
+    if not inserted:
+        raise RuntimeError("Recurring site check-in schedule was not saved")
+    row = _site_check_in_schedule_rule_row(int(inserted["id"]))
+    append_access_log(
+        request,
+        "SITE_CHECK_IN_SCHEDULE_RULE_SAVED",
+        True,
+        f"Schedule rule {inserted['id']} by {admin['name']}",
+    )
+    return {
+        "success": True,
+        "rule": _serialize_site_check_in_schedule_rule(row),
+    }
+
+
+@app.get("/api/admin/site-check-in-schedule-rules")
+def admin_list_site_check_in_schedule_rules(
+    request: Request,
+    active_only: bool = Query(default=True, alias="activeOnly"),
+    limit: int = Query(default=200, ge=1, le=500),
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    active_clause = "WHERE sr.active = true" if active_only else ""
+    rows = db.query_all(
+        f"""
+        SELECT sr.id, sr.employee_id, e.name AS employee_name,
+               sr.location_id, l.address AS site_name, sr.weekdays,
+               sr.local_start_time, sr.timezone, sr.starts_on,
+               NULLIF(sr.ends_on, 'infinity'::date) AS ends_on,
+               sr.grace_minutes, sr.active, sr.created_at, sr.updated_at
+        FROM site_check_in_schedule_rules sr
+        JOIN employees e ON e.id = sr.employee_id
+        JOIN locations l ON l.id = sr.location_id
+        {active_clause}
+        ORDER BY sr.active DESC, sr.starts_on DESC, sr.id DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    return {
+        "success": True,
+        "rules": [_serialize_site_check_in_schedule_rule(row) for row in rows],
+    }
+
+
+@app.delete("/api/admin/site-check-in-schedule-rules/{rule_id}")
+def admin_end_site_check_in_schedule_rule(
+    rule_id: int,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    ended = db.query_one(
+        """
+        UPDATE site_check_in_schedule_rules
+        SET active = false, updated_at = NOW()
+        WHERE id = %s AND active = true
+        RETURNING id
+        """,
+        (rule_id,),
+    )
+    if not ended:
+        raise HTTPException(status_code=404, detail="Active recurring schedule not found")
+    append_access_log(
+        request,
+        "SITE_CHECK_IN_SCHEDULE_RULE_ENDED",
+        True,
+        f"Schedule rule {rule_id} by {admin['name']}",
+    )
+    return {"success": True, "ruleId": rule_id}
 
 
 @app.get("/api/admin/site-check-ins")
@@ -4714,6 +5012,7 @@ def timesheet_locations(
             "geofenceRadiusM": SITE_CHECK_IN_RADIUS_M,
             "maxAccuracyM": SITE_CHECK_IN_MAX_ACCURACY_M,
             "deviceClockSkewReviewSeconds": SITE_CHECK_IN_DEVICE_SKEW_SECONDS,
+            "scheduleTimezone": TIMEZONE_NAME,
             "offlineQueue": False,
         },
     }

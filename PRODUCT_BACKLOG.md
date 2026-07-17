@@ -4,7 +4,9 @@ This file records approved future product slices. An item listed here is not yet
 
 ## QR Site Check-In
 
-Status: Implemented, pending deployment. See `QR_SITE_CHECKIN.md`.
+Status: Core QR check-in is deployed. Recurring weekly arrival rules are in the
+current implementation slice, pending review and deployment. See
+`QR_SITE_CHECKIN.md`.
 
 Add a **Check in** action for employees with this contract:
 
