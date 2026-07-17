@@ -29,6 +29,8 @@ CREATE TABLE locations (
     min_margin_pct    NUMERIC(5, 2),
     lat             NUMERIC(10, 7),
     lng             NUMERIC(10, 7),
+    check_in_token_nonce      VARCHAR(64),
+    check_in_token_rotated_at TIMESTAMPTZ,
     active        BOOLEAN NOT NULL DEFAULT true,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -114,6 +116,54 @@ CREATE TABLE schedules (
 CREATE INDEX idx_schedules_week ON schedules(week_start);
 CREATE INDEX idx_schedules_employee ON schedules(employee_id);
 
+-- Exact employee/site start times used only for QR arrival classification.
+-- The existing schedules table stores weekly hour totals and cannot determine
+-- whether a specific arrival is on time.
+CREATE TABLE site_check_in_schedules (
+    id              BIGSERIAL PRIMARY KEY,
+    employee_id     INTEGER NOT NULL REFERENCES employees(id),
+    location_id     INTEGER NOT NULL REFERENCES locations(id),
+    scheduled_start TIMESTAMPTZ NOT NULL,
+    grace_minutes   INTEGER NOT NULL DEFAULT 10
+                        CHECK (grace_minutes BETWEEN 0 AND 120),
+    created_by      INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (employee_id, location_id, scheduled_start)
+);
+
+-- Immutable evidence for each authenticated QR site check-in. Device time is
+-- retained as evidence; server_checked_in_at is the official timestamp.
+CREATE TABLE site_check_ins (
+    id                       BIGSERIAL PRIMARY KEY,
+    employee_id              INTEGER NOT NULL REFERENCES employees(id),
+    location_id              INTEGER NOT NULL REFERENCES locations(id),
+    server_checked_in_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    device_scanned_at        TIMESTAMPTZ NOT NULL,
+    latitude                 NUMERIC(10, 7) NOT NULL,
+    longitude                NUMERIC(10, 7) NOT NULL,
+    accuracy_m               NUMERIC(10, 2) NOT NULL,
+    geofence_radius_m        INTEGER NOT NULL,
+    distance_m               NUMERIC(10, 2),
+    geofence_status          VARCHAR(32) NOT NULL
+                                 CHECK (geofence_status IN
+                                    ('inside', 'outside', 'uncertain', 'low_accuracy', 'site_unpinned')),
+    classification           VARCHAR(24) NOT NULL
+                                 CHECK (classification IN ('on_time', 'late', 'needs_review')),
+    classification_reason    VARCHAR(64) NOT NULL,
+    schedule_id              BIGINT REFERENCES site_check_in_schedules(id) ON DELETE SET NULL,
+    scheduled_start          TIMESTAMPTZ,
+    grace_minutes            INTEGER,
+    device_clock_skew_seconds NUMERIC(12, 2) NOT NULL,
+    review_status            VARCHAR(24) NOT NULL
+                                 CHECK (review_status IN
+                                    ('not_required', 'pending', 'approved', 'rejected')),
+    reviewed_by              INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    reviewed_at              TIMESTAMPTZ,
+    review_note              TEXT NOT NULL DEFAULT '',
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (employee_id, location_id, device_scanned_at)
+);
+
 -- Settings (key-value)
 CREATE TABLE settings (
     key   TEXT PRIMARY KEY,
@@ -178,6 +228,12 @@ CREATE INDEX idx_shifts_time_cat     ON shifts(time_category);
 CREATE INDEX idx_shifts_clock_out    ON shifts(clock_out);
 CREATE INDEX idx_locations_active    ON locations(active);
 CREATE INDEX idx_employees_active    ON employees(active);
+CREATE INDEX idx_site_check_in_schedules_lookup
+    ON site_check_in_schedules(employee_id, location_id, scheduled_start);
+CREATE INDEX idx_site_check_ins_employee_time
+    ON site_check_ins(employee_id, server_checked_in_at DESC);
+CREATE INDEX idx_site_check_ins_review
+    ON site_check_ins(review_status, server_checked_in_at DESC);
 CREATE INDEX idx_time_data_correction_batches_created
     ON time_data_correction_batches(created_at);
 CREATE INDEX idx_receivables_operation_attempts_state

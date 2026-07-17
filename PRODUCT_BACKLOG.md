@@ -4,7 +4,7 @@ This file records approved future product slices. An item listed here is not yet
 
 ## QR Site Check-In
 
-Status: Later slice
+Status: Implemented, pending deployment. See `QR_SITE_CHECKIN.md`.
 
 Add a **Check in** action for employees with this contract:
 
@@ -17,4 +17,4 @@ Add a **Check in** action for employees with this contract:
 - Let the server validate that the site exists, evaluate the configured geofence using coordinates and reported accuracy, and classify the result as `on_time`, `late`, or `needs_review`.
 - Store enough evidence for an admin to review the decision: employee, site, server timestamp, device scan timestamp, coordinates, accuracy, geofence result, and classification reason.
 
-Before implementation, define the QR token format, geofence radius/accuracy policy, schedule source used for the on-time decision, offline behavior, and admin review workflow.
+The QR token format, geofence radius/accuracy policy, exact-arrival schedule source, offline behavior, and admin review workflow are defined in `QR_SITE_CHECKIN.md`.
