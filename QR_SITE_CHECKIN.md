@@ -52,11 +52,19 @@ codes stay canonical behind a reverse proxy.
 ## On-time source
 
 Weekly hour budgets in the existing `schedules` table cannot establish a start
-time. QR classification therefore uses `site_check_in_schedules`, which records
-an exact employee, site, scheduled start timestamp, and grace period. The
-closest record within 12 hours is used. A confident in-geofence check-in at or
-before scheduled start plus grace is `on_time`; a later one is `late`. No
-matching exact schedule is `needs_review`.
+time. QR classification therefore uses either:
+
+- `site_check_in_schedules` for an exact employee, site, timestamp, and grace
+  period; or
+- `site_check_in_schedule_rules` for durable weekday, local start time, date
+  range, company timezone, and grace-period rules.
+
+An exact record is an explicit override when one is within 12 hours. Otherwise,
+the server computes the closest weekly-rule occurrence within 12 hours in the
+rule's timezone. This keeps a 7:00 AM arrival at 7:00 AM across daylight-saving
+changes instead of freezing its UTC offset. A confident in-geofence check-in at
+or before scheduled start plus grace is `on_time`; a later one is `late`. No
+matching exact schedule or weekly rule is `needs_review`.
 
 The device scan timestamp is stored only as evidence. A difference greater than
 10 minutes from the server timestamp triggers `needs_review` and never changes
@@ -65,7 +73,9 @@ the official time.
 ## Admin review
 
 Admins can create or rotate printable site QR codes, create exact arrival
-schedules, list pending evidence, and approve or reject a `needs_review` record
-with a required note. The evidence keeps the employee, site, both timestamps,
-coordinates, accuracy, distance, geofence result, schedule snapshot,
-classification reason, and review decision.
+schedules, create or end recurring weekday rules, list pending evidence, and
+approve or reject a `needs_review` record with a required note. Ending a weekly
+rule is a soft deletion so prior evidence retains its source. The evidence keeps
+the employee, site, both timestamps, coordinates, accuracy, distance, geofence
+result, exact schedule or weekly-rule ID, schedule snapshot, classification
+reason, and review decision.

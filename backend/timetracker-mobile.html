@@ -83,6 +83,31 @@
             flex: 1 1 180px;
         }
 
+        .weekday-picker {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin: 6px 0 10px;
+        }
+
+        .weekday-option {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            width: auto;
+            margin: 0;
+            padding: 8px 10px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--text);
+            background: #f8faff;
+        }
+
+        .weekday-option input {
+            width: auto;
+            margin: 0;
+        }
+
         label {
             display: block;
             margin: 10px 0 6px;
@@ -437,6 +462,48 @@
             </div>
             <button id="saveSiteCheckInScheduleButton" type="button">Save Arrival Schedule</button>
             <div id="siteCheckInScheduleMessage" class="message"></div>
+
+            <h3 style="margin-top: 16px;">Repeat Weekly</h3>
+            <p class="meta">
+                Uses the employee and site selected above. Exact one-time arrivals override a weekly schedule.
+                Times use the company timezone.
+            </p>
+            <label>Arrival days</label>
+            <div class="weekday-picker" id="siteCheckInWeekdayPicker">
+                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="0" checked>Mon</label>
+                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="1" checked>Tue</label>
+                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="2" checked>Wed</label>
+                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="3" checked>Thu</label>
+                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="4" checked>Fri</label>
+                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="5">Sat</label>
+                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="6">Sun</label>
+            </div>
+            <div class="row">
+                <div>
+                    <label for="siteCheckInRecurringTime">Arrival time</label>
+                    <input id="siteCheckInRecurringTime" type="time" value="07:00" step="60">
+                </div>
+                <div>
+                    <label for="siteCheckInRecurringStart">Starts on</label>
+                    <input id="siteCheckInRecurringStart" type="date">
+                </div>
+                <div>
+                    <label for="siteCheckInRecurringEnd">Ends on (optional)</label>
+                    <input id="siteCheckInRecurringEnd" type="date">
+                </div>
+                <div>
+                    <label for="siteCheckInRecurringGraceMinutes">Grace minutes</label>
+                    <input id="siteCheckInRecurringGraceMinutes" type="number" min="0" max="120" value="10">
+                </div>
+            </div>
+            <div class="row">
+                <button id="saveRecurringSiteCheckInScheduleButton" type="button">Save Weekly Schedule</button>
+                <button id="refreshRecurringSiteCheckInSchedulesButton" type="button">Refresh Weekly Schedules</button>
+            </div>
+            <div id="recurringSiteCheckInScheduleMessage" class="message"></div>
+            <div id="recurringSiteCheckInScheduleList">
+                <p class="meta">No weekly schedules loaded.</p>
+            </div>
 
             <div class="row" style="margin-top: 16px;">
                 <h3>Needs Review</h3>
@@ -1434,6 +1501,106 @@
             }
         }
 
+        const SITE_CHECK_IN_WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+        function renderRecurringSiteCheckInSchedules(rules) {
+            const list = document.getElementById('recurringSiteCheckInScheduleList');
+            if (!rules.length) {
+                list.innerHTML = '<p class="meta">No active weekly schedules.</p>';
+                return;
+            }
+            list.innerHTML = rules.map((rule) => {
+                const dayLabels = rule.weekdays.map((day) => SITE_CHECK_IN_WEEKDAY_LABELS[day]).join(', ');
+                const dateRange = rule.endsOn
+                    ? `${rule.startsOn} through ${rule.endsOn}`
+                    : `${rule.startsOn} onward`;
+                return `
+                    <div class="correction-card">
+                        <strong>${escapeHtml(rule.employeeName)}</strong> at ${escapeHtml(rule.siteName)}
+                        <p class="meta">
+                            ${escapeHtml(dayLabels)} at ${escapeHtml(rule.localStart)}
+                            (${escapeHtml(rule.timezone)}) | ${escapeHtml(dateRange)} |
+                            ${escapeHtml(rule.graceMinutes)} minute grace
+                        </p>
+                        <button class="btn-danger" type="button" data-site-schedule-rule-id="${escapeHtml(rule.id)}">
+                            End Weekly Schedule
+                        </button>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function loadRecurringSiteCheckInSchedules() {
+            if (!hasAdminSession()) {
+                return;
+            }
+            const message = document.getElementById('recurringSiteCheckInScheduleMessage');
+            clearMessage(message);
+            try {
+                const payload = await apiRequest(
+                    '/admin/site-check-in-schedule-rules',
+                    'GET',
+                    null,
+                    true
+                );
+                renderRecurringSiteCheckInSchedules(Array.isArray(payload.rules) ? payload.rules : []);
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function saveRecurringSiteCheckInSchedule() {
+            const message = document.getElementById('recurringSiteCheckInScheduleMessage');
+            clearMessage(message);
+            try {
+                const employeeId = Number(document.getElementById('siteCheckInEmployeeSelect').value);
+                const siteId = Number(document.getElementById('siteCheckInScheduleSiteSelect').value);
+                const weekdays = Array.from(document.querySelectorAll('.siteCheckInWeekday:checked'))
+                    .map((checkbox) => Number(checkbox.value));
+                const localStart = document.getElementById('siteCheckInRecurringTime').value;
+                const startsOn = document.getElementById('siteCheckInRecurringStart').value;
+                const endsOn = document.getElementById('siteCheckInRecurringEnd').value || null;
+                const graceMinutes = Number(document.getElementById('siteCheckInRecurringGraceMinutes').value);
+                if (!employeeId || !siteId || !weekdays.length || !localStart || !startsOn) {
+                    throw new Error('Employee, site, at least one day, arrival time, and start date are required.');
+                }
+                if (endsOn && endsOn < startsOn) {
+                    throw new Error('End date must be on or after the start date.');
+                }
+                const payload = await apiRequest('/admin/site-check-in-schedule-rules', 'POST', {
+                    employeeId,
+                    siteId,
+                    weekdays,
+                    localStart,
+                    startsOn,
+                    endsOn,
+                    graceMinutes
+                }, true);
+                await loadRecurringSiteCheckInSchedules();
+                setMessage(
+                    message,
+                    'success',
+                    `Weekly arrival saved for ${payload.rule.employeeName} at ${payload.rule.siteName}.`
+                );
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function endRecurringSiteCheckInSchedule(ruleId) {
+            const message = document.getElementById('recurringSiteCheckInScheduleMessage');
+            if (!window.confirm('End this weekly arrival schedule? Existing check-in evidence will be kept.')) {
+                return;
+            }
+            try {
+                await apiRequest(`/admin/site-check-in-schedule-rules/${ruleId}`, 'DELETE', null, true);
+                await loadRecurringSiteCheckInSchedules();
+                setMessage(message, 'success', 'Weekly arrival schedule ended.');
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
         function renderSiteCheckInReviews(checkIns) {
             const list = document.getElementById('siteCheckInReviewList');
             if (!checkIns.length) {
@@ -1516,7 +1683,8 @@
             if (hasAdminSession()) {
                 await Promise.all([
                     loadAdminCheckInEmployees(),
-                    loadSiteCheckInReviews()
+                    loadSiteCheckInReviews(),
+                    loadRecurringSiteCheckInSchedules()
                 ]);
             }
         }
@@ -2129,6 +2297,7 @@
             document.getElementById('siteCheckInScheduledStart').value = toLocalDateTimeInput(
                 new Date(now.getTime() + 60 * 60 * 1000).toISOString()
             );
+            document.getElementById('siteCheckInRecurringStart').value = currentDateIso();
 
             try {
                 const storedToken = localStorage.getItem(STORAGE_TOKEN) || '';
@@ -2185,6 +2354,20 @@
         document.getElementById('loadSiteQrButton').addEventListener('click', () => loadOrRotateSiteQr(false));
         document.getElementById('rotateSiteQrButton').addEventListener('click', () => loadOrRotateSiteQr(true));
         document.getElementById('saveSiteCheckInScheduleButton').addEventListener('click', saveSiteCheckInSchedule);
+        document.getElementById('saveRecurringSiteCheckInScheduleButton').addEventListener(
+            'click',
+            saveRecurringSiteCheckInSchedule
+        );
+        document.getElementById('refreshRecurringSiteCheckInSchedulesButton').addEventListener(
+            'click',
+            loadRecurringSiteCheckInSchedules
+        );
+        document.getElementById('recurringSiteCheckInScheduleList').addEventListener('click', (event) => {
+            const button = event.target.closest('[data-site-schedule-rule-id]');
+            if (button) {
+                endRecurringSiteCheckInSchedule(Number(button.dataset.siteScheduleRuleId));
+            }
+        });
         document.getElementById('refreshSiteCheckInReviewsButton').addEventListener('click', loadSiteCheckInReviews);
         document.getElementById('siteCheckInReviewList').addEventListener('click', (event) => {
             const button = event.target.closest('[data-site-review-id]');

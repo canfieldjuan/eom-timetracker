@@ -48,7 +48,8 @@ def _apply_schema(conn):
         cur.execute("""
             DROP TABLE IF EXISTS receivables_operation_attempts,
                 time_data_correction_batches, site_check_ins,
-                site_check_in_schedules, schedules, departures, visits,
+                site_check_in_schedule_rules, site_check_in_schedules,
+                schedules, departures, visits,
                 shifts, jobs, locations, employees, settings CASCADE
         """)
     conn.commit()

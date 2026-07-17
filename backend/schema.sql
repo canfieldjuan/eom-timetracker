@@ -131,6 +131,35 @@ CREATE TABLE site_check_in_schedules (
     UNIQUE (employee_id, location_id, scheduled_start)
 );
 
+-- Durable weekly arrival rules. Python weekday numbering is used:
+-- Monday = 0 through Sunday = 6. Exact schedules above override a recurring
+-- rule when both could classify the same check-in.
+CREATE TABLE site_check_in_schedule_rules (
+    id               BIGSERIAL PRIMARY KEY,
+    employee_id      INTEGER NOT NULL REFERENCES employees(id),
+    location_id      INTEGER NOT NULL REFERENCES locations(id),
+    weekdays         SMALLINT[] NOT NULL,
+    local_start_time TIME NOT NULL,
+    timezone         TEXT NOT NULL,
+    starts_on        DATE NOT NULL,
+    ends_on          DATE NOT NULL DEFAULT 'infinity',
+    grace_minutes    INTEGER NOT NULL DEFAULT 10
+                         CHECK (grace_minutes BETWEEN 0 AND 120),
+    active           BOOLEAN NOT NULL DEFAULT true,
+    created_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (
+        cardinality(weekdays) BETWEEN 1 AND 7
+        AND weekdays <@ ARRAY[0, 1, 2, 3, 4, 5, 6]::SMALLINT[]
+    ),
+    CHECK (ends_on >= starts_on),
+    UNIQUE (
+        employee_id, location_id, weekdays, local_start_time,
+        timezone, starts_on, ends_on
+    )
+);
+
 -- Immutable evidence for each authenticated QR site check-in. Device time is
 -- retained as evidence; server_checked_in_at is the official timestamp.
 CREATE TABLE site_check_ins (
@@ -151,6 +180,7 @@ CREATE TABLE site_check_ins (
                                  CHECK (classification IN ('on_time', 'late', 'needs_review')),
     classification_reason    VARCHAR(64) NOT NULL,
     schedule_id              BIGINT REFERENCES site_check_in_schedules(id) ON DELETE SET NULL,
+    schedule_rule_id         BIGINT REFERENCES site_check_in_schedule_rules(id) ON DELETE SET NULL,
     scheduled_start          TIMESTAMPTZ,
     grace_minutes            INTEGER,
     device_clock_skew_seconds NUMERIC(12, 2) NOT NULL,
@@ -230,6 +260,8 @@ CREATE INDEX idx_locations_active    ON locations(active);
 CREATE INDEX idx_employees_active    ON employees(active);
 CREATE INDEX idx_site_check_in_schedules_lookup
     ON site_check_in_schedules(employee_id, location_id, scheduled_start);
+CREATE INDEX idx_site_check_in_schedule_rules_lookup
+    ON site_check_in_schedule_rules(employee_id, location_id, active, starts_on, ends_on);
 CREATE INDEX idx_site_check_ins_employee_time
     ON site_check_ins(employee_id, server_checked_in_at DESC);
 CREATE INDEX idx_site_check_ins_review
