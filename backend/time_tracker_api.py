@@ -259,14 +259,18 @@ def build_gps_meta(
     longitude: Optional[float],
     override_reason: str = "",
     override_detail: str = "",
+    accuracy: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     reason = str(override_reason or "").strip()
-    detail = str(override_detail or "").strip()
+    detail = str(override_detail or "").strip() if reason else ""
     nearest = None
+    accuracy_m = None
     if latitude is not None and longitude is not None:
         nearest = find_nearest_location_match(latitude, longitude, timesheet_data)
+        if accuracy is not None:
+            accuracy_m = round(float(accuracy), 2)
 
-    if not nearest and not reason and not detail:
+    if not nearest and not reason and not detail and accuracy_m is None:
         return None
 
     return {
@@ -276,7 +280,19 @@ def build_gps_meta(
         "matchedLocation": str(nearest["location"]) if nearest else "",
         "distanceM": round(float(nearest["distanceM"]), 2) if nearest else None,
         "withinRadius": bool(nearest["withinRadius"]) if nearest else None,
+        "accuracyM": accuracy_m,
     }
+
+
+def build_gps_point(
+    latitude: float,
+    longitude: float,
+    accuracy: Optional[float] = None,
+) -> Dict[str, float]:
+    point = {"lat": latitude, "lng": longitude}
+    if accuracy is not None:
+        point["accuracy"] = round(float(accuracy), 2)
+    return point
 
 
 def require_gps_override(
@@ -284,14 +300,31 @@ def require_gps_override(
     latitude: Optional[float],
     longitude: Optional[float],
     override_reason: str = "",
+    override_detail: str = "",
 ) -> Optional[str]:
-    if str(override_reason or "").strip():
+    has_latitude = latitude is not None
+    has_longitude = longitude is not None
+    if has_latitude != has_longitude:
+        return "Latitude and longitude must be provided together."
+
+    reason = str(override_reason or "").strip()
+    detail = str(override_detail or "").strip()
+    if detail and not reason:
+        return "GPS override details require an override reason."
+
+    if reason:
         return None
 
-    if latitude is None or longitude is None:
-        return None
+    if not has_latitude:
+        return "GPS location is required. Add an override reason to continue."
 
+    assert latitude is not None and longitude is not None
     nearest = find_nearest_location_match(latitude, longitude, timesheet_data)
+    if not nearest:
+        return (
+            "GPS location cannot be matched because no saved site has a location pin. "
+            "Add an override reason to continue."
+        )
     if nearest and not nearest["withinRadius"]:
         distance_m = round(float(nearest["distanceM"]))
         return (
@@ -1352,17 +1385,25 @@ def build_public_current_status(
         else:
             loc = str(entry.get("location", ""))
             customer = _resolve_customer(loc, location_customers)
-        # Best available GPS: active visit, latest departure, latest visit, then clock-in GPS
-        last_departure_gps = next((d for d in reversed(departures) if isinstance(d.get("gps"), dict)), None)
-        last_gps_visit = next((v for v in reversed(visits) if isinstance(v.get("gps"), dict)), None)
-        if active_visit and isinstance(active_visit.get("gps"), dict):
-            gps = active_visit["gps"]
-        elif last_departure_gps:
-            gps = last_departure_gps["gps"]
-        elif last_gps_visit:
-            gps = last_gps_visit["gps"]
+        # Surface the latest action's evidence even when it is override-only.
+        # Falling back only when GPS is absent can show stale coordinates and
+        # hide the exception that an administrator actually needs to review.
+        last_visit = visits[-1] if visits and isinstance(visits[-1], dict) else None
+        if active_visit:
+            evidence = active_visit
+        elif last_departure and isinstance(last_departure, dict):
+            evidence = last_departure
+        elif last_visit:
+            evidence = last_visit
+        else:
+            evidence = None
+
+        if evidence:
+            gps = evidence.get("gps") if isinstance(evidence.get("gps"), dict) else None
+            gps_meta = evidence.get("gpsMeta")
         else:
             gps = entry.get("clockInGps")
+            gps_meta = entry.get("clockInGpsMeta")
 
         visit_rows = []
         for v in visits:
@@ -1406,6 +1447,7 @@ def build_public_current_status(
                 "location": loc,
                 "customer": customer,
                 "clockInGps": gps,
+                "clockInGpsMeta": gps_meta if isinstance(gps_meta, dict) else None,
                 "visits": visit_rows,
                 "departures": departure_rows,
                 "activeVisit": {
@@ -1619,24 +1661,27 @@ MAX_GPS_OVERRIDE_DETAIL_LEN = parse_int(os.getenv("MAX_GPS_OVERRIDE_DETAIL_LEN")
 class ClockInRequest(BaseModel):
     location: str = Field(default="", max_length=MAX_LOCATION_LEN)
     notes: str = Field(default="", max_length=MAX_NOTES_LEN)
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
 class ClockOutRequest(BaseModel):
     notes: str = Field(default="", max_length=MAX_NOTES_LEN)
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
 class DepartRequest(BaseModel):
     notes: str = Field(default="", max_length=MAX_NOTES_LEN)
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
@@ -2480,6 +2525,7 @@ def clock_in(
             payload.latitude,
             payload.longitude,
             payload.gpsOverrideReason,
+            payload.gpsOverrideDetail,
         )
         if override_error:
             return False, override_error
@@ -2513,13 +2559,17 @@ def clock_in(
             "visits": [],
         }
         if has_gps:
-            entry["clockInGps"] = {"lat": payload.latitude, "lng": payload.longitude}
+            assert payload.latitude is not None and payload.longitude is not None
+            entry["clockInGps"] = build_gps_point(
+                payload.latitude, payload.longitude, payload.accuracy
+            )
         entry["clockInGpsMeta"] = build_gps_meta(
             timesheet_data,
             payload.latitude,
             payload.longitude,
             payload.gpsOverrideReason,
             payload.gpsOverrideDetail,
+            payload.accuracy,
         )
         timesheet_data["entries"].append(entry)
         timesheet_data["nextId"] = entry_id + 1
@@ -2561,6 +2611,7 @@ def clock_out(
             payload.latitude if payload else None,
             payload.longitude if payload else None,
             payload.gpsOverrideReason if payload else "",
+            payload.gpsOverrideDetail if payload else "",
         )
         if override_error:
             return False, override_error
@@ -2579,16 +2630,16 @@ def clock_out(
         if notes:
             open_entry["notes"] = notes
         if payload and payload.latitude is not None and payload.longitude is not None:
-            open_entry["clockOutGps"] = {
-                "lat": payload.latitude,
-                "lng": payload.longitude,
-            }
+            open_entry["clockOutGps"] = build_gps_point(
+                payload.latitude, payload.longitude, payload.accuracy
+            )
         open_entry["clockOutGpsMeta"] = build_gps_meta(
             timesheet_data,
             payload.latitude if payload else None,
             payload.longitude if payload else None,
             payload.gpsOverrideReason if payload else "",
             payload.gpsOverrideDetail if payload else "",
+            payload.accuracy if payload else None,
         )
 
         return True, open_entry
@@ -2632,6 +2683,7 @@ def log_visit(
             payload.latitude,
             payload.longitude,
             payload.gpsOverrideReason,
+            payload.gpsOverrideDetail,
         )
         if override_error:
             return False, override_error
@@ -2654,13 +2706,16 @@ def log_visit(
             "arrivalTime": to_utc_iso(now_utc),
             "location": location,
             "customer": customer,
-            "gps": {"lat": payload.latitude, "lng": payload.longitude} if has_gps else None,
+            "gps": build_gps_point(
+                payload.latitude, payload.longitude, payload.accuracy
+            ) if has_gps else None,
             "gpsMeta": build_gps_meta(
                 timesheet_data,
                 payload.latitude,
                 payload.longitude,
                 payload.gpsOverrideReason,
                 payload.gpsOverrideDetail,
+                payload.accuracy,
             ),
         }
 
@@ -2718,6 +2773,7 @@ def depart_location(
             payload.latitude if payload else None,
             payload.longitude if payload else None,
             payload.gpsOverrideReason if payload else "",
+            payload.gpsOverrideDetail if payload else "",
         )
         if override_error:
             return False, override_error
@@ -2737,13 +2793,13 @@ def depart_location(
                 payload.longitude if payload else None,
                 payload.gpsOverrideReason if payload else "",
                 payload.gpsOverrideDetail if payload else "",
+                payload.accuracy if payload else None,
             ),
         }
         if payload and payload.latitude is not None and payload.longitude is not None:
-            departure["gps"] = {
-                "lat": payload.latitude,
-                "lng": payload.longitude,
-            }
+            departure["gps"] = build_gps_point(
+                payload.latitude, payload.longitude, payload.accuracy
+            )
 
         if not isinstance(open_entry.get("departures"), list):
             open_entry["departures"] = []
@@ -2939,6 +2995,7 @@ def admin_update_locations(
 
     locations = []
     location_coords: Dict[str, Dict[str, float]] = {}
+    location_pin_fields_present = set()
     location_customers: Dict[str, str] = {}
     location_rates: Dict[str, float] = {}
     location_rate_types: Dict[str, str] = {}
@@ -2951,6 +3008,8 @@ def admin_update_locations(
         if isinstance(item, dict) and item.get("name", "").strip():
             name = str(item["name"]).strip()
             locations.append(name)
+            if "lat" in item or "lng" in item:
+                location_pin_fields_present.add(name)
             if item.get("lat") is not None and item.get("lng") is not None:
                 try:
                     location_coords[name] = {"lat": float(item["lat"]), "lng": float(item["lng"])}
@@ -2988,6 +3047,21 @@ def admin_update_locations(
             locations.append(item.strip())
 
     def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
+        existing_coords = data.get("location_coords", {})
+        for name in locations:
+            if name in location_coords or name in location_pin_fields_present:
+                continue
+            existing = existing_coords.get(name) if isinstance(existing_coords, dict) else None
+            if not isinstance(existing, dict):
+                continue
+            try:
+                location_coords[name] = {
+                    "lat": float(existing["lat"]),
+                    "lng": float(existing["lng"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+
         data["locations"] = locations
         data["location_coords"] = location_coords
         data["location_customers"] = location_customers

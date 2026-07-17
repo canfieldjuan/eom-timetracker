@@ -270,7 +270,11 @@ def test_verified_admin_correction_clears_stale_shift_block(
         clock_in_response = client.post(
             "/api/timesheet/clock-in",
             headers=emp_auth,
-            json={"location": "123 Main St, Effingham"},
+            json={
+                "location": "123 Main St, Effingham",
+                "latitude": 39.1203,
+                "longitude": -88.54335,
+            },
         )
         assert clock_in_response.status_code == 200, clock_in_response.text
         new_shift_id = clock_in_response.json()["entry"]["id"]
@@ -278,7 +282,11 @@ def test_verified_admin_correction_clears_stale_shift_block(
         clock_out_response = client.post(
             "/api/timesheet/clock-out",
             headers=emp_auth,
-            json={"notes": "cleanup after verified correction"},
+            json={
+                "notes": "cleanup after verified correction",
+                "latitude": 39.1203,
+                "longitude": -88.54335,
+            },
         )
         assert clock_out_response.status_code == 200, clock_out_response.text
     finally:

@@ -72,8 +72,14 @@ def _seed(conn):
         )
         cur.execute(
             """
-            INSERT INTO locations (address, customer_name, rate, rate_type, expected_hours)
-            VALUES ('123 Main St, Effingham', 'Test Customer', 150.00, 'per_visit', 3.0)
+            INSERT INTO locations (
+                address, customer_name, lat, lng,
+                rate, rate_type, expected_hours
+            )
+            VALUES (
+                '123 Main St, Effingham', 'Test Customer', 39.1203, -88.54335,
+                150.00, 'per_visit', 3.0
+            )
             ON CONFLICT (address) DO NOTHING
             """,
         )
@@ -155,12 +161,16 @@ def completed_shift_id(client, emp_auth, employee_id, location_id):
     """Create and clock-out a shift owned by the employee, return its ID."""
     ci = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
         "location": "123 Main St, Effingham",
+        "latitude": 39.1203,
+        "longitude": -88.54335,
     })
     assert ci.status_code == 200, ci.text
     entry_id = ci.json()["entry"]["id"]
 
     co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
         "notes": "test shift",
+        "latitude": 39.1203,
+        "longitude": -88.54335,
     })
     assert co.status_code == 200, co.text
     return entry_id
