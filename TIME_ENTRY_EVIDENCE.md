@@ -2,7 +2,7 @@
 
 This contract applies to the existing clock-in, clock-out, arrival, and
 departure actions. It does not add continuous/background tracking and does not
-implement the future QR check-in backlog item.
+govern the separate QR site-arrival evidence flow; see `QR_SITE_CHECKIN.md`.
 
 - The authenticated session identifies the employee; the client cannot choose
   a different employee ID.
@@ -24,4 +24,6 @@ implement the future QR check-in backlog item.
 
 Browser geolocation remains client-reported and can be spoofed by a determined
 user. This slice prevents silent GPS omission and makes exceptions visible; it
-does not replace a company-vehicle tracker or the later QR/geofence workflow.
+does not replace a company-vehicle tracker. The QR flow adds signed site
+selection and stricter accuracy-aware geofence review, but its phone GPS can
+still be spoofed by a determined user.

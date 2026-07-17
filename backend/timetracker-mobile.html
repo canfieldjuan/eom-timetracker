@@ -259,6 +259,26 @@
             border-color: var(--warn-border);
         }
 
+        .qr-preview {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 12px;
+            margin-top: 10px;
+            background: #ffffff;
+            text-align: center;
+        }
+
+        .qr-preview img {
+            display: block;
+            width: min(100%, 320px);
+            height: auto;
+            margin: 0 auto 8px;
+        }
+
+        .qr-preview a {
+            font-weight: 700;
+        }
+
         .inline-choice {
             display: flex;
             align-items: flex-start;
@@ -376,6 +396,56 @@
         <div id="adminPanel" class="panel hidden">
             <h2>Admin Tools</h2>
             <p class="meta">Administrator login is required for every tool in this section.</p>
+
+            <h3>QR Site Check-In</h3>
+            <p class="meta">
+                Create a printable QR for each site, schedule exact arrival times, and review uncertain check-ins.
+            </p>
+            <label for="adminCheckInSiteSelect">Site QR</label>
+            <select id="adminCheckInSiteSelect"></select>
+            <div class="row">
+                <button id="loadSiteQrButton" type="button">Load or Create QR</button>
+                <button id="rotateSiteQrButton" class="btn-danger" type="button">Rotate QR</button>
+            </div>
+            <div id="siteQrMessage" class="message"></div>
+            <div id="siteQrPreview" class="qr-preview hidden">
+                <img id="siteQrImage" alt="Printable site check-in QR code">
+                <p id="siteQrLabel"></p>
+                <a id="siteQrDownload" download="site-check-in-qr.svg">Download SVG</a>
+            </div>
+
+            <h3 style="margin-top: 16px;">Schedule an Arrival</h3>
+            <div class="row">
+                <div>
+                    <label for="siteCheckInEmployeeSelect">Employee</label>
+                    <select id="siteCheckInEmployeeSelect"></select>
+                </div>
+                <div>
+                    <label for="siteCheckInScheduleSiteSelect">Site</label>
+                    <select id="siteCheckInScheduleSiteSelect"></select>
+                </div>
+            </div>
+            <div class="row">
+                <div>
+                    <label for="siteCheckInScheduledStart">Scheduled start</label>
+                    <input id="siteCheckInScheduledStart" type="datetime-local">
+                </div>
+                <div>
+                    <label for="siteCheckInGraceMinutes">Grace minutes</label>
+                    <input id="siteCheckInGraceMinutes" type="number" min="0" max="120" value="10">
+                </div>
+            </div>
+            <button id="saveSiteCheckInScheduleButton" type="button">Save Arrival Schedule</button>
+            <div id="siteCheckInScheduleMessage" class="message"></div>
+
+            <div class="row" style="margin-top: 16px;">
+                <h3>Needs Review</h3>
+                <button id="refreshSiteCheckInReviewsButton" type="button">Refresh Review Queue</button>
+            </div>
+            <div id="siteCheckInReviewMessage" class="message"></div>
+            <div id="siteCheckInReviewList">
+                <p class="meta">No review queue loaded.</p>
+            </div>
 
             <h3>Time Data Audit</h3>
             <p class="meta">Checks for duplicate and stale shifts without changing any time records.</p>
@@ -565,6 +635,15 @@
             </div>
 
             <div class="panel">
+                <h3>Site Check-In</h3>
+                <p id="siteCheckInPrompt" class="meta">
+                    Scan the printed site QR with your phone camera. Return here, then tap Check in to share your current location once.
+                </p>
+                <button id="siteCheckInButton" class="btn-success" type="button" disabled>Check in</button>
+                <div id="siteCheckInMessage" class="message"></div>
+            </div>
+
+            <div class="panel">
                 <h3>Time Entry</h3>
 
                 <label for="locationSelect">Location</label>
@@ -624,7 +703,11 @@
             dashboardTab: 'overview',
             correctionInventory: null,
             correctionPlan: null,
-            correctionSelection: null
+            correctionSelection: null,
+            sites: [],
+            adminEmployees: [],
+            pendingSiteCheckIn: null,
+            siteQrObjectUrl: ''
         };
 
         function defaultApiBaseUrl() {
@@ -740,6 +823,110 @@
                     }
                 );
             });
+        }
+
+        function capturePendingSiteQr() {
+            const queryParams = new URLSearchParams(window.location.search);
+            const token = queryParams.get('checkIn');
+            state.pendingSiteCheckIn = token
+                ? { token, scannedAt: new Date().toISOString(), site: null }
+                : null;
+        }
+
+        function renderPendingSiteCheckIn() {
+            const prompt = document.getElementById('siteCheckInPrompt');
+            const button = document.getElementById('siteCheckInButton');
+            const pending = state.pendingSiteCheckIn;
+            if (pending && pending.site) {
+                prompt.textContent = `Ready to check in at ${pending.site.name}. Location is requested only when you tap Check in.`;
+                button.disabled = false;
+                return;
+            }
+
+            prompt.textContent = pending
+                ? 'Resolving the scanned site QR. Sign in if prompted.'
+                : 'Scan the printed site QR with your phone camera. Return here, then tap Check in to share your current location once.';
+            button.disabled = true;
+        }
+
+        async function resolvePendingSiteCheckIn() {
+            renderPendingSiteCheckIn();
+            if (!state.token || !state.pendingSiteCheckIn) {
+                return;
+            }
+
+            const message = document.getElementById('siteCheckInMessage');
+            clearMessage(message);
+            try {
+                const payload = await apiRequest(
+                    '/timesheet/site-check-in/resolve',
+                    'POST',
+                    { token: state.pendingSiteCheckIn.token },
+                    true
+                );
+                state.pendingSiteCheckIn.site = payload.site;
+                renderPendingSiteCheckIn();
+                setMessage(message, 'success', `Site QR recognized: ${payload.site.name}.`);
+            } catch (error) {
+                state.pendingSiteCheckIn.site = null;
+                renderPendingSiteCheckIn();
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        function clearPendingSiteCheckIn() {
+            state.pendingSiteCheckIn = null;
+            const url = new URL(window.location.href);
+            url.searchParams.delete('checkIn');
+            window.history.replaceState({}, '', url);
+            renderPendingSiteCheckIn();
+        }
+
+        function siteCheckInResultMessage(checkIn, duplicate) {
+            const prefix = duplicate ? 'This scan was already recorded.' : 'Site check-in recorded.';
+            if (checkIn.classification === 'on_time') {
+                return `${prefix} Marked on time at ${checkIn.siteName}.`;
+            }
+            if (checkIn.classification === 'late') {
+                return `${prefix} Marked late at ${checkIn.siteName}.`;
+            }
+            return `${prefix} Sent to admin review at ${checkIn.siteName}.`;
+        }
+
+        async function handleSiteCheckIn() {
+            const message = document.getElementById('siteCheckInMessage');
+            clearMessage(message);
+            if (!state.pendingSiteCheckIn || !state.pendingSiteCheckIn.site) {
+                setMessage(message, 'error', 'Scan a valid site QR first.');
+                return;
+            }
+
+            const button = document.getElementById('siteCheckInButton');
+            button.disabled = true;
+            try {
+                const coords = await getCurrentCoordinates();
+                const payload = await apiRequest('/timesheet/site-check-in', 'POST', {
+                    employeeId: state.user.id,
+                    siteId: state.pendingSiteCheckIn.site.id,
+                    token: state.pendingSiteCheckIn.token,
+                    scannedAt: state.pendingSiteCheckIn.scannedAt,
+                    latitude: coords.latitude,
+                    longitude: coords.longitude,
+                    accuracy: coords.accuracy
+                }, true);
+                const resultText = siteCheckInResultMessage(payload.checkIn, payload.duplicate);
+                clearPendingSiteCheckIn();
+                setMessage(message, 'success', resultText);
+                if (hasAdminSession()) {
+                    await loadSiteCheckInReviews();
+                }
+            } catch (error) {
+                const text = error instanceof TypeError
+                    ? 'No check-in was recorded. An internet connection is required; reconnect and try again.'
+                    : error.message;
+                setMessage(message, 'error', text);
+                renderPendingSiteCheckIn();
+            }
         }
 
         function readGpsOverrideFields() {
@@ -883,6 +1070,7 @@
                 departButton.disabled = true;
                 clockOutButton.disabled = true;
             }
+            renderPendingSiteCheckIn();
         }
 
         function captureStaleShiftReview(error) {
@@ -1128,15 +1316,187 @@
             const data = await apiRequest('/timesheet/locations', 'GET', null, true);
             const select = document.getElementById('locationSelect');
             const options = Array.isArray(data.locations) ? data.locations : [];
+            state.sites = Array.isArray(data.sites) ? data.sites : [];
 
             if (!options.length) {
                 select.innerHTML = '<option value="">No locations configured</option>';
-                return;
+            } else {
+                select.innerHTML = options
+                    .map((location) => `<option value="${escapeHtml(location)}">${escapeHtml(location)}</option>`)
+                    .join('');
             }
 
-            select.innerHTML = options
-                .map((location) => `<option value="${escapeHtml(location)}">${escapeHtml(location)}</option>`)
-                .join('');
+            const siteOptions = state.sites.length
+                ? state.sites.map((site) => (
+                    `<option value="${escapeHtml(site.id)}">${escapeHtml(site.name)}</option>`
+                )).join('')
+                : '<option value="">No sites configured</option>';
+            document.getElementById('adminCheckInSiteSelect').innerHTML = siteOptions;
+            document.getElementById('siteCheckInScheduleSiteSelect').innerHTML = siteOptions;
+        }
+
+        async function loadAdminCheckInEmployees() {
+            if (!hasAdminSession()) {
+                return;
+            }
+            const payload = await apiRequest('/admin/employees', 'GET', null, true);
+            state.adminEmployees = (Array.isArray(payload.employees) ? payload.employees : [])
+                .filter((employee) => employee.active && employee.role === 'employee');
+            document.getElementById('siteCheckInEmployeeSelect').innerHTML = state.adminEmployees.length
+                ? state.adminEmployees.map((employee) => (
+                    `<option value="${escapeHtml(employee.id)}">${escapeHtml(employee.name)}</option>`
+                )).join('')
+                : '<option value="">No active employees</option>';
+        }
+
+        function clearSiteQrPreview() {
+            if (state.siteQrObjectUrl) {
+                URL.revokeObjectURL(state.siteQrObjectUrl);
+                state.siteQrObjectUrl = '';
+            }
+            document.getElementById('siteQrPreview').classList.add('hidden');
+            document.getElementById('siteQrImage').removeAttribute('src');
+            document.getElementById('siteQrDownload').removeAttribute('href');
+        }
+
+        function renderSiteQr(payload) {
+            clearSiteQrPreview();
+            const blob = new Blob([payload.qrSvg], { type: 'image/svg+xml' });
+            state.siteQrObjectUrl = URL.createObjectURL(blob);
+            const siteName = payload.site.name || `site-${payload.site.id}`;
+            const safeName = siteName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+            document.getElementById('siteQrImage').src = state.siteQrObjectUrl;
+            document.getElementById('siteQrLabel').textContent = `${siteName} — print and post at this site`;
+            const download = document.getElementById('siteQrDownload');
+            download.href = state.siteQrObjectUrl;
+            download.download = `${safeName || 'site'}-check-in-qr.svg`;
+            document.getElementById('siteQrPreview').classList.remove('hidden');
+        }
+
+        async function loadOrRotateSiteQr(rotate) {
+            const message = document.getElementById('siteQrMessage');
+            clearMessage(message);
+            const siteId = Number(document.getElementById('adminCheckInSiteSelect').value);
+            if (!siteId) {
+                setMessage(message, 'error', 'Choose a site first.');
+                return;
+            }
+            if (rotate && !window.confirm('Rotate this QR? Any previously printed code for this site will stop working.')) {
+                return;
+            }
+            try {
+                const payload = await apiRequest(
+                    `/admin/locations/${siteId}/check-in-qr`,
+                    'POST',
+                    { rotate },
+                    true
+                );
+                renderSiteQr(payload);
+                setMessage(
+                    message,
+                    'success',
+                    payload.rotated ? 'Site QR created or rotated.' : 'Current site QR loaded.'
+                );
+            } catch (error) {
+                clearSiteQrPreview();
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function saveSiteCheckInSchedule() {
+            const message = document.getElementById('siteCheckInScheduleMessage');
+            clearMessage(message);
+            try {
+                const employeeId = Number(document.getElementById('siteCheckInEmployeeSelect').value);
+                const siteId = Number(document.getElementById('siteCheckInScheduleSiteSelect').value);
+                const localStart = document.getElementById('siteCheckInScheduledStart').value;
+                const graceMinutes = Number(document.getElementById('siteCheckInGraceMinutes').value);
+                if (!employeeId || !siteId || !localStart) {
+                    throw new Error('Employee, site, and scheduled start are required.');
+                }
+                const scheduledStart = new Date(localStart);
+                if (Number.isNaN(scheduledStart.getTime())) {
+                    throw new Error('Scheduled start is invalid.');
+                }
+                const payload = await apiRequest('/admin/site-check-in-schedules', 'POST', {
+                    employeeId,
+                    siteId,
+                    scheduledStart: scheduledStart.toISOString(),
+                    graceMinutes
+                }, true);
+                setMessage(
+                    message,
+                    'success',
+                    `Arrival scheduled for ${payload.schedule.employeeName} at ${payload.schedule.siteName}.`
+                );
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        function renderSiteCheckInReviews(checkIns) {
+            const list = document.getElementById('siteCheckInReviewList');
+            if (!checkIns.length) {
+                list.innerHTML = '<p class="meta">No site check-ins need review.</p>';
+                return;
+            }
+            list.innerHTML = checkIns.map((checkIn) => `
+                <div class="correction-card warning">
+                    <strong>${escapeHtml(checkIn.employeeName)}</strong> at ${escapeHtml(checkIn.siteName)}
+                    <p class="meta">
+                        Server time: ${escapeHtml(formatCorrectionTimestamp(checkIn.serverCheckedInAt))} |
+                        Reason: ${escapeHtml(checkIn.classificationReason)} |
+                        Geofence: ${escapeHtml(checkIn.geofenceStatus)} |
+                        Distance: ${escapeHtml(checkIn.distanceM ?? 'unknown')}m |
+                        Accuracy: ${escapeHtml(checkIn.accuracyM)}m
+                    </p>
+                    <div class="row">
+                        <button type="button" data-site-review-id="${escapeHtml(checkIn.id)}" data-site-review-decision="approved">Approve</button>
+                        <button class="btn-danger" type="button" data-site-review-id="${escapeHtml(checkIn.id)}" data-site-review-decision="rejected">Reject</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function loadSiteCheckInReviews() {
+            if (!hasAdminSession()) {
+                return;
+            }
+            const message = document.getElementById('siteCheckInReviewMessage');
+            clearMessage(message);
+            try {
+                const payload = await apiRequest(
+                    '/admin/site-check-ins?review_status=pending',
+                    'GET',
+                    null,
+                    true
+                );
+                renderSiteCheckInReviews(Array.isArray(payload.checkIns) ? payload.checkIns : []);
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function reviewSiteCheckIn(checkInId, decision) {
+            const message = document.getElementById('siteCheckInReviewMessage');
+            const note = window.prompt(`Why is this check-in ${decision}?`);
+            if (note === null) {
+                return;
+            }
+            if (note.trim().length < 3) {
+                setMessage(message, 'error', 'Enter a review note with at least 3 characters.');
+                return;
+            }
+            try {
+                await apiRequest(`/admin/site-check-ins/${checkInId}`, 'PATCH', {
+                    decision,
+                    note: note.trim()
+                }, true);
+                await loadSiteCheckInReviews();
+                setMessage(message, 'success', `Check-in ${decision}.`);
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
         }
 
         async function loadCurrentStatus() {
@@ -1151,7 +1511,14 @@
         async function refreshEmployeePanels() {
             clearMessage(document.getElementById('entryMessage'));
             await loadLocations();
+            await resolvePendingSiteCheckIn();
             await loadCurrentStatus();
+            if (hasAdminSession()) {
+                await Promise.all([
+                    loadAdminCheckInEmployees(),
+                    loadSiteCheckInReviews()
+                ]);
+            }
         }
 
         async function handleLogin() {
@@ -1271,6 +1638,10 @@
             state.correctionInventory = null;
             state.correctionPlan = null;
             state.correctionSelection = null;
+            state.sites = [];
+            state.adminEmployees = [];
+            clearSiteQrPreview();
+            capturePendingSiteQr();
 
             localStorage.removeItem(STORAGE_TOKEN);
             localStorage.removeItem(STORAGE_USER);
@@ -1282,6 +1653,8 @@
             document.getElementById('buildCorrectionPlanButton').disabled = true;
             invalidateCorrectionPlan();
             clearMessage(document.getElementById('entryMessage'));
+            clearMessage(document.getElementById('siteCheckInMessage'));
+            renderPendingSiteCheckIn();
             hideGpsOverridePanel(true);
         }
 
@@ -1745,12 +2118,17 @@
         async function bootstrap() {
             state.apiBaseUrl = defaultApiBaseUrl();
             document.getElementById('apiBaseUrl').value = state.apiBaseUrl;
+            capturePendingSiteQr();
+            renderPendingSiteCheckIn();
 
             const now = new Date();
             document.getElementById('adminLogDate').value = currentDateIso();
             document.getElementById('reportMonth').value = String(now.getMonth() + 1);
             document.getElementById('reportYear').value = String(now.getFullYear());
             document.getElementById('reportCompany').value = 'Your Company';
+            document.getElementById('siteCheckInScheduledStart').value = toLocalDateTimeInput(
+                new Date(now.getTime() + 60 * 60 * 1000).toISOString()
+            );
 
             try {
                 const storedToken = localStorage.getItem(STORAGE_TOKEN) || '';
@@ -1783,6 +2161,7 @@
             await loadDashboard();
         });
         document.getElementById('loginButton').addEventListener('click', handleLogin);
+        document.getElementById('siteCheckInButton').addEventListener('click', handleSiteCheckIn);
         document.getElementById('clockInButton').addEventListener('click', handleClockIn);
         document.getElementById('arriveButton').addEventListener('click', handleArrive);
         document.getElementById('departButton').addEventListener('click', handleDepart);
@@ -1803,6 +2182,16 @@
             }
         });
         document.getElementById('loadTimeDataAuditButton').addEventListener('click', loadTimeDataAudit);
+        document.getElementById('loadSiteQrButton').addEventListener('click', () => loadOrRotateSiteQr(false));
+        document.getElementById('rotateSiteQrButton').addEventListener('click', () => loadOrRotateSiteQr(true));
+        document.getElementById('saveSiteCheckInScheduleButton').addEventListener('click', saveSiteCheckInSchedule);
+        document.getElementById('refreshSiteCheckInReviewsButton').addEventListener('click', loadSiteCheckInReviews);
+        document.getElementById('siteCheckInReviewList').addEventListener('click', (event) => {
+            const button = event.target.closest('[data-site-review-id]');
+            if (button) {
+                reviewSiteCheckIn(Number(button.dataset.siteReviewId), button.dataset.siteReviewDecision);
+            }
+        });
         document.getElementById('loadCorrectionInventoryButton').addEventListener('click', loadCorrectionInventory);
         document.getElementById('buildCorrectionPlanButton').addEventListener('click', buildCorrectionPlan);
         document.getElementById('applyCorrectionPlanButton').addEventListener('click', applyCorrectionPlan);

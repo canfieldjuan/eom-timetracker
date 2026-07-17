@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import calendar
 import csv
 import hashlib
@@ -14,6 +15,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -32,6 +34,8 @@ import jwt
 import psycopg2
 import psycopg2.extras
 import requests
+import qrcode
+import qrcode.image.svg
 import db
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -225,6 +229,15 @@ def parse_allowed_ips(value: Optional[str]) -> List[str]:
 
 LOCATION_MATCH_RADIUS_DEFAULT_M = 50
 LOCATION_MATCH_RADIUS_M = LOCATION_MATCH_RADIUS_DEFAULT_M
+SITE_CHECK_IN_RADIUS_DEFAULT_M = 50
+SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M = 100
+SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS = 12
+SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS = 600
+SITE_CHECK_IN_QR_VERSION = "eom1"
+SITE_CHECK_IN_RADIUS_M = SITE_CHECK_IN_RADIUS_DEFAULT_M
+SITE_CHECK_IN_MAX_ACCURACY_M = SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M
+SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS
+SITE_CHECK_IN_DEVICE_SKEW_SECONDS = SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS
 
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -233,6 +246,97 @@ def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     a = (math.sin(math.radians(lat2 - lat1) / 2) ** 2
          + math.cos(phi1) * math.cos(phi2) * math.sin(math.radians(lng2 - lng1) / 2) ** 2)
     return 2 * R * math.asin(math.sqrt(a))
+
+
+def _base64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _site_check_in_signature(site_id: int, nonce: str) -> str:
+    message = f"{SITE_CHECK_IN_QR_VERSION}.{site_id}.{nonce}".encode("utf-8")
+    digest = hmac.new(
+        JWT_SECRET.encode("utf-8"),
+        b"site-check-in\0" + message,
+        hashlib.sha256,
+    ).digest()
+    return _base64url_encode(digest)
+
+
+def build_site_check_in_token(site_id: int, nonce: str) -> str:
+    signature = _site_check_in_signature(site_id, nonce)
+    return f"{SITE_CHECK_IN_QR_VERSION}.{site_id}.{nonce}.{signature}"
+
+
+def parse_site_check_in_token(token: str) -> Tuple[int, str]:
+    parts = str(token or "").strip().split(".")
+    if len(parts) != 4 or parts[0] != SITE_CHECK_IN_QR_VERSION:
+        raise ValueError("Invalid or expired site QR code")
+
+    try:
+        site_id = int(parts[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid or expired site QR code") from exc
+
+    nonce, signature = parts[2], parts[3]
+    if site_id <= 0 or not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", nonce):
+        raise ValueError("Invalid or expired site QR code")
+
+    expected = _site_check_in_signature(site_id, nonce)
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("Invalid or expired site QR code")
+    return site_id, nonce
+
+
+def build_site_check_in_qr_svg(check_in_url: str) -> str:
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=4,
+        image_factory=qrcode.image.svg.SvgPathFillImage,
+    )
+    qr.add_data(check_in_url)
+    qr.make(fit=True)
+    return qr.make_image().to_string(encoding="unicode")
+
+
+def evaluate_site_check_in_geofence(
+    *,
+    site_latitude: Optional[float],
+    site_longitude: Optional[float],
+    latitude: float,
+    longitude: float,
+    accuracy: float,
+) -> Dict[str, Any]:
+    if site_latitude is None or site_longitude is None:
+        return {
+            "status": "site_unpinned",
+            "distanceM": None,
+            "radiusM": SITE_CHECK_IN_RADIUS_M,
+            "accuracyM": round(float(accuracy), 2),
+        }
+
+    distance_m = haversine_m(
+        latitude,
+        longitude,
+        float(site_latitude),
+        float(site_longitude),
+    )
+    accuracy_m = float(accuracy)
+    if accuracy_m > SITE_CHECK_IN_MAX_ACCURACY_M:
+        geofence_status = "low_accuracy"
+    elif distance_m + accuracy_m <= SITE_CHECK_IN_RADIUS_M:
+        geofence_status = "inside"
+    elif distance_m - accuracy_m > SITE_CHECK_IN_RADIUS_M:
+        geofence_status = "outside"
+    else:
+        geofence_status = "uncertain"
+
+    return {
+        "status": geofence_status,
+        "distanceM": round(distance_m, 2),
+        "radiusM": SITE_CHECK_IN_RADIUS_M,
+        "accuracyM": round(accuracy_m, 2),
+    }
 
 
 def find_nearest_location_match(lat: float, lng: float, timesheet_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1673,6 +1777,55 @@ class ClockInRequest(BaseModel):
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
 
 
+class SiteQrRequest(BaseModel):
+    rotate: bool = False
+
+
+class SiteQrResolveRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+
+
+class SiteCheckInRequest(BaseModel):
+    employeeId: int = Field(gt=0)
+    siteId: int = Field(gt=0)
+    token: str = Field(min_length=20, max_length=256)
+    scannedAt: datetime
+    latitude: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
+    accuracy: float = Field(ge=0, le=100_000, allow_inf_nan=False)
+
+    @field_validator("scannedAt")
+    @classmethod
+    def scanned_at_must_include_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("scannedAt must include a timezone")
+        return value.astimezone(timezone.utc)
+
+
+class SiteCheckInScheduleRequest(BaseModel):
+    employeeId: int = Field(gt=0)
+    siteId: int = Field(gt=0)
+    scheduledStart: datetime
+    graceMinutes: int = Field(default=10, ge=0, le=120)
+
+    @field_validator("scheduledStart")
+    @classmethod
+    def scheduled_start_must_include_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("scheduledStart must include a timezone")
+        return value.astimezone(timezone.utc)
+
+
+class SiteCheckInReviewRequest(BaseModel):
+    decision: str = Field(pattern="^(approved|rejected)$")
+    note: str = Field(min_length=3, max_length=500)
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def strip_review_note(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class ClockOutRequest(BaseModel):
     notes: str = Field(default="", max_length=MAX_NOTES_LEN)
     latitude: Optional[float] = Field(default=None, ge=-90, le=90)
@@ -1837,6 +1990,31 @@ APP_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 TOKEN_TTL_HOURS = parse_int(os.getenv("TOKEN_TTL_HOURS"), 12)
 MAX_ACTIVE_SHIFT_HOURS = float(os.getenv("MAX_ACTIVE_SHIFT_HOURS", "24"))
 LOCATION_MATCH_RADIUS_M = parse_int(os.getenv("LOCATION_MATCH_RADIUS_M"), LOCATION_MATCH_RADIUS_DEFAULT_M)
+SITE_CHECK_IN_RADIUS_M = max(
+    1,
+    parse_int(os.getenv("SITE_CHECK_IN_RADIUS_M"), SITE_CHECK_IN_RADIUS_DEFAULT_M),
+)
+SITE_CHECK_IN_MAX_ACCURACY_M = max(
+    1,
+    parse_int(
+        os.getenv("SITE_CHECK_IN_MAX_ACCURACY_M"),
+        SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M,
+    ),
+)
+SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = max(
+    1,
+    parse_int(
+        os.getenv("SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS"),
+        SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS,
+    ),
+)
+SITE_CHECK_IN_DEVICE_SKEW_SECONDS = max(
+    0,
+    parse_int(
+        os.getenv("SITE_CHECK_IN_DEVICE_SKEW_SECONDS"),
+        SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS,
+    ),
+)
 
 ACCESS_START_HOUR = parse_int(os.getenv("ACCESS_START_HOUR"), 8)
 ACCESS_END_HOUR = parse_int(os.getenv("ACCESS_END_HOUR"), 18)
@@ -1860,6 +2038,9 @@ ATLAS_RECEIVABLES_SERVICE_TOKEN = os.getenv(
 ATLAS_RECEIVABLES_TIMEOUT_SECONDS = max(
     1.0, float(os.getenv("ATLAS_RECEIVABLES_TIMEOUT_SECONDS", "10"))
 )
+PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "").strip().rstrip("/")
+if PUBLIC_APP_URL and not re.fullmatch(r"https?://[^\s]+", PUBLIC_APP_URL):
+    raise RuntimeError("PUBLIC_APP_URL must be an absolute http or https URL")
 
 LOGIN_RATE_LIMIT_MAX        = parse_int(os.getenv("LOGIN_RATE_LIMIT_MAX"),        10)
 LOGIN_RATE_LIMIT_WINDOW_S   = parse_int(os.getenv("LOGIN_RATE_LIMIT_WINDOW_S"),   60)
@@ -2579,6 +2760,69 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE locations ADD COLUMN IF NOT EXISTS expected_hours NUMERIC(6,2)"
     )
+    db.execute(
+        "ALTER TABLE locations ADD COLUMN IF NOT EXISTS check_in_token_nonce VARCHAR(64)"
+    )
+    db.execute(
+        "ALTER TABLE locations ADD COLUMN IF NOT EXISTS check_in_token_rotated_at TIMESTAMPTZ"
+    )
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS site_check_in_schedules (
+            id              BIGSERIAL PRIMARY KEY,
+            employee_id     INTEGER NOT NULL REFERENCES employees(id),
+            location_id     INTEGER NOT NULL REFERENCES locations(id),
+            scheduled_start TIMESTAMPTZ NOT NULL,
+            grace_minutes   INTEGER NOT NULL DEFAULT 10
+                                CHECK (grace_minutes BETWEEN 0 AND 120),
+            created_by      INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (employee_id, location_id, scheduled_start)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS site_check_ins (
+            id                        BIGSERIAL PRIMARY KEY,
+            employee_id               INTEGER NOT NULL REFERENCES employees(id),
+            location_id               INTEGER NOT NULL REFERENCES locations(id),
+            server_checked_in_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            device_scanned_at         TIMESTAMPTZ NOT NULL,
+            latitude                  NUMERIC(10, 7) NOT NULL,
+            longitude                 NUMERIC(10, 7) NOT NULL,
+            accuracy_m                NUMERIC(10, 2) NOT NULL,
+            geofence_radius_m         INTEGER NOT NULL,
+            distance_m                NUMERIC(10, 2),
+            geofence_status           VARCHAR(32) NOT NULL
+                                          CHECK (geofence_status IN
+                                            ('inside', 'outside', 'uncertain', 'low_accuracy', 'site_unpinned')),
+            classification            VARCHAR(24) NOT NULL
+                                          CHECK (classification IN ('on_time', 'late', 'needs_review')),
+            classification_reason     VARCHAR(64) NOT NULL,
+            schedule_id               BIGINT REFERENCES site_check_in_schedules(id) ON DELETE SET NULL,
+            scheduled_start           TIMESTAMPTZ,
+            grace_minutes             INTEGER,
+            device_clock_skew_seconds NUMERIC(12, 2) NOT NULL,
+            review_status             VARCHAR(24) NOT NULL
+                                          CHECK (review_status IN
+                                            ('not_required', 'pending', 'approved', 'rejected')),
+            reviewed_by               INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            reviewed_at               TIMESTAMPTZ,
+            review_note               TEXT NOT NULL DEFAULT '',
+            created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (employee_id, location_id, device_scanned_at)
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_site_check_in_schedules_lookup
+        ON site_check_in_schedules(employee_id, location_id, scheduled_start)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_site_check_ins_employee_time
+        ON site_check_ins(employee_id, server_checked_in_at DESC)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_site_check_ins_review
+        ON site_check_ins(review_status, server_checked_in_at DESC)
+    """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id              SERIAL PRIMARY KEY,
@@ -2726,6 +2970,163 @@ def startup_event() -> None:
     _ensure_schema_migrations()
     _auto_migrate_if_empty()
     apply_bootstrap_admins()
+
+
+def _site_check_in_url(request: Request, token: str) -> str:
+    app_url = PUBLIC_APP_URL or str(request.base_url).rstrip("/")
+    return f"{app_url}/?checkIn={token}"
+
+
+def _resolve_site_check_in_qr(token: str) -> Dict[str, Any]:
+    try:
+        site_id, nonce = parse_site_check_in_token(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    site = db.query_one(
+        """
+        SELECT id, address, customer_name, lat, lng, check_in_token_nonce,
+               check_in_token_rotated_at
+        FROM locations
+        WHERE id = %s AND active = true
+        """,
+        (site_id,),
+    )
+    configured_nonce = str(site.get("check_in_token_nonce") or "") if site else ""
+    if not site or not configured_nonce or not hmac.compare_digest(configured_nonce, nonce):
+        raise HTTPException(status_code=404, detail="Invalid or expired site QR code")
+    return site
+
+
+def _site_check_in_schedule_row(schedule_id: int) -> Optional[Dict[str, Any]]:
+    return db.query_one(
+        """
+        SELECT sc.id, sc.employee_id, e.name AS employee_name,
+               sc.location_id, l.address AS site_name,
+               sc.scheduled_start, sc.grace_minutes, sc.created_at
+        FROM site_check_in_schedules sc
+        JOIN employees e ON e.id = sc.employee_id
+        JOIN locations l ON l.id = sc.location_id
+        WHERE sc.id = %s
+        """,
+        (schedule_id,),
+    )
+
+
+def _serialize_site_check_in_schedule(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "employeeId": int(row["employee_id"]),
+        "employeeName": str(row.get("employee_name") or ""),
+        "siteId": int(row["location_id"]),
+        "siteName": str(row.get("site_name") or ""),
+        "scheduledStart": to_utc_iso(row["scheduled_start"]),
+        "graceMinutes": int(row["grace_minutes"]),
+        "createdAt": to_utc_iso(row["created_at"]),
+    }
+
+
+def _site_check_in_row(check_in_id: int) -> Optional[Dict[str, Any]]:
+    return db.query_one(
+        """
+        SELECT ci.*, e.name AS employee_name, l.address AS site_name,
+               reviewer.name AS reviewed_by_name
+        FROM site_check_ins ci
+        JOIN employees e ON e.id = ci.employee_id
+        JOIN locations l ON l.id = ci.location_id
+        LEFT JOIN employees reviewer ON reviewer.id = ci.reviewed_by
+        WHERE ci.id = %s
+        """,
+        (check_in_id,),
+    )
+
+
+def _serialize_site_check_in(row: Dict[str, Any]) -> Dict[str, Any]:
+    distance = row.get("distance_m")
+    scheduled_start = row.get("scheduled_start")
+    reviewed_at = row.get("reviewed_at")
+    return {
+        "id": int(row["id"]),
+        "employeeId": int(row["employee_id"]),
+        "employeeName": str(row.get("employee_name") or ""),
+        "siteId": int(row["location_id"]),
+        "siteName": str(row.get("site_name") or ""),
+        "serverCheckedInAt": to_utc_iso(row["server_checked_in_at"]),
+        "deviceScannedAt": to_utc_iso(row["device_scanned_at"]),
+        "latitude": float(row["latitude"]),
+        "longitude": float(row["longitude"]),
+        "accuracyM": float(row["accuracy_m"]),
+        "geofenceRadiusM": int(row["geofence_radius_m"]),
+        "distanceM": float(distance) if distance is not None else None,
+        "geofenceStatus": str(row["geofence_status"]),
+        "classification": str(row["classification"]),
+        "classificationReason": str(row["classification_reason"]),
+        "scheduleId": int(row["schedule_id"]) if row.get("schedule_id") else None,
+        "scheduledStart": to_utc_iso(scheduled_start) if scheduled_start else None,
+        "graceMinutes": int(row["grace_minutes"]) if row.get("grace_minutes") is not None else None,
+        "deviceClockSkewSeconds": float(row["device_clock_skew_seconds"]),
+        "reviewStatus": str(row["review_status"]),
+        "reviewedBy": str(row.get("reviewed_by_name") or ""),
+        "reviewedAt": to_utc_iso(reviewed_at) if reviewed_at else None,
+        "reviewNote": str(row.get("review_note") or ""),
+    }
+
+
+def _matching_site_check_in_schedule(
+    employee_id: int,
+    site_id: int,
+    checked_in_at: datetime,
+) -> Optional[Dict[str, Any]]:
+    return db.query_one(
+        """
+        SELECT id, scheduled_start, grace_minutes
+        FROM site_check_in_schedules
+        WHERE employee_id = %s
+          AND location_id = %s
+          AND scheduled_start BETWEEN
+              %s - (%s * INTERVAL '1 hour')
+              AND %s + (%s * INTERVAL '1 hour')
+        ORDER BY ABS(EXTRACT(EPOCH FROM (scheduled_start - %s))), id
+        LIMIT 1
+        """,
+        (
+            employee_id,
+            site_id,
+            checked_in_at,
+            SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
+            checked_in_at,
+            SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
+            checked_in_at,
+        ),
+    )
+
+
+def _classify_site_check_in(
+    geofence: Dict[str, Any],
+    schedule: Optional[Dict[str, Any]],
+    checked_in_at: datetime,
+    device_clock_skew_seconds: float,
+) -> Tuple[str, str, str]:
+    geofence_reason = {
+        "site_unpinned": "site_missing_location_pin",
+        "low_accuracy": "location_accuracy_too_low",
+        "outside": "outside_geofence",
+        "uncertain": "geofence_boundary_uncertain",
+    }.get(str(geofence["status"]))
+    if geofence_reason:
+        return "needs_review", geofence_reason, "pending"
+
+    if device_clock_skew_seconds > SITE_CHECK_IN_DEVICE_SKEW_SECONDS:
+        return "needs_review", "device_clock_skew", "pending"
+
+    if not schedule:
+        return "needs_review", "no_matching_schedule", "pending"
+
+    scheduled_start = schedule["scheduled_start"]
+    grace_deadline = scheduled_start + timedelta(minutes=int(schedule["grace_minutes"]))
+    if checked_in_at <= grace_deadline:
+        return "on_time", "within_grace_period", "not_required"
+    return "late", "after_grace_period", "not_required"
 
 
 @app.get("/", include_in_schema=False)
@@ -2956,6 +3357,423 @@ def receivables_clear_deposit_batch(
         admin,
         idempotency_key=idempotency_key,
     )
+
+
+@app.post("/api/admin/locations/{site_id}/check-in-qr")
+def admin_site_check_in_qr(
+    site_id: int,
+    payload: SiteQrRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    site = db.query_one(
+        """
+        SELECT id, address, customer_name, active, check_in_token_nonce,
+               check_in_token_rotated_at
+        FROM locations
+        WHERE id = %s
+        """,
+        (site_id,),
+    )
+    if not site or not site.get("active"):
+        raise HTTPException(status_code=404, detail="Active site not found")
+
+    nonce = str(site.get("check_in_token_nonce") or "")
+    rotated = False
+    if payload.rotate:
+        candidate_nonce = secrets.token_urlsafe(18)
+        row = db.query_one(
+            """
+            UPDATE locations
+            SET check_in_token_nonce = %s, check_in_token_rotated_at = NOW()
+            WHERE id = %s AND active = true
+            RETURNING check_in_token_nonce, check_in_token_rotated_at
+            """,
+            (candidate_nonce, site_id),
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Active site not found")
+        nonce = str(row["check_in_token_nonce"])
+        site["check_in_token_rotated_at"] = row["check_in_token_rotated_at"]
+        rotated = True
+    elif not nonce:
+        candidate_nonce = secrets.token_urlsafe(18)
+        row = db.query_one(
+            """
+            UPDATE locations
+            SET check_in_token_nonce = %s, check_in_token_rotated_at = NOW()
+            WHERE id = %s
+              AND active = true
+              AND COALESCE(check_in_token_nonce, '') = ''
+            RETURNING check_in_token_nonce, check_in_token_rotated_at
+            """,
+            (candidate_nonce, site_id),
+        )
+        if row:
+            rotated = True
+        else:
+            row = db.query_one(
+                """
+                SELECT check_in_token_nonce, check_in_token_rotated_at
+                FROM locations
+                WHERE id = %s
+                  AND active = true
+                  AND COALESCE(check_in_token_nonce, '') <> ''
+                """,
+                (site_id,),
+            )
+        if not row:
+            raise HTTPException(status_code=404, detail="Active site not found")
+        nonce = str(row["check_in_token_nonce"])
+        site["check_in_token_rotated_at"] = row["check_in_token_rotated_at"]
+
+    token = build_site_check_in_token(site_id, nonce)
+    check_in_url = _site_check_in_url(request, token)
+    rotated_at = site.get("check_in_token_rotated_at")
+    append_access_log(
+        request,
+        "SITE_QR_ROTATED" if rotated else "SITE_QR_LOADED",
+        True,
+        f"Admin {admin['name']} site {site_id}",
+    )
+    return {
+        "success": True,
+        "site": {
+            "id": int(site["id"]),
+            "name": str(site["address"]),
+            "customerName": str(site.get("customer_name") or ""),
+        },
+        "token": token,
+        "checkInUrl": check_in_url,
+        "qrSvg": build_site_check_in_qr_svg(check_in_url),
+        "rotated": rotated,
+        "rotatedAt": to_utc_iso(rotated_at) if rotated_at else None,
+    }
+
+
+@app.post("/api/timesheet/site-check-in/resolve")
+def resolve_site_check_in_qr(
+    payload: SiteQrResolveRequest,
+    request: Request,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    site = _resolve_site_check_in_qr(payload.token)
+    append_access_log(
+        request,
+        "SITE_QR_RESOLVED",
+        True,
+        f"Employee {employee['name']} site {site['id']}",
+    )
+    return {
+        "success": True,
+        "site": {
+            "id": int(site["id"]),
+            "name": str(site["address"]),
+            "customerName": str(site.get("customer_name") or ""),
+        },
+    }
+
+
+@app.post("/api/timesheet/site-check-in")
+def record_site_check_in(
+    payload: SiteCheckInRequest,
+    request: Request,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    if int(payload.employeeId) != int(employee["id"]):
+        append_access_log(
+            request,
+            "SITE_CHECK_IN_REJECTED",
+            False,
+            f"Session employee {employee['id']} attempted employee {payload.employeeId}",
+        )
+        raise HTTPException(status_code=403, detail="employeeId must match the signed-in employee")
+
+    site = _resolve_site_check_in_qr(payload.token)
+    if int(site["id"]) != int(payload.siteId):
+        append_access_log(
+            request,
+            "SITE_CHECK_IN_REJECTED",
+            False,
+            f"QR site {site['id']} did not match submitted site {payload.siteId}",
+        )
+        raise HTTPException(status_code=400, detail="siteId must match the scanned site QR")
+
+    official_time = utc_now()
+    geofence = evaluate_site_check_in_geofence(
+        site_latitude=float(site["lat"]) if site.get("lat") is not None else None,
+        site_longitude=float(site["lng"]) if site.get("lng") is not None else None,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        accuracy=payload.accuracy,
+    )
+    schedule = _matching_site_check_in_schedule(
+        int(employee["id"]),
+        int(site["id"]),
+        official_time,
+    )
+    device_clock_skew_seconds = abs(
+        (official_time - payload.scannedAt.astimezone(timezone.utc)).total_seconds()
+    )
+    classification, reason, review_status = _classify_site_check_in(
+        geofence,
+        schedule,
+        official_time,
+        device_clock_skew_seconds,
+    )
+
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO site_check_ins (
+                    employee_id, location_id, server_checked_in_at,
+                    device_scanned_at, latitude, longitude, accuracy_m,
+                    geofence_radius_m, distance_m, geofence_status,
+                    classification, classification_reason, schedule_id,
+                    scheduled_start, grace_minutes, device_clock_skew_seconds,
+                    review_status
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (employee_id, location_id, device_scanned_at)
+                DO NOTHING
+                RETURNING id
+                """,
+                (
+                    int(employee["id"]),
+                    int(site["id"]),
+                    official_time,
+                    payload.scannedAt,
+                    payload.latitude,
+                    payload.longitude,
+                    payload.accuracy,
+                    geofence["radiusM"],
+                    geofence["distanceM"],
+                    geofence["status"],
+                    classification,
+                    reason,
+                    schedule["id"] if schedule else None,
+                    schedule["scheduled_start"] if schedule else None,
+                    schedule["grace_minutes"] if schedule else None,
+                    device_clock_skew_seconds,
+                    review_status,
+                ),
+            )
+            inserted = cur.fetchone()
+            duplicate = inserted is None
+            if inserted:
+                check_in_id = int(inserted[0])
+            else:
+                cur.execute(
+                    """
+                    SELECT id FROM site_check_ins
+                    WHERE employee_id = %s
+                      AND location_id = %s
+                      AND device_scanned_at = %s
+                    """,
+                    (int(employee["id"]), int(site["id"]), payload.scannedAt),
+                )
+                existing = cur.fetchone()
+                if not existing:
+                    raise RuntimeError("Unable to reconcile duplicate site check-in")
+                check_in_id = int(existing[0])
+
+    row = _site_check_in_row(check_in_id)
+    if not row:
+        raise RuntimeError("Site check-in was stored but could not be reloaded")
+    append_access_log(
+        request,
+        "SITE_CHECK_IN_RECORDED",
+        True,
+        f"Employee {employee['name']} site {site['id']} classification {row['classification']}",
+    )
+    return {
+        "success": True,
+        "duplicate": duplicate,
+        "checkIn": _serialize_site_check_in(row),
+    }
+
+
+@app.post("/api/admin/site-check-in-schedules")
+def admin_create_site_check_in_schedule(
+    payload: SiteCheckInScheduleRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    target_employee = db.query_one(
+        "SELECT id FROM employees WHERE id = %s AND active = true",
+        (payload.employeeId,),
+    )
+    if not target_employee:
+        raise HTTPException(status_code=404, detail="Active employee not found")
+    site = db.query_one(
+        "SELECT id FROM locations WHERE id = %s AND active = true",
+        (payload.siteId,),
+    )
+    if not site:
+        raise HTTPException(status_code=404, detail="Active site not found")
+
+    inserted = db.query_one(
+        """
+        INSERT INTO site_check_in_schedules (
+            employee_id, location_id, scheduled_start, grace_minutes, created_by
+        )
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (employee_id, location_id, scheduled_start)
+        DO UPDATE SET grace_minutes = EXCLUDED.grace_minutes,
+                      created_by = EXCLUDED.created_by
+        RETURNING id
+        """,
+        (
+            payload.employeeId,
+            payload.siteId,
+            payload.scheduledStart,
+            payload.graceMinutes,
+            int(admin["id"]),
+        ),
+    )
+    if not inserted:
+        raise RuntimeError("Site check-in schedule was not saved")
+    row = _site_check_in_schedule_row(int(inserted["id"]))
+    append_access_log(
+        request,
+        "SITE_CHECK_IN_SCHEDULE_SAVED",
+        True,
+        f"Schedule {inserted['id']} by {admin['name']}",
+    )
+    return {"success": True, "schedule": _serialize_site_check_in_schedule(row)}
+
+
+@app.get("/api/admin/site-check-in-schedules")
+def admin_list_site_check_in_schedules(
+    request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    rows = db.query_all(
+        """
+        SELECT sc.id, sc.employee_id, e.name AS employee_name,
+               sc.location_id, l.address AS site_name,
+               sc.scheduled_start, sc.grace_minutes, sc.created_at
+        FROM site_check_in_schedules sc
+        JOIN employees e ON e.id = sc.employee_id
+        JOIN locations l ON l.id = sc.location_id
+        ORDER BY sc.scheduled_start DESC, sc.id DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    return {
+        "success": True,
+        "schedules": [_serialize_site_check_in_schedule(row) for row in rows],
+    }
+
+
+@app.delete("/api/admin/site-check-in-schedules/{schedule_id}")
+def admin_delete_site_check_in_schedule(
+    schedule_id: int,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    deleted = db.query_one(
+        "DELETE FROM site_check_in_schedules WHERE id = %s RETURNING id",
+        (schedule_id,),
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Site check-in schedule not found")
+    append_access_log(
+        request,
+        "SITE_CHECK_IN_SCHEDULE_DELETED",
+        True,
+        f"Schedule {schedule_id} by {admin['name']}",
+    )
+    return {"success": True, "scheduleId": schedule_id}
+
+
+@app.get("/api/admin/site-check-ins")
+def admin_list_site_check_ins(
+    request: Request,
+    classification: Optional[str] = None,
+    review_status: Optional[str] = None,
+    limit: int = Query(default=200, ge=1, le=500),
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    if classification not in {None, "on_time", "late", "needs_review"}:
+        raise HTTPException(status_code=400, detail="Invalid classification filter")
+    if review_status not in {None, "not_required", "pending", "approved", "rejected"}:
+        raise HTTPException(status_code=400, detail="Invalid review status filter")
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if classification:
+        clauses.append("ci.classification = %s")
+        params.append(classification)
+    if review_status:
+        clauses.append("ci.review_status = %s")
+        params.append(review_status)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    rows = db.query_all(
+        f"""
+        SELECT ci.*, e.name AS employee_name, l.address AS site_name,
+               reviewer.name AS reviewed_by_name
+        FROM site_check_ins ci
+        JOIN employees e ON e.id = ci.employee_id
+        JOIN locations l ON l.id = ci.location_id
+        LEFT JOIN employees reviewer ON reviewer.id = ci.reviewed_by
+        {where}
+        ORDER BY ci.server_checked_in_at DESC, ci.id DESC
+        LIMIT %s
+        """,
+        tuple(params),
+    )
+    return {
+        "success": True,
+        "checkIns": [_serialize_site_check_in(row) for row in rows],
+    }
+
+
+@app.patch("/api/admin/site-check-ins/{check_in_id}")
+def admin_review_site_check_in(
+    check_in_id: int,
+    payload: SiteCheckInReviewRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    existing = db.query_one(
+        "SELECT id, classification FROM site_check_ins WHERE id = %s",
+        (check_in_id,),
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Site check-in not found")
+    if existing["classification"] != "needs_review":
+        raise HTTPException(status_code=409, detail="Only needs-review check-ins require a decision")
+
+    updated = db.query_one(
+        """
+        UPDATE site_check_ins
+        SET review_status = %s,
+            reviewed_by = %s,
+            reviewed_at = NOW(),
+            review_note = %s
+        WHERE id = %s
+        RETURNING id
+        """,
+        (payload.decision, int(admin["id"]), payload.note.strip(), check_in_id),
+    )
+    row = _site_check_in_row(int(updated["id"])) if updated else None
+    if not row:
+        raise RuntimeError("Site check-in review was saved but could not be reloaded")
+    append_access_log(
+        request,
+        "SITE_CHECK_IN_REVIEWED",
+        True,
+        f"Check-in {check_in_id} {payload.decision} by {admin['name']}",
+    )
+    return {"success": True, "checkIn": _serialize_site_check_in(row)}
 
 
 @app.post("/api/auth/login")
@@ -3859,8 +4677,46 @@ def timesheet_locations(
     _: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     payload = load_timesheets()
+    site_rows = db.query_all(
+        """
+        SELECT id, address, customer_name, lat, lng,
+               check_in_token_nonce IS NOT NULL AS qr_configured
+        FROM locations
+        WHERE active = true
+        ORDER BY id
+        """
+    )
+    sites = [
+        {
+            "id": int(row["id"]),
+            "name": str(row["address"]),
+            "customerName": str(row.get("customer_name") or ""),
+            "latitude": float(row["lat"]) if row.get("lat") is not None else None,
+            "longitude": float(row["lng"]) if row.get("lng") is not None else None,
+            "qrConfigured": bool(row.get("qr_configured")),
+        }
+        for row in site_rows
+    ]
     append_access_log(request, "LOCATIONS_SUCCESS", True, "Locations fetched")
-    return {"success": True, "locations": payload["locations"], "location_coords": payload["location_coords"], "location_customers": payload["location_customers"], "location_rates": payload["location_rates"], "location_rate_types": payload["location_rate_types"], "location_types": payload["location_types"], "location_frequencies": payload["location_frequencies"], "location_expected_hours": payload.get("location_expected_hours", {}), "locationMatchRadiusM": LOCATION_MATCH_RADIUS_M}
+    return {
+        "success": True,
+        "locations": payload["locations"],
+        "sites": sites,
+        "location_coords": payload["location_coords"],
+        "location_customers": payload["location_customers"],
+        "location_rates": payload["location_rates"],
+        "location_rate_types": payload["location_rate_types"],
+        "location_types": payload["location_types"],
+        "location_frequencies": payload["location_frequencies"],
+        "location_expected_hours": payload.get("location_expected_hours", {}),
+        "locationMatchRadiusM": LOCATION_MATCH_RADIUS_M,
+        "siteCheckInPolicy": {
+            "geofenceRadiusM": SITE_CHECK_IN_RADIUS_M,
+            "maxAccuracyM": SITE_CHECK_IN_MAX_ACCURACY_M,
+            "deviceClockSkewReviewSeconds": SITE_CHECK_IN_DEVICE_SKEW_SECONDS,
+            "offlineQueue": False,
+        },
+    }
 
 
 @app.put("/api/admin/locations")

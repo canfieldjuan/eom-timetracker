@@ -34,6 +34,8 @@ services:
         sync: false
       - key: ALLOWED_ORIGIN_REGEX
         sync: false
+      - key: PUBLIC_APP_URL
+        sync: false
       - key: ALLOW_PUBLIC_REGISTRATION
         value: "false"
       - key: ATLAS_RECEIVABLES_BASE_URL
