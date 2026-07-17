@@ -852,16 +852,7 @@
             const departButton = document.getElementById('departButton');
             const clockOutButton = document.getElementById('clockOutButton');
 
-            if (state.myStatus) {
-                chip.className = 'status-chip status-on';
-                chip.textContent = 'Clocked in';
-                const statusText = state.myStatus.canDepart ? 'On site' : 'In transit';
-                details.textContent = `Location: ${state.myStatus.location || '-'} | Status: ${statusText} | Started: ${state.myStatus.clockInTime || '-'}`;
-                clockInButton.disabled = true;
-                arriveButton.disabled = state.myStatus.canDepart;
-                departButton.disabled = !state.myStatus.canDepart;
-                clockOutButton.disabled = false;
-            } else if (state.staleOpenShift) {
+            if (state.staleOpenShift) {
                 const stale = state.staleOpenShift;
                 chip.className = 'status-chip status-review';
                 chip.textContent = 'Needs review';
@@ -872,6 +863,15 @@
                 arriveButton.disabled = true;
                 departButton.disabled = true;
                 clockOutButton.disabled = true;
+            } else if (state.myStatus) {
+                chip.className = 'status-chip status-on';
+                chip.textContent = 'Clocked in';
+                const statusText = state.myStatus.canDepart ? 'On site' : 'In transit';
+                details.textContent = `Location: ${state.myStatus.location || '-'} | Status: ${statusText} | Started: ${state.myStatus.clockInTime || '-'}`;
+                clockInButton.disabled = true;
+                arriveButton.disabled = state.myStatus.canDepart;
+                departButton.disabled = !state.myStatus.canDepart;
+                clockOutButton.disabled = false;
             } else {
                 chip.className = 'status-chip status-off';
                 chip.textContent = 'Not clocked in';

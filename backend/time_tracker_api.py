@@ -991,6 +991,26 @@ def is_stale_open_entry(entry: Dict[str, Any], reference_time: datetime) -> bool
     return elapsed_hours > MAX_ACTIVE_SHIFT_HOURS
 
 
+def get_stale_open_entry(
+    entries: List[Dict[str, Any]],
+    employee_id: int,
+    reference_time: datetime,
+) -> Optional[Dict[str, Any]]:
+    stale_entries = [
+        entry
+        for entry in entries
+        if entry.get("employeeId") == employee_id
+        and is_stale_open_entry(entry, reference_time)
+    ]
+    if not stale_entries:
+        return None
+
+    stale_entries.sort(
+        key=lambda item: (str(item.get("clockIn", "")), int(item.get("id", 0)))
+    )
+    return stale_entries[0]
+
+
 STALE_SHIFT_REVIEW_CODE = "STALE_SHIFT_REQUIRES_REVIEW"
 
 
@@ -2446,9 +2466,12 @@ def clock_in(
     work_date = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         existing_open = get_open_entry(timesheet_data["entries"], employee["id"])
-        if existing_open and is_stale_open_entry(existing_open, now_utc):
-            return False, stale_shift_review_failure(existing_open, now_utc)
         if existing_open:
             return False, "Already clocked in"
 
@@ -2524,11 +2547,14 @@ def clock_out(
     now_utc = utc_now()
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
         if not open_entry:
             return False, "Not currently clocked in"
-        if is_stale_open_entry(open_entry, now_utc):
-            return False, stale_shift_review_failure(open_entry, now_utc)
 
         override_error = require_gps_override(
             timesheet_data,
@@ -2592,11 +2618,14 @@ def log_visit(
     now_utc = utc_now()
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
         if not open_entry:
             return False, "Not currently clocked in"
-        if is_stale_open_entry(open_entry, now_utc):
-            return False, stale_shift_review_failure(open_entry, now_utc)
 
         override_error = require_gps_override(
             timesheet_data,
@@ -2675,11 +2704,14 @@ def depart_location(
     now_utc = utc_now()
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee["id"], now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
         if not open_entry:
             return False, "Not currently clocked in"
-        if is_stale_open_entry(open_entry, now_utc):
-            return False, stale_shift_review_failure(open_entry, now_utc)
 
         override_error = require_gps_override(
             timesheet_data,
@@ -3011,13 +3043,20 @@ def timesheet_current_status(
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     timesheet_data = load_timesheets()
+    now_utc = utc_now()
+    own_stale_open = get_stale_open_entry(
+        timesheet_data.get("entries", []), int(employee["id"]), now_utc
+    )
     rows = build_public_current_status(timesheet_data)
     if employee.get("role") != "admin":
-        rows = [row for row in rows if int(row.get("id", 0)) == int(employee["id"])]
-    own_open_entry = get_open_entry(timesheet_data.get("entries", []), int(employee["id"]))
+        rows = (
+            []
+            if own_stale_open
+            else [row for row in rows if int(row.get("id", 0)) == int(employee["id"])]
+        )
     stale_open_shift = (
-        stale_open_shift_summary(own_open_entry, utc_now())
-        if own_open_entry
+        stale_open_shift_summary(own_stale_open, now_utc)
+        if own_stale_open
         else None
     )
     response_rows = [

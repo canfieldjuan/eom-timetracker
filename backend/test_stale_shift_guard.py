@@ -30,6 +30,29 @@ def _insert_stale_shift(employee_id, location_id, *, days_old=3):
     return shift_id, clock_in
 
 
+def _insert_recent_open_shift(employee_id, location_id, *, hours_old=1):
+    clock_in = datetime.now(timezone.utc) - timedelta(hours=hours_old)
+    shift_id = db.execute_returning(
+        """
+        INSERT INTO shifts (
+            employee_id,
+            location_id,
+            location_label,
+            clock_in,
+            clock_out,
+            total_hours,
+            notes,
+            local_date,
+            timezone
+        )
+        VALUES (%s, %s, '123 Main St, Effingham', %s, NULL, NULL, '', %s, 'America/Chicago')
+        RETURNING id
+        """,
+        (employee_id, location_id, clock_in, clock_in.date()),
+    )
+    return shift_id
+
+
 def _delete_open_shifts(employee_id):
     db.execute(
         "DELETE FROM shifts WHERE employee_id = %s AND clock_out IS NULL",
@@ -139,6 +162,58 @@ def test_unrelated_write_never_auto_closes_stale_shift(
         assert stored["notes"] == ""
     finally:
         db.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+
+
+def test_older_stale_shift_blocks_actions_when_a_newer_open_shift_exists(
+    client,
+    emp_auth,
+    employee_id,
+    location_id,
+):
+    _delete_open_shifts(employee_id)
+    stale_id, _ = _insert_stale_shift(employee_id, location_id)
+    recent_id = _insert_recent_open_shift(employee_id, location_id)
+
+    try:
+        status = client.get("/api/timesheet/current-status", headers=emp_auth)
+        assert status.status_code == 200, status.text
+        assert status.json()["currentlyWorking"] == []
+        assert status.json()["staleOpenShift"]["shiftId"] == stale_id
+
+        attempts = [
+            ("/api/timesheet/clock-in", {"location": "123 Main St, Effingham"}),
+            ("/api/timesheet/clock-out", {}),
+            ("/api/timesheet/visit", {"location": "123 Main St, Effingham"}),
+            ("/api/timesheet/depart", {}),
+        ]
+        for endpoint, payload in attempts:
+            response = client.post(endpoint, headers=emp_auth, json=payload)
+            assert response.status_code == 409, (endpoint, response.text)
+            error = response.json()
+            assert error["code"] == "STALE_SHIFT_REQUIRES_REVIEW"
+            assert error["details"]["staleOpenShift"]["shiftId"] == stale_id
+
+        stored = db.query_all(
+            """
+            SELECT id, clock_out
+            FROM shifts
+            WHERE id = ANY(%s)
+            ORDER BY id
+            """,
+            ([stale_id, recent_id],),
+        )
+        assert [row["id"] for row in stored] == [stale_id, recent_id]
+        assert all(row["clock_out"] is None for row in stored)
+        assert db.query_one(
+            "SELECT COUNT(*) AS count FROM visits WHERE shift_id = %s",
+            (recent_id,),
+        )["count"] == 0
+        assert db.query_one(
+            "SELECT COUNT(*) AS count FROM departures WHERE shift_id = %s",
+            (recent_id,),
+        )["count"] == 0
+    finally:
+        db.execute("DELETE FROM shifts WHERE id = ANY(%s)", ([stale_id, recent_id],))
 
 
 def test_verified_admin_correction_clears_stale_shift_block(
