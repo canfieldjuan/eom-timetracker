@@ -15,9 +15,10 @@ implement the future QR check-in backlog item.
 - Coordinates inside the configured site radius are accepted. Coordinates
   outside the radius, or coordinates that cannot be compared because no site
   is pinned, require an explicit override reason.
+- Override details are accepted only with an explicit override reason.
 - The browser sends the device-reported accuracy in meters. The server stores
-  it as evidence but does not treat it as proof that the device location is
-  genuine and does not apply an accuracy cutoff in this slice.
+  any finite, nonnegative value as evidence but does not treat it as proof that
+  the device location is genuine and does not apply an accuracy cutoff.
 - Administrators can see the latest coordinates, reported accuracy, site-match
   result, and any override reason in the live worker dashboard.
 
