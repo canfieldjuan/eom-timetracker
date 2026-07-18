@@ -1751,6 +1751,28 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1)
 
 
+SELF_SERVICE_PASSWORD_MIN_LENGTH = 8
+BCRYPT_PASSWORD_MAX_BYTES = 72
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(alias="currentPassword", min_length=1, max_length=256)
+    new_password: str = Field(
+        alias="newPassword",
+        min_length=SELF_SERVICE_PASSWORD_MIN_LENGTH,
+        max_length=BCRYPT_PASSWORD_MAX_BYTES,
+    )
+
+    @field_validator("new_password")
+    @classmethod
+    def new_password_must_fit_bcrypt(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > BCRYPT_PASSWORD_MAX_BYTES:
+            raise ValueError(
+                f"newPassword must be at most {BCRYPT_PASSWORD_MAX_BYTES} UTF-8 bytes"
+            )
+        return value
+
+
 class RegisterRequest(BaseModel):
     name: str = Field(min_length=2)
     password: str = Field(min_length=4)
@@ -2097,6 +2119,12 @@ if PUBLIC_APP_URL and not re.fullmatch(r"https?://[^\s]+", PUBLIC_APP_URL):
 
 LOGIN_RATE_LIMIT_MAX        = parse_int(os.getenv("LOGIN_RATE_LIMIT_MAX"),        10)
 LOGIN_RATE_LIMIT_WINDOW_S   = parse_int(os.getenv("LOGIN_RATE_LIMIT_WINDOW_S"),   60)
+PASSWORD_CHANGE_RATE_LIMIT_MAX = parse_int(
+    os.getenv("PASSWORD_CHANGE_RATE_LIMIT_MAX"), 5
+)
+PASSWORD_CHANGE_RATE_LIMIT_WINDOW_S = parse_int(
+    os.getenv("PASSWORD_CHANGE_RATE_LIMIT_WINDOW_S"), 300
+)
 REGISTER_RATE_LIMIT_MAX     = parse_int(os.getenv("REGISTER_RATE_LIMIT_MAX"),      3)
 REGISTER_RATE_LIMIT_WINDOW_S = parse_int(os.getenv("REGISTER_RATE_LIMIT_WINDOW_S"), 300)
 RATE_LIMIT_BUCKET_SOFT_CAP  = parse_int(os.getenv("RATE_LIMIT_BUCKET_SOFT_CAP"), 10000)
@@ -4162,6 +4190,53 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
         "token": token,
         "employee": {"id": employee["id"], "name": employee["name"], "role": employee.get("role", "employee")},
     }
+
+
+@app.post("/api/auth/change-password")
+def change_password(
+    payload: ChangePasswordRequest,
+    request: Request,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, bool]:
+    _rate_limit_check(
+        request,
+        key_prefix=f"change-password:{employee['id']}",
+        max_calls=PASSWORD_CHANGE_RATE_LIMIT_MAX,
+        window_seconds=PASSWORD_CHANGE_RATE_LIMIT_WINDOW_S,
+    )
+
+    def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, str]:
+        account = find_employee_by_id(employees_data["employees"], int(employee["id"]))
+        if not account or not account.get("active", True):
+            return False, "Current password is incorrect"
+        if not verify_password(payload.current_password, account["password"]):
+            return False, "Current password is incorrect"
+        if verify_password(payload.new_password, account["password"]):
+            return False, "New password must be different from the current password"
+
+        account["password"] = bcrypt.hashpw(
+            payload.new_password.encode("utf-8"),
+            bcrypt.gensalt(10),
+        ).decode("utf-8")
+        return True, "Password updated"
+
+    updated, result = update_employees(mutator)
+    if not updated:
+        append_access_log(
+            request,
+            "PASSWORD_CHANGE_FAILED",
+            False,
+            f"Employee id={employee['id']}",
+        )
+        raise HTTPException(status_code=400, detail=result)
+
+    append_access_log(
+        request,
+        "PASSWORD_CHANGED",
+        True,
+        f"Employee id={employee['id']}",
+    )
+    return {"success": True}
 
 
 def create_employee_account(
