@@ -577,7 +577,11 @@
                 <div>
                     <label for="arrivalTimecardReconciliationView">View</label>
                     <select id="arrivalTimecardReconciliationView">
-                        <option value="exceptions">Exceptions only</option>
+                        <option value="open">Open exceptions</option>
+                        <option value="needs_correction">Needs correction</option>
+                        <option value="resolved">Resolved exceptions</option>
+                        <option value="reopened">Reopened exceptions</option>
+                        <option value="exceptions">All exceptions</option>
                         <option value="all">All scheduled arrivals</option>
                         <option value="matched">Matched</option>
                         <option value="pending">Pending</option>
@@ -1870,15 +1874,30 @@
             return `${Math.abs(numericMinutes)} min ${direction} QR`;
         }
 
+        function arrivalTimecardReviewStateLabel(reviewState) {
+            const labels = {
+                open: 'Open - not reviewed',
+                reopened: 'Reopened - evidence changed',
+                resolved: 'Resolved - no timecard change',
+                needs_correction: 'Needs timecard correction',
+                not_applicable: 'No exception review needed'
+            };
+            return labels[reviewState] || humanizeSiteCheckInValue(reviewState);
+        }
+
         function renderArrivalTimecardReconciliation(payload) {
             const list = document.getElementById('arrivalTimecardReconciliationList');
             const summaryElement = document.getElementById('arrivalTimecardReconciliationSummary');
             const summary = payload && payload.summary ? payload.summary : {};
+            const reviewSummary = payload && payload.reviewSummary ? payload.reviewSummary : {};
             const rows = payload && Array.isArray(payload.rows) ? payload.rows : [];
             summaryElement.textContent = [
                 `${summary.total || 0} scheduled`,
                 `${summary.matched || 0} matched`,
                 `${summary.exceptions || 0} exception${summary.exceptions === 1 ? '' : 's'}`,
+                `${reviewSummary.open || 0} open`,
+                `${reviewSummary.resolved || 0} resolved`,
+                `${reviewSummary.needsCorrection || 0} need correction`,
                 `${summary.pending || 0} pending`,
                 `${payload.gapThresholdMinutes || 0}-minute allowed gap`
             ].join(' | ');
@@ -1908,7 +1927,31 @@
                       `Geofence: ${humanizeSiteCheckInValue(qr.geofenceStatus)} | ` +
                       `Review: ${humanizeSiteCheckInValue(qr.reviewStatus)}`
                     : 'QR evidence: missing';
-                const cardClass = row.hasException
+                const review = row.review;
+                const reviewDetail = review
+                    ? `${arrivalTimecardReviewStateLabel(row.reviewState)} by ${review.reviewedBy} ` +
+                      `at ${formatCorrectionTimestamp(review.reviewedAt)}: ${review.note}`
+                    : arrivalTimecardReviewStateLabel(row.reviewState);
+                const reviewActions = row.hasException
+                    ? `
+                        <div class="row">
+                            <button
+                                type="button"
+                                data-arrival-review-key="${escapeHtml(row.key)}"
+                                data-arrival-review-fingerprint="${escapeHtml(row.evidenceFingerprint)}"
+                                data-arrival-review-disposition="resolved"
+                            >Resolve - no timecard change</button>
+                            <button
+                                class="btn-danger"
+                                type="button"
+                                data-arrival-review-key="${escapeHtml(row.key)}"
+                                data-arrival-review-fingerprint="${escapeHtml(row.evidenceFingerprint)}"
+                                data-arrival-review-disposition="needs_correction"
+                            >Flag timecard correction</button>
+                        </div>
+                    `
+                    : '';
+                const cardClass = row.hasOpenReview
                     ? 'correction-card warning'
                     : 'correction-card';
                 return `
@@ -1930,6 +1973,8 @@
                             Difference: ${escapeHtml(formatArrivalTimecardDifference(row.timecardDifferenceMinutes))}
                         </p>
                         <p class="meta">${escapeHtml(row.outcomeReason)}</p>
+                        <p class="meta">Review: ${escapeHtml(reviewDetail)}</p>
+                        ${reviewActions}
                     </div>
                 `;
             }).join('');
@@ -1956,7 +2001,9 @@
             if (siteId) filters.set('siteId', siteId);
             if (fromDate) filters.set('fromDate', fromDate);
             if (toDate) filters.set('toDate', toDate);
-            if (selectedView === 'exceptions') {
+            if (['open', 'reopened', 'resolved', 'needs_correction'].includes(selectedView)) {
+                filters.set('reviewState', selectedView);
+            } else if (selectedView === 'exceptions') {
                 filters.set('exceptionsOnly', 'true');
             } else if (selectedView !== 'all') {
                 filters.set('outcome', selectedView);
@@ -1971,6 +2018,45 @@
                 );
                 renderArrivalTimecardReconciliation(payload);
                 setMessage(message, 'success', 'Read-only reconciliation loaded. No timecards changed.');
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
+        async function reviewArrivalTimecardException(
+            occurrenceKey,
+            evidenceFingerprint,
+            disposition
+        ) {
+            const message = document.getElementById('arrivalTimecardReconciliationMessage');
+            const action = disposition === 'resolved'
+                ? 'resolved with no timecard change'
+                : 'flagged for timecard correction';
+            const note = window.prompt(`Why is this exception being ${action}?`);
+            if (note === null) {
+                return;
+            }
+            if (note.trim().length < 3) {
+                setMessage(message, 'error', 'Enter a review note with at least 3 characters.');
+                return;
+            }
+            try {
+                const encodedKey = encodeURIComponent(occurrenceKey);
+                const payload = await apiRequest(
+                    `/admin/site-check-in-reconciliation/${encodedKey}/review`,
+                    'POST',
+                    {
+                        evidenceFingerprint,
+                        disposition,
+                        note: note.trim()
+                    },
+                    true
+                );
+                if (payload.timecardsChanged !== false) {
+                    throw new Error('Review safety confirmation was missing');
+                }
+                await loadArrivalTimecardReconciliation();
+                setMessage(message, 'success', `Exception ${action}. No timecards changed.`);
             } catch (error) {
                 setMessage(message, 'error', error.message);
             }
@@ -2762,6 +2848,19 @@
         document.getElementById('refreshArrivalTimecardReconciliationButton').addEventListener(
             'click',
             loadArrivalTimecardReconciliation
+        );
+        document.getElementById('arrivalTimecardReconciliationList').addEventListener(
+            'click',
+            (event) => {
+                const button = event.target.closest('[data-arrival-review-key]');
+                if (button) {
+                    reviewArrivalTimecardException(
+                        button.dataset.arrivalReviewKey,
+                        button.dataset.arrivalReviewFingerprint,
+                        button.dataset.arrivalReviewDisposition
+                    );
+                }
+            }
         );
         document.getElementById('siteCheckInReviewList').addEventListener('click', (event) => {
             const button = event.target.closest('[data-site-review-id]');

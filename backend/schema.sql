@@ -194,6 +194,28 @@ CREATE TABLE site_check_ins (
     UNIQUE (employee_id, location_id, device_scanned_at)
 );
 
+-- Append-only admin dispositions for derived reconciliation exceptions. A
+-- disposition applies only to the exact evidence fingerprint that was
+-- reviewed; changed QR or timecard evidence automatically reopens the row.
+CREATE TABLE site_check_in_reconciliation_reviews (
+    id                   BIGSERIAL PRIMARY KEY,
+    occurrence_key       VARCHAR(128) NOT NULL,
+    evidence_fingerprint VARCHAR(64) NOT NULL
+                             CHECK (evidence_fingerprint ~ '^[0-9a-f]{64}$'),
+    employee_id          INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    location_id          INTEGER REFERENCES locations(id) ON DELETE SET NULL,
+    scheduled_start      TIMESTAMPTZ NOT NULL,
+    outcome              VARCHAR(32) NOT NULL,
+    evidence             JSONB NOT NULL,
+    disposition          VARCHAR(32) NOT NULL
+                             CHECK (disposition IN ('resolved', 'needs_correction')),
+    note                 TEXT NOT NULL
+                             CHECK (char_length(note) BETWEEN 3 AND 500),
+    reviewed_by          INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    reviewed_by_name     TEXT NOT NULL,
+    reviewed_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Settings (key-value)
 CREATE TABLE settings (
     key   TEXT PRIMARY KEY,
@@ -266,6 +288,10 @@ CREATE INDEX idx_site_check_ins_employee_time
     ON site_check_ins(employee_id, server_checked_in_at DESC);
 CREATE INDEX idx_site_check_ins_review
     ON site_check_ins(review_status, server_checked_in_at DESC);
+CREATE INDEX idx_site_check_in_reconciliation_reviews_lookup
+    ON site_check_in_reconciliation_reviews(
+        occurrence_key, evidence_fingerprint, reviewed_at DESC
+    );
 CREATE INDEX idx_time_data_correction_batches_created
     ON time_data_correction_batches(created_at);
 CREATE INDEX idx_receivables_operation_attempts_state

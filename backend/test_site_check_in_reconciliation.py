@@ -21,6 +21,7 @@ def isolate_reconciliation_data(setup_db):
     def clean() -> None:
         conn = _raw_conn()
         with conn.cursor() as cur:
+            cur.execute("DELETE FROM site_check_in_reconciliation_reviews")
             cur.execute("DELETE FROM site_check_ins")
             cur.execute("DELETE FROM site_check_in_schedule_rules")
             cur.execute("DELETE FROM site_check_in_schedules")
@@ -264,6 +265,13 @@ class TestArrivalTimecardReconciliation:
         )
         assert invalid_outcome.status_code == 400
 
+        invalid_review = client.get(
+            "/api/admin/site-check-in-reconciliation",
+            headers=auth,
+            params={"reviewState": "hidden_forever"},
+        )
+        assert invalid_review.status_code == 400
+
     def test_exact_schedule_overrides_weekly_rule_and_matches_clock_in(
         self,
         client,
@@ -334,6 +342,16 @@ class TestArrivalTimecardReconciliation:
         assert row["timecardDifferenceMinutes"] == -2.0
         assert row["timecardEvent"]["eventType"] == "clock_in"
         assert row["timecardEvent"]["siteId"] == location_id
+        rejected_review = client.post(
+            f"/api/admin/site-check-in-reconciliation/{row['key']}/review",
+            headers=auth,
+            json={
+                "evidenceFingerprint": row["evidenceFingerprint"],
+                "disposition": "resolved",
+                "note": "Matched rows need no disposition",
+            },
+        )
+        assert rejected_review.status_code == 409
         assert reconciliation_source_snapshot() == source_before
 
     def test_explicit_arrived_event_wins_and_wrong_site_is_flagged(
@@ -521,6 +539,265 @@ class TestArrivalTimecardReconciliation:
         assert exceptions.json()["returned"] == 3
         assert all(row["hasException"] for row in exceptions.json()["rows"])
 
+    def test_review_dispositions_are_admin_only_audited_and_filterable(
+        self,
+        client,
+        auth,
+        emp_auth,
+        employee_id,
+        location_id,
+        monkeypatch,
+    ):
+        import time_tracker_api
+
+        scheduled_start = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        current_time = {"value": scheduled_start + timedelta(minutes=20)}
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: current_time["value"])
+        create_exact_schedule(
+            client,
+            auth,
+            employee_id,
+            location_id,
+            scheduled_start,
+        )
+
+        initial = client.get(
+            "/api/admin/site-check-in-reconciliation",
+            headers=auth,
+            params={"fromDate": "2026-07-20", "toDate": "2026-07-20"},
+        )
+        assert initial.status_code == 200, initial.text
+        payload = initial.json()
+        row = payload["rows"][0]
+        assert row["outcome"] == "missing_both"
+        assert row["reviewState"] == "open"
+        assert row["hasOpenReview"] is True
+        assert row["review"] is None
+        assert len(row["evidenceFingerprint"]) == 64
+        reworded_row = dict(row)
+        reworded_row["outcomeReason"] = "Display copy changed without new evidence."
+        assert (
+            time_tracker_api._site_check_in_reconciliation_fingerprint(reworded_row)
+            == row["evidenceFingerprint"]
+        )
+        assert payload["reviewSummary"] == {
+            "open": 1,
+            "resolved": 0,
+            "needsCorrection": 0,
+            "reopened": 0,
+        }
+
+        forbidden = client.post(
+            f"/api/admin/site-check-in-reconciliation/{row['key']}/review",
+            headers=emp_auth,
+            json={
+                "evidenceFingerprint": row["evidenceFingerprint"],
+                "disposition": "resolved",
+                "note": "Admin review required",
+            },
+        )
+        assert forbidden.status_code == 403
+
+        invalid_fingerprint = client.post(
+            f"/api/admin/site-check-in-reconciliation/{row['key']}/review",
+            headers=auth,
+            json={
+                "evidenceFingerprint": "not-a-fingerprint",
+                "disposition": "resolved",
+                "note": "Evidence reviewed",
+            },
+        )
+        assert invalid_fingerprint.status_code == 422
+
+        source_before = reconciliation_source_snapshot()
+        resolved = client.post(
+            f"/api/admin/site-check-in-reconciliation/{row['key']}/review",
+            headers=auth,
+            json={
+                "evidenceFingerprint": row["evidenceFingerprint"],
+                "disposition": "resolved",
+                "note": "Employee called before arrival",
+            },
+        )
+        assert resolved.status_code == 200, resolved.text
+        resolved_payload = resolved.json()
+        assert resolved_payload["timecardsChanged"] is False
+        assert resolved_payload["row"]["reviewState"] == "resolved"
+        assert resolved_payload["row"]["hasOpenReview"] is False
+        saved_review = resolved_payload["row"]["review"]
+        assert saved_review["id"] > 0
+        assert saved_review["disposition"] == "resolved"
+        assert saved_review["note"] == "Employee called before arrival"
+        assert saved_review["reviewedBy"] == "Juan Canfield"
+        assert saved_review["reviewedAt"].endswith("Z")
+        assert saved_review["outcome"] == "missing_both"
+        assert reconciliation_source_snapshot() == source_before
+
+        open_rows = client.get(
+            "/api/admin/site-check-in-reconciliation",
+            headers=auth,
+            params={
+                "fromDate": "2026-07-20",
+                "toDate": "2026-07-20",
+                "reviewState": "open",
+            },
+        )
+        assert open_rows.status_code == 200, open_rows.text
+        assert open_rows.json()["rows"] == []
+        assert open_rows.json()["reviewSummary"]["resolved"] == 1
+
+        resolved_rows = client.get(
+            "/api/admin/site-check-in-reconciliation",
+            headers=auth,
+            params={
+                "fromDate": "2026-07-20",
+                "toDate": "2026-07-20",
+                "reviewState": "resolved",
+            },
+        )
+        assert resolved_rows.status_code == 200, resolved_rows.text
+        assert resolved_rows.json()["returned"] == 1
+
+        needs_correction = client.post(
+            f"/api/admin/site-check-in-reconciliation/{row['key']}/review",
+            headers=auth,
+            json={
+                "evidenceFingerprint": row["evidenceFingerprint"],
+                "disposition": "needs_correction",
+                "note": "Verify and correct the paid entry",
+            },
+        )
+        assert needs_correction.status_code == 200, needs_correction.text
+        assert needs_correction.json()["row"]["reviewState"] == "needs_correction"
+        assert needs_correction.json()["row"]["hasOpenReview"] is True
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT disposition, note, reviewed_by_name, evidence
+                FROM site_check_in_reconciliation_reviews
+                ORDER BY id
+                """
+            )
+            history = cur.fetchall()
+        conn.close()
+        assert [record[0] for record in history] == ["resolved", "needs_correction"]
+        assert history[0][1] == "Employee called before arrival"
+        assert history[0][2] == "Juan Canfield"
+        assert history[0][3]["outcome"] == "missing_both"
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO site_check_in_reconciliation_reviews (
+                    occurrence_key, evidence_fingerprint, employee_id,
+                    location_id, scheduled_start, outcome, evidence,
+                    disposition, note, reviewed_by, reviewed_by_name
+                )
+                SELECT occurrence_key, %s, employee_id, location_id,
+                       scheduled_start, outcome, evidence, 'resolved',
+                       'A later review of different evidence', reviewed_by,
+                       reviewed_by_name
+                FROM site_check_in_reconciliation_reviews
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("b" * 64,),
+            )
+        conn.commit()
+        conn.close()
+
+        returned_to_prior_evidence = client.get(
+            "/api/admin/site-check-in-reconciliation",
+            headers=auth,
+            params={"fromDate": "2026-07-20", "toDate": "2026-07-20"},
+        )
+        assert returned_to_prior_evidence.status_code == 200
+        prior_row = returned_to_prior_evidence.json()["rows"][0]
+        assert prior_row["reviewHistoryCount"] == 3
+        assert prior_row["reviewState"] == "needs_correction"
+        assert prior_row["review"]["note"] == "Verify and correct the paid entry"
+
+    def test_changed_evidence_reopens_review_and_rejects_stale_write(
+        self,
+        client,
+        auth,
+        emp_auth,
+        employee_id,
+        location_id,
+        monkeypatch,
+    ):
+        import time_tracker_api
+
+        scheduled_start = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        current_time = {"value": scheduled_start + timedelta(minutes=20)}
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: current_time["value"])
+        create_exact_schedule(
+            client,
+            auth,
+            employee_id,
+            location_id,
+            scheduled_start,
+        )
+        token = create_qr_token(client, auth, location_id)
+
+        initial = client.get(
+            "/api/admin/site-check-in-reconciliation",
+            headers=auth,
+            params={"fromDate": "2026-07-20", "toDate": "2026-07-20"},
+        )
+        initial_row = initial.json()["rows"][0]
+        old_fingerprint = initial_row["evidenceFingerprint"]
+        reviewed = client.post(
+            f"/api/admin/site-check-in-reconciliation/{initial_row['key']}/review",
+            headers=auth,
+            json={
+                "evidenceFingerprint": old_fingerprint,
+                "disposition": "resolved",
+                "note": "No evidence was expected",
+            },
+        )
+        assert reviewed.status_code == 200, reviewed.text
+
+        current_time["value"] = scheduled_start + timedelta(minutes=25)
+        record_qr_check_in(
+            client,
+            emp_auth,
+            employee_id,
+            location_id,
+            token,
+            current_time["value"],
+        )
+        current_time["value"] = scheduled_start + timedelta(minutes=30)
+        changed = client.get(
+            "/api/admin/site-check-in-reconciliation",
+            headers=auth,
+            params={"fromDate": "2026-07-20", "toDate": "2026-07-20"},
+        )
+        assert changed.status_code == 200, changed.text
+        changed_row = changed.json()["rows"][0]
+        assert changed_row["outcome"] == "missing_time_entry"
+        assert changed_row["reviewState"] == "reopened"
+        assert changed_row["hasOpenReview"] is True
+        assert changed_row["review"] is None
+        assert changed_row["reviewHistoryCount"] == 1
+        assert changed_row["evidenceFingerprint"] != old_fingerprint
+        assert changed.json()["reviewSummary"]["reopened"] == 1
+
+        stale = client.post(
+            f"/api/admin/site-check-in-reconciliation/{changed_row['key']}/review",
+            headers=auth,
+            json={
+                "evidenceFingerprint": old_fingerprint,
+                "disposition": "resolved",
+                "note": "This browser view is stale",
+            },
+        )
+        assert stale.status_code == 409
+        assert "evidence changed" in stale.json()["error"].lower()
+
     def test_time_gap_and_unresolved_qr_evidence_remain_exceptions(
         self,
         client,
@@ -650,3 +927,9 @@ def test_frontend_exposes_read_only_arrival_timecard_reconciliation():
     assert "filters.set('exceptionsOnly', 'true')" in html
     assert "filters.set('outcome', selectedView)" in html
     assert "timecardDifferenceMinutes" in html
+    assert "Open exceptions" in html
+    assert "Flag timecard correction" in html
+    assert "reviewArrivalTimecardException" in html
+    assert "filters.set('reviewState', selectedView)" in html
+    assert "/admin/site-check-in-reconciliation/${encodedKey}/review" in html
+    assert "No timecards changed" in html

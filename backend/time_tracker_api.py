@@ -1884,6 +1884,17 @@ class SiteCheckInReviewRequest(BaseModel):
         return value.strip() if isinstance(value, str) else value
 
 
+class SiteCheckInReconciliationReviewRequest(BaseModel):
+    evidenceFingerprint: str = Field(pattern="^[0-9a-f]{64}$")
+    disposition: str = Field(pattern="^(resolved|needs_correction)$")
+    note: str = Field(min_length=3, max_length=500)
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def strip_reconciliation_review_note(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class ClockOutRequest(BaseModel):
     notes: str = Field(default="", max_length=MAX_NOTES_LEN)
     latitude: Optional[float] = Field(default=None, ge=-90, le=90)
@@ -2956,6 +2967,32 @@ def _ensure_schema_migrations() -> None:
         ON site_check_ins(review_status, server_checked_in_at DESC)
     """)
     db.execute("""
+        CREATE TABLE IF NOT EXISTS site_check_in_reconciliation_reviews (
+            id                   BIGSERIAL PRIMARY KEY,
+            occurrence_key       VARCHAR(128) NOT NULL,
+            evidence_fingerprint VARCHAR(64) NOT NULL
+                                     CHECK (evidence_fingerprint ~ '^[0-9a-f]{64}$'),
+            employee_id          INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            location_id          INTEGER REFERENCES locations(id) ON DELETE SET NULL,
+            scheduled_start      TIMESTAMPTZ NOT NULL,
+            outcome              VARCHAR(32) NOT NULL,
+            evidence             JSONB NOT NULL,
+            disposition          VARCHAR(32) NOT NULL
+                                     CHECK (disposition IN ('resolved', 'needs_correction')),
+            note                 TEXT NOT NULL
+                                     CHECK (char_length(note) BETWEEN 3 AND 500),
+            reviewed_by          INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            reviewed_by_name     TEXT NOT NULL,
+            reviewed_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_site_check_in_reconciliation_reviews_lookup
+        ON site_check_in_reconciliation_reviews(
+            occurrence_key, evidence_fingerprint, reviewed_at DESC
+        )
+    """)
+    db.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id              SERIAL PRIMARY KEY,
             location_id     INTEGER REFERENCES locations(id),
@@ -3666,6 +3703,122 @@ def _serialize_reconciliation_timecard_event(
             else None
         ),
     }
+
+
+def _site_check_in_reconciliation_evidence(
+    row: Dict[str, Any],
+) -> Dict[str, Any]:
+    qr = row.get("qrCheckIn") or {}
+    timecard = row.get("timecardEvent") or {}
+    return {
+        "employeeId": row["employeeId"],
+        "siteId": row["siteId"],
+        "scheduledStart": row["scheduledStart"],
+        "dueAt": row["dueAt"],
+        "graceMinutes": row["graceMinutes"],
+        "scheduleId": row.get("scheduleId"),
+        "scheduleRuleId": row.get("scheduleRuleId"),
+        "outcome": row["outcome"],
+        "timecardDifferenceMinutes": row.get("timecardDifferenceMinutes"),
+        "qrCheckIn": (
+            {
+                "id": qr.get("id"),
+                "serverCheckedInAt": qr.get("serverCheckedInAt"),
+                "classification": qr.get("classification"),
+                "classificationReason": qr.get("classificationReason"),
+                "geofenceStatus": qr.get("geofenceStatus"),
+                "distanceM": qr.get("distanceM"),
+                "accuracyM": qr.get("accuracyM"),
+                "reviewStatus": qr.get("reviewStatus"),
+            }
+            if qr
+            else None
+        ),
+        "timecardEvent": (
+            {
+                "eventType": timecard.get("eventType"),
+                "eventAt": timecard.get("eventAt"),
+                "shiftId": timecard.get("shiftId"),
+                "visitId": timecard.get("visitId"),
+                "siteId": timecard.get("siteId"),
+                "siteName": timecard.get("siteName"),
+                "locationLabel": timecard.get("locationLabel"),
+            }
+            if timecard
+            else None
+        ),
+    }
+
+
+def _site_check_in_reconciliation_fingerprint(row: Dict[str, Any]) -> str:
+    evidence = _site_check_in_reconciliation_evidence(row)
+    canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _serialize_site_check_in_reconciliation_review(
+    row: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "disposition": str(row["disposition"]),
+        "note": str(row["note"]),
+        "reviewedBy": str(row["reviewed_by_name"]),
+        "reviewedAt": to_utc_iso(row["reviewed_at"]),
+        "outcome": str(row["outcome"]),
+    }
+
+
+def _attach_site_check_in_reconciliation_reviews(
+    rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not rows:
+        return rows
+    review_rows = db.query_all(
+        """
+        SELECT id, occurrence_key, evidence_fingerprint, outcome,
+               disposition, note, reviewed_by_name, reviewed_at
+        FROM site_check_in_reconciliation_reviews
+        WHERE occurrence_key = ANY(%s)
+        ORDER BY reviewed_at DESC, id DESC
+        """,
+        ([str(row["key"]) for row in rows],),
+    )
+    reviews_by_key: Dict[str, List[Dict[str, Any]]] = {}
+    for review in review_rows:
+        reviews_by_key.setdefault(str(review["occurrence_key"]), []).append(review)
+
+    for row in rows:
+        fingerprint = _site_check_in_reconciliation_fingerprint(row)
+        history = reviews_by_key.get(str(row["key"]), [])
+        current_review = next(
+            (
+                review
+                for review in history
+                if str(review["evidence_fingerprint"]) == fingerprint
+            ),
+            None,
+        )
+        row["evidenceFingerprint"] = fingerprint
+        row["reviewHistoryCount"] = len(history)
+        row["review"] = (
+            _serialize_site_check_in_reconciliation_review(current_review)
+            if current_review
+            else None
+        )
+        if not row["hasException"]:
+            row["reviewState"] = "not_applicable"
+            row["hasOpenReview"] = False
+        elif current_review:
+            row["reviewState"] = str(current_review["disposition"])
+            row["hasOpenReview"] = current_review["disposition"] != "resolved"
+        elif history:
+            row["reviewState"] = "reopened"
+            row["hasOpenReview"] = True
+        else:
+            row["reviewState"] = "open"
+            row["hasOpenReview"] = True
+    return rows
 
 
 def build_site_check_in_reconciliation(
@@ -4657,6 +4810,11 @@ def admin_site_check_in_reconciliation(
     to_date: Optional[date] = Query(default=None, alias="toDate"),
     outcome: Optional[str] = Query(default=None, max_length=32),
     exceptions_only: bool = Query(default=False, alias="exceptionsOnly"),
+    review_state: Optional[str] = Query(
+        default=None,
+        alias="reviewState",
+        max_length=32,
+    ),
     limit: int = Query(default=200, ge=1, le=500),
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
@@ -4689,6 +4847,17 @@ def admin_site_check_in_reconciliation(
     }
     if outcome is not None and outcome not in allowed_outcomes:
         raise HTTPException(status_code=400, detail="Invalid reconciliation outcome filter")
+    allowed_review_states = {
+        "open",
+        "reopened",
+        "resolved",
+        "needs_correction",
+    }
+    if review_state is not None and review_state not in allowed_review_states:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid reconciliation review filter",
+        )
 
     rows = build_site_check_in_reconciliation(
         selected_from,
@@ -4697,6 +4866,7 @@ def admin_site_check_in_reconciliation(
         site_id=site_id,
         now_utc=official_now,
     )
+    _attach_site_check_in_reconciliation_reviews(rows)
     outcome_counts = {name: 0 for name in sorted(allowed_outcomes)}
     for row in rows:
         outcome_counts[row["outcome"]] += 1
@@ -4711,11 +4881,32 @@ def admin_site_check_in_reconciliation(
         ),
         "byOutcome": outcome_counts,
     }
+    exception_rows = [row for row in rows if row["hasException"]]
+    review_summary = {
+        "open": sum(1 for row in exception_rows if row["hasOpenReview"]),
+        "resolved": sum(
+            1 for row in exception_rows if row["reviewState"] == "resolved"
+        ),
+        "needsCorrection": sum(
+            1
+            for row in exception_rows
+            if row["reviewState"] == "needs_correction"
+        ),
+        "reopened": sum(
+            1 for row in exception_rows if row["reviewState"] == "reopened"
+        ),
+    }
     filtered_rows = rows
     if exceptions_only:
         filtered_rows = [row for row in filtered_rows if row["hasException"]]
     if outcome:
         filtered_rows = [row for row in filtered_rows if row["outcome"] == outcome]
+    if review_state == "open":
+        filtered_rows = [row for row in filtered_rows if row["hasOpenReview"]]
+    elif review_state:
+        filtered_rows = [
+            row for row in filtered_rows if row["reviewState"] == review_state
+        ]
     filtered_rows = filtered_rows[:limit]
     return {
         "success": True,
@@ -4725,8 +4916,107 @@ def admin_site_check_in_reconciliation(
         "gapThresholdMinutes": SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES,
         "readOnly": True,
         "summary": summary,
+        "reviewSummary": review_summary,
         "returned": len(filtered_rows),
         "rows": filtered_rows,
+    }
+
+
+def _site_check_in_reconciliation_date_for_key(occurrence_key: str) -> date:
+    exact_match = re.fullmatch(r"exact:(\d+)", occurrence_key)
+    if exact_match:
+        schedule = db.query_one(
+            "SELECT scheduled_start FROM site_check_in_schedules WHERE id = %s",
+            (int(exact_match.group(1)),),
+        )
+        if not schedule:
+            raise HTTPException(status_code=404, detail="Scheduled arrival not found")
+        return schedule["scheduled_start"].astimezone(APP_TIMEZONE).date()
+
+    rule_match = re.fullmatch(r"rule:(\d+):(\d{4}-\d{2}-\d{2})", occurrence_key)
+    if rule_match:
+        try:
+            return date.fromisoformat(rule_match.group(2))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid reconciliation occurrence key",
+            ) from exc
+    raise HTTPException(status_code=400, detail="Invalid reconciliation occurrence key")
+
+
+@app.post("/api/admin/site-check-in-reconciliation/{occurrence_key}/review")
+def admin_review_site_check_in_reconciliation(
+    occurrence_key: str,
+    payload: SiteCheckInReconciliationReviewRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    occurrence_date = _site_check_in_reconciliation_date_for_key(occurrence_key)
+    rows = build_site_check_in_reconciliation(
+        occurrence_date,
+        occurrence_date,
+        now_utc=utc_now(),
+    )
+    row = next((item for item in rows if item["key"] == occurrence_key), None)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Reconciliation occurrence not found",
+        )
+    _attach_site_check_in_reconciliation_reviews([row])
+    if not row["hasException"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Only reconciliation exceptions require a disposition",
+        )
+    if row["evidenceFingerprint"] != payload.evidenceFingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail="Reconciliation evidence changed; refresh before reviewing",
+        )
+
+    evidence = _site_check_in_reconciliation_evidence(row)
+    review = db.query_one(
+        """
+        INSERT INTO site_check_in_reconciliation_reviews (
+            occurrence_key, evidence_fingerprint, employee_id, location_id,
+            scheduled_start, outcome, evidence, disposition, note,
+            reviewed_by, reviewed_by_name
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            occurrence_key,
+            row["evidenceFingerprint"],
+            row["employeeId"],
+            row["siteId"],
+            parse_utc_iso(row["scheduledStart"]),
+            row["outcome"],
+            json.dumps(evidence),
+            payload.disposition,
+            payload.note,
+            int(admin["id"]),
+            str(admin["name"]),
+        ),
+    )
+    if not review:
+        raise RuntimeError("Reconciliation review was saved but could not be reloaded")
+    _attach_site_check_in_reconciliation_reviews([row])
+    append_access_log(
+        request,
+        "ARRIVAL_EXCEPTION_REVIEWED",
+        True,
+        (
+            f"Arrival {occurrence_key} marked {payload.disposition} "
+            f"by {admin['name']}"
+        ),
+    )
+    return {
+        "success": True,
+        "timecardsChanged": False,
+        "row": row,
     }
 
 
