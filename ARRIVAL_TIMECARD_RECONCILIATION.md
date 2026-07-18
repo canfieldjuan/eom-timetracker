@@ -18,6 +18,10 @@ time, but it does not create future reconciliation rows.
 The endpoint accepts employee, site, company-local date, outcome, and
 exceptions-only filters. A request is limited to 31 calendar days.
 
+Admin dispositions for derived exceptions are stored separately under the
+append-only contract in `ARRIVAL_EXCEPTION_REVIEW.md`. The reconciliation GET
+remains read-only; recording a disposition never changes paid-time evidence.
+
 ## Evidence matching
 
 For each scheduled row, the server matches at most one QR check-in and one
@@ -65,4 +69,4 @@ Mayra to review; it is not an automatic wage or disciplinary decision.
 `GET /api/admin/site-check-in-reconciliation` is admin-only and returns the
 official as-of time, threshold, summary counts, and evidence rows. The admin
 **Arrival vs. Timecard** view uses the same employee, site, and date filters as
-**Arrival Activity** and defaults to exceptions only.
+**Arrival Activity** and defaults to open exceptions.
