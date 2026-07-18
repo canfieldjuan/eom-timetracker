@@ -3719,7 +3719,6 @@ def _site_check_in_reconciliation_evidence(
         "scheduleId": row.get("scheduleId"),
         "scheduleRuleId": row.get("scheduleRuleId"),
         "outcome": row["outcome"],
-        "outcomeReason": row["outcomeReason"],
         "timecardDifferenceMinutes": row.get("timecardDifferenceMinutes"),
         "qrCheckIn": (
             {
@@ -3792,11 +3791,13 @@ def _attach_site_check_in_reconciliation_reviews(
     for row in rows:
         fingerprint = _site_check_in_reconciliation_fingerprint(row)
         history = reviews_by_key.get(str(row["key"]), [])
-        latest = history[0] if history else None
-        current_review = (
-            latest
-            if latest and str(latest["evidence_fingerprint"]) == fingerprint
-            else None
+        current_review = next(
+            (
+                review
+                for review in history
+                if str(review["evidence_fingerprint"]) == fingerprint
+            ),
+            None,
         )
         row["evidenceFingerprint"] = fingerprint
         row["reviewHistoryCount"] = len(history)

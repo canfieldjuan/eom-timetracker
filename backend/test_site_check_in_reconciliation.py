@@ -574,6 +574,12 @@ class TestArrivalTimecardReconciliation:
         assert row["hasOpenReview"] is True
         assert row["review"] is None
         assert len(row["evidenceFingerprint"]) == 64
+        reworded_row = dict(row)
+        reworded_row["outcomeReason"] = "Display copy changed without new evidence."
+        assert (
+            time_tracker_api._site_check_in_reconciliation_fingerprint(reworded_row)
+            == row["evidenceFingerprint"]
+        )
         assert payload["reviewSummary"] == {
             "open": 1,
             "resolved": 0,
@@ -680,6 +686,39 @@ class TestArrivalTimecardReconciliation:
         assert history[0][1] == "Employee called before arrival"
         assert history[0][2] == "Juan Canfield"
         assert history[0][3]["outcome"] == "missing_both"
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO site_check_in_reconciliation_reviews (
+                    occurrence_key, evidence_fingerprint, employee_id,
+                    location_id, scheduled_start, outcome, evidence,
+                    disposition, note, reviewed_by, reviewed_by_name
+                )
+                SELECT occurrence_key, %s, employee_id, location_id,
+                       scheduled_start, outcome, evidence, 'resolved',
+                       'A later review of different evidence', reviewed_by,
+                       reviewed_by_name
+                FROM site_check_in_reconciliation_reviews
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                ("b" * 64,),
+            )
+        conn.commit()
+        conn.close()
+
+        returned_to_prior_evidence = client.get(
+            "/api/admin/site-check-in-reconciliation",
+            headers=auth,
+            params={"fromDate": "2026-07-20", "toDate": "2026-07-20"},
+        )
+        assert returned_to_prior_evidence.status_code == 200
+        prior_row = returned_to_prior_evidence.json()["rows"][0]
+        assert prior_row["reviewHistoryCount"] == 3
+        assert prior_row["reviewState"] == "needs_correction"
+        assert prior_row["review"]["note"] == "Verify and correct the paid entry"
 
     def test_changed_evidence_reopens_review_and_rejects_stale_write(
         self,
