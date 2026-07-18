@@ -3,10 +3,26 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import re
 
 import pytest
 
 import db
+
+
+def test_default_portal_cors_is_limited_to_owned_frontends():
+    import time_tracker_api as api
+
+    assert "https://effinghamofficemaids.com" in api.DEFAULT_PORTAL_ALLOWED_ORIGINS
+    assert "https://www.effinghamofficemaids.com" in api.DEFAULT_PORTAL_ALLOWED_ORIGINS
+    assert re.fullmatch(
+        api.DEFAULT_PORTAL_ALLOWED_ORIGIN_REGEX,
+        "https://effingham-office-maids-websi-git-dc77db-juan-canfields-projects.vercel.app",
+    )
+    assert not re.fullmatch(
+        api.DEFAULT_PORTAL_ALLOWED_ORIGIN_REGEX,
+        "https://effingham-office-maids-websi-git-dc77db-attacker.vercel.app",
+    )
 
 
 @pytest.mark.parametrize("path", ["/", "/timetracker-mobile.html"])
