@@ -4,9 +4,10 @@ This file records approved future product slices. An item listed here is not yet
 
 ## QR Site Check-In
 
-Status: Core QR check-in and recurring weekly arrival rules are deployed. The
-admin Arrival Activity view is in the current implementation slice, pending
-review and deployment. See `QR_SITE_CHECKIN.md`.
+Status: Core QR check-in, recurring weekly arrival rules, and the admin Arrival
+Activity view are deployed. Read-only arrival-versus-timecard reconciliation is
+the current implementation slice. See `QR_SITE_CHECKIN.md` and
+`ARRIVAL_TIMECARD_RECONCILIATION.md`.
 
 Add a **Check in** action for employees with this contract:
 

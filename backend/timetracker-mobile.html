@@ -521,7 +521,8 @@
                 <button id="refreshSiteCheckInActivityButton" type="button">Apply Filters</button>
             </div>
             <p class="meta">
-                Shows official server-timed QR arrivals. Filters use the company timezone.
+                Shows official server-timed QR arrivals. Employee, site, and date filters
+                also control the timecard reconciliation below. Dates use the company timezone.
             </p>
             <div class="row">
                 <div>
@@ -560,6 +561,35 @@
             <p id="siteCheckInActivitySummary" class="meta">No arrival activity loaded.</p>
             <div id="siteCheckInActivityList">
                 <p class="meta">No arrival activity loaded.</p>
+            </div>
+
+            <div class="row" style="margin-top: 16px;">
+                <h3>Arrival vs. Timecard</h3>
+                <button id="refreshArrivalTimecardReconciliationButton" type="button">
+                    Refresh Reconciliation
+                </button>
+            </div>
+            <p class="meta">
+                Read-only comparison of scheduled QR arrivals against paid clock-ins and
+                Arrived events. This does not change timecards or wages.
+            </p>
+            <div class="row">
+                <div>
+                    <label for="arrivalTimecardReconciliationView">View</label>
+                    <select id="arrivalTimecardReconciliationView">
+                        <option value="exceptions">Exceptions only</option>
+                        <option value="all">All scheduled arrivals</option>
+                        <option value="matched">Matched</option>
+                        <option value="pending">Pending</option>
+                    </select>
+                </div>
+            </div>
+            <div id="arrivalTimecardReconciliationMessage" class="message"></div>
+            <p id="arrivalTimecardReconciliationSummary" class="meta">
+                No reconciliation loaded.
+            </p>
+            <div id="arrivalTimecardReconciliationList">
+                <p class="meta">No reconciliation loaded.</p>
             </div>
 
             <div class="row" style="margin-top: 16px;">
@@ -1800,6 +1830,152 @@
             }
         }
 
+        function arrivalTimecardOutcomeStyle(outcome) {
+            if (outcome === 'matched') {
+                return 'status-on';
+            }
+            if (outcome === 'pending') {
+                return 'status-review';
+            }
+            return 'status-off';
+        }
+
+        function arrivalTimecardOutcomeLabel(outcome) {
+            const labels = {
+                matched: 'Matched',
+                pending: 'Pending',
+                missing_qr: 'Missing QR',
+                missing_time_entry: 'Missing time entry',
+                missing_both: 'Missing both',
+                site_mismatch: 'Site mismatch',
+                time_gap: 'Time gap',
+                qr_needs_review: 'QR needs review',
+                qr_rejected: 'QR rejected'
+            };
+            return labels[outcome] || humanizeSiteCheckInValue(outcome);
+        }
+
+        function formatArrivalTimecardDifference(minutes) {
+            if (minutes === null || minutes === undefined) {
+                return 'No timestamp comparison';
+            }
+            const numericMinutes = Number(minutes);
+            if (!Number.isFinite(numericMinutes)) {
+                return 'No timestamp comparison';
+            }
+            if (numericMinutes === 0) {
+                return 'Same minute as QR';
+            }
+            const direction = numericMinutes < 0 ? 'before' : 'after';
+            return `${Math.abs(numericMinutes)} min ${direction} QR`;
+        }
+
+        function renderArrivalTimecardReconciliation(payload) {
+            const list = document.getElementById('arrivalTimecardReconciliationList');
+            const summaryElement = document.getElementById('arrivalTimecardReconciliationSummary');
+            const summary = payload && payload.summary ? payload.summary : {};
+            const rows = payload && Array.isArray(payload.rows) ? payload.rows : [];
+            summaryElement.textContent = [
+                `${summary.total || 0} scheduled`,
+                `${summary.matched || 0} matched`,
+                `${summary.exceptions || 0} exception${summary.exceptions === 1 ? '' : 's'}`,
+                `${summary.pending || 0} pending`,
+                `${payload.gapThresholdMinutes || 0}-minute allowed gap`
+            ].join(' | ');
+
+            if (!rows.length) {
+                list.innerHTML = '<p class="meta">No reconciliation rows match this view.</p>';
+                return;
+            }
+
+            list.innerHTML = rows.map((row) => {
+                const qr = row.qrCheckIn;
+                const timecard = row.timecardEvent;
+                const qrText = qr
+                    ? formatCorrectionTimestamp(qr.serverCheckedInAt)
+                    : 'Missing';
+                const timecardAction = timecard && timecard.eventType === 'visit'
+                    ? 'Arrived'
+                    : 'Clock in';
+                const timecardText = timecard
+                    ? `${timecardAction} ${formatCorrectionTimestamp(timecard.eventAt)}`
+                    : 'Missing';
+                const timecardSite = timecard
+                    ? (timecard.siteName || timecard.locationLabel || 'Unknown site')
+                    : '-';
+                const qrEvidence = qr
+                    ? `QR status: ${humanizeSiteCheckInValue(qr.classification)} | ` +
+                      `Geofence: ${humanizeSiteCheckInValue(qr.geofenceStatus)} | ` +
+                      `Review: ${humanizeSiteCheckInValue(qr.reviewStatus)}`
+                    : 'QR evidence: missing';
+                const cardClass = row.hasException
+                    ? 'correction-card warning'
+                    : 'correction-card';
+                return `
+                    <div class="${cardClass}">
+                        <div class="activity-card-header">
+                            <strong>${escapeHtml(row.employeeName)} at ${escapeHtml(row.siteName)}</strong>
+                            <span class="status-chip ${arrivalTimecardOutcomeStyle(row.outcome)}">
+                                ${escapeHtml(arrivalTimecardOutcomeLabel(row.outcome))}
+                            </span>
+                        </div>
+                        <p class="meta">
+                            Scheduled: ${escapeHtml(formatCorrectionTimestamp(row.scheduledStart))} |
+                            QR: ${escapeHtml(qrText)} |
+                            Paid event: ${escapeHtml(timecardText)} |
+                            Paid site: ${escapeHtml(timecardSite)}
+                        </p>
+                        <p class="meta">
+                            ${escapeHtml(qrEvidence)} |
+                            Difference: ${escapeHtml(formatArrivalTimecardDifference(row.timecardDifferenceMinutes))}
+                        </p>
+                        <p class="meta">${escapeHtml(row.outcomeReason)}</p>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function loadArrivalTimecardReconciliation() {
+            if (!hasAdminSession()) {
+                return;
+            }
+            const message = document.getElementById('arrivalTimecardReconciliationMessage');
+            clearMessage(message);
+            const fromDate = document.getElementById('siteCheckInActivityFromDate').value;
+            const toDate = document.getElementById('siteCheckInActivityToDate').value;
+            if (fromDate && toDate && fromDate > toDate) {
+                setMessage(message, 'error', 'From date must be on or before through date.');
+                return;
+            }
+
+            const filters = new URLSearchParams({ limit: '500' });
+            const employeeId = document.getElementById('siteCheckInActivityEmployee').value;
+            const siteId = document.getElementById('siteCheckInActivitySite').value;
+            const selectedView = document.getElementById('arrivalTimecardReconciliationView').value;
+            if (employeeId) filters.set('employeeId', employeeId);
+            if (siteId) filters.set('siteId', siteId);
+            if (fromDate) filters.set('fromDate', fromDate);
+            if (toDate) filters.set('toDate', toDate);
+            if (selectedView === 'exceptions') {
+                filters.set('exceptionsOnly', 'true');
+            } else if (selectedView !== 'all') {
+                filters.set('outcome', selectedView);
+            }
+
+            try {
+                const payload = await apiRequest(
+                    `/admin/site-check-in-reconciliation?${filters.toString()}`,
+                    'GET',
+                    null,
+                    true
+                );
+                renderArrivalTimecardReconciliation(payload);
+                setMessage(message, 'success', 'Read-only reconciliation loaded. No timecards changed.');
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
         function renderSiteCheckInReviews(checkIns) {
             const list = document.getElementById('siteCheckInReviewList');
             if (!checkIns.length) {
@@ -1858,7 +2034,11 @@
                     decision,
                     note: note.trim()
                 }, true);
-                await Promise.all([loadSiteCheckInReviews(), loadSiteCheckInActivity()]);
+                await Promise.all([
+                    loadSiteCheckInReviews(),
+                    loadSiteCheckInActivity(),
+                    loadArrivalTimecardReconciliation()
+                ]);
                 setMessage(message, 'success', `Check-in ${decision}.`);
             } catch (error) {
                 setMessage(message, 'error', error.message);
@@ -1883,6 +2063,7 @@
                 await loadAdminCheckInEmployees();
                 await Promise.all([
                     loadSiteCheckInActivity(),
+                    loadArrivalTimecardReconciliation(),
                     loadSiteCheckInReviews(),
                     loadRecurringSiteCheckInSchedules()
                 ]);
@@ -2571,7 +2752,16 @@
         document.getElementById('refreshSiteCheckInReviewsButton').addEventListener('click', loadSiteCheckInReviews);
         document.getElementById('refreshSiteCheckInActivityButton').addEventListener(
             'click',
-            loadSiteCheckInActivity
+            async () => {
+                await Promise.all([
+                    loadSiteCheckInActivity(),
+                    loadArrivalTimecardReconciliation()
+                ]);
+            }
+        );
+        document.getElementById('refreshArrivalTimecardReconciliationButton').addEventListener(
+            'click',
+            loadArrivalTimecardReconciliation
         );
         document.getElementById('siteCheckInReviewList').addEventListener('click', (event) => {
             const button = event.target.closest('[data-site-review-id]');

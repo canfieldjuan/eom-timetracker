@@ -233,11 +233,16 @@ SITE_CHECK_IN_RADIUS_DEFAULT_M = 50
 SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M = 100
 SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS = 12
 SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS = 600
+SITE_CHECK_IN_RECONCILIATION_GAP_DEFAULT_MINUTES = 15
+SITE_CHECK_IN_RECONCILIATION_MAX_DAYS = 31
 SITE_CHECK_IN_QR_VERSION = "eom1"
 SITE_CHECK_IN_RADIUS_M = SITE_CHECK_IN_RADIUS_DEFAULT_M
 SITE_CHECK_IN_MAX_ACCURACY_M = SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M
 SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS
 SITE_CHECK_IN_DEVICE_SKEW_SECONDS = SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS
+SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES = (
+    SITE_CHECK_IN_RECONCILIATION_GAP_DEFAULT_MINUTES
+)
 
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -2046,6 +2051,13 @@ SITE_CHECK_IN_DEVICE_SKEW_SECONDS = max(
         SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS,
     ),
 )
+SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES = max(
+    0,
+    parse_int(
+        os.getenv("SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES"),
+        SITE_CHECK_IN_RECONCILIATION_GAP_DEFAULT_MINUTES,
+    ),
+)
 
 ACCESS_START_HOUR = parse_int(os.getenv("ACCESS_START_HOUR"), 8)
 ACCESS_END_HOUR = parse_int(os.getenv("ACCESS_END_HOUR"), 18)
@@ -3180,6 +3192,505 @@ def _serialize_site_check_in(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _site_check_in_reconciliation_window(
+    from_date: date,
+    to_date: date,
+) -> Tuple[datetime, datetime]:
+    start_local = datetime.combine(from_date, clock_time.min, tzinfo=APP_TIMEZONE)
+    end_local = datetime.combine(
+        to_date + timedelta(days=1),
+        clock_time.min,
+        tzinfo=APP_TIMEZONE,
+    )
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def _site_check_in_reconciliation_occurrences(
+    from_date: date,
+    to_date: date,
+    employee_id: Optional[int],
+    site_id: Optional[int],
+) -> List[Dict[str, Any]]:
+    start_utc, end_utc = _site_check_in_reconciliation_window(from_date, to_date)
+    override_window = timedelta(hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS)
+    exact_clauses = ["sc.scheduled_start >= %s", "sc.scheduled_start < %s"]
+    exact_params: List[Any] = [start_utc - override_window, end_utc + override_window]
+    if employee_id is not None:
+        exact_clauses.append("sc.employee_id = %s")
+        exact_params.append(employee_id)
+    if site_id is not None:
+        exact_clauses.append("sc.location_id = %s")
+        exact_params.append(site_id)
+    exact_rows = db.query_all(
+        f"""
+        SELECT sc.id, sc.employee_id, e.name AS employee_name,
+               sc.location_id, l.address AS site_name,
+               sc.scheduled_start, sc.grace_minutes
+        FROM site_check_in_schedules sc
+        JOIN employees e ON e.id = sc.employee_id
+        JOIN locations l ON l.id = sc.location_id
+        WHERE {' AND '.join(exact_clauses)}
+        ORDER BY sc.scheduled_start, sc.id
+        """,
+        tuple(exact_params),
+    )
+
+    occurrences: List[Dict[str, Any]] = []
+    exact_starts: Dict[Tuple[int, int], List[datetime]] = {}
+    for row in exact_rows:
+        scheduled_start = row["scheduled_start"]
+        pair = (int(row["employee_id"]), int(row["location_id"]))
+        exact_starts.setdefault(pair, []).append(scheduled_start)
+        if not start_utc <= scheduled_start < end_utc:
+            continue
+        occurrences.append(
+            {
+                "key": f"exact:{int(row['id'])}",
+                "employee_id": pair[0],
+                "employee_name": str(row.get("employee_name") or ""),
+                "location_id": pair[1],
+                "site_name": str(row.get("site_name") or ""),
+                "scheduled_start": scheduled_start,
+                "grace_minutes": int(row["grace_minutes"]),
+                "schedule_id": int(row["id"]),
+                "schedule_rule_id": None,
+                "schedule_source": "exact",
+            }
+        )
+
+    rule_clauses = [
+        "sr.starts_on <= %s",
+        "sr.ends_on >= %s",
+        "(sr.active = true OR sr.updated_at >= %s)",
+    ]
+    rule_params: List[Any] = [to_date, from_date, start_utc]
+    if employee_id is not None:
+        rule_clauses.append("sr.employee_id = %s")
+        rule_params.append(employee_id)
+    if site_id is not None:
+        rule_clauses.append("sr.location_id = %s")
+        rule_params.append(site_id)
+    rule_rows = db.query_all(
+        f"""
+        SELECT sr.id, sr.employee_id, e.name AS employee_name,
+               sr.location_id, l.address AS site_name, sr.weekdays,
+               sr.local_start_time, sr.timezone, sr.starts_on,
+               NULLIF(sr.ends_on, 'infinity'::date) AS ends_on,
+               sr.grace_minutes, sr.active, sr.updated_at
+        FROM site_check_in_schedule_rules sr
+        JOIN employees e ON e.id = sr.employee_id
+        JOIN locations l ON l.id = sr.location_id
+        WHERE {' AND '.join(rule_clauses)}
+        ORDER BY sr.id
+        """,
+        tuple(rule_params),
+    )
+
+    recurring_keys: set[Tuple[int, int, datetime]] = set()
+    override_window_seconds = SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS * 3600
+    for row in rule_rows:
+        try:
+            rule_zone = ZoneInfo(str(row["timezone"]))
+        except (KeyError, ValueError):
+            logger.warning(
+                "Ignoring site check-in rule %s with invalid timezone",
+                row.get("id"),
+            )
+            continue
+        employee_key = int(row["employee_id"])
+        site_key = int(row["location_id"])
+        pair = (employee_key, site_key)
+        weekdays = {int(day) for day in row["weekdays"]}
+        local_day = start_utc.astimezone(rule_zone).date() - timedelta(days=1)
+        final_local_day = end_utc.astimezone(rule_zone).date() + timedelta(days=1)
+        rule_end = row.get("ends_on") or date.max
+        while local_day <= final_local_day:
+            if (
+                local_day.weekday() in weekdays
+                and row["starts_on"] <= local_day <= rule_end
+            ):
+                local_start = datetime.combine(
+                    local_day,
+                    row["local_start_time"],
+                    tzinfo=rule_zone,
+                )
+                scheduled_start = local_start.astimezone(timezone.utc)
+                exact_override = any(
+                    abs((exact_start - scheduled_start).total_seconds())
+                    <= override_window_seconds
+                    for exact_start in exact_starts.get(pair, [])
+                )
+                recurring_key = (employee_key, site_key, scheduled_start)
+                active_at_occurrence = bool(row["active"]) or (
+                    scheduled_start <= row["updated_at"]
+                )
+                if (
+                    start_utc <= scheduled_start < end_utc
+                    and not exact_override
+                    and active_at_occurrence
+                    and recurring_key not in recurring_keys
+                ):
+                    recurring_keys.add(recurring_key)
+                    occurrences.append(
+                        {
+                            "key": f"rule:{int(row['id'])}:{local_day.isoformat()}",
+                            "employee_id": employee_key,
+                            "employee_name": str(row.get("employee_name") or ""),
+                            "location_id": site_key,
+                            "site_name": str(row.get("site_name") or ""),
+                            "scheduled_start": scheduled_start,
+                            "grace_minutes": int(row["grace_minutes"]),
+                            "schedule_id": None,
+                            "schedule_rule_id": int(row["id"]),
+                            "schedule_source": "weekly_rule",
+                        }
+                    )
+            local_day += timedelta(days=1)
+
+    return sorted(
+        occurrences,
+        key=lambda row: (
+            row["scheduled_start"],
+            row["employee_name"],
+            row["location_id"],
+        ),
+    )
+
+
+def _site_check_in_reconciliation_check_ins(
+    occurrences: List[Dict[str, Any]],
+    start_utc: datetime,
+    end_utc: datetime,
+) -> List[Dict[str, Any]]:
+    if not occurrences:
+        return []
+    employee_ids = sorted({row["employee_id"] for row in occurrences})
+    site_ids = sorted({row["location_id"] for row in occurrences})
+    window = timedelta(hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS)
+    return db.query_all(
+        """
+        SELECT ci.*, e.name AS employee_name, l.address AS site_name,
+               reviewer.name AS reviewed_by_name
+        FROM site_check_ins ci
+        JOIN employees e ON e.id = ci.employee_id
+        JOIN locations l ON l.id = ci.location_id
+        LEFT JOIN employees reviewer ON reviewer.id = ci.reviewed_by
+        WHERE ci.employee_id = ANY(%s)
+          AND ci.location_id = ANY(%s)
+          AND ci.server_checked_in_at >= %s
+          AND ci.server_checked_in_at < %s
+        ORDER BY ci.server_checked_in_at, ci.id
+        """,
+        (employee_ids, site_ids, start_utc - window, end_utc + window),
+    )
+
+
+def _site_check_in_reconciliation_timecard_events(
+    occurrences: List[Dict[str, Any]],
+    start_utc: datetime,
+    end_utc: datetime,
+) -> List[Dict[str, Any]]:
+    if not occurrences:
+        return []
+    employee_ids = sorted({row["employee_id"] for row in occurrences})
+    window = timedelta(hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS)
+    return db.query_all(
+        """
+        SELECT 'clock_in'::text AS event_type, s.id AS shift_id,
+               NULL::integer AS visit_id, s.employee_id,
+               CASE
+                   WHEN l.id IS NOT NULL AND s.location_label = l.address THEN l.id
+                   ELSE NULL
+               END AS location_id,
+               CASE
+                   WHEN l.id IS NOT NULL AND s.location_label = l.address THEN l.address
+                   ELSE NULL
+               END AS site_name,
+               s.location_label, s.clock_in AS event_at,
+               s.clock_in AS shift_clock_in, s.clock_out AS shift_clock_out
+        FROM shifts s
+        LEFT JOIN locations l ON l.id = s.location_id
+        WHERE s.employee_id = ANY(%s)
+          AND s.clock_in >= %s
+          AND s.clock_in < %s
+
+        UNION ALL
+
+        SELECT 'visit'::text AS event_type, s.id AS shift_id,
+               v.id AS visit_id, s.employee_id, v.location_id,
+               l.address AS site_name, v.location_label,
+               v.arrival_time AS event_at, s.clock_in AS shift_clock_in,
+               s.clock_out AS shift_clock_out
+        FROM visits v
+        JOIN shifts s ON s.id = v.shift_id
+        LEFT JOIN locations l ON l.id = v.location_id
+        WHERE s.employee_id = ANY(%s)
+          AND v.arrival_time >= %s
+          AND v.arrival_time < %s
+
+        ORDER BY event_at, shift_id, event_type
+        """,
+        (
+            employee_ids,
+            start_utc - window,
+            end_utc + window,
+            employee_ids,
+            start_utc - window,
+            end_utc + window,
+        ),
+    )
+
+
+def _match_reconciliation_check_in(
+    occurrence: Dict[str, Any],
+    check_ins: List[Dict[str, Any]],
+    used_ids: set[int],
+) -> Optional[Dict[str, Any]]:
+    scheduled_start = occurrence["scheduled_start"]
+    max_distance = SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS * 3600
+    candidates = []
+    for row in check_ins:
+        row_id = int(row["id"])
+        if row_id in used_ids:
+            continue
+        if (
+            int(row["employee_id"]) != occurrence["employee_id"]
+            or int(row["location_id"]) != occurrence["location_id"]
+        ):
+            continue
+        distance = abs((row["server_checked_in_at"] - scheduled_start).total_seconds())
+        if distance > max_distance:
+            continue
+        exact_link = (
+            occurrence["schedule_id"] is not None
+            and row.get("schedule_id") == occurrence["schedule_id"]
+        )
+        rule_link = (
+            occurrence["schedule_rule_id"] is not None
+            and row.get("schedule_rule_id") == occurrence["schedule_rule_id"]
+        )
+        candidates.append((0 if exact_link or rule_link else 1, distance, row_id, row))
+    if not candidates:
+        return None
+    selected = min(candidates)[3]
+    used_ids.add(int(selected["id"]))
+    return selected
+
+
+def _match_reconciliation_timecard_event(
+    occurrence: Dict[str, Any],
+    check_in: Optional[Dict[str, Any]],
+    events: List[Dict[str, Any]],
+    used_keys: set[str],
+) -> Optional[Dict[str, Any]]:
+    scheduled_start = occurrence["scheduled_start"]
+    anchor = check_in["server_checked_in_at"] if check_in else scheduled_start
+    max_distance = SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS * 3600
+    candidates = []
+    for row in events:
+        if int(row["employee_id"]) != occurrence["employee_id"]:
+            continue
+        event_key = (
+            f"visit:{int(row['visit_id'])}"
+            if row.get("visit_id") is not None
+            else f"clock_in:{int(row['shift_id'])}"
+        )
+        if event_key in used_keys:
+            continue
+        schedule_distance = abs((row["event_at"] - scheduled_start).total_seconds())
+        if schedule_distance > max_distance:
+            continue
+        row_site_id = int(row["location_id"]) if row.get("location_id") else None
+        site_rank = 0 if row_site_id == occurrence["location_id"] else 1
+        anchor_distance = abs((row["event_at"] - anchor).total_seconds())
+        event_type_rank = 0 if row["event_type"] == "visit" else 1
+        candidates.append(
+            (site_rank, anchor_distance, event_type_rank, schedule_distance, event_key, row)
+        )
+    if not candidates:
+        return None
+    selected_entry = min(candidates)
+    used_keys.add(selected_entry[4])
+    return selected_entry[5]
+
+
+def _site_check_in_reconciliation_outcome(
+    occurrence: Dict[str, Any],
+    check_in: Optional[Dict[str, Any]],
+    event: Optional[Dict[str, Any]],
+    now_utc: datetime,
+) -> Tuple[str, str, Optional[float]]:
+    due_at = occurrence["scheduled_start"] + timedelta(
+        minutes=occurrence["grace_minutes"]
+    )
+    if now_utc <= due_at and (check_in is None or event is None):
+        return "pending", "The scheduled arrival is still within its grace period.", None
+
+    event_site_id = int(event["location_id"]) if event and event.get("location_id") else None
+    site_matches = event_site_id == occurrence["location_id"]
+    if check_in is None:
+        if event is None:
+            return "missing_both", "No QR arrival or paid-time arrival was found.", None
+        if not site_matches:
+            return "site_mismatch", "Paid-time evidence points to a different or unknown site.", None
+        return "missing_qr", "Paid-time arrival exists, but no matching QR arrival was found.", None
+    if event is None:
+        return "missing_time_entry", "QR arrival exists, but no paid-time arrival was found.", None
+    difference_minutes = round(
+        (event["event_at"] - check_in["server_checked_in_at"]).total_seconds() / 60,
+        1,
+    )
+    if not site_matches:
+        return (
+            "site_mismatch",
+            "QR and paid-time evidence do not identify the same site.",
+            difference_minutes,
+        )
+    if (
+        check_in["classification"] == "needs_review"
+        and check_in["review_status"] != "approved"
+    ):
+        if check_in["review_status"] == "rejected":
+            return (
+                "qr_rejected",
+                "The matching QR evidence was rejected by an admin.",
+                difference_minutes,
+            )
+        return (
+            "qr_needs_review",
+            "The matching QR evidence still requires an admin decision.",
+            difference_minutes,
+        )
+    if abs(difference_minutes) > SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES:
+        return (
+            "time_gap",
+            "QR and paid-time arrivals are farther apart than the allowed gap.",
+            difference_minutes,
+        )
+    return (
+        "matched",
+        "QR and paid-time arrivals agree within the allowed gap.",
+        difference_minutes,
+    )
+
+
+def _serialize_reconciliation_check_in(
+    row: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    distance = row.get("distance_m")
+    return {
+        "id": int(row["id"]),
+        "serverCheckedInAt": to_utc_iso(row["server_checked_in_at"]),
+        "classification": str(row["classification"]),
+        "classificationReason": str(row["classification_reason"]),
+        "geofenceStatus": str(row["geofence_status"]),
+        "distanceM": float(distance) if distance is not None else None,
+        "accuracyM": float(row["accuracy_m"]),
+        "reviewStatus": str(row["review_status"]),
+    }
+
+
+def _serialize_reconciliation_timecard_event(
+    row: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    return {
+        "eventType": str(row["event_type"]),
+        "eventAt": to_utc_iso(row["event_at"]),
+        "shiftId": int(row["shift_id"]),
+        "visitId": int(row["visit_id"]) if row.get("visit_id") is not None else None,
+        "siteId": int(row["location_id"]) if row.get("location_id") else None,
+        "siteName": str(row.get("site_name") or ""),
+        "locationLabel": str(row.get("location_label") or ""),
+        "shiftClockIn": to_utc_iso(row["shift_clock_in"]),
+        "shiftClockOut": (
+            to_utc_iso(row["shift_clock_out"])
+            if row.get("shift_clock_out") is not None
+            else None
+        ),
+    }
+
+
+def build_site_check_in_reconciliation(
+    from_date: date,
+    to_date: date,
+    employee_id: Optional[int] = None,
+    site_id: Optional[int] = None,
+    now_utc: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    occurrences = _site_check_in_reconciliation_occurrences(
+        from_date,
+        to_date,
+        employee_id,
+        site_id,
+    )
+    start_utc, end_utc = _site_check_in_reconciliation_window(from_date, to_date)
+    check_ins = _site_check_in_reconciliation_check_ins(
+        occurrences,
+        start_utc,
+        end_utc,
+    )
+    events = _site_check_in_reconciliation_timecard_events(
+        occurrences,
+        start_utc,
+        end_utc,
+    )
+    used_check_in_ids: set[int] = set()
+    used_event_keys: set[str] = set()
+    official_now = now_utc or utc_now()
+    reconciled: List[Dict[str, Any]] = []
+    for occurrence in occurrences:
+        check_in = _match_reconciliation_check_in(
+            occurrence,
+            check_ins,
+            used_check_in_ids,
+        )
+        event = _match_reconciliation_timecard_event(
+            occurrence,
+            check_in,
+            events,
+            used_event_keys,
+        )
+        outcome, reason, difference_minutes = _site_check_in_reconciliation_outcome(
+            occurrence,
+            check_in,
+            event,
+            official_now,
+        )
+        due_at = occurrence["scheduled_start"] + timedelta(
+            minutes=occurrence["grace_minutes"]
+        )
+        reconciled.append(
+            {
+                "key": occurrence["key"],
+                "employeeId": occurrence["employee_id"],
+                "employeeName": occurrence["employee_name"],
+                "siteId": occurrence["location_id"],
+                "siteName": occurrence["site_name"],
+                "scheduledStart": to_utc_iso(occurrence["scheduled_start"]),
+                "dueAt": to_utc_iso(due_at),
+                "graceMinutes": occurrence["grace_minutes"],
+                "scheduleId": occurrence["schedule_id"],
+                "scheduleRuleId": occurrence["schedule_rule_id"],
+                "scheduleSource": occurrence["schedule_source"],
+                "outcome": outcome,
+                "outcomeReason": reason,
+                "hasException": outcome not in {"matched", "pending"},
+                "timecardDifferenceMinutes": difference_minutes,
+                "qrCheckIn": _serialize_reconciliation_check_in(check_in),
+                "timecardEvent": _serialize_reconciliation_timecard_event(event),
+            }
+        )
+    return sorted(
+        reconciled,
+        key=lambda row: (row["scheduledStart"], row["employeeName"], row["siteId"]),
+        reverse=True,
+    )
+
+
 def _matching_site_check_in_schedule(
     employee_id: int,
     site_id: int,
@@ -4057,6 +4568,87 @@ def admin_list_site_check_ins(
     return {
         "success": True,
         "checkIns": [_serialize_site_check_in(row) for row in rows],
+    }
+
+
+@app.get("/api/admin/site-check-in-reconciliation")
+def admin_site_check_in_reconciliation(
+    employee_id: Optional[int] = Query(default=None, alias="employeeId", gt=0),
+    site_id: Optional[int] = Query(default=None, alias="siteId", gt=0),
+    from_date: Optional[date] = Query(default=None, alias="fromDate"),
+    to_date: Optional[date] = Query(default=None, alias="toDate"),
+    outcome: Optional[str] = Query(default=None, max_length=32),
+    exceptions_only: bool = Query(default=False, alias="exceptionsOnly"),
+    limit: int = Query(default=200, ge=1, le=500),
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    official_now = utc_now()
+    company_today = official_now.astimezone(APP_TIMEZONE).date()
+    selected_from = from_date or company_today
+    selected_to = to_date or selected_from
+    if selected_from > selected_to:
+        raise HTTPException(status_code=400, detail="fromDate must be on or before toDate")
+    if selected_to == date.max:
+        raise HTTPException(status_code=400, detail="toDate is outside the supported range")
+    if (selected_to - selected_from).days >= SITE_CHECK_IN_RECONCILIATION_MAX_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Arrival reconciliation supports at most "
+                f"{SITE_CHECK_IN_RECONCILIATION_MAX_DAYS} days at a time"
+            ),
+        )
+    allowed_outcomes = {
+        "matched",
+        "pending",
+        "missing_qr",
+        "missing_time_entry",
+        "missing_both",
+        "site_mismatch",
+        "time_gap",
+        "qr_needs_review",
+        "qr_rejected",
+    }
+    if outcome is not None and outcome not in allowed_outcomes:
+        raise HTTPException(status_code=400, detail="Invalid reconciliation outcome filter")
+
+    rows = build_site_check_in_reconciliation(
+        selected_from,
+        selected_to,
+        employee_id=employee_id,
+        site_id=site_id,
+        now_utc=official_now,
+    )
+    outcome_counts = {name: 0 for name in sorted(allowed_outcomes)}
+    for row in rows:
+        outcome_counts[row["outcome"]] += 1
+    summary = {
+        "total": len(rows),
+        "matched": outcome_counts["matched"],
+        "pending": outcome_counts["pending"],
+        "exceptions": sum(
+            count
+            for name, count in outcome_counts.items()
+            if name not in {"matched", "pending"}
+        ),
+        "byOutcome": outcome_counts,
+    }
+    filtered_rows = rows
+    if exceptions_only:
+        filtered_rows = [row for row in filtered_rows if row["hasException"]]
+    if outcome:
+        filtered_rows = [row for row in filtered_rows if row["outcome"] == outcome]
+    filtered_rows = filtered_rows[:limit]
+    return {
+        "success": True,
+        "asOf": to_utc_iso(official_now),
+        "fromDate": selected_from.isoformat(),
+        "toDate": selected_to.isoformat(),
+        "gapThresholdMinutes": SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES,
+        "readOnly": True,
+        "summary": summary,
+        "returned": len(filtered_rows),
+        "rows": filtered_rows,
     }
 
 

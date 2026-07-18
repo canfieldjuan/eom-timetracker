@@ -80,3 +80,7 @@ required note. Ending a weekly rule is a soft deletion so prior evidence retains
 its source. The evidence keeps the employee, site, both timestamps, coordinates,
 accuracy, distance, geofence result, exact schedule or weekly-rule ID, schedule
 snapshot, classification reason, and review decision.
+
+The separate read-only comparison with paid clock-ins and **Arrived** events is
+defined in `ARRIVAL_TIMECARD_RECONCILIATION.md`. It surfaces exceptions for an
+admin but does not alter the paid-time source of record.
