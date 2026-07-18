@@ -9,7 +9,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier, Event, Lock
 
+import bcrypt
 import pytest
+
+import db
 
 
 # ===============================================================================
@@ -45,6 +48,91 @@ class TestAuth:
     def test_employee_cannot_access_admin(self, client, emp_auth):
         r = client.get("/api/admin/employees", headers=emp_auth)
         assert r.status_code == 403
+
+    def test_change_password_requires_current_password_and_reauthenticates(
+        self, client, emp_auth
+    ):
+        endpoint = "/api/auth/change-password"
+        changed_password = "gomez-new-2026"
+        original_hash = db.query_one(
+            "SELECT password_hash FROM employees WHERE name = %s",
+            ("Catalina Gomez",),
+        )["password_hash"]
+
+        try:
+            assert client.post(
+                endpoint,
+                json={
+                    "currentPassword": "gomez1",
+                    "newPassword": changed_password,
+                },
+            ).status_code == 401
+
+            wrong_current = client.post(
+                endpoint,
+                headers=emp_auth,
+                json={
+                    "currentPassword": "not-the-current-password",
+                    "newPassword": changed_password,
+                },
+            )
+            assert wrong_current.status_code == 400
+            assert wrong_current.json()["error"] == "Current password is incorrect"
+
+            too_short = client.post(
+                endpoint,
+                headers=emp_auth,
+                json={"currentPassword": "gomez1", "newPassword": "short"},
+            )
+            assert too_short.status_code == 422
+
+            changed = client.post(
+                endpoint,
+                headers=emp_auth,
+                json={
+                    "currentPassword": "gomez1",
+                    "newPassword": changed_password,
+                },
+            )
+            assert changed.status_code == 200
+            assert changed.json() == {"success": True}
+
+            assert client.post(
+                "/api/auth/login",
+                json={"name": "Catalina Gomez", "password": "gomez1"},
+            ).status_code == 401
+            assert client.post(
+                "/api/auth/login",
+                json={"name": "Catalina Gomez", "password": changed_password},
+            ).status_code == 200
+
+            same_password = client.post(
+                endpoint,
+                headers=emp_auth,
+                json={
+                    "currentPassword": changed_password,
+                    "newPassword": changed_password,
+                },
+            )
+            assert same_password.status_code == 400
+            assert "must be different" in same_password.json()["error"]
+        finally:
+            db.execute(
+                "UPDATE employees SET password_hash = %s WHERE name = %s",
+                (original_hash, "Catalina Gomez"),
+            )
+
+    def test_change_password_rejects_values_beyond_bcrypt_limit(self, client, emp_auth):
+        response = client.post(
+            "/api/auth/change-password",
+            headers=emp_auth,
+            json={
+                "currentPassword": "gomez1",
+                "newPassword": "é" * 37,
+            },
+        )
+
+        assert response.status_code == 422
 
 
 class _AtlasResponse:
