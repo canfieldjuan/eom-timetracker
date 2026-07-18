@@ -31,9 +31,9 @@ services:
       - key: RESEND_FROM_NAME
         sync: false
       - key: ALLOWED_ORIGINS
-        sync: false
+        value: https://effinghamofficemaids.com,https://www.effinghamofficemaids.com,https://effingham-office-maids-website.vercel.app
       - key: ALLOWED_ORIGIN_REGEX
-        sync: false
+        value: '^https://effingham-office-maids-[a-z0-9-]+-juan-canfields-projects\.vercel\.app$'
       - key: PUBLIC_APP_URL
         sync: false
       - key: ALLOW_PUBLIC_REGISTRATION

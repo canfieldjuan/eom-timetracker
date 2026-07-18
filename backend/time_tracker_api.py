@@ -2057,8 +2057,24 @@ BOOTSTRAP_ADMIN_IDS = [
     int(x) for x in os.getenv("BOOTSTRAP_ADMIN_IDS", "").split(",") if x.strip().isdigit()
 ]
 
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
-ALLOWED_ORIGIN_REGEX = (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip() or None
+DEFAULT_PORTAL_ALLOWED_ORIGINS = [
+    "https://effinghamofficemaids.com",
+    "https://www.effinghamofficemaids.com",
+    "https://effingham-office-maids-website.vercel.app",
+]
+DEFAULT_PORTAL_ALLOWED_ORIGIN_REGEX = (
+    r"^https://effingham-office-maids-[a-z0-9-]+-juan-canfields-projects\.vercel\.app$"
+)
+_configured_allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
+ALLOWED_ORIGINS = _configured_allowed_origins or DEFAULT_PORTAL_ALLOWED_ORIGINS
+ALLOWED_ORIGIN_REGEX = (
+    (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip()
+    or DEFAULT_PORTAL_ALLOWED_ORIGIN_REGEX
+)
 ALLOW_PUBLIC_REGISTRATION = parse_bool(os.getenv("ALLOW_PUBLIC_REGISTRATION"), False)
 MAX_REPORT_RECIPIENTS = parse_int(os.getenv("MAX_REPORT_RECIPIENTS"), 50)
 MAX_REPORT_EMAIL_LEN = parse_int(os.getenv("MAX_REPORT_EMAIL_LEN"), 320)
