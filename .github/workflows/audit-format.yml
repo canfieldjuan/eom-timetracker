@@ -1,0 +1,69 @@
+name: audit-format
+
+# Enforces the FORM of AUDIT_PROTOCOL.md (citations + the three-way sort) on
+# findings documents. It does NOT judge whether a finding is true — a reviewer
+# does. See AUDIT_PROTOCOL.md and scripts/check_audit_format.mjs.
+#
+# Scope (kept narrow to avoid false-failing the repo's contract docs):
+#   - Always: self-test the checker against the good/bad fixtures.
+#   - On PRs labeled `audit` or `review`: check every changed *.md file.
+#   - Always: if AUDIT_FINDINGS.md changed, check it.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  audit-format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Self-test — good fixture must pass, bad fixture must fail
+        run: |
+          set -e
+          node scripts/check_audit_format.mjs scripts/fixtures/audit-good.md
+          if node scripts/check_audit_format.mjs scripts/fixtures/audit-bad.md; then
+            echo "::error::audit-format checker did NOT reject the bad fixture — the gate is broken"
+            exit 1
+          fi
+          echo "Self-test passed: good fixture accepted, bad fixture rejected."
+
+      - name: Check changed findings documents
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -e
+          CHANGED=$(git diff --name-only --diff-filter=d "$BASE_SHA"...HEAD || true)
+          TO_CHECK=""
+          for f in $CHANGED; do
+            case "$f" in
+              *.md) : ;;
+              *) continue ;;
+            esac
+            # Always enforce on AUDIT_FINDINGS.md; enforce on all .md when labeled.
+            if [ "$(basename "$f")" = "AUDIT_FINDINGS.md" ]; then
+              TO_CHECK="$TO_CHECK $f"
+            elif echo ",$LABELS," | grep -qiE ',(audit|review),'; then
+              TO_CHECK="$TO_CHECK $f"
+            fi
+          done
+          if [ -n "$TO_CHECK" ]; then
+            echo "Enforcing audit-format on:$TO_CHECK"
+            node scripts/check_audit_format.mjs $TO_CHECK
+          else
+            echo "No findings documents to enforce (add the 'audit' or 'review' label to check changed .md files)."
+          fi
