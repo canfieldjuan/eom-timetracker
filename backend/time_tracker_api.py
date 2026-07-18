@@ -5001,6 +5001,7 @@ def timesheet_locations(
     _: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     payload = load_timesheets()
+    company_date = utc_now().astimezone(ZoneInfo(TIMEZONE_NAME)).date().isoformat()
     site_rows = db.query_all(
         """
         SELECT id, address, customer_name, lat, lng,
@@ -5039,6 +5040,7 @@ def timesheet_locations(
             "maxAccuracyM": SITE_CHECK_IN_MAX_ACCURACY_M,
             "deviceClockSkewReviewSeconds": SITE_CHECK_IN_DEVICE_SKEW_SECONDS,
             "scheduleTimezone": TIMEZONE_NAME,
+            "companyDate": company_date,
             "offlineQueue": False,
         },
     }

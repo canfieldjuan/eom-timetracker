@@ -764,7 +764,13 @@ class TestSiteCheckInAdminReview:
         assert reviewed.json()["checkIn"]["reviewedBy"] == "Juan Canfield"
         assert reviewed.json()["checkIn"]["reviewNote"] == "GPS evidence verified"
 
-    def test_locations_publish_site_ids_and_policy(self, client, emp_auth, location_id):
+    def test_locations_publish_site_ids_and_policy(
+        self, client, emp_auth, location_id, monkeypatch
+    ):
+        import time_tracker_api
+
+        fixed_utc = datetime(2026, 7, 18, 4, 30, tzinfo=timezone.utc)
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: fixed_utc)
         response = client.get("/api/timesheet/locations", headers=emp_auth)
         assert response.status_code == 200, response.text
         payload = response.json()
@@ -774,6 +780,7 @@ class TestSiteCheckInAdminReview:
             "maxAccuracyM": 100,
             "deviceClockSkewReviewSeconds": 600,
             "scheduleTimezone": "America/Chicago",
+            "companyDate": "2026-07-17",
             "offlineQueue": False,
         }
 
@@ -797,3 +804,5 @@ def test_frontend_contains_scan_then_tap_contract():
     assert "filters.set('siteId', siteId)" in html
     assert "filters.set('fromDate', fromDate)" in html
     assert "filters.set('toDate', toDate)" in html
+    assert "initializeSiteCheckInActivityDates" in html
+    assert "data.siteCheckInPolicy.companyDate" in html

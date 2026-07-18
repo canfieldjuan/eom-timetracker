@@ -831,7 +831,8 @@
             sites: [],
             adminEmployees: [],
             pendingSiteCheckIn: null,
-            siteQrObjectUrl: ''
+            siteQrObjectUrl: '',
+            siteCheckInActivityDatesInitialized: false
         };
 
         function defaultApiBaseUrl() {
@@ -882,6 +883,18 @@
             const month = String(now.getMonth() + 1).padStart(2, '0');
             const day = String(now.getDate()).padStart(2, '0');
             return `${year}-${month}-${day}`;
+        }
+
+        function initializeSiteCheckInActivityDates(companyDate) {
+            if (state.siteCheckInActivityDatesInitialized) {
+                return;
+            }
+            const normalizedDate = /^\d{4}-\d{2}-\d{2}$/.test(String(companyDate || ''))
+                ? String(companyDate)
+                : currentDateIso();
+            document.getElementById('siteCheckInActivityFromDate').value = normalizedDate;
+            document.getElementById('siteCheckInActivityToDate').value = normalizedDate;
+            state.siteCheckInActivityDatesInitialized = true;
         }
 
         function splitReportEmails(raw) {
@@ -1441,6 +1454,9 @@
             const select = document.getElementById('locationSelect');
             const options = Array.isArray(data.locations) ? data.locations : [];
             state.sites = Array.isArray(data.sites) ? data.sites : [];
+            initializeSiteCheckInActivityDates(
+                data.siteCheckInPolicy && data.siteCheckInPolicy.companyDate
+            );
 
             if (!options.length) {
                 select.innerHTML = '<option value="">No locations configured</option>';
@@ -2482,8 +2498,6 @@
                 new Date(now.getTime() + 60 * 60 * 1000).toISOString()
             );
             document.getElementById('siteCheckInRecurringStart').value = currentDateIso();
-            document.getElementById('siteCheckInActivityFromDate').value = currentDateIso();
-            document.getElementById('siteCheckInActivityToDate').value = currentDateIso();
 
             try {
                 const storedToken = localStorage.getItem(STORAGE_TOKEN) || '';
