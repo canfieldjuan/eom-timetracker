@@ -2,9 +2,16 @@
 // Enforce the FORM of AUDIT_PROTOCOL.md on findings documents.
 //
 // This checks structure and citations, NOT truth. A reviewer still judges whether
-// a finding is correct. What it hard-fails:
-//   1. Missing any of the three required bucket headings
-//      (Confirmed / Contradicted / Could-not-determine).
+// a finding is correct.
+//
+// A file is treated as a findings document (and enforced) only if it opts in, by
+// EITHER having at least one bucket heading (Confirmed / Contradicted /
+// Could-not-determine as a markdown heading) OR being named AUDIT_FINDINGS.md.
+// Any other markdown file (README, AUDIT_PROTOCOL.md, contract docs) is skipped —
+// so the gate never false-fails a doc that simply isn't a findings report.
+//
+// For a findings document, it hard-fails:
+//   1. Missing any of the three required bucket headings.
 //   2. Any list item under "Confirmed" that carries no citation.
 //
 // A citation is a `file:line` token (e.g. time_tracker_api.py:1113), a bare line
@@ -15,6 +22,7 @@
 // Exit 0 = all pass, 1 = at least one violation, 2 = bad invocation.
 
 import { readFileSync } from 'node:fs';
+import { basename } from 'node:path';
 
 const CITATION = /(?:[\w./-]+\.\w+:\d+(?:-\d+)?)|(?::\d+(?:-\d+)?\b)|(?:\]\()/;
 const BUCKETS = ['confirmed', 'contradicted', 'could-not-determine'];
@@ -34,6 +42,7 @@ function checkFile(path) {
   }
 
   const foundBuckets = new Set();
+  const confirmedViolations = [];
   // Track which bucket (if any) each line belongs to.
   let current = null; // 'confirmed' | 'contradicted' | 'could-not-determine' | null
 
@@ -49,13 +58,19 @@ function checkFile(path) {
       const body = stripItem(line);
       if (looksEmpty(body)) return;
       if (!CITATION.test(line)) {
-        errors.push(
+        confirmedViolations.push(
           `${path}:${i + 1}: Confirmed item has no file:line citation -> ${body.slice(0, 80)}`
         );
       }
     }
   });
 
+  // A file is only enforced if it opts in as a findings document: it has at least
+  // one bucket heading, or it is named AUDIT_FINDINGS.md. Otherwise skip silently.
+  const isFindingsDoc = foundBuckets.size > 0 || basename(path) === 'AUDIT_FINDINGS.md';
+  if (!isFindingsDoc) return errors;
+
+  errors.push(...confirmedViolations);
   const missing = BUCKETS.filter((b) => !foundBuckets.has(b));
   if (missing.length) {
     errors.push(

@@ -4,14 +4,16 @@ name: audit-format
 # findings documents. It does NOT judge whether a finding is true — a reviewer
 # does. See AUDIT_PROTOCOL.md and scripts/check_audit_format.mjs.
 #
-# Scope (kept narrow to avoid false-failing the repo's contract docs):
+# The checker self-scopes: it only enforces a .md file that opts in as a findings
+# document (has a Confirmed/Contradicted/Could-not-determine heading, or is named
+# AUDIT_FINDINGS.md). Every other .md (README, AUDIT_PROTOCOL.md, contract docs) is
+# skipped, so this never false-fails a non-findings doc.
 #   - Always: self-test the checker against the good/bad fixtures.
-#   - On PRs labeled `audit` or `review`: check every changed *.md file.
-#   - Always: if AUDIT_FINDINGS.md changed, check it.
+#   - On PRs: run the checker over every changed *.md file (self-scoping does the rest).
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
 
@@ -40,30 +42,17 @@ jobs:
           fi
           echo "Self-test passed: good fixture accepted, bad fixture rejected."
 
-      - name: Check changed findings documents
+      - name: Check changed markdown (checker self-scopes to findings docs)
         if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
           set -e
-          CHANGED=$(git diff --name-only --diff-filter=d "$BASE_SHA"...HEAD || true)
-          TO_CHECK=""
-          for f in $CHANGED; do
-            case "$f" in
-              *.md) : ;;
-              *) continue ;;
-            esac
-            # Always enforce on AUDIT_FINDINGS.md; enforce on all .md when labeled.
-            if [ "$(basename "$f")" = "AUDIT_FINDINGS.md" ]; then
-              TO_CHECK="$TO_CHECK $f"
-            elif echo ",$LABELS," | grep -qiE ',(audit|review),'; then
-              TO_CHECK="$TO_CHECK $f"
-            fi
-          done
-          if [ -n "$TO_CHECK" ]; then
-            echo "Enforcing audit-format on:$TO_CHECK"
-            node scripts/check_audit_format.mjs $TO_CHECK
+          CHANGED=$(git diff --name-only --diff-filter=d "$BASE_SHA"...HEAD -- '*.md' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "Scanning changed markdown:"
+            echo "$CHANGED"
+            node scripts/check_audit_format.mjs $CHANGED
           else
-            echo "No findings documents to enforce (add the 'audit' or 'review' label to check changed .md files)."
+            echo "No changed markdown files."
           fi
