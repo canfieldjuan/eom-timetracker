@@ -3996,6 +3996,10 @@ def admin_list_site_check_ins(
     request: Request,
     classification: Optional[str] = None,
     review_status: Optional[str] = None,
+    employee_id: Optional[int] = Query(default=None, alias="employeeId", gt=0),
+    site_id: Optional[int] = Query(default=None, alias="siteId", gt=0),
+    from_date: Optional[date] = Query(default=None, alias="fromDate"),
+    to_date: Optional[date] = Query(default=None, alias="toDate"),
     limit: int = Query(default=200, ge=1, le=500),
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
@@ -4003,6 +4007,8 @@ def admin_list_site_check_ins(
         raise HTTPException(status_code=400, detail="Invalid classification filter")
     if review_status not in {None, "not_required", "pending", "approved", "rejected"}:
         raise HTTPException(status_code=400, detail="Invalid review status filter")
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(status_code=400, detail="fromDate must be on or before toDate")
 
     clauses: List[str] = []
     params: List[Any] = []
@@ -4012,6 +4018,26 @@ def admin_list_site_check_ins(
     if review_status:
         clauses.append("ci.review_status = %s")
         params.append(review_status)
+    if employee_id:
+        clauses.append("ci.employee_id = %s")
+        params.append(employee_id)
+    if site_id:
+        clauses.append("ci.location_id = %s")
+        params.append(site_id)
+
+    company_timezone = ZoneInfo(TIMEZONE_NAME)
+    if from_date:
+        from_timestamp = datetime.combine(
+            from_date, clock_time.min, tzinfo=company_timezone
+        ).astimezone(timezone.utc)
+        clauses.append("ci.server_checked_in_at >= %s")
+        params.append(from_timestamp)
+    if to_date and to_date < date.max:
+        to_timestamp = datetime.combine(
+            to_date + timedelta(days=1), clock_time.min, tzinfo=company_timezone
+        ).astimezone(timezone.utc)
+        clauses.append("ci.server_checked_in_at < %s")
+        params.append(to_timestamp)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.append(limit)
     rows = db.query_all(
@@ -4975,6 +5001,7 @@ def timesheet_locations(
     _: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     payload = load_timesheets()
+    company_date = utc_now().astimezone(ZoneInfo(TIMEZONE_NAME)).date().isoformat()
     site_rows = db.query_all(
         """
         SELECT id, address, customer_name, lat, lng,
@@ -5013,6 +5040,7 @@ def timesheet_locations(
             "maxAccuracyM": SITE_CHECK_IN_MAX_ACCURACY_M,
             "deviceClockSkewReviewSeconds": SITE_CHECK_IN_DEVICE_SKEW_SECONDS,
             "scheduleTimezone": TIMEZONE_NAME,
+            "companyDate": company_date,
             "offlineQueue": False,
         },
     }

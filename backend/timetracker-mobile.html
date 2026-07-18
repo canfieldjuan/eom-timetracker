@@ -284,6 +284,17 @@
             border-color: var(--warn-border);
         }
 
+        .activity-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .activity-card-header .status-chip {
+            flex: 0 0 auto;
+        }
+
         .qr-preview {
             border: 1px solid var(--border);
             border-radius: 10px;
@@ -503,6 +514,52 @@
             <div id="recurringSiteCheckInScheduleMessage" class="message"></div>
             <div id="recurringSiteCheckInScheduleList">
                 <p class="meta">No weekly schedules loaded.</p>
+            </div>
+
+            <div class="row" style="margin-top: 16px;">
+                <h3>Arrival Activity</h3>
+                <button id="refreshSiteCheckInActivityButton" type="button">Apply Filters</button>
+            </div>
+            <p class="meta">
+                Shows official server-timed QR arrivals. Filters use the company timezone.
+            </p>
+            <div class="row">
+                <div>
+                    <label for="siteCheckInActivityClassification">Status</label>
+                    <select id="siteCheckInActivityClassification">
+                        <option value="">All statuses</option>
+                        <option value="on_time">On time</option>
+                        <option value="late">Late</option>
+                        <option value="needs_review">Needs review</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="siteCheckInActivityEmployee">Employee</label>
+                    <select id="siteCheckInActivityEmployee">
+                        <option value="">All employees</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="siteCheckInActivitySite">Site</label>
+                    <select id="siteCheckInActivitySite">
+                        <option value="">All sites</option>
+                    </select>
+                </div>
+            </div>
+            <div class="row">
+                <div>
+                    <label for="siteCheckInActivityFromDate">From date</label>
+                    <input id="siteCheckInActivityFromDate" type="date">
+                </div>
+                <div>
+                    <label for="siteCheckInActivityToDate">Through date</label>
+                    <input id="siteCheckInActivityToDate" type="date">
+                </div>
+            </div>
+            <div id="siteCheckInActivityMessage" class="message"></div>
+            <p id="siteCheckInActivitySummary" class="meta">No arrival activity loaded.</p>
+            <div id="siteCheckInActivityList">
+                <p class="meta">No arrival activity loaded.</p>
             </div>
 
             <div class="row" style="margin-top: 16px;">
@@ -774,7 +831,8 @@
             sites: [],
             adminEmployees: [],
             pendingSiteCheckIn: null,
-            siteQrObjectUrl: ''
+            siteQrObjectUrl: '',
+            siteCheckInActivityDatesInitialized: false
         };
 
         function defaultApiBaseUrl() {
@@ -825,6 +883,18 @@
             const month = String(now.getMonth() + 1).padStart(2, '0');
             const day = String(now.getDate()).padStart(2, '0');
             return `${year}-${month}-${day}`;
+        }
+
+        function initializeSiteCheckInActivityDates(companyDate) {
+            if (state.siteCheckInActivityDatesInitialized) {
+                return;
+            }
+            const normalizedDate = /^\d{4}-\d{2}-\d{2}$/.test(String(companyDate || ''))
+                ? String(companyDate)
+                : currentDateIso();
+            document.getElementById('siteCheckInActivityFromDate').value = normalizedDate;
+            document.getElementById('siteCheckInActivityToDate').value = normalizedDate;
+            state.siteCheckInActivityDatesInitialized = true;
         }
 
         function splitReportEmails(raw) {
@@ -1384,6 +1454,9 @@
             const select = document.getElementById('locationSelect');
             const options = Array.isArray(data.locations) ? data.locations : [];
             state.sites = Array.isArray(data.sites) ? data.sites : [];
+            initializeSiteCheckInActivityDates(
+                data.siteCheckInPolicy && data.siteCheckInPolicy.companyDate
+            );
 
             if (!options.length) {
                 select.innerHTML = '<option value="">No locations configured</option>';
@@ -1400,6 +1473,14 @@
                 : '<option value="">No sites configured</option>';
             document.getElementById('adminCheckInSiteSelect').innerHTML = siteOptions;
             document.getElementById('siteCheckInScheduleSiteSelect').innerHTML = siteOptions;
+            const activitySiteSelect = document.getElementById('siteCheckInActivitySite');
+            const selectedActivitySite = activitySiteSelect.value;
+            activitySiteSelect.innerHTML = '<option value="">All sites</option>' + state.sites.map((site) => (
+                `<option value="${escapeHtml(site.id)}">${escapeHtml(site.name)}</option>`
+            )).join('');
+            if (Array.from(activitySiteSelect.options).some((option) => option.value === selectedActivitySite)) {
+                activitySiteSelect.value = selectedActivitySite;
+            }
         }
 
         async function loadAdminCheckInEmployees() {
@@ -1414,6 +1495,17 @@
                     `<option value="${escapeHtml(employee.id)}">${escapeHtml(employee.name)}</option>`
                 )).join('')
                 : '<option value="">No active employees</option>';
+            const activityEmployeeSelect = document.getElementById('siteCheckInActivityEmployee');
+            const selectedActivityEmployee = activityEmployeeSelect.value;
+            activityEmployeeSelect.innerHTML = '<option value="">All employees</option>' + state.adminEmployees
+                .map((employee) => (
+                    `<option value="${escapeHtml(employee.id)}">${escapeHtml(employee.name)}</option>`
+                )).join('');
+            if (Array.from(activityEmployeeSelect.options).some(
+                (option) => option.value === selectedActivityEmployee
+            )) {
+                activityEmployeeSelect.value = selectedActivityEmployee;
+            }
         }
 
         function clearSiteQrPreview() {
@@ -1601,6 +1693,113 @@
             }
         }
 
+        function humanizeSiteCheckInValue(value) {
+            const text = String(value || '').replace(/_/g, ' ');
+            return text ? text.charAt(0).toUpperCase() + text.slice(1) : '-';
+        }
+
+        function siteCheckInClassificationStyle(classification) {
+            if (classification === 'on_time') {
+                return 'status-on';
+            }
+            if (classification === 'late') {
+                return 'status-off';
+            }
+            return 'status-review';
+        }
+
+        function renderSiteCheckInActivity(checkIns) {
+            const list = document.getElementById('siteCheckInActivityList');
+            const summary = document.getElementById('siteCheckInActivitySummary');
+            const counts = checkIns.reduce((totals, checkIn) => {
+                if (Object.prototype.hasOwnProperty.call(totals, checkIn.classification)) {
+                    totals[checkIn.classification] += 1;
+                }
+                return totals;
+            }, { on_time: 0, late: 0, needs_review: 0 });
+            summary.textContent = [
+                `${checkIns.length} check-in${checkIns.length === 1 ? '' : 's'}`,
+                `${counts.on_time} on time`,
+                `${counts.late} late`,
+                `${counts.needs_review} need review`
+            ].join(' | ');
+
+            if (!checkIns.length) {
+                list.innerHTML = '<p class="meta">No QR arrivals match these filters.</p>';
+                return;
+            }
+
+            list.innerHTML = checkIns.map((checkIn) => {
+                const scheduledText = checkIn.scheduledStart
+                    ? formatCorrectionTimestamp(checkIn.scheduledStart)
+                    : 'No matching schedule';
+                const scheduleSource = checkIn.scheduleRuleId
+                    ? 'weekly rule'
+                    : (checkIn.scheduleId ? 'one-time schedule' : 'none');
+                const cardClass = checkIn.classification === 'needs_review'
+                    ? 'correction-card warning'
+                    : 'correction-card';
+                return `
+                    <div class="${cardClass}">
+                        <div class="activity-card-header">
+                            <strong>${escapeHtml(checkIn.employeeName)} at ${escapeHtml(checkIn.siteName)}</strong>
+                            <span class="status-chip ${siteCheckInClassificationStyle(checkIn.classification)}">
+                                ${escapeHtml(humanizeSiteCheckInValue(checkIn.classification))}
+                            </span>
+                        </div>
+                        <p class="meta">
+                            Official time: ${escapeHtml(formatCorrectionTimestamp(checkIn.serverCheckedInAt))} |
+                            Scheduled: ${escapeHtml(scheduledText)} |
+                            Source: ${escapeHtml(scheduleSource)}
+                        </p>
+                        <p class="meta">
+                            Geofence: ${escapeHtml(humanizeSiteCheckInValue(checkIn.geofenceStatus))} |
+                            Distance: ${escapeHtml(checkIn.distanceM ?? 'unknown')}m |
+                            Accuracy: ${escapeHtml(checkIn.accuracyM)}m |
+                            Reason: ${escapeHtml(humanizeSiteCheckInValue(checkIn.classificationReason))} |
+                            Review: ${escapeHtml(humanizeSiteCheckInValue(checkIn.reviewStatus))}
+                        </p>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function loadSiteCheckInActivity() {
+            if (!hasAdminSession()) {
+                return;
+            }
+            const message = document.getElementById('siteCheckInActivityMessage');
+            clearMessage(message);
+            const fromDate = document.getElementById('siteCheckInActivityFromDate').value;
+            const toDate = document.getElementById('siteCheckInActivityToDate').value;
+            if (fromDate && toDate && fromDate > toDate) {
+                setMessage(message, 'error', 'From date must be on or before through date.');
+                return;
+            }
+
+            const filters = new URLSearchParams({ limit: '500' });
+            const classification = document.getElementById('siteCheckInActivityClassification').value;
+            const employeeId = document.getElementById('siteCheckInActivityEmployee').value;
+            const siteId = document.getElementById('siteCheckInActivitySite').value;
+            if (classification) filters.set('classification', classification);
+            if (employeeId) filters.set('employeeId', employeeId);
+            if (siteId) filters.set('siteId', siteId);
+            if (fromDate) filters.set('fromDate', fromDate);
+            if (toDate) filters.set('toDate', toDate);
+
+            try {
+                const payload = await apiRequest(
+                    `/admin/site-check-ins?${filters.toString()}`,
+                    'GET',
+                    null,
+                    true
+                );
+                renderSiteCheckInActivity(Array.isArray(payload.checkIns) ? payload.checkIns : []);
+            } catch (error) {
+                setMessage(message, 'error', error.message);
+            }
+        }
+
         function renderSiteCheckInReviews(checkIns) {
             const list = document.getElementById('siteCheckInReviewList');
             if (!checkIns.length) {
@@ -1659,7 +1858,7 @@
                     decision,
                     note: note.trim()
                 }, true);
-                await loadSiteCheckInReviews();
+                await Promise.all([loadSiteCheckInReviews(), loadSiteCheckInActivity()]);
                 setMessage(message, 'success', `Check-in ${decision}.`);
             } catch (error) {
                 setMessage(message, 'error', error.message);
@@ -1681,8 +1880,9 @@
             await resolvePendingSiteCheckIn();
             await loadCurrentStatus();
             if (hasAdminSession()) {
+                await loadAdminCheckInEmployees();
                 await Promise.all([
-                    loadAdminCheckInEmployees(),
+                    loadSiteCheckInActivity(),
                     loadSiteCheckInReviews(),
                     loadRecurringSiteCheckInSchedules()
                 ]);
@@ -2369,6 +2569,10 @@
             }
         });
         document.getElementById('refreshSiteCheckInReviewsButton').addEventListener('click', loadSiteCheckInReviews);
+        document.getElementById('refreshSiteCheckInActivityButton').addEventListener(
+            'click',
+            loadSiteCheckInActivity
+        );
         document.getElementById('siteCheckInReviewList').addEventListener('click', (event) => {
             const button = event.target.closest('[data-site-review-id]');
             if (button) {
