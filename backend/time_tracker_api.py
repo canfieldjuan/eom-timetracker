@@ -2070,7 +2070,13 @@ _configured_allowed_origins = [
     for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
 ]
-ALLOWED_ORIGINS = _configured_allowed_origins or DEFAULT_PORTAL_ALLOWED_ORIGINS
+# These are first-party portal origins, so keep them available even when an
+# older Render environment value supplies additional origins. Environment
+# configuration can extend this list but cannot accidentally disable the
+# public portal.
+ALLOWED_ORIGINS = list(
+    dict.fromkeys([*DEFAULT_PORTAL_ALLOWED_ORIGINS, *_configured_allowed_origins])
+)
 ALLOWED_ORIGIN_REGEX = (
     (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip()
     or DEFAULT_PORTAL_ALLOWED_ORIGIN_REGEX

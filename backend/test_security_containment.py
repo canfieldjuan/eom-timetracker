@@ -15,6 +15,8 @@ def test_default_portal_cors_is_limited_to_owned_frontends():
 
     assert "https://effinghamofficemaids.com" in api.DEFAULT_PORTAL_ALLOWED_ORIGINS
     assert "https://www.effinghamofficemaids.com" in api.DEFAULT_PORTAL_ALLOWED_ORIGINS
+    assert "https://effinghamofficemaids.com" in api.ALLOWED_ORIGINS
+    assert "https://www.effinghamofficemaids.com" in api.ALLOWED_ORIGINS
     assert re.fullmatch(
         api.DEFAULT_PORTAL_ALLOWED_ORIGIN_REGEX,
         "https://effingham-office-maids-websi-git-dc77db-juan-canfields-projects.vercel.app",
