@@ -25,9 +25,10 @@ paid-time arrival within the configured schedule window.
 
 - A QR check-in linked to the exact schedule or weekly rule is preferred, then
   the nearest same-employee, same-site QR record.
-- A same-site paid-time event is preferred over an event at another or unknown
-  site. Within that group, the event nearest the QR timestamp (or scheduled
-  time when QR evidence is missing) is used.
+- Same-site paid-time events are allocated across all scheduled stops before an
+  event at another or unknown site can be used as mismatch evidence. Within
+  each group, the event nearest the QR timestamp (or scheduled time when QR
+  evidence is missing) is used.
 - Paid-time evidence can be an explicit **Arrived** visit or a clock-in whose
   original location label exactly identifies the registered site.
 - A shift location that was only auto-linked later by an **Arrived** action is

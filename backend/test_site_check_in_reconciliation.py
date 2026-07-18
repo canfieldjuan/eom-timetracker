@@ -13,6 +13,7 @@ from conftest import _raw_conn
 SITE_LATITUDE = 39.1203
 SITE_LONGITUDE = -88.54335
 TEST_SHIFT_NOTE = "reconciliation-test"
+SECOND_SITE_ADDRESS = "456 Oak St, Effingham"
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +25,10 @@ def isolate_reconciliation_data(setup_db):
             cur.execute("DELETE FROM site_check_in_schedule_rules")
             cur.execute("DELETE FROM site_check_in_schedules")
             cur.execute("DELETE FROM shifts WHERE notes = %s", (TEST_SHIFT_NOTE,))
+            cur.execute(
+                "DELETE FROM locations WHERE address = %s",
+                (SECOND_SITE_ADDRESS,),
+            )
             cur.execute(
                 """
                 UPDATE locations
@@ -170,6 +175,26 @@ def site_address(location_id):
         address = cur.fetchone()[0]
     conn.close()
     return address
+
+
+def create_second_site():
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO locations (
+                address, customer_name, lat, lng,
+                rate, rate_type, expected_hours
+            )
+            VALUES (%s, 'Second Test Customer', %s, %s, 125.00, 'per_visit', 2.0)
+            RETURNING id
+            """,
+            (SECOND_SITE_ADDRESS, SITE_LATITUDE, SITE_LONGITUDE),
+        )
+        location_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return location_id
 
 
 def reconciliation_source_snapshot():
@@ -369,6 +394,65 @@ class TestArrivalTimecardReconciliation:
         assert second["timecardEvent"]["eventType"] == "clock_in"
         assert second["timecardEvent"]["siteId"] is None
         assert second["hasException"] is True
+
+    def test_wrong_site_event_is_reserved_for_its_scheduled_stop(
+        self,
+        client,
+        auth,
+        emp_auth,
+        employee_id,
+        location_id,
+        monkeypatch,
+    ):
+        import time_tracker_api
+
+        first_start = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        second_start = first_start + timedelta(hours=1)
+        current_time = {"value": first_start + timedelta(minutes=5)}
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: current_time["value"])
+        second_site_id = create_second_site()
+
+        create_exact_schedule(client, auth, employee_id, location_id, first_start)
+        create_exact_schedule(client, auth, employee_id, second_site_id, second_start)
+        first_token = create_qr_token(client, auth, location_id)
+        second_token = create_qr_token(client, auth, second_site_id)
+        record_qr_check_in(
+            client,
+            emp_auth,
+            employee_id,
+            location_id,
+            first_token,
+            current_time["value"],
+        )
+        current_time["value"] = second_start + timedelta(minutes=5)
+        record_qr_check_in(
+            client,
+            emp_auth,
+            employee_id,
+            second_site_id,
+            second_token,
+            current_time["value"],
+        )
+        insert_shift(
+            employee_id,
+            second_start + timedelta(minutes=3),
+            location_id=second_site_id,
+            location_label=site_address(second_site_id),
+        )
+
+        current_time["value"] = second_start + timedelta(hours=1)
+        response = client.get(
+            "/api/admin/site-check-in-reconciliation",
+            headers=auth,
+            params={"fromDate": "2026-07-20", "toDate": "2026-07-20"},
+        )
+        assert response.status_code == 200, response.text
+        rows = {row["siteId"]: row for row in response.json()["rows"]}
+
+        assert rows[location_id]["outcome"] == "missing_time_entry"
+        assert rows[location_id]["timecardEvent"] is None
+        assert rows[second_site_id]["outcome"] == "matched"
+        assert rows[second_site_id]["timecardEvent"]["siteId"] == second_site_id
 
     def test_missing_evidence_and_pending_rows_are_separated(
         self,

@@ -3482,6 +3482,8 @@ def _match_reconciliation_timecard_event(
     check_in: Optional[Dict[str, Any]],
     events: List[Dict[str, Any]],
     used_keys: set[str],
+    *,
+    same_site_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
     scheduled_start = occurrence["scheduled_start"]
     anchor = check_in["server_checked_in_at"] if check_in else scheduled_start
@@ -3501,6 +3503,8 @@ def _match_reconciliation_timecard_event(
         if schedule_distance > max_distance:
             continue
         row_site_id = int(row["location_id"]) if row.get("location_id") else None
+        if same_site_only and row_site_id != occurrence["location_id"]:
+            continue
         site_rank = 0 if row_site_id == occurrence["location_id"] else 1
         anchor_distance = abs((row["event_at"] - anchor).total_seconds())
         event_type_rank = 0 if row["event_type"] == "visit" else 1
@@ -3641,19 +3645,43 @@ def build_site_check_in_reconciliation(
     used_check_in_ids: set[int] = set()
     used_event_keys: set[str] = set()
     official_now = now_utc or utc_now()
-    reconciled: List[Dict[str, Any]] = []
+    occurrence_matches: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
     for occurrence in occurrences:
-        check_in = _match_reconciliation_check_in(
-            occurrence,
-            check_ins,
-            used_check_in_ids,
+        occurrence_matches.append(
+            (
+                occurrence,
+                _match_reconciliation_check_in(
+                    occurrence,
+                    check_ins,
+                    used_check_in_ids,
+                ),
+            )
         )
-        event = _match_reconciliation_timecard_event(
-            occurrence,
-            check_in,
-            events,
-            used_event_keys,
+
+    # Allocate correct-site evidence across the full multi-stop day before a
+    # wrong or unknown-site event can be used to explain a mismatch elsewhere.
+    event_matches: List[Optional[Dict[str, Any]]] = []
+    for occurrence, check_in in occurrence_matches:
+        event_matches.append(
+            _match_reconciliation_timecard_event(
+                occurrence,
+                check_in,
+                events,
+                used_event_keys,
+                same_site_only=True,
+            )
         )
+    for index, (occurrence, check_in) in enumerate(occurrence_matches):
+        if event_matches[index] is None:
+            event_matches[index] = _match_reconciliation_timecard_event(
+                occurrence,
+                check_in,
+                events,
+                used_event_keys,
+            )
+
+    reconciled: List[Dict[str, Any]] = []
+    for (occurrence, check_in), event in zip(occurrence_matches, event_matches):
         outcome, reason, difference_minutes = _site_check_in_reconciliation_outcome(
             occurrence,
             check_in,
