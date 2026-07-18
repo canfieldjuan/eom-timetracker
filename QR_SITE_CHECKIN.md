@@ -73,9 +73,10 @@ the official time.
 ## Admin review
 
 Admins can create or rotate printable site QR codes, create exact arrival
-schedules, create or end recurring weekday rules, list pending evidence, and
-approve or reject a `needs_review` record with a required note. Ending a weekly
-rule is a soft deletion so prior evidence retains its source. The evidence keeps
-the employee, site, both timestamps, coordinates, accuracy, distance, geofence
-result, exact schedule or weekly-rule ID, schedule snapshot, classification
-reason, and review decision.
+schedules, create or end recurring weekday rules, and browse all arrival
+evidence by status, employee, site, and company-local date range. A separate
+exception queue lets an admin approve or reject a `needs_review` record with a
+required note. Ending a weekly rule is a soft deletion so prior evidence retains
+its source. The evidence keeps the employee, site, both timestamps, coordinates,
+accuracy, distance, geofence result, exact schedule or weekly-rule ID, schedule
+snapshot, classification reason, and review decision.

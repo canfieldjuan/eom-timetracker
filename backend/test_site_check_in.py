@@ -6,6 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -696,6 +697,49 @@ class TestSiteCheckInAdminReview:
         assert queue.status_code == 200
         assert any(row["id"] == check_in_id for row in queue.json()["checkIns"])
 
+        company_today = datetime.now(ZoneInfo("America/Chicago")).date()
+        filtered = client.get(
+            "/api/admin/site-check-ins",
+            headers=auth,
+            params={
+                "classification": "needs_review",
+                "employeeId": employee_id,
+                "siteId": location_id,
+                "fromDate": company_today.isoformat(),
+                "toDate": company_today.isoformat(),
+            },
+        )
+        assert filtered.status_code == 200, filtered.text
+        assert [row["id"] for row in filtered.json()["checkIns"]] == [check_in_id]
+
+        no_employee_match = client.get(
+            "/api/admin/site-check-ins?employeeId=999999", headers=auth
+        )
+        assert no_employee_match.status_code == 200
+        assert no_employee_match.json()["checkIns"] == []
+
+        future_date = company_today + timedelta(days=1)
+        no_date_match = client.get(
+            "/api/admin/site-check-ins",
+            headers=auth,
+            params={
+                "fromDate": future_date.isoformat(),
+                "toDate": future_date.isoformat(),
+            },
+        )
+        assert no_date_match.status_code == 200
+        assert no_date_match.json()["checkIns"] == []
+
+        backwards_range = client.get(
+            "/api/admin/site-check-ins",
+            headers=auth,
+            params={
+                "fromDate": future_date.isoformat(),
+                "toDate": company_today.isoformat(),
+            },
+        )
+        assert backwards_range.status_code == 400
+
         forbidden = client.patch(
             f"/api/admin/site-check-ins/{check_in_id}",
             headers=emp_auth,
@@ -746,3 +790,10 @@ def test_frontend_contains_scan_then_tap_contract():
     assert "saveRecurringSiteCheckInSchedule" in html
     assert "'/admin/site-check-in-schedule-rules'" in html
     assert "siteCheckInWeekday" in html
+    assert "Arrival Activity" in html
+    assert "loadSiteCheckInActivity" in html
+    assert "siteCheckInActivityClassification" in html
+    assert "filters.set('employeeId', employeeId)" in html
+    assert "filters.set('siteId', siteId)" in html
+    assert "filters.set('fromDate', fromDate)" in html
+    assert "filters.set('toDate', toDate)" in html
