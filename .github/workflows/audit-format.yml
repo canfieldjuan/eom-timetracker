@@ -48,7 +48,9 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -e
-          CHANGED=$(git diff --name-only --diff-filter=d "$BASE_SHA"...HEAD -- '*.md' || true)
+          # Exclude scaffolding: fixtures are exercised by the self-test above, and
+          # .github templates intentionally carry placeholder bucket headings.
+          CHANGED=$(git diff --name-only --diff-filter=d "$BASE_SHA"...HEAD -- '*.md' ':(exclude)scripts/fixtures/**' ':(exclude).github/**' || true)
           if [ -n "$CHANGED" ]; then
             echo "Scanning changed markdown:"
             echo "$CHANGED"
