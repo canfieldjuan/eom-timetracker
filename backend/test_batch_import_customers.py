@@ -48,6 +48,71 @@ def test_import_plan_updates_only_fields_present_in_source():
     assert "lng" not in operation["payload"]
 
 
+def test_importer_preserves_existing_rate_type_when_source_omits_it(monkeypatch):
+    calls = []
+
+    def fake_api_call(url, method, body=None, token=None):
+        calls.append((url, method, body, token))
+        if url.endswith("/api/auth/login"):
+            return {"token": "admin-token"}
+        if "/api/admin/locations?" in url:
+            return {
+                "locations": [
+                    {
+                        "id": 44,
+                        "address": "1810 Ave of Mid-America, Effingham, IL",
+                        "customerName": "Firefly",
+                        "locationType": "Commercial",
+                        "rate": 27.0,
+                        "rateType": "hourly",
+                        "active": True,
+                    }
+                ]
+            }
+        if url.endswith("/api/admin/locations/44") and method == "PATCH":
+            return {"success": True, "location": {"id": 44}}
+        raise AssertionError((url, method, body, token))
+
+    monkeypatch.setattr(importer, "api_call", fake_api_call)
+    monkeypatch.setattr(importer, "geocode", lambda _address: None)
+    monkeypatch.setattr(
+        importer,
+        "CUSTOMERS",
+        [
+            {
+                "customer": "Firefly Grill",
+                "address": "1810 Ave of Mid-America, Effingham, IL",
+                "type": "Commercial",
+                "rate": 29.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "batch_import_customers.py",
+            "--url",
+            "https://example.test",
+            "--username",
+            "Juan Canfield",
+            "--password",
+            "secret",
+            "--apply",
+        ],
+    )
+
+    importer.main()
+
+    patch_calls = [call for call in calls if call[1] == "PATCH"]
+    assert len(patch_calls) == 1
+    assert patch_calls[0][2] == {
+        "customerName": "Firefly Grill",
+        "rate": 29.0,
+    }
+    assert "rateType" not in patch_calls[0][2]
+
+
 def test_importer_authenticates_with_name_and_uses_atomic_create(monkeypatch):
     calls = []
 

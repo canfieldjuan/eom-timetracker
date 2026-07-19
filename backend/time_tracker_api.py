@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, time as clock_time, timedelta, timezone
 from ipaddress import ip_address, ip_network
 from pathlib import Path
-from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple, Union
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -877,7 +877,8 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
 
     visit_rows = db.query_all(
         """
-        SELECT v.shift_id, COALESCE(l.address, '') AS location,
+        SELECT v.shift_id,
+               COALESCE(NULLIF(v.location_label, ''), l.address, '') AS location,
                v.location_label, v.customer_name, v.arrival_time, v.gps, v.gps_meta
         FROM visits v
         LEFT JOIN locations l ON v.location_id = l.id
@@ -890,7 +891,8 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
 
     departure_rows = db.query_all(
         """
-        SELECT d.shift_id, COALESCE(l.address, '') AS location,
+        SELECT d.shift_id,
+               COALESCE(NULLIF(d.location_label, ''), l.address, '') AS location,
                d.location_label, d.customer_name, d.departure_time, d.gps, d.gps_meta
         FROM departures d
         LEFT JOIN locations l ON d.location_id = l.id
@@ -904,7 +906,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
     shift_rows = db.query_all(
         """
         SELECT s.id, s.employee_id, e.name AS employee_name,
-               COALESCE(l.address, '') AS location,
+               COALESCE(NULLIF(s.location_label, ''), l.address, '') AS location,
                s.location_label,
                s.clock_in, s.clock_out, s.total_hours,
                s.notes, s.local_date, s.timezone,
@@ -1883,7 +1885,12 @@ class LocationWriteRequest(BaseModel):
 class LocationListSyncRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    locations: List[LocationWriteRequest] = Field(max_length=5_000)
+    locations: List[
+        Union[
+            LocationWriteRequest,
+            Annotated[str, Field(max_length=MAX_LOCATION_LEN)],
+        ]
+    ] = Field(max_length=5_000)
 
 
 class LocationUpdateRequest(BaseModel):
@@ -1965,6 +1972,8 @@ class LocationUpdateRequest(BaseModel):
             raise ValueError("address cannot be null")
         if "customer_name" in fields and self.customer_name is None:
             raise ValueError("customerName cannot be null")
+        if "rate_type" in fields and self.rate_type is None:
+            raise ValueError("rateType cannot be null")
         if ("lat" in fields) != ("lng" in fields):
             raise ValueError("lat and lng must be provided together")
         if "lat" in fields and ((self.lat is None) != (self.lng is None)):
@@ -3663,14 +3672,8 @@ def _site_check_in_reconciliation_timecard_events(
         """
         SELECT 'clock_in'::text AS event_type, s.id AS shift_id,
                NULL::integer AS visit_id, s.employee_id,
-               CASE
-                   WHEN l.id IS NOT NULL AND s.location_label = l.address THEN l.id
-                   ELSE NULL
-               END AS location_id,
-               CASE
-                   WHEN l.id IS NOT NULL AND s.location_label = l.address THEN l.address
-                   ELSE NULL
-               END AS site_name,
+               s.location_id,
+               COALESCE(NULLIF(s.location_label, ''), l.address) AS site_name,
                s.location_label, s.clock_in AS event_at,
                s.clock_in AS shift_clock_in, s.clock_out AS shift_clock_out
         FROM shifts s
@@ -3683,7 +3686,8 @@ def _site_check_in_reconciliation_timecard_events(
 
         SELECT 'visit'::text AS event_type, s.id AS shift_id,
                v.id AS visit_id, s.employee_id, v.location_id,
-               l.address AS site_name, v.location_label,
+               COALESCE(NULLIF(v.location_label, ''), l.address) AS site_name,
+               v.location_label,
                v.arrival_time AS event_at, s.clock_in AS shift_clock_in,
                s.clock_out AS shift_clock_out
         FROM visits v
@@ -6323,7 +6327,41 @@ def _update_location_from_write(
     return dict(row)
 
 
-def _legacy_location_response(archived_count: int = 0) -> Dict[str, Any]:
+def _deactivate_location_check_in_schedules(
+    cur: Any,
+    location_ids: List[int],
+) -> Dict[str, int]:
+    """Stop future arrival obligations while preserving historical evidence."""
+    ids = sorted({int(location_id) for location_id in location_ids})
+    if not ids:
+        return {"futureSchedulesDeleted": 0, "scheduleRulesDeactivated": 0}
+
+    cur.execute(
+        """
+        DELETE FROM site_check_in_schedules
+        WHERE location_id = ANY(%s) AND scheduled_start >= NOW()
+        """,
+        (ids,),
+    )
+    future_schedules_deleted = int(cur.rowcount)
+    cur.execute(
+        """
+        UPDATE site_check_in_schedule_rules
+        SET active = false, updated_at = NOW()
+        WHERE location_id = ANY(%s) AND active = true
+        """,
+        (ids,),
+    )
+    return {
+        "futureSchedulesDeleted": future_schedules_deleted,
+        "scheduleRulesDeactivated": int(cur.rowcount),
+    }
+
+
+def _legacy_location_response(
+    archived_count: int = 0,
+    schedule_cleanup: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
     rows = db.query_all(
         f"SELECT {LOCATION_SELECT_COLUMNS} FROM locations WHERE active = true ORDER BY id"
     )
@@ -6354,6 +6392,8 @@ def _legacy_location_response(archived_count: int = 0) -> Dict[str, Any]:
         "location_target_labor": values_for("target_labor_pct", float),
         "location_min_margin": values_for("min_margin_pct", float),
         "archivedCount": archived_count,
+        "scheduleCleanup": schedule_cleanup
+        or {"futureSchedulesDeleted": 0, "scheduleRulesDeactivated": 0},
     }
 
 
@@ -6470,24 +6510,34 @@ def admin_update_locations(
     request: Request,
     admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
+    submitted_items: List[Union[LocationWriteRequest, str]] = [
+        item
+        for item in payload.locations
+        if not isinstance(item, str) or item.strip()
+    ]
     normalized_addresses: Dict[str, str] = {}
-    for item in payload.locations:
-        key = normalize_location_address(item.address)
+    for item in submitted_items:
+        address = item.strip() if isinstance(item, str) else item.address
+        key = normalize_location_address(address)
         if key in normalized_addresses:
             raise HTTPException(
                 status_code=409,
                 detail=(
                     f"Duplicate locations '{normalized_addresses[key]}' and "
-                    f"'{item.address}' differ only by capitalization or spacing"
+                    f"'{address}' differ only by capitalization or spacing"
                 ),
             )
-        normalized_addresses[key] = item.address
+        normalized_addresses[key] = address
 
     archived_count = 0
+    schedule_cleanup = {
+        "futureSchedulesDeleted": 0,
+        "scheduleRulesDeactivated": 0,
+    }
     with TIMESHEET_WRITE_LOCK, db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             rows = _lock_and_load_location_rows(cur)
-            if not payload.locations and any(row.get("active") for row in rows):
+            if not submitted_items and any(row.get("active") for row in rows):
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -6497,8 +6547,30 @@ def admin_update_locations(
                 )
 
             submitted_ids: List[int] = []
-            for item in payload.locations:
-                existing = _find_normalized_location(rows, item.address)
+            for submitted_item in submitted_items:
+                submitted_address = (
+                    submitted_item.strip()
+                    if isinstance(submitted_item, str)
+                    else submitted_item.address
+                )
+                existing = _find_normalized_location(rows, submitted_address)
+                if isinstance(submitted_item, str):
+                    if existing:
+                        saved_address = str(existing["address"])
+                        customer_name = str(
+                            existing.get("customer_name") or saved_address
+                        )
+                        item = LocationWriteRequest(
+                            address=saved_address,
+                            customerName=customer_name,
+                        )
+                    else:
+                        item = LocationWriteRequest(
+                            address=submitted_address,
+                            customerName=submitted_address,
+                        )
+                else:
+                    item = submitted_item
                 if existing:
                     row = _update_location_from_write(cur, int(existing["id"]), item)
                 else:
@@ -6515,18 +6587,23 @@ def admin_update_locations(
                     """,
                     (submitted_ids,),
                 )
-                archived_count = len(cur.fetchall())
+                archived_ids = [int(row["id"]) for row in cur.fetchall()]
+                archived_count = len(archived_ids)
+                schedule_cleanup = _deactivate_location_check_in_schedules(
+                    cur,
+                    archived_ids,
+                )
 
     append_access_log(
         request,
         "LOCATIONS_SYNCHRONIZED",
         True,
         (
-            f"Admin {admin['name']}: {len(payload.locations)} active locations, "
-            f"{archived_count} archived"
+            f"Admin {admin['name']}: {len(submitted_items)} active locations, "
+            f"{archived_count} archived; schedule cleanup: {schedule_cleanup}"
         ),
     )
-    return _legacy_location_response(archived_count)
+    return _legacy_location_response(archived_count, schedule_cleanup)
 
 
 @app.patch("/api/admin/locations/pin")
@@ -6668,12 +6745,19 @@ def admin_archive_location(
                 if not row:
                     raise HTTPException(status_code=409, detail="Location changed; reload and retry")
                 archived = dict(row)
+            schedule_cleanup = _deactivate_location_check_in_schedules(
+                cur,
+                [location_id],
+            )
 
     append_access_log(
         request,
         "LOCATION_ARCHIVED",
         True,
-        f"Admin {admin['name']} location {location_id}; already archived: {already_archived}",
+        (
+            f"Admin {admin['name']} location {location_id}; "
+            f"already archived: {already_archived}; schedule cleanup: {schedule_cleanup}"
+        ),
     )
     return {
         "success": True,
@@ -6681,6 +6765,7 @@ def admin_archive_location(
         "archived": True,
         "alreadyArchived": already_archived,
         "historicalReferencesPreserved": True,
+        "scheduleCleanup": schedule_cleanup,
     }
 
 
@@ -6769,7 +6854,7 @@ def build_time_data_audit() -> Dict[str, Any]:
         SELECT
             e.id AS employee_id,
             e.name AS employee_name,
-            COALESCE(l.address, s.location_label, '') AS location,
+            COALESCE(NULLIF(s.location_label, ''), l.address, '') AS location,
             s.clock_in,
             s.clock_out,
             ARRAY_AGG(s.id ORDER BY s.id) AS shift_ids,
@@ -6780,7 +6865,7 @@ def build_time_data_audit() -> Dict[str, Any]:
         GROUP BY
             e.id,
             e.name,
-            COALESCE(l.address, s.location_label, ''),
+            COALESCE(NULLIF(s.location_label, ''), l.address, ''),
             s.clock_in,
             s.clock_out
         HAVING COUNT(*) > 1
@@ -6810,7 +6895,7 @@ def build_time_data_audit() -> Dict[str, Any]:
             s.id AS shift_id,
             e.id AS employee_id,
             e.name AS employee_name,
-            COALESCE(l.address, s.location_label, '') AS location,
+            COALESCE(NULLIF(s.location_label, ''), l.address, '') AS location,
             s.clock_in,
             ROUND(
                 (EXTRACT(EPOCH FROM (NOW() - s.clock_in)) / 3600.0)::numeric,
@@ -6907,7 +6992,7 @@ def _correction_shift_snapshots(
             s.employee_id,
             e.name AS employee_name,
             s.location_id,
-            COALESCE(l.address, s.location_label, '') AS effective_location,
+            COALESCE(NULLIF(s.location_label, ''), l.address, '') AS effective_location,
             s.location_label,
             s.clock_in,
             s.clock_out,
@@ -6938,7 +7023,7 @@ def _correction_shift_snapshots(
             v.id,
             v.shift_id,
             v.location_id,
-            COALESCE(l.address, v.location_label, '') AS effective_location,
+            COALESCE(NULLIF(v.location_label, ''), l.address, '') AS effective_location,
             v.location_label,
             v.customer_name,
             v.arrival_time,
@@ -6959,7 +7044,7 @@ def _correction_shift_snapshots(
             d.id,
             d.shift_id,
             d.location_id,
-            COALESCE(l.address, d.location_label, '') AS effective_location,
+            COALESCE(NULLIF(d.location_label, ''), l.address, '') AS effective_location,
             d.location_label,
             d.customer_name,
             d.departure_time,
@@ -7083,7 +7168,7 @@ def build_time_data_correction_inventory(
         SELECT
             e.id AS employee_id,
             e.name AS employee_name,
-            COALESCE(l.address, s.location_label, '') AS location,
+            COALESCE(NULLIF(s.location_label, ''), l.address, '') AS location,
             s.clock_in,
             s.clock_out,
             ARRAY_AGG(s.id ORDER BY s.id) AS shift_ids,
@@ -7094,7 +7179,7 @@ def build_time_data_correction_inventory(
         GROUP BY
             e.id,
             e.name,
-            COALESCE(l.address, s.location_label, ''),
+            COALESCE(NULLIF(s.location_label, ''), l.address, ''),
             s.clock_in,
             s.clock_out
         HAVING COUNT(*) > 1

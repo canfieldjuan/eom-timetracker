@@ -291,8 +291,9 @@ def main():
             "address": c["address"],
             "customerName": c["customer"],
             "locationType": c["type"],
-            "rateType": c.get("rateType", "per_visit"),
         }
+        if "rateType" in c:
+            entry["rateType"] = c["rateType"]
         if "rate" in c:
             entry["rate"] = c["rate"]
         if coords:
