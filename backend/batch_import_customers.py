@@ -2,19 +2,26 @@
 """
 Batch import 45 customers (29 residential + 16 commercial) into the EOM timetracker.
 
-Usage:
+Usage (preview only by default):
     python batch_import_customers.py --url https://eom-timetracker.onrender.com \
-        --username "Juan Canfield" --password "YOUR_PASSWORD"
+        --username "Juan Canfield"
+
+Apply the reviewed preview explicitly:
+    python batch_import_customers.py --url https://eom-timetracker.onrender.com \
+        --username "Juan Canfield" --apply
 
 Options:
     --url        Base URL of the API (default: https://eom-timetracker.onrender.com)
     --username   Admin username
-    --password   Admin password
-    --dry-run    Print payload without sending
+    --password   Admin password (prompted securely when omitted)
+    --apply      Apply the preview with atomic create/update calls
+    --dry-run    Deprecated alias for preview-only behavior
 """
 
 import argparse
+import getpass
 import json
+import re
 import time
 import urllib.request
 import urllib.error
@@ -93,74 +100,227 @@ def api_call(url: str, method: str, body: dict | None = None, token: str | None 
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read())
+            detail = payload.get("error") or payload.get("detail") or str(payload)
+        except Exception:
+            detail = exc.reason
+        raise RuntimeError(f"{method} {url} failed ({exc.code}): {detail}") from exc
+
+
+def normalize_address(address: str) -> str:
+    collapsed = re.sub(r"\s+", " ", address.strip())
+    collapsed = re.sub(r"\s*,\s*", ", ", collapsed)
+    return collapsed.casefold()
+
+
+def build_import_plan(imported: list[dict], existing: list[dict]) -> dict:
+    """Return an idempotent plan without inventing values for omitted fields."""
+    existing_by_key: dict[str, list[dict]] = {}
+    for location in existing:
+        existing_by_key.setdefault(normalize_address(location["address"]), []).append(location)
+
+    operations: list[dict] = []
+    conflicts: list[dict] = []
+    imported_keys: set[str] = set()
+    field_map = {
+        "customerName": "customerName",
+        "locationType": "locationType",
+        "rate": "rate",
+        "rateType": "rateType",
+        "frequency": "frequency",
+        "lat": "latitude",
+        "lng": "longitude",
+        "expectedHours": "expectedHours",
+        "targetLaborPct": "targetLaborPct",
+        "minMarginPct": "minMarginPct",
+    }
+
+    for candidate in imported:
+        key = normalize_address(candidate["address"])
+        if key in imported_keys:
+            conflicts.append(
+                {
+                    "address": candidate["address"],
+                    "reason": "duplicate address in import source",
+                }
+            )
+            continue
+        imported_keys.add(key)
+
+        matches = existing_by_key.get(key, [])
+        if len(matches) > 1:
+            conflicts.append(
+                {
+                    "address": candidate["address"],
+                    "reason": "multiple saved locations match after normalization",
+                    "locationIds": [int(match["id"]) for match in matches],
+                }
+            )
+            continue
+        if not matches:
+            operations.append({"action": "create", "payload": candidate})
+            continue
+
+        current = matches[0]
+        if not current.get("active", True):
+            operations.append(
+                {
+                    "action": "reactivate",
+                    "locationId": int(current["id"]),
+                    "payload": candidate,
+                }
+            )
+            continue
+
+        patch: dict = {}
+        changes: dict = {}
+        for incoming_field, existing_field in field_map.items():
+            if incoming_field not in candidate:
+                continue
+            incoming_value = candidate[incoming_field]
+            current_value = current.get(existing_field)
+            if isinstance(incoming_value, float) and current_value is not None:
+                equal = abs(incoming_value - float(current_value)) < 0.000001
+            else:
+                equal = incoming_value == current_value
+            if not equal:
+                patch[incoming_field] = incoming_value
+                changes[incoming_field] = {"from": current_value, "to": incoming_value}
+
+        operations.append(
+            {
+                "action": "update" if patch else "unchanged",
+                "locationId": int(current["id"]),
+                "address": str(current["address"]),
+                "payload": patch,
+                "changes": changes,
+            }
+        )
+
+    return {"operations": operations, "conflicts": conflicts}
+
+
+def print_import_plan(plan: dict) -> None:
+    counts: dict[str, int] = {}
+    for operation in plan["operations"]:
+        action = operation["action"]
+        counts[action] = counts.get(action, 0) + 1
+        if action in {"create", "reactivate"}:
+            print(f"  {action.upper():10} {operation['payload']['address']}")
+        elif action == "update":
+            fields = ", ".join(operation["changes"])
+            print(f"  UPDATE     {operation['address']} ({fields})")
+
+    print(
+        "\nPlan: "
+        + ", ".join(
+            f"{counts.get(action, 0)} {action}"
+            for action in ("create", "reactivate", "update", "unchanged")
+        )
+    )
+    if plan["conflicts"]:
+        print(f"Conflicts: {len(plan['conflicts'])}")
+        for conflict in plan["conflicts"]:
+            print(f"  CONFLICT   {conflict['address']}: {conflict['reason']}")
+
+
+def apply_import_plan(base: str, token: str, plan: dict) -> None:
+    for operation in plan["operations"]:
+        action = operation["action"]
+        if action == "unchanged":
+            continue
+        if action in {"create", "reactivate"}:
+            api_call(
+                f"{base}/api/admin/locations",
+                "POST",
+                operation["payload"],
+                token,
+            )
+        else:
+            api_call(
+                f"{base}/api/admin/locations/{operation['locationId']}",
+                "PATCH",
+                operation["payload"],
+                token,
+            )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Batch import EOM customers")
     parser.add_argument("--url", default=API_BASE)
     parser.add_argument("--username", required=True)
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--password")
+    parser.add_argument("--apply", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     base = args.url.rstrip("/")
 
-    # Step 1 — geocode all addresses
+    password = args.password or getpass.getpass("Admin password: ")
+
+    # Step 1 — authenticate before doing slow external work.
+    print("Authenticating...")
+    resp = api_call(
+        f"{base}/api/auth/login",
+        "POST",
+        {"name": args.username, "password": password},
+    )
+    token = resp.get("token") or resp.get("access_token")
+    if not token:
+        raise RuntimeError(f"Login response did not contain an access token: {resp}")
+    print("Authenticated.")
+
+    existing_response = api_call(
+        f"{base}/api/admin/locations?includeArchived=true",
+        "GET",
+        token=token,
+    )
+    existing = existing_response.get("locations", [])
+
+    # Step 2 — geocode all addresses.
     print(f"Geocoding {len(CUSTOMERS)} addresses (1 req/sec to respect Nominatim rate limit)...")
     locations = []
     for i, c in enumerate(CUSTOMERS):
         print(f"  [{i+1}/{len(CUSTOMERS)}] {c['customer']} — {c['address']}")
         coords = geocode(c["address"])
         entry = {
-            "name": c["address"],
-            "customer": c["customer"],
-            "type": c["type"],
-            "lat": coords[0] if coords else None,
-            "lng": coords[1] if coords else None,
-            "rate": c.get("rate"),
+            "address": c["address"],
+            "customerName": c["customer"],
+            "locationType": c["type"],
             "rateType": c.get("rateType", "per_visit"),
         }
+        if "rate" in c:
+            entry["rate"] = c["rate"]
         if coords:
+            entry["lat"], entry["lng"] = coords
             print(f"    → {coords[0]:.5f}, {coords[1]:.5f}")
         else:
-            print(f"    → geocode failed, will import without GPS pin")
+            print("    → geocode failed; existing GPS data will remain unchanged")
         locations.append(entry)
         if i < len(CUSTOMERS) - 1:
             time.sleep(1.1)  # Nominatim requires ≥1 req/sec
 
-    pinned = sum(1 for l in locations if l["lat"] is not None)
+    pinned = sum(1 for location in locations if "lat" in location)
     print(f"\nGeocoded {pinned}/{len(locations)} locations successfully.")
 
-    if args.dry_run:
-        print("\n--- DRY RUN PAYLOAD ---")
-        print(json.dumps({"locations": locations}, indent=2))
+    plan = build_import_plan(locations, existing)
+    print_import_plan(plan)
+    if plan["conflicts"]:
+        raise RuntimeError("Resolve import conflicts before applying changes")
+
+    if args.dry_run or not args.apply:
+        print("\nPreview only. Re-run with --apply after reviewing this diff.")
         return
 
-    # Step 2 — authenticate
-    print("\nAuthenticating...")
-    try:
-        resp = api_call(f"{base}/api/auth/login", "POST", {
-            "username": args.username,
-            "password": args.password,
-        })
-        token = resp.get("token") or resp.get("access_token")
-        if not token:
-            print(f"Login failed: {resp}")
-            return
-        print("Authenticated.")
-    except Exception as e:
-        print(f"Login error: {e}")
-        return
-
-    # Step 3 — push locations
-    print(f"Importing {len(locations)} locations...")
-    try:
-        result = api_call(f"{base}/api/admin/locations", "PUT", {"locations": locations}, token)
-        imported = len(result.get("locations", []))
-        print(f"Done. {imported} locations now in system.")
-    except Exception as e:
-        print(f"Import error: {e}")
+    apply_import_plan(base, token, plan)
+    changed = sum(
+        operation["action"] != "unchanged" for operation in plan["operations"]
+    )
+    print(f"\nApplied {changed} atomic location changes. Existing unrelated locations were untouched.")
 
 
 if __name__ == "__main__":

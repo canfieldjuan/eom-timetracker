@@ -41,7 +41,14 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, sta
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 _data_dir_env = os.environ.get("DATA_DIR", "")
@@ -1792,6 +1799,177 @@ MAX_LOCATION_LEN            = parse_int(os.getenv("MAX_LOCATION_LEN"),          
 MAX_NOTES_LEN               = parse_int(os.getenv("MAX_NOTES_LEN"),               2000)
 MAX_GPS_OVERRIDE_REASON_LEN = parse_int(os.getenv("MAX_GPS_OVERRIDE_REASON_LEN"), 200)
 MAX_GPS_OVERRIDE_DETAIL_LEN = parse_int(os.getenv("MAX_GPS_OVERRIDE_DETAIL_LEN"), 500)
+
+
+class LocationWriteRequest(BaseModel):
+    """Validated location payload shared by create and legacy list sync."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    address: str = Field(
+        min_length=1,
+        max_length=MAX_LOCATION_LEN,
+        validation_alias=AliasChoices("address", "name"),
+    )
+    customer_name: str = Field(
+        min_length=1,
+        max_length=256,
+        validation_alias=AliasChoices("customerName", "customer"),
+    )
+    location_type: Optional[str] = Field(
+        default=None,
+        pattern="^(Residential|Commercial)$",
+        validation_alias=AliasChoices("locationType", "type"),
+    )
+    rate: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+    rate_type: str = Field(
+        default="per_visit",
+        pattern="^(per_visit|hourly|monthly)$",
+        validation_alias=AliasChoices("rateType", "rate_type"),
+    )
+    frequency: Optional[str] = Field(default=None, max_length=200)
+    lat: Optional[float] = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
+    lng: Optional[float] = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
+    expected_hours: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1_000,
+        validation_alias=AliasChoices("expectedHours", "expected_hours"),
+    )
+    target_labor_pct: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        validation_alias=AliasChoices("targetLaborPct", "target_labor_pct"),
+    )
+    min_margin_pct: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        validation_alias=AliasChoices("minMarginPct", "min_margin_pct"),
+    )
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def address_is_required(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("address is required")
+        return value.strip()
+
+    @field_validator("customer_name", mode="before")
+    @classmethod
+    def customer_name_is_required(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("customerName is required")
+        return value.strip()
+
+    @field_validator("frequency", mode="before")
+    @classmethod
+    def normalize_frequency(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @model_validator(mode="after")
+    def pin_is_complete(self) -> "LocationWriteRequest":
+        fields = self.model_fields_set
+        if ("lat" in fields) != ("lng" in fields):
+            raise ValueError("lat and lng must be provided together")
+        if (self.lat is None) != (self.lng is None):
+            raise ValueError("lat and lng must both be numbers or both be null")
+        return self
+
+
+class LocationListSyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    locations: List[LocationWriteRequest] = Field(max_length=5_000)
+
+
+class LocationUpdateRequest(BaseModel):
+    """Partial location update; omitted fields are never cleared."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    address: Optional[str] = Field(default=None, min_length=1, max_length=MAX_LOCATION_LEN)
+    customer_name: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        validation_alias=AliasChoices("customerName", "customer"),
+    )
+    location_type: Optional[str] = Field(
+        default=None,
+        pattern="^(Residential|Commercial)$",
+        validation_alias=AliasChoices("locationType", "type"),
+    )
+    rate: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+    rate_type: Optional[str] = Field(
+        default=None,
+        pattern="^(per_visit|hourly|monthly)$",
+        validation_alias=AliasChoices("rateType", "rate_type"),
+    )
+    frequency: Optional[str] = Field(default=None, max_length=200)
+    lat: Optional[float] = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
+    lng: Optional[float] = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
+    expected_hours: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1_000,
+        validation_alias=AliasChoices("expectedHours", "expected_hours"),
+    )
+    target_labor_pct: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        validation_alias=AliasChoices("targetLaborPct", "target_labor_pct"),
+    )
+    min_margin_pct: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        validation_alias=AliasChoices("minMarginPct", "min_margin_pct"),
+    )
+
+    @field_validator("address", mode="before")
+    @classmethod
+    def normalize_optional_address(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("address cannot be blank")
+        return value.strip()
+
+    @field_validator("customer_name", mode="before")
+    @classmethod
+    def normalize_optional_customer_name(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("customerName cannot be blank")
+        return value.strip()
+
+    @field_validator("frequency", mode="before")
+    @classmethod
+    def normalize_optional_frequency(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @model_validator(mode="after")
+    def update_is_coherent(self) -> "LocationUpdateRequest":
+        fields = self.model_fields_set
+        if not fields:
+            raise ValueError("at least one location field is required")
+        if "address" in fields and self.address is None:
+            raise ValueError("address cannot be null")
+        if "customer_name" in fields and self.customer_name is None:
+            raise ValueError("customerName cannot be null")
+        if ("lat" in fields) != ("lng" in fields):
+            raise ValueError("lat and lng must be provided together")
+        if "lat" in fields and ((self.lat is None) != (self.lng is None)):
+            raise ValueError("lat and lng must both be numbers or both be null")
+        return self
 
 
 class ClockInRequest(BaseModel):
@@ -6002,6 +6180,239 @@ def my_timesheet_hours(
     }
 
 
+LOCATION_SELECT_COLUMNS = """
+    id, address, customer_name, location_type, rate, rate_type, frequency,
+    lat, lng, expected_hours, target_labor_pct, min_margin_pct,
+    active, created_at
+"""
+
+
+def normalize_location_address(address: str) -> str:
+    """Normalize only presentation differences; do not guess postal abbreviations."""
+    collapsed = re.sub(r"\s+", " ", address.strip())
+    collapsed = re.sub(r"\s*,\s*", ", ", collapsed)
+    return collapsed.casefold()
+
+
+def _location_row_to_api(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "address": str(row["address"]),
+        "customerName": str(row.get("customer_name") or ""),
+        "locationType": row.get("location_type"),
+        "rate": float(row["rate"]) if row.get("rate") is not None else None,
+        "rateType": str(row.get("rate_type") or "per_visit"),
+        "frequency": str(row.get("frequency") or ""),
+        "latitude": float(row["lat"]) if row.get("lat") is not None else None,
+        "longitude": float(row["lng"]) if row.get("lng") is not None else None,
+        "expectedHours": (
+            float(row["expected_hours"])
+            if row.get("expected_hours") is not None
+            else None
+        ),
+        "targetLaborPct": (
+            float(row["target_labor_pct"])
+            if row.get("target_labor_pct") is not None
+            else None
+        ),
+        "minMarginPct": (
+            float(row["min_margin_pct"])
+            if row.get("min_margin_pct") is not None
+            else None
+        ),
+        "active": bool(row.get("active")),
+        "createdAt": (
+            to_utc_iso(row["created_at"]) if row.get("created_at") else None
+        ),
+    }
+
+
+def _find_normalized_location(
+    rows: List[Dict[str, Any]],
+    address: str,
+    *,
+    exclude_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    key = normalize_location_address(address)
+    matches = [
+        row
+        for row in rows
+        if int(row["id"]) != exclude_id
+        and normalize_location_address(str(row["address"])) == key
+    ]
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Multiple saved locations match '{address}'. "
+                "Archive or rename the duplicates before continuing."
+            ),
+        )
+    return matches[0] if matches else None
+
+
+def _lock_and_load_location_rows(cur: Any) -> List[Dict[str, Any]]:
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("eom_location_writes",))
+    cur.execute(f"SELECT {LOCATION_SELECT_COLUMNS} FROM locations ORDER BY id")
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _insert_location(cur: Any, payload: LocationWriteRequest) -> Dict[str, Any]:
+    cur.execute(
+        f"""
+        INSERT INTO locations (
+            address, customer_name, location_type, rate, rate_type, frequency,
+            lat, lng, expected_hours, target_labor_pct, min_margin_pct, active
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true)
+        RETURNING {LOCATION_SELECT_COLUMNS}
+        """,
+        (
+            payload.address,
+            payload.customer_name,
+            payload.location_type,
+            payload.rate,
+            payload.rate_type,
+            payload.frequency,
+            payload.lat,
+            payload.lng,
+            payload.expected_hours,
+            payload.target_labor_pct,
+            payload.min_margin_pct,
+        ),
+    )
+    return dict(cur.fetchone())
+
+
+def _update_location_from_write(
+    cur: Any,
+    location_id: int,
+    payload: LocationWriteRequest,
+) -> Dict[str, Any]:
+    fields = payload.model_fields_set
+    assignments = ["address = %s", "customer_name = %s", "active = true"]
+    values: List[Any] = [payload.address, payload.customer_name]
+    optional_columns = {
+        "location_type": "location_type",
+        "rate": "rate",
+        "rate_type": "rate_type",
+        "frequency": "frequency",
+        "lat": "lat",
+        "lng": "lng",
+        "expected_hours": "expected_hours",
+        "target_labor_pct": "target_labor_pct",
+        "min_margin_pct": "min_margin_pct",
+    }
+    for field_name, column in optional_columns.items():
+        if field_name in fields:
+            assignments.append(f"{column} = %s")
+            values.append(getattr(payload, field_name))
+    values.append(location_id)
+    cur.execute(
+        f"""
+        UPDATE locations
+        SET {', '.join(assignments)}
+        WHERE id = %s
+        RETURNING {LOCATION_SELECT_COLUMNS}
+        """,
+        tuple(values),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Location not found")
+    return dict(row)
+
+
+def _legacy_location_response(archived_count: int = 0) -> Dict[str, Any]:
+    rows = db.query_all(
+        f"SELECT {LOCATION_SELECT_COLUMNS} FROM locations WHERE active = true ORDER BY id"
+    )
+    locations = [str(row["address"]) for row in rows]
+    coords = {
+        str(row["address"]): {"lat": float(row["lat"]), "lng": float(row["lng"])}
+        for row in rows
+        if row.get("lat") is not None and row.get("lng") is not None
+    }
+
+    def values_for(column: str, converter: Callable[[Any], Any] = lambda value: value):
+        return {
+            str(row["address"]): converter(row[column])
+            for row in rows
+            if row.get(column) is not None
+        }
+
+    return {
+        "success": True,
+        "locations": locations,
+        "location_coords": coords,
+        "location_customers": values_for("customer_name", str),
+        "location_rates": values_for("rate", float),
+        "location_rate_types": values_for("rate_type", str),
+        "location_types": values_for("location_type", str),
+        "location_frequencies": values_for("frequency", str),
+        "location_expected_hours": values_for("expected_hours", float),
+        "location_target_labor": values_for("target_labor_pct", float),
+        "location_min_margin": values_for("min_margin_pct", float),
+        "archivedCount": archived_count,
+    }
+
+
+@app.get("/api/admin/locations")
+def admin_list_locations(
+    request: Request,
+    include_archived: bool = Query(default=False, alias="includeArchived"),
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    where = "" if include_archived else "WHERE active = true"
+    rows = db.query_all(
+        f"SELECT {LOCATION_SELECT_COLUMNS} FROM locations {where} ORDER BY customer_name, address, id"
+    )
+    append_access_log(
+        request,
+        "ADMIN_LOCATIONS_LOADED",
+        True,
+        f"{len(rows)} locations; include archived: {include_archived}",
+    )
+    return {"success": True, "locations": [_location_row_to_api(row) for row in rows]}
+
+
+@app.post("/api/admin/locations")
+def admin_create_location(
+    payload: LocationWriteRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with TIMESHEET_WRITE_LOCK, db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            rows = _lock_and_load_location_rows(cur)
+            existing = _find_normalized_location(rows, payload.address)
+            if existing and existing.get("active"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Location already exists as '{existing['address']}' "
+                        f"for {existing.get('customer_name') or 'another customer'}"
+                    ),
+                )
+            if existing:
+                row = _update_location_from_write(cur, int(existing["id"]), payload)
+                reactivated = True
+            else:
+                row = _insert_location(cur, payload)
+                reactivated = False
+    append_access_log(
+        request,
+        "LOCATION_REACTIVATED" if reactivated else "LOCATION_CREATED",
+        True,
+        f"Admin {admin['name']} location {row['id']}",
+    )
+    return {
+        "success": True,
+        "location": _location_row_to_api(row),
+        "reactivated": reactivated,
+    }
+
+
 @app.get("/api/timesheet/locations")
 def timesheet_locations(
     request: Request,
@@ -6055,98 +6466,67 @@ def timesheet_locations(
 
 @app.put("/api/admin/locations")
 def admin_update_locations(
-    payload: Dict[str, Any],
+    payload: LocationListSyncRequest,
     request: Request,
-    _: Dict[str, Any] = Depends(get_current_admin),
+    admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    raw = payload.get("locations")
-    if not isinstance(raw, list):
-        raise HTTPException(status_code=400, detail="locations must be a list")
+    normalized_addresses: Dict[str, str] = {}
+    for item in payload.locations:
+        key = normalize_location_address(item.address)
+        if key in normalized_addresses:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Duplicate locations '{normalized_addresses[key]}' and "
+                    f"'{item.address}' differ only by capitalization or spacing"
+                ),
+            )
+        normalized_addresses[key] = item.address
 
-    locations = []
-    location_coords: Dict[str, Dict[str, float]] = {}
-    location_pin_fields_present = set()
-    location_customers: Dict[str, str] = {}
-    location_rates: Dict[str, float] = {}
-    location_rate_types: Dict[str, str] = {}
-    location_types: Dict[str, str] = {}
-    location_frequencies: Dict[str, str] = {}
-    location_expected_hours: Dict[str, float] = {}
-    location_target_labor: Dict[str, float] = {}
-    location_min_margin: Dict[str, float] = {}
-    for item in raw:
-        if isinstance(item, dict) and item.get("name", "").strip():
-            name = str(item["name"]).strip()
-            locations.append(name)
-            if "lat" in item or "lng" in item:
-                location_pin_fields_present.add(name)
-            if item.get("lat") is not None and item.get("lng") is not None:
-                try:
-                    location_coords[name] = {"lat": float(item["lat"]), "lng": float(item["lng"])}
-                except (TypeError, ValueError):
-                    pass
-            if item.get("customer", "").strip():
-                location_customers[name] = str(item["customer"]).strip()
-            if item.get("rate") is not None:
-                try:
-                    location_rates[name] = float(item["rate"])
-                except (TypeError, ValueError):
-                    pass
-            if item.get("rateType") in ("per_visit", "hourly", "monthly"):
-                location_rate_types[name] = item["rateType"]
-            if item.get("type") in ("Residential", "Commercial"):
-                location_types[name] = item["type"]
-            if isinstance(item.get("frequency"), str) and item["frequency"].strip():
-                location_frequencies[name] = item["frequency"].strip()
-            if item.get("expectedHours") is not None:
-                try:
-                    location_expected_hours[name] = float(item["expectedHours"])
-                except (TypeError, ValueError):
-                    pass
-            if item.get("targetLaborPct") is not None:
-                try:
-                    location_target_labor[name] = float(item["targetLaborPct"])
-                except (TypeError, ValueError):
-                    pass
-            if item.get("minMarginPct") is not None:
-                try:
-                    location_min_margin[name] = float(item["minMarginPct"])
-                except (TypeError, ValueError):
-                    pass
-        elif isinstance(item, str) and item.strip():
-            locations.append(item.strip())
+    archived_count = 0
+    with TIMESHEET_WRITE_LOCK, db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            rows = _lock_and_load_location_rows(cur)
+            if not payload.locations and any(row.get("active") for row in rows):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Refusing to archive every location through a list save. "
+                        "Archive locations individually."
+                    ),
+                )
 
-    def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
-        existing_coords = data.get("location_coords", {})
-        for name in locations:
-            if name in location_coords or name in location_pin_fields_present:
-                continue
-            existing = existing_coords.get(name) if isinstance(existing_coords, dict) else None
-            if not isinstance(existing, dict):
-                continue
-            try:
-                location_coords[name] = {
-                    "lat": float(existing["lat"]),
-                    "lng": float(existing["lng"]),
-                }
-            except (KeyError, TypeError, ValueError):
-                continue
+            submitted_ids: List[int] = []
+            for item in payload.locations:
+                existing = _find_normalized_location(rows, item.address)
+                if existing:
+                    row = _update_location_from_write(cur, int(existing["id"]), item)
+                else:
+                    row = _insert_location(cur, item)
+                submitted_ids.append(int(row["id"]))
 
-        data["locations"] = locations
-        data["location_coords"] = location_coords
-        data["location_customers"] = location_customers
-        data["location_rates"] = location_rates
-        data["location_rate_types"] = location_rate_types
-        data["location_types"] = location_types
-        data["location_frequencies"] = location_frequencies
-        data["location_expected_hours"] = location_expected_hours
-        data["location_target_labor"] = location_target_labor
-        data["location_min_margin"] = location_min_margin
-        return True, locations
+            if submitted_ids:
+                cur.execute(
+                    """
+                    UPDATE locations
+                    SET active = false
+                    WHERE active = true AND NOT (id = ANY(%s))
+                    RETURNING id
+                    """,
+                    (submitted_ids,),
+                )
+                archived_count = len(cur.fetchall())
 
-    update_timesheets(mutator)
-    append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations, {len(location_coords)} with coords")
-    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies, "location_expected_hours": location_expected_hours, "location_target_labor": location_target_labor, "location_min_margin": location_min_margin}
+    append_access_log(
+        request,
+        "LOCATIONS_SYNCHRONIZED",
+        True,
+        (
+            f"Admin {admin['name']}: {len(payload.locations)} active locations, "
+            f"{archived_count} archived"
+        ),
+    )
+    return _legacy_location_response(archived_count)
 
 
 @app.patch("/api/admin/locations/pin")
@@ -6179,6 +6559,129 @@ def admin_patch_location_pin(
 
     append_access_log(request, "LOCATION_PIN_SET", True, f"Pin set for: {location}")
     return {"success": True}
+
+
+@app.patch("/api/admin/locations/{location_id}")
+def admin_update_location(
+    location_id: int,
+    payload: LocationUpdateRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with TIMESHEET_WRITE_LOCK, db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            rows = _lock_and_load_location_rows(cur)
+            current = next(
+                (row for row in rows if int(row["id"]) == location_id),
+                None,
+            )
+            if not current or not current.get("active"):
+                raise HTTPException(status_code=404, detail="Active location not found")
+
+            address = payload.address or str(current["address"])
+            duplicate = _find_normalized_location(
+                rows,
+                address,
+                exclude_id=location_id,
+            )
+            if duplicate:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Location already exists as '{duplicate['address']}' "
+                        f"for {duplicate.get('customer_name') or 'another customer'}"
+                    ),
+                )
+
+            columns = {
+                "address": "address",
+                "customer_name": "customer_name",
+                "location_type": "location_type",
+                "rate": "rate",
+                "rate_type": "rate_type",
+                "frequency": "frequency",
+                "lat": "lat",
+                "lng": "lng",
+                "expected_hours": "expected_hours",
+                "target_labor_pct": "target_labor_pct",
+                "min_margin_pct": "min_margin_pct",
+            }
+            assignments: List[str] = []
+            values: List[Any] = []
+            for field_name, column in columns.items():
+                if field_name in payload.model_fields_set:
+                    assignments.append(f"{column} = %s")
+                    values.append(getattr(payload, field_name))
+            values.append(location_id)
+            cur.execute(
+                f"""
+                UPDATE locations
+                SET {', '.join(assignments)}
+                WHERE id = %s AND active = true
+                RETURNING {LOCATION_SELECT_COLUMNS}
+                """,
+                tuple(values),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Active location not found")
+            updated = dict(row)
+
+    append_access_log(
+        request,
+        "LOCATION_UPDATED",
+        True,
+        f"Admin {admin['name']} location {location_id}",
+    )
+    return {"success": True, "location": _location_row_to_api(updated)}
+
+
+@app.delete("/api/admin/locations/{location_id}")
+def admin_archive_location(
+    location_id: int,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with TIMESHEET_WRITE_LOCK, db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            rows = _lock_and_load_location_rows(cur)
+            current = next(
+                (row for row in rows if int(row["id"]) == location_id),
+                None,
+            )
+            if not current:
+                raise HTTPException(status_code=404, detail="Location not found")
+            already_archived = not bool(current.get("active"))
+            if already_archived:
+                archived = current
+            else:
+                cur.execute(
+                    f"""
+                    UPDATE locations
+                    SET active = false
+                    WHERE id = %s AND active = true
+                    RETURNING {LOCATION_SELECT_COLUMNS}
+                    """,
+                    (location_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=409, detail="Location changed; reload and retry")
+                archived = dict(row)
+
+    append_access_log(
+        request,
+        "LOCATION_ARCHIVED",
+        True,
+        f"Admin {admin['name']} location {location_id}; already archived: {already_archived}",
+    )
+    return {
+        "success": True,
+        "location": _location_row_to_api(archived),
+        "archived": True,
+        "alreadyArchived": already_archived,
+        "historicalReferencesPreserved": True,
+    }
 
 
 @app.get("/api/timesheet/current-status")
