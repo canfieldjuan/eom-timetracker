@@ -5283,6 +5283,18 @@ def admin_update_employee(
             emp["role"] = new_role
         if "active" in payload:
             emp["active"] = bool(payload["active"])
+        # Guard against locking everyone out: after applying role/active, at least
+        # one active admin must remain. Checked inside the write lock (via
+        # update_employees) so it is atomic against concurrent demotions.
+        has_active_admin = any(
+            str(e.get("role") or "").lower() == "admin" and bool(e.get("active"))
+            for e in employees_data["employees"]
+        )
+        if not has_active_admin:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot demote or deactivate the last active admin. Promote or activate another admin first.",
+            )
         if hashed_password:
             emp["password"] = hashed_password
         if "hourlyRate" in payload:
