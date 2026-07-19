@@ -71,39 +71,39 @@ def _calculate_email_summary(employee_data: Dict[str, Any]) -> Dict[str, Any]:
         "top_employee": top_employee,
     }
 
-def load_employee_data_from_files(month: int, year: int) -> Dict[str, Any]:
-    """Load employee timesheet data directly from JSON files for the specified month."""
-    from pathlib import Path
+def load_employee_data_from_db(month: int, year: int) -> Dict[str, Any]:
+    """Load completed-shift data for the given month from PostgreSQL — the same
+    store the running API uses. Replaces the old JSON-file loader, which read a
+    data/timesheets.json the runtime never writes (so reports were always empty
+    or stale). Runs inside the report subprocess, which inherits DATABASE_URL."""
+    import db
 
-    data_dir_env = os.getenv("DATA_DIR", "")
-    if data_dir_env:
-        data_dir = Path(data_dir_env)
-    else:
-        backend_dir = Path(os.path.dirname(os.path.abspath(__file__)))
-        data_dir = backend_dir.parent / "data"
+    if db._pool is None:
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if not database_url:
+            print("DATABASE_URL is not set; cannot load report data from database")
+            return None
+        db.init_pool(database_url)
 
-    timesheets_file = data_dir / "timesheets.json"
-    if not timesheets_file.exists():
-        print(f"Timesheets file not found: {timesheets_file}")
-        return None
+    rows = db.query_all(
+        """
+        SELECT s.employee_id, e.name AS employee_name, s.clock_in, s.clock_out
+        FROM shifts s
+        JOIN employees e ON e.id = s.employee_id
+        WHERE s.clock_out IS NOT NULL
+        ORDER BY e.name, s.clock_in
+        """
+    )
 
-    with open(timesheets_file, "r", encoding="utf-8") as f:
-        timesheet_data = json.load(f)
-
-    entries = timesheet_data.get("entries", [])
     employees_map: Dict[int, Dict[str, Any]] = {}
-
-    for entry in entries:
-        clock_in_str = entry.get("clockIn", "")
-        clock_out_str = entry.get("clockOut")
-        if not clock_in_str or not clock_out_str:
-            continue
-        try:
-            clock_in = datetime.fromisoformat(clock_in_str.replace("Z", "+00:00"))
-            clock_out = datetime.fromisoformat(clock_out_str.replace("Z", "+00:00"))
-        except ValueError:
+    for row in rows:
+        clock_in = row["clock_in"]
+        clock_out = row["clock_out"]
+        if clock_in is None or clock_out is None:
             continue
 
+        # clock_in / clock_out are timezone-aware (TIMESTAMPTZ). Bucket by the
+        # local month/year and format hours identically to the previous loader.
         clock_in_local = clock_in.astimezone(REPORT_TIMEZONE)
         clock_out_local = clock_out.astimezone(REPORT_TIMEZONE)
 
@@ -111,8 +111,8 @@ def load_employee_data_from_files(month: int, year: int) -> Dict[str, Any]:
             continue
 
         hours = round((clock_out - clock_in).total_seconds() / 3600, 2)
-        emp_id = int(entry.get("employeeId", 0))
-        emp_name = str(entry.get("employeeName", f"Employee {emp_id}"))
+        emp_id = int(row["employee_id"])
+        emp_name = str(row.get("employee_name") or f"Employee {emp_id}")
 
         if emp_id not in employees_map:
             employees_map[emp_id] = {"id": emp_id, "name": emp_name, "shifts": []}
@@ -207,8 +207,8 @@ def generate_report(month: int, year: int, company_name: str = "Your Company",
         print("Using mock data for testing...")
         employee_data = load_mock_monthly_data(month, year)
     else:
-        print("Loading data from files...")
-        employee_data = load_employee_data_from_files(month, year)
+        print("Loading data from database...")
+        employee_data = load_employee_data_from_db(month, year)
     
     if not employee_data:
         print("Failed to load employee data")
@@ -260,7 +260,7 @@ def send_report(report_path: str, recipient_emails: List[str],
         if use_mock_data:
             employee_data = load_mock_monthly_data(month, year)
         else:
-            employee_data = load_employee_data_from_files(month, year) or {}
+            employee_data = load_employee_data_from_db(month, year) or {}
         summary_data = _calculate_email_summary(employee_data)
         
         success = email_service.send_monthly_report(
