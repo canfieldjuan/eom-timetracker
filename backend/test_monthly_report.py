@@ -33,6 +33,34 @@ def test_report_reads_real_shift_hours_from_db(client, employee_id):
     assert data["summary"]["totalHours"] >= 2.0
 
 
+def test_report_excludes_shifts_outside_the_requested_month(client, employee_id):
+    # A shift in a clearly different month must not bleed into another month's
+    # report — proves the DB-side month bound (and the defensive per-row filter).
+    past_in = datetime(2020, 3, 15, 9, 0, tzinfo=mrm.REPORT_TIMEZONE)
+    past_out = past_in + timedelta(hours=3)
+    db.execute(
+        """
+        INSERT INTO shifts (employee_id, clock_in, clock_out, location_label, timezone)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (employee_id, past_in, past_out, "Old Site", mrm.REPORT_TIMEZONE_NAME),
+    )
+
+    # Present when we ask for March 2020...
+    march = mrm.load_employee_data_from_db(3, 2020)
+    march_hours = sum(
+        s["hours"] for e in march["employees"] if e["id"] == employee_id for s in e["shifts"]
+    )
+    assert march_hours >= 3.0
+
+    # ...absent from the current month's report.
+    now = datetime.now(mrm.REPORT_TIMEZONE)
+    if (now.year, now.month) != (2020, 3):
+        current = mrm.load_employee_data_from_db(now.month, now.year)
+        dates = [s["date"] for e in current["employees"] for s in e["shifts"]]
+        assert not any(d.startswith("2020-03") for d in dates)
+
+
 def test_mock_path_is_opt_in(client):
     # The mock generator still exists (for explicit testing) but is no longer the
     # default source — the endpoint only uses it when --mock-data is passed.

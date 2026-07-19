@@ -85,14 +85,29 @@ def load_employee_data_from_db(month: int, year: int) -> Dict[str, Any]:
             return None
         db.init_pool(database_url)
 
+    # Bound the scan to the requested month at the DB level so the query does not
+    # read (and the 60s report subprocess does not choke on) all historical shifts
+    # as volume grows. The window is the month in the report timezone: shifts whose
+    # local clock-in falls in [first-of-month, first-of-next-month). Comparing the
+    # tz-aware clock_in against these local midnights is exactly equivalent to the
+    # per-row local month/year check below (kept as a defensive guard).
+    month_start = datetime(year, month, 1, tzinfo=REPORT_TIMEZONE)
+    if month == 12:
+        month_end = datetime(year + 1, 1, 1, tzinfo=REPORT_TIMEZONE)
+    else:
+        month_end = datetime(year, month + 1, 1, tzinfo=REPORT_TIMEZONE)
+
     rows = db.query_all(
         """
         SELECT s.employee_id, e.name AS employee_name, s.clock_in, s.clock_out
         FROM shifts s
         JOIN employees e ON e.id = s.employee_id
         WHERE s.clock_out IS NOT NULL
+          AND s.clock_in >= %s
+          AND s.clock_in < %s
         ORDER BY e.name, s.clock_in
-        """
+        """,
+        (month_start, month_end),
     )
 
     employees_map: Dict[int, Dict[str, Any]] = {}
