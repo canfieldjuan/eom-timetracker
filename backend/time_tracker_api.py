@@ -185,12 +185,22 @@ def normalize_ip(raw_ip: str) -> str:
 
 
 def get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "")
-    forwarded_ip = forwarded.split(",")[0].strip() if forwarded else ""
-
     direct_ip = request.client.host if request.client and request.client.host else ""
-    selected = forwarded_ip if TRUST_PROXY and forwarded_ip else direct_ip
-    return normalize_ip(selected) if selected else "unknown"
+
+    if TRUST_PROXY:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        hops = [part.strip() for part in forwarded.split(",") if part.strip()]
+        if hops:
+            # A client can PREPEND fake entries on the left of X-Forwarded-For;
+            # only the rightmost entries are appended by our own proxy layer.
+            # Trust the hop TRUSTED_PROXY_HOPS from the right (default 1 = the
+            # address our proxy actually observed), never the leftmost/
+            # client-supplied value. For honest traffic (a single real hop) this
+            # is identical to before.
+            index = max(0, len(hops) - TRUSTED_PROXY_HOPS)
+            return normalize_ip(hops[index])
+
+    return normalize_ip(direct_ip) if direct_ip else "unknown"
 
 
 def parse_int(value: Optional[str], default: int) -> int:
@@ -2098,6 +2108,10 @@ validate_schedule(ACCESS_START_HOUR, ACCESS_END_HOUR)
 ALLOWED_DAYS = parse_allowed_days(os.getenv("ALLOWED_DAYS"))
 ALLOWED_IPS = parse_allowed_ips(os.getenv("ALLOWED_IPS"))
 TRUST_PROXY = parse_bool(os.getenv("TRUST_PROXY"), False)
+# Number of trusted reverse-proxy hops between the app and the public internet.
+# Used to pick the real client IP from the RIGHT of X-Forwarded-For (Render's
+# edge = 1). Increase only if you add another trusted proxy (e.g. a CDN).
+TRUSTED_PROXY_HOPS = max(1, parse_int(os.getenv("TRUSTED_PROXY_HOPS"), 1))
 BOOTSTRAP_ADMIN_IDS = [
     int(x) for x in os.getenv("BOOTSTRAP_ADMIN_IDS", "").split(",") if x.strip().isdigit()
 ]
