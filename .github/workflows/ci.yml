@@ -53,3 +53,30 @@ jobs:
         run: pytest -v -rA --tb=short
         env:
           DATABASE_URL: postgresql://eom_test:eom_test@localhost:5433/eom_test
+
+  # Warn-first quality signal. Non-blocking today (reports but does not fail the
+  # build) so a large unlinted production codebase does not flood every PR. Ratchet
+  # to blocking (drop the `|| true` / add `--strict`) once the backlog is triaged.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Ruff (warn-first — real-bug rules only, see ruff.toml)
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+          ruff check backend --output-format=github || true
+
+      - name: Brittle-pattern scan (warn-first)
+        run: node scripts/check_brittle_patterns.mjs backend/time_tracker_api.py backend/monthly_report_main.py backend/report_generator.py backend/timetracker-mobile.html
