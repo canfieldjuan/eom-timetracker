@@ -16,6 +16,11 @@ services:
         value: /opt/render/project/data
       - key: TRUST_PROXY
         value: "true"
+      # Trusted proxy hops between the app and the internet (Render edge = 1).
+      # The real client IP is read this many hops from the right of
+      # X-Forwarded-For, so a client cannot spoof it by prepending fake entries.
+      - key: TRUSTED_PROXY_HOPS
+        value: "1"
       - key: ACCESS_START_HOUR
         value: "6"
       - key: ACCESS_END_HOUR
