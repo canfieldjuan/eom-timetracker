@@ -8,8 +8,9 @@ crossing the declared boundaries.
 
 ## Root cause
 
-The system has no server-authoritative Customer-to-Job-Site aggregate or atomic
-mutation boundary.
+The reliability root cause is an address-keyed, whole-list mutation boundary
+instead of server-authoritative, ID-based Site operations. The onboarding model
+gap is separate but related: there is no stable Customer-to-Job-Site aggregate.
 
 `backend/schema.sql:17-36` uses one `locations` row as the customer identity,
 physical site, service/pricing profile, GPS pin, QR configuration, and lifecycle
@@ -30,16 +31,19 @@ The importer is another symptom of the same missing authority: it sends
 `username` although `LoginRequest` requires `name`, previews only a local
 payload, and applies through the unsafe whole-list route.
 
-The correct fix is therefore not another client-side check, a special-case
-archive button, or more mocking. It is an additive Customer/Job-Site model with
-stable IDs, server-owned validation and lifecycle rules, atomic APIs, compatible
-legacy behavior, and real persistence verification.
+The reliability fix is therefore not another client-side check, a special-case
+archive button, or more mocking. It requires atomic Site APIs and safe legacy
+writes. Completing the Issue #19 onboarding acceptance criteria additionally
+requires an additive Customer/Job-Site model with stable IDs, server-owned
+validation and lifecycle rules, compatible legacy behavior, and real
+persistence verification.
 
 ## Required model and behavior
 
 ### Customer and site identity
 
-- A Customer is a stable record with one or more Job Sites (`locations`).
+- A Customer is a stable record with zero or more Job Sites while it is a
+  draft, and requires at least one active Job Site to become ready (`locations`).
 - Customer names are not unique.
 - Customer-level data is the display name, primary contact name/phone/email,
   billing name/email/address, and optional external Atlas contact ID.
@@ -47,9 +51,11 @@ legacy behavior, and real persistence verification.
   hours, profitability targets, GPS/QR state, plus service scope, access
   instructions, service preferences, pet notes, and service start date.
 - `locations.customer_name` remains synchronized as a compatibility snapshot.
-- Existing rows with the same trimmed, nonblank `customer_name` are linked to a
-  shared Customer by an idempotent additive backfill. Blank names remain
-  unlinked and are surfaced for review; migration must not invent an identity.
+- Each existing Site with a nonblank `customer_name` receives its own Customer
+  during an idempotent additive backfill. Equal names are not evidence that two
+  Sites belong to the same Customer. Admins may later reassign a Site to an
+  explicitly selected Customer. Blank names remain unlinked and are surfaced
+  for review; migration must not invent an identity.
 
 ### Atomic persistence
 
@@ -62,7 +68,14 @@ legacy behavior, and real persistence verification.
   cannot be cleared.
 - Every mutation returns the canonical persisted record.
 - Server validation owns required fields, enums, numeric bounds, coordinate
-  pairing/ranges, email/date formats, and maximum lengths.
+  pairing/ranges, email/date formats, and maximum lengths. Names are limited to
+  200 characters; phone to 50; email to 320; address/billing address to 500;
+  frequency to 100; service scope/access/preferences to 4,000 each; pet notes to
+  2,000. Rate is `0..999999.99`, expected hours `0..9999.99`, percentages
+  `0..100`, latitude `-90..90`, and longitude `-180..180`. Rate type is
+  `per_visit`, `hourly`, or `monthly`; Site type is `Residential` or
+  `Commercial`; service start date is ISO `YYYY-MM-DD`; Atlas contact ID is a
+  UUID.
 - Errors retain the existing envelope and add stable codes plus field-level
   details so the portal can present a corrective action.
 
@@ -75,6 +88,9 @@ legacy behavior, and real persistence verification.
 - Atomic compatibility Site routes are `GET/POST /api/admin/locations`,
   `PATCH/DELETE /api/admin/locations/{site_id}`, and
   `POST /api/admin/locations/{site_id}/restore`.
+- Customer and Site lists default to active records; `includeArchived=true`
+  returns both active and archived records. Static `/locations/pin` is declared
+  before integer `/{site_id}` PATCH/DELETE routes so it cannot be shadowed.
 - Customer create/update fields are `name`, `primaryContactName`,
   `primaryPhone`, `primaryEmail`, `billingName`, `billingEmail`,
   `billingAddress`, `atlasContactId`, and optional nested `primarySite` on
@@ -112,12 +128,19 @@ legacy behavior, and real persistence verification.
 - The server normalizes full site addresses by trimming, collapsing whitespace,
   standardizing comma spacing, and case-folding without removing suite/unit
   identity.
-- A normalized address cannot be duplicated across active or archived sites.
+- No new Site mutation may create a normalized-address duplicate across active
+  or archived Sites. Retained legacy collisions are quarantined exceptions that
+  remain reviewable but cannot be copied or expanded.
 - An active duplicate returns `409` with the matching Customer and Site IDs.
 - An archived duplicate returns `409`, the matching IDs, and an explicit restore
   capability; it is never silently recreated.
 - Concurrent creates deterministically yield one record and one conflict.
-- Legacy normalized collisions are reported and never silently merged/deleted.
+- `locations.address_key` is nullable for deploy safety. Migration fills it only
+  for collision-free legacy rows and applies a partial unique index where the
+  key is non-null. Collided rows keep a null key, are returned as review items,
+  and are never silently merged/deleted. New writes take a transaction-scoped
+  lock, check every normalized legacy row including null-key collisions, and
+  always store a non-null key.
 
 ### Archive and restore
 
@@ -125,14 +148,20 @@ legacy behavior, and real persistence verification.
   nulls historical foreign keys.
 - Archived sites disappear from new employee choices and cannot resolve QR
   check-ins.
-- Site archive invalidates its QR nonce, ends future recurring QR arrival rules,
-  and cancels only future exact QR arrivals. Past schedules, check-ins,
-  reconciliation, shifts, visits, departures, and jobs remain intact.
+- Archive lifecycle integration is explicitly in scope. Site archive invalidates
+  its QR nonce, soft-ends active recurring QR arrival rules, and marks only
+  future exact QR arrivals with `cancelled_at`, `cancelled_by`, and an archive
+  reason. Matching ignores cancelled exact arrivals. Past schedules, check-ins,
+  reconciliation, shifts, visits, departures, and jobs remain intact and
+  readable.
 - Restore does not reactivate an old QR code or schedule.
 - A Customer with active sites cannot be archived; the conflict lists those
   sites. Restoring a site requires its Customer to be active first.
 
 ### Onboarding state
+
+The following readiness/profile rules were explicitly approved for Issue #19;
+they are product requirements rather than facts inferred from the old schema.
 
 - Customer states are `draft`, `needs_setup`, `ready`, and `archived`.
 - Site states are `needs_setup`, `ready`, and `archived`.
@@ -177,13 +206,23 @@ legacy behavior, and real persistence verification.
   employee registration and role behavior do not change.
 - Preserve `GET /api/timesheet/locations` response keys and active-site behavior.
 - Preserve legacy `PUT /api/admin/locations` and
-  `PATCH /api/admin/locations/pin`. PUT may become safer, but old aliases and
-  response maps remain accepted and omission never means archive.
+  `PATCH /api/admin/locations/pin`. PUT accepts old `name`/`customer`/`type` and
+  current `address`/`customerName`/`locationType` aliases; current aliases take
+  precedence when both are present. It retains `lat`, `lng`, `rate`, `rateType`,
+  `frequency`, `expectedHours`, `targetLaborPct`, and `minMarginPct`. Omitted
+  fields and omitted Sites are preserved; explicit null clears only nullable
+  fields; string-only entries update/create only the address. Existing response
+  maps remain.
 - Preserve current location request keys (`lat`, `lng`) and website response
   keys (`latitude`, `longitude`) on the atomic compatibility API.
-- Preserve jobs, schedules, analytics, reports, check-in classification,
-  reconciliation, and receivables contracts. Additive IDs may be exposed while
-  existing names and lookup fields remain.
+- Preserve stored jobs/schedules, analytics, reports, check-in classification,
+  reconciliation, and receivables contracts. Job or schedule creation with a
+  supplied `locationId` validates that exact active Site and derives its
+  compatibility customer name. Name-only fallback remains only when it resolves
+  to exactly one active Site; otherwise it returns `409 ambiguous_customer_site`
+  instead of selecting an arbitrary first row. Weekly scheduling for a Customer
+  with multiple active Sites remains unavailable until Issue #20 rather than
+  silently conflating Sites under the existing name-based unique constraint.
 - Preserve all historical location references and reporting after archive.
 
 ## Explicitly out of scope
@@ -195,8 +234,8 @@ legacy behavior, and real persistence verification.
 - Automatic jobs, schedules, QR generation, employee assignment, billing
   records, or Atlas contact creation.
 - Clock-in/out, background location polling, GPS evidence, geofence math, QR
-  classification, review decisions, or time corrections, except the minimum
-  archive filtering needed to stop future inactive-site events.
+  classification, review decisions, or time corrections. The only QR-scheduling
+  change allowed is the archive lifecycle behavior explicitly defined above.
 - Public marketing, translations, clean URLs, payments, unrelated portal tabs,
   destructive migrations, or rewriting production history.
 
@@ -212,7 +251,10 @@ legacy behavior, and real persistence verification.
   ended future rules, cancelled future arrivals, and unchanged past evidence.
 - Prove legacy whole-list writes preserve omitted advanced fields and unrelated
   rows.
-- Prove backfill is idempotent and blank names remain unassigned.
+- Prove backfill is idempotent, creates one Customer per named legacy Site, never
+  merges equal names, and leaves blank names unassigned.
+- Prove explicit `locationId` job/schedule resolution and ambiguous name-only
+  rejection without changing stored historical records.
 - Prove admin access and the unchanged employee location contract.
 
 ### Importer
@@ -228,9 +270,12 @@ legacy behavior, and real persistence verification.
   and save-success plus refresh-failure recovery.
 - Run the website against real local FastAPI/PostgreSQL; mocked fetch alone is
   insufficient.
-- Verify production separately with read-only counts/read-back and an
-  authenticated, non-rotating Firefly QR test. Test fixtures are not evidence
-  about real production customers.
+- Verify production separately with read-only counts/read-back. The Firefly QR
+  verification may authenticate and resolve the existing non-rotated token, but
+  it must stop before `POST /api/timesheet/site-check-in`; an actual production
+  check-in creates immutable evidence and requires separate explicit
+  authorization and an identified employee. Test fixtures are not evidence about
+  real customers.
 
 ## Completion audit
 
