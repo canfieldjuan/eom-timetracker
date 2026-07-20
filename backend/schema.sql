@@ -252,6 +252,186 @@ CREATE TABLE site_check_in_reconciliation_reviews (
     reviewed_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- One-way, read-only Google Calendar connection state. Credentials are
+-- encrypted by the application before they reach PostgreSQL. Revoked rows are
+-- retained as connection provenance, but their credential ciphertext is
+-- scrubbed.
+CREATE TABLE google_calendar_connections (
+    id                     BIGSERIAL PRIMARY KEY,
+    google_account_email   TEXT,
+    credential_ciphertext  TEXT,
+    granted_scopes         TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    selected_calendar_id   TEXT,
+    selected_calendar_name TEXT,
+    selected_calendar_timezone TEXT,
+    connected_by           INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    connected_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    revoked_at             TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX uq_google_calendar_active_connection
+    ON google_calendar_connections ((revoked_at IS NULL))
+    WHERE revoked_at IS NULL;
+
+-- OAuth callbacks cannot carry the portal bearer token. A random state value
+-- is stored only as a hash, bound to the initiating admin, and consumed once.
+CREATE TABLE google_calendar_oauth_states (
+    state_hash                 VARCHAR(64) PRIMARY KEY
+                                   CHECK (state_hash ~ '^[0-9a-f]{64}$'),
+    admin_employee_id          INTEGER NOT NULL REFERENCES employees(id),
+    pkce_verifier_ciphertext   TEXT NOT NULL,
+    expires_at                 TIMESTAMPTZ NOT NULL,
+    consumed_at                TIMESTAMPTZ,
+    created_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Reusable service crews and effective-dated membership. Imported Calendar
+-- times are deliberately absent: membership describes who may be assigned,
+-- not paid time or an exact arrival promise.
+CREATE TABLE crews (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    active      BOOLEAN NOT NULL DEFAULT true,
+    created_by  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE crew_memberships (
+    id             BIGSERIAL PRIMARY KEY,
+    crew_id        BIGINT NOT NULL REFERENCES crews(id),
+    employee_id    INTEGER NOT NULL REFERENCES employees(id),
+    effective_from DATE NOT NULL,
+    effective_to   DATE,
+    created_by     INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (effective_to IS NULL OR effective_to >= effective_from),
+    UNIQUE (crew_id, employee_id, effective_from)
+);
+
+INSERT INTO crews (name) VALUES ('Morning Crew') ON CONFLICT (name) DO NOTHING;
+
+-- A reviewed import is the immutable approval boundary. The source and full
+-- resolved plan fingerprints let approval fail closed if Google changes after
+-- preview, while an applied row makes an exact retry idempotent.
+CREATE TABLE calendar_import_previews (
+    id                  TEXT PRIMARY KEY,
+    connection_id       BIGINT NOT NULL REFERENCES google_calendar_connections(id),
+    calendar_id         TEXT NOT NULL,
+    range_start         TIMESTAMPTZ NOT NULL,
+    range_end           TIMESTAMPTZ NOT NULL,
+    source_fingerprint  VARCHAR(64) NOT NULL
+                            CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+    preview_fingerprint VARCHAR(64) NOT NULL
+                            CHECK (preview_fingerprint ~ '^[0-9a-f]{64}$'),
+    payload             JSONB NOT NULL,
+    status              VARCHAR(16) NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open', 'applied', 'stale')),
+    created_by          INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at          TIMESTAMPTZ NOT NULL,
+    applied_at          TIMESTAMPTZ,
+    result              JSONB,
+    CHECK (range_end > range_start)
+);
+
+-- Manual customer/location decisions are durable per Google occurrence. They
+-- reference existing locations read-only; the importer never creates or edits
+-- a customer/site, and one exception in a recurring series cannot overwrite
+-- another occurrence's reviewed decision.
+CREATE TABLE google_calendar_event_mappings (
+    id                BIGSERIAL PRIMARY KEY,
+    connection_id     BIGINT NOT NULL REFERENCES google_calendar_connections(id),
+    calendar_id       TEXT NOT NULL,
+    source_key        VARCHAR(64) NOT NULL
+                          CHECK (source_key ~ '^[0-9a-f]{64}$'),
+    location_id       INTEGER NOT NULL REFERENCES locations(id),
+    created_by        INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    updated_by        INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (source_key)
+);
+
+-- One row is one customer service obligation, including one expanded recurring
+-- occurrence. Approximate times are ordering/capacity hints only and have no
+-- relationship to shifts, payroll, QR evidence, or exact-arrival schedules.
+CREATE TABLE planned_service_visits (
+    id                    BIGSERIAL PRIMARY KEY,
+    connection_id         BIGINT NOT NULL REFERENCES google_calendar_connections(id),
+    mapping_id            BIGINT REFERENCES google_calendar_event_mappings(id),
+    source_calendar_id    TEXT NOT NULL,
+    source_event_id       TEXT NOT NULL,
+    source_series_id      TEXT NOT NULL,
+    source_occurrence_id  TEXT NOT NULL,
+    source_key            VARCHAR(64) NOT NULL UNIQUE
+                              CHECK (source_key ~ '^[0-9a-f]{64}$'),
+    source_fingerprint    VARCHAR(64) NOT NULL
+                              CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+    source_etag           TEXT,
+    source_updated_at     TIMESTAMPTZ,
+    title                 TEXT NOT NULL DEFAULT '',
+    description           TEXT NOT NULL DEFAULT '',
+    source_location_text  TEXT NOT NULL DEFAULT '',
+    location_id           INTEGER NOT NULL REFERENCES locations(id),
+    approximate_start     TIMESTAMPTZ NOT NULL,
+    approximate_end       TIMESTAMPTZ NOT NULL,
+    all_day               BOOLEAN NOT NULL DEFAULT false,
+    source_timezone       TEXT,
+    status                VARCHAR(16) NOT NULL DEFAULT 'planned'
+                              CHECK (status IN ('planned', 'cancelled', 'completed')),
+    cancelled_at          TIMESTAMPTZ,
+    completed_at          TIMESTAMPTZ,
+    last_preview_id       TEXT REFERENCES calendar_import_previews(id),
+    last_imported_by      INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (approximate_end > approximate_start),
+    CHECK (status <> 'cancelled' OR cancelled_at IS NOT NULL),
+    CHECK (status <> 'completed' OR completed_at IS NOT NULL)
+);
+
+-- Assignment changes are retired, never deleted. Exactly one of crew or
+-- employee is present so default crews and per-visit individual overrides can
+-- coexist without inventing shifts.
+CREATE TABLE planned_visit_assignments (
+    id                  BIGSERIAL PRIMARY KEY,
+    planned_visit_id    BIGINT NOT NULL REFERENCES planned_service_visits(id),
+    crew_id             BIGINT REFERENCES crews(id),
+    employee_id         INTEGER REFERENCES employees(id),
+    active              BOOLEAN NOT NULL DEFAULT true,
+    assigned_by         INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    assigned_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    retired_by          INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    retired_at          TIMESTAMPTZ,
+    CHECK ((crew_id IS NULL) <> (employee_id IS NULL)),
+    CHECK (active OR retired_at IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX uq_planned_visit_active_crew_assignment
+    ON planned_visit_assignments(planned_visit_id, crew_id)
+    WHERE active AND crew_id IS NOT NULL;
+
+CREATE UNIQUE INDEX uq_planned_visit_active_employee_assignment
+    ON planned_visit_assignments(planned_visit_id, employee_id)
+    WHERE active AND employee_id IS NOT NULL;
+
+-- Append-only domain provenance lives in PostgreSQL with the mutation it
+-- describes. It is intentionally separate from the best-effort request log.
+CREATE TABLE planned_visit_audit_events (
+    id                  BIGSERIAL PRIMARY KEY,
+    planned_visit_id    BIGINT REFERENCES planned_service_visits(id),
+    preview_id          TEXT REFERENCES calendar_import_previews(id),
+    action              VARCHAR(48) NOT NULL,
+    source_key          VARCHAR(64),
+    actor_employee_id   INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    actor_name          TEXT NOT NULL,
+    before_state        JSONB,
+    after_state         JSONB,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Settings (key-value)
 CREATE TABLE settings (
     key   TEXT PRIMARY KEY,
@@ -339,3 +519,19 @@ CREATE INDEX idx_receivables_operation_attempts_state
 CREATE UNIQUE INDEX uq_receivables_operation_attempts_active_identity
     ON receivables_operation_attempts(operation_identity)
     WHERE state IN ('pending', 'resolved');
+CREATE INDEX idx_google_calendar_oauth_states_expiry
+    ON google_calendar_oauth_states(expires_at, consumed_at);
+CREATE INDEX idx_crew_memberships_effective
+    ON crew_memberships(crew_id, effective_from, effective_to);
+CREATE INDEX idx_calendar_import_previews_status
+    ON calendar_import_previews(status, expires_at);
+CREATE INDEX idx_google_calendar_event_mappings_source
+    ON google_calendar_event_mappings(connection_id, calendar_id, source_key);
+CREATE INDEX idx_planned_service_visits_window
+    ON planned_service_visits(approximate_start, status);
+CREATE INDEX idx_planned_service_visits_source
+    ON planned_service_visits(connection_id, source_calendar_id, source_series_id);
+CREATE INDEX idx_planned_visit_assignments_visit
+    ON planned_visit_assignments(planned_visit_id, active);
+CREATE INDEX idx_planned_visit_audit_events_visit
+    ON planned_visit_audit_events(planned_visit_id, created_at);

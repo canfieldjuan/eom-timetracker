@@ -34,6 +34,19 @@ os.environ.setdefault("LOGIN_RATE_LIMIT_MAX", "0")
 os.environ.setdefault("REGISTER_RATE_LIMIT_MAX", "0")
 os.environ.setdefault("ALLOW_PUBLIC_REGISTRATION", "false")
 os.environ.setdefault("ALLOWED_ORIGINS", "https://trusted.example")
+os.environ.setdefault("GOOGLE_CALENDAR_CLIENT_ID", "test-google-client")
+os.environ.setdefault("GOOGLE_CALENDAR_CLIENT_SECRET", "test-google-secret")
+os.environ.setdefault(
+    "GOOGLE_CALENDAR_REDIRECT_URI",
+    "https://api.example.test/api/google-calendar/oauth/callback",
+)
+os.environ.setdefault(
+    "GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY",
+    "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=",
+)
+os.environ.setdefault(
+    "GOOGLE_CALENDAR_PORTAL_URL", "https://portal.example.test/portal.html"
+)
 
 SCHEMA_FILE = BACKEND_DIR / "schema.sql"
 
@@ -46,7 +59,12 @@ def _apply_schema(conn):
     """Drop and recreate all tables from schema.sql."""
     with conn.cursor() as cur:
         cur.execute("""
-            DROP TABLE IF EXISTS receivables_operation_attempts,
+            DROP TABLE IF EXISTS planned_visit_audit_events,
+                planned_visit_assignments, planned_service_visits,
+                google_calendar_event_mappings, calendar_import_previews,
+                crew_memberships, crews, google_calendar_oauth_states,
+                google_calendar_connections,
+                receivables_operation_attempts,
                 time_data_correction_batches,
                 site_check_in_reconciliation_reviews, site_check_ins,
                 site_check_in_schedule_rules, site_check_in_schedules,

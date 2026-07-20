@@ -49,6 +49,18 @@ services:
         sync: false
       - key: ATLAS_RECEIVABLES_TIMEOUT_SECONDS
         value: "10"
+      # Google Calendar is a one-way, read-only planning source. OAuth client
+      # material and the independent Fernet key remain server-side secrets.
+      - key: GOOGLE_CALENDAR_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CALENDAR_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_CALENDAR_REDIRECT_URI
+        sync: false
+      - key: GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: GOOGLE_CALENDAR_PORTAL_URL
+        value: https://effinghamofficemaids.com/portal.html
     disk:
       name: eom-data
       mountPath: /opt/render/project/data
