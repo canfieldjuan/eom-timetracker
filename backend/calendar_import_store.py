@@ -842,7 +842,9 @@ def read_planned_source_identities(
     return db.query_all(
         """
         SELECT source_key, source_event_id, source_series_id,
-               source_occurrence_id
+               source_occurrence_id, title, description,
+               source_location_text, approximate_start, approximate_end,
+               all_day, source_timezone, source_updated_at
         FROM planned_service_visits
         WHERE source_calendar_id = %s
           AND status = 'planned'

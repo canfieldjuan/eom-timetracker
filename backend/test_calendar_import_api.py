@@ -1247,6 +1247,11 @@ def test_provider_confirmed_missing_occurrence_is_previewed_and_applied_as_cance
     preview = preview_response.json()
     assert preview["counts"]["cancel"] == 1
     assert preview["counts"]["unresolved"] == 0
+    cancelled_item = preview["items"][0]
+    assert cancelled_item["summary"] == original.summary
+    assert cancelled_item["calendarLocation"] == original.location
+    assert cancelled_item["start"] == original.start
+    assert cancelled_item["end"] == original.end
     approved = client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
