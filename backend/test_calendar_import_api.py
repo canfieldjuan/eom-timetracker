@@ -1227,16 +1227,26 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, au
     assert stored["status"] == "planned"
 
 
+@pytest.mark.parametrize("recurring", [False, True])
 def test_provider_confirmed_missing_occurrence_is_previewed_and_applied_as_cancelled(
-    client, auth
+    client, auth, recurring
 ):
     connect_selected_calendar()
-    original = google_occurrence("event-that-google-deleted")
+    original = google_occurrence(
+        "instance-that-google-deleted" if recurring else "event-that-google-deleted",
+        recurring_event_id="deleted-series" if recurring else None,
+        original_start=WINDOW_START if recurring else None,
+    )
     FakeGoogleClient.occurrences = [original]
     approve_current_preview(client, auth)
 
     FakeGoogleClient.occurrences = []
-    FakeGoogleClient.targeted_occurrences = {original.event_id: None}
+    if recurring:
+        FakeGoogleClient.targeted_recurring_occurrences = {
+            ("deleted-series", original.original_start_query): None
+        }
+    else:
+        FakeGoogleClient.targeted_occurrences = {original.event_id: None}
     preview_response = client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,

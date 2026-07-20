@@ -634,6 +634,28 @@ def test_targeted_batch_returns_tombstones_for_confirmed_deleted_identities():
     assert occurrences == [None, None]
 
 
+@pytest.mark.parametrize(
+    ("recurring_event_id", "original_start"),
+    [
+        (" ", " "),
+        ("series-1", None),
+        (None, "2026-07-20T14:00:00Z"),
+        (123, "2026-07-20T14:00:00Z"),
+    ],
+)
+def test_targeted_occurrence_request_rejects_malformed_recurring_identity(
+    recurring_event_id, original_start
+):
+    with pytest.raises(
+        GoogleCalendarConfigurationError, match="Recurring Calendar identity"
+    ):
+        TargetedOccurrenceRequest(
+            event_id="event-1",
+            recurring_event_id=recurring_event_id,
+            original_start=original_start,
+        )
+
+
 def test_targeted_batch_classifies_not_found_as_retryable_not_deleted():
     recorder = RequestRecorder(
         [

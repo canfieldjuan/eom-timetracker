@@ -133,6 +133,26 @@ class TargetedOccurrenceRequest:
     recurring_event_id: Optional[str] = None
     original_start: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        event_id = _required_text(self.event_id, "Google event ID")
+        recurring_event_id = _optional_text(self.recurring_event_id)
+        original_start = _optional_text(self.original_start)
+        if self.recurring_event_id is not None and recurring_event_id is None:
+            raise GoogleCalendarConfigurationError(
+                "Recurring Calendar identity is incomplete"
+            )
+        if self.original_start is not None and original_start is None:
+            raise GoogleCalendarConfigurationError(
+                "Recurring Calendar identity is incomplete"
+            )
+        if bool(recurring_event_id) != bool(original_start):
+            raise GoogleCalendarConfigurationError(
+                "Recurring Calendar identity is incomplete"
+            )
+        object.__setattr__(self, "event_id", event_id)
+        object.__setattr__(self, "recurring_event_id", recurring_event_id)
+        object.__setattr__(self, "original_start", original_start)
+
 
 @dataclass(frozen=True)
 class _BatchJSONPart:
