@@ -25,7 +25,11 @@ def isolate_reconciliation_data(setup_db):
             cur.execute("DELETE FROM site_check_ins")
             cur.execute("DELETE FROM site_check_in_schedule_rules")
             cur.execute("DELETE FROM site_check_in_schedules")
-            cur.execute("DELETE FROM shifts WHERE notes = %s", (TEST_SHIFT_NOTE,))
+            # Reconciliation intentionally reads every matching shift, not only
+            # rows created by this module. Isolate that evidence from earlier
+            # session-scoped API tests whose real-time shifts can collide with
+            # these fixed dates when the wall clock reaches the fixture window.
+            cur.execute("DELETE FROM shifts")
             cur.execute(
                 "DELETE FROM locations WHERE address = %s",
                 (SECOND_SITE_ADDRESS,),
