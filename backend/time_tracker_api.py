@@ -41,7 +41,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, sta
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 _data_dir_env = os.environ.get("DATA_DIR", "")
@@ -354,8 +354,14 @@ def evaluate_site_check_in_geofence(
     }
 
 
-def find_nearest_location_match(lat: float, lng: float, timesheet_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    coords = timesheet_data.get("location_coords", {})
+def find_nearest_location_match(
+    lat: float,
+    lng: float,
+    timesheet_data: Dict[str, Any],
+    *,
+    coordinate_map_key: str = "location_coords",
+) -> Optional[Dict[str, Any]]:
+    coords = timesheet_data.get(coordinate_map_key, {})
     best_name, best_dist = None, float("inf")
     for name, c in coords.items():
         d = haversine_m(lat, lng, c["lat"], c["lng"])
@@ -370,8 +376,19 @@ def find_nearest_location_match(lat: float, lng: float, timesheet_data: Dict[str
     }
 
 
-def find_nearest_location(lat: float, lng: float, timesheet_data: Dict[str, Any]) -> Optional[str]:
-    nearest = find_nearest_location_match(lat, lng, timesheet_data)
+def find_nearest_location(
+    lat: float,
+    lng: float,
+    timesheet_data: Dict[str, Any],
+    *,
+    coordinate_map_key: str = "location_coords",
+) -> Optional[str]:
+    nearest = find_nearest_location_match(
+        lat,
+        lng,
+        timesheet_data,
+        coordinate_map_key=coordinate_map_key,
+    )
     if nearest and nearest["withinRadius"]:
         return str(nearest["location"])
     return None
@@ -843,10 +860,11 @@ def _row_to_entry(
 def _load_timesheets_from_db() -> Dict[str, Any]:
     loc_rows = db.query_all(
         "SELECT address, customer_name, location_type, rate, rate_type, "
-        "frequency, lat, lng, expected_hours, target_labor_pct, min_margin_pct "
-        "FROM locations WHERE active = true ORDER BY id"
+        "frequency, lat, lng, expected_hours, target_labor_pct, min_margin_pct, active "
+        "FROM locations ORDER BY id"
     )
-    locations: List[str] = [r["address"] for r in loc_rows]
+    active_loc_rows = [row for row in loc_rows if bool(row.get("active"))]
+    locations: List[str] = [r["address"] for r in active_loc_rows]
     location_coords: Dict[str, Dict[str, float]] = {}
     location_customers: Dict[str, str] = {}
     location_rates: Dict[str, float] = {}
@@ -857,7 +875,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
     location_target_labor: Dict[str, float] = {}
     location_min_margin: Dict[str, float] = {}
 
-    for r in loc_rows:
+    for r in active_loc_rows:
         addr = r["address"]
         if r.get("lat") is not None and r.get("lng") is not None:
             location_coords[addr] = {"lat": float(r["lat"]), "lng": float(r["lng"])}
@@ -877,6 +895,33 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
             location_target_labor[addr] = float(r["target_labor_pct"])
         if r.get("min_margin_pct") is not None:
             location_min_margin[addr] = float(r["min_margin_pct"])
+
+    historical_location_coords: Dict[str, Dict[str, float]] = {}
+    historical_location_customers: Dict[str, str] = {}
+    historical_location_rates: Dict[str, float] = {}
+    historical_location_rate_types: Dict[str, str] = {}
+    historical_location_expected_hours: Dict[str, float] = {}
+    historical_location_target_labor: Dict[str, float] = {}
+    historical_location_min_margin: Dict[str, float] = {}
+    for row in loc_rows:
+        address = str(row["address"])
+        if row.get("lat") is not None and row.get("lng") is not None:
+            historical_location_coords[address] = {
+                "lat": float(row["lat"]),
+                "lng": float(row["lng"]),
+            }
+        if row.get("customer_name"):
+            historical_location_customers[address] = str(row["customer_name"])
+        if row.get("rate") is not None:
+            historical_location_rates[address] = float(row["rate"])
+        if row.get("rate_type"):
+            historical_location_rate_types[address] = str(row["rate_type"])
+        if row.get("expected_hours") is not None:
+            historical_location_expected_hours[address] = float(row["expected_hours"])
+        if row.get("target_labor_pct") is not None:
+            historical_location_target_labor[address] = float(row["target_labor_pct"])
+        if row.get("min_margin_pct") is not None:
+            historical_location_min_margin[address] = float(row["min_margin_pct"])
 
     visit_rows = db.query_all(
         """
@@ -943,6 +988,13 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
         "location_expected_hours": location_expected_hours,
         "location_target_labor": location_target_labor,
         "location_min_margin": location_min_margin,
+        "_historical_location_coords": historical_location_coords,
+        "_historical_location_customers": historical_location_customers,
+        "_historical_location_rates": historical_location_rates,
+        "_historical_location_rate_types": historical_location_rate_types,
+        "_historical_location_expected_hours": historical_location_expected_hours,
+        "_historical_location_target_labor": historical_location_target_labor,
+        "_historical_location_min_margin": historical_location_min_margin,
     }
 
 
@@ -952,47 +1004,15 @@ def _save_timesheets_to_db(
     pre_visit_counts: Dict[int, int],
     pre_departure_counts: Dict[int, int],
 ) -> None:
-    """Upsert locations, shifts, and new child events. Updates in-memory entry IDs for new shifts."""
+    """Persist time evidence without mutating the server-authoritative Site list."""
     with db.get_conn() as conn:
         cur = conn.cursor()
 
-        addr_to_id: Dict[str, int] = {}
-        for addr in timesheet_data.get("locations", []):
-            c = timesheet_data.get("location_coords", {}).get(addr, {})
-            cur.execute(
-                """
-                INSERT INTO locations
-                  (address, customer_name, location_type, rate, rate_type, frequency, lat, lng,
-                   expected_hours, target_labor_pct, min_margin_pct)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (address) DO UPDATE SET
-                    customer_name    = EXCLUDED.customer_name,
-                    location_type    = EXCLUDED.location_type,
-                    rate             = EXCLUDED.rate,
-                    rate_type        = EXCLUDED.rate_type,
-                    frequency        = EXCLUDED.frequency,
-                    lat              = EXCLUDED.lat,
-                    lng              = EXCLUDED.lng,
-                    expected_hours   = EXCLUDED.expected_hours,
-                    target_labor_pct = COALESCE(EXCLUDED.target_labor_pct, locations.target_labor_pct),
-                    min_margin_pct   = COALESCE(EXCLUDED.min_margin_pct, locations.min_margin_pct)
-                RETURNING id
-                """,
-                (
-                    addr,
-                    timesheet_data.get("location_customers", {}).get(addr),
-                    timesheet_data.get("location_types", {}).get(addr),
-                    timesheet_data.get("location_rates", {}).get(addr),
-                    timesheet_data.get("location_rate_types", {}).get(addr, "per_visit"),
-                    timesheet_data.get("location_frequencies", {}).get(addr),
-                    c.get("lat"),
-                    c.get("lng"),
-                    timesheet_data.get("location_expected_hours", {}).get(addr),
-                    timesheet_data.get("location_target_labor", {}).get(addr),
-                    timesheet_data.get("location_min_margin", {}).get(addr),
-                ),
-            )
-            addr_to_id[addr] = cur.fetchone()[0]
+        cur.execute("SELECT id, address FROM locations WHERE active = true")
+        addr_to_id: Dict[str, int] = {
+            str(address): int(location_id)
+            for location_id, address in cur.fetchall()
+        }
 
         for entry in timesheet_data.get("entries", []):
             loc_id = addr_to_id.get(entry.get("location", ""))
@@ -1033,7 +1053,6 @@ def _save_timesheets_to_db(
                 cur.execute(
                     """
                     UPDATE shifts SET
-                        location_id         = %s,
                         location_label      = %s,
                         clock_in            = %s,
                         clock_out           = %s,
@@ -1051,7 +1070,6 @@ def _save_timesheets_to_db(
                     WHERE id = %s
                     """,
                     (
-                        loc_id,
                         entry.get("location", ""),
                         entry.get("clockIn"),
                         entry.get("clockOut"),
@@ -1477,11 +1495,25 @@ def _resolve_customer(location: str, location_customers: Dict[str, str]) -> str:
     return location_customers.get(location, "")
 
 
+def _historical_location_metadata(
+    timesheet_data: Dict[str, Any],
+    key: str,
+) -> Dict[str, Any]:
+    historical = timesheet_data.get(f"_historical_{key}")
+    if isinstance(historical, dict):
+        return historical
+    current = timesheet_data.get(key)
+    return current if isinstance(current, dict) else {}
+
+
 def build_public_current_status(
     timesheet_data: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     timesheet_data = timesheet_data or load_timesheets()
-    location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
+    location_customers = _historical_location_metadata(
+        timesheet_data,
+        "location_customers",
+    )
     now = utc_now()
 
     rows: List[Dict[str, Any]] = []
@@ -1796,6 +1828,224 @@ class RegisterRequest(BaseModel):
 class AdminEmployeeCreateRequest(RegisterRequest):
     role: str = "employee"
     hourlyRate: Optional[float] = None
+
+
+CUSTOMER_NAME_MAX_LENGTH = 200
+CUSTOMER_PHONE_MAX_LENGTH = 50
+CUSTOMER_EMAIL_MAX_LENGTH = 320
+SITE_ADDRESS_MAX_LENGTH = 500
+SITE_FREQUENCY_MAX_LENGTH = 100
+SITE_DETAIL_MAX_LENGTH = 4000
+SITE_PET_NOTES_MAX_LENGTH = 2000
+SITE_RATE_MAX = 999999.99
+SITE_EXPECTED_HOURS_MAX = 9999.99
+
+
+def _strip_required_text(value: Any) -> Any:
+    return value.strip() if isinstance(value, str) else value
+
+
+def _strip_optional_text(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    return stripped or None
+
+
+def _validate_optional_email(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value):
+        raise ValueError("must be a valid email address")
+    return value
+
+
+def _validate_iso_service_date(value: Any) -> Any:
+    if value is None or isinstance(value, date):
+        return value
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("must use ISO YYYY-MM-DD format")
+    return value
+
+
+class PrimarySiteCreateRequest(BaseModel):
+    address: str = Field(min_length=1, max_length=SITE_ADDRESS_MAX_LENGTH)
+    locationType: str = Field(pattern="^(Residential|Commercial)$")
+    rate: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=SITE_RATE_MAX,
+        allow_inf_nan=False,
+    )
+    rateType: str = Field(default="per_visit", pattern="^(per_visit|hourly|monthly)$")
+    frequency: Optional[str] = Field(default=None, max_length=SITE_FREQUENCY_MAX_LENGTH)
+    expectedHours: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=SITE_EXPECTED_HOURS_MAX,
+        allow_inf_nan=False,
+    )
+    targetLaborPct: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    minMarginPct: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    lat: Optional[float] = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
+    lng: Optional[float] = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
+    serviceScope: Optional[str] = Field(default=None, max_length=SITE_DETAIL_MAX_LENGTH)
+    accessInstructions: Optional[str] = Field(default=None, max_length=SITE_DETAIL_MAX_LENGTH)
+    servicePreferences: Optional[str] = Field(default=None, max_length=SITE_DETAIL_MAX_LENGTH)
+    petNotes: Optional[str] = Field(default=None, max_length=SITE_PET_NOTES_MAX_LENGTH)
+    serviceStartDate: Optional[date] = None
+
+    @field_validator(
+        "address",
+        "frequency",
+        "serviceScope",
+        "accessInstructions",
+        "servicePreferences",
+        "petNotes",
+        mode="before",
+    )
+    @classmethod
+    def normalize_text_fields(cls, value: Any, info: Any) -> Any:
+        if info.field_name == "address":
+            return _strip_required_text(value)
+        return _strip_optional_text(value)
+
+    @field_validator("serviceStartDate", mode="before")
+    @classmethod
+    def validate_service_start_date(cls, value: Any) -> Any:
+        return _validate_iso_service_date(value)
+
+    @model_validator(mode="after")
+    def coordinates_must_be_paired(self) -> "PrimarySiteCreateRequest":
+        if (self.lat is None) != (self.lng is None):
+            raise ValueError("lat and lng must be provided together")
+        return self
+
+
+class CustomerCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=CUSTOMER_NAME_MAX_LENGTH)
+    primaryContactName: Optional[str] = Field(default=None, max_length=CUSTOMER_NAME_MAX_LENGTH)
+    primaryPhone: Optional[str] = Field(default=None, max_length=CUSTOMER_PHONE_MAX_LENGTH)
+    primaryEmail: Optional[str] = Field(default=None, max_length=CUSTOMER_EMAIL_MAX_LENGTH)
+    billingName: Optional[str] = Field(default=None, max_length=CUSTOMER_NAME_MAX_LENGTH)
+    billingEmail: Optional[str] = Field(default=None, max_length=CUSTOMER_EMAIL_MAX_LENGTH)
+    billingAddress: Optional[str] = Field(default=None, max_length=SITE_ADDRESS_MAX_LENGTH)
+    atlasContactId: Optional[UUID] = None
+    primarySite: Optional[PrimarySiteCreateRequest] = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value: Any) -> Any:
+        return _strip_required_text(value)
+
+    @field_validator(
+        "primaryContactName",
+        "primaryPhone",
+        "primaryEmail",
+        "billingName",
+        "billingEmail",
+        "billingAddress",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_fields(cls, value: Any) -> Any:
+        return _strip_optional_text(value)
+
+    @field_validator("primaryEmail", "billingEmail")
+    @classmethod
+    def validate_emails(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_optional_email(value)
+
+
+class CustomerUpdateRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=CUSTOMER_NAME_MAX_LENGTH)
+    primaryContactName: Optional[str] = Field(default=None, max_length=CUSTOMER_NAME_MAX_LENGTH)
+    primaryPhone: Optional[str] = Field(default=None, max_length=CUSTOMER_PHONE_MAX_LENGTH)
+    primaryEmail: Optional[str] = Field(default=None, max_length=CUSTOMER_EMAIL_MAX_LENGTH)
+    billingName: Optional[str] = Field(default=None, max_length=CUSTOMER_NAME_MAX_LENGTH)
+    billingEmail: Optional[str] = Field(default=None, max_length=CUSTOMER_EMAIL_MAX_LENGTH)
+    billingAddress: Optional[str] = Field(default=None, max_length=SITE_ADDRESS_MAX_LENGTH)
+    atlasContactId: Optional[UUID] = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value: Any) -> Any:
+        return _strip_required_text(value)
+
+    @field_validator(
+        "primaryContactName",
+        "primaryPhone",
+        "primaryEmail",
+        "billingName",
+        "billingEmail",
+        "billingAddress",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_fields(cls, value: Any) -> Any:
+        return _strip_optional_text(value)
+
+    @field_validator("primaryEmail", "billingEmail")
+    @classmethod
+    def validate_emails(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_optional_email(value)
+
+
+class SiteCreateRequest(PrimarySiteCreateRequest):
+    customerId: Optional[int] = Field(default=None, gt=0)
+    customerName: Optional[str] = Field(default=None, min_length=1, max_length=CUSTOMER_NAME_MAX_LENGTH)
+
+    @field_validator("customerName", mode="before")
+    @classmethod
+    def normalize_customer_name(cls, value: Any) -> Any:
+        return _strip_required_text(value)
+
+
+class SiteUpdateRequest(BaseModel):
+    customerId: Optional[int] = Field(default=None, gt=0)
+    customerName: Optional[str] = Field(default=None, min_length=1, max_length=CUSTOMER_NAME_MAX_LENGTH)
+    address: Optional[str] = Field(default=None, min_length=1, max_length=SITE_ADDRESS_MAX_LENGTH)
+    locationType: Optional[str] = Field(default=None, pattern="^(Residential|Commercial)$")
+    rate: Optional[float] = Field(default=None, ge=0, le=SITE_RATE_MAX, allow_inf_nan=False)
+    rateType: Optional[str] = Field(default=None, pattern="^(per_visit|hourly|monthly)$")
+    frequency: Optional[str] = Field(default=None, max_length=SITE_FREQUENCY_MAX_LENGTH)
+    expectedHours: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=SITE_EXPECTED_HOURS_MAX,
+        allow_inf_nan=False,
+    )
+    targetLaborPct: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    minMarginPct: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)
+    lat: Optional[float] = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
+    lng: Optional[float] = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
+    serviceScope: Optional[str] = Field(default=None, max_length=SITE_DETAIL_MAX_LENGTH)
+    accessInstructions: Optional[str] = Field(default=None, max_length=SITE_DETAIL_MAX_LENGTH)
+    servicePreferences: Optional[str] = Field(default=None, max_length=SITE_DETAIL_MAX_LENGTH)
+    petNotes: Optional[str] = Field(default=None, max_length=SITE_PET_NOTES_MAX_LENGTH)
+    serviceStartDate: Optional[date] = None
+
+    @field_validator("customerName", "address", mode="before")
+    @classmethod
+    def normalize_required_text(cls, value: Any) -> Any:
+        return _strip_required_text(value)
+
+    @field_validator(
+        "frequency",
+        "serviceScope",
+        "accessInstructions",
+        "servicePreferences",
+        "petNotes",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_fields(cls, value: Any) -> Any:
+        return _strip_optional_text(value)
+
+    @field_validator("serviceStartDate", mode="before")
+    @classmethod
+    def validate_service_start_date(cls, value: Any) -> Any:
+        return _validate_iso_service_date(value)
 
 
 MAX_LOCATION_LEN            = parse_int(os.getenv("MAX_LOCATION_LEN"),            500)
@@ -2772,13 +3022,198 @@ async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
-    first_error = exc.errors()[0] if exc.errors() else {}
+    errors = exc.errors()
+    first_error = errors[0] if errors else {}
     message = first_error.get("msg", "Invalid request payload")
-    return JSONResponse(status_code=422, content={"success": False, "error": message})
+    field_errors: Dict[str, str] = {}
+    for error in errors:
+        location = [str(part) for part in error.get("loc", ()) if part != "body"]
+        error_message = str(error.get("msg", "Invalid value"))
+        if "lat and lng must be provided together" in error_message:
+            prefix = ".".join(location)
+            field_prefix = f"{prefix}." if prefix else ""
+            field_errors.setdefault(f"{field_prefix}lat", "coordinate pair required")
+            field_errors.setdefault(f"{field_prefix}lng", "coordinate pair required")
+            continue
+        field = ".".join(location) or "body"
+        field_errors.setdefault(field, error_message)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": message,
+            "code": "validation_error",
+            "details": {"fields": field_errors},
+        },
+    )
+
+
+def normalize_site_address(address: str) -> str:
+    """Return the durable identity key without erasing suite/unit identity."""
+    normalized = re.sub(r"\s+", " ", address.strip())
+    normalized = re.sub(r"\s*,\s*", ", ", normalized)
+    return normalized.casefold()
+
+
+CUSTOMER_SITE_MUTATION_LOCK = "eom_customer_site_mutations_v1"
+
+
+def _lock_customer_site_mutations(cur: Any) -> None:
+    """Serialize the small admin mutation surface before taking row locks."""
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (CUSTOMER_SITE_MUTATION_LOCK,),
+    )
+
+
+def _ensure_customer_site_schema() -> None:
+    """Install and backfill the Customer/Site model in one transaction."""
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("eom_customer_site_schema_v1",))
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customers (
+                    id                   SERIAL PRIMARY KEY,
+                    name                 TEXT NOT NULL,
+                    primary_contact_name VARCHAR(200),
+                    primary_phone        VARCHAR(50),
+                    primary_email        VARCHAR(320),
+                    billing_name         VARCHAR(200),
+                    billing_email        VARCHAR(320),
+                    billing_address      VARCHAR(500),
+                    atlas_contact_id     UUID,
+                    active               BOOLEAN NOT NULL DEFAULT true,
+                    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    archived_at          TIMESTAMPTZ,
+                    archived_by          INTEGER REFERENCES employees(id) ON DELETE SET NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE customers ALTER COLUMN name TYPE TEXT;
+                ALTER TABLE locations ADD COLUMN IF NOT EXISTS customer_id INTEGER REFERENCES customers(id);
+                ALTER TABLE locations ADD COLUMN IF NOT EXISTS address_key TEXT;
+                ALTER TABLE locations ADD COLUMN IF NOT EXISTS service_scope TEXT;
+                ALTER TABLE locations ADD COLUMN IF NOT EXISTS access_instructions TEXT;
+                ALTER TABLE locations ADD COLUMN IF NOT EXISTS service_preferences TEXT;
+                ALTER TABLE locations ADD COLUMN IF NOT EXISTS pet_notes TEXT;
+                ALTER TABLE locations ADD COLUMN IF NOT EXISTS service_start_date DATE;
+                ALTER TABLE locations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+                ALTER TABLE locations ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+                ALTER TABLE locations ADD COLUMN IF NOT EXISTS archived_by INTEGER REFERENCES employees(id) ON DELETE SET NULL;
+                """
+            )
+
+            cur.execute(
+                """
+                SELECT id, customer_id, customer_name, address, address_key
+                FROM locations
+                ORDER BY id
+                FOR UPDATE
+                """
+            )
+            sites = [dict(row) for row in cur.fetchall()]
+            for site in sites:
+                if site.get("customer_id") is not None:
+                    continue
+                customer_name = str(site.get("customer_name") or "").strip()
+                if not customer_name:
+                    continue
+                cur.execute(
+                    "INSERT INTO customers (name) VALUES (%s) RETURNING id",
+                    (customer_name,),
+                )
+                customer_id = int(cur.fetchone()["id"])
+                cur.execute(
+                    """
+                    UPDATE locations
+                    SET customer_id = %s, customer_name = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (customer_id, customer_name, site["id"]),
+                )
+
+            keys_by_site = {
+                int(site["id"]): normalize_site_address(str(site["address"]))
+                for site in sites
+            }
+            key_counts: Dict[str, int] = {}
+            for key in keys_by_site.values():
+                key_counts[key] = key_counts.get(key, 0) + 1
+
+            desired_keys = {
+                site_id: key if key_counts[key] == 1 else None
+                for site_id, key in keys_by_site.items()
+            }
+            current_keys = {
+                int(site["id"]): site.get("address_key") for site in sites
+            }
+            changed_site_ids = [
+                site_id
+                for site_id, desired_key in desired_keys.items()
+                if current_keys.get(site_id) != desired_key
+            ]
+            # Clear only changing rows first so key swaps/collisions remain safe
+            # under an already-installed unique index without rewriting every
+            # healthy Site on every process restart.
+            if changed_site_ids:
+                cur.execute(
+                    "UPDATE locations SET address_key = NULL WHERE id = ANY(%s)",
+                    (changed_site_ids,),
+                )
+            for site_id in changed_site_ids:
+                key = desired_keys[site_id]
+                if key is not None:
+                    cur.execute(
+                        "UPDATE locations SET address_key = %s WHERE id = %s",
+                        (key, site_id),
+                    )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_customers_active ON customers(active);
+                CREATE INDEX IF NOT EXISTS idx_locations_customer_id ON locations(customer_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_locations_address_key
+                    ON locations(address_key) WHERE address_key IS NOT NULL;
+                """
+            )
+
+
+def _ensure_weekly_schedule_site_schema() -> None:
+    """Add Site identity while retaining the legacy arbiter for rollout safety."""
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS schedules (
+            id              SERIAL PRIMARY KEY,
+            employee_id     INTEGER NOT NULL REFERENCES employees(id),
+            location_id     INTEGER REFERENCES locations(id),
+            customer_name   TEXT NOT NULL,
+            week_start      DATE NOT NULL,
+            scheduled_hours NUMERIC(6, 2) NOT NULL,
+            notes           TEXT NOT NULL DEFAULT '',
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute(
+        "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS "
+        "location_id INTEGER REFERENCES locations(id)"
+    )
+    # Do not remove origin/main's name-based UNIQUE constraint in the same
+    # rolling deployment that stops using it as an ON CONFLICT arbiter. A
+    # follow-up deployment can remove it after every serving instance runs the
+    # Site-aware write path below.
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_schedules_site_week
+        ON schedules(employee_id, location_id, week_start)
+    """)
 
 
 def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
+    _ensure_customer_site_schema()
     db.execute("""
         CREATE TABLE IF NOT EXISTS receivables_operation_attempts (
             attempt_id          BIGSERIAL PRIMARY KEY,
@@ -2896,6 +3331,14 @@ def _ensure_schema_migrations() -> None:
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (employee_id, location_id, scheduled_start)
         )
+    """)
+    db.execute("""
+        ALTER TABLE site_check_in_schedules
+            ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+        ALTER TABLE site_check_in_schedules
+            ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES employees(id) ON DELETE SET NULL;
+        ALTER TABLE site_check_in_schedules
+            ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS site_check_in_schedule_rules (
@@ -3054,19 +3497,7 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS location_label TEXT NOT NULL DEFAULT ''"
     )
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS schedules (
-            id              SERIAL PRIMARY KEY,
-            employee_id     INTEGER NOT NULL REFERENCES employees(id),
-            location_id     INTEGER REFERENCES locations(id),
-            customer_name   TEXT NOT NULL,
-            week_start      DATE NOT NULL,
-            scheduled_hours NUMERIC(6, 2) NOT NULL,
-            notes           TEXT NOT NULL DEFAULT '',
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE (employee_id, customer_name, week_start)
-        )
-    """)
+    _ensure_weekly_schedule_site_schema()
     db.execute("""
         CREATE TABLE IF NOT EXISTS departures (
             id             SERIAL PRIMARY KEY,
@@ -3123,16 +3554,16 @@ def _ensure_schema_migrations() -> None:
         )
 
 
-def _auto_migrate_if_empty() -> None:
+def _auto_migrate_if_empty() -> bool:
     """Run JSON->PostgreSQL migration if the employees table is empty."""
     result = db.query_one("SELECT COUNT(*) AS n FROM employees")
     if result and result["n"] > 0:
-        return
+        return False
     if not EMPLOYEES_FILE.exists() or not TIMESHEETS_FILE.exists():
-        return
+        return False
     migrate_script = BACKEND_DIR / "migrate_json_to_pg.py"
     if not migrate_script.exists():
-        return
+        return False
     database_url = os.getenv("DATABASE_URL", "")
     completed = subprocess.run(
         [sys.executable, str(migrate_script), "--db-url", database_url],
@@ -3140,8 +3571,10 @@ def _auto_migrate_if_empty() -> None:
     )
     if completed.returncode != 0:
         print(f"[auto-migrate] ERROR:\n{completed.stderr}", flush=True)
+        return False
     else:
         print(f"[auto-migrate] Done:\n{completed.stdout}", flush=True)
+        return True
 
 
 @app.on_event("startup")
@@ -3151,7 +3584,11 @@ def startup_event() -> None:
         raise RuntimeError("DATABASE_URL env var not set")
     db.init_pool(database_url)
     _ensure_schema_migrations()
-    _auto_migrate_if_empty()
+    imported_legacy_json = _auto_migrate_if_empty()
+    # A first-run JSON import happens after the schema upgrade and can insert
+    # legacy Sites. Re-run the idempotent Customer/address backfill immediately.
+    if imported_legacy_json:
+        _ensure_customer_site_schema()
     apply_bootstrap_admins()
 
 
@@ -3160,21 +3597,29 @@ def _site_check_in_url(request: Request, token: str) -> str:
     return f"{app_url}/?checkIn={token}"
 
 
-def _resolve_site_check_in_qr(token: str) -> Dict[str, Any]:
+def _resolve_site_check_in_qr(
+    token: str,
+    *,
+    cur: Optional[Any] = None,
+    for_update: bool = False,
+) -> Dict[str, Any]:
     try:
         site_id, nonce = parse_site_check_in_token(token)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    site = db.query_one(
-        """
+    query = """
         SELECT id, address, customer_name, lat, lng, check_in_token_nonce,
                check_in_token_rotated_at
         FROM locations
         WHERE id = %s AND active = true
-        """,
-        (site_id,),
-    )
+        """ + (" FOR UPDATE" if for_update else "")
+    if cur is None:
+        site = db.query_one(query, (site_id,))
+    else:
+        cur.execute(query, (site_id,))
+        row = cur.fetchone()
+        site = dict(row) if row else None
     configured_nonce = str(site.get("check_in_token_nonce") or "") if site else ""
     if not site or not configured_nonce or not hmac.compare_digest(configured_nonce, nonce):
         raise HTTPException(status_code=404, detail="Invalid or expired site QR code")
@@ -3186,7 +3631,8 @@ def _site_check_in_schedule_row(schedule_id: int) -> Optional[Dict[str, Any]]:
         """
         SELECT sc.id, sc.employee_id, e.name AS employee_name,
                sc.location_id, l.address AS site_name,
-               sc.scheduled_start, sc.grace_minutes, sc.created_at
+               sc.scheduled_start, sc.grace_minutes, sc.created_at,
+               sc.cancelled_at, sc.cancelled_by, sc.cancellation_reason
         FROM site_check_in_schedules sc
         JOIN employees e ON e.id = sc.employee_id
         JOIN locations l ON l.id = sc.location_id
@@ -3205,6 +3651,17 @@ def _serialize_site_check_in_schedule(row: Dict[str, Any]) -> Dict[str, Any]:
         "siteName": str(row.get("site_name") or ""),
         "scheduledStart": to_utc_iso(row["scheduled_start"]),
         "graceMinutes": int(row["grace_minutes"]),
+        "cancelledAt": (
+            to_utc_iso(row["cancelled_at"])
+            if row.get("cancelled_at")
+            else None
+        ),
+        "cancelledBy": (
+            int(row["cancelled_by"])
+            if row.get("cancelled_by") is not None
+            else None
+        ),
+        "cancellationReason": row.get("cancellation_reason"),
         "createdAt": to_utc_iso(row["created_at"]),
     }
 
@@ -3314,7 +3771,11 @@ def _site_check_in_reconciliation_occurrences(
 ) -> List[Dict[str, Any]]:
     start_utc, end_utc = _site_check_in_reconciliation_window(from_date, to_date)
     override_window = timedelta(hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS)
-    exact_clauses = ["sc.scheduled_start >= %s", "sc.scheduled_start < %s"]
+    exact_clauses = [
+        "sc.cancelled_at IS NULL",
+        "sc.scheduled_start >= %s",
+        "sc.scheduled_start < %s",
+    ]
     exact_params: List[Any] = [start_utc - override_window, end_utc + override_window]
     if employee_id is not None:
         exact_clauses.append("sc.employee_id = %s")
@@ -3940,35 +4401,41 @@ def _matching_site_check_in_schedule(
     employee_id: int,
     site_id: int,
     checked_in_at: datetime,
+    *,
+    cur: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
-    exact_schedule = db.query_one(
-        """
+    exact_sql = """
         SELECT id, scheduled_start, grace_minutes
         FROM site_check_in_schedules
         WHERE employee_id = %s
           AND location_id = %s
+          AND cancelled_at IS NULL
           AND scheduled_start BETWEEN
               %s - (%s * INTERVAL '1 hour')
               AND %s + (%s * INTERVAL '1 hour')
         ORDER BY ABS(EXTRACT(EPOCH FROM (scheduled_start - %s))), id
         LIMIT 1
-        """,
-        (
-            employee_id,
-            site_id,
-            checked_in_at,
-            SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
-            checked_in_at,
-            SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
-            checked_in_at,
-        ),
+        """
+    exact_params = (
+        employee_id,
+        site_id,
+        checked_in_at,
+        SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
+        checked_in_at,
+        SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
+        checked_in_at,
     )
+    if cur is None:
+        exact_schedule = db.query_one(exact_sql, exact_params)
+    else:
+        cur.execute(exact_sql, exact_params)
+        exact_row = cur.fetchone()
+        exact_schedule = dict(exact_row) if exact_row else None
     if exact_schedule:
         exact_schedule["schedule_rule_id"] = None
         return exact_schedule
 
-    rules = db.query_all(
-        """
+    rules_sql = """
         SELECT id, weekdays, local_start_time, timezone, starts_on, ends_on,
                grace_minutes
         FROM site_check_in_schedule_rules
@@ -3976,9 +4443,12 @@ def _matching_site_check_in_schedule(
           AND location_id = %s
           AND active = true
         ORDER BY id
-        """,
-        (employee_id, site_id),
-    )
+        """
+    if cur is None:
+        rules = db.query_all(rules_sql, (employee_id, site_id))
+    else:
+        cur.execute(rules_sql, (employee_id, site_id))
+        rules = [dict(row) for row in cur.fetchall()]
     candidates: List[Tuple[float, int, datetime, int]] = []
     for rule in rules:
         try:
@@ -4413,41 +4883,54 @@ def record_site_check_in(
         )
         raise HTTPException(status_code=403, detail="employeeId must match the signed-in employee")
 
-    site = _resolve_site_check_in_qr(payload.token)
-    if int(site["id"]) != int(payload.siteId):
-        append_access_log(
-            request,
-            "SITE_CHECK_IN_REJECTED",
-            False,
-            f"QR site {site['id']} did not match submitted site {payload.siteId}",
-        )
-        raise HTTPException(status_code=400, detail="siteId must match the scanned site QR")
-
-    official_time = utc_now()
-    geofence = evaluate_site_check_in_geofence(
-        site_latitude=float(site["lat"]) if site.get("lat") is not None else None,
-        site_longitude=float(site["lng"]) if site.get("lng") is not None else None,
-        latitude=payload.latitude,
-        longitude=payload.longitude,
-        accuracy=payload.accuracy,
-    )
-    schedule = _matching_site_check_in_schedule(
-        int(employee["id"]),
-        int(site["id"]),
-        official_time,
-    )
-    device_clock_skew_seconds = abs(
-        (official_time - payload.scannedAt.astimezone(timezone.utc)).total_seconds()
-    )
-    classification, reason, review_status = _classify_site_check_in(
-        geofence,
-        schedule,
-        official_time,
-        device_clock_skew_seconds,
-    )
-
     with db.get_conn() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            site = _resolve_site_check_in_qr(
+                payload.token,
+                cur=cur,
+                for_update=True,
+            )
+            if int(site["id"]) != int(payload.siteId):
+                append_access_log(
+                    request,
+                    "SITE_CHECK_IN_REJECTED",
+                    False,
+                    f"QR site {site['id']} did not match submitted site {payload.siteId}",
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail="siteId must match the scanned site QR",
+                )
+
+            official_time = utc_now()
+            geofence = evaluate_site_check_in_geofence(
+                site_latitude=(
+                    float(site["lat"]) if site.get("lat") is not None else None
+                ),
+                site_longitude=(
+                    float(site["lng"]) if site.get("lng") is not None else None
+                ),
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                accuracy=payload.accuracy,
+            )
+            schedule = _matching_site_check_in_schedule(
+                int(employee["id"]),
+                int(site["id"]),
+                official_time,
+                cur=cur,
+            )
+            device_clock_skew_seconds = abs(
+                (
+                    official_time - payload.scannedAt.astimezone(timezone.utc)
+                ).total_seconds()
+            )
+            classification, reason, review_status = _classify_site_check_in(
+                geofence,
+                schedule,
+                official_time,
+                device_clock_skew_seconds,
+            )
             cur.execute(
                 """
                 INSERT INTO site_check_ins (
@@ -4490,7 +4973,7 @@ def record_site_check_in(
             inserted = cur.fetchone()
             duplicate = inserted is None
             if inserted:
-                check_in_id = int(inserted[0])
+                check_in_id = int(inserted["id"])
             else:
                 cur.execute(
                     """
@@ -4504,7 +4987,7 @@ def record_site_check_in(
                 existing = cur.fetchone()
                 if not existing:
                     raise RuntimeError("Unable to reconcile duplicate site check-in")
-                check_in_id = int(existing[0])
+                check_in_id = int(existing["id"])
 
     row = _site_check_in_row(check_in_id)
     if not row:
@@ -4528,46 +5011,54 @@ def admin_create_site_check_in_schedule(
     request: Request,
     admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    target_employee = db.query_one(
-        "SELECT id FROM employees WHERE id = %s AND active = true",
-        (payload.employeeId,),
-    )
-    if not target_employee:
-        raise HTTPException(status_code=404, detail="Active employee not found")
-    site = db.query_one(
-        "SELECT id FROM locations WHERE id = %s AND active = true",
-        (payload.siteId,),
-    )
-    if not site:
-        raise HTTPException(status_code=404, detail="Active site not found")
-
-    inserted = db.query_one(
-        """
-        INSERT INTO site_check_in_schedules (
-            employee_id, location_id, scheduled_start, grace_minutes, created_by
-        )
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (employee_id, location_id, scheduled_start)
-        DO UPDATE SET grace_minutes = EXCLUDED.grace_minutes,
-                      created_by = EXCLUDED.created_by
-        RETURNING id
-        """,
-        (
-            payload.employeeId,
-            payload.siteId,
-            payload.scheduledStart,
-            payload.graceMinutes,
-            int(admin["id"]),
-        ),
-    )
-    if not inserted:
-        raise RuntimeError("Site check-in schedule was not saved")
-    row = _site_check_in_schedule_row(int(inserted["id"]))
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            cur.execute(
+                "SELECT id FROM employees WHERE id = %s AND active = true",
+                (payload.employeeId,),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Active employee not found")
+            cur.execute(
+                "SELECT id FROM locations WHERE id = %s AND active = true FOR UPDATE",
+                (payload.siteId,),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Active site not found")
+            cur.execute(
+                """
+                INSERT INTO site_check_in_schedules (
+                    employee_id, location_id, scheduled_start,
+                    grace_minutes, created_by
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (employee_id, location_id, scheduled_start)
+                DO UPDATE SET grace_minutes = EXCLUDED.grace_minutes,
+                              created_by = EXCLUDED.created_by,
+                              cancelled_at = NULL,
+                              cancelled_by = NULL,
+                              cancellation_reason = NULL
+                RETURNING id
+                """,
+                (
+                    payload.employeeId,
+                    payload.siteId,
+                    payload.scheduledStart,
+                    payload.graceMinutes,
+                    int(admin["id"]),
+                ),
+            )
+            inserted = cur.fetchone()
+            if not inserted:
+                raise RuntimeError("Site check-in schedule was not saved")
+            schedule_id = int(inserted["id"])
+    row = _site_check_in_schedule_row(schedule_id)
     append_access_log(
         request,
         "SITE_CHECK_IN_SCHEDULE_SAVED",
         True,
-        f"Schedule {inserted['id']} by {admin['name']}",
+        f"Schedule {schedule_id} by {admin['name']}",
     )
     return {"success": True, "schedule": _serialize_site_check_in_schedule(row)}
 
@@ -4582,7 +5073,8 @@ def admin_list_site_check_in_schedules(
         """
         SELECT sc.id, sc.employee_id, e.name AS employee_name,
                sc.location_id, l.address AS site_name,
-               sc.scheduled_start, sc.grace_minutes, sc.created_at
+               sc.scheduled_start, sc.grace_minutes, sc.created_at,
+               sc.cancelled_at, sc.cancelled_by, sc.cancellation_reason
         FROM site_check_in_schedules sc
         JOIN employees e ON e.id = sc.employee_id
         JOIN locations l ON l.id = sc.location_id
@@ -4631,59 +5123,63 @@ def admin_create_site_check_in_schedule_rule(
     except (KeyError, ValueError) as exc:
         raise RuntimeError(f"Configured timezone is invalid: {TIMEZONE_NAME}") from exc
 
-    target_employee = db.query_one(
-        "SELECT id FROM employees WHERE id = %s AND active = true",
-        (payload.employeeId,),
-    )
-    if not target_employee:
-        raise HTTPException(status_code=404, detail="Active employee not found")
-    site = db.query_one(
-        "SELECT id FROM locations WHERE id = %s AND active = true",
-        (payload.siteId,),
-    )
-    if not site:
-        raise HTTPException(status_code=404, detail="Active site not found")
-
-    inserted = db.query_one(
-        """
-        INSERT INTO site_check_in_schedule_rules (
-            employee_id, location_id, weekdays, local_start_time, timezone,
-            starts_on, ends_on, grace_minutes, active, created_by
-        )
-        VALUES (
-            %s, %s, %s, %s, %s, %s,
-            COALESCE(%s, 'infinity'::date), %s, true, %s
-        )
-        ON CONFLICT (
-            employee_id, location_id, weekdays, local_start_time,
-            timezone, starts_on, ends_on
-        )
-        DO UPDATE SET grace_minutes = EXCLUDED.grace_minutes,
-                      active = true,
-                      created_by = EXCLUDED.created_by,
-                      updated_at = NOW()
-        RETURNING id
-        """,
-        (
-            payload.employeeId,
-            payload.siteId,
-            payload.weekdays,
-            payload.localStart,
-            TIMEZONE_NAME,
-            payload.startsOn,
-            payload.endsOn,
-            payload.graceMinutes,
-            int(admin["id"]),
-        ),
-    )
-    if not inserted:
-        raise RuntimeError("Recurring site check-in schedule was not saved")
-    row = _site_check_in_schedule_rule_row(int(inserted["id"]))
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            cur.execute(
+                "SELECT id FROM employees WHERE id = %s AND active = true",
+                (payload.employeeId,),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Active employee not found")
+            cur.execute(
+                "SELECT id FROM locations WHERE id = %s AND active = true FOR UPDATE",
+                (payload.siteId,),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Active site not found")
+            cur.execute(
+                """
+                INSERT INTO site_check_in_schedule_rules (
+                    employee_id, location_id, weekdays, local_start_time, timezone,
+                    starts_on, ends_on, grace_minutes, active, created_by
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    COALESCE(%s, 'infinity'::date), %s, true, %s
+                )
+                ON CONFLICT (
+                    employee_id, location_id, weekdays, local_start_time,
+                    timezone, starts_on, ends_on
+                )
+                DO UPDATE SET grace_minutes = EXCLUDED.grace_minutes,
+                              active = true,
+                              created_by = EXCLUDED.created_by,
+                              updated_at = NOW()
+                RETURNING id
+                """,
+                (
+                    payload.employeeId,
+                    payload.siteId,
+                    payload.weekdays,
+                    payload.localStart,
+                    TIMEZONE_NAME,
+                    payload.startsOn,
+                    payload.endsOn,
+                    payload.graceMinutes,
+                    int(admin["id"]),
+                ),
+            )
+            inserted = cur.fetchone()
+            if not inserted:
+                raise RuntimeError("Recurring site check-in schedule was not saved")
+            rule_id = int(inserted["id"])
+    row = _site_check_in_schedule_rule_row(rule_id)
     append_access_log(
         request,
         "SITE_CHECK_IN_SCHEDULE_RULE_SAVED",
         True,
-        f"Schedule rule {inserted['id']} by {admin['name']}",
+        f"Schedule rule {rule_id} by {admin['name']}",
     )
     return {
         "success": True,
@@ -5405,7 +5901,10 @@ def admin_employee_hours(
         raise HTTPException(status_code=404, detail="Employee not found")
 
     timesheet_data = load_timesheets()
-    location_customers = timesheet_data.get("location_customers", {})
+    location_customers = _historical_location_metadata(
+        timesheet_data,
+        "location_customers",
+    )
     now = utc_now()
 
     days_since_monday = now.weekday()
@@ -5955,7 +6454,10 @@ def my_timesheet_hours(
     current_employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     timesheet_data = load_timesheets()
-    location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
+    location_customers = _historical_location_metadata(
+        timesheet_data,
+        "location_customers",
+    )
     employee_id = current_employee["id"]
     now = utc_now()
 
@@ -6079,100 +6581,911 @@ def timesheet_locations(
     }
 
 
+CUSTOMER_SELECT_COLUMNS = """
+    c.id, c.name, c.primary_contact_name, c.primary_phone, c.primary_email,
+    c.billing_name, c.billing_email, c.billing_address, c.atlas_contact_id,
+    c.active, c.created_at, c.updated_at, c.archived_at, c.archived_by
+"""
+
+SITE_SELECT_COLUMNS = """
+    l.id, l.customer_id, l.address, l.address_key, l.customer_name,
+    l.location_type, l.rate, l.rate_type, l.frequency, l.expected_hours,
+    l.target_labor_pct, l.min_margin_pct, l.lat, l.lng, l.service_scope,
+    l.access_instructions, l.service_preferences, l.pet_notes,
+    l.service_start_date, l.check_in_token_nonce, l.active, l.created_at,
+    l.updated_at, l.archived_at, l.archived_by,
+    c.name AS canonical_customer_name
+"""
+
+
+def _raise_validation_error(message: str, fields: Dict[str, str]) -> None:
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "code": "validation_error",
+            "message": message,
+            "details": {"fields": fields},
+        },
+    )
+
+
+def _raise_conflict(code: str, message: str, details: Dict[str, Any]) -> None:
+    raise HTTPException(
+        status_code=409,
+        detail={"code": code, "message": message, "details": details},
+    )
+
+
+def _site_required_checklist(row: Dict[str, Any]) -> Dict[str, bool]:
+    return {
+        "address": bool(str(row.get("address") or "").strip()),
+        "locationType": row.get("location_type") in ("Residential", "Commercial"),
+        "rate": row.get("rate") is not None,
+        "rateType": row.get("rate_type") in ("per_visit", "hourly", "monthly"),
+        "gps": row.get("lat") is not None and row.get("lng") is not None,
+    }
+
+
+def _site_optional_checklist(row: Dict[str, Any]) -> Dict[str, bool]:
+    return {
+        "frequency": bool(row.get("frequency")),
+        "expectedHours": row.get("expected_hours") is not None,
+        "profitabilityTargets": (
+            row.get("target_labor_pct") is not None
+            and row.get("min_margin_pct") is not None
+        ),
+        "serviceScope": bool(row.get("service_scope")),
+        "accessInstructions": bool(row.get("access_instructions")),
+        "servicePreferences": bool(row.get("service_preferences")),
+        "petNotes": bool(row.get("pet_notes")),
+        "serviceStartDate": row.get("service_start_date") is not None,
+        "qr": bool(row.get("check_in_token_nonce")),
+    }
+
+
+def _site_status(row: Dict[str, Any]) -> str:
+    if not bool(row.get("active")):
+        return "archived"
+    return "ready" if all(_site_required_checklist(row).values()) else "needs_setup"
+
+
+def _serialize_site(row: Dict[str, Any]) -> Dict[str, Any]:
+    required = _site_required_checklist(row)
+    optional = _site_optional_checklist(row)
+    migration_review: List[str] = []
+    if row.get("customer_id") is None:
+        migration_review.append("unlinked_customer")
+    if row.get("address_key") is None:
+        migration_review.append("duplicate_normalized_address")
+    service_start = row.get("service_start_date")
+    return {
+        "id": int(row["id"]),
+        "customerId": int(row["customer_id"]) if row.get("customer_id") is not None else None,
+        "customerName": str(
+            row.get("canonical_customer_name") or row.get("customer_name") or ""
+        ),
+        "address": str(row["address"]),
+        "locationType": row.get("location_type"),
+        "rate": float(row["rate"]) if row.get("rate") is not None else None,
+        "rateType": row.get("rate_type"),
+        "frequency": row.get("frequency"),
+        "expectedHours": (
+            float(row["expected_hours"])
+            if row.get("expected_hours") is not None
+            else None
+        ),
+        "targetLaborPct": (
+            float(row["target_labor_pct"])
+            if row.get("target_labor_pct") is not None
+            else None
+        ),
+        "minMarginPct": (
+            float(row["min_margin_pct"])
+            if row.get("min_margin_pct") is not None
+            else None
+        ),
+        "latitude": float(row["lat"]) if row.get("lat") is not None else None,
+        "longitude": float(row["lng"]) if row.get("lng") is not None else None,
+        "serviceScope": row.get("service_scope"),
+        "accessInstructions": row.get("access_instructions"),
+        "servicePreferences": row.get("service_preferences"),
+        "petNotes": row.get("pet_notes"),
+        "serviceStartDate": service_start.isoformat() if service_start else None,
+        "qrConfigured": bool(row.get("check_in_token_nonce")),
+        "active": bool(row.get("active")),
+        "status": _site_status(row),
+        "checklist": {"required": required, "optional": optional},
+        "migrationReview": migration_review,
+        "createdAt": to_utc_iso(row["created_at"]),
+        "updatedAt": to_utc_iso(row["updated_at"]),
+        "archivedAt": to_utc_iso(row["archived_at"]) if row.get("archived_at") else None,
+        "archivedBy": int(row["archived_by"]) if row.get("archived_by") is not None else None,
+    }
+
+
+def _customer_status(row: Dict[str, Any], sites: List[Dict[str, Any]]) -> str:
+    if not bool(row.get("active")):
+        return "archived"
+    active_sites = [site for site in sites if site["active"]]
+    if not active_sites:
+        return "draft"
+    has_name = bool(str(row.get("name") or "").strip())
+    return (
+        "ready"
+        if has_name and all(site["status"] == "ready" for site in active_sites)
+        else "needs_setup"
+    )
+
+
+def _serialize_customer(row: Dict[str, Any], sites: List[Dict[str, Any]]) -> Dict[str, Any]:
+    active_sites = [site for site in sites if site["active"]]
+    required = {
+        "name": bool(str(row.get("name") or "").strip()),
+        "activeSite": bool(active_sites),
+        "allActiveSitesReady": bool(active_sites)
+        and all(site["status"] == "ready" for site in active_sites),
+    }
+    optional = {
+        "primaryContact": bool(
+            row.get("primary_contact_name")
+            or row.get("primary_phone")
+            or row.get("primary_email")
+        ),
+        "billing": bool(
+            row.get("billing_name")
+            or row.get("billing_email")
+            or row.get("billing_address")
+        ),
+        "atlasContact": row.get("atlas_contact_id") is not None,
+    }
+    return {
+        "id": int(row["id"]),
+        "name": str(row["name"]),
+        "primaryContactName": row.get("primary_contact_name"),
+        "primaryPhone": row.get("primary_phone"),
+        "primaryEmail": row.get("primary_email"),
+        "billingName": row.get("billing_name"),
+        "billingEmail": row.get("billing_email"),
+        "billingAddress": row.get("billing_address"),
+        "atlasContactId": (
+            str(row["atlas_contact_id"])
+            if row.get("atlas_contact_id") is not None
+            else None
+        ),
+        "active": bool(row.get("active")),
+        "status": _customer_status(row, sites),
+        "siteCount": len(sites),
+        "activeSiteCount": len(active_sites),
+        "readySiteCount": sum(site["status"] == "ready" for site in active_sites),
+        "checklist": {"required": required, "optional": optional},
+        "sites": sites,
+        "createdAt": to_utc_iso(row["created_at"]),
+        "updatedAt": to_utc_iso(row["updated_at"]),
+        "archivedAt": to_utc_iso(row["archived_at"]) if row.get("archived_at") else None,
+        "archivedBy": int(row["archived_by"]) if row.get("archived_by") is not None else None,
+    }
+
+
+def _customer_row(cur: Any, customer_id: int, for_update: bool = False) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        f"SELECT {CUSTOMER_SELECT_COLUMNS} FROM customers c WHERE c.id = %s"
+        + (" FOR UPDATE" if for_update else ""),
+        (customer_id,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _site_row(cur: Any, site_id: int, for_update: bool = False) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        f"""
+        SELECT {SITE_SELECT_COLUMNS}
+        FROM locations l
+        LEFT JOIN customers c ON c.id = l.customer_id
+        WHERE l.id = %s
+        """
+        + (" FOR UPDATE OF l" if for_update else ""),
+        (site_id,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _sites_for_customer(cur: Any, customer_id: int, include_archived: bool) -> List[Dict[str, Any]]:
+    active_clause = "" if include_archived else " AND l.active = true"
+    cur.execute(
+        f"""
+        SELECT {SITE_SELECT_COLUMNS}
+        FROM locations l
+        LEFT JOIN customers c ON c.id = l.customer_id
+        WHERE l.customer_id = %s{active_clause}
+        ORDER BY l.id
+        """,
+        (customer_id,),
+    )
+    return [_serialize_site(dict(row)) for row in cur.fetchall()]
+
+
+def _canonical_customer(cur: Any, customer_id: int, include_archived_sites: bool = True) -> Dict[str, Any]:
+    row = _customer_row(cur, customer_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return _serialize_customer(
+        row,
+        _sites_for_customer(cur, customer_id, include_archived_sites),
+    )
+
+
+def _canonical_site(cur: Any, site_id: int) -> Dict[str, Any]:
+    row = _site_row(cur, site_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Location not found")
+    return _serialize_site(row)
+
+
+def _lock_address_and_find_conflicts(
+    cur: Any,
+    address: str,
+    exclude_site_id: Optional[int] = None,
+) -> str:
+    address_key = normalize_site_address(address)
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (address_key,))
+    cur.execute(
+        """
+        SELECT id, customer_id, address, address_key, active
+        FROM locations
+        WHERE (%s IS NULL OR id <> %s)
+        ORDER BY active DESC, id
+        """,
+        (exclude_site_id, exclude_site_id),
+    )
+    conflicts = [
+        dict(row)
+        for row in cur.fetchall()
+        if normalize_site_address(str(row["address"])) == address_key
+    ]
+    if conflicts:
+        active_conflicts = [row for row in conflicts if bool(row["active"])]
+        match = active_conflicts[0] if active_conflicts else conflicts[0]
+        code = "duplicate_site_address" if active_conflicts else "archived_site_address"
+        details = {
+            "siteId": int(match["id"]),
+            "customerId": (
+                int(match["customer_id"])
+                if match.get("customer_id") is not None
+                else None
+            ),
+            "matchingSiteIds": [int(row["id"]) for row in conflicts],
+            "canRestore": not bool(active_conflicts),
+        }
+        _raise_conflict(
+            code,
+            (
+                "A job site already uses this address"
+                if active_conflicts
+                else "An archived job site already uses this address"
+            ),
+            details,
+        )
+    return address_key
+
+
+def _active_customer_for_site(cur: Any, customer_id: int) -> Dict[str, Any]:
+    customer = _customer_row(cur, customer_id, for_update=True)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if not bool(customer["active"]):
+        _raise_conflict(
+            "customer_archived",
+            "Restore the Customer before adding or restoring a Site",
+            {"customerId": customer_id, "canRestore": True},
+        )
+    return customer
+
+
+def _insert_customer(cur: Any, payload: CustomerCreateRequest) -> int:
+    cur.execute(
+        """
+        INSERT INTO customers (
+            name, primary_contact_name, primary_phone, primary_email,
+            billing_name, billing_email, billing_address, atlas_contact_id
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            payload.name,
+            payload.primaryContactName,
+            payload.primaryPhone,
+            payload.primaryEmail,
+            payload.billingName,
+            payload.billingEmail,
+            payload.billingAddress,
+            str(payload.atlasContactId) if payload.atlasContactId is not None else None,
+        ),
+    )
+    return int(cur.fetchone()["id"])
+
+
+def _insert_site(
+    cur: Any,
+    customer_id: Optional[int],
+    customer_name: Optional[str],
+    payload: PrimarySiteCreateRequest,
+) -> int:
+    address_key = _lock_address_and_find_conflicts(cur, payload.address)
+    cur.execute(
+        """
+        INSERT INTO locations (
+            customer_id, address, address_key, customer_name, location_type,
+            rate, rate_type, frequency, expected_hours, target_labor_pct,
+            min_margin_pct, lat, lng, service_scope, access_instructions,
+            service_preferences, pet_notes, service_start_date
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        RETURNING id
+        """,
+        (
+            customer_id,
+            payload.address,
+            address_key,
+            customer_name,
+            payload.locationType,
+            payload.rate,
+            payload.rateType,
+            payload.frequency,
+            payload.expectedHours,
+            payload.targetLaborPct,
+            payload.minMarginPct,
+            payload.lat,
+            payload.lng,
+            payload.serviceScope,
+            payload.accessInstructions,
+            payload.servicePreferences,
+            payload.petNotes,
+            payload.serviceStartDate,
+        ),
+    )
+    return int(cur.fetchone()["id"])
+
+
+@app.get("/api/admin/customers")
+def admin_list_customers(
+    request: Request,
+    includeArchived: bool = Query(default=False),
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    active_clause = "" if includeArchived else " WHERE c.active = true"
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"SELECT {CUSTOMER_SELECT_COLUMNS} FROM customers c"
+                f"{active_clause} ORDER BY lower(c.name), c.id"
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+            customers = [
+                _serialize_customer(
+                    row,
+                    _sites_for_customer(cur, int(row["id"]), includeArchived),
+                )
+                for row in rows
+            ]
+    append_access_log(request, "CUSTOMERS_LISTED", True, f"{len(customers)} customers")
+    return {"success": True, "customers": customers}
+
+
+@app.post("/api/admin/customers", status_code=201)
+def admin_create_customer(
+    payload: CustomerCreateRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            customer_id = _insert_customer(cur, payload)
+            if payload.primarySite is not None:
+                _insert_site(cur, customer_id, payload.name, payload.primarySite)
+            customer = _canonical_customer(cur, customer_id)
+    append_access_log(
+        request,
+        "CUSTOMER_CREATED",
+        True,
+        f"Customer {customer_id} by {admin['name']}",
+    )
+    return {"success": True, "customer": customer}
+
+
+@app.get("/api/admin/customers/{customer_id}")
+def admin_get_customer(
+    customer_id: int,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            customer = _canonical_customer(cur, customer_id)
+    append_access_log(request, "CUSTOMER_VIEWED", True, f"Customer {customer_id}")
+    return {"success": True, "customer": customer}
+
+
+@app.patch("/api/admin/customers/{customer_id}")
+def admin_patch_customer(
+    customer_id: int,
+    payload: CustomerUpdateRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    present = payload.model_fields_set
+    if "name" in present and payload.name is None:
+        _raise_validation_error("Customer name cannot be cleared", {"name": "required"})
+
+    field_map = {
+        "name": "name",
+        "primaryContactName": "primary_contact_name",
+        "primaryPhone": "primary_phone",
+        "primaryEmail": "primary_email",
+        "billingName": "billing_name",
+        "billingEmail": "billing_email",
+        "billingAddress": "billing_address",
+        "atlasContactId": "atlas_contact_id",
+    }
+    values = payload.model_dump()
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            existing = _customer_row(cur, customer_id, for_update=True)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Customer not found")
+            assignments: List[str] = []
+            params: List[Any] = []
+            for request_field, column in field_map.items():
+                if request_field not in present:
+                    continue
+                assignments.append(f"{column} = %s")
+                value = values[request_field]
+                if request_field == "atlasContactId" and value is not None:
+                    value = str(value)
+                params.append(value)
+            if assignments:
+                assignments.append("updated_at = NOW()")
+                params.append(customer_id)
+                cur.execute(
+                    f"UPDATE customers SET {', '.join(assignments)} WHERE id = %s",
+                    tuple(params),
+                )
+            if "name" in present:
+                cur.execute(
+                    """
+                    UPDATE locations
+                    SET customer_name = %s, updated_at = NOW()
+                    WHERE customer_id = %s
+                    """,
+                    (payload.name, customer_id),
+                )
+            customer = _canonical_customer(cur, customer_id)
+    append_access_log(
+        request,
+        "CUSTOMER_UPDATED",
+        True,
+        f"Customer {customer_id} by {admin['name']}",
+    )
+    return {"success": True, "customer": customer}
+
+
+@app.delete("/api/admin/customers/{customer_id}")
+def admin_archive_customer(
+    customer_id: int,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            existing = _customer_row(cur, customer_id, for_update=True)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Customer not found")
+            if bool(existing["active"]):
+                cur.execute(
+                    """
+                    SELECT id, address FROM locations
+                    WHERE customer_id = %s AND active = true
+                    ORDER BY id
+                    FOR UPDATE
+                    """,
+                    (customer_id,),
+                )
+                active_sites = [dict(row) for row in cur.fetchall()]
+                if active_sites:
+                    _raise_conflict(
+                        "customer_has_active_sites",
+                        "Archive every active Site before archiving this Customer",
+                        {
+                            "customerId": customer_id,
+                            "activeSites": [
+                                {"id": int(site["id"]), "address": str(site["address"])}
+                                for site in active_sites
+                            ],
+                        },
+                    )
+                cur.execute(
+                    """
+                    UPDATE customers
+                    SET active = false, archived_at = NOW(), archived_by = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (admin["id"], customer_id),
+                )
+            customer = _canonical_customer(cur, customer_id)
+    append_access_log(
+        request,
+        "CUSTOMER_ARCHIVED",
+        True,
+        f"Customer {customer_id} by {admin['name']}",
+    )
+    return {"success": True, "customer": customer}
+
+
+@app.post("/api/admin/customers/{customer_id}/restore")
+def admin_restore_customer(
+    customer_id: int,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            existing = _customer_row(cur, customer_id, for_update=True)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Customer not found")
+            if not bool(existing["active"]):
+                cur.execute(
+                    """
+                    UPDATE customers
+                    SET active = true, archived_at = NULL, archived_by = NULL,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (customer_id,),
+                )
+            customer = _canonical_customer(cur, customer_id)
+    append_access_log(
+        request,
+        "CUSTOMER_RESTORED",
+        True,
+        f"Customer {customer_id} by {admin['name']}",
+    )
+    return {"success": True, "customer": customer}
+
+
+@app.post("/api/admin/customers/{customer_id}/locations", status_code=201)
+def admin_create_customer_site(
+    customer_id: int,
+    payload: PrimarySiteCreateRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            customer_row = _active_customer_for_site(cur, customer_id)
+            site_id = _insert_site(cur, customer_id, str(customer_row["name"]), payload)
+            location = _canonical_site(cur, site_id)
+    append_access_log(
+        request,
+        "LOCATION_CREATED",
+        True,
+        f"Location {site_id} for Customer {customer_id} by {admin['name']}",
+    )
+    return {"success": True, "location": location}
+
+
+@app.get("/api/admin/locations")
+def admin_list_locations(
+    request: Request,
+    includeArchived: bool = Query(default=False),
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    active_clause = "" if includeArchived else " WHERE l.active = true"
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT {SITE_SELECT_COLUMNS}
+                FROM locations l
+                LEFT JOIN customers c ON c.id = l.customer_id
+                {active_clause}
+                ORDER BY l.id
+                """
+            )
+            locations = [_serialize_site(dict(row)) for row in cur.fetchall()]
+    append_access_log(request, "LOCATIONS_LISTED", True, f"{len(locations)} locations")
+    return {"success": True, "locations": locations}
+
+
+@app.post("/api/admin/locations", status_code=201)
+def admin_create_location(
+    payload: SiteCreateRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    if payload.customerId is None and payload.customerName is None:
+        _raise_validation_error(
+            "A Customer is required",
+            {"customerId": "customerId or customerName is required"},
+        )
+
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            if payload.customerId is not None:
+                customer_row = _active_customer_for_site(cur, payload.customerId)
+                customer_id = payload.customerId
+                customer_name = str(customer_row["name"])
+                if (
+                    payload.customerName is not None
+                    and payload.customerName != customer_name
+                ):
+                    _raise_validation_error(
+                        "customerId and customerName identify different Customers",
+                        {"customerName": "must match the selected Customer"},
+                    )
+            else:
+                new_customer = CustomerCreateRequest(name=payload.customerName)
+                customer_id = _insert_customer(cur, new_customer)
+                customer_name = str(payload.customerName)
+            site_id = _insert_site(cur, customer_id, customer_name, payload)
+            location = _canonical_site(cur, site_id)
+    append_access_log(
+        request,
+        "LOCATION_CREATED",
+        True,
+        f"Location {site_id} by {admin['name']}",
+    )
+    return {"success": True, "location": location}
+
+
 @app.put("/api/admin/locations")
 def admin_update_locations(
     payload: Dict[str, Any],
     request: Request,
-    _: Dict[str, Any] = Depends(get_current_admin),
+    admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     raw = payload.get("locations")
     if not isinstance(raw, list):
         raise HTTPException(status_code=400, detail="locations must be a list")
 
-    locations = []
-    location_coords: Dict[str, Dict[str, float]] = {}
-    location_pin_fields_present = set()
-    location_customers: Dict[str, str] = {}
-    location_rates: Dict[str, float] = {}
-    location_rate_types: Dict[str, str] = {}
-    location_types: Dict[str, str] = {}
-    location_frequencies: Dict[str, str] = {}
-    location_expected_hours: Dict[str, float] = {}
-    location_target_labor: Dict[str, float] = {}
-    location_min_margin: Dict[str, float] = {}
-    for item in raw:
-        if isinstance(item, dict) and item.get("name", "").strip():
-            name = str(item["name"]).strip()
-            locations.append(name)
-            if "lat" in item or "lng" in item:
-                location_pin_fields_present.add(name)
-            if item.get("lat") is not None and item.get("lng") is not None:
-                try:
-                    location_coords[name] = {"lat": float(item["lat"]), "lng": float(item["lng"])}
-                except (TypeError, ValueError):
-                    pass
-            if item.get("customer", "").strip():
-                location_customers[name] = str(item["customer"]).strip()
-            if item.get("rate") is not None:
-                try:
-                    location_rates[name] = float(item["rate"])
-                except (TypeError, ValueError):
-                    pass
-            if item.get("rateType") in ("per_visit", "hourly", "monthly"):
-                location_rate_types[name] = item["rateType"]
-            if item.get("type") in ("Residential", "Commercial"):
-                location_types[name] = item["type"]
-            if isinstance(item.get("frequency"), str) and item["frequency"].strip():
-                location_frequencies[name] = item["frequency"].strip()
-            if item.get("expectedHours") is not None:
-                try:
-                    location_expected_hours[name] = float(item["expectedHours"])
-                except (TypeError, ValueError):
-                    pass
-            if item.get("targetLaborPct") is not None:
-                try:
-                    location_target_labor[name] = float(item["targetLaborPct"])
-                except (TypeError, ValueError):
-                    pass
-            if item.get("minMarginPct") is not None:
-                try:
-                    location_min_margin[name] = float(item["minMarginPct"])
-                except (TypeError, ValueError):
-                    pass
-        elif isinstance(item, str) and item.strip():
-            locations.append(item.strip())
+    direct_fields = (
+        "lat",
+        "lng",
+        "rate",
+        "rateType",
+        "frequency",
+        "expectedHours",
+        "targetLaborPct",
+        "minMarginPct",
+    )
+    update_column_map = {
+        "locationType": "location_type",
+        "rate": "rate",
+        "rateType": "rate_type",
+        "frequency": "frequency",
+        "expectedHours": "expected_hours",
+        "targetLaborPct": "target_labor_pct",
+        "minMarginPct": "min_margin_pct",
+        "lat": "lat",
+        "lng": "lng",
+    }
 
-    def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
-        existing_coords = data.get("location_coords", {})
-        for name in locations:
-            if name in location_coords or name in location_pin_fields_present:
-                continue
-            existing = existing_coords.get(name) if isinstance(existing_coords, dict) else None
-            if not isinstance(existing, dict):
-                continue
-            try:
-                location_coords[name] = {
-                    "lat": float(existing["lat"]),
-                    "lng": float(existing["lng"]),
-                }
-            except (KeyError, TypeError, ValueError):
-                continue
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            for index, item in enumerate(raw):
+                if isinstance(item, str):
+                    address = item.strip()
+                    patch_data: Dict[str, Any] = {}
+                elif isinstance(item, dict):
+                    if "address" in item:
+                        address_value = item.get("address")
+                    else:
+                        address_value = item.get("name")
+                    address = (
+                        address_value.strip()
+                        if isinstance(address_value, str)
+                        else ""
+                    )
+                    patch_data = {}
+                    if "customerName" in item:
+                        patch_data["customerName"] = item.get("customerName")
+                    elif "customer" in item:
+                        patch_data["customerName"] = item.get("customer")
+                    if "locationType" in item:
+                        patch_data["locationType"] = item.get("locationType")
+                    elif "type" in item:
+                        patch_data["locationType"] = item.get("type")
+                    for field in direct_fields:
+                        if field in item:
+                            patch_data[field] = item.get(field)
+                else:
+                    _raise_validation_error(
+                        "Each location must be an address string or object",
+                        {f"locations.{index}": "invalid entry"},
+                    )
 
-        data["locations"] = locations
-        data["location_coords"] = location_coords
-        data["location_customers"] = location_customers
-        data["location_rates"] = location_rates
-        data["location_rate_types"] = location_rate_types
-        data["location_types"] = location_types
-        data["location_frequencies"] = location_frequencies
-        data["location_expected_hours"] = location_expected_hours
-        data["location_target_labor"] = location_target_labor
-        data["location_min_margin"] = location_min_margin
-        return True, locations
+                if not address:
+                    _raise_validation_error(
+                        "Every legacy location entry requires an address",
+                        {f"locations.{index}.address": "required"},
+                    )
+                if len(address) > SITE_ADDRESS_MAX_LENGTH:
+                    _raise_validation_error(
+                        "Location address is too long",
+                        {
+                            f"locations.{index}.address": (
+                                f"must be at most {SITE_ADDRESS_MAX_LENGTH} characters"
+                            )
+                        },
+                    )
 
-    update_timesheets(mutator)
-    append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations, {len(location_coords)} with coords")
-    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies, "location_expected_hours": location_expected_hours, "location_target_labor": location_target_labor, "location_min_margin": location_min_margin}
+                try:
+                    validated = SiteUpdateRequest(**patch_data)
+                except ValidationError as exc:
+                    fields = {
+                        f"locations.{index}."
+                        + (".".join(str(part) for part in error.get("loc", ())) or "body"):
+                        str(error.get("msg", "Invalid value"))
+                        for error in exc.errors()
+                    }
+                    _raise_validation_error(next(iter(fields.values())), fields)
+                present = validated.model_fields_set
+                values = validated.model_dump()
+                for field in ("customerName", "locationType", "rateType"):
+                    if field in present and values[field] is None:
+                        _raise_validation_error(
+                            f"{field} cannot be cleared",
+                            {f"locations.{index}.{field}": "cannot be cleared"},
+                        )
+
+                cur.execute(
+                    "SELECT id FROM locations WHERE address = %s FOR UPDATE",
+                    (address,),
+                )
+                existing_id_row = cur.fetchone()
+                if not existing_id_row:
+                    address_key = _lock_address_and_find_conflicts(cur, address)
+                    customer_id: Optional[int] = None
+                    customer_name = values.get("customerName") if "customerName" in present else None
+                    if customer_name:
+                        cur.execute(
+                            "INSERT INTO customers (name) VALUES (%s) RETURNING id",
+                            (customer_name,),
+                        )
+                        customer_id = int(cur.fetchone()["id"])
+                    lat = values.get("lat") if "lat" in present else None
+                    lng = values.get("lng") if "lng" in present else None
+                    if (lat is None) != (lng is None):
+                        _raise_validation_error(
+                            "lat and lng must be provided or cleared together",
+                            {
+                                f"locations.{index}.lat": "coordinate pair required",
+                                f"locations.{index}.lng": "coordinate pair required",
+                            },
+                        )
+                    cur.execute(
+                        """
+                        INSERT INTO locations (
+                            customer_id, address, address_key, customer_name,
+                            location_type, rate, rate_type, frequency,
+                            expected_hours, target_labor_pct, min_margin_pct,
+                            lat, lng
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            customer_id,
+                            address,
+                            address_key,
+                            customer_name,
+                            values.get("locationType") if "locationType" in present else None,
+                            values.get("rate") if "rate" in present else None,
+                            values.get("rateType") if "rateType" in present else "per_visit",
+                            values.get("frequency") if "frequency" in present else None,
+                            values.get("expectedHours") if "expectedHours" in present else None,
+                            values.get("targetLaborPct") if "targetLaborPct" in present else None,
+                            values.get("minMarginPct") if "minMarginPct" in present else None,
+                            lat,
+                            lng,
+                        ),
+                    )
+                    continue
+
+                site_id = int(existing_id_row["id"])
+                existing = _site_row(cur, site_id)
+                if not existing:
+                    raise RuntimeError("Location disappeared during legacy update")
+
+                if "customerName" in present:
+                    customer_name = str(values["customerName"])
+                    customer_id = existing.get("customer_id")
+                    if customer_id is None:
+                        cur.execute(
+                            "INSERT INTO customers (name) VALUES (%s) RETURNING id",
+                            (customer_name,),
+                        )
+                        customer_id = int(cur.fetchone()["id"])
+                        cur.execute(
+                            """
+                            UPDATE locations
+                            SET customer_id = %s, customer_name = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (customer_id, customer_name, site_id),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE customers SET name = %s, updated_at = NOW() WHERE id = %s",
+                            (customer_name, customer_id),
+                        )
+                        cur.execute(
+                            """
+                            UPDATE locations
+                            SET customer_name = %s, updated_at = NOW()
+                            WHERE customer_id = %s
+                            """,
+                            (customer_name, customer_id),
+                        )
+
+                merged_lat = values["lat"] if "lat" in present else existing.get("lat")
+                merged_lng = values["lng"] if "lng" in present else existing.get("lng")
+                if (merged_lat is None) != (merged_lng is None):
+                    _raise_validation_error(
+                        "lat and lng must be provided or cleared together",
+                        {
+                            f"locations.{index}.lat": "coordinate pair required",
+                            f"locations.{index}.lng": "coordinate pair required",
+                        },
+                    )
+
+                assignments: List[str] = []
+                params: List[Any] = []
+                for request_field, column in update_column_map.items():
+                    if request_field not in present:
+                        continue
+                    assignments.append(f"{column} = %s")
+                    params.append(values[request_field])
+                if assignments:
+                    assignments.append("updated_at = NOW()")
+                    params.append(site_id)
+                    cur.execute(
+                        f"UPDATE locations SET {', '.join(assignments)} WHERE id = %s",
+                        tuple(params),
+                    )
+
+    canonical = load_timesheets()
+    append_access_log(
+        request,
+        "LOCATIONS_UPDATED",
+        True,
+        f"{len(raw)} legacy entries by {admin['name']}",
+    )
+    return {
+        "success": True,
+        "locations": canonical["locations"],
+        "location_coords": canonical["location_coords"],
+        "location_customers": canonical["location_customers"],
+        "location_rates": canonical["location_rates"],
+        "location_rate_types": canonical["location_rate_types"],
+        "location_types": canonical["location_types"],
+        "location_frequencies": canonical["location_frequencies"],
+        "location_expected_hours": canonical.get("location_expected_hours", {}),
+        "location_target_labor": canonical.get("location_target_labor", {}),
+        "location_min_margin": canonical.get("location_min_margin", {}),
+    }
 
 
 @app.patch("/api/admin/locations/pin")
@@ -6192,19 +7505,264 @@ def admin_patch_location_pin(
         lat, lng = float(lat), float(lng)
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="lat and lng must be numbers")
+    if not -90 <= lat <= 90 or not -180 <= lng <= 180:
+        raise HTTPException(status_code=400, detail="lat or lng is outside the valid range")
 
-    def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
-        if location not in data.get("locations", []):
-            return False, "Location not found"
-        data.setdefault("location_coords", {})[location] = {"lat": lat, "lng": lng}
-        return True, None
-
-    ok, err = update_timesheets(mutator)
-    if not ok:
-        raise HTTPException(status_code=400, detail=str(err))
+    updated = db.query_one(
+        """
+        UPDATE locations
+        SET lat = %s, lng = %s, updated_at = NOW()
+        WHERE address = %s AND active = true
+        RETURNING id
+        """,
+        (lat, lng, location),
+    )
+    if not updated:
+        raise HTTPException(status_code=400, detail="Location not found")
 
     append_access_log(request, "LOCATION_PIN_SET", True, f"Pin set for: {location}")
     return {"success": True}
+
+
+@app.patch("/api/admin/locations/{site_id}")
+def admin_patch_location(
+    site_id: int,
+    payload: SiteUpdateRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    present = payload.model_fields_set
+    required_fields = {
+        "customerId": payload.customerId,
+        "customerName": payload.customerName,
+        "address": payload.address,
+        "locationType": payload.locationType,
+        "rateType": payload.rateType,
+    }
+    cleared_required = {
+        field: "cannot be cleared"
+        for field, value in required_fields.items()
+        if field in present and value is None
+    }
+    if cleared_required:
+        _raise_validation_error("Required Site fields cannot be cleared", cleared_required)
+
+    values = payload.model_dump()
+    site_field_map = {
+        "address": "address",
+        "locationType": "location_type",
+        "rate": "rate",
+        "rateType": "rate_type",
+        "frequency": "frequency",
+        "expectedHours": "expected_hours",
+        "targetLaborPct": "target_labor_pct",
+        "minMarginPct": "min_margin_pct",
+        "lat": "lat",
+        "lng": "lng",
+        "serviceScope": "service_scope",
+        "accessInstructions": "access_instructions",
+        "servicePreferences": "service_preferences",
+        "petNotes": "pet_notes",
+        "serviceStartDate": "service_start_date",
+    }
+
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            existing = _site_row(cur, site_id, for_update=True)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Location not found")
+
+            assignments: List[str] = []
+            params: List[Any] = []
+            customer_id = existing.get("customer_id")
+            customer_name = str(
+                existing.get("canonical_customer_name")
+                or existing.get("customer_name")
+                or ""
+            )
+
+            if "customerId" in present:
+                target_customer = _active_customer_for_site(cur, int(payload.customerId))
+                target_name = str(target_customer["name"])
+                if "customerName" in present and payload.customerName != target_name:
+                    _raise_validation_error(
+                        "customerId and customerName identify different Customers",
+                        {"customerName": "must match the selected Customer"},
+                    )
+                customer_id = int(payload.customerId)
+                customer_name = target_name
+                assignments.extend(["customer_id = %s", "customer_name = %s"])
+                params.extend([customer_id, customer_name])
+            elif "customerName" in present:
+                if customer_id is None:
+                    _raise_validation_error(
+                        "Select a Customer before renaming this unlinked legacy Site",
+                        {"customerId": "required for an unlinked Site"},
+                    )
+                target_customer = _customer_row(cur, int(customer_id), for_update=True)
+                if not target_customer:
+                    raise HTTPException(status_code=404, detail="Customer not found")
+                customer_name = str(payload.customerName)
+                cur.execute(
+                    """
+                    UPDATE customers
+                    SET name = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (customer_name, customer_id),
+                )
+                cur.execute(
+                    """
+                    UPDATE locations
+                    SET customer_name = %s, updated_at = NOW()
+                    WHERE customer_id = %s
+                    """,
+                    (customer_name, customer_id),
+                )
+
+            if "address" in present:
+                address_key = _lock_address_and_find_conflicts(
+                    cur,
+                    str(payload.address),
+                    exclude_site_id=site_id,
+                )
+                assignments.extend(["address = %s", "address_key = %s"])
+                params.extend([payload.address, address_key])
+
+            merged_lat = values["lat"] if "lat" in present else existing.get("lat")
+            merged_lng = values["lng"] if "lng" in present else existing.get("lng")
+            if (merged_lat is None) != (merged_lng is None):
+                _raise_validation_error(
+                    "lat and lng must be provided or cleared together",
+                    {"lat": "coordinate pair required", "lng": "coordinate pair required"},
+                )
+
+            for request_field, column in site_field_map.items():
+                if request_field not in present or request_field == "address":
+                    continue
+                assignments.append(f"{column} = %s")
+                params.append(values[request_field])
+
+            if assignments:
+                assignments.append("updated_at = NOW()")
+                params.append(site_id)
+                cur.execute(
+                    f"UPDATE locations SET {', '.join(assignments)} WHERE id = %s",
+                    tuple(params),
+                )
+            location = _canonical_site(cur, site_id)
+
+    append_access_log(
+        request,
+        "LOCATION_UPDATED",
+        True,
+        f"Location {site_id} by {admin['name']}",
+    )
+    return {"success": True, "location": location}
+
+
+@app.delete("/api/admin/locations/{site_id}")
+def admin_archive_location(
+    site_id: int,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    archived_at = utc_now()
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            existing = _site_row(cur, site_id, for_update=True)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Location not found")
+            if bool(existing["active"]):
+                cur.execute(
+                    """
+                    UPDATE locations
+                    SET active = false, archived_at = %s, archived_by = %s,
+                        check_in_token_nonce = NULL,
+                        check_in_token_rotated_at = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (archived_at, admin["id"], archived_at, archived_at, site_id),
+                )
+                cur.execute(
+                    """
+                    UPDATE site_check_in_schedule_rules
+                    SET active = false, updated_at = %s
+                    WHERE location_id = %s AND active = true
+                    """,
+                    (archived_at, site_id),
+                )
+                cur.execute(
+                    """
+                    UPDATE site_check_in_schedules
+                    SET cancelled_at = %s, cancelled_by = %s,
+                        cancellation_reason = 'site_archived'
+                    WHERE location_id = %s
+                      AND scheduled_start > %s
+                      AND cancelled_at IS NULL
+                    """,
+                    (archived_at, admin["id"], site_id, archived_at),
+                )
+            location = _canonical_site(cur, site_id)
+
+    append_access_log(
+        request,
+        "LOCATION_ARCHIVED",
+        True,
+        f"Location {site_id} by {admin['name']}",
+    )
+    return {"success": True, "location": location}
+
+
+@app.post("/api/admin/locations/{site_id}/restore")
+def admin_restore_location(
+    site_id: int,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    restored_at = utc_now()
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            existing = _site_row(cur, site_id, for_update=True)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Location not found")
+            customer_id = existing.get("customer_id")
+            if customer_id is None:
+                _raise_conflict(
+                    "customer_archived",
+                    "Assign this legacy Site to an active Customer before restoring it",
+                    {"customerId": None, "siteId": site_id, "canRestore": False},
+                )
+            _active_customer_for_site(cur, int(customer_id))
+            if not bool(existing["active"]):
+                address_key = _lock_address_and_find_conflicts(
+                    cur,
+                    str(existing["address"]),
+                    exclude_site_id=site_id,
+                )
+                cur.execute(
+                    """
+                    UPDATE locations
+                    SET active = true, archived_at = NULL, archived_by = NULL,
+                        address_key = %s, check_in_token_nonce = NULL,
+                        check_in_token_rotated_at = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (address_key, restored_at, restored_at, site_id),
+                )
+            location = _canonical_site(cur, site_id)
+
+    append_access_log(
+        request,
+        "LOCATION_RESTORED",
+        True,
+        f"Location {site_id} by {admin['name']}",
+    )
+    return {"success": True, "location": location}
 
 
 @app.get("/api/timesheet/current-status")
@@ -7274,7 +8832,10 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
         raise HTTPException(status_code=400, detail="period must be day, week, month, or year")
 
     timesheet_data = load_timesheets()
-    location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
+    location_customers = _historical_location_metadata(
+        timesheet_data,
+        "location_customers",
+    )
     employees_data = load_employees()
     emp_names = {emp["id"]: emp["name"] for emp in employees_data["employees"]}
 
@@ -7456,6 +9017,116 @@ def admin_update_settings(
 # Scheduling & Forecasting - Phase 8
 # ---------------------------------------------------------------------------
 
+
+def _resolve_site_for_creation(
+    cur: Any,
+    location_id: Optional[int],
+    requested_customer_name: str,
+    *,
+    weekly_schedule: bool = False,
+) -> Tuple[int, str, int]:
+    if location_id is not None:
+        cur.execute(
+            """
+            SELECT l.id, l.customer_id,
+                   COALESCE(c.name, l.customer_name, '') AS customer_name
+            FROM locations l
+            LEFT JOIN customers c ON c.id = l.customer_id
+            WHERE l.id = %s AND l.active = true
+            FOR UPDATE OF l
+            """,
+            (location_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Active location not found")
+        customer_name = str(row.get("customer_name") or "").strip()
+        customer_id = row.get("customer_id")
+        if customer_id is None or not customer_name:
+            _raise_conflict(
+                "ambiguous_customer_site",
+                "The selected legacy Site must be assigned to a Customer first",
+                {"locationId": location_id, "matchingSiteIds": []},
+            )
+        resolved_id = int(row["id"])
+    else:
+        cur.execute(
+            """
+            SELECT l.id, l.customer_id,
+                   COALESCE(c.name, l.customer_name, '') AS customer_name
+            FROM locations l
+            LEFT JOIN customers c ON c.id = l.customer_id
+            WHERE l.active = true
+              AND COALESCE(c.name, l.customer_name, '') = %s
+            ORDER BY l.id
+            FOR UPDATE OF l
+            """,
+            (requested_customer_name,),
+        )
+        candidates = [dict(row) for row in cur.fetchall()]
+        if len(candidates) != 1:
+            _raise_conflict(
+                "ambiguous_customer_site",
+                "Select an exact active Site for this Customer",
+                {
+                    "customerName": requested_customer_name,
+                    "matchingSiteIds": [int(row["id"]) for row in candidates],
+                },
+            )
+        resolved_id = int(candidates[0]["id"])
+        customer_id = candidates[0].get("customer_id")
+        customer_name = str(candidates[0].get("customer_name") or "").strip()
+        if customer_id is None or not customer_name:
+            _raise_conflict(
+                "ambiguous_customer_site",
+                "The selected legacy Site must be assigned to a Customer first",
+                {"locationId": resolved_id, "matchingSiteIds": [resolved_id]},
+            )
+
+    if weekly_schedule:
+        cur.execute(
+            """
+            SELECT l.id
+            FROM locations l
+            WHERE l.active = true
+              AND l.customer_id = %s
+            ORDER BY l.id
+            FOR UPDATE OF l
+            """,
+            (customer_id,),
+        )
+        same_customer_sites = [dict(row) for row in cur.fetchall()]
+        if len(same_customer_sites) != 1:
+            _raise_conflict(
+                "ambiguous_customer_site",
+                "Weekly multi-Site scheduling is deferred to Issue #20",
+                {
+                    "customerName": customer_name,
+                    "matchingSiteIds": [
+                        int(row["id"]) for row in same_customer_sites
+                    ],
+                },
+            )
+    return resolved_id, customer_name, int(customer_id)
+
+
+def _legacy_schedule_name_arbiter_present(cur: Any) -> bool:
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid = 'schedules'::regclass
+              AND contype = 'u'
+              AND pg_get_constraintdef(oid) LIKE '%%employee_id%%'
+              AND pg_get_constraintdef(oid) LIKE '%%customer_name%%'
+              AND pg_get_constraintdef(oid) LIKE '%%week_start%%'
+        ) AS present
+        """
+    )
+    return bool(cur.fetchone()["present"])
+
+
 @app.post("/api/admin/schedules")
 def admin_create_schedule(
     payload: ScheduleEntryRequest,
@@ -7475,28 +9146,182 @@ def admin_create_schedule(
     days_since_sunday = (ws.weekday() + 1) % 7
     week_start = ws - timedelta(days=days_since_sunday)
 
-    location_id = payload.locationId
-    if location_id is None:
-        loc = db.query_one(
-            "SELECT id FROM locations WHERE customer_name = %s AND active = true LIMIT 1",
-            (customer,),
-        )
-        if loc:
-            location_id = loc["id"]
-
-    row = db.query_one(
-        """
-        INSERT INTO schedules (employee_id, location_id, customer_name, week_start, scheduled_hours, notes)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (employee_id, customer_name, week_start)
-        DO UPDATE SET scheduled_hours = EXCLUDED.scheduled_hours, notes = EXCLUDED.notes
-        RETURNING *
-        """,
-        (payload.employeeId, location_id, customer, week_start, payload.scheduledHours, payload.notes),
-    )
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            location_id, customer, customer_id = _resolve_site_for_creation(
+                cur,
+                payload.locationId,
+                customer,
+                weekly_schedule=True,
+            )
+            cur.execute(
+                """
+                SELECT sc.id
+                FROM schedules sc
+                WHERE sc.employee_id = %s
+                  AND sc.week_start = %s
+                  AND sc.location_id IS NULL
+                  AND sc.customer_name = %s
+                ORDER BY sc.id
+                FOR UPDATE
+                """,
+                (payload.employeeId, week_start, customer),
+            )
+            legacy_name_schedule_ids = [
+                int(item["id"]) for item in cur.fetchall()
+            ]
+            if legacy_name_schedule_ids:
+                cur.execute(
+                    """
+                    SELECT l.id, l.customer_id
+                    FROM locations l
+                    LEFT JOIN customers c ON c.id = l.customer_id
+                    WHERE COALESCE(c.name, l.customer_name, '') = %s
+                    ORDER BY l.id
+                    FOR UPDATE OF l
+                    """,
+                    (customer,),
+                )
+                matching_name_sites = [dict(item) for item in cur.fetchall()]
+                matching_name_site_ids = [
+                    int(item["id"]) for item in matching_name_sites
+                ]
+                matching_customer_ids = {
+                    int(item["customer_id"])
+                    for item in matching_name_sites
+                    if item.get("customer_id") is not None
+                }
+                has_unlinked_match = any(
+                    item.get("customer_id") is None
+                    for item in matching_name_sites
+                )
+                if has_unlinked_match or matching_customer_ids != {customer_id}:
+                    _raise_conflict(
+                        "ambiguous_customer_site",
+                        "A legacy weekly schedule with this shared Customer name "
+                        "requires review before assigning an exact Site",
+                        {
+                            "customerName": customer,
+                            "locationId": location_id,
+                            "matchingSiteIds": matching_name_site_ids,
+                            "matchingScheduleIds": legacy_name_schedule_ids,
+                        },
+                    )
+            cur.execute(
+                """
+                SELECT sc.id
+                FROM schedules sc
+                LEFT JOIN locations existing_site ON existing_site.id = sc.location_id
+                WHERE sc.employee_id = %s
+                  AND sc.week_start = %s
+                  AND (
+                      sc.location_id = %s
+                      OR existing_site.customer_id = %s
+                      OR (sc.location_id IS NULL AND sc.customer_name = %s)
+                  )
+                ORDER BY sc.id
+                FOR UPDATE OF sc
+                """,
+                (
+                    payload.employeeId,
+                    week_start,
+                    location_id,
+                    customer_id,
+                    customer,
+                ),
+            )
+            matching_schedule_ids = [int(item["id"]) for item in cur.fetchall()]
+            if len(matching_schedule_ids) > 1:
+                _raise_conflict(
+                    "ambiguous_customer_site",
+                    "Multiple legacy weekly schedules require review before updating",
+                    {
+                        "customerName": customer,
+                        "locationId": location_id,
+                        "matchingScheduleIds": matching_schedule_ids,
+                    },
+                )
+            legacy_name_arbiter_present = _legacy_schedule_name_arbiter_present(cur)
+            if legacy_name_arbiter_present:
+                current_schedule_id = (
+                    matching_schedule_ids[0] if matching_schedule_ids else None
+                )
+                cur.execute(
+                    """
+                    SELECT id, location_id
+                    FROM schedules
+                    WHERE employee_id = %s
+                      AND week_start = %s
+                      AND customer_name = %s
+                      AND id <> %s
+                    ORDER BY id
+                    FOR UPDATE
+                    """,
+                    (
+                        payload.employeeId,
+                        week_start,
+                        customer,
+                        current_schedule_id or 0,
+                    ),
+                )
+                rollout_conflicts = [dict(item) for item in cur.fetchall()]
+                if rollout_conflicts:
+                    _raise_conflict(
+                        "ambiguous_customer_site",
+                        "This shared Customer name cannot be scheduled at a "
+                        "second Site until the staged Site-identity migration "
+                        "is finalized",
+                        {
+                            "customerName": customer,
+                            "locationId": location_id,
+                            "matchingScheduleIds": [
+                                int(item["id"]) for item in rollout_conflicts
+                            ],
+                            "migrationPending": True,
+                        },
+                    )
+            if matching_schedule_ids:
+                cur.execute(
+                    """
+                    UPDATE schedules
+                    SET location_id = %s, customer_name = %s,
+                        scheduled_hours = %s, notes = %s
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (
+                        location_id,
+                        customer,
+                        payload.scheduledHours,
+                        payload.notes,
+                        matching_schedule_ids[0],
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO schedules (
+                        employee_id, location_id, customer_name, week_start,
+                        scheduled_hours, notes
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        payload.employeeId,
+                        location_id,
+                        customer,
+                        week_start,
+                        payload.scheduledHours,
+                        payload.notes,
+                    ),
+                )
+            row = dict(cur.fetchone())
     append_access_log(request, "SCHEDULE_CREATED", True, f"Schedule {row['id']}")
     return {"success": True, "schedule": {
-        "id": row["id"], "employeeId": row["employee_id"], "customerName": row["customer_name"],
+        "id": row["id"], "employeeId": row["employee_id"],
+        "locationId": row["location_id"], "customerName": row["customer_name"],
         "weekStart": str(row["week_start"]), "scheduledHours": float(row["scheduled_hours"]),
         "notes": row["notes"],
     }}
@@ -7530,7 +9355,8 @@ def admin_list_schedules(
     )
     return {"success": True, "schedules": [
         {
-            "id": r["id"], "employeeId": r["employee_id"], "employeeName": r["employee_name"],
+            "id": r["id"], "employeeId": r["employee_id"],
+            "employeeName": r["employee_name"], "locationId": r.get("location_id"),
             "customerName": r["customer_name"], "weekStart": str(r["week_start"]),
             "scheduledHours": float(r["scheduled_hours"]), "notes": r["notes"],
         }
@@ -7552,6 +9378,69 @@ def admin_delete_schedule(
     db.execute("DELETE FROM schedules WHERE id = %s", (schedule_id,))
     append_access_log(request, "SCHEDULE_DELETED", True, f"Schedule {schedule_id}")
     return {"success": True, "scheduleId": schedule_id}
+
+
+def _reporting_site_identity_catalog() -> Tuple[
+    Dict[int, Dict[str, Any]],
+    Dict[str, List[int]],
+]:
+    """Return stable Site metadata and only-unambiguous legacy aliases."""
+    rows = db.query_all(
+        """
+        SELECT l.id, l.customer_id, l.address, l.customer_name AS legacy_name,
+               COALESCE(c.name, l.customer_name, l.address, '') AS customer_name,
+               l.rate, l.rate_type, l.expected_hours, l.active
+        FROM locations l
+        LEFT JOIN customers c ON c.id = l.customer_id
+        ORDER BY l.id
+        """
+    )
+    sites = {int(row["id"]): dict(row) for row in rows}
+    alias_sets: Dict[str, set[int]] = {}
+    for row in rows:
+        site_id = int(row["id"])
+        for value in (
+            row.get("customer_name"),
+            row.get("legacy_name"),
+            row.get("address"),
+        ):
+            alias = str(value or "").strip()
+            if alias:
+                alias_sets.setdefault(alias, set()).add(site_id)
+    return sites, {
+        alias: sorted(site_ids) for alias, site_ids in alias_sets.items()
+    }
+
+
+def _reporting_site_identity(
+    location_id: Optional[int],
+    legacy_label: str,
+    alias_site_ids: Dict[str, List[int]],
+    sites_by_id: Dict[int, Dict[str, Any]],
+) -> Tuple[str, Any]:
+    if location_id is not None:
+        site_id = int(location_id)
+        site = sites_by_id.get(site_id)
+        if site and site.get("customer_id") is not None:
+            return ("customer", int(site["customer_id"]))
+        return ("site", site_id)
+    label = str(legacy_label or "").strip()
+    candidates = alias_site_ids.get(label, [])
+    if candidates:
+        candidate_sites = [sites_by_id[site_id] for site_id in candidates]
+        candidate_customer_ids = {
+            int(site["customer_id"])
+            for site in candidate_sites
+            if site.get("customer_id") is not None
+        }
+        has_unlinked_candidate = any(
+            site.get("customer_id") is None for site in candidate_sites
+        )
+        if not has_unlinked_candidate and len(candidate_customer_ids) == 1:
+            return ("customer", next(iter(candidate_customer_ids)))
+    if len(candidates) == 1:
+        return ("site", candidates[0])
+    return ("legacy", label)
 
 
 @app.get("/api/admin/analytics/schedule-vs-actual")
@@ -7577,73 +9466,139 @@ def admin_schedule_vs_actual(
     ws = ws - timedelta(days=days_since_sunday)
     we = ws + timedelta(days=6)
 
+    sites_by_id, alias_site_ids = _reporting_site_identity_catalog()
     schedules = db.query_all(
         """
-        SELECT sc.employee_id, e.name AS employee_name, sc.customer_name, sc.scheduled_hours
+        SELECT sc.employee_id, e.name AS employee_name, sc.location_id,
+               COALESCE(c.name, sc.customer_name) AS customer_name,
+               sc.scheduled_hours
         FROM schedules sc
         JOIN employees e ON sc.employee_id = e.id
+        LEFT JOIN locations l ON l.id = sc.location_id
+        LEFT JOIN customers c ON c.id = l.customer_id
         WHERE sc.week_start = %s
         """,
         (ws,),
     )
 
-    location_customers = {
-        r["address"]: r["customer_name"]
-        for r in db.query_all("SELECT address, customer_name FROM locations WHERE customer_name IS NOT NULL")
-    }
-
     actuals = db.query_all(
         """
         SELECT s.employee_id, e.name AS employee_name,
-               COALESCE(l.address, '') AS location,
+               s.location_id,
+               COALESCE(c.name, l.customer_name, l.address,
+                        s.location_label, '') AS customer_name,
                COALESCE(SUM(s.total_hours), 0) AS actual_hours
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
         LEFT JOIN locations l ON s.location_id = l.id
+        LEFT JOIN customers c ON c.id = l.customer_id
         WHERE s.clock_out IS NOT NULL AND s.local_date >= %s AND s.local_date <= %s
-        GROUP BY s.employee_id, e.name, l.address
+        GROUP BY s.employee_id, e.name, s.location_id, c.name,
+                 l.customer_name, l.address, s.location_label
         """,
         (ws, we),
     )
 
-    # Build actual hours by (employee_id, customer)
-    actual_map: Dict[Tuple[int, str], float] = {}
+    # Aggregate by stable Customer identity. A legacy alias resolves when all
+    # matching Sites belong to one Customer; cross-Customer ambiguity remains.
+    actual_map: Dict[Tuple[int, Tuple[str, Any]], Dict[str, Any]] = {}
     for a in actuals:
-        cust = location_customers.get(a["location"], a["location"])
-        key = (a["employee_id"], cust)
-        actual_map[key] = actual_map.get(key, 0) + float(a["actual_hours"] or 0)
+        identity = _reporting_site_identity(
+            a.get("location_id"),
+            str(a.get("customer_name") or ""),
+            alias_site_ids,
+            sites_by_id,
+        )
+        key = (int(a["employee_id"]), identity)
+        current = actual_map.setdefault(
+            key,
+            {
+                "employeeName": str(a["employee_name"]),
+                "customerName": str(a.get("customer_name") or ""),
+                "hours": 0.0,
+                "locationIds": set(),
+            },
+        )
+        current["hours"] += float(a["actual_hours"] or 0)
+        if a.get("location_id") is not None:
+            current["locationIds"].add(int(a["location_id"]))
+
+    scheduled_map: Dict[Tuple[int, Tuple[str, Any]], Dict[str, Any]] = {}
+    for sc in schedules:
+        identity = _reporting_site_identity(
+            sc.get("location_id"),
+            str(sc.get("customer_name") or ""),
+            alias_site_ids,
+            sites_by_id,
+        )
+        key = (int(sc["employee_id"]), identity)
+        current = scheduled_map.setdefault(
+            key,
+            {
+                "employeeName": str(sc["employee_name"]),
+                "customerName": str(sc.get("customer_name") or ""),
+                "hours": 0.0,
+                "locationIds": set(),
+            },
+        )
+        current["hours"] += float(sc["scheduled_hours"] or 0)
+        if sc.get("location_id") is not None:
+            current["locationIds"].add(int(sc["location_id"]))
 
     comparisons = []
-    all_keys = set()
-    for sc in schedules:
-        key = (sc["employee_id"], sc["customer_name"])
-        all_keys.add(key)
-        scheduled = float(sc["scheduled_hours"])
-        actual = actual_map.get(key, 0.0)
+    for key in set(scheduled_map) | set(actual_map):
+        employee_id_value, identity = key
+        scheduled_entry = scheduled_map.get(key)
+        actual_entry = actual_map.get(key)
+        scheduled = float(scheduled_entry["hours"]) if scheduled_entry else 0.0
+        actual = float(actual_entry["hours"]) if actual_entry else 0.0
         drift = round(actual - scheduled, 2)
+        scheduled_location_ids = (
+            scheduled_entry.get("locationIds", set()) if scheduled_entry else set()
+        )
+        actual_location_ids = (
+            actual_entry.get("locationIds", set()) if actual_entry else set()
+        )
+        location_id_value = (
+            next(iter(scheduled_location_ids))
+            if len(scheduled_location_ids) == 1
+            else (
+                next(iter(actual_location_ids))
+                if len(actual_location_ids) == 1
+                else (int(identity[1]) if identity[0] == "site" else None)
+            )
+        )
+        site = sites_by_id.get(location_id_value) if location_id_value else None
+        customer_name = str(
+            (scheduled_entry or {}).get("customerName")
+            or (actual_entry or {}).get("customerName")
+            or (site or {}).get("customer_name")
+            or identity[1]
+        )
         comparisons.append({
-            "employeeId": sc["employee_id"],
-            "employeeName": sc["employee_name"],
-            "customerName": sc["customer_name"],
+            "employeeId": employee_id_value,
+            "employeeName": str(
+                (scheduled_entry or actual_entry or {}).get(
+                    "employeeName",
+                    f"Employee {employee_id_value}",
+                )
+            ),
+            "customerId": (
+                int(identity[1])
+                if identity[0] == "customer"
+                else (
+                    int(site["customer_id"])
+                    if site and site.get("customer_id") is not None
+                    else None
+                )
+            ),
+            "locationId": location_id_value,
+            "customerName": customer_name,
             "scheduledHours": round(scheduled, 2),
             "actualHours": round(actual, 2),
             "driftHours": drift,
             "driftPct": round(drift / scheduled * 100, 1) if scheduled > 0 else None,
         })
-
-    # Add actuals with no schedule
-    for (emp_id, cust), actual in actual_map.items():
-        if (emp_id, cust) not in all_keys:
-            emp_name = db.query_one("SELECT name FROM employees WHERE id = %s", (emp_id,))
-            comparisons.append({
-                "employeeId": emp_id,
-                "employeeName": emp_name["name"] if emp_name else f"Employee {emp_id}",
-                "customerName": cust,
-                "scheduledHours": 0,
-                "actualHours": round(actual, 2),
-                "driftHours": round(actual, 2),
-                "driftPct": None,
-            })
 
     total_scheduled = sum(c["scheduledHours"] for c in comparisons)
     total_actual = sum(c["actualHours"] for c in comparisons)
@@ -7679,45 +9634,63 @@ def admin_forecast(
     lookback_start = current_week_start - timedelta(weeks=8)
     lookback_end = current_week_start - timedelta(days=1)
 
-    timesheet_data = load_timesheets()
+    sites_by_id, alias_site_ids = _reporting_site_identity_catalog()
     settings = load_settings()
-    location_customers = timesheet_data.get("location_customers", {})
-    location_rates = timesheet_data.get("location_rates", {})
-    location_rate_types = timesheet_data.get("location_rate_types", {})
+    active_site_ids_by_customer: Dict[int, set[int]] = {}
+    for site_id, site in sites_by_id.items():
+        if bool(site.get("active")) and site.get("customer_id") is not None:
+            active_site_ids_by_customer.setdefault(
+                int(site["customer_id"]),
+                set(),
+            ).add(site_id)
 
     # Historical actuals by customer per week
     hist_rows = db.query_all(
         """
-        SELECT COALESCE(l.customer_name, COALESCE(l.address, '')) AS customer,
-               s.local_date,
-               SUM(s.total_hours) AS hours,
-               s.employee_id,
-               e.hourly_rate
+        SELECT s.location_id,
+               COALESCE(c.name, l.customer_name, l.address,
+                        s.location_label, 'Unknown') AS customer,
+               s.local_date, SUM(s.total_hours) AS hours
         FROM shifts s
-        JOIN employees e ON s.employee_id = e.id
         LEFT JOIN locations l ON s.location_id = l.id
+        LEFT JOIN customers c ON c.id = l.customer_id
         WHERE s.clock_out IS NOT NULL AND s.local_date >= %s AND s.local_date <= %s
-        GROUP BY customer, s.local_date, s.employee_id, e.hourly_rate
+        GROUP BY s.location_id, customer, s.local_date
         """,
         (lookback_start, lookback_end),
     )
 
-    # Aggregate by customer weekly averages
-    customer_weekly: Dict[str, Dict[str, float]] = {}  # customer -> {week -> hours}
+    # Aggregate by stable Site rather than a duplicate-prone display name.
+    customer_weekly: Dict[Tuple[str, Any], Dict[str, float]] = {}
+    identity_names: Dict[Tuple[str, Any], str] = {}
+    historical_site_ids: Dict[Tuple[str, Any], set[int]] = {}
     for r in hist_rows:
-        cust = r["customer"] or "Unknown"
+        customer_name = str(r["customer"] or "Unknown")
+        identity = _reporting_site_identity(
+            r.get("location_id"),
+            customer_name,
+            alias_site_ids,
+            sites_by_id,
+        )
+        identity_names.setdefault(identity, customer_name)
+        if r.get("location_id") is not None:
+            historical_site_ids.setdefault(identity, set()).add(
+                int(r["location_id"])
+            )
         d = r["local_date"]
         ds = (d.weekday() + 1) % 7
         wk = str(d - timedelta(days=ds))
-        if cust not in customer_weekly:
-            customer_weekly[cust] = {}
-        customer_weekly[cust][wk] = customer_weekly[cust].get(wk, 0) + float(r["hours"] or 0)
+        if identity not in customer_weekly:
+            customer_weekly[identity] = {}
+        customer_weekly[identity][wk] = (
+            customer_weekly[identity].get(wk, 0) + float(r["hours"] or 0)
+        )
 
     # Average hours per week per customer
-    customer_avg: Dict[str, float] = {}
-    for cust, weeks in customer_weekly.items():
+    customer_avg: Dict[Tuple[str, Any], float] = {}
+    for identity, weeks in customer_weekly.items():
         if weeks:
-            customer_avg[cust] = round(sum(weeks.values()) / len(weeks), 2)
+            customer_avg[identity] = round(sum(weeks.values()) / len(weeks), 2)
 
     # Get avg labor rate
     avg_rate_row = db.query_one("SELECT AVG(hourly_rate) AS avg_rate FROM employees WHERE hourly_rate IS NOT NULL AND active = true")
@@ -7731,32 +9704,84 @@ def admin_forecast(
 
         # Check if we have schedules for this week
         scheduled = db.query_all(
-            "SELECT customer_name, SUM(scheduled_hours) AS hours FROM schedules WHERE week_start = %s GROUP BY customer_name",
+            """
+            SELECT sc.location_id, COALESCE(c.name, sc.customer_name) AS customer_name,
+                   SUM(sc.scheduled_hours) AS hours
+            FROM schedules sc
+            LEFT JOIN locations l ON l.id = sc.location_id
+            LEFT JOIN customers c ON c.id = l.customer_id
+            WHERE sc.week_start = %s
+            GROUP BY sc.location_id, c.name, sc.customer_name
+            """,
             (forecast_week_start,),
         )
-        scheduled_map = {s["customer_name"]: float(s["hours"]) for s in scheduled}
+        scheduled_map: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+        for schedule in scheduled:
+            customer_name = str(schedule.get("customer_name") or "")
+            identity = _reporting_site_identity(
+                schedule.get("location_id"),
+                customer_name,
+                alias_site_ids,
+                sites_by_id,
+            )
+            identity_names.setdefault(identity, customer_name)
+            scheduled_entry = scheduled_map.setdefault(
+                identity,
+                {"hours": 0.0, "locationIds": set()},
+            )
+            scheduled_entry["hours"] += float(schedule["hours"] or 0)
+            if schedule.get("location_id") is not None:
+                scheduled_entry["locationIds"].add(int(schedule["location_id"]))
 
         total_hours = 0.0
         total_labor = 0.0
         total_revenue = 0.0
         by_customer = []
 
-        all_customers = set(customer_avg.keys()) | set(scheduled_map.keys())
-        for cust in all_customers:
+        all_customers = set(customer_avg) | set(scheduled_map)
+        for identity in all_customers:
             # Use schedule if available, otherwise historical average
-            hours = scheduled_map.get(cust, customer_avg.get(cust, 0))
+            scheduled_entry = scheduled_map.get(identity)
+            hours = (
+                float(scheduled_entry["hours"])
+                if scheduled_entry
+                else customer_avg.get(identity, 0)
+            )
             labor = hours * avg_labor_rate
 
-            # Estimate revenue from location rates
-            loc_addr = None
-            for addr, cn in location_customers.items():
-                if cn == cust:
-                    loc_addr = addr
-                    break
+            scheduled_site_ids = (
+                scheduled_entry.get("locationIds", set())
+                if scheduled_entry
+                else set()
+            )
+            historical_ids = historical_site_ids.get(identity, set())
+            active_customer_site_ids = (
+                active_site_ids_by_customer.get(int(identity[1]), set())
+                if identity[0] == "customer"
+                else set()
+            )
+            location_id_value = (
+                next(iter(scheduled_site_ids))
+                if len(scheduled_site_ids) == 1
+                else (
+                    next(iter(active_customer_site_ids))
+                    if len(active_customer_site_ids) == 1
+                    else (
+                        next(iter(historical_ids))
+                        if len(historical_ids) == 1
+                        else (
+                            int(identity[1])
+                            if identity[0] == "site"
+                            else None
+                        )
+                    )
+                )
+            )
+            site = sites_by_id.get(location_id_value) if location_id_value else None
             rev = 0.0
-            if loc_addr:
-                rate = location_rates.get(loc_addr)
-                rt = location_rate_types.get(loc_addr, "per_visit")
+            if site:
+                rate = float(site["rate"]) if site.get("rate") is not None else None
+                rt = str(site.get("rate_type") or "per_visit")
                 if rate is not None:
                     if rt == "hourly":
                         rev = rate * hours
@@ -7764,7 +9789,11 @@ def admin_forecast(
                         rev = rate / 4.33  # approximate weekly from monthly
                     else:  # per_visit
                         # estimate visits from hours and expected hours per visit
-                        exp_h = timesheet_data.get("location_expected_hours", {}).get(loc_addr)
+                        exp_h = (
+                            float(site["expected_hours"])
+                            if site.get("expected_hours") is not None
+                            else None
+                        )
                         if exp_h and exp_h > 0:
                             est_visits = hours / exp_h
                         else:
@@ -7775,9 +9804,23 @@ def admin_forecast(
             total_labor += labor
             total_revenue += rev
             by_customer.append({
-                "customer": cust,
+                "customerId": (
+                    int(identity[1])
+                    if identity[0] == "customer"
+                    else (
+                        int(site["customer_id"])
+                        if site and site.get("customer_id") is not None
+                        else None
+                    )
+                ),
+                "locationId": location_id_value,
+                "customer": str(
+                    (site or {}).get("customer_name")
+                    or identity_names.get(identity)
+                    or identity[1]
+                ),
                 "forecastHours": round(hours, 2),
-                "source": "schedule" if cust in scheduled_map else "historical",
+                "source": "schedule" if identity in scheduled_map else "historical",
                 "estLaborCost": round(labor, 2),
                 "estRevenue": round(rev, 2),
             })
@@ -8086,11 +10129,20 @@ def admin_pricing_recommendations(
     settings = load_settings()
     timesheet_data = load_timesheets()
 
-    location_customers = timesheet_data.get("location_customers", {})
-    location_rates = timesheet_data.get("location_rates", {})
-    location_rate_types = timesheet_data.get("location_rate_types", {})
-    location_target_labor = timesheet_data.get("location_target_labor", {})
-    location_min_margin = timesheet_data.get("location_min_margin", {})
+    location_customers = _historical_location_metadata(timesheet_data, "location_customers")
+    location_rates = _historical_location_metadata(timesheet_data, "location_rates")
+    location_rate_types = _historical_location_metadata(
+        timesheet_data,
+        "location_rate_types",
+    )
+    location_target_labor = _historical_location_metadata(
+        timesheet_data,
+        "location_target_labor",
+    )
+    location_min_margin = _historical_location_metadata(
+        timesheet_data,
+        "location_min_margin",
+    )
 
     # Build reverse map: customer_name -> location address
     customer_to_loc: Dict[str, str] = {}
@@ -8232,23 +10284,34 @@ def admin_create_job(
     if payload.revenue is not None and payload.revenue < 0:
         raise HTTPException(status_code=400, detail="revenue cannot be negative")
 
-    location_id = payload.locationId
-    if location_id is None:
-        loc = db.query_one(
-            "SELECT id FROM locations WHERE customer_name = %s AND active = true LIMIT 1",
-            (customer,),
-        )
-        if loc:
-            location_id = loc["id"]
-
-    row = db.query_one(
-        """
-        INSERT INTO jobs (location_id, customer_name, scheduled_date, expected_hours, revenue, notes, status)
-        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *
-        """,
-        (location_id, customer, scheduled, payload.expectedHours, payload.revenue,
-         payload.notes, payload.status),
-    )
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            location_id, customer, _customer_id = _resolve_site_for_creation(
+                cur,
+                payload.locationId,
+                customer,
+            )
+            cur.execute(
+                """
+                INSERT INTO jobs (
+                    location_id, customer_name, scheduled_date, expected_hours,
+                    revenue, notes, status
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    location_id,
+                    customer,
+                    scheduled,
+                    payload.expectedHours,
+                    payload.revenue,
+                    payload.notes,
+                    payload.status,
+                ),
+            )
+            row = dict(cur.fetchone())
     append_access_log(request, "JOB_CREATED", True, f"Job {row['id']} for {customer}")
     return {"success": True, "job": _job_row_to_dict(row)}
 
@@ -8661,10 +10724,16 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     employees_data = load_employees()
     settings = load_settings()
 
-    location_customers = timesheet_data.get("location_customers", {})
-    location_rates = timesheet_data.get("location_rates", {})
-    location_rate_types = timesheet_data.get("location_rate_types", {})
-    location_expected_hours = timesheet_data.get("location_expected_hours", {})
+    location_customers = _historical_location_metadata(timesheet_data, "location_customers")
+    location_rates = _historical_location_metadata(timesheet_data, "location_rates")
+    location_rate_types = _historical_location_metadata(
+        timesheet_data,
+        "location_rate_types",
+    )
+    location_expected_hours = _historical_location_metadata(
+        timesheet_data,
+        "location_expected_hours",
+    )
 
     emp_rates: Dict[int, float] = {}
     for emp in employees_data["employees"]:
@@ -8687,7 +10756,12 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             try:
                 parts = location[4:].split(",")
                 gps_lat, gps_lng = float(parts[0].strip()), float(parts[1].strip())
-                matched = find_nearest_location(gps_lat, gps_lng, timesheet_data)
+                matched = find_nearest_location(
+                    gps_lat,
+                    gps_lng,
+                    timesheet_data,
+                    coordinate_map_key="_historical_location_coords",
+                )
                 if matched:
                     resolved = matched
                     customer = location_customers.get(matched) or matched
@@ -9145,9 +11219,12 @@ def admin_analytics_customer(
     employees_data = load_employees()
     settings = load_settings()
 
-    location_customers = timesheet_data.get("location_customers", {})
-    location_rates = timesheet_data.get("location_rates", {})
-    location_rate_types = timesheet_data.get("location_rate_types", {})
+    location_customers = _historical_location_metadata(timesheet_data, "location_customers")
+    location_rates = _historical_location_metadata(timesheet_data, "location_rates")
+    location_rate_types = _historical_location_metadata(
+        timesheet_data,
+        "location_rate_types",
+    )
 
     emp_names: Dict[int, str] = {e["id"]: e["name"] for e in employees_data["employees"]}
     emp_rates: Dict[int, float] = {}
@@ -9163,7 +11240,12 @@ def admin_analytics_customer(
             try:
                 parts = location[4:].split(",")
                 gps_lat, gps_lng = float(parts[0].strip()), float(parts[1].strip())
-                matched = find_nearest_location(gps_lat, gps_lng, timesheet_data)
+                matched = find_nearest_location(
+                    gps_lat,
+                    gps_lng,
+                    timesheet_data,
+                    coordinate_map_key="_historical_location_coords",
+                )
                 if matched:
                     resolved = matched
                     customer = location_customers.get(matched) or matched

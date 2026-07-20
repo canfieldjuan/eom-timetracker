@@ -14,25 +14,53 @@ CREATE TABLE employees (
     last_login_at TIMESTAMPTZ
 );
 
--- Locations (customers / job sites)
+-- Customers (stable business identity; a draft may have zero job sites)
+CREATE TABLE customers (
+    id                   SERIAL PRIMARY KEY,
+    name                 TEXT NOT NULL,
+    primary_contact_name VARCHAR(200),
+    primary_phone        VARCHAR(50),
+    primary_email        VARCHAR(320),
+    billing_name         VARCHAR(200),
+    billing_email        VARCHAR(320),
+    billing_address      VARCHAR(500),
+    atlas_contact_id     UUID,
+    active               BOOLEAN NOT NULL DEFAULT true,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    archived_at          TIMESTAMPTZ,
+    archived_by          INTEGER REFERENCES employees(id) ON DELETE SET NULL
+);
+
+-- Locations (customer job sites)
 CREATE TABLE locations (
-    id            SERIAL PRIMARY KEY,
-    address       TEXT NOT NULL UNIQUE,
-    customer_name TEXT,
-    location_type TEXT CHECK (location_type IN ('Residential', 'Commercial')),
-    rate          NUMERIC(8, 2),
-    rate_type     TEXT NOT NULL DEFAULT 'per_visit'
-                      CHECK (rate_type IN ('per_visit', 'hourly', 'monthly')),
-    frequency       TEXT,
-    expected_hours  NUMERIC(6, 2),
+    id              SERIAL PRIMARY KEY,
+    customer_id     INTEGER REFERENCES customers(id),
+    address         TEXT NOT NULL UNIQUE,
+    address_key     TEXT,
+    customer_name   TEXT,
+    location_type   TEXT CHECK (location_type IN ('Residential', 'Commercial')),
+    rate            NUMERIC(8, 2),
+    rate_type       TEXT NOT NULL DEFAULT 'per_visit'
+                        CHECK (rate_type IN ('per_visit', 'hourly', 'monthly')),
+    frequency         TEXT,
+    expected_hours    NUMERIC(6, 2),
     target_labor_pct  NUMERIC(5, 2),
     min_margin_pct    NUMERIC(5, 2),
-    lat             NUMERIC(10, 7),
-    lng             NUMERIC(10, 7),
+    lat               NUMERIC(10, 7),
+    lng               NUMERIC(10, 7),
+    service_scope       TEXT,
+    access_instructions TEXT,
+    service_preferences TEXT,
+    pet_notes           TEXT,
+    service_start_date  DATE,
     check_in_token_nonce      VARCHAR(64),
     check_in_token_rotated_at TIMESTAMPTZ,
-    active        BOOLEAN NOT NULL DEFAULT true,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    active          BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    archived_at     TIMESTAMPTZ,
+    archived_by     INTEGER REFERENCES employees(id) ON DELETE SET NULL
 );
 
 -- Jobs (service visits / scheduled work at a customer)
@@ -100,7 +128,7 @@ CREATE TABLE departures (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Schedules (planned hours per employee per customer per week)
+-- Schedules (planned hours per employee per exact job site per week)
 CREATE TABLE schedules (
     id              SERIAL PRIMARY KEY,
     employee_id     INTEGER NOT NULL REFERENCES employees(id),
@@ -109,12 +137,13 @@ CREATE TABLE schedules (
     week_start      DATE NOT NULL,
     scheduled_hours NUMERIC(6, 2) NOT NULL,
     notes           TEXT NOT NULL DEFAULT '',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (employee_id, customer_name, week_start)
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_schedules_week ON schedules(week_start);
 CREATE INDEX idx_schedules_employee ON schedules(employee_id);
+CREATE INDEX idx_schedules_site_week
+    ON schedules(employee_id, location_id, week_start);
 
 -- Exact employee/site start times used only for QR arrival classification.
 -- The existing schedules table stores weekly hour totals and cannot determine
@@ -128,6 +157,9 @@ CREATE TABLE site_check_in_schedules (
                         CHECK (grace_minutes BETWEEN 0 AND 120),
     created_by      INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    cancelled_at    TIMESTAMPTZ,
+    cancelled_by    INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    cancellation_reason TEXT,
     UNIQUE (employee_id, location_id, scheduled_start)
 );
 
@@ -278,7 +310,11 @@ CREATE INDEX idx_jobs_status         ON jobs(status);
 CREATE INDEX idx_shifts_job_id       ON shifts(job_id);
 CREATE INDEX idx_shifts_time_cat     ON shifts(time_category);
 CREATE INDEX idx_shifts_clock_out    ON shifts(clock_out);
+CREATE INDEX idx_customers_active    ON customers(active);
 CREATE INDEX idx_locations_active    ON locations(active);
+CREATE INDEX idx_locations_customer_id ON locations(customer_id);
+CREATE UNIQUE INDEX uq_locations_address_key
+    ON locations(address_key) WHERE address_key IS NOT NULL;
 CREATE INDEX idx_employees_active    ON employees(active);
 CREATE INDEX idx_site_check_in_schedules_lookup
     ON site_check_in_schedules(employee_id, location_id, scheduled_start);
