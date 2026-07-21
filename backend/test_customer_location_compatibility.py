@@ -452,6 +452,90 @@ def test_job_name_only_zero_or_multiple_active_sites_is_rejected(client, auth):
     )["count"] == before_count
 
 
+def test_job_auto_link_uses_exact_site_when_customer_names_are_equal(
+    client,
+    auth,
+    employee_id,
+):
+    import db
+
+    shared_name = f"{TEST_PREFIX} Customer Auto Link Shared"
+    customers = []
+    for _ in range(2):
+        response = client.post(
+            "/api/admin/customers",
+            headers=auth,
+            json={"name": shared_name},
+        )
+        assert response.status_code == 201, response.text
+        customers.append(response.json()["customer"])
+    sites = [
+        _create_site(client, auth, customers[0]["id"], "304 Auto Link A"),
+        _create_site(client, auth, customers[1]["id"], "305 Auto Link B"),
+    ]
+    service_date = "2026-08-07"
+    jobs = []
+    for site in sites:
+        response = client.post(
+            "/api/admin/jobs",
+            headers=auth,
+            json={
+                "locationId": site["id"],
+                "customerName": shared_name,
+                "scheduledDate": service_date,
+                "notes": f"Exact Site {site['id']}",
+            },
+        )
+        assert response.status_code == 200, response.text
+        jobs.append(response.json()["job"])
+
+    shift_ids = []
+    for index, site in enumerate(sites):
+        shift_ids.append(
+            db.execute_returning(
+                """
+                INSERT INTO shifts (
+                    employee_id, location_id, location_label, clock_in,
+                    clock_out, total_hours, notes, local_date
+                )
+                VALUES (
+                    %s, %s, %s, %s::date + (%s * INTERVAL '1 hour'),
+                    %s::date + ((%s + 1) * INTERVAL '1 hour'), 1.0,
+                    'exact Site auto-link proof', %s
+                )
+                RETURNING id
+                """,
+                (
+                    employee_id,
+                    site["id"],
+                    site["address"],
+                    service_date,
+                    9 + index,
+                    service_date,
+                    9 + index,
+                    service_date,
+                ),
+            )
+        )
+
+    linked = client.post("/api/admin/jobs/auto-link", headers=auth)
+    assert linked.status_code == 200, linked.text
+    assert linked.json()["success"] is True
+    persisted = db.query_all(
+        """
+        SELECT id, location_id, job_id
+        FROM shifts WHERE id = ANY(%s)
+        ORDER BY id
+        """,
+        (shift_ids,),
+    )
+    by_location = {row["location_id"]: row["job_id"] for row in persisted}
+    assert by_location == {
+        sites[0]["id"]: jobs[0]["id"],
+        sites[1]["id"]: jobs[1]["id"],
+    }
+
+
 def test_weekly_schedule_exact_and_unique_name_resolution_persist_site(
     client,
     auth,
@@ -1081,3 +1165,108 @@ def test_forecast_uses_the_active_replacement_site_for_customer_economics(
     assert customer_rows[0]["locationId"] == replacement_site["id"]
     assert customer_rows[0]["forecastHours"] == 2.0
     assert customer_rows[0]["estRevenue"] == 440.0
+
+
+def test_forecast_sums_site_economics_for_one_customer_with_multiple_sites(
+    client,
+    auth,
+    employee_id,
+):
+    import db
+    import time_tracker_api as api
+
+    customer = _create_customer(client, auth, "Forecast Multi Site")
+    hourly_site = _create_site(
+        client,
+        auth,
+        customer["id"],
+        "410 Forecast Hourly",
+        rate=100.0,
+        rateType="hourly",
+        expectedHours=2.0,
+    )
+    visit_site = _create_site(
+        client,
+        auth,
+        customer["id"],
+        "411 Forecast Per Visit",
+        rate=150.0,
+        rateType="per_visit",
+        expectedHours=3.0,
+    )
+    historical_date = api.to_local(api.utc_now()).date() - timedelta(days=10)
+    for site, hours, hour in (
+        (hourly_site, 2.0, 9),
+        (visit_site, 3.0, 13),
+    ):
+        db.execute(
+            """
+            INSERT INTO shifts (
+                employee_id, location_id, location_label, clock_in, clock_out,
+                total_hours, notes, local_date
+            )
+            VALUES (
+                %s, %s, %s, %s::date + (%s * INTERVAL '1 hour'),
+                %s::date + ((%s + %s) * INTERVAL '1 hour'), %s,
+                'multi-Site forecast proof', %s
+            )
+            """,
+            (
+                employee_id,
+                site["id"],
+                site["address"],
+                historical_date,
+                hour,
+                historical_date,
+                hour,
+                hours,
+                hours,
+                historical_date,
+            ),
+        )
+
+    historical = client.get(
+        "/api/admin/analytics/forecast",
+        headers=auth,
+        params={"weeks_ahead": 1},
+    )
+    assert historical.status_code == 200, historical.text
+    historical_rows = [
+        row
+        for row in historical.json()["forecasts"][0]["byCustomer"]
+        if row["customerId"] == customer["id"]
+    ]
+    assert len(historical_rows) == 1
+    assert historical_rows[0]["locationId"] is None
+    assert historical_rows[0]["source"] == "historical"
+    assert historical_rows[0]["forecastHours"] == 5.0
+    assert historical_rows[0]["estRevenue"] == 350.0
+
+    today = api.to_local(api.utc_now()).date()
+    current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+    db.execute(
+        """
+        INSERT INTO schedules (
+            employee_id, location_id, customer_name, week_start,
+            scheduled_hours, notes
+        )
+        VALUES (%s, %s, %s, %s, 6.0, 'scheduled Site override proof')
+        """,
+        (employee_id, visit_site["id"], customer["name"], current_sunday),
+    )
+    scheduled = client.get(
+        "/api/admin/analytics/forecast",
+        headers=auth,
+        params={"weeks_ahead": 1},
+    )
+    assert scheduled.status_code == 200, scheduled.text
+    scheduled_rows = [
+        row
+        for row in scheduled.json()["forecasts"][0]["byCustomer"]
+        if row["customerId"] == customer["id"]
+    ]
+    assert len(scheduled_rows) == 1
+    assert scheduled_rows[0]["locationId"] == visit_site["id"]
+    assert scheduled_rows[0]["source"] == "schedule"
+    assert scheduled_rows[0]["forecastHours"] == 6.0
+    assert scheduled_rows[0]["estRevenue"] == 300.0

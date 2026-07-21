@@ -1053,6 +1053,7 @@ def _save_timesheets_to_db(
                 cur.execute(
                     """
                     UPDATE shifts SET
+                        location_id         = COALESCE(location_id, %s),
                         location_label      = %s,
                         clock_in            = %s,
                         clock_out           = %s,
@@ -1070,6 +1071,7 @@ def _save_timesheets_to_db(
                     WHERE id = %s
                     """,
                     (
+                        loc_id,
                         entry.get("location", ""),
                         entry.get("clockIn"),
                         entry.get("clockOut"),
@@ -9617,6 +9619,28 @@ def admin_schedule_vs_actual(
     }
 
 
+def _forecast_revenue_for_site(site: Optional[Dict[str, Any]], hours: float) -> float:
+    if not site or site.get("rate") is None:
+        return 0.0
+    rate = float(site["rate"])
+    rate_type = str(site.get("rate_type") or "per_visit")
+    if rate_type == "hourly":
+        return rate * hours
+    if rate_type == "monthly":
+        return rate / 4.33
+    expected_hours = (
+        float(site["expected_hours"])
+        if site.get("expected_hours") is not None
+        else None
+    )
+    estimated_visits = (
+        hours / expected_hours
+        if expected_hours and expected_hours > 0
+        else 1
+    )
+    return rate * estimated_visits
+
+
 @app.get("/api/admin/analytics/forecast")
 def admin_forecast(
     request: Request,
@@ -9660,12 +9684,16 @@ def admin_forecast(
         (lookback_start, lookback_end),
     )
 
-    # Aggregate by stable Site rather than a duplicate-prone display name.
+    # Aggregate output by stable Customer identity while retaining Site-level
+    # hour buckets for pricing. Equal display names remain separate identities.
     customer_weekly: Dict[Tuple[str, Any], Dict[str, float]] = {}
     identity_names: Dict[Tuple[str, Any], str] = {}
     historical_site_ids: Dict[Tuple[str, Any], set[int]] = {}
+    historical_hours_by_site: Dict[Tuple[str, Any], Dict[int, float]] = {}
+    historical_unassigned_hours: Dict[Tuple[str, Any], float] = {}
     for r in hist_rows:
         customer_name = str(r["customer"] or "Unknown")
+        row_hours = float(r["hours"] or 0)
         identity = _reporting_site_identity(
             r.get("location_id"),
             customer_name,
@@ -9674,8 +9702,13 @@ def admin_forecast(
         )
         identity_names.setdefault(identity, customer_name)
         if r.get("location_id") is not None:
-            historical_site_ids.setdefault(identity, set()).add(
-                int(r["location_id"])
+            site_id = int(r["location_id"])
+            historical_site_ids.setdefault(identity, set()).add(site_id)
+            site_hours = historical_hours_by_site.setdefault(identity, {})
+            site_hours[site_id] = site_hours.get(site_id, 0.0) + row_hours
+        else:
+            historical_unassigned_hours[identity] = (
+                historical_unassigned_hours.get(identity, 0.0) + row_hours
             )
         d = r["local_date"]
         ds = (d.weekday() + 1) % 7
@@ -9683,7 +9716,7 @@ def admin_forecast(
         if identity not in customer_weekly:
             customer_weekly[identity] = {}
         customer_weekly[identity][wk] = (
-            customer_weekly[identity].get(wk, 0) + float(r["hours"] or 0)
+            customer_weekly[identity].get(wk, 0) + row_hours
         )
 
     # Average hours per week per customer
@@ -9727,11 +9760,22 @@ def admin_forecast(
             identity_names.setdefault(identity, customer_name)
             scheduled_entry = scheduled_map.setdefault(
                 identity,
-                {"hours": 0.0, "locationIds": set()},
+                {
+                    "hours": 0.0,
+                    "siteHours": {},
+                    "unassignedHours": 0.0,
+                },
             )
-            scheduled_entry["hours"] += float(schedule["hours"] or 0)
+            scheduled_hours = float(schedule["hours"] or 0)
+            scheduled_entry["hours"] += scheduled_hours
             if schedule.get("location_id") is not None:
-                scheduled_entry["locationIds"].add(int(schedule["location_id"]))
+                scheduled_site_id = int(schedule["location_id"])
+                scheduled_entry["siteHours"][scheduled_site_id] = (
+                    scheduled_entry["siteHours"].get(scheduled_site_id, 0.0)
+                    + scheduled_hours
+                )
+            else:
+                scheduled_entry["unassignedHours"] += scheduled_hours
 
         total_hours = 0.0
         total_labor = 0.0
@@ -9749,56 +9793,75 @@ def admin_forecast(
             )
             labor = hours * avg_labor_rate
 
-            scheduled_site_ids = (
-                scheduled_entry.get("locationIds", set())
-                if scheduled_entry
-                else set()
-            )
             historical_ids = historical_site_ids.get(identity, set())
             active_customer_site_ids = (
                 active_site_ids_by_customer.get(int(identity[1]), set())
                 if identity[0] == "customer"
                 else set()
             )
-            location_id_value = (
-                next(iter(scheduled_site_ids))
-                if len(scheduled_site_ids) == 1
-                else (
-                    next(iter(active_customer_site_ids))
-                    if len(active_customer_site_ids) == 1
-                    else (
-                        next(iter(historical_ids))
-                        if len(historical_ids) == 1
-                        else (
-                            int(identity[1])
-                            if identity[0] == "site"
-                            else None
-                        )
-                    )
+            economics_hours_by_site: Dict[int, float]
+            unassigned_hours = 0.0
+            if scheduled_entry:
+                economics_hours_by_site = {
+                    int(site_id): float(site_hours)
+                    for site_id, site_hours in scheduled_entry.get(
+                        "siteHours",
+                        {},
+                    ).items()
+                }
+                unassigned_hours = float(
+                    scheduled_entry.get("unassignedHours", 0.0)
                 )
+            elif identity[0] == "customer" and len(active_customer_site_ids) == 1:
+                # Historical hours at a retired Site use the sole active
+                # replacement Site's current economics.
+                economics_hours_by_site = {
+                    next(iter(active_customer_site_ids)): float(hours)
+                }
+            else:
+                observed_weeks = max(len(customer_weekly.get(identity, {})), 1)
+                economics_hours_by_site = {
+                    int(site_id): float(site_hours) / observed_weeks
+                    for site_id, site_hours in historical_hours_by_site.get(
+                        identity,
+                        {},
+                    ).items()
+                }
+                unassigned_hours = (
+                    historical_unassigned_hours.get(identity, 0.0)
+                    / observed_weeks
+                )
+
+            if unassigned_hours:
+                fallback_site_id: Optional[int] = None
+                if len(economics_hours_by_site) == 1:
+                    fallback_site_id = next(iter(economics_hours_by_site))
+                elif identity[0] == "site":
+                    fallback_site_id = int(identity[1])
+                elif len(active_customer_site_ids) == 1:
+                    fallback_site_id = next(iter(active_customer_site_ids))
+                elif len(historical_ids) == 1:
+                    fallback_site_id = next(iter(historical_ids))
+                if fallback_site_id is not None:
+                    economics_hours_by_site[fallback_site_id] = (
+                        economics_hours_by_site.get(fallback_site_id, 0.0)
+                        + unassigned_hours
+                    )
+
+            economics_site_ids = set(economics_hours_by_site)
+            location_id_value = (
+                next(iter(economics_site_ids))
+                if len(economics_site_ids) == 1
+                else None
             )
             site = sites_by_id.get(location_id_value) if location_id_value else None
-            rev = 0.0
-            if site:
-                rate = float(site["rate"]) if site.get("rate") is not None else None
-                rt = str(site.get("rate_type") or "per_visit")
-                if rate is not None:
-                    if rt == "hourly":
-                        rev = rate * hours
-                    elif rt == "monthly":
-                        rev = rate / 4.33  # approximate weekly from monthly
-                    else:  # per_visit
-                        # estimate visits from hours and expected hours per visit
-                        exp_h = (
-                            float(site["expected_hours"])
-                            if site.get("expected_hours") is not None
-                            else None
-                        )
-                        if exp_h and exp_h > 0:
-                            est_visits = hours / exp_h
-                        else:
-                            est_visits = 1
-                        rev = rate * est_visits
+            rev = sum(
+                _forecast_revenue_for_site(
+                    sites_by_id.get(site_id),
+                    site_hours,
+                )
+                for site_id, site_hours in economics_hours_by_site.items()
+            )
 
             total_hours += hours
             total_labor += labor
@@ -10353,24 +10416,64 @@ def admin_auto_link_jobs(
     request: Request,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    """Auto-link unlinked shifts to jobs by matching customer + date."""
+    """Auto-link only when an exact Site/date match is unambiguous."""
     jobs = db.query_all(
         """
-        SELECT j.id, j.customer_name, j.scheduled_date, l.address
+        SELECT j.id, j.location_id, j.customer_name, j.scheduled_date
         FROM jobs j
-        LEFT JOIN locations l ON j.location_id = l.id
         WHERE j.status != 'cancelled'
         """
     )
 
-    location_customers = {
-        r["address"]: r["customer_name"]
-        for r in db.query_all("SELECT address, customer_name FROM locations WHERE customer_name IS NOT NULL")
+    site_rows = db.query_all(
+        """
+        SELECT l.id, l.address, l.active,
+               COALESCE(c.name, l.customer_name, '') AS customer_name
+        FROM locations l
+        LEFT JOIN customers c ON c.id = l.customer_id
+        """
+    )
+    site_id_by_address = {
+        str(row["address"]): int(row["id"])
+        for row in site_rows
     }
+    customer_by_address = {
+        str(row["address"]): str(row.get("customer_name") or "")
+        for row in site_rows
+    }
+    active_site_ids_by_customer_name: Dict[str, set[int]] = {}
+    for row in site_rows:
+        if not bool(row.get("active")):
+            continue
+        normalized_name = str(row.get("customer_name") or "").strip().casefold()
+        if normalized_name:
+            active_site_ids_by_customer_name.setdefault(normalized_name, set()).add(
+                int(row["id"])
+            )
+
+    jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = {}
+    legacy_jobs_by_name_date: Dict[Tuple[str, date], List[Dict[str, Any]]] = {}
+    for job in jobs:
+        scheduled_date = job.get("scheduled_date")
+        if not scheduled_date:
+            continue
+        if job.get("location_id") is not None:
+            jobs_by_site_date.setdefault(
+                (int(job["location_id"]), scheduled_date),
+                [],
+            ).append(job)
+            continue
+        normalized_name = str(job.get("customer_name") or "").strip().casefold()
+        if normalized_name:
+            legacy_jobs_by_name_date.setdefault(
+                (normalized_name, scheduled_date),
+                [],
+            ).append(job)
 
     unlinked = db.query_all(
         """
-        SELECT s.id, s.local_date, COALESCE(l.address, '') AS location
+        SELECT s.id, s.local_date, s.location_id,
+               COALESCE(l.address, s.location_label, '') AS location
         FROM shifts s
         LEFT JOIN locations l ON s.location_id = l.id
         WHERE s.job_id IS NULL AND s.clock_out IS NOT NULL
@@ -10382,21 +10485,43 @@ def admin_auto_link_jobs(
             with conn.cursor() as cur:
                 linked = 0
                 for shift in unlinked:
-                    shift_customer = location_customers.get(shift["location"], shift["location"])
                     shift_date = shift["local_date"]
                     if not shift_date:
                         continue
-                    shift_cust_norm = shift_customer.strip().lower() if shift_customer else ""
-                    for job in jobs:
-                        job_cust_norm = job["customer_name"].strip().lower() if job["customer_name"] else ""
-                        if job_cust_norm == shift_cust_norm and job["scheduled_date"] == shift_date:
-                            cur.execute(
-                                "UPDATE shifts SET job_id = %s WHERE id = %s AND job_id IS NULL",
-                                (job["id"], shift["id"]),
+                    location = str(shift.get("location") or "")
+                    shift_site_id = (
+                        int(shift["location_id"])
+                        if shift.get("location_id") is not None
+                        else site_id_by_address.get(location)
+                    )
+                    shift_customer = customer_by_address.get(location, location)
+                    normalized_customer = shift_customer.strip().casefold()
+                    active_name_site_ids = active_site_ids_by_customer_name.get(
+                        normalized_customer,
+                        set(),
+                    )
+                    if shift_site_id is None and len(active_name_site_ids) == 1:
+                        shift_site_id = next(iter(active_name_site_ids))
+
+                    candidates = (
+                        jobs_by_site_date.get((shift_site_id, shift_date), [])
+                        if shift_site_id is not None
+                        else []
+                    )
+                    if not candidates and len(active_name_site_ids) == 1:
+                        if shift_site_id in active_name_site_ids:
+                            candidates = legacy_jobs_by_name_date.get(
+                                (normalized_customer, shift_date),
+                                [],
                             )
-                            if cur.rowcount > 0:
-                                linked += 1
-                            break
+                    if len(candidates) != 1:
+                        continue
+                    cur.execute(
+                        "UPDATE shifts SET job_id = %s WHERE id = %s AND job_id IS NULL",
+                        (candidates[0]["id"], shift["id"]),
+                    )
+                    if cur.rowcount > 0:
+                        linked += 1
 
     append_access_log(request, "JOBS_AUTO_LINKED", True, f"{linked} shifts auto-linked")
     return {"success": True, "linkedCount": linked}

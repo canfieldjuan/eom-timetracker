@@ -74,6 +74,10 @@ def _clean_test_rows() -> None:
                     (location_ids,),
                 )
             cur.execute(
+                "DELETE FROM shifts WHERE location_label LIKE %s",
+                (f"{TEST_PREFIX}%",),
+            )
+            cur.execute(
                 "DELETE FROM customers WHERE name LIKE %s",
                 (f"{TEST_PREFIX}%",),
             )
@@ -520,6 +524,15 @@ def test_stale_time_save_cannot_recreate_a_renamed_site_or_repoint_history(
     )
     assert renamed.status_code == 200, renamed.text
 
+    replacement_customer = _create_customer(client, auth, "Stale Replacement")
+    replacement_response = client.post(
+        f"/api/admin/customers/{replacement_customer['id']}/locations",
+        headers=auth,
+        json={"address": old_address, "locationType": "Commercial"},
+    )
+    assert replacement_response.status_code == 201, replacement_response.text
+    replacement_site = replacement_response.json()["location"]
+
     api._save_timesheets_to_db(
         stale_snapshot,
         pre_shift_ids,
@@ -530,7 +543,7 @@ def test_stale_time_save_cannot_recreate_a_renamed_site_or_repoint_history(
     assert api.db.query_one(
         "SELECT id FROM locations WHERE address = %s",
         (old_address,),
-    ) is None
+    ) == {"id": replacement_site["id"]}
     assert api.db.query_one(
         "SELECT address FROM locations WHERE id = %s",
         (site["id"],),
@@ -539,6 +552,49 @@ def test_stale_time_save_cannot_recreate_a_renamed_site_or_repoint_history(
         "SELECT location_id FROM shifts WHERE id = %s",
         (shift_id,),
     ) == {"location_id": site["id"]}
+
+
+def test_existing_manual_shift_backfills_site_fk_after_site_creation(
+    client,
+    auth,
+    emp_auth,
+):
+    import db
+
+    address = f"{TEST_PREFIX} 176 Later Site, Effingham, IL 62401"
+    clock_in = client.post(
+        "/api/timesheet/clock-in",
+        headers=emp_auth,
+        json={
+            "location": address,
+            "gpsOverrideReason": "customer_request",
+            "gpsOverrideDetail": "Site is not configured yet",
+        },
+    )
+    assert clock_in.status_code == 200, clock_in.text
+    shift_id = clock_in.json()["entry"]["id"]
+    assert db.query_one(
+        "SELECT location_id, location_label FROM shifts WHERE id = %s",
+        (shift_id,),
+    ) == {"location_id": None, "location_label": address}
+
+    customer = _create_customer(client, auth, "Later Site")
+    site = _create_site(client, auth, customer["id"], "176 Later Site")
+    assert site["address"] == address
+
+    clock_out = client.post(
+        "/api/timesheet/clock-out",
+        headers=emp_auth,
+        json={
+            "gpsOverrideReason": "customer_request",
+            "gpsOverrideDetail": "Committed Site FK backfill proof",
+        },
+    )
+    assert clock_out.status_code == 200, clock_out.text
+    assert db.query_one(
+        "SELECT location_id, location_label FROM shifts WHERE id = %s",
+        (shift_id,),
+    ) == {"location_id": site["id"], "location_label": address}
 
 
 def test_customer_with_primary_site_rolls_back_as_one_transaction_on_conflict(
