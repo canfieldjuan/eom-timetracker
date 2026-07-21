@@ -1335,14 +1335,18 @@ def build_calendar_import_router(
                 detail="Stored Google Calendar connection is unavailable",
             )
         try:
-            _client(config).revoke_token(token=revocation_token)
+            disconnected = store.disconnect_calendar(
+                connection_id=int(connection["id"]),
+                admin_id=int(admin["id"]),
+                admin_name=str(admin["name"]),
+                before_disconnect=lambda: _client(config).revoke_token(
+                    token=revocation_token
+                ),
+            )
+        except store.CalendarStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except GoogleCalendarError as exc:
             raise _google_failure(exc) from exc
-        disconnected = store.disconnect_calendar(
-            connection_id=int(connection["id"]),
-            admin_id=int(admin["id"]),
-            admin_name=str(admin["name"]),
-        )
         return {"success": True, "disconnected": disconnected}
 
     @router.get("/api/admin/planned-visits/crews")

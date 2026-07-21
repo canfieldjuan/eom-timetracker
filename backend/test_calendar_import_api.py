@@ -741,8 +741,63 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
         == "operations@example.test"
     )
 
-    disconnected = client.delete("/api/admin/google-calendar/connection", headers=auth)
-    assert disconnected.status_code == 200, disconnected.text
+    active_connection_id = int(store.active_connection()["id"])
+    blocked_disconnect = client.delete(
+        "/api/admin/google-calendar/connection", headers=auth
+    )
+    assert blocked_disconnect.status_code == 409, blocked_disconnect.text
+    assert "Resolve or cancel future planned visits" in blocked_disconnect.json()[
+        "error"
+    ]
+    assert FakeGoogleClient.revoked_tokens == []
+    retained_connection = db.query_one(
+        """
+        SELECT revoked_at, credential_ciphertext
+        FROM google_calendar_connections
+        WHERE id = %s
+        """,
+        (active_connection_id,),
+    )
+    assert retained_connection["revoked_at"] is None
+    assert retained_connection["credential_ciphertext"] is not None
+    assert (
+        db.query_one(
+            """
+            SELECT COUNT(*) AS n
+            FROM planned_visit_audit_events
+            WHERE action = 'calendar_disconnected'
+            """
+        )["n"]
+        == 0
+    )
+
+    # Preserve proof that the selection guard also protects an orphaned legacy
+    # row created before disconnects began failing closed.
+    db.execute(
+        """
+        UPDATE google_calendar_connections
+        SET revoked_at = NOW(), credential_ciphertext = NULL, updated_at = NOW()
+        WHERE id = %s
+        """,
+        (active_connection_id,),
+    )
+    unselected_connection = connect_unselected_calendar()
+    recoverable_disconnect = client.delete(
+        "/api/admin/google-calendar/connection", headers=auth
+    )
+    assert recoverable_disconnect.status_code == 200, recoverable_disconnect.text
+    assert recoverable_disconnect.json() == {"success": True, "disconnected": True}
+    assert FakeGoogleClient.revoked_tokens == ["refresh-secret"]
+    released_unselected = db.query_one(
+        """
+        SELECT revoked_at, credential_ciphertext
+        FROM google_calendar_connections
+        WHERE id = %s
+        """,
+        (unselected_connection,),
+    )
+    assert released_unselected["revoked_at"] is not None
+    assert released_unselected["credential_ciphertext"] is None
     connect_unselected_calendar()
     blocked_after_reconnect = client.put(
         "/api/admin/google-calendar/calendar",
@@ -805,6 +860,15 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
         store.active_connection()["selected_calendar_id"]
         == "dispatch@example.test"
     )
+    disconnected_after_reconciliation = client.delete(
+        "/api/admin/google-calendar/connection", headers=auth
+    )
+    assert disconnected_after_reconciliation.status_code == 200
+    assert disconnected_after_reconciliation.json() == {
+        "success": True,
+        "disconnected": True,
+    }
+    assert FakeGoogleClient.revoked_tokens == ["refresh-secret", "refresh-secret"]
 
 
 def test_bootstrap_seeds_morning_crew_only_from_three_unique_active_identities(

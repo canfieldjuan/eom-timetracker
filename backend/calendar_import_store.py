@@ -11,7 +11,7 @@ import json
 import secrets
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import psycopg2.extras
 from cryptography.fernet import Fernet, InvalidToken
@@ -540,7 +540,13 @@ def select_calendar(
             )
 
 
-def disconnect_calendar(*, connection_id: int, admin_id: int, admin_name: str) -> bool:
+def disconnect_calendar(
+    *,
+    connection_id: int,
+    admin_id: int,
+    admin_name: str,
+    before_disconnect: Callable[[], None] | None = None,
+) -> bool:
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -548,18 +554,46 @@ def disconnect_calendar(*, connection_id: int, admin_id: int, admin_name: str) -
             )
             cur.execute(
                 """
-                UPDATE google_calendar_connections
-                SET revoked_at = NOW(), credential_ciphertext = NULL,
-                    updated_at = NOW()
+                SELECT id, selected_calendar_id, selected_calendar_name,
+                       selected_calendar_timezone
+                FROM google_calendar_connections
                 WHERE id = %s AND revoked_at IS NULL
-                RETURNING id, selected_calendar_id, selected_calendar_name,
-                          selected_calendar_timezone
+                FOR UPDATE
                 """,
                 (connection_id,),
             )
             row = cur.fetchone()
             if not row:
                 return False
+            selected_calendar_id = str(row["selected_calendar_id"] or "").strip()
+            if selected_calendar_id:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM planned_service_visits
+                    WHERE status = 'planned'
+                      AND approximate_end > NOW()
+                      AND source_calendar_id = %s
+                    LIMIT 1
+                    """,
+                    (selected_calendar_id,),
+                )
+                if cur.fetchone():
+                    raise CalendarStoreError(
+                        "Resolve or cancel future planned visits before disconnecting "
+                        "Google Calendar"
+                    )
+            if before_disconnect is not None:
+                before_disconnect()
+            cur.execute(
+                """
+                UPDATE google_calendar_connections
+                SET revoked_at = NOW(), credential_ciphertext = NULL,
+                    updated_at = NOW()
+                WHERE id = %s AND revoked_at IS NULL
+                """,
+                (connection_id,),
+            )
             cur.execute(
                 """
                 INSERT INTO planned_visit_audit_events (
