@@ -487,19 +487,57 @@ def select_calendar(
     calendar_name: str,
     calendar_timezone: str | None,
 ) -> None:
-    updated = db.execute_returning(
-        """
-        UPDATE google_calendar_connections
-        SET selected_calendar_id = %s, selected_calendar_name = %s,
-            selected_calendar_timezone = %s,
-            updated_at = NOW()
-        WHERE id = %s AND revoked_at IS NULL
-        RETURNING id
-        """,
-        (calendar_id, calendar_name, calendar_timezone, connection_id),
-    )
-    if not updated:
-        raise CalendarStoreError("Google Calendar connection is no longer active")
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", ("google-calendar",)
+            )
+            cur.execute(
+                """
+                SELECT selected_calendar_id
+                FROM google_calendar_connections
+                WHERE id = %s AND revoked_at IS NULL
+                FOR UPDATE
+                """,
+                (connection_id,),
+            )
+            connection = cur.fetchone()
+            if not connection:
+                raise CalendarStoreError(
+                    "Google Calendar connection is no longer active"
+                )
+
+            selected_calendar_id = str(
+                connection.get("selected_calendar_id") or ""
+            ).strip()
+            if selected_calendar_id != calendar_id:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM planned_service_visits
+                    WHERE status = 'planned'
+                      AND approximate_end > NOW()
+                      AND source_calendar_id <> %s
+                    LIMIT 1
+                    """,
+                    (calendar_id,),
+                )
+                if cur.fetchone():
+                    raise CalendarStoreError(
+                        "Resolve future planned visits from the current Google "
+                        "Calendar before selecting a different Calendar"
+                    )
+
+            cur.execute(
+                """
+                UPDATE google_calendar_connections
+                SET selected_calendar_id = %s, selected_calendar_name = %s,
+                    selected_calendar_timezone = %s,
+                    updated_at = NOW()
+                WHERE id = %s AND revoked_at IS NULL
+                """,
+                (calendar_id, calendar_name, calendar_timezone, connection_id),
+            )
 
 
 def disconnect_calendar(*, connection_id: int, admin_id: int, admin_name: str) -> bool:

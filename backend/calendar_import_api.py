@@ -1299,12 +1299,15 @@ def build_calendar_import_router(
             raise HTTPException(
                 status_code=422, detail="Selected Google Calendar is unavailable"
             )
-        store.select_calendar(
-            connection_id=int(connection["id"]),
-            calendar_id=selected.calendar_id,
-            calendar_name=selected.summary,
-            calendar_timezone=selected.time_zone,
-        )
+        try:
+            store.select_calendar(
+                connection_id=int(connection["id"]),
+                calendar_id=selected.calendar_id,
+                calendar_name=selected.summary,
+                calendar_timezone=selected.time_zone,
+            )
+        except store.CalendarStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"success": True, "calendar": _calendar_dict(selected)}
 
     @router.delete("/api/admin/google-calendar/connection")
