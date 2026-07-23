@@ -51,7 +51,7 @@ def _apply_schema(conn):
                 site_check_in_reconciliation_reviews, site_check_ins,
                 site_check_in_schedule_rules, site_check_in_schedules,
                 schedules, departures, visits,
-                shifts, jobs, locations, employees, settings CASCADE
+                shifts, jobs, locations, customers, employees, settings CASCADE
         """)
     conn.commit()
     sql = SCHEMA_FILE.read_text()

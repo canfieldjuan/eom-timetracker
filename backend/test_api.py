@@ -1885,10 +1885,10 @@ class TestSchedules:
         assert r.status_code == 200, r.text
         assert r.json()["schedule"]["weekStart"] == "2026-03-29"
 
-    def test_upsert_schedule(self, client, auth, employee_id):
+    def test_upsert_schedule(self, client, auth, employee_id, location_id):
         """Posting twice for same employee/customer/week should update hours."""
         base = {"employeeId": employee_id, "customerName": "Upsert Test",
-                "weekStart": "2026-03-29", "notes": ""}
+                "locationId": location_id, "weekStart": "2026-03-29", "notes": ""}
         client.post("/api/admin/schedules", headers=auth, json={**base, "scheduledHours": 5.0})
         r2 = client.post("/api/admin/schedules", headers=auth, json={**base, "scheduledHours": 9.0})
         assert r2.status_code == 200, r2.text
@@ -1905,10 +1905,11 @@ class TestSchedules:
         for sc in r.json()["schedules"]:
             assert sc["weekStart"] == "2026-03-29"
 
-    def test_delete_schedule(self, client, auth, employee_id):
+    def test_delete_schedule(self, client, auth, employee_id, location_id):
         create = client.post("/api/admin/schedules", headers=auth, json={
             "employeeId": employee_id, "customerName": "Delete Sched",
-            "weekStart": "2026-03-29", "scheduledHours": 4.0, "notes": "",
+            "locationId": location_id, "weekStart": "2026-03-29",
+            "scheduledHours": 4.0, "notes": "",
         })
         sc_id = create.json()["schedule"]["id"]
         r = client.delete(f"/api/admin/schedules/{sc_id}", headers=auth)
