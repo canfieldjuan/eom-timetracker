@@ -57,6 +57,12 @@ class ConsumedOAuthState:
     reconnect_connection_id: int | None
 
 
+@dataclass(frozen=True)
+class _CanonicalLocationSnapshot:
+    by_id: dict[int, dict[str, Any]]
+    by_normalized_hint: dict[str, tuple[dict[str, Any], ...]]
+
+
 class CredentialCipher:
     """Fernet wrapper that never accepts an implicit or derived key."""
 
@@ -2366,12 +2372,35 @@ def _calendar_sites_by_id(
     return [_calendar_site_payload(dict(row)) for row in cur.fetchall()]
 
 
+def _canonical_job_service_dates(existing_job: dict[str, Any]) -> list[date]:
+    """Return every local service date touched by the stored job window."""
+
+    service_dates = {existing_job["scheduled_date"]}
+    scheduled_start = existing_job.get("scheduled_start")
+    scheduled_end = existing_job.get("scheduled_end")
+    if (
+        scheduled_start is None
+        or scheduled_end is None
+        or scheduled_end <= scheduled_start
+    ):
+        return sorted(service_dates)
+
+    cursor = scheduled_start.astimezone(PRODUCT_TIMEZONE).date()
+    final_date = (
+        (scheduled_end - timedelta(microseconds=1)).astimezone(PRODUCT_TIMEZONE).date()
+    )
+    while cursor <= final_date:
+        service_dates.add(cursor)
+        cursor += timedelta(days=1)
+    return sorted(service_dates)
+
+
 def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> bool:
-    """Conservatively protect a Site/day job using existing immutable evidence."""
+    """Conservatively protect every local service date touched by a job."""
 
     job_id = int(existing_job["id"])
     location_id = int(existing_job["location_id"])
-    scheduled_date = existing_job["scheduled_date"]
+    service_dates = _canonical_job_service_dates(existing_job)
     cur.execute(
         """
         SELECT (
@@ -2386,37 +2415,41 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
                   AND COALESCE(
                       local_date,
                       (clock_in AT TIME ZONE 'America/Chicago')::date
-                  ) = %s
+                  ) = ANY(%s)
             )
             OR EXISTS (
                 SELECT 1 FROM visits
                 WHERE location_id = %s
-                  AND (arrival_time AT TIME ZONE 'America/Chicago')::date = %s
+                  AND (
+                      arrival_time AT TIME ZONE 'America/Chicago'
+                  )::date = ANY(%s)
             )
             OR EXISTS (
                 SELECT 1 FROM departures
                 WHERE location_id = %s
-                  AND (departure_time AT TIME ZONE 'America/Chicago')::date = %s
+                  AND (
+                      departure_time AT TIME ZONE 'America/Chicago'
+                  )::date = ANY(%s)
             )
             OR EXISTS (
                 SELECT 1 FROM site_check_ins
                 WHERE location_id = %s
                   AND (
                       server_checked_in_at AT TIME ZONE 'America/Chicago'
-                  )::date = %s
+                  )::date = ANY(%s)
             )
         ) AS has_work
         """,
         (
             job_id,
             location_id,
-            scheduled_date,
+            service_dates,
             location_id,
-            scheduled_date,
+            service_dates,
             location_id,
-            scheduled_date,
+            service_dates,
             location_id,
-            scheduled_date,
+            service_dates,
         ),
     )
     row = cur.fetchone()
@@ -2457,6 +2490,7 @@ def _resolve_canonical_location(
     source: dict[str, Any],
     occurrence: Any,
     existing_job: dict[str, Any] | None,
+    location_snapshot: _CanonicalLocationSnapshot,
 ) -> tuple[int | None, str | None, tuple[int, ...]]:
     """Resolve a Site by operator mapping or exact normalized title/address."""
 
@@ -2488,44 +2522,23 @@ def _resolve_canonical_location(
     mapping = cur.fetchone()
     expected_type = CALENDAR_ROLE_LOCATION_TYPES[str(source["role"])]
     if mapping:
-        cur.execute(
-            """
-            SELECT id, active, location_type
-            FROM locations
-            WHERE id = %s
-            """,
-            (int(mapping["location_id"]),),
-        )
-        selected = cur.fetchone()
+        selected = location_snapshot.by_id.get(int(mapping["location_id"]))
         if not selected or not bool(selected["active"]):
             return None, "archived_site", (int(mapping["location_id"]),)
         if str(selected.get("location_type") or "") != expected_type:
             return None, "wrong_site_type", (int(selected["id"]),)
         return int(selected["id"]), None, (int(selected["id"]),)
 
-    cur.execute(
-        """
-        SELECT id, address, customer_name, active, location_type
-        FROM locations
-        ORDER BY id
-        """
-    )
-    locations = [dict(row) for row in cur.fetchall()]
     hints = {
         value
         for raw in (occurrence.location_text, occurrence.title)
         if (value := normalize_match_text(raw))
     }
-    matches = [
-        row
-        for row in locations
-        if hints.intersection(
-            {
-                normalize_match_text(row.get("address")),
-                normalize_match_text(row.get("customer_name")),
-            }
-        )
-    ]
+    matches_by_id: dict[int, dict[str, Any]] = {}
+    for hint in hints:
+        for row in location_snapshot.by_normalized_hint.get(hint, ()):
+            matches_by_id[int(row["id"])] = row
+    matches = [matches_by_id[row_id] for row_id in sorted(matches_by_id)]
     valid = [
         row
         for row in matches
@@ -2555,11 +2568,7 @@ def _resolve_canonical_location(
     if wrong_type:
         return None, "wrong_site_type", tuple(int(row["id"]) for row in wrong_type)
     if existing_job:
-        cur.execute(
-            "SELECT active, location_type FROM locations WHERE id = %s",
-            (int(existing_job["location_id"]),),
-        )
-        prior = cur.fetchone()
+        prior = location_snapshot.by_id.get(int(existing_job["location_id"]))
         if (
             prior
             and bool(prior["active"])
@@ -2571,6 +2580,33 @@ def _resolve_canonical_location(
                 (int(existing_job["location_id"]),),
             )
     return None, "missing_site", ()
+
+
+def _read_canonical_locations(cur: Any) -> _CanonicalLocationSnapshot:
+    """Load the immutable Site matching snapshot once for one source sync."""
+
+    from planned_visits import normalize_match_text
+
+    cur.execute(
+        """
+        SELECT id, address, customer_name, active, location_type
+        FROM locations
+        ORDER BY id
+        """
+    )
+    locations = tuple(dict(row) for row in cur.fetchall())
+    by_normalized_hint: dict[str, list[dict[str, Any]]] = {}
+    for row in locations:
+        for raw_hint in (row.get("address"), row.get("customer_name")):
+            normalized_hint = normalize_match_text(raw_hint)
+            if normalized_hint:
+                by_normalized_hint.setdefault(normalized_hint, []).append(row)
+    return _CanonicalLocationSnapshot(
+        by_id={int(row["id"]): row for row in locations},
+        by_normalized_hint={
+            hint: tuple(rows) for hint, rows in by_normalized_hint.items()
+        },
+    )
 
 
 def sync_calendar_source(
@@ -2644,6 +2680,7 @@ def sync_calendar_source(
             if not source_row:
                 raise CalendarStoreError("Google Calendar source is no longer active")
             source = dict(source_row)
+            location_snapshot = _read_canonical_locations(cur)
             for occurrence in occurrence_rows:
                 if occurrence.calendar_id != str(source["calendar_id"]):
                     raise CalendarStoreError(
@@ -2734,6 +2771,80 @@ def sync_calendar_source(
                     continue
 
                 if occurrence.all_day:
+                    if existing is not None and (
+                        existing["status"] in {"in_progress", "completed"} or has_work
+                    ):
+                        counts["unresolved"] += 1
+                        exceptions.append(
+                            _canonical_exception(
+                                source=source,
+                                occurrence=occurrence,
+                                fingerprint=fingerprint,
+                                code="protected_work",
+                                candidate_sites=_calendar_sites_by_id(
+                                    cur, (int(existing["location_id"]),)
+                                ),
+                            )
+                        )
+                        continue
+                    if existing is not None:
+                        scheduled_date = occurrence.starts_at.astimezone(
+                            PRODUCT_TIMEZONE
+                        ).date()
+                        already_invalid = (
+                            existing.get("source_fingerprint") == fingerprint
+                            and bool(existing.get("source_all_day"))
+                            and existing.get("scheduled_start") == occurrence.starts_at
+                            and existing.get("scheduled_end") == occurrence.ends_at
+                        )
+                        if not already_invalid:
+                            cur.execute(
+                                """
+                                UPDATE jobs
+                                SET scheduled_date = %s, scheduled_start = %s,
+                                    scheduled_end = %s, source_fingerprint = %s,
+                                    source_etag = %s, source_updated_at = %s,
+                                    source_title = %s, source_location_text = %s,
+                                    source_timezone = %s, source_all_day = true,
+                                    expected_hours = NULL, revenue = NULL,
+                                    status = 'scheduled', cancelled_at = NULL,
+                                    cancellation_reason = NULL, updated_at = NOW()
+                                WHERE id = %s
+                                """,
+                                (
+                                    scheduled_date,
+                                    occurrence.starts_at,
+                                    occurrence.ends_at,
+                                    fingerprint,
+                                    occurrence.revision or None,
+                                    occurrence.updated_at,
+                                    occurrence.title,
+                                    occurrence.location_text,
+                                    occurrence.time_zone
+                                    or str(source["calendar_timezone"]),
+                                    int(existing["id"]),
+                                ),
+                            )
+                            cur.execute(
+                                """
+                                INSERT INTO planned_visit_audit_events (
+                                    action, source_key, actor_employee_id,
+                                    actor_name, after_state
+                                ) VALUES (%s, %s, %s, %s, %s::jsonb)
+                                """,
+                                (
+                                    "canonical_job_invalidated_all_day",
+                                    occurrence.source_key,
+                                    actor_id,
+                                    actor_name,
+                                    json.dumps(
+                                        {
+                                            "jobId": int(existing["id"]),
+                                            "sourceId": int(source["id"]),
+                                        }
+                                    ),
+                                ),
+                            )
                     counts["unresolved"] += 1
                     exceptions.append(
                         _canonical_exception(
@@ -2741,6 +2852,13 @@ def sync_calendar_source(
                             occurrence=occurrence,
                             fingerprint=fingerprint,
                             code="all_day",
+                            candidate_sites=(
+                                _calendar_sites_by_id(
+                                    cur, (int(existing["location_id"]),)
+                                )
+                                if existing is not None
+                                else ()
+                            ),
                         )
                     )
                     continue
@@ -2761,6 +2879,7 @@ def sync_calendar_source(
                     source=source,
                     occurrence=occurrence,
                     existing_job=existing,
+                    location_snapshot=location_snapshot,
                 )
                 if issue or location_id is None:
                     counts["unresolved"] += 1

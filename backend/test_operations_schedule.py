@@ -11,6 +11,7 @@ import db
 from operations_schedule import (
     _closed_shift_segments,
     _forecast_job_values,
+    _job_issues,
     _match_segment_to_job,
     allocate_monthly_cents,
 )
@@ -242,11 +243,72 @@ def test_actual_matching_fails_closed_when_two_service_windows_overlap():
     match, reason, candidate_ids = _match_segment_to_job(
         segment,
         {(77, service_day): jobs},
+        {int(job["id"]): job for job in jobs},
         ZoneInfo("America/Chicago"),
     )
     assert match is None
     assert reason == "ambiguous_job"
     assert candidate_ids == [1, 2]
+
+
+def test_linked_shift_does_not_override_an_explicit_different_site_segment():
+    service_day = date(2026, 7, 20)
+    linked_job = {
+        "id": 1,
+        "location_id": 77,
+        "scheduled_date": service_day,
+        "scheduled_start": datetime(2026, 7, 20, 13, tzinfo=timezone.utc),
+        "scheduled_end": datetime(2026, 7, 20, 15, tzinfo=timezone.utc),
+        "status": "scheduled",
+    }
+    visited_job = {
+        "id": 2,
+        "location_id": 88,
+        "scheduled_date": service_day,
+        "scheduled_start": datetime(2026, 7, 20, 15, tzinfo=timezone.utc),
+        "scheduled_end": datetime(2026, 7, 20, 17, tzinfo=timezone.utc),
+        "status": "scheduled",
+    }
+    segment = {
+        "job_id": linked_job["id"],
+        "location_id": visited_job["location_id"],
+        "start": datetime(2026, 7, 20, 15, tzinfo=timezone.utc),
+        "end": datetime(2026, 7, 20, 17, tzinfo=timezone.utc),
+    }
+
+    match, reason, candidate_ids = _match_segment_to_job(
+        segment,
+        {(visited_job["location_id"], service_day): [visited_job]},
+        {linked_job["id"]: linked_job, visited_job["id"]: visited_job},
+        ZoneInfo("America/Chicago"),
+    )
+
+    assert match == visited_job
+    assert reason == "unique_site_date"
+    assert candidate_ids == [visited_job["id"]]
+
+
+def test_missing_site_does_not_report_site_economics_issues():
+    start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    issue_codes = {
+        issue["code"]
+        for issue in _job_issues(
+            {
+                "location_id": None,
+                "site_expected_hours": None,
+                "rate": None,
+                "rate_type": None,
+                "source_role": "residential_morning",
+                "source_all_day": False,
+                "scheduled_start": start,
+                "scheduled_end": start + timedelta(hours=2),
+            }
+        )
+    }
+
+    assert "missing_site" in issue_codes
+    assert "missing_expected_hours" not in issue_codes
+    assert "missing_rate" not in issue_codes
 
 
 def test_closed_shift_preserves_initial_site_before_first_visit():
@@ -800,6 +862,155 @@ def test_qr_establishes_site_presence_without_creating_paid_time(client, auth):
     )
 
 
+def test_explicit_shift_job_link_wins_when_site_matching_is_ambiguous(client, auth):
+    service_day = date(2026, 7, 20)
+    shift_start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    shift_end = shift_start + timedelta(hours=2)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "linked_shift_residential",
+                "residential_morning",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "Linked Shift",
+                site_type="Residential",
+                rate=125,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+            linked_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Linked Shift",
+                start=shift_start - timedelta(hours=1),
+                end=shift_end + timedelta(hours=1),
+                source_seed="linked-shift-target",
+            )
+            other_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Linked Shift",
+                start=shift_start - timedelta(minutes=30),
+                end=shift_end + timedelta(minutes=30),
+                source_seed="linked-shift-other",
+            )
+            employee_id = _employee(cur, "Linked Shift", 18)
+            cur.execute(
+                """
+                INSERT INTO shifts (
+                    employee_id, job_id, clock_in, clock_out, total_hours,
+                    local_date, timezone, time_category
+                )
+                VALUES (
+                    %s, %s, %s, %s, 2, %s,
+                    'America/Chicago', 'productive'
+                )
+                """,
+                (
+                    employee_id,
+                    linked_job_id,
+                    shift_start,
+                    shift_end,
+                    service_day,
+                ),
+            )
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(service_day), "end_date": str(service_day)},
+    )
+    assert response.status_code == 200, response.text
+    jobs = {row["id"]: row for row in response.json()["jobs"]}
+
+    assert jobs[linked_job_id]["actualHours"] == 2
+    assert jobs[linked_job_id]["workers"][0]["intervals"][0]["match"] == "linked_shift"
+    assert jobs[other_job_id]["actualHours"] == 0
+
+
+def test_qr_only_presence_without_shift_is_retained_with_zero_hours(client, auth):
+    service_day = date(2026, 7, 20)
+    checked_in_at = datetime(2026, 7, 20, 15, tzinfo=timezone.utc)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "qr_without_shift_residential",
+                "residential_morning",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "QR Without Shift",
+                site_type="Residential",
+                rate=125,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+            job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer QR Without Shift",
+                start=checked_in_at - timedelta(hours=1),
+                end=checked_in_at + timedelta(hours=1),
+                source_seed="qr-without-shift",
+            )
+            employee_id = _employee(cur, "QR Without Shift", 18)
+            cur.execute(
+                """
+                INSERT INTO site_check_ins (
+                    employee_id, location_id, server_checked_in_at,
+                    device_scanned_at, latitude, longitude, accuracy_m,
+                    geofence_radius_m, distance_m, geofence_status,
+                    classification, classification_reason,
+                    device_clock_skew_seconds, review_status
+                )
+                VALUES (
+                    %s, %s, %s, %s, 39.12, -88.54, 5,
+                    100, 3, 'inside', 'on_time', 'test', 0,
+                    'not_required'
+                )
+                """,
+                (employee_id, site_id, checked_in_at, checked_in_at),
+            )
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(service_day), "end_date": str(service_day)},
+    )
+    assert response.status_code == 200, response.text
+    job = next(row for row in response.json()["jobs"] if row["id"] == job_id)
+
+    assert job["actualHours"] == 0
+    assert job["workers"] == [
+        {
+            "employeeId": employee_id,
+            "employeeName": f"{TEST_PREFIX} Employee QR Without Shift",
+            "intervals": [
+                {
+                    "shiftId": None,
+                    "intervalStart": checked_in_at.isoformat().replace("+00:00", "Z"),
+                    "intervalEnd": None,
+                    "hours": None,
+                    "finalized": False,
+                    "presenceOnly": True,
+                    "evidence": ["qr_check_in"],
+                    "match": "unique_site_date",
+                }
+            ],
+            "status": "observed",
+            "hours": 0,
+            "laborCost": 0,
+        }
+    ]
+
+
 def test_saturday_night_job_keeps_post_midnight_actual(client, auth):
     app_timezone = ZoneInfo("America/Chicago")
     service_day = date(2026, 7, 18)
@@ -910,6 +1121,62 @@ def _three_dates_in_one_forecast_month(today: date) -> list[date]:
         by_month.setdefault((cursor.year, cursor.month), []).append(cursor)
         cursor += timedelta(days=1)
     return max(by_month.values(), key=len)[:3]
+
+
+def test_monthly_rate_uses_all_non_cancelled_jobs_as_denominator(client, auth):
+    today = datetime.now(ZoneInfo("America/Chicago")).date()
+    service_dates = _three_dates_in_one_forecast_month(today)[:2]
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "monthly_denominator_commercial",
+                "commercial_evening_night",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "Monthly Denominator",
+                site_type="Commercial",
+                rate=100,
+                rate_type="monthly",
+                expected_hours=2,
+            )
+            job_ids = []
+            for index, service_date in enumerate(service_dates):
+                local_start = datetime.combine(
+                    service_date,
+                    time(hour=18),
+                    tzinfo=ZoneInfo("America/Chicago"),
+                )
+                job_ids.append(
+                    _job(
+                        cur,
+                        source_id=source_id,
+                        location_id=site_id,
+                        customer_name=f"{TEST_PREFIX} Customer Monthly Denominator",
+                        start=local_start.astimezone(timezone.utc),
+                        end=(local_start + timedelta(hours=2)).astimezone(timezone.utc),
+                        source_seed=f"monthly-denominator-{index}",
+                    )
+                )
+            cur.execute(
+                "UPDATE jobs SET scheduled_end = NULL WHERE id = %s",
+                (job_ids[1],),
+            )
+
+    response = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4},
+    )
+    assert response.status_code == 200, response.text
+    jobs = {
+        row["jobId"]: row for week in response.json()["weeks"] for row in week["jobs"]
+    }
+
+    assert jobs[job_ids[0]]["estRevenue"] == 50
+    assert jobs[job_ids[1]]["includedInForecast"] is False
+    assert jobs[job_ids[1]]["estRevenue"] is None
 
 
 def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth):

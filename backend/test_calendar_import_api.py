@@ -3054,6 +3054,43 @@ def test_source_sync_commits_one_calendar_when_the_other_fetch_fails(client, aut
     }
 
 
+def test_source_sync_loads_site_matching_snapshot_once(client, auth, monkeypatch):
+    sources = configure_canonical_sources(client, auth)
+    connection = store.active_connection()
+    assert connection is not None
+    occurrences = [
+        calendar_api._source_occurrence(
+            google_occurrence(
+                f"site-snapshot-{index}",
+                calendar_id="residential@example.test",
+                start=WINDOW_START + timedelta(days=index),
+            )
+        )
+        for index in range(2)
+    ]
+    original_loader = store._read_canonical_locations
+    load_count = 0
+
+    def counted_loader(cur):
+        nonlocal load_count
+        load_count += 1
+        return original_loader(cur)
+
+    monkeypatch.setattr(store, "_read_canonical_locations", counted_loader)
+    result = store.sync_calendar_source(
+        source_id=int(sources[store.RESIDENTIAL_MORNING_ROLE]["id"]),
+        expected_credential_version=int(connection["credential_version"]),
+        occurrences=occurrences,
+        window_start=WINDOW_START,
+        window_end=WINDOW_START + timedelta(days=30),
+        actor_id=1,
+        actor_name="Juan Canfield",
+    )
+
+    assert result["counts"]["create"] == 2
+    assert load_count == 1
+
+
 def test_site_date_time_evidence_protects_job_without_shift_job_id(client, auth):
     configure_canonical_sources(client, auth)
     original = google_occurrence(
@@ -3124,6 +3161,165 @@ def test_site_date_time_evidence_protects_job_without_shift_job_id(client, auth)
             "status"
         ]
         == "scheduled"
+    )
+
+
+def test_overnight_job_protects_work_evidence_on_second_service_date(client, auth):
+    configure_canonical_sources(client, auth)
+    local_start = datetime(
+        2026,
+        7,
+        25,
+        23,
+        tzinfo=ZoneInfo("America/Chicago"),
+    )
+    original = google_occurrence(
+        "overnight-protected-work",
+        calendar_id="commercial@example.test",
+        summary="Commercial Customer",
+        location="456 Oak St, Effingham",
+        start=local_start.astimezone(timezone.utc),
+        end=(local_start + timedelta(hours=2)).astimezone(timezone.utc),
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [],
+        "commercial@example.test": [original],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_start
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    employee_id = int(
+        db.query_one("SELECT id FROM employees WHERE name = 'Catalina Gomez'")["id"]
+    )
+    second_service_date = (local_start + timedelta(days=1)).date()
+    evidence_start = (local_start + timedelta(hours=1, minutes=15)).astimezone(
+        timezone.utc
+    )
+    db.execute(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, local_date, time_category, notes, job_id
+        ) VALUES (
+            %s, %s, 'Commercial Customer', %s, %s, 0.5, %s, 'productive',
+            'canonical-calendar-test-evidence', NULL
+        )
+        """,
+        (
+            employee_id,
+            int(job["location_id"]),
+            evidence_start,
+            evidence_start + timedelta(minutes=30),
+            second_service_date,
+        ),
+    )
+
+    moved = google_occurrence(
+        "overnight-protected-work",
+        calendar_id="commercial@example.test",
+        summary="Commercial Customer",
+        location="456 Oak St, Effingham",
+        start=(local_start + timedelta(days=7)).astimezone(timezone.utc),
+        end=(local_start + timedelta(days=7, hours=2)).astimezone(timezone.utc),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["commercial@example.test"] = [moved]
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["unresolved"] == 1
+    assert response.json()["exceptions"][0]["code"] == "protected_work"
+    assert (
+        db.query_one(
+            "SELECT scheduled_start FROM jobs WHERE id = %s",
+            (int(job["id"]),),
+        )["scheduled_start"]
+        == job["scheduled_start"]
+    )
+
+
+def test_timed_job_changed_to_all_day_is_invalidated_in_canonical_plan(client, auth):
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "timed-to-all-day",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    original_job = db.query_one(
+        """
+        SELECT id, scheduled_start
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    all_day = replace(
+        original,
+        all_day=True,
+        start="2026-07-20",
+        end="2026-07-21",
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [all_day]
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["unresolved"] == 1
+    assert response.json()["exceptions"][0]["code"] == "all_day"
+    stored = db.query_one(
+        """
+        SELECT scheduled_date, scheduled_start, scheduled_end, source_all_day,
+               source_fingerprint, status
+        FROM jobs
+        WHERE id = %s
+        """,
+        (int(original_job["id"]),),
+    )
+    assert stored["source_all_day"] is True
+    assert stored["scheduled_start"] != original_job["scheduled_start"]
+    assert stored["status"] == "scheduled"
+
+    schedule = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": str(stored["scheduled_date"]),
+            "end_date": str(stored["scheduled_date"]),
+        },
+    )
+    assert schedule.status_code == 200, schedule.text
+    scheduled_job = next(
+        row for row in schedule.json()["jobs"] if row["id"] == int(original_job["id"])
+    )
+    assert scheduled_job["includedInPlan"] is False
+    assert {issue["code"] for issue in scheduled_job["issues"]} >= {"all_day_event"}
+
+    retry = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert retry.status_code == 200, retry.text
+    assert (
+        db.query_one(
+            """
+            SELECT scheduled_date, scheduled_start, scheduled_end, source_all_day,
+                   source_fingerprint, status
+            FROM jobs
+            WHERE id = %s
+            """,
+            (int(original_job["id"]),),
+        )
+        == stored
     )
 
 

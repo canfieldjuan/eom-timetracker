@@ -139,17 +139,21 @@ def _job_issues(job: Dict[str, Any]) -> List[Dict[str, str]]:
         issues.append(
             _issue("archived_site", "This scheduled job points to an archived Site.")
         )
-    if job.get("site_expected_hours") is None:
-        issues.append(
-            _issue(
-                "missing_expected_hours",
-                "Expected labor hours per visit are not configured for this Site.",
+    if job.get("location_id") is not None:
+        if job.get("site_expected_hours") is None:
+            issues.append(
+                _issue(
+                    "missing_expected_hours",
+                    "Expected labor hours per visit are not configured for this Site.",
+                )
             )
-        )
-    if job.get("rate") is None:
-        issues.append(
-            _issue("missing_rate", "A service price is not configured for this Site.")
-        )
+        if job.get("rate") is None:
+            issues.append(
+                _issue(
+                    "missing_rate",
+                    "A service price is not configured for this Site.",
+                )
+            )
     if job.get("location_id") is not None and job.get("rate_type") not in {
         "per_visit",
         "hourly",
@@ -249,11 +253,13 @@ def _load_time_evidence(
     Dict[int, List[Dict[str, Any]]],
     Dict[int, List[Dict[str, Any]]],
     Dict[Tuple[int, int], List[datetime]],
+    List[Dict[str, Any]],
 ]:
     shifts = db.query_all(
         """
         SELECT s.id, s.employee_id, e.name AS employee_name, e.hourly_rate,
-               s.location_id, s.location_label, s.clock_in, s.clock_out
+               s.location_id, s.location_label, s.clock_in, s.clock_out,
+               s.job_id
         FROM shifts s
         JOIN employees e ON e.id = s.employee_id
         WHERE s.time_category = 'productive'
@@ -263,54 +269,101 @@ def _load_time_evidence(
         """,
         (range_end, observed_at, range_start),
     )
-    if not shifts:
-        return [], {}, {}, {}
 
     shift_ids = [int(row["id"]) for row in shifts]
     visits: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for row in db.query_all(
-        """
-        SELECT id, shift_id, location_id, location_label, customer_name,
-               arrival_time
-        FROM visits
-        WHERE shift_id = ANY(%s)
-        ORDER BY shift_id, arrival_time, id
-        """,
-        (shift_ids,),
-    ):
-        visits[int(row["shift_id"])].append(row)
+    if shift_ids:
+        for row in db.query_all(
+            """
+            SELECT id, shift_id, location_id, location_label, customer_name,
+                   arrival_time
+            FROM visits
+            WHERE shift_id = ANY(%s)
+            ORDER BY shift_id, arrival_time, id
+            """,
+            (shift_ids,),
+        ):
+            visits[int(row["shift_id"])].append(row)
 
     departures: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for row in db.query_all(
-        """
-        SELECT id, shift_id, location_id, location_label, customer_name,
-               departure_time
-        FROM departures
-        WHERE shift_id = ANY(%s)
-        ORDER BY shift_id, departure_time, id
-        """,
-        (shift_ids,),
-    ):
-        departures[int(row["shift_id"])].append(row)
+    if shift_ids:
+        for row in db.query_all(
+            """
+            SELECT id, shift_id, location_id, location_label, customer_name,
+                   departure_time
+            FROM departures
+            WHERE shift_id = ANY(%s)
+            ORDER BY shift_id, departure_time, id
+            """,
+            (shift_ids,),
+        ):
+            departures[int(row["shift_id"])].append(row)
 
     qr_by_employee_site: Dict[Tuple[int, int], List[datetime]] = defaultdict(list)
-    employee_ids = sorted({int(row["employee_id"]) for row in shifts})
-    for row in db.query_all(
+    qr_rows = db.query_all(
         """
-        SELECT employee_id, location_id, server_checked_in_at
-        FROM site_check_ins
-        WHERE employee_id = ANY(%s)
-          AND server_checked_in_at >= %s
-          AND server_checked_in_at < %s
-        ORDER BY employee_id, location_id, server_checked_in_at, id
+        SELECT sci.id, sci.employee_id, e.name AS employee_name, e.hourly_rate,
+               sci.location_id, l.address AS location_label,
+               sci.server_checked_in_at
+        FROM site_check_ins sci
+        JOIN employees e ON e.id = sci.employee_id
+        LEFT JOIN locations l ON l.id = sci.location_id
+        WHERE sci.server_checked_in_at >= %s
+          AND sci.server_checked_in_at < %s
+        ORDER BY sci.employee_id, sci.location_id,
+                 sci.server_checked_in_at, sci.id
         """,
-        (employee_ids, range_start, min(range_end, observed_at)),
-    ):
+        (range_start, min(range_end, observed_at)),
+    )
+    for row in qr_rows:
         qr_by_employee_site[(int(row["employee_id"]), int(row["location_id"]))].append(
             row["server_checked_in_at"]
         )
 
-    return shifts, visits, departures, qr_by_employee_site
+    return shifts, visits, departures, qr_by_employee_site, qr_rows
+
+
+def _qr_only_presence_segments(
+    qr_rows: List[Dict[str, Any]],
+    shifts: List[Dict[str, Any]],
+    observed_at: datetime,
+) -> List[Dict[str, Any]]:
+    """Keep Site presence that has no overlapping productive shift."""
+
+    shifts_by_employee: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for shift in shifts:
+        shifts_by_employee[int(shift["employee_id"])].append(shift)
+
+    output: List[Dict[str, Any]] = []
+    for row in qr_rows:
+        employee_id = int(row["employee_id"])
+        checked_in_at = row["server_checked_in_at"]
+        covered_by_shift = any(
+            shift["clock_in"] <= checked_in_at
+            and (shift.get("clock_out") or observed_at) > checked_in_at
+            for shift in shifts_by_employee.get(employee_id, [])
+        )
+        if covered_by_shift:
+            continue
+        output.append(
+            {
+                "shift_id": None,
+                "job_id": None,
+                "employee_id": employee_id,
+                "employee_name": str(row["employee_name"]),
+                "hourly_rate": row.get("hourly_rate"),
+                "location_id": int(row["location_id"]),
+                "location_label": str(row.get("location_label") or ""),
+                "start": checked_in_at,
+                "end": checked_in_at + timedelta(microseconds=1),
+                "finalized": False,
+                "in_progress": False,
+                "presence_only": True,
+                "evidence": ["qr_check_in"],
+                "unassigned_gap": False,
+            }
+        )
+    return output
 
 
 def _closed_shift_segments(
@@ -333,6 +386,7 @@ def _closed_shift_segments(
 
     common = {
         "shift_id": int(shift["id"]),
+        "job_id": shift.get("job_id"),
         "employee_id": int(shift["employee_id"]),
         "employee_name": str(shift["employee_name"]),
         "hourly_rate": shift.get("hourly_rate"),
@@ -572,6 +626,7 @@ def _open_shift_presence(
 
     return {
         "shift_id": int(shift["id"]),
+        "job_id": shift.get("job_id"),
         "employee_id": int(shift["employee_id"]),
         "employee_name": str(shift["employee_name"]),
         "hourly_rate": shift.get("hourly_rate"),
@@ -600,8 +655,26 @@ def _segment_candidate_dates(
 def _match_segment_to_job(
     segment: Dict[str, Any],
     jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]],
+    jobs_by_id: Dict[int, Dict[str, Any]],
     app_timezone: ZoneInfo,
 ) -> Tuple[Optional[Dict[str, Any]], str, List[int]]:
+    linked_job_id = segment.get("job_id")
+    if linked_job_id is not None:
+        linked_job = jobs_by_id.get(int(linked_job_id))
+        segment_location_id = segment.get("location_id")
+        linked_location_id = (
+            linked_job.get("location_id") if linked_job is not None else None
+        )
+        link_applies_to_segment = (
+            segment_location_id is None
+            or linked_location_id is None
+            or int(segment_location_id) == int(linked_location_id)
+        )
+        if linked_job is not None and link_applies_to_segment:
+            if linked_job.get("status") == "cancelled":
+                return None, "cancelled_job", [int(linked_job_id)]
+            return linked_job, "linked_shift", [int(linked_job_id)]
+
     location_id = segment.get("location_id")
     if location_id is None:
         reason = "unassigned_gap" if segment.get("unassigned_gap") else "missing_site"
@@ -647,7 +720,9 @@ def _serialize_unmatched(
 ) -> Dict[str, Any]:
     finalized = bool(segment["finalized"])
     return {
-        "shiftId": int(segment["shift_id"]),
+        "shiftId": (
+            int(segment["shift_id"]) if segment.get("shift_id") is not None else None
+        ),
         "employeeId": int(segment["employee_id"]),
         "employeeName": segment["employee_name"],
         "locationId": segment.get("location_id"),
@@ -680,6 +755,7 @@ def _decorate_schedule_jobs(
     visible_range_end: Optional[datetime] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = defaultdict(list)
+    jobs_by_id = {int(job["id"]): job for job in jobs}
     for job in jobs:
         if job.get("location_id") is not None:
             service_dates = {job["scheduled_date"]}
@@ -703,7 +779,7 @@ def _decorate_schedule_jobs(
             for service_date in service_dates:
                 jobs_by_site_date[(int(job["location_id"]), service_date)].append(job)
 
-    shifts, visits, departures, qr_by_employee_site = _load_time_evidence(
+    shifts, visits, departures, qr_by_employee_site, qr_rows = _load_time_evidence(
         range_start,
         range_end,
         observed_at,
@@ -735,6 +811,7 @@ def _decorate_schedule_jobs(
                     range_end,
                 )
             )
+    segments.extend(_qr_only_presence_segments(qr_rows, shifts, observed_at))
 
     workers_by_job: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
     unmatched: List[Dict[str, Any]] = []
@@ -742,6 +819,7 @@ def _decorate_schedule_jobs(
         job, reason, candidate_job_ids = _match_segment_to_job(
             segment,
             jobs_by_site_date,
+            jobs_by_id,
             app_timezone,
         )
         if job is None:
@@ -779,7 +857,11 @@ def _decorate_schedule_jobs(
         segment_hours = _hours(segment["start"], segment["end"]) if finalized else None
         worker["intervals"].append(
             {
-                "shiftId": int(segment["shift_id"]),
+                "shiftId": (
+                    int(segment["shift_id"])
+                    if segment.get("shift_id") is not None
+                    else None
+                ),
                 "intervalStart": _utc_iso(segment["start"]),
                 "intervalEnd": _utc_iso(segment["end"]) if finalized else None,
                 "hours": round(segment_hours, 2) if segment_hours is not None else None,
@@ -1239,7 +1321,6 @@ def build_operations_schedule_router(
                 job.get("status") != "cancelled"
                 and job.get("location_id") is not None
                 and str(job.get("rate_type") or "") == "monthly"
-                and _job_is_projection_eligible(job)
             ):
                 scheduled_date = job["scheduled_date"]
                 monthly_groups[
