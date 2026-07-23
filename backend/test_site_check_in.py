@@ -761,9 +761,36 @@ class TestSiteCheckInAdminReview:
             json={"decision": "approved", "note": "  GPS evidence verified  "},
         )
         assert reviewed.status_code == 200, reviewed.text
-        assert reviewed.json()["checkIn"]["reviewStatus"] == "approved"
-        assert reviewed.json()["checkIn"]["reviewedBy"] == "Juan Canfield"
-        assert reviewed.json()["checkIn"]["reviewNote"] == "GPS evidence verified"
+        first_decision = reviewed.json()["checkIn"]
+        assert first_decision["reviewStatus"] == "approved"
+        assert first_decision["reviewedBy"] == "Juan Canfield"
+        assert first_decision["reviewNote"] == "GPS evidence verified"
+
+        repeated = client.patch(
+            f"/api/admin/site-check-ins/{check_in_id}",
+            headers=auth,
+            json={"decision": "rejected", "note": "Replace the first decision"},
+        )
+        assert repeated.status_code == 409, repeated.text
+
+        persisted_response = client.get(
+            "/api/admin/site-check-ins",
+            headers=auth,
+            params={"employeeId": employee_id, "siteId": location_id},
+        )
+        assert persisted_response.status_code == 200, persisted_response.text
+        persisted = next(
+            row
+            for row in persisted_response.json()["checkIns"]
+            if row["id"] == check_in_id
+        )
+        assert {
+            key: persisted[key]
+            for key in ("reviewStatus", "reviewedBy", "reviewedAt", "reviewNote")
+        } == {
+            key: first_decision[key]
+            for key in ("reviewStatus", "reviewedBy", "reviewedAt", "reviewNote")
+        }
 
     def test_locations_publish_site_ids_and_policy(
         self, client, emp_auth, location_id, monkeypatch

@@ -5782,15 +5782,6 @@ def admin_review_site_check_in(
     request: Request,
     admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    existing = db.query_one(
-        "SELECT id, classification FROM site_check_ins WHERE id = %s",
-        (check_in_id,),
-    )
-    if not existing:
-        raise HTTPException(status_code=404, detail="Site check-in not found")
-    if existing["classification"] != "needs_review":
-        raise HTTPException(status_code=409, detail="Only needs-review check-ins require a decision")
-
     updated = db.query_one(
         """
         UPDATE site_check_ins
@@ -5799,10 +5790,29 @@ def admin_review_site_check_in(
             reviewed_at = NOW(),
             review_note = %s
         WHERE id = %s
+          AND classification = 'needs_review'
+          AND review_status = 'pending'
         RETURNING id
         """,
         (payload.decision, int(admin["id"]), payload.note.strip(), check_in_id),
     )
+    if not updated:
+        existing = db.query_one(
+            "SELECT id, classification FROM site_check_ins WHERE id = %s",
+            (check_in_id,),
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail="Site check-in not found")
+        if existing["classification"] != "needs_review":
+            raise HTTPException(
+                status_code=409,
+                detail="Only needs-review check-ins require a decision",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail="This site check-in already has a review decision",
+        )
+
     row = _site_check_in_row(int(updated["id"])) if updated else None
     if not row:
         raise RuntimeError("Site check-in review was saved but could not be reloaded")
