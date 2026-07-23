@@ -688,6 +688,7 @@ def test_status_calendar_selection_and_morning_crew_resolution(client, auth):
     assert status.json() == {
         "configured": True,
         "connected": False,
+        "connectionId": None,
         "scope": " ".join(CALENDAR_READONLY_SCOPES),
         "scopes": list(CALENDAR_READONLY_SCOPES),
         "accountEmail": None,
@@ -696,7 +697,10 @@ def test_status_calendar_selection_and_morning_crew_resolution(client, auth):
         "selectedCalendarTimeZone": None,
     }
 
-    connect_selected_calendar()
+    connection_id = connect_selected_calendar()
+    connected_status = client.get("/api/admin/google-calendar/status", headers=auth)
+    assert connected_status.status_code == 200
+    assert connected_status.json()["connectionId"] == connection_id
     reconnect = client.post("/api/admin/google-calendar/connect", headers=auth)
     assert reconnect.status_code == 200
     assert reconnect.json()["authorizationUrl"].startswith(
@@ -719,6 +723,173 @@ def test_status_calendar_selection_and_morning_crew_resolution(client, auth):
     assert crews.json()["morningCrew"]["ready"] is True
     assert crews.json()["morningCrew"]["identityIssues"] == []
     assert len(crews.json()["morningCrew"]["memberIds"]) == 3
+
+
+def test_calendar_without_provider_timezone_uses_configured_fallback(client, auth):
+    connection_id = connect_unselected_calendar()
+    FakeGoogleClient.calendars = [
+        CalendarSummary(
+            calendar_id="operations@example.test",
+            summary="Operations",
+            primary=True,
+            selected=True,
+            access_role="owner",
+            time_zone=None,
+        )
+    ]
+
+    selected = client.put(
+        "/api/admin/google-calendar/calendar",
+        headers=auth,
+        json={"calendarId": "operations@example.test"},
+    )
+
+    assert selected.status_code == 200, selected.text
+    status = client.get("/api/admin/google-calendar/status", headers=auth)
+    assert status.status_code == 200, status.text
+    assert status.json()["connectionId"] == connection_id
+    assert status.json()["selectedCalendarTimeZone"] == "America/Chicago"
+
+    FakeGoogleClient.occurrences = [google_occurrence("timezone-fallback")]
+    preview = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={
+            "expectedConnectionId": connection_id,
+            "expectedCalendarId": "operations@example.test",
+            "expectedCalendarTimeZone": "America/Chicago",
+            "resolutions": [],
+        },
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["calendarTimeZone"] == "America/Chicago"
+
+
+def test_preview_binds_and_returns_the_expected_source_identity(client, auth):
+    connection_id = connect_selected_calendar()
+    FakeGoogleClient.occurrences = [google_occurrence("source-bound-preview")]
+    payload = {
+        "expectedConnectionId": connection_id,
+        "expectedCalendarId": "operations@example.test",
+        "expectedCalendarTimeZone": "America/Chicago",
+        "resolutions": [],
+    }
+
+    preview = client.post(
+        "/api/admin/google-calendar/preview", headers=auth, json=payload
+    )
+
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["connectionId"] == connection_id
+    assert preview.json()["calendarId"] == "operations@example.test"
+    assert preview.json()["calendarTimeZone"] == "America/Chicago"
+
+    changed = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={**payload, "expectedConnectionId": connection_id + 1},
+    )
+    assert changed.status_code == 409
+    assert changed.json()["error"] == (
+        "Google Calendar connection changed; create a new preview"
+    )
+
+
+def test_preview_rejects_partial_source_expectation(client, auth):
+    response = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={"expectedConnectionId": 1, "resolutions": []},
+    )
+
+    assert response.status_code == 422
+
+
+def test_bound_preview_normalizes_disconnect_and_cleared_selection_conflicts(
+    client, auth
+):
+    connection_id = connect_selected_calendar()
+    payload = {
+        "expectedConnectionId": connection_id,
+        "expectedCalendarId": "operations@example.test",
+        "expectedCalendarTimeZone": "America/Chicago",
+        "resolutions": [],
+    }
+    active = store.active_connection()
+    store.disconnect_calendar(
+        connection_id=connection_id,
+        expected_credential_version=int(active["credential_version"]),
+        admin_id=1,
+        admin_name="Juan Canfield",
+    )
+
+    disconnected = client.post(
+        "/api/admin/google-calendar/preview", headers=auth, json=payload
+    )
+    assert disconnected.status_code == 409
+    assert disconnected.json()["error"] == (
+        "Google Calendar connection changed; create a new preview"
+    )
+
+    replacement_id = connect_selected_calendar()
+    db.execute(
+        """
+        UPDATE google_calendar_connections
+        SET selected_calendar_id = NULL,
+            selected_calendar_name = NULL,
+            selected_calendar_timezone = NULL
+        WHERE id = %s
+        """,
+        (replacement_id,),
+    )
+    no_selection = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={**payload, "expectedConnectionId": replacement_id},
+    )
+    assert no_selection.status_code == 409
+    assert no_selection.json()["error"] == (
+        "Selected Google Calendar changed; create a new preview"
+    )
+
+
+def test_preview_insert_rechecks_the_active_source_after_provider_reads(
+    client, auth, monkeypatch
+):
+    connection_id = connect_selected_calendar()
+    FakeGoogleClient.occurrences = [google_occurrence("preview-insert-race")]
+    real_create_preview = store.create_preview
+
+    def switch_source_then_create(**kwargs):
+        active = store.active_connection()
+        store.select_calendar(
+            connection_id=connection_id,
+            calendar_id="different@example.test",
+            calendar_name="Different calendar",
+            calendar_timezone="America/Chicago",
+            expected_credential_version=int(active["credential_version"]),
+        )
+        return real_create_preview(**kwargs)
+
+    monkeypatch.setattr(store, "create_preview", switch_source_then_create)
+
+    response = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={
+            "expectedConnectionId": connection_id,
+            "expectedCalendarId": "operations@example.test",
+            "expectedCalendarTimeZone": "America/Chicago",
+            "resolutions": [],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == (
+        "Google Calendar connection changed; create a new preview"
+    )
+    assert store.active_connection()["selected_calendar_id"] == "different@example.test"
+    assert db.query_one("SELECT COUNT(*) AS n FROM calendar_import_previews")["n"] == 0
 
 
 def test_invalid_grant_reauthorizes_exact_connection_with_future_visit(
@@ -1529,7 +1700,9 @@ def test_provider_timezone_change_invalidates_preview_before_any_write(client, a
     assert db.query_one("SELECT COUNT(*) AS n FROM planned_service_visits")["n"] == 0
 
 
-def test_new_preview_refreshes_live_calendar_name_and_timezone(client, auth):
+def test_bound_preview_refreshes_metadata_then_recovers_from_timezone_change(
+    client, auth
+):
     connection_id = connect_selected_calendar()
     FakeGoogleClient.calendars = [
         CalendarSummary(
@@ -1546,10 +1719,18 @@ def test_new_preview_refreshes_live_calendar_name_and_timezone(client, auth):
     response = client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
-        json={"resolutions": []},
+        json={
+            "expectedConnectionId": connection_id,
+            "expectedCalendarId": "operations@example.test",
+            "expectedCalendarTimeZone": "America/Chicago",
+            "resolutions": [],
+        },
     )
 
-    assert response.status_code == 200, response.text
+    assert response.status_code == 409
+    assert response.json()["error"] == (
+        "Google Calendar timezone changed; create a new preview"
+    )
     connection = db.query_one(
         """
         SELECT selected_calendar_name, selected_calendar_timezone
@@ -1561,6 +1742,103 @@ def test_new_preview_refreshes_live_calendar_name_and_timezone(client, auth):
         "selected_calendar_name": "Updated Operations",
         "selected_calendar_timezone": "America/Denver",
     }
+    status = client.get("/api/admin/google-calendar/status", headers=auth)
+    assert status.json()["selectedCalendarName"] == "Updated Operations"
+    assert status.json()["selectedCalendarTimeZone"] == "America/Denver"
+
+    recovered = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={
+            "expectedConnectionId": connection_id,
+            "expectedCalendarId": "operations@example.test",
+            "expectedCalendarTimeZone": "America/Denver",
+            "resolutions": [],
+        },
+    )
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["calendarTimeZone"] == "America/Denver"
+
+
+def test_metadata_refresh_connection_race_returns_retryable_conflict(
+    client, auth, monkeypatch
+):
+    connect_selected_calendar()
+    FakeGoogleClient.calendars = [
+        CalendarSummary(
+            calendar_id="operations@example.test",
+            summary="Updated Operations",
+            primary=True,
+            selected=True,
+            access_role="owner",
+            time_zone="America/Denver",
+        )
+    ]
+    FakeGoogleClient.occurrences = [google_occurrence("metadata-refresh-race")]
+
+    def reject_stale_metadata(**_kwargs):
+        raise store.CalendarStoreError("credentials changed; reload")
+
+    monkeypatch.setattr(store, "select_calendar", reject_stale_metadata)
+
+    response = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={"resolutions": []},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == (
+        "Google Calendar connection changed; create a new preview"
+    )
+
+
+def test_metadata_refresh_cannot_switch_back_a_concurrent_calendar_choice(
+    client, auth, monkeypatch
+):
+    connection_id = connect_selected_calendar()
+    FakeGoogleClient.calendars = [
+        CalendarSummary(
+            calendar_id="operations@example.test",
+            summary="Updated Operations",
+            primary=True,
+            selected=True,
+            access_role="owner",
+            time_zone="America/Chicago",
+        )
+    ]
+    FakeGoogleClient.occurrences = [google_occurrence("metadata-selection-race")]
+    real_select_calendar = store.select_calendar
+
+    def switch_then_refresh(**kwargs):
+        active = store.active_connection()
+        real_select_calendar(
+            connection_id=connection_id,
+            calendar_id="different@example.test",
+            calendar_name="Different calendar",
+            calendar_timezone="America/Chicago",
+            expected_credential_version=int(active["credential_version"]),
+        )
+        return real_select_calendar(**kwargs)
+
+    monkeypatch.setattr(store, "select_calendar", switch_then_refresh)
+
+    response = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={
+            "expectedConnectionId": connection_id,
+            "expectedCalendarId": "operations@example.test",
+            "expectedCalendarTimeZone": "America/Chicago",
+            "resolutions": [],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == (
+        "Google Calendar connection changed; create a new preview"
+    )
+    assert store.active_connection()["selected_calendar_id"] == "different@example.test"
 
 
 def test_reconnect_reconciles_the_same_occurrence_without_a_duplicate(client, auth):

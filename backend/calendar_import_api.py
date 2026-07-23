@@ -133,9 +133,27 @@ class PreviewResolutionRequest(BaseModel):
 
 
 class CalendarPreviewRequest(BaseModel):
+    expectedConnectionId: int | None = Field(default=None, gt=0)
+    expectedCalendarId: str | None = Field(default=None, min_length=1, max_length=1024)
+    expectedCalendarTimeZone: str | None = Field(
+        default=None, min_length=1, max_length=255
+    )
     resolutions: list[PreviewResolutionRequest] = Field(
         default_factory=list, max_length=2500
     )
+
+    @model_validator(mode="after")
+    def validate_source_expectation(self) -> CalendarPreviewRequest:
+        values = (
+            self.expectedConnectionId,
+            self.expectedCalendarId,
+            self.expectedCalendarTimeZone,
+        )
+        if any(value is not None for value in values) and not all(
+            value is not None for value in values
+        ):
+            raise ValueError("Expected Calendar source identity must be complete")
+        return self
 
     @field_validator("resolutions")
     @classmethod
@@ -688,7 +706,19 @@ def _read_source_window(
     expected_calendar_id: str | None = None,
     expected_time_zone: str | None = None,
 ) -> tuple[dict[str, Any], list[SourceOccurrence], str, datetime, datetime]:
-    client, connection, access_token = _access_context(config)
+    try:
+        client, connection, access_token = _access_context(config)
+    except HTTPException as exc:
+        if (
+            expected_connection_id is not None
+            and exc.status_code == 409
+            and exc.detail == "Google Calendar is not connected"
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Google Calendar connection changed; create a new preview",
+            ) from exc
+        raise
     if (
         expected_connection_id is not None
         and int(connection["id"]) != expected_connection_id
@@ -699,6 +729,11 @@ def _read_source_window(
         )
     calendar_id = str(connection.get("selected_calendar_id") or "").strip()
     if not calendar_id:
+        if expected_calendar_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Selected Google Calendar changed; create a new preview",
+            )
         raise HTTPException(status_code=409, detail="Select a Google Calendar first")
     if expected_calendar_id is not None and calendar_id != expected_calendar_id:
         raise HTTPException(
@@ -718,29 +753,36 @@ def _read_source_window(
         calendar_time_zone = (
             str(selected_calendar.time_zone or "").strip() or config.timezone_name
         )
-        if expected_time_zone is not None and calendar_time_zone != expected_time_zone:
-            raise HTTPException(
-                status_code=409,
-                detail="Google Calendar timezone changed; create a new preview",
-            )
-        if expected_time_zone is None and (
+        if (
             str(connection.get("selected_calendar_timezone") or "")
             != calendar_time_zone
             or str(connection.get("selected_calendar_name") or "")
             != selected_calendar.summary
         ):
-            store.select_calendar(
-                connection_id=int(connection["id"]),
-                calendar_id=calendar_id,
-                calendar_name=selected_calendar.summary,
-                calendar_timezone=calendar_time_zone,
-                expected_credential_version=int(connection["credential_version"]),
-            )
+            try:
+                store.select_calendar(
+                    connection_id=int(connection["id"]),
+                    calendar_id=calendar_id,
+                    calendar_name=selected_calendar.summary,
+                    calendar_timezone=calendar_time_zone,
+                    expected_credential_version=int(connection["credential_version"]),
+                    expected_selected_calendar_id=calendar_id,
+                )
+            except store.CalendarStoreError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Google Calendar connection changed; create a new preview",
+                ) from exc
             connection = {
                 **connection,
                 "selected_calendar_name": selected_calendar.summary,
                 "selected_calendar_timezone": calendar_time_zone,
             }
+        if expected_time_zone is not None and calendar_time_zone != expected_time_zone:
+            raise HTTPException(
+                status_code=409,
+                detail="Google Calendar timezone changed; create a new preview",
+            )
         if window_start is None:
             window_start, window_end = _preview_window_bounds(calendar_time_zone)
         elif window_end is None:
@@ -1059,6 +1101,9 @@ def _preview_response(
         "previewId": stored["id"],
         "previewFingerprint": preview.reviewed_fingerprint,
         "sourceFingerprint": preview.source_fingerprint,
+        "connectionId": int(stored["connection_id"]),
+        "calendarId": str(stored["calendar_id"]),
+        "calendarTimeZone": str(stored["payload"]["calendarTimeZone"]),
         "expiresAt": stored["expires_at"].isoformat(),
         "rangeStart": stored["range_start"].isoformat(),
         "rangeEnd": stored["range_end"].isoformat(),
@@ -1107,7 +1152,13 @@ def _register_preview_routes(
             calendar_time_zone,
             window_start,
             range_end,
-        ) = _read_source_window(config, window_start=None)
+        ) = _read_source_window(
+            config,
+            window_start=None,
+            expected_connection_id=payload.expectedConnectionId,
+            expected_calendar_id=payload.expectedCalendarId,
+            expected_time_zone=payload.expectedCalendarTimeZone,
+        )
         try:
             preview = _build_reviewed_preview(
                 config=config,
@@ -1119,26 +1170,33 @@ def _register_preview_routes(
             )
         except PlanningContractError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        stored = store.create_preview(
-            connection_id=int(connection["id"]),
-            calendar_id=str(connection["selected_calendar_id"]),
-            range_start=window_start,
-            range_end=range_end,
-            source_fingerprint=preview.source_fingerprint,
-            preview_fingerprint=preview.reviewed_fingerprint,
-            payload={
-                "resolutions": [
-                    {
-                        **resolution.model_dump(),
-                        "crewProvided": bool(resolution.crewProvided),
-                        "employeesProvided": bool(resolution.employeesProvided),
-                    }
-                    for resolution in payload.resolutions
-                ],
-                "calendarTimeZone": calendar_time_zone,
-            },
-            admin_id=int(admin["id"]),
-        )
+        try:
+            stored = store.create_preview(
+                connection_id=int(connection["id"]),
+                calendar_id=str(connection["selected_calendar_id"]),
+                calendar_timezone=calendar_time_zone,
+                range_start=window_start,
+                range_end=range_end,
+                source_fingerprint=preview.source_fingerprint,
+                preview_fingerprint=preview.reviewed_fingerprint,
+                payload={
+                    "resolutions": [
+                        {
+                            **resolution.model_dump(),
+                            "crewProvided": bool(resolution.crewProvided),
+                            "employeesProvided": bool(resolution.employeesProvided),
+                        }
+                        for resolution in payload.resolutions
+                    ],
+                    "calendarTimeZone": calendar_time_zone,
+                },
+                admin_id=int(admin["id"]),
+            )
+        except store.CalendarStoreError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Google Calendar connection changed; create a new preview",
+            ) from exc
         return _preview_response(config=config, stored=stored, preview=preview)
 
     @router.post("/api/admin/google-calendar/approve")
@@ -1238,6 +1296,7 @@ def build_calendar_import_router(
         return {
             "configured": configured,
             "connected": bool(connection),
+            "connectionId": int(connection["id"]) if connection else None,
             "scope": " ".join(CALENDAR_READONLY_SCOPES),
             "scopes": list(CALENDAR_READONLY_SCOPES),
             "accountEmail": connection.get("google_account_email")
@@ -1391,7 +1450,9 @@ def build_calendar_import_router(
                 connection_id=int(connection["id"]),
                 calendar_id=selected.calendar_id,
                 calendar_name=selected.summary,
-                calendar_timezone=selected.time_zone,
+                calendar_timezone=(
+                    str(selected.time_zone or "").strip() or config.timezone_name
+                ),
                 expected_credential_version=int(connection["credential_version"]),
             )
         except store.CalendarStoreError as exc:

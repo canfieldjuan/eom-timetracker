@@ -608,6 +608,7 @@ def select_calendar(
     calendar_name: str,
     calendar_timezone: str | None,
     expected_credential_version: int,
+    expected_selected_calendar_id: str | None = None,
 ) -> None:
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -636,6 +637,13 @@ def select_calendar(
             selected_calendar_id = str(
                 connection.get("selected_calendar_id") or ""
             ).strip()
+            if (
+                expected_selected_calendar_id is not None
+                and selected_calendar_id != expected_selected_calendar_id
+            ):
+                raise CalendarStoreError(
+                    "Selected Google Calendar changed; reload the Calendar list"
+                )
             if selected_calendar_id != calendar_id:
                 cur.execute(
                     """
@@ -1085,6 +1093,7 @@ def create_preview(
     *,
     connection_id: int,
     calendar_id: str,
+    calendar_timezone: str,
     range_start: datetime,
     range_end: datetime,
     source_fingerprint: str,
@@ -1095,30 +1104,56 @@ def create_preview(
 ) -> dict[str, Any]:
     preview_id = secrets.token_urlsafe(24)
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)
-    row = db.query_one(
-        """
-        INSERT INTO calendar_import_previews (
-            id, connection_id, calendar_id, range_start, range_end,
-            source_fingerprint, preview_fingerprint, payload,
-            created_by, expires_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
-        RETURNING id, connection_id, calendar_id, range_start, range_end,
-                  source_fingerprint, preview_fingerprint, payload, status,
-                  created_by, created_at, expires_at, applied_at, result
-        """,
-        (
-            preview_id,
-            connection_id,
-            calendar_id,
-            range_start,
-            range_end,
-            source_fingerprint,
-            preview_fingerprint,
-            json.dumps(payload),
-            admin_id,
-            expires_at,
-        ),
-    )
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", ("google-calendar",)
+            )
+            cur.execute(
+                """
+                SELECT selected_calendar_id, selected_calendar_timezone
+                FROM google_calendar_connections
+                WHERE id = %s AND revoked_at IS NULL
+                FOR UPDATE
+                """,
+                (connection_id,),
+            )
+            connection = cur.fetchone()
+            if (
+                not connection
+                or str(connection.get("selected_calendar_id") or "") != calendar_id
+                or str(connection.get("selected_calendar_timezone") or "")
+                != calendar_timezone
+            ):
+                raise CalendarStoreError(
+                    "Google Calendar connection changed before preview"
+                )
+            cur.execute(
+                """
+                INSERT INTO calendar_import_previews (
+                    id, connection_id, calendar_id, range_start, range_end,
+                    source_fingerprint, preview_fingerprint, payload,
+                    created_by, expires_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                RETURNING id, connection_id, calendar_id, range_start, range_end,
+                          source_fingerprint, preview_fingerprint, payload, status,
+                          created_by, created_at, expires_at, applied_at, result
+                """,
+                (
+                    preview_id,
+                    connection_id,
+                    calendar_id,
+                    range_start,
+                    range_end,
+                    source_fingerprint,
+                    preview_fingerprint,
+                    json.dumps(payload),
+                    admin_id,
+                    expires_at,
+                ),
+            )
+            result = cur.fetchone()
+            row = dict(result) if result else None
     if not row:  # pragma: no cover - PostgreSQL RETURNING invariant
         raise CalendarStoreError("Calendar preview could not be saved")
     return row

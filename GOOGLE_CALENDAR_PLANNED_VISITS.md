@@ -79,9 +79,13 @@ arrivals, and server timestamps remain the only actual-work evidence.
      must retain actor and source provenance.
 
 5. **Reachable operator workflow and proof**
-   - Wire the currently used admin portal to connection status, calendar
-     selection, preview, manual resolution, warnings, and approval. The other
-     overlapping portal is not consolidated or redesigned in this arc.
+   - Wire the currently used admin portal at
+     `https://effinghamofficemaids.com/portal.html` to connection status,
+     calendar selection, preview, manual resolution, warnings, and approval.
+     That surface lives in the companion website repository and ships through
+     [website PR #24](https://github.com/canfieldjuan/Effingham_Office_Maids_Website/pull/24)
+     after this backend deploys. The separately backend-served overlapping
+     portal is not consolidated or redesigned in this arc.
    - Enforce existing admin authentication/authorization at every new endpoint.
    - Add focused unit tests for normalization, stable identity, matching,
      overlaps, and soft-time semantics; database-backed tests for idempotent
