@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+from psycopg2.errors import UniqueViolation
 
 from conftest import _raw_conn
 
@@ -816,6 +817,18 @@ def test_weekly_schedules_keep_equal_named_customers_distinct_by_site(
         ],
         key=lambda row: row["id"],
     )
+    with pytest.raises(UniqueViolation):
+        db.execute(
+            """
+            INSERT INTO schedules (
+                employee_id, location_id, customer_name, week_start,
+                scheduled_hours, notes
+            )
+            VALUES (%s, %s, 'Different snapshot', '2026-09-06', 1.0,
+                    'Fresh schema exact Site duplicate')
+            """,
+            (employee_id, first_site["id"]),
+        )
 
     update_first = client.post(
         "/api/admin/schedules",
@@ -903,6 +916,18 @@ def test_weekly_schedules_keep_equal_named_customers_distinct_by_site(
         "scheduled_hours": 1.5,
         "notes": "Legacy name-only row",
     }
+    with pytest.raises(UniqueViolation):
+        db.execute(
+            """
+            INSERT INTO schedules (
+                employee_id, location_id, customer_name, week_start,
+                scheduled_hours, notes
+            )
+            VALUES (%s, NULL, %s, '2026-09-13', 2.0,
+                    'Fresh schema unresolved duplicate')
+            """,
+            (employee_id, shared_name),
+        )
 
     for site, hours, hour in (
         (first_site, 1.0, 12),

@@ -142,8 +142,12 @@ CREATE TABLE schedules (
 
 CREATE INDEX idx_schedules_week ON schedules(week_start);
 CREATE INDEX idx_schedules_employee ON schedules(employee_id);
-CREATE INDEX idx_schedules_site_week
-    ON schedules(employee_id, location_id, week_start);
+CREATE UNIQUE INDEX uq_schedules_employee_site_week
+    ON schedules(employee_id, location_id, week_start)
+    WHERE location_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_schedules_employee_legacy_name_week
+    ON schedules(employee_id, customer_name, week_start)
+    WHERE location_id IS NULL;
 
 -- Exact employee/site start times used only for QR arrival classification.
 -- The existing schedules table stores weekly hour totals and cannot determine
