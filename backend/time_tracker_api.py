@@ -2402,6 +2402,23 @@ ATLAS_RECEIVABLES_SERVICE_TOKEN = os.getenv(
 ATLAS_RECEIVABLES_TIMEOUT_SECONDS = max(
     1.0, float(os.getenv("ATLAS_RECEIVABLES_TIMEOUT_SECONDS", "10"))
 )
+GOOGLE_CALENDAR_CLIENT_ID = os.getenv("GOOGLE_CALENDAR_CLIENT_ID", "").strip()
+GOOGLE_CALENDAR_CLIENT_SECRET = os.getenv(
+    "GOOGLE_CALENDAR_CLIENT_SECRET", ""
+).strip()
+GOOGLE_CALENDAR_REDIRECT_URI = os.getenv(
+    "GOOGLE_CALENDAR_REDIRECT_URI", ""
+).strip()
+GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY = os.getenv(
+    "GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY", ""
+).strip()
+GOOGLE_CALENDAR_PORTAL_URL = os.getenv(
+    "GOOGLE_CALENDAR_PORTAL_URL",
+    "https://effinghamofficemaids.com/portal.html",
+).strip()
+GOOGLE_CALENDAR_TIMEOUT_SECONDS = max(
+    1.0, float(os.getenv("GOOGLE_CALENDAR_TIMEOUT_SECONDS", "10"))
+)
 PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "").strip().rstrip("/")
 if PUBLIC_APP_URL and not re.fullmatch(r"https?://[^\s]+", PUBLIC_APP_URL):
     raise RuntimeError("PUBLIC_APP_URL must be an absolute http or https URL")
@@ -3710,6 +3727,13 @@ def _ensure_schema_migrations() -> None:
             (key, json.dumps(default_val)),
         )
 
+    # Calendar planning is an additive domain. Keeping its migration in the
+    # focused module prevents accidental coupling to shifts, QR evidence,
+    # customer/location writes, or receivables.
+    from calendar_import_store import ensure_schema as ensure_calendar_schema
+
+    ensure_calendar_schema()
+
 
 def _auto_migrate_if_empty() -> bool:
     """Run JSON->PostgreSQL migration if the employees table is empty."""
@@ -3747,6 +3771,11 @@ def startup_event() -> None:
     if imported_legacy_json:
         _ensure_customer_site_schema()
     apply_bootstrap_admins()
+    from calendar_import_store import bootstrap_morning_crew_memberships
+
+    bootstrap_morning_crew_memberships(
+        effective_from=datetime.now(APP_TIMEZONE).date()
+    )
 
 
 def _site_check_in_url(request: Request, token: str) -> str:
@@ -11506,10 +11535,51 @@ def admin_analytics_customer(
     }
 
 
+# Calendar import routes are registered through a focused factory so protocol,
+# persistence, and planning rules remain outside this timekeeping module.
+from calendar_import_api import (
+    CalendarImportConfig,
+    CalendarOAuthAccessLogFilter,
+    build_calendar_import_router,
+)
+
+app.include_router(
+    build_calendar_import_router(
+        config=CalendarImportConfig(
+            client_id=GOOGLE_CALENDAR_CLIENT_ID,
+            client_secret=GOOGLE_CALENDAR_CLIENT_SECRET,
+            redirect_uri=GOOGLE_CALENDAR_REDIRECT_URI,
+            encryption_key=GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY,
+            portal_url=GOOGLE_CALENDAR_PORTAL_URL,
+            timeout_seconds=GOOGLE_CALENDAR_TIMEOUT_SECONDS,
+            timezone_name=TIMEZONE_NAME,
+        ),
+        get_current_admin=get_current_admin,
+    )
+)
+
+
 if __name__ == "__main__":
+    import copy
+
     import uvicorn
 
     host = os.getenv("TIMETRACKER_HOST", "0.0.0.0")
     port = parse_int(os.getenv("PORT") or os.getenv("TIMETRACKER_PORT"), 9000)
     dev = os.getenv("ENV", "production").lower() == "development"
-    uvicorn.run("time_tracker_api:app", host=host, port=port, reload=dev)
+    log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    log_config.setdefault("filters", {})["calendar_oauth_redaction"] = {
+        "()": CalendarOAuthAccessLogFilter,
+    }
+    access_handler = log_config["handlers"]["access"]
+    access_handler["filters"] = [
+        *access_handler.get("filters", []),
+        "calendar_oauth_redaction",
+    ]
+    uvicorn.run(
+        "time_tracker_api:app",
+        host=host,
+        port=port,
+        reload=dev,
+        log_config=log_config,
+    )
