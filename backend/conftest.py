@@ -47,6 +47,7 @@ os.environ.setdefault(
 os.environ.setdefault(
     "GOOGLE_CALENDAR_PORTAL_URL", "https://portal.example.test/portal.html"
 )
+os.environ.setdefault("PUBLIC_APP_URL", "https://portal.example.test")
 
 SCHEMA_FILE = BACKEND_DIR / "schema.sql"
 

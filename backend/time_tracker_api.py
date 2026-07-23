@@ -3822,14 +3822,22 @@ def _canonical_portal_base(request: Request) -> Optional[str]:
     return PUBLIC_APP_URL
 
 
-def _site_check_in_url(request: Request, token: str) -> str:
+def _require_canonical_portal_base(request: Request) -> str:
     portal_base = _canonical_portal_base(request)
-    if portal_base:
-        # Canonical EOM portal (issue #35): /portal, not /portal.html — the
-        # website deploy uses cleanUrls and 308-hops the .html form.
-        return f"{portal_base}/portal?checkIn={quote(token, safe='')}"
-    app_url = PUBLIC_APP_URL or str(request.base_url).rstrip("/")
-    return f"{app_url}/?checkIn={token}"
+    if not portal_base:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="QR check-in portal is not configured",
+            headers={"Cache-Control": "no-store"},
+        )
+    return portal_base
+
+
+def _site_check_in_url(request: Request, token: str) -> str:
+    portal_base = _require_canonical_portal_base(request)
+    # Canonical EOM portal (issue #35): /portal, not /portal.html — the
+    # website deploy uses cleanUrls and 308-hops the .html form.
+    return f"{portal_base}/portal?checkIn={quote(token, safe='')}"
 
 
 def _resolve_site_check_in_qr(
@@ -4766,10 +4774,11 @@ def time_tracker_page(
 ) -> Response:
     # QR check-in deep links belong to the canonical EOM portal (issue #35).
     # Forward ONLY the checkIn value — other params (e.g. apiBaseUrl) must not
-    # ride a printed-QR redirect. 302 + no-store so rollback (unsetting
-    # PUBLIC_APP_URL) is not defeated by phone browsers caching the redirect.
-    portal_base = _canonical_portal_base(request)
-    if check_in and portal_base:
+    # ride a printed-QR redirect. 302 + no-store prevents phone browsers from
+    # caching a cutover destination. If the canonical portal is unavailable,
+    # fail closed instead of serving a legacy page that cannot submit the QR.
+    if check_in:
+        portal_base = _require_canonical_portal_base(request)
         return RedirectResponse(
             f"{portal_base}/portal?checkIn={quote(check_in, safe='')}",
             status_code=302,
@@ -5002,6 +5011,10 @@ def admin_site_check_in_qr(
     )
     if not site or not site.get("active"):
         raise HTTPException(status_code=404, detail="Active site not found")
+
+    # Validate the destination before creating or rotating a token. A failed
+    # configuration check must not revoke an already-printed QR code.
+    _require_canonical_portal_base(request)
 
     nonce = str(site.get("check_in_token_nonce") or "")
     rotated = False

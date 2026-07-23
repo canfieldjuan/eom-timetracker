@@ -2,10 +2,9 @@
 
 GET / and GET /timetracker-mobile.html must 302 QR deep links
 (?checkIn=<token>) to {PUBLIC_APP_URL}/portal when PUBLIC_APP_URL points at
-the canonical EOM portal, and keep serving the legacy Firefly page in every
-other state (env unset, param absent or empty, self-origin configuration).
-The redirect must forward ONLY the checkIn value and must never be cacheable,
-so unsetting PUBLIC_APP_URL rolls the cutover back completely.
+the canonical EOM portal. Requests without a usable external portal fail closed
+instead of serving or generating a nonfunctional backend QR path. The redirect
+must forward ONLY the checkIn value and must never be cacheable.
 """
 
 from __future__ import annotations
@@ -74,11 +73,14 @@ def test_empty_param_serves_legacy_page(client, portal_env):
     assert PAGE_MARKER in resp.text
 
 
-def test_unset_public_app_url_serves_legacy_page(client):
-    assert time_tracker_api.PUBLIC_APP_URL == ""
-    resp = _get(client, "/", params={"checkIn": "tok"})
-    assert resp.status_code == 200
-    assert PAGE_MARKER in resp.text
+def test_unset_public_app_url_fails_closed(client, monkeypatch):
+    monkeypatch.setattr(time_tracker_api, "PUBLIC_APP_URL", "")
+    for path in ("/", "/timetracker-mobile.html"):
+        resp = _get(client, path, params={"checkIn": "tok"})
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "QR check-in portal is not configured"
+        assert resp.headers["cache-control"] == "no-store"
+        assert PAGE_MARKER not in resp.text
 
 
 def test_self_origin_public_app_url_never_redirects(client, monkeypatch):
@@ -88,8 +90,10 @@ def test_self_origin_public_app_url_never_redirects(client, monkeypatch):
     # public one, and a scheme-sensitive check would still loop.
     monkeypatch.setattr(time_tracker_api, "PUBLIC_APP_URL", "https://testserver")
     resp = _get(client, "/", params={"checkIn": "tok"})
-    assert resp.status_code == 200
-    assert PAGE_MARKER in resp.text
+    assert resp.status_code == 503
+    assert resp.json()["error"] == "QR check-in portal is not configured"
+    assert resp.headers["cache-control"] == "no-store"
+    assert PAGE_MARKER not in resp.text
 
 
 def test_generated_qr_url_targets_portal_when_configured(
@@ -99,15 +103,36 @@ def test_generated_qr_url_targets_portal_when_configured(
     assert data["checkInUrl"] == f"{PORTAL}/portal?checkIn={data['token']}"
 
 
-def test_generated_qr_url_keeps_legacy_shape_when_unset(client, auth, location_id):
-    assert time_tracker_api.PUBLIC_APP_URL == ""
-    data = create_site_qr(client, auth, location_id)
-    assert data["checkInUrl"] == f"http://testserver/?checkIn={data['token']}"
+def test_generated_qr_fails_closed_when_unset(client, auth, location_id, monkeypatch):
+    monkeypatch.setattr(time_tracker_api, "PUBLIC_APP_URL", "")
+    response = client.post(
+        f"/api/admin/locations/{location_id}/check-in-qr",
+        headers=auth,
+        json={"rotate": False},
+    )
+    assert response.status_code == 503
+    assert response.json()["error"] == "QR check-in portal is not configured"
+    assert response.headers["cache-control"] == "no-store"
 
 
-def test_generated_qr_url_keeps_legacy_shape_for_self_origin(
+def test_generated_qr_fails_closed_for_self_origin_without_rotating_token(
     client, auth, location_id, monkeypatch
 ):
+    before = time_tracker_api.db.query_one(
+        "SELECT check_in_token_nonce FROM locations WHERE id = %s",
+        (location_id,),
+    )
     monkeypatch.setattr(time_tracker_api, "PUBLIC_APP_URL", "https://testserver")
-    data = create_site_qr(client, auth, location_id)
-    assert data["checkInUrl"] == f"https://testserver/?checkIn={data['token']}"
+    response = client.post(
+        f"/api/admin/locations/{location_id}/check-in-qr",
+        headers=auth,
+        json={"rotate": True},
+    )
+    after = time_tracker_api.db.query_one(
+        "SELECT check_in_token_nonce FROM locations WHERE id = %s",
+        (location_id,),
+    )
+    assert response.status_code == 503
+    assert response.json()["error"] == "QR check-in portal is not configured"
+    assert response.headers["cache-control"] == "no-store"
+    assert after == before

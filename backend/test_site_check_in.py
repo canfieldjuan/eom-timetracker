@@ -150,8 +150,9 @@ class TestSiteQr:
     ):
         first = create_site_qr(client, auth, location_id)
         assert first["site"]["id"] == location_id
-        assert first["checkInUrl"].startswith("http://testserver/")
-        assert "?checkIn=eom1." in first["checkInUrl"]
+        assert first["checkInUrl"].startswith(
+            "https://portal.example.test/portal?checkIn=eom1."
+        )
         assert "<svg" in first["qrSvg"]
 
         resolved = client.post(
@@ -785,15 +786,25 @@ class TestSiteCheckInAdminReview:
         }
 
 
-def test_frontend_contains_scan_then_tap_contract():
+def test_legacy_frontend_retires_employee_qr_flow_but_keeps_admin_controls():
     html = (Path(__file__).parent / "timetracker-mobile.html").read_text()
-    assert "siteCheckInButton" in html
-    assert "queryParams.get('checkIn')" in html
-    assert "'/timesheet/site-check-in/resolve'" in html
-    assert "'/timesheet/site-check-in'" in html
+
+    assert 'id="siteCheckInButton"' not in html
+    assert "pendingSiteCheckIn" not in html
+    assert "queryParams.get('checkIn')" not in html
+    assert "'/timesheet/site-check-in/resolve'" not in html
+    assert "apiRequest('/timesheet/site-check-in'" not in html
+    assert "handleSiteCheckIn" not in html
+
+    # GPS remains shared by ordinary clock/arrival actions.
     assert "await getCurrentCoordinates()" in html
-    assert "token: state.pendingSiteCheckIn.token" in html
-    assert "scannedAt: state.pendingSiteCheckIn.scannedAt" in html
+
+    # Admin QR, scheduling, evidence, and reconciliation controls are separate
+    # capabilities and remain available until the full legacy portal retires.
+    assert 'id="loadSiteQrButton"' in html
+    assert 'id="rotateSiteQrButton"' in html
+    assert "siteQrDownload" in html
+    assert "`/admin/locations/${siteId}/check-in-qr`" in html
     assert "saveRecurringSiteCheckInSchedule" in html
     assert "'/admin/site-check-in-schedule-rules'" in html
     assert "siteCheckInWeekday" in html
@@ -806,3 +817,10 @@ def test_frontend_contains_scan_then_tap_contract():
     assert "filters.set('toDate', toDate)" in html
     assert "initializeSiteCheckInActivityDates" in html
     assert "data.siteCheckInPolicy.companyDate" in html
+
+    # Retiring QR handling must not disturb the legacy page's ordinary
+    # time-entry controls while the rest of that page remains available.
+    assert 'id="clockInButton"' in html
+    assert 'id="arriveButton"' in html
+    assert 'id="departButton"' in html
+    assert 'id="clockOutButton"' in html
