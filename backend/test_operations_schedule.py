@@ -1296,6 +1296,76 @@ def test_qr_only_presence_without_shift_is_retained_with_zero_hours(client, auth
     ]
 
 
+def test_only_accepted_qr_rows_create_schedule_presence(client, auth):
+    service_day = date(2026, 7, 20)
+    checked_in_at = datetime(2026, 7, 20, 15, tzinfo=timezone.utc)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "qr_review_states_residential",
+                "residential_morning",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "QR Review States",
+                site_type="Residential",
+                rate=125,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+            job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer QR Review States",
+                start=checked_in_at - timedelta(hours=1),
+                end=checked_in_at + timedelta(hours=1),
+                source_seed="qr-review-states",
+            )
+            for suffix, review_status in (
+                ("QR Pending", "pending"),
+                ("QR Rejected", "rejected"),
+                ("QR Approved", "approved"),
+            ):
+                employee_id = _employee(cur, suffix, 18)
+                cur.execute(
+                    """
+                    INSERT INTO site_check_ins (
+                        employee_id, location_id, server_checked_in_at,
+                        device_scanned_at, latitude, longitude, accuracy_m,
+                        geofence_radius_m, distance_m, geofence_status,
+                        classification, classification_reason,
+                        device_clock_skew_seconds, review_status
+                    )
+                    VALUES (
+                        %s, %s, %s, %s, 39.12, -88.54, 5,
+                        100, 3, 'inside', 'needs_review', 'test', 0, %s
+                    )
+                    """,
+                    (
+                        employee_id,
+                        site_id,
+                        checked_in_at,
+                        checked_in_at,
+                        review_status,
+                    ),
+                )
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(service_day), "end_date": str(service_day)},
+    )
+
+    assert response.status_code == 200, response.text
+    job = next(row for row in response.json()["jobs"] if row["id"] == job_id)
+    assert [worker["employeeName"] for worker in job["workers"]] == [
+        f"{TEST_PREFIX} Employee QR Approved"
+    ]
+    assert job["workers"][0]["intervals"][0]["evidence"] == ["qr_check_in"]
+
+
 def test_saturday_night_job_keeps_post_midnight_actual(client, auth):
     app_timezone = ZoneInfo("America/Chicago")
     service_day = date(2026, 7, 18)
