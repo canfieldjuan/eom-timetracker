@@ -1,7 +1,8 @@
 """Durable storage and secret handling for read-only Calendar imports.
 
-This module intentionally has no shift, payroll, QR, billing, or location-write
-dependencies. Google occurrences become planned-service obligations only.
+Calendar synchronization writes canonical jobs and reads existing work evidence
+only to prevent unsafe moves or cancellations. It never mutates shifts, payroll,
+QR evidence, billing, or Customer/Site records.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import secrets
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
+from zoneinfo import ZoneInfo
 
 import psycopg2.extras
 from cryptography.fernet import Fernet, InvalidToken
@@ -21,6 +23,17 @@ import db
 
 MORNING_CREW_NAME = "Morning Crew"
 MORNING_CREW_EXPECTED_NAMES = ("Carmen", "Pamela", "Tina")
+RESIDENTIAL_MORNING_ROLE = "residential_morning"
+COMMERCIAL_EVENING_NIGHT_ROLE = "commercial_evening_night"
+CALENDAR_SOURCE_ROLES = (
+    RESIDENTIAL_MORNING_ROLE,
+    COMMERCIAL_EVENING_NIGHT_ROLE,
+)
+CALENDAR_ROLE_LOCATION_TYPES = {
+    RESIDENTIAL_MORNING_ROLE: "Residential",
+    COMMERCIAL_EVENING_NIGHT_ROLE: "Commercial",
+}
+PRODUCT_TIMEZONE = ZoneInfo("America/Chicago")
 
 
 class CalendarStoreError(RuntimeError):
@@ -118,6 +131,70 @@ def ensure_schema() -> None:
             ON google_calendar_connections ((revoked_at IS NULL))
             WHERE revoked_at IS NULL;
 
+        CREATE TABLE IF NOT EXISTS google_calendar_sources (
+            id                 BIGSERIAL PRIMARY KEY,
+            connection_id      BIGINT NOT NULL REFERENCES google_calendar_connections(id),
+            role               VARCHAR(40) NOT NULL
+                                   CHECK (
+                                       role IN (
+                                           'residential_morning',
+                                           'commercial_evening_night'
+                                       )
+                                   ),
+            calendar_id        TEXT NOT NULL,
+            calendar_name      TEXT NOT NULL,
+            calendar_timezone  TEXT NOT NULL,
+            last_synced_at     TIMESTAMPTZ,
+            last_sync_status   VARCHAR(16) NOT NULL DEFAULT 'never'
+                                   CHECK (
+                                       last_sync_status IN ('never', 'success', 'failed')
+                                   ),
+            last_sync_error    TEXT,
+            last_sync_counts   JSONB,
+            last_sync_window_start TIMESTAMPTZ,
+            last_sync_window_end   TIMESTAMPTZ,
+            created_by         INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            updated_by         INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (connection_id, role),
+            UNIQUE (connection_id, calendar_id)
+        );
+
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS scheduled_start TIMESTAMPTZ;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS scheduled_end TIMESTAMPTZ;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS calendar_source_id
+            BIGINT REFERENCES google_calendar_sources(id);
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_calendar_id TEXT;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_event_id TEXT;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_series_id TEXT;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_occurrence_id TEXT;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_key VARCHAR(64)
+            CHECK (source_key IS NULL OR source_key ~ '^[0-9a-f]{64}$');
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_fingerprint VARCHAR(64)
+            CHECK (
+                source_fingerprint IS NULL
+                OR source_fingerprint ~ '^[0-9a-f]{64}$'
+            );
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_etag TEXT;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_updated_at TIMESTAMPTZ;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_title TEXT;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_location_text TEXT;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_timezone TEXT;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS source_all_day
+            BOOLEAN NOT NULL DEFAULT false;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+        ALTER TABLE jobs ADD COLUMN IF NOT EXISTS updated_at
+            TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_google_source_key
+            ON jobs(source_key) WHERE source_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_google_calendar_sources_connection
+            ON google_calendar_sources(connection_id, role);
+        CREATE INDEX IF NOT EXISTS idx_jobs_calendar_source_window
+            ON jobs(calendar_source_id, scheduled_start, status);
+
         CREATE TABLE IF NOT EXISTS google_calendar_oauth_states (
             state_hash                 VARCHAR(64) PRIMARY KEY
                                            CHECK (state_hash ~ '^[0-9a-f]{64}$'),
@@ -185,6 +262,14 @@ def ensure_schema() -> None:
             calendar_id       TEXT NOT NULL,
             source_key        VARCHAR(64) NOT NULL
                                   CHECK (source_key ~ '^[0-9a-f]{64}$'),
+            source_series_id  TEXT,
+            mapping_scope     VARCHAR(16) NOT NULL DEFAULT 'occurrence'
+                                  CHECK (mapping_scope IN ('occurrence', 'series')),
+            source_fingerprint VARCHAR(64)
+                                  CHECK (
+                                      source_fingerprint IS NULL
+                                      OR source_fingerprint ~ '^[0-9a-f]{64}$'
+                                  ),
             location_id       INTEGER NOT NULL REFERENCES locations(id),
             created_by        INTEGER REFERENCES employees(id) ON DELETE SET NULL,
             updated_by        INTEGER REFERENCES employees(id) ON DELETE SET NULL,
@@ -192,6 +277,19 @@ def ensure_schema() -> None:
             updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE (source_key)
         );
+
+        ALTER TABLE google_calendar_event_mappings
+            ADD COLUMN IF NOT EXISTS source_series_id TEXT;
+        ALTER TABLE google_calendar_event_mappings
+            ADD COLUMN IF NOT EXISTS mapping_scope
+                VARCHAR(16) NOT NULL DEFAULT 'occurrence'
+                CHECK (mapping_scope IN ('occurrence', 'series'));
+        ALTER TABLE google_calendar_event_mappings
+            ADD COLUMN IF NOT EXISTS source_fingerprint VARCHAR(64)
+                CHECK (
+                    source_fingerprint IS NULL
+                    OR source_fingerprint ~ '^[0-9a-f]{64}$'
+                );
 
         CREATE TABLE IF NOT EXISTS planned_service_visits (
             id                    BIGSERIAL PRIMARY KEY,
@@ -219,6 +317,7 @@ def ensure_schema() -> None:
                                       CHECK (status IN ('planned', 'cancelled', 'completed')),
             cancelled_at          TIMESTAMPTZ,
             completed_at          TIMESTAMPTZ,
+            migrated_job_id       INTEGER REFERENCES jobs(id),
             last_preview_id       TEXT REFERENCES calendar_import_previews(id),
             last_imported_by      INTEGER REFERENCES employees(id) ON DELETE SET NULL,
             created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -227,6 +326,9 @@ def ensure_schema() -> None:
             CHECK (status <> 'cancelled' OR cancelled_at IS NOT NULL),
             CHECK (status <> 'completed' OR completed_at IS NOT NULL)
         );
+
+        ALTER TABLE planned_service_visits
+            ADD COLUMN IF NOT EXISTS migrated_job_id INTEGER REFERENCES jobs(id);
 
         CREATE TABLE IF NOT EXISTS planned_visit_assignments (
             id                  BIGSERIAL PRIMARY KEY,
@@ -271,6 +373,11 @@ def ensure_schema() -> None:
             ON calendar_import_previews(status, expires_at);
         CREATE INDEX IF NOT EXISTS idx_google_calendar_event_mappings_source
             ON google_calendar_event_mappings(connection_id, calendar_id, source_key);
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_google_calendar_event_mappings_series
+            ON google_calendar_event_mappings(
+                connection_id, calendar_id, source_series_id
+            )
+            WHERE mapping_scope = 'series' AND source_series_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_planned_service_visits_window
             ON planned_service_visits(approximate_start, status);
         CREATE INDEX IF NOT EXISTS idx_planned_service_visits_source
@@ -281,6 +388,7 @@ def ensure_schema() -> None:
             ON planned_visit_audit_events(planned_visit_id, created_at);
         """
     )
+    migrate_legacy_planned_visits()
 
 
 def _state_hash(state: str) -> str:
@@ -527,6 +635,22 @@ def reauthorize_active_connection(
                 )
             cur.execute(
                 """
+                SELECT calendar_id
+                FROM google_calendar_sources
+                WHERE connection_id = %s
+                """,
+                (connection_id,),
+            )
+            configured_source_ids = {
+                str(row["calendar_id"]).strip() for row in cur.fetchall()
+            }
+            if not configured_source_ids.issubset(accessible):
+                raise CalendarStoreError(
+                    "The reauthorized Google account cannot access all configured "
+                    "Calendar sources"
+                )
+            cur.execute(
+                """
                 UPDATE google_calendar_connections
                 SET google_account_email = %s, credential_ciphertext = %s,
                     granted_scopes = %s, connected_by = %s,
@@ -722,6 +846,23 @@ def disconnect_calendar(
                         "Resolve or cancel future planned visits before disconnecting "
                         "Google Calendar"
                     )
+            cur.execute(
+                """
+                SELECT 1
+                FROM jobs j
+                JOIN google_calendar_sources s ON s.id = j.calendar_source_id
+                WHERE s.connection_id = %s
+                  AND j.status <> 'cancelled'
+                  AND COALESCE(j.scheduled_end, j.scheduled_start) > NOW()
+                LIMIT 1
+                """,
+                (connection_id,),
+            )
+            if cur.fetchone():
+                raise CalendarStoreError(
+                    "Resolve or cancel future scheduled work before disconnecting "
+                    "Google Calendar"
+                )
             if before_disconnect is not None:
                 before_disconnect()
             cur.execute(
@@ -1852,3 +1993,1387 @@ def apply_reviewed_preview(
                 (json.dumps(result), preview_id),
             )
             return result
+
+
+def list_calendar_sources(*, connection_id: int | None = None) -> list[dict[str, Any]]:
+    """Return the two canonical Calendar bindings without exposing credentials."""
+
+    if connection_id is None:
+        connection = active_connection()
+        if not connection:
+            return []
+        connection_id = int(connection["id"])
+    return db.query_all(
+        """
+        SELECT id, connection_id, role, calendar_id, calendar_name,
+               calendar_timezone, last_synced_at, last_sync_status,
+               last_sync_error, last_sync_counts, last_sync_window_start,
+               last_sync_window_end, created_at, updated_at
+        FROM google_calendar_sources
+        WHERE connection_id = %s
+        ORDER BY role
+        """,
+        (connection_id,),
+    )
+
+
+def replace_calendar_sources(
+    *,
+    connection_id: int,
+    expected_credential_version: int,
+    bindings: Iterable[dict[str, str]],
+    actor_id: int,
+    actor_name: str,
+) -> list[dict[str, Any]]:
+    """Atomically install the two distinct, pre-validated readable Calendars."""
+
+    rows = [dict(binding) for binding in bindings]
+    by_role = {str(row.get("role") or ""): row for row in rows}
+    if set(by_role) != set(CALENDAR_SOURCE_ROLES) or len(rows) != len(by_role):
+        raise CalendarStoreError("Both Calendar source roles are required")
+    calendar_ids = [
+        str(by_role[role].get("calendar_id") or "").strip()
+        for role in CALENDAR_SOURCE_ROLES
+    ]
+    if any(not calendar_id for calendar_id in calendar_ids):
+        raise CalendarStoreError("Both Calendar source IDs are required")
+    if len(set(calendar_ids)) != len(calendar_ids):
+        raise CalendarStoreError(
+            "Residential and Commercial Calendars must be different"
+        )
+    for role in CALENDAR_SOURCE_ROLES:
+        for field in ("calendar_name", "calendar_timezone"):
+            if not str(by_role[role].get(field) or "").strip():
+                raise CalendarStoreError("Calendar source metadata is incomplete")
+
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("google-calendar-sources",),
+            )
+            cur.execute(
+                """
+                SELECT id, credential_version
+                FROM google_calendar_connections
+                WHERE id = %s AND revoked_at IS NULL
+                FOR UPDATE
+                """,
+                (connection_id,),
+            )
+            connection = cur.fetchone()
+            if not connection:
+                raise CalendarStoreError(
+                    "Google Calendar connection is no longer active"
+                )
+            if int(connection["credential_version"]) != expected_credential_version:
+                raise CalendarStoreError(
+                    "Google Calendar credentials changed; reload the Calendar list"
+                )
+            cur.execute(
+                """
+                SELECT id, role, calendar_id
+                FROM google_calendar_sources
+                WHERE connection_id = %s
+                FOR UPDATE
+                """,
+                (connection_id,),
+            )
+            existing_by_role = {str(row["role"]): row for row in cur.fetchall()}
+            for role, existing in existing_by_role.items():
+                replacement_id = str(by_role[role]["calendar_id"]).strip()
+                if str(existing["calendar_id"]) == replacement_id:
+                    continue
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM jobs
+                    WHERE calendar_source_id = %s
+                      AND status <> 'cancelled'
+                      AND COALESCE(scheduled_end, scheduled_start) > NOW()
+                    LIMIT 1
+                    """,
+                    (int(existing["id"]),),
+                )
+                if cur.fetchone():
+                    raise CalendarStoreError(
+                        "Resolve future scheduled work before replacing a Calendar source"
+                    )
+            # Move changed IDs out of the unique-key space before either role is
+            # updated. This keeps a no-work role swap atomic instead of letting
+            # the first upsert collide with the second role's prior Calendar.
+            for role, existing in existing_by_role.items():
+                replacement_id = str(by_role[role]["calendar_id"]).strip()
+                if str(existing["calendar_id"]) == replacement_id:
+                    continue
+                cur.execute(
+                    """
+                    UPDATE google_calendar_sources
+                    SET calendar_id = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        f"pending-calendar-source-{int(existing['id'])}-"
+                        f"{secrets.token_hex(8)}",
+                        int(existing["id"]),
+                    ),
+                )
+
+            for role in CALENDAR_SOURCE_ROLES:
+                binding = by_role[role]
+                cur.execute(
+                    """
+                    INSERT INTO google_calendar_sources (
+                        connection_id, role, calendar_id, calendar_name,
+                        calendar_timezone, created_by, updated_by
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (connection_id, role) DO UPDATE
+                    SET calendar_id = EXCLUDED.calendar_id,
+                        calendar_name = EXCLUDED.calendar_name,
+                        calendar_timezone = EXCLUDED.calendar_timezone,
+                        last_synced_at = CASE
+                            WHEN google_calendar_sources.calendar_id
+                                 = EXCLUDED.calendar_id
+                             AND google_calendar_sources.calendar_timezone
+                                 = EXCLUDED.calendar_timezone
+                            THEN google_calendar_sources.last_synced_at
+                            ELSE NULL
+                        END,
+                        last_sync_status = CASE
+                            WHEN google_calendar_sources.calendar_id
+                                 = EXCLUDED.calendar_id
+                             AND google_calendar_sources.calendar_timezone
+                                 = EXCLUDED.calendar_timezone
+                            THEN google_calendar_sources.last_sync_status
+                            ELSE 'never'
+                        END,
+                        last_sync_error = NULL,
+                        last_sync_counts = CASE
+                            WHEN google_calendar_sources.calendar_id
+                                 = EXCLUDED.calendar_id
+                             AND google_calendar_sources.calendar_timezone
+                                 = EXCLUDED.calendar_timezone
+                            THEN google_calendar_sources.last_sync_counts
+                            ELSE NULL
+                        END,
+                        last_sync_window_start = CASE
+                            WHEN google_calendar_sources.calendar_id
+                                 = EXCLUDED.calendar_id
+                             AND google_calendar_sources.calendar_timezone
+                                 = EXCLUDED.calendar_timezone
+                            THEN google_calendar_sources.last_sync_window_start
+                            ELSE NULL
+                        END,
+                        last_sync_window_end = CASE
+                            WHEN google_calendar_sources.calendar_id
+                                 = EXCLUDED.calendar_id
+                             AND google_calendar_sources.calendar_timezone
+                                 = EXCLUDED.calendar_timezone
+                            THEN google_calendar_sources.last_sync_window_end
+                            ELSE NULL
+                        END,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    """,
+                    (
+                        connection_id,
+                        role,
+                        str(binding["calendar_id"]).strip(),
+                        str(binding["calendar_name"]).strip(),
+                        str(binding["calendar_timezone"]).strip(),
+                        actor_id,
+                        actor_id,
+                    ),
+                )
+
+            residential = by_role[RESIDENTIAL_MORNING_ROLE]
+            cur.execute(
+                """
+                UPDATE google_calendar_connections
+                SET selected_calendar_id = %s,
+                    selected_calendar_name = %s,
+                    selected_calendar_timezone = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    str(residential["calendar_id"]).strip(),
+                    str(residential["calendar_name"]).strip(),
+                    str(residential["calendar_timezone"]).strip(),
+                    connection_id,
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO planned_visit_audit_events (
+                    action, actor_employee_id, actor_name, after_state
+                ) VALUES ('calendar_sources_configured', %s, %s, %s::jsonb)
+                """,
+                (
+                    actor_id,
+                    actor_name,
+                    json.dumps(
+                        {
+                            "connectionId": connection_id,
+                            "sources": [
+                                {
+                                    "role": role,
+                                    "calendarId": str(by_role[role]["calendar_id"]),
+                                }
+                                for role in CALENDAR_SOURCE_ROLES
+                            ],
+                        }
+                    ),
+                ),
+            )
+    return list_calendar_sources(connection_id=connection_id)
+
+
+def mark_calendar_source_sync_failed(
+    *,
+    source_id: int,
+    expected_credential_version: int,
+    expected_calendar_id: str,
+    expected_calendar_timezone: str,
+    window_start: datetime,
+    window_end: datetime,
+    message: str,
+) -> bool:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT connection_id FROM google_calendar_sources WHERE id = %s",
+                (source_id,),
+            )
+            source_reference = cur.fetchone()
+            if not source_reference:
+                return False
+            connection_id = int(source_reference["connection_id"])
+            cur.execute(
+                """
+                SELECT revoked_at, credential_version
+                FROM google_calendar_connections
+                WHERE id = %s
+                FOR SHARE
+                """,
+                (connection_id,),
+            )
+            connection = cur.fetchone()
+            if not connection or connection["revoked_at"] is not None:
+                return False
+            if int(connection["credential_version"]) != expected_credential_version:
+                return False
+            cur.execute(
+                """
+                UPDATE google_calendar_sources
+                SET last_synced_at = NOW(), last_sync_status = 'failed',
+                    last_sync_error = %s, last_sync_counts = NULL,
+                    last_sync_window_start = %s, last_sync_window_end = %s,
+                    updated_at = NOW()
+                WHERE id = %s AND connection_id = %s
+                  AND calendar_id = %s AND calendar_timezone = %s
+                RETURNING id
+                """,
+                (
+                    message[:500],
+                    window_start,
+                    window_end,
+                    source_id,
+                    connection_id,
+                    expected_calendar_id,
+                    expected_calendar_timezone,
+                ),
+            )
+            return cur.fetchone() is not None
+
+
+def read_canonical_source_identities(
+    *, source_id: int, range_start: datetime
+) -> list[dict[str, Any]]:
+    """Return source jobs that require targeted provider reconciliation."""
+
+    return db.query_all(
+        """
+        SELECT id, source_key, source_event_id, source_series_id,
+               source_occurrence_id, source_title AS title,
+               source_location_text, scheduled_start AS approximate_start,
+               scheduled_end AS approximate_end, source_all_day AS all_day,
+               source_timezone, source_updated_at, source_etag,
+               source_fingerprint, location_id, status
+        FROM jobs
+        WHERE calendar_source_id = %s
+          AND source_key IS NOT NULL
+          AND status = 'scheduled'
+          AND COALESCE(scheduled_end, scheduled_start) > %s
+        ORDER BY source_key
+        """,
+        (source_id, range_start),
+    )
+
+
+def _canonical_exception(
+    *,
+    source: dict[str, Any],
+    occurrence: Any,
+    fingerprint: str,
+    code: str,
+    candidate_sites: Iterable[dict[str, Any]] = (),
+    conflicting_job_ids: Iterable[int] = (),
+) -> dict[str, Any]:
+    return {
+        "code": code,
+        "sourceId": int(source["id"]),
+        "sourceRole": str(source["role"]),
+        "sourceKey": occurrence.source_key,
+        "sourceFingerprint": fingerprint,
+        "eventId": occurrence.event_id,
+        "seriesId": occurrence.series_id,
+        "occurrenceId": occurrence.occurrence_id,
+        "title": occurrence.title,
+        "calendarLocation": occurrence.location_text,
+        "start": occurrence.starts_at.isoformat() if occurrence.starts_at else None,
+        "end": occurrence.ends_at.isoformat() if occurrence.ends_at else None,
+        "candidateSites": list(candidate_sites),
+        "conflictingJobIds": sorted(set(int(value) for value in conflicting_job_ids)),
+    }
+
+
+def _calendar_site_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "customerName": row.get("customer_name"),
+        "address": str(row["address"]),
+        "locationType": row.get("location_type"),
+        "active": bool(row["active"]),
+    }
+
+
+def _calendar_sites_by_id(
+    cur: Any, location_ids: Iterable[int]
+) -> list[dict[str, Any]]:
+    ids = sorted(set(int(value) for value in location_ids))
+    if not ids:
+        return []
+    cur.execute(
+        """
+        SELECT id, customer_name, address, location_type, active
+        FROM locations
+        WHERE id = ANY(%s)
+        ORDER BY customer_name NULLS LAST, address, id
+        """,
+        (ids,),
+    )
+    return [_calendar_site_payload(dict(row)) for row in cur.fetchall()]
+
+
+def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> bool:
+    """Conservatively protect a Site/day job using existing immutable evidence."""
+
+    job_id = int(existing_job["id"])
+    location_id = int(existing_job["location_id"])
+    scheduled_date = existing_job["scheduled_date"]
+    cur.execute(
+        """
+        SELECT (
+            EXISTS (
+                SELECT 1 FROM shifts
+                WHERE job_id = %s
+            )
+            OR EXISTS (
+                SELECT 1 FROM shifts
+                WHERE location_id = %s
+                  AND time_category = 'productive'
+                  AND COALESCE(
+                      local_date,
+                      (clock_in AT TIME ZONE 'America/Chicago')::date
+                  ) = %s
+            )
+            OR EXISTS (
+                SELECT 1 FROM visits
+                WHERE location_id = %s
+                  AND (arrival_time AT TIME ZONE 'America/Chicago')::date = %s
+            )
+            OR EXISTS (
+                SELECT 1 FROM departures
+                WHERE location_id = %s
+                  AND (departure_time AT TIME ZONE 'America/Chicago')::date = %s
+            )
+            OR EXISTS (
+                SELECT 1 FROM site_check_ins
+                WHERE location_id = %s
+                  AND (
+                      server_checked_in_at AT TIME ZONE 'America/Chicago'
+                  )::date = %s
+            )
+        ) AS has_work
+        """,
+        (
+            job_id,
+            location_id,
+            scheduled_date,
+            location_id,
+            scheduled_date,
+            location_id,
+            scheduled_date,
+            location_id,
+            scheduled_date,
+        ),
+    )
+    row = cur.fetchone()
+    return bool(row and row["has_work"])
+
+
+def _canonical_snapshot_is_stale(
+    *,
+    existing_job: dict[str, Any],
+    occurrence: Any,
+    fingerprint: str,
+) -> bool:
+    """Reject a provider snapshot that cannot be newer than stored source state."""
+
+    stored_fingerprint = str(existing_job.get("source_fingerprint") or "")
+    if stored_fingerprint == fingerprint:
+        return False
+    stored_updated = existing_job.get("source_updated_at")
+    incoming_updated = occurrence.updated_at
+    if stored_updated is None:
+        return False
+    if incoming_updated is None:
+        return True
+    if incoming_updated < stored_updated:
+        return True
+    if incoming_updated > stored_updated:
+        return False
+    incoming_is_confirmed_deletion = (
+        occurrence.cancelled and occurrence.revision == "provider-deleted"
+    )
+    stored_is_confirmed_deletion = existing_job.get("source_etag") == "provider-deleted"
+    return not incoming_is_confirmed_deletion or stored_is_confirmed_deletion
+
+
+def _resolve_canonical_location(
+    cur: Any,
+    *,
+    source: dict[str, Any],
+    occurrence: Any,
+    existing_job: dict[str, Any] | None,
+) -> tuple[int | None, str | None, tuple[int, ...]]:
+    """Resolve a Site by operator mapping or exact normalized title/address."""
+
+    from planned_visits import normalize_match_text
+
+    cur.execute(
+        """
+        SELECT location_id
+        FROM google_calendar_event_mappings
+        WHERE connection_id = %s AND calendar_id = %s
+          AND (
+              source_key = %s
+              OR (
+                  mapping_scope = 'series'
+                  AND source_series_id = %s
+              )
+          )
+        ORDER BY CASE WHEN source_key = %s THEN 0 ELSE 1 END, id
+        LIMIT 1
+        """,
+        (
+            int(source["connection_id"]),
+            str(source["calendar_id"]),
+            occurrence.source_key,
+            occurrence.series_id,
+            occurrence.source_key,
+        ),
+    )
+    mapping = cur.fetchone()
+    expected_type = CALENDAR_ROLE_LOCATION_TYPES[str(source["role"])]
+    if mapping:
+        cur.execute(
+            """
+            SELECT id, active, location_type
+            FROM locations
+            WHERE id = %s
+            """,
+            (int(mapping["location_id"]),),
+        )
+        selected = cur.fetchone()
+        if not selected or not bool(selected["active"]):
+            return None, "archived_site", (int(mapping["location_id"]),)
+        if str(selected.get("location_type") or "") != expected_type:
+            return None, "wrong_site_type", (int(selected["id"]),)
+        return int(selected["id"]), None, (int(selected["id"]),)
+
+    cur.execute(
+        """
+        SELECT id, address, customer_name, active, location_type
+        FROM locations
+        ORDER BY id
+        """
+    )
+    locations = [dict(row) for row in cur.fetchall()]
+    hints = {
+        value
+        for raw in (occurrence.location_text, occurrence.title)
+        if (value := normalize_match_text(raw))
+    }
+    matches = [
+        row
+        for row in locations
+        if hints.intersection(
+            {
+                normalize_match_text(row.get("address")),
+                normalize_match_text(row.get("customer_name")),
+            }
+        )
+    ]
+    valid = [
+        row
+        for row in matches
+        if bool(row["active"]) and str(row.get("location_type") or "") == expected_type
+    ]
+    if len(valid) == 1:
+        resolved_id = int(valid[0]["id"])
+        if existing_job and int(existing_job["location_id"]) != resolved_id:
+            return (
+                None,
+                "site_changed",
+                tuple(
+                    sorted(
+                        {
+                            int(existing_job["location_id"]),
+                            resolved_id,
+                        }
+                    )
+                ),
+            )
+        return resolved_id, None, (resolved_id,)
+    if len(valid) > 1:
+        return None, "ambiguous_site", tuple(int(row["id"]) for row in valid)
+    if matches and all(not bool(row["active"]) for row in matches):
+        return None, "archived_site", tuple(int(row["id"]) for row in matches)
+    wrong_type = [row for row in matches if bool(row["active"])]
+    if wrong_type:
+        return None, "wrong_site_type", tuple(int(row["id"]) for row in wrong_type)
+    if existing_job:
+        cur.execute(
+            "SELECT active, location_type FROM locations WHERE id = %s",
+            (int(existing_job["location_id"]),),
+        )
+        prior = cur.fetchone()
+        if (
+            prior
+            and bool(prior["active"])
+            and str(prior.get("location_type") or "") == expected_type
+        ):
+            return (
+                int(existing_job["location_id"]),
+                None,
+                (int(existing_job["location_id"]),),
+            )
+    return None, "missing_site", ()
+
+
+def sync_calendar_source(
+    *,
+    source_id: int,
+    expected_credential_version: int,
+    occurrences: Iterable[Any],
+    window_start: datetime,
+    window_end: datetime,
+    actor_id: int,
+    actor_name: str,
+) -> dict[str, Any]:
+    """Apply one complete source snapshot to canonical jobs, without assignments."""
+
+    from planned_visits import occurrence_fingerprint
+
+    occurrence_rows = sorted(list(occurrences), key=lambda row: row.source_key)
+    if len({row.source_key for row in occurrence_rows}) != len(occurrence_rows):
+        raise CalendarStoreError(
+            "Google Calendar returned a duplicate occurrence identity"
+        )
+    counts = {
+        "create": 0,
+        "update": 0,
+        "cancel": 0,
+        "unchanged": 0,
+        "unresolved": 0,
+    }
+    exceptions: list[dict[str, Any]] = []
+    eligible_sites: list[dict[str, Any]] = []
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"google-calendar-source:{source_id}",),
+            )
+            cur.execute(
+                "SELECT connection_id FROM google_calendar_sources WHERE id = %s",
+                (source_id,),
+            )
+            source_reference = cur.fetchone()
+            if not source_reference:
+                raise CalendarStoreError("Google Calendar source is no longer active")
+            connection_id = int(source_reference["connection_id"])
+            cur.execute(
+                """
+                SELECT revoked_at, credential_version
+                FROM google_calendar_connections
+                WHERE id = %s
+                FOR SHARE
+                """,
+                (connection_id,),
+            )
+            connection = cur.fetchone()
+            if not connection or connection["revoked_at"] is not None:
+                raise CalendarStoreError("Google Calendar source is no longer active")
+            if int(connection["credential_version"]) != expected_credential_version:
+                raise CalendarStoreError(
+                    "Google Calendar credentials changed; sync again"
+                )
+            cur.execute(
+                """
+                SELECT *
+                FROM google_calendar_sources
+                WHERE id = %s AND connection_id = %s
+                FOR UPDATE
+                """,
+                (source_id, connection_id),
+            )
+            source_row = cur.fetchone()
+            if not source_row:
+                raise CalendarStoreError("Google Calendar source is no longer active")
+            source = dict(source_row)
+            for occurrence in occurrence_rows:
+                if occurrence.calendar_id != str(source["calendar_id"]):
+                    raise CalendarStoreError(
+                        "Google Calendar returned an inconsistent source identity"
+                    )
+                if occurrence.time_zone != str(source["calendar_timezone"]):
+                    raise CalendarStoreError(
+                        "Google Calendar source timezone changed; sync again"
+                    )
+                fingerprint = occurrence_fingerprint(occurrence)
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM jobs
+                    WHERE source_key = %s
+                    FOR UPDATE
+                    """,
+                    (occurrence.source_key,),
+                )
+                existing_row = cur.fetchone()
+                existing = dict(existing_row) if existing_row else None
+                has_work = (
+                    _canonical_job_has_work_evidence(cur, existing)
+                    if existing is not None
+                    else False
+                )
+                if existing is not None and _canonical_snapshot_is_stale(
+                    existing_job=existing,
+                    occurrence=occurrence,
+                    fingerprint=fingerprint,
+                ):
+                    counts["unresolved"] += 1
+                    exceptions.append(
+                        _canonical_exception(
+                            source=source,
+                            occurrence=occurrence,
+                            fingerprint=fingerprint,
+                            code="stale_source_snapshot",
+                            candidate_sites=_calendar_sites_by_id(
+                                cur, (int(existing["location_id"]),)
+                            ),
+                        )
+                    )
+                    continue
+
+                if occurrence.cancelled:
+                    if existing is None:
+                        counts["unchanged"] += 1
+                        continue
+                    if existing["status"] in {"in_progress", "completed"} or has_work:
+                        counts["unresolved"] += 1
+                        exceptions.append(
+                            _canonical_exception(
+                                source=source,
+                                occurrence=occurrence,
+                                fingerprint=fingerprint,
+                                code="protected_work",
+                                candidate_sites=_calendar_sites_by_id(
+                                    cur, (int(existing["location_id"]),)
+                                ),
+                            )
+                        )
+                        continue
+                    if (
+                        existing["status"] == "cancelled"
+                        and existing.get("source_fingerprint") == fingerprint
+                    ):
+                        counts["unchanged"] += 1
+                        continue
+                    cur.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'cancelled', cancelled_at = NOW(),
+                            cancellation_reason = 'source_cancelled',
+                            source_fingerprint = %s,
+                            source_etag = %s, source_updated_at = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (
+                            fingerprint,
+                            occurrence.revision or None,
+                            occurrence.updated_at,
+                            int(existing["id"]),
+                        ),
+                    )
+                    counts["cancel"] += 1
+                    continue
+
+                if occurrence.all_day:
+                    counts["unresolved"] += 1
+                    exceptions.append(
+                        _canonical_exception(
+                            source=source,
+                            occurrence=occurrence,
+                            fingerprint=fingerprint,
+                            code="all_day",
+                        )
+                    )
+                    continue
+                if occurrence.starts_at is None or occurrence.ends_at is None:
+                    counts["unresolved"] += 1
+                    exceptions.append(
+                        _canonical_exception(
+                            source=source,
+                            occurrence=occurrence,
+                            fingerprint=fingerprint,
+                            code="missing_time",
+                        )
+                    )
+                    continue
+
+                location_id, issue, candidate_ids = _resolve_canonical_location(
+                    cur,
+                    source=source,
+                    occurrence=occurrence,
+                    existing_job=existing,
+                )
+                if issue or location_id is None:
+                    counts["unresolved"] += 1
+                    exceptions.append(
+                        _canonical_exception(
+                            source=source,
+                            occurrence=occurrence,
+                            fingerprint=fingerprint,
+                            code=issue or "missing_site",
+                            candidate_sites=_calendar_sites_by_id(cur, candidate_ids),
+                        )
+                    )
+                    continue
+                if existing is not None and (
+                    existing["status"] in {"in_progress", "completed"} or has_work
+                ):
+                    unchanged_source = (
+                        existing.get("source_fingerprint") == fingerprint
+                        and int(existing["location_id"]) == location_id
+                    )
+                    if unchanged_source:
+                        counts["unchanged"] += 1
+                    else:
+                        counts["unresolved"] += 1
+                        exceptions.append(
+                            _canonical_exception(
+                                source=source,
+                                occurrence=occurrence,
+                                fingerprint=fingerprint,
+                                code="protected_work",
+                                candidate_sites=_calendar_sites_by_id(
+                                    cur, (location_id,)
+                                ),
+                            )
+                        )
+                    continue
+
+                cur.execute(
+                    """
+                    SELECT COALESCE(l.customer_name, c.name, l.address) AS customer_name
+                    FROM locations l
+                    LEFT JOIN customers c ON c.id = l.customer_id
+                    WHERE l.id = %s
+                    """,
+                    (location_id,),
+                )
+                location = cur.fetchone()
+                customer_name = str(location["customer_name"])
+                scheduled_date = occurrence.starts_at.astimezone(
+                    PRODUCT_TIMEZONE
+                ).date()
+                source_values = (
+                    location_id,
+                    customer_name,
+                    scheduled_date,
+                    occurrence.starts_at,
+                    occurrence.ends_at,
+                    int(source["id"]),
+                    str(source["calendar_id"]),
+                    occurrence.event_id,
+                    occurrence.series_id,
+                    occurrence.occurrence_id or occurrence.event_id,
+                    occurrence.source_key,
+                    fingerprint,
+                    occurrence.revision or None,
+                    occurrence.updated_at,
+                    occurrence.title,
+                    occurrence.location_text,
+                    occurrence.time_zone or str(source["calendar_timezone"]),
+                    bool(occurrence.all_day),
+                )
+                if existing is None:
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM jobs
+                        WHERE source_key IS NULL
+                          AND location_id = %s
+                          AND scheduled_date = %s
+                          AND status <> 'cancelled'
+                        ORDER BY id
+                        LIMIT 2
+                        """,
+                        (location_id, scheduled_date),
+                    )
+                    collisions = [int(row["id"]) for row in cur.fetchall()]
+                    if collisions:
+                        counts["unresolved"] += 1
+                        exceptions.append(
+                            _canonical_exception(
+                                source=source,
+                                occurrence=occurrence,
+                                fingerprint=fingerprint,
+                                code="legacy_job_collision",
+                                candidate_sites=_calendar_sites_by_id(
+                                    cur, (location_id,)
+                                ),
+                                conflicting_job_ids=collisions,
+                            )
+                        )
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO jobs (
+                            location_id, customer_name, scheduled_date,
+                            scheduled_start, scheduled_end, expected_hours,
+                            revenue, notes, status, calendar_source_id,
+                            source_calendar_id, source_event_id, source_series_id,
+                            source_occurrence_id, source_key, source_fingerprint,
+                            source_etag, source_updated_at, source_title,
+                            source_location_text, source_timezone, source_all_day,
+                            updated_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, NULL, NULL, '', 'scheduled',
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, NOW()
+                        )
+                        RETURNING id
+                        """,
+                        source_values,
+                    )
+                    job_id = int(cur.fetchone()["id"])
+                    counts["create"] += 1
+                    audit_action = "canonical_job_created"
+                else:
+                    unchanged = (
+                        existing.get("source_fingerprint") == fingerprint
+                        and int(existing["location_id"]) == location_id
+                        and int(existing.get("calendar_source_id") or 0)
+                        == int(source["id"])
+                        and existing["status"] == "scheduled"
+                        and existing["customer_name"] == customer_name
+                        and existing["scheduled_date"] == scheduled_date
+                        and existing.get("scheduled_start") == occurrence.starts_at
+                        and existing.get("scheduled_end") == occurrence.ends_at
+                        and existing.get("source_calendar_id")
+                        == str(source["calendar_id"])
+                        and existing.get("source_event_id") == occurrence.event_id
+                        and existing.get("source_series_id") == occurrence.series_id
+                        and existing.get("source_occurrence_id")
+                        == (occurrence.occurrence_id or occurrence.event_id)
+                    )
+                    if unchanged:
+                        counts["unchanged"] += 1
+                        continue
+                    job_id = int(existing["id"])
+                    cur.execute(
+                        """
+                        UPDATE jobs
+                        SET location_id = %s, customer_name = %s,
+                            scheduled_date = %s, scheduled_start = %s,
+                            scheduled_end = %s, calendar_source_id = %s,
+                            source_calendar_id = %s, source_event_id = %s,
+                            source_series_id = %s, source_occurrence_id = %s,
+                            source_key = %s, source_fingerprint = %s,
+                            source_etag = %s, source_updated_at = %s,
+                            source_title = %s, source_location_text = %s,
+                            source_timezone = %s, source_all_day = %s,
+                            expected_hours = NULL, revenue = NULL,
+                            status = 'scheduled', cancelled_at = NULL,
+                            cancellation_reason = NULL, updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (*source_values, job_id),
+                    )
+                    counts["update"] += 1
+                    audit_action = "canonical_job_updated"
+                cur.execute(
+                    """
+                    INSERT INTO planned_visit_audit_events (
+                        action, source_key, actor_employee_id, actor_name,
+                        after_state
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        audit_action,
+                        occurrence.source_key,
+                        actor_id,
+                        actor_name,
+                        json.dumps({"jobId": job_id, "sourceId": int(source["id"])}),
+                    ),
+                )
+
+            cur.execute(
+                """
+                UPDATE google_calendar_sources
+                SET last_synced_at = NOW(), last_sync_status = 'success',
+                    last_sync_error = NULL, last_sync_counts = %s::jsonb,
+                    last_sync_window_start = %s, last_sync_window_end = %s,
+                    updated_by = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (json.dumps(counts), window_start, window_end, actor_id, source_id),
+            )
+            cur.execute(
+                """
+                SELECT id, customer_name, address, location_type, active
+                FROM locations
+                WHERE active = true AND location_type = %s
+                ORDER BY customer_name NULLS LAST, address, id
+                """,
+                (CALENDAR_ROLE_LOCATION_TYPES[str(source["role"])],),
+            )
+            eligible_sites = [
+                _calendar_site_payload(dict(row)) for row in cur.fetchall()
+            ]
+    return {
+        "sourceId": source_id,
+        "sourceRole": str(source["role"]),
+        "calendarId": str(source["calendar_id"]),
+        "status": "success",
+        "counts": counts,
+        "exceptions": exceptions,
+        "eligibleSites": eligible_sites,
+    }
+
+
+def upsert_canonical_mapping(
+    *,
+    source_id: int,
+    expected_credential_version: int,
+    expected_calendar_id: str,
+    expected_calendar_timezone: str,
+    source_key: str,
+    source_series_id: str,
+    source_fingerprint: str,
+    location_id: int,
+    apply_to_series: bool,
+    actor_id: int,
+    actor_name: str,
+) -> dict[str, Any]:
+    """Persist one fingerprint-reviewed Site decision for an occurrence/series."""
+
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT connection_id FROM google_calendar_sources WHERE id = %s",
+                (source_id,),
+            )
+            source_reference = cur.fetchone()
+            if not source_reference:
+                raise CalendarStoreError("Google Calendar source is no longer active")
+            connection_id = int(source_reference["connection_id"])
+            cur.execute(
+                """
+                SELECT revoked_at, credential_version
+                FROM google_calendar_connections
+                WHERE id = %s
+                FOR SHARE
+                """,
+                (connection_id,),
+            )
+            connection = cur.fetchone()
+            if not connection or connection["revoked_at"] is not None:
+                raise CalendarStoreError("Google Calendar source is no longer active")
+            if int(connection["credential_version"]) != expected_credential_version:
+                raise CalendarStoreError(
+                    "Google Calendar credentials changed; sync again"
+                )
+            cur.execute(
+                """
+                SELECT *
+                FROM google_calendar_sources
+                WHERE id = %s AND connection_id = %s
+                FOR SHARE
+                """,
+                (source_id, connection_id),
+            )
+            source = cur.fetchone()
+            if not source:
+                raise CalendarStoreError("Google Calendar source is no longer active")
+            if (
+                str(source["calendar_id"]) != expected_calendar_id
+                or str(source["calendar_timezone"]) != expected_calendar_timezone
+            ):
+                raise CalendarStoreError("Google Calendar source changed; sync again")
+            cur.execute(
+                "SELECT id, active, location_type FROM locations WHERE id = %s FOR SHARE",
+                (location_id,),
+            )
+            location = cur.fetchone()
+            if not location or not bool(location["active"]):
+                raise CalendarStoreError("Selected Site is no longer active")
+            expected_type = CALENDAR_ROLE_LOCATION_TYPES[str(source["role"])]
+            if str(location.get("location_type") or "") != expected_type:
+                raise CalendarStoreError(
+                    f"Selected Site must be {expected_type} for this Calendar"
+                )
+            mapping_scope = "series" if apply_to_series else "occurrence"
+            if apply_to_series:
+                cur.execute(
+                    """
+                    SELECT id, source_key, mapping_scope
+                    FROM google_calendar_event_mappings
+                    WHERE connection_id = %s AND calendar_id = %s
+                      AND mapping_scope = 'series' AND source_series_id = %s
+                    FOR UPDATE
+                    """,
+                    (
+                        int(source["connection_id"]),
+                        str(source["calendar_id"]),
+                        source_series_id,
+                    ),
+                )
+                existing = cur.fetchone()
+                if not existing:
+                    cur.execute(
+                        """
+                        SELECT id, source_key, mapping_scope
+                        FROM google_calendar_event_mappings
+                        WHERE source_key = %s
+                        FOR UPDATE
+                        """,
+                        (source_key,),
+                    )
+                    existing = cur.fetchone()
+            else:
+                cur.execute(
+                    """
+                    SELECT id, source_key, mapping_scope
+                    FROM google_calendar_event_mappings
+                    WHERE source_key = %s
+                    FOR UPDATE
+                    """,
+                    (source_key,),
+                )
+                existing = cur.fetchone()
+            if existing:
+                mapping_id = int(existing["id"])
+                stored_source_key = (
+                    str(existing["source_key"])
+                    if str(existing["mapping_scope"]) == "series"
+                    else source_key
+                )
+                cur.execute(
+                    """
+                    UPDATE google_calendar_event_mappings
+                    SET source_key = %s, source_series_id = %s,
+                        mapping_scope = %s, source_fingerprint = %s,
+                        location_id = %s, updated_by = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        stored_source_key,
+                        source_series_id,
+                        mapping_scope,
+                        source_fingerprint,
+                        location_id,
+                        actor_id,
+                        mapping_id,
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO google_calendar_event_mappings (
+                        connection_id, calendar_id, source_key, source_series_id,
+                        mapping_scope, source_fingerprint, location_id,
+                        created_by, updated_by
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        int(source["connection_id"]),
+                        str(source["calendar_id"]),
+                        source_key,
+                        source_series_id,
+                        mapping_scope,
+                        source_fingerprint,
+                        location_id,
+                        actor_id,
+                        actor_id,
+                    ),
+                )
+                mapping_id = int(cur.fetchone()["id"])
+            cur.execute(
+                """
+                INSERT INTO planned_visit_audit_events (
+                    action, source_key, actor_employee_id, actor_name, after_state
+                ) VALUES ('canonical_site_mapping_saved', %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    source_key,
+                    actor_id,
+                    actor_name,
+                    json.dumps(
+                        {
+                            "mappingId": mapping_id,
+                            "sourceId": source_id,
+                            "scope": mapping_scope,
+                            "seriesId": source_series_id,
+                            "locationId": location_id,
+                        }
+                    ),
+                ),
+            )
+    return {
+        "id": mapping_id,
+        "sourceId": source_id,
+        "sourceKey": source_key,
+        "seriesId": source_series_id,
+        "scope": mapping_scope,
+        "sourceFingerprint": source_fingerprint,
+        "locationId": location_id,
+    }
+
+
+def migrate_legacy_planned_visits() -> dict[str, Any]:
+    """Idempotently backfill non-conflicting legacy visits into canonical jobs."""
+
+    counts = {"created": 0, "linked": 0, "collisions": 0}
+    collision_rows: list[dict[str, Any]] = []
+    exceptions: list[dict[str, Any]] = []
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("canonical-calendar-legacy-migration",),
+            )
+            cur.execute(
+                """
+                SELECT pv.*, COALESCE(l.customer_name, c.name, l.address) AS customer_name,
+                       l.active AS location_active, l.location_type
+                FROM planned_service_visits pv
+                JOIN locations l ON l.id = pv.location_id
+                LEFT JOIN customers c ON c.id = l.customer_id
+                WHERE pv.migrated_job_id IS NULL
+                ORDER BY pv.id
+                FOR UPDATE OF pv
+                """
+            )
+            visits = [dict(row) for row in cur.fetchall()]
+            for visit in visits:
+                cur.execute(
+                    """
+                    SELECT revoked_at
+                    FROM google_calendar_connections
+                    WHERE id = %s
+                    FOR SHARE
+                    """,
+                    (int(visit["connection_id"]),),
+                )
+                connection = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT id, role
+                    FROM google_calendar_sources
+                    WHERE connection_id = %s AND calendar_id = %s
+                    """,
+                    (
+                        int(visit["connection_id"]),
+                        str(visit["source_calendar_id"]),
+                    ),
+                )
+                source = cur.fetchone()
+                is_active_plan = str(visit["status"]) == "planned"
+                migration_issue: str | None = None
+                if is_active_plan:
+                    if not connection or connection["revoked_at"] is not None:
+                        migration_issue = "source_disconnected"
+                    elif source is None:
+                        migration_issue = "source_unbound"
+                    elif bool(visit.get("all_day")):
+                        migration_issue = "all_day"
+                    elif not bool(visit.get("location_active")):
+                        migration_issue = "archived_site"
+                    else:
+                        expected_type = CALENDAR_ROLE_LOCATION_TYPES[
+                            str(source["role"])
+                        ]
+                        if str(visit.get("location_type") or "") != expected_type:
+                            migration_issue = "wrong_site_type"
+                if migration_issue is not None:
+                    exceptions.append(
+                        {
+                            "plannedVisitId": int(visit["id"]),
+                            "sourceKey": str(visit["source_key"]),
+                            "code": migration_issue,
+                            "locationId": int(visit["location_id"]),
+                        }
+                    )
+                    continue
+                cur.execute(
+                    "SELECT id FROM jobs WHERE source_key = %s FOR UPDATE",
+                    (str(visit["source_key"]),),
+                )
+                existing = cur.fetchone()
+                if existing:
+                    job_id = int(existing["id"])
+                    counts["linked"] += 1
+                else:
+                    scheduled_date = (
+                        visit["approximate_start"].astimezone(PRODUCT_TIMEZONE).date()
+                    )
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM jobs
+                        WHERE source_key IS NULL
+                          AND location_id = %s
+                          AND scheduled_date = %s
+                          AND status <> 'cancelled'
+                        ORDER BY id
+                        LIMIT 2
+                        """,
+                        (int(visit["location_id"]), scheduled_date),
+                    )
+                    collision_ids = [int(row["id"]) for row in cur.fetchall()]
+                    if collision_ids:
+                        counts["collisions"] += 1
+                        collision_rows.append(
+                            {
+                                "plannedVisitId": int(visit["id"]),
+                                "sourceKey": str(visit["source_key"]),
+                                "jobIds": collision_ids,
+                            }
+                        )
+                        continue
+                    status = {
+                        "planned": "scheduled",
+                        "cancelled": "cancelled",
+                        "completed": "completed",
+                    }[str(visit["status"])]
+                    cur.execute(
+                        """
+                        INSERT INTO jobs (
+                            location_id, customer_name, scheduled_date,
+                            scheduled_start, scheduled_end, expected_hours,
+                            revenue, notes, status, calendar_source_id,
+                            source_calendar_id, source_event_id, source_series_id,
+                            source_occurrence_id, source_key, source_fingerprint,
+                            source_etag, source_updated_at, source_title,
+                            source_location_text, source_timezone, source_all_day,
+                            cancelled_at, cancellation_reason, updated_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, NULL, NULL, '', %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, NOW()
+                        )
+                        RETURNING id
+                        """,
+                        (
+                            int(visit["location_id"]),
+                            str(visit["customer_name"]),
+                            scheduled_date,
+                            visit["approximate_start"],
+                            visit["approximate_end"],
+                            status,
+                            int(source["id"]) if source else None,
+                            str(visit["source_calendar_id"]),
+                            str(visit["source_event_id"]),
+                            str(visit["source_series_id"]),
+                            str(visit["source_occurrence_id"]),
+                            str(visit["source_key"]),
+                            str(visit["source_fingerprint"]),
+                            visit.get("source_etag"),
+                            visit.get("source_updated_at"),
+                            str(visit.get("title") or ""),
+                            str(visit.get("source_location_text") or ""),
+                            str(visit.get("source_timezone") or ""),
+                            bool(visit.get("all_day")),
+                            visit.get("cancelled_at"),
+                            (
+                                "legacy_calendar_cancelled"
+                                if status == "cancelled"
+                                else None
+                            ),
+                        ),
+                    )
+                    job_id = int(cur.fetchone()["id"])
+                    counts["created"] += 1
+                cur.execute(
+                    """
+                    UPDATE planned_service_visits
+                    SET migrated_job_id = %s
+                    WHERE id = %s AND migrated_job_id IS NULL
+                    RETURNING id
+                    """,
+                    (job_id, int(visit["id"])),
+                )
+                if cur.fetchone():
+                    cur.execute(
+                        """
+                        INSERT INTO planned_visit_audit_events (
+                            planned_visit_id, action, source_key, actor_name,
+                            before_state, after_state
+                        ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                        """,
+                        (
+                            int(visit["id"]),
+                            (
+                                "canonical_job_migration_linked"
+                                if existing
+                                else "canonical_job_migration_created"
+                            ),
+                            str(visit["source_key"]),
+                            "system:canonical-calendar-migration",
+                            json.dumps(
+                                {
+                                    "plannedVisitId": int(visit["id"]),
+                                    "status": str(visit["status"]),
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "jobId": job_id,
+                                    "sourceKey": str(visit["source_key"]),
+                                }
+                            ),
+                        ),
+                    )
+    return {
+        "counts": counts,
+        "collisions": collision_rows,
+        "exceptions": exceptions,
+    }

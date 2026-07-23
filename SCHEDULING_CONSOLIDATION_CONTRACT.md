@@ -1,7 +1,7 @@
 # Scheduling Consolidation Contract
 
-Status: implementation contract  
-Product timezone: `America/Chicago`  
+Status: implementation contract
+Product timezone: `America/Chicago`
 Portal week: Sunday through Saturday
 
 This contract was derived before implementation code. It is the standard the

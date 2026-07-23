@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+import hmac
 import logging
 import math
 from typing import Any, Callable, Iterable
@@ -41,6 +42,7 @@ from planned_visits import (
     build_preview,
     resolve_employee_name,
     source_set_fingerprint,
+    occurrence_fingerprint,
 )
 
 
@@ -87,6 +89,33 @@ PositiveInt = int
 
 class CalendarSelectionRequest(BaseModel):
     calendarId: str = Field(min_length=1, max_length=1024)
+
+
+class CalendarSourcesRequest(BaseModel):
+    residentialMorningCalendarId: str = Field(min_length=1, max_length=1024)
+    commercialEveningNightCalendarId: str = Field(min_length=1, max_length=1024)
+
+    @model_validator(mode="after")
+    def validate_distinct_calendars(self) -> CalendarSourcesRequest:
+        if (
+            self.residentialMorningCalendarId.strip()
+            == self.commercialEveningNightCalendarId.strip()
+        ):
+            raise ValueError("Residential and Commercial Calendars must be different")
+        return self
+
+
+class CalendarMappingRequest(BaseModel):
+    sourceId: int = Field(gt=0)
+    sourceKey: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    sourceFingerprint: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    eventId: str = Field(min_length=1, max_length=1024)
+    seriesId: str = Field(min_length=1, max_length=1024)
+    occurrenceId: str = Field(min_length=1, max_length=1024)
+    locationId: int = Field(gt=0)
+    applyToSeries: bool = True
 
 
 class CrewMembershipRequest(BaseModel):
@@ -1135,6 +1164,156 @@ def _preview_response(
     }
 
 
+def _calendar_source_dict(source: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": int(source["id"]),
+        "connectionId": int(source["connection_id"]),
+        "role": str(source["role"]),
+        "calendarId": str(source["calendar_id"]),
+        "calendarName": str(source["calendar_name"]),
+        "calendarTimeZone": str(source["calendar_timezone"]),
+        "lastSyncedAt": (
+            source["last_synced_at"].isoformat()
+            if source.get("last_synced_at")
+            else None
+        ),
+        "lastSyncStatus": str(source.get("last_sync_status") or "never"),
+        "lastSyncError": source.get("last_sync_error"),
+        "lastSyncCounts": source.get("last_sync_counts"),
+        "lastSyncWindowStart": (
+            source["last_sync_window_start"].isoformat()
+            if source.get("last_sync_window_start")
+            else None
+        ),
+        "lastSyncWindowEnd": (
+            source["last_sync_window_end"].isoformat()
+            if source.get("last_sync_window_end")
+            else None
+        ),
+    }
+
+
+def _canonical_sync_window(
+    time_zone_name: str, *, now_utc: datetime | None = None
+) -> tuple[datetime, datetime]:
+    """Cover recent changes and all jobs needed by the twelve-week forecast."""
+
+    zone = ZoneInfo(time_zone_name)
+    local_now = (now_utc or datetime.now(timezone.utc)).astimezone(zone)
+    today = local_now.date()
+    current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+    two_weeks_back = current_sunday - timedelta(days=14)
+    month_start = today.replace(day=1)
+    local_start_date = min(two_weeks_back, month_start)
+    forecast_last_day = current_sunday + timedelta(weeks=12, days=6)
+    if forecast_last_day.month == 12:
+        end_date = date(forecast_last_day.year + 1, 1, 1)
+    else:
+        end_date = date(
+            forecast_last_day.year,
+            forecast_last_day.month + 1,
+            1,
+        )
+    return (
+        datetime.combine(local_start_date, time.min, tzinfo=zone).astimezone(
+            timezone.utc
+        ),
+        datetime.combine(end_date, time.min, tzinfo=zone).astimezone(timezone.utc),
+    )
+
+
+def _canonical_source_occurrences(
+    *,
+    client: GoogleCalendarClient,
+    access_token: str,
+    source: dict[str, Any],
+    window_start: datetime,
+    window_end: datetime,
+) -> list[SourceOccurrence]:
+    """Read one complete source and reconcile known identities omitted by its window."""
+
+    calendar_id = str(source["calendar_id"])
+    time_zone_name = str(source["calendar_timezone"])
+    rows = client.list_occurrences(
+        access_token=access_token,
+        calendar_id=calendar_id,
+        window_start=window_start,
+        window_end=window_end,
+        time_zone=time_zone_name,
+    )
+    rows_by_key: dict[str, CalendarOccurrence] = {}
+    for row in rows:
+        if row.source_key in rows_by_key:
+            raise GoogleCalendarResponseError(
+                "Google Calendar returned a duplicate occurrence identity"
+            )
+        rows_by_key[row.source_key] = row
+    source_rows_by_key = {
+        source_key: _source_occurrence(row)
+        for source_key, row in rows_by_key.items()
+    }
+    identities = store.read_canonical_source_identities(
+        source_id=int(source["id"]),
+        range_start=window_start,
+    )
+    identity_by_key = {str(row["source_key"]): row for row in identities}
+    missing = [
+        identity
+        for identity in identities
+        if str(identity["source_key"]) not in rows_by_key
+    ]
+    if len(missing) > MAX_TARGETED_RECONCILIATIONS:
+        raise GoogleCalendarResponseError(
+            "Google Calendar omitted too many scheduled occurrences to reconcile safely"
+        )
+    targeted_requests: list[TargetedOccurrenceRequest] = []
+    for identity in missing:
+        event_id = str(identity["source_event_id"])
+        series_id = str(identity["source_series_id"])
+        occurrence_id = str(identity["source_occurrence_id"])
+        if series_id != event_id and occurrence_id != event_id:
+            targeted_requests.append(
+                TargetedOccurrenceRequest(
+                    event_id=event_id,
+                    recurring_event_id=series_id,
+                    original_start=occurrence_id,
+                )
+            )
+        else:
+            targeted_requests.append(TargetedOccurrenceRequest(event_id=event_id))
+    targeted_rows = client.get_occurrences_batch(
+        access_token=access_token,
+        calendar_id=calendar_id,
+        requests_=targeted_requests,
+        time_zone=time_zone_name,
+    )
+    for identity, targeted in zip(missing, targeted_rows, strict=True):
+        source_key = str(identity["source_key"])
+        if len(source_rows_by_key) >= MAX_PREVIEW_OCCURRENCES:
+            raise GoogleCalendarResponseError(
+                "Google Calendar has too many scheduled occurrences to reconcile"
+            )
+        if targeted is None:
+            source_rows_by_key[source_key] = _deleted_source_occurrence(
+                identity=identity,
+                calendar_id=calendar_id,
+                time_zone=time_zone_name,
+            )
+        elif targeted.source_key != source_key:
+            raise GoogleCalendarResponseError(
+                "Google Calendar returned inconsistent occurrence identity"
+            )
+        else:
+            source_rows_by_key[source_key] = _source_occurrence(targeted)
+    return [
+        _cancelled_occurrence_with_stored_context(
+            source_rows_by_key[key],
+            identity_by_key.get(key),
+        )
+        for key in sorted(source_rows_by_key)
+    ]
+
+
 def _register_preview_routes(
     *,
     router: APIRouter,
@@ -1293,6 +1472,28 @@ def build_calendar_import_router(
     ) -> dict[str, Any]:
         configured = config.configured
         connection = store.active_connection() if configured else None
+        source_rows = (
+            store.list_calendar_sources(connection_id=int(connection["id"]))
+            if connection
+            else []
+        )
+        source_roles = {str(source["role"]) for source in source_rows}
+        sources_ready = source_roles == set(store.CALENDAR_SOURCE_ROLES)
+        source_statuses = {
+            str(source.get("last_sync_status") or "never") for source in source_rows
+        }
+        if not connection:
+            sync_status = "disconnected"
+        elif not sources_ready:
+            sync_status = "incomplete"
+        elif source_statuses == {"success"}:
+            sync_status = "success"
+        elif "failed" in source_statuses and "success" in source_statuses:
+            sync_status = "partial"
+        elif "failed" in source_statuses:
+            sync_status = "failed"
+        else:
+            sync_status = "never"
         return {
             "configured": configured,
             "connected": bool(connection),
@@ -1311,6 +1512,10 @@ def build_calendar_import_router(
             "selectedCalendarTimeZone": (
                 connection.get("selected_calendar_timezone") if connection else None
             ),
+            "capabilityVersion": "canonical-schedule.v1",
+            "sourcesReady": sources_ready,
+            "syncStatus": sync_status,
+            "sources": [_calendar_source_dict(source) for source in source_rows],
         }
 
     @router.post("/api/admin/google-calendar/connect")
@@ -1425,7 +1630,268 @@ def build_calendar_import_router(
         return {
             "calendars": [_calendar_dict(calendar) for calendar in calendars],
             "selectedCalendarId": connection.get("selected_calendar_id"),
+            "sources": [
+                _calendar_source_dict(source)
+                for source in store.list_calendar_sources(
+                    connection_id=int(connection["id"])
+                )
+            ],
         }
+
+    @router.put("/api/admin/google-calendar/sources")
+    def configure_google_calendar_sources(
+        payload: CalendarSourcesRequest,
+        admin: dict[str, Any] = Depends(get_current_admin),
+    ) -> dict[str, Any]:
+        connection, calendars = _list_calendars(config)
+        calendars_by_id = {
+            calendar.calendar_id: calendar
+            for calendar in calendars
+            if calendar.access_role in {"reader", "writer", "owner"}
+        }
+        requested = {
+            store.RESIDENTIAL_MORNING_ROLE: (
+                payload.residentialMorningCalendarId.strip()
+            ),
+            store.COMMERCIAL_EVENING_NIGHT_ROLE: (
+                payload.commercialEveningNightCalendarId.strip()
+            ),
+        }
+        unavailable = [
+            calendar_id
+            for calendar_id in requested.values()
+            if calendar_id not in calendars_by_id
+        ]
+        if unavailable:
+            raise HTTPException(
+                status_code=422,
+                detail="Each selected Google Calendar must be readable",
+            )
+        bindings = []
+        for role in store.CALENDAR_SOURCE_ROLES:
+            selected = calendars_by_id[requested[role]]
+            bindings.append(
+                {
+                    "role": role,
+                    "calendar_id": selected.calendar_id,
+                    "calendar_name": selected.summary,
+                    "calendar_timezone": (
+                        str(selected.time_zone or "").strip() or config.timezone_name
+                    ),
+                }
+            )
+        try:
+            sources = store.replace_calendar_sources(
+                connection_id=int(connection["id"]),
+                expected_credential_version=int(connection["credential_version"]),
+                bindings=bindings,
+                actor_id=int(admin["id"]),
+                actor_name=str(admin["name"]),
+            )
+        except store.CalendarStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "success": True,
+            "sourcesReady": True,
+            "sources": [_calendar_source_dict(source) for source in sources],
+        }
+
+    @router.post("/api/admin/google-calendar/sync")
+    def synchronize_google_calendar_sources(
+        admin: dict[str, Any] = Depends(get_current_admin),
+    ) -> dict[str, Any]:
+        client, connection, access_token = _access_context(config)
+        sources = store.list_calendar_sources(connection_id=int(connection["id"]))
+        if {str(source["role"]) for source in sources} != set(
+            store.CALENDAR_SOURCE_ROLES
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Configure both Google Calendar sources before syncing",
+            )
+        legacy_migration = store.migrate_legacy_planned_visits()
+        window_start, window_end = _canonical_sync_window(config.timezone_name)
+        results: list[dict[str, Any]] = []
+        failures = 0
+        for source in sources:
+            try:
+                occurrences = _canonical_source_occurrences(
+                    client=client,
+                    access_token=access_token,
+                    source=source,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+                result = store.sync_calendar_source(
+                    source_id=int(source["id"]),
+                    expected_credential_version=int(
+                        connection["credential_version"]
+                    ),
+                    occurrences=occurrences,
+                    window_start=window_start,
+                    window_end=window_end,
+                    actor_id=int(admin["id"]),
+                    actor_name=str(admin["name"]),
+                )
+            except (GoogleCalendarError, PlanningContractError) as exc:
+                failures += 1
+                message = str(exc)
+                store.mark_calendar_source_sync_failed(
+                    source_id=int(source["id"]),
+                    expected_credential_version=int(
+                        connection["credential_version"]
+                    ),
+                    expected_calendar_id=str(source["calendar_id"]),
+                    expected_calendar_timezone=str(source["calendar_timezone"]),
+                    window_start=window_start,
+                    window_end=window_end,
+                    message=message,
+                )
+                result = {
+                    "sourceId": int(source["id"]),
+                    "sourceRole": str(source["role"]),
+                    "calendarId": str(source["calendar_id"]),
+                    "status": "failed",
+                    "error": message,
+                    "counts": None,
+                    "exceptions": [],
+                    "eligibleSites": [],
+                }
+            except store.CalendarStoreError as exc:
+                failures += 1
+                message = str(exc)
+                store.mark_calendar_source_sync_failed(
+                    source_id=int(source["id"]),
+                    expected_credential_version=int(
+                        connection["credential_version"]
+                    ),
+                    expected_calendar_id=str(source["calendar_id"]),
+                    expected_calendar_timezone=str(source["calendar_timezone"]),
+                    window_start=window_start,
+                    window_end=window_end,
+                    message=message,
+                )
+                result = {
+                    "sourceId": int(source["id"]),
+                    "sourceRole": str(source["role"]),
+                    "calendarId": str(source["calendar_id"]),
+                    "status": "failed",
+                    "error": message,
+                    "counts": None,
+                    "exceptions": [],
+                    "eligibleSites": [],
+                }
+            results.append(result)
+        status = (
+            "success"
+            if failures == 0
+            else "failed"
+            if failures == len(sources)
+            else "partial"
+        )
+        total_counts = {
+            key: sum(
+                int(result["counts"][key])
+                for result in results
+                if result.get("counts")
+            )
+            for key in ("create", "update", "cancel", "unchanged", "unresolved")
+        }
+        return {
+            "success": failures == 0,
+            "status": status,
+            "rangeStart": window_start.isoformat(),
+            "rangeEnd": window_end.isoformat(),
+            "counts": total_counts,
+            "exceptions": [
+                exception
+                for result in results
+                for exception in result.get("exceptions", [])
+            ],
+            "eligibleSitesByRole": {
+                str(result["sourceRole"]): result.get("eligibleSites", [])
+                for result in results
+            },
+            "legacyMigration": legacy_migration,
+            "sources": results,
+        }
+
+    @router.put("/api/admin/google-calendar/mappings")
+    def save_google_calendar_mapping(
+        payload: CalendarMappingRequest,
+        admin: dict[str, Any] = Depends(get_current_admin),
+    ) -> dict[str, Any]:
+        client, connection, access_token = _access_context(config)
+        source = next(
+            (
+                row
+                for row in store.list_calendar_sources(
+                    connection_id=int(connection["id"])
+                )
+                if int(row["id"]) == payload.sourceId
+            ),
+            None,
+        )
+        if source is None:
+            raise HTTPException(
+                status_code=409, detail="Google Calendar source changed; sync again"
+            )
+        try:
+            if (
+                payload.seriesId != payload.eventId
+                and payload.occurrenceId != payload.eventId
+            ):
+                current = client.get_recurring_occurrence(
+                    access_token=access_token,
+                    calendar_id=str(source["calendar_id"]),
+                    recurring_event_id=payload.seriesId,
+                    original_start=payload.occurrenceId,
+                    time_zone=str(source["calendar_timezone"]),
+                )
+            else:
+                current = client.get_occurrence(
+                    access_token=access_token,
+                    calendar_id=str(source["calendar_id"]),
+                    event_id=payload.eventId,
+                    time_zone=str(source["calendar_timezone"]),
+                )
+            occurrence = _source_occurrence(current)
+        except GoogleCalendarError as exc:
+            raise _google_failure(exc) from exc
+        if occurrence.cancelled:
+            raise HTTPException(
+                status_code=409,
+                detail="Google Calendar occurrence was cancelled; sync again",
+            )
+        current_fingerprint = occurrence_fingerprint(occurrence)
+        if (
+            occurrence.source_key != payload.sourceKey
+            or occurrence.series_id != payload.seriesId
+            or not hmac.compare_digest(
+                current_fingerprint, payload.sourceFingerprint
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Google Calendar occurrence changed; sync again",
+            )
+        try:
+            mapping = store.upsert_canonical_mapping(
+                source_id=payload.sourceId,
+                expected_credential_version=int(connection["credential_version"]),
+                expected_calendar_id=str(source["calendar_id"]),
+                expected_calendar_timezone=str(source["calendar_timezone"]),
+                source_key=payload.sourceKey,
+                source_series_id=payload.seriesId,
+                source_fingerprint=current_fingerprint,
+                location_id=payload.locationId,
+                apply_to_series=payload.applyToSeries,
+                actor_id=int(admin["id"]),
+                actor_name=str(admin["name"]),
+            )
+        except store.CalendarStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"success": True, "mapping": mapping}
 
     @router.put("/api/admin/google-calendar/calendar")
     def choose_google_calendar(

@@ -64,7 +64,7 @@ def _apply_schema(conn):
                 planned_visit_assignments, planned_service_visits,
                 google_calendar_event_mappings, calendar_import_previews,
                 crew_memberships, crews, google_calendar_oauth_states,
-                google_calendar_connections,
+                google_calendar_sources, google_calendar_connections,
                 receivables_operation_attempts,
                 time_data_correction_batches,
                 site_check_in_reconciliation_reviews, site_check_ins,

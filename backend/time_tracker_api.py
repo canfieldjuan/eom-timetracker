@@ -11609,6 +11609,19 @@ def admin_analytics_customer(
     }
 
 
+# Canonical operational Schedule and Forecast are read-only projections over
+# jobs and existing time evidence.  Their focused router deliberately has no
+# access to timekeeping mutation helpers.
+from operations_schedule import build_operations_schedule_router
+
+app.include_router(
+    build_operations_schedule_router(
+        get_current_admin=get_current_admin,
+        timezone_name=TIMEZONE_NAME,
+    )
+)
+
+
 # Calendar import routes are registered through a focused factory so protocol,
 # persistence, and planning rules remain outside this timekeeping module.
 from calendar_import_api import (

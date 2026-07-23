@@ -69,13 +69,43 @@ CREATE TABLE jobs (
     location_id     INTEGER REFERENCES locations(id),
     customer_name   TEXT NOT NULL,
     scheduled_date  DATE NOT NULL,
+    scheduled_start TIMESTAMPTZ,
+    scheduled_end   TIMESTAMPTZ,
     expected_hours  NUMERIC(6, 2),
     revenue         NUMERIC(10, 2),
     notes           TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL DEFAULT 'scheduled'
                         CHECK (status IN ('scheduled', 'in_progress', 'completed', 'cancelled')),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    source_calendar_id   TEXT,
+    source_event_id      TEXT,
+    source_series_id     TEXT,
+    source_occurrence_id TEXT,
+    source_key           VARCHAR(64)
+                             CHECK (source_key IS NULL OR source_key ~ '^[0-9a-f]{64}$'),
+    source_fingerprint   VARCHAR(64)
+                             CHECK (
+                                 source_fingerprint IS NULL
+                                 OR source_fingerprint ~ '^[0-9a-f]{64}$'
+                             ),
+    source_etag          TEXT,
+    source_updated_at    TIMESTAMPTZ,
+    source_title         TEXT,
+    source_location_text TEXT,
+    source_timezone      TEXT,
+    source_all_day       BOOLEAN NOT NULL DEFAULT false,
+    cancelled_at         TIMESTAMPTZ,
+    cancellation_reason  TEXT,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (
+        scheduled_start IS NULL
+        OR scheduled_end IS NULL
+        OR scheduled_end > scheduled_start
+    )
 );
+
+CREATE UNIQUE INDEX uq_jobs_google_source_key
+    ON jobs(source_key) WHERE source_key IS NOT NULL;
 
 -- Shifts (time entries)
 CREATE TABLE shifts (
@@ -276,6 +306,39 @@ CREATE UNIQUE INDEX uq_google_calendar_active_connection
     ON google_calendar_connections ((revoked_at IS NULL))
     WHERE revoked_at IS NULL;
 
+-- One OAuth grant supplies exactly two independently synchronized planning
+-- sources. Roles are business semantics and do not depend on event clock time.
+CREATE TABLE google_calendar_sources (
+    id                 BIGSERIAL PRIMARY KEY,
+    connection_id      BIGINT NOT NULL REFERENCES google_calendar_connections(id),
+    role               VARCHAR(40) NOT NULL
+                           CHECK (
+                               role IN (
+                                   'residential_morning',
+                                   'commercial_evening_night'
+                               )
+                           ),
+    calendar_id        TEXT NOT NULL,
+    calendar_name      TEXT NOT NULL,
+    calendar_timezone  TEXT NOT NULL,
+    last_synced_at     TIMESTAMPTZ,
+    last_sync_status   VARCHAR(16) NOT NULL DEFAULT 'never'
+                           CHECK (last_sync_status IN ('never', 'success', 'failed')),
+    last_sync_error    TEXT,
+    last_sync_counts   JSONB,
+    last_sync_window_start TIMESTAMPTZ,
+    last_sync_window_end   TIMESTAMPTZ,
+    created_by         INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    updated_by         INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (connection_id, role),
+    UNIQUE (connection_id, calendar_id)
+);
+
+ALTER TABLE jobs
+    ADD COLUMN calendar_source_id BIGINT REFERENCES google_calendar_sources(id);
+
 -- OAuth callbacks cannot carry the portal bearer token. A random state value
 -- is stored only as a hash, bound to the initiating admin and (for recovery)
 -- one exact active connection, and consumed once.
@@ -340,16 +403,23 @@ CREATE TABLE calendar_import_previews (
     CHECK (range_end > range_start)
 );
 
--- Manual customer/location decisions are durable per Google occurrence. They
--- reference existing locations read-only; the importer never creates or edits
--- a customer/site, and one exception in a recurring series cannot overwrite
--- another occurrence's reviewed decision.
+-- Manual customer/location decisions are durable per Google occurrence or
+-- recurring series. They reference existing locations read-only; the importer
+-- never creates or edits a customer/site.
 CREATE TABLE google_calendar_event_mappings (
     id                BIGSERIAL PRIMARY KEY,
     connection_id     BIGINT NOT NULL REFERENCES google_calendar_connections(id),
     calendar_id       TEXT NOT NULL,
     source_key        VARCHAR(64) NOT NULL
                           CHECK (source_key ~ '^[0-9a-f]{64}$'),
+    source_series_id  TEXT,
+    mapping_scope     VARCHAR(16) NOT NULL DEFAULT 'occurrence'
+                          CHECK (mapping_scope IN ('occurrence', 'series')),
+    source_fingerprint VARCHAR(64)
+                          CHECK (
+                              source_fingerprint IS NULL
+                              OR source_fingerprint ~ '^[0-9a-f]{64}$'
+                          ),
     location_id       INTEGER NOT NULL REFERENCES locations(id),
     created_by        INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     updated_by        INTEGER REFERENCES employees(id) ON DELETE SET NULL,
@@ -387,6 +457,7 @@ CREATE TABLE planned_service_visits (
                               CHECK (status IN ('planned', 'cancelled', 'completed')),
     cancelled_at          TIMESTAMPTZ,
     completed_at          TIMESTAMPTZ,
+    migrated_job_id       INTEGER REFERENCES jobs(id),
     last_preview_id       TEXT REFERENCES calendar_import_previews(id),
     last_imported_by      INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -525,12 +596,19 @@ CREATE UNIQUE INDEX uq_receivables_operation_attempts_active_identity
     WHERE state IN ('pending', 'resolved');
 CREATE INDEX idx_google_calendar_oauth_states_expiry
     ON google_calendar_oauth_states(expires_at, consumed_at);
+CREATE INDEX idx_google_calendar_sources_connection
+    ON google_calendar_sources(connection_id, role);
+CREATE INDEX idx_jobs_calendar_source_window
+    ON jobs(calendar_source_id, scheduled_start, status);
 CREATE INDEX idx_crew_memberships_effective
     ON crew_memberships(crew_id, effective_from, effective_to);
 CREATE INDEX idx_calendar_import_previews_status
     ON calendar_import_previews(status, expires_at);
 CREATE INDEX idx_google_calendar_event_mappings_source
     ON google_calendar_event_mappings(connection_id, calendar_id, source_key);
+CREATE UNIQUE INDEX uq_google_calendar_event_mappings_series
+    ON google_calendar_event_mappings(connection_id, calendar_id, source_series_id)
+    WHERE mapping_scope = 'series' AND source_series_id IS NOT NULL;
 CREATE INDEX idx_planned_service_visits_window
     ON planned_service_visits(approximate_start, status);
 CREATE INDEX idx_planned_service_visits_source
