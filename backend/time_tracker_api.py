@@ -3184,33 +3184,188 @@ def _ensure_customer_site_schema() -> None:
                 """
             )
 
+WEEKLY_SCHEDULE_SCHEMA_LOCK_TIMEOUT = "5s"
+
 
 def _ensure_weekly_schedule_site_schema() -> None:
-    """Add Site identity while retaining the legacy arbiter for rollout safety."""
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS schedules (
-            id              SERIAL PRIMARY KEY,
-            employee_id     INTEGER NOT NULL REFERENCES employees(id),
-            location_id     INTEGER REFERENCES locations(id),
-            customer_name   TEXT NOT NULL,
-            week_start      DATE NOT NULL,
-            scheduled_hours NUMERIC(6, 2) NOT NULL,
-            notes           TEXT NOT NULL DEFAULT '',
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-    db.execute(
-        "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS "
-        "location_id INTEGER REFERENCES locations(id)"
-    )
-    # Do not remove origin/main's name-based UNIQUE constraint in the same
-    # rolling deployment that stops using it as an ON CONFLICT arbiter. A
-    # follow-up deployment can remove it after every serving instance runs the
-    # Site-aware write path below.
-    db.execute("""
-        CREATE INDEX IF NOT EXISTS idx_schedules_site_week
-        ON schedules(employee_id, location_id, week_start)
-    """)
+    """Finalize weekly schedule identity after the Site-aware rollout."""
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SET LOCAL lock_timeout = %s",
+                (WEEKLY_SCHEDULE_SCHEMA_LOCK_TIMEOUT,),
+            )
+            _lock_customer_site_mutations(cur)
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("eom_weekly_schedule_site_schema_v2",),
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id              SERIAL PRIMARY KEY,
+                    employee_id     INTEGER NOT NULL REFERENCES employees(id),
+                    location_id     INTEGER REFERENCES locations(id),
+                    customer_name   TEXT NOT NULL,
+                    week_start      DATE NOT NULL,
+                    scheduled_hours NUMERIC(6, 2) NOT NULL,
+                    notes           TEXT NOT NULL DEFAULT '',
+                    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
+                ALTER TABLE schedules ADD COLUMN IF NOT EXISTS
+                    location_id INTEGER REFERENCES locations(id);
+
+                LOCK TABLE schedules IN SHARE ROW EXCLUSIVE MODE;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    uq_schedules_employee_site_week
+                    ON schedules(employee_id, location_id, week_start)
+                    WHERE location_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    uq_schedules_employee_legacy_name_week
+                    ON schedules(employee_id, customer_name, week_start)
+                    WHERE location_id IS NULL;
+
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_index index_row
+                        WHERE index_row.indexrelid = to_regclass(
+                                  'uq_schedules_employee_site_week'
+                              )
+                          AND index_row.indrelid = 'schedules'::regclass
+                          AND index_row.indisunique
+                          AND index_row.indisvalid
+                          AND index_row.indisready
+                          AND index_row.indnkeyatts = 3
+                          AND pg_get_indexdef(
+                                  index_row.indexrelid, 1, true
+                              ) = 'employee_id'
+                          AND pg_get_indexdef(
+                                  index_row.indexrelid, 2, true
+                              ) = 'location_id'
+                          AND pg_get_indexdef(
+                                  index_row.indexrelid, 3, true
+                              ) = 'week_start'
+                          AND replace(
+                                  replace(
+                                      pg_get_expr(
+                                          index_row.indpred,
+                                          index_row.indrelid
+                                      ),
+                                      '(',
+                                      ''
+                                  ),
+                                  ')',
+                                  ''
+                              ) = 'location_id IS NOT NULL'
+                    ) THEN
+                        RAISE EXCEPTION
+                            'weekly schedule Site identity index is invalid';
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_index index_row
+                        WHERE index_row.indexrelid = to_regclass(
+                                  'uq_schedules_employee_legacy_name_week'
+                              )
+                          AND index_row.indrelid = 'schedules'::regclass
+                          AND index_row.indisunique
+                          AND index_row.indisvalid
+                          AND index_row.indisready
+                          AND index_row.indnkeyatts = 3
+                          AND pg_get_indexdef(
+                                  index_row.indexrelid, 1, true
+                              ) = 'employee_id'
+                          AND pg_get_indexdef(
+                                  index_row.indexrelid, 2, true
+                              ) = 'customer_name'
+                          AND pg_get_indexdef(
+                                  index_row.indexrelid, 3, true
+                              ) = 'week_start'
+                          AND replace(
+                                  replace(
+                                      pg_get_expr(
+                                          index_row.indpred,
+                                          index_row.indrelid
+                                      ),
+                                      '(',
+                                      ''
+                                  ),
+                                  ')',
+                                  ''
+                              ) = 'location_id IS NULL'
+                    ) THEN
+                        RAISE EXCEPTION
+                            'weekly schedule legacy identity index is invalid';
+                    END IF;
+                END $$;
+
+                DO $$
+                DECLARE
+                    legacy_constraint RECORD;
+                BEGIN
+                    FOR legacy_constraint IN
+                        SELECT constraint_row.conname
+                        FROM pg_constraint constraint_row
+                        WHERE constraint_row.conrelid = 'schedules'::regclass
+                          AND constraint_row.contype = 'u'
+                          AND (
+                              SELECT array_agg(
+                                  attribute_row.attname
+                                  ORDER BY attribute_row.attname
+                              )
+                              FROM unnest(constraint_row.conkey)
+                                   AS key_row(attnum)
+                              JOIN pg_attribute attribute_row
+                                ON attribute_row.attrelid =
+                                   constraint_row.conrelid
+                               AND attribute_row.attnum = key_row.attnum
+                          ) = ARRAY[
+                              'customer_name',
+                              'employee_id',
+                              'week_start'
+                          ]::name[]
+                    LOOP
+                        EXECUTE format(
+                            'ALTER TABLE schedules DROP CONSTRAINT %I',
+                            legacy_constraint.conname
+                        );
+                    END LOOP;
+
+                    IF EXISTS (
+                        SELECT 1
+                        FROM pg_constraint constraint_row
+                        WHERE constraint_row.conrelid = 'schedules'::regclass
+                          AND constraint_row.contype = 'u'
+                          AND (
+                              SELECT array_agg(
+                                  attribute_row.attname
+                                  ORDER BY attribute_row.attname
+                              )
+                              FROM unnest(constraint_row.conkey)
+                                   AS key_row(attnum)
+                              JOIN pg_attribute attribute_row
+                                ON attribute_row.attrelid =
+                                   constraint_row.conrelid
+                               AND attribute_row.attnum = key_row.attnum
+                          ) = ARRAY[
+                              'customer_name',
+                              'employee_id',
+                              'week_start'
+                          ]::name[]
+                    ) THEN
+                        RAISE EXCEPTION
+                            'legacy weekly schedule name constraint remains';
+                    END IF;
+                END $$;
+
+                DROP INDEX IF EXISTS idx_schedules_site_week;
+                """
+            )
 
 
 def _ensure_schema_migrations() -> None:
@@ -9112,23 +9267,6 @@ def _resolve_site_for_creation(
     return resolved_id, customer_name, int(customer_id)
 
 
-def _legacy_schedule_name_arbiter_present(cur: Any) -> bool:
-    cur.execute(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM pg_constraint
-            WHERE conrelid = 'schedules'::regclass
-              AND contype = 'u'
-              AND pg_get_constraintdef(oid) LIKE '%%employee_id%%'
-              AND pg_get_constraintdef(oid) LIKE '%%customer_name%%'
-              AND pg_get_constraintdef(oid) LIKE '%%week_start%%'
-        ) AS present
-        """
-    )
-    return bool(cur.fetchone()["present"])
-
-
 @app.post("/api/admin/schedules")
 def admin_create_schedule(
     payload: ScheduleEntryRequest,
@@ -9244,45 +9382,6 @@ def admin_create_schedule(
                         "matchingScheduleIds": matching_schedule_ids,
                     },
                 )
-            legacy_name_arbiter_present = _legacy_schedule_name_arbiter_present(cur)
-            if legacy_name_arbiter_present:
-                current_schedule_id = (
-                    matching_schedule_ids[0] if matching_schedule_ids else None
-                )
-                cur.execute(
-                    """
-                    SELECT id, location_id
-                    FROM schedules
-                    WHERE employee_id = %s
-                      AND week_start = %s
-                      AND customer_name = %s
-                      AND id <> %s
-                    ORDER BY id
-                    FOR UPDATE
-                    """,
-                    (
-                        payload.employeeId,
-                        week_start,
-                        customer,
-                        current_schedule_id or 0,
-                    ),
-                )
-                rollout_conflicts = [dict(item) for item in cur.fetchall()]
-                if rollout_conflicts:
-                    _raise_conflict(
-                        "ambiguous_customer_site",
-                        "This shared Customer name cannot be scheduled at a "
-                        "second Site until the staged Site-identity migration "
-                        "is finalized",
-                        {
-                            "customerName": customer,
-                            "locationId": location_id,
-                            "matchingScheduleIds": [
-                                int(item["id"]) for item in rollout_conflicts
-                            ],
-                            "migrationPending": True,
-                        },
-                    )
             if matching_schedule_ids:
                 cur.execute(
                     """

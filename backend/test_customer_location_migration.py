@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from uuid import uuid4
 
 import pytest
 from psycopg2 import sql
+from psycopg2.errors import LockNotAvailable, RaiseException, UniqueViolation
 from psycopg2.pool import ThreadedConnectionPool
 
 from conftest import TEST_DB_URL, _raw_conn
@@ -296,8 +298,11 @@ def test_customer_site_backfill_is_idempotent_and_never_merges_equal_names(
     ) is None
 
 
-def test_customer_site_migration_upgrades_the_actual_legacy_table_shape(client):
-    """Origin/main's Customer-less locations table upgrades without data loss."""
+def test_customer_site_and_schedule_migrations_upgrade_the_legacy_shape(
+    client,
+    monkeypatch,
+):
+    """Legacy Customer/Site and schedule identity upgrade without data loss."""
     import time_tracker_api as api
 
     schema_name = f"issue19_legacy_{uuid4().hex}"
@@ -401,6 +406,20 @@ def test_customer_site_migration_upgrades_the_actual_legacy_table_shape(client):
             options=f"-c search_path={schema_name}",
         )
         api.db._pool = isolated_pool
+        legacy_schedule_before = api.db.query_one(
+            """
+            SELECT id, employee_id, customer_name, week_start,
+                   scheduled_hours, notes, created_at
+            FROM schedules
+            WHERE id = %s
+            """,
+            (legacy_schedule_id,),
+        )
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda *_args, **_kwargs: None,
+        )
         api._ensure_customer_site_schema()
         api._ensure_weekly_schedule_site_schema()
 
@@ -459,20 +478,16 @@ def test_customer_site_migration_upgrades_the_actual_legacy_table_shape(client):
         ) == {"data_type": "text"}
         assert api.db.query_one(
             """
-            SELECT id, employee_id, location_id, customer_name, week_start,
-                   scheduled_hours, notes
+            SELECT id, employee_id, customer_name, week_start,
+                   scheduled_hours, notes, created_at
             FROM schedules WHERE id = %s
             """,
             (legacy_schedule_id,),
-        ) == {
-            "id": legacy_schedule_id,
-            "employee_id": legacy_employee_id,
-            "location_id": None,
-            "customer_name": same_name,
-            "week_start": date(2026, 7, 19),
-            "scheduled_hours": 4.5,
-            "notes": "Legacy schedule",
-        }
+        ) == legacy_schedule_before
+        assert api.db.query_one(
+            "SELECT location_id FROM schedules WHERE id = %s",
+            (legacy_schedule_id,),
+        ) == {"location_id": None}
         assert api.db.query_one(
             """
             SELECT COUNT(*) AS count
@@ -481,7 +496,33 @@ def test_customer_site_migration_upgrades_the_actual_legacy_table_shape(client):
               AND contype = 'u'
               AND pg_get_constraintdef(oid) LIKE '%%customer_name%%'
             """
-        ) == {"count": 1}
+        ) == {"count": 0}
+        schedule_indexes = {
+            row["indexname"]: row["indexdef"]
+            for row in api.db.query_all(
+                """
+                SELECT indexname, indexdef
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND tablename = 'schedules'
+                """
+            )
+        }
+        assert "uq_schedules_employee_site_week" in schedule_indexes
+        assert "UNIQUE INDEX" in schedule_indexes[
+            "uq_schedules_employee_site_week"
+        ]
+        assert "WHERE (location_id IS NOT NULL)" in schedule_indexes[
+            "uq_schedules_employee_site_week"
+        ]
+        assert "uq_schedules_employee_legacy_name_week" in schedule_indexes
+        assert "UNIQUE INDEX" in schedule_indexes[
+            "uq_schedules_employee_legacy_name_week"
+        ]
+        assert "WHERE (location_id IS NULL)" in schedule_indexes[
+            "uq_schedules_employee_legacy_name_week"
+        ]
+        assert "idx_schedules_site_week" not in schedule_indexes
 
         same_name_sites = [
             row for row in rows if row["canonical_name"] == same_name
@@ -491,29 +532,90 @@ def test_customer_site_migration_upgrades_the_actual_legacy_table_shape(client):
             "UPDATE schedules SET location_id = %s WHERE id = %s",
             (same_name_sites[0]["id"], legacy_schedule_id),
         )
-        with pytest.raises(api.HTTPException) as rollout_error:
-            api.admin_create_schedule(
-                api.ScheduleEntryRequest(
-                    employeeId=legacy_employee_id,
-                    locationId=same_name_sites[1]["id"],
-                    customerName=same_name,
-                    weekStart="2026-07-19",
-                    scheduledHours=6.0,
-                    notes="Must wait for staged finalization",
-                ),
-                None,
-                {},
+        second_same_name_schedule = api.admin_create_schedule(
+            api.ScheduleEntryRequest(
+                employeeId=legacy_employee_id,
+                locationId=same_name_sites[1]["id"],
+                customerName=same_name,
+                weekStart="2026-07-19",
+                scheduledHours=6.0,
+                notes="Distinct exact Site",
+            ),
+            None,
+            {},
+        )["schedule"]
+        assert second_same_name_schedule["id"] != legacy_schedule_id
+        assert api.db.query_all(
+            """
+            SELECT id, location_id, customer_name, scheduled_hours, notes
+            FROM schedules
+            WHERE employee_id = %s AND week_start = '2026-07-19'
+            ORDER BY id
+            """,
+            (legacy_employee_id,),
+        ) == [
+            {
+                "id": legacy_schedule_id,
+                "location_id": same_name_sites[0]["id"],
+                "customer_name": same_name,
+                "scheduled_hours": 4.5,
+                "notes": "Legacy schedule",
+            },
+            {
+                "id": second_same_name_schedule["id"],
+                "location_id": same_name_sites[1]["id"],
+                "customer_name": same_name,
+                "scheduled_hours": 6.0,
+                "notes": "Distinct exact Site",
+            },
+        ]
+        with pytest.raises(UniqueViolation):
+            api.db.execute(
+                """
+                INSERT INTO schedules (
+                    employee_id, location_id, customer_name, week_start,
+                    scheduled_hours, notes
+                )
+                VALUES (%s, %s, 'Different snapshot', '2026-07-19', 1.0,
+                        'Must violate exact Site identity')
+                """,
+                (legacy_employee_id, same_name_sites[0]["id"]),
             )
-        assert rollout_error.value.status_code == 409
-        assert rollout_error.value.detail["code"] == "ambiguous_customer_site"
-        assert rollout_error.value.detail["details"]["migrationPending"] is True
+
+        unresolved_schedule_id = api.db.execute_returning(
+            """
+            INSERT INTO schedules (
+                employee_id, location_id, customer_name, week_start,
+                scheduled_hours, notes
+            )
+            VALUES (%s, NULL, 'Unresolved Legacy', '2026-08-02', 1.0,
+                    'Preserve unresolved identity')
+            RETURNING id
+            """,
+            (legacy_employee_id,),
+        )
+        with pytest.raises(UniqueViolation):
+            api.db.execute(
+                """
+                INSERT INTO schedules (
+                    employee_id, location_id, customer_name, week_start,
+                    scheduled_hours, notes
+                )
+                VALUES (%s, NULL, 'Unresolved Legacy', '2026-08-02', 2.0,
+                        'Must not multiply unresolved history')
+                """,
+                (legacy_employee_id,),
+            )
         assert api.db.query_one(
-            "SELECT location_id, scheduled_hours, notes FROM schedules WHERE id = %s",
-            (legacy_schedule_id,),
+            """
+            SELECT location_id, scheduled_hours, notes
+            FROM schedules WHERE id = %s
+            """,
+            (unresolved_schedule_id,),
         ) == {
-            "location_id": same_name_sites[0]["id"],
-            "scheduled_hours": 4.5,
-            "notes": "Legacy schedule",
+            "location_id": None,
+            "scheduled_hours": 1.0,
+            "notes": "Preserve unresolved identity",
         }
 
         alpha_customer_id = api.db.execute_returning(
@@ -576,41 +678,35 @@ def test_customer_site_migration_upgrades_the_actual_legacy_table_shape(client):
             "UPDATE locations SET customer_name = 'Legacy Beta' WHERE customer_id = %s",
             (alpha_customer_id,),
         )
-        with pytest.raises(api.HTTPException) as rename_rollout_error:
-            api.admin_create_schedule(
-                api.ScheduleEntryRequest(
-                    employeeId=legacy_employee_id,
-                    locationId=alpha_site_id,
-                    customerName="Legacy Beta",
-                    weekStart="2026-07-26",
-                    scheduledHours=7.0,
-                    notes="Must not collide after rename",
-                ),
-                None,
-                {},
-            )
-        assert rename_rollout_error.value.status_code == 409
-        assert rename_rollout_error.value.detail["details"]["migrationPending"] is True
-        assert rename_rollout_error.value.detail["details"][
-            "matchingScheduleIds"
-        ] == [beta_schedule_id]
+        renamed_schedule = api.admin_create_schedule(
+            api.ScheduleEntryRequest(
+                employeeId=legacy_employee_id,
+                locationId=alpha_site_id,
+                customerName="Legacy Beta",
+                weekStart="2026-07-26",
+                scheduledHours=7.0,
+                notes="Update exact renamed Customer",
+            ),
+            None,
+            {},
+        )["schedule"]
+        assert renamed_schedule["id"] == alpha_schedule_id
         assert api.db.query_one(
             "SELECT customer_name, scheduled_hours, notes FROM schedules WHERE id = %s",
             (alpha_schedule_id,),
         ) == {
-            "customer_name": "Legacy Alpha",
-            "scheduled_hours": 2.0,
-            "notes": "Alpha",
+            "customer_name": "Legacy Beta",
+            "scheduled_hours": 7.0,
+            "notes": "Update exact renamed Customer",
         }
         assert api.db.query_one(
-            """
-            SELECT COUNT(*) AS count
-            FROM pg_indexes
-            WHERE schemaname = current_schema()
-              AND tablename = 'schedules'
-              AND indexname = 'idx_schedules_site_week'
-            """
-        ) == {"count": 1}
+            "SELECT customer_name, scheduled_hours, notes FROM schedules WHERE id = %s",
+            (beta_schedule_id,),
+        ) == {
+            "customer_name": "Legacy Beta",
+            "scheduled_hours": 3.0,
+            "notes": "Beta",
+        }
 
         first_mapping = {
             row["id"]: (row["customer_id"], row["address_key"])
@@ -621,6 +717,23 @@ def test_customer_site_migration_upgrades_the_actual_legacy_table_shape(client):
         first_customer_count = api.db.query_one(
             "SELECT COUNT(*) AS count FROM customers"
         )["count"]
+        first_schedule_rows = api.db.query_all(
+            """
+            SELECT id, employee_id, location_id, customer_name, week_start,
+                   scheduled_hours, notes, created_at
+            FROM schedules
+            ORDER BY id
+            """
+        )
+        first_schedule_indexes = api.db.query_all(
+            """
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+            ORDER BY indexname
+            """
+        )
         api._ensure_customer_site_schema()
         api._ensure_weekly_schedule_site_schema()
         assert {
@@ -632,6 +745,325 @@ def test_customer_site_migration_upgrades_the_actual_legacy_table_shape(client):
         assert api.db.query_one(
             "SELECT COUNT(*) AS count FROM customers"
         )["count"] == first_customer_count
+        assert api.db.query_all(
+            """
+            SELECT id, employee_id, location_id, customer_name, week_start,
+                   scheduled_hours, notes, created_at
+            FROM schedules
+            ORDER BY id
+            """
+        ) == first_schedule_rows
+        assert api.db.query_all(
+            """
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+            ORDER BY indexname
+            """
+        ) == first_schedule_indexes
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_constraint
+            WHERE conrelid = 'schedules'::regclass
+              AND contype = 'u'
+              AND pg_get_constraintdef(oid) LIKE '%%customer_name%%'
+            """
+        ) == {"count": 0}
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname IN (
+                  'uq_schedules_employee_site_week',
+                  'uq_schedules_employee_legacy_name_week'
+              )
+            """
+        ) == {"count": 2}
+    finally:
+        api.db._pool = old_pool
+        if isolated_pool is not None:
+            isolated_pool.closeall()
+        setup_conn.close()
+        cleanup_conn = _raw_conn()
+        try:
+            with cleanup_conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                        sql.Identifier(schema_name)
+                    )
+                )
+            cleanup_conn.commit()
+        finally:
+            cleanup_conn.close()
+
+
+def test_schedule_site_identity_migration_rolls_back_without_proven_replacements(
+    client,
+    monkeypatch,
+):
+    """A bad legacy state cannot remove the old arbiter without replacement."""
+    import time_tracker_api as api
+
+    schema_name = f"issue19_schedule_conflict_{uuid4().hex}"
+    setup_conn = _raw_conn()
+    isolated_pool = None
+    old_pool = api.db._pool
+    try:
+        with setup_conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+            )
+            cur.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
+            cur.execute(
+                """
+                CREATE TABLE employees (
+                    id SERIAL PRIMARY KEY
+                );
+                CREATE TABLE locations (
+                    id SERIAL PRIMARY KEY
+                );
+                CREATE TABLE schedules (
+                    id              SERIAL PRIMARY KEY,
+                    employee_id     INTEGER NOT NULL REFERENCES employees(id),
+                    location_id     INTEGER REFERENCES locations(id),
+                    customer_name   TEXT NOT NULL,
+                    week_start      DATE NOT NULL,
+                    scheduled_hours NUMERIC(6, 2) NOT NULL,
+                    notes           TEXT NOT NULL DEFAULT '',
+                    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (employee_id, customer_name, week_start)
+                );
+                CREATE INDEX idx_schedules_site_week
+                    ON schedules(employee_id, location_id, week_start);
+                INSERT INTO employees DEFAULT VALUES;
+                INSERT INTO locations DEFAULT VALUES;
+                INSERT INTO schedules (
+                    employee_id, location_id, customer_name, week_start,
+                    scheduled_hours, notes
+                )
+                VALUES
+                    (1, 1, 'Old Snapshot', '2026-08-09', 2.0, 'First'),
+                    (1, 1, 'Renamed Snapshot', '2026-08-09', 3.0, 'Second');
+                """
+            )
+        setup_conn.commit()
+
+        isolated_pool = ThreadedConnectionPool(
+            1,
+            4,
+            dsn=TEST_DB_URL,
+            options=f"-c search_path={schema_name}",
+        )
+        api.db._pool = isolated_pool
+        before_rows = api.db.query_all(
+            "SELECT * FROM schedules ORDER BY id"
+        )
+
+        with pytest.raises(UniqueViolation):
+            api._ensure_weekly_schedule_site_schema()
+
+        assert api.db.query_all(
+            "SELECT * FROM schedules ORDER BY id"
+        ) == before_rows
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_constraint
+            WHERE conrelid = 'schedules'::regclass
+              AND contype = 'u'
+              AND pg_get_constraintdef(oid) LIKE '%%customer_name%%'
+            """
+        ) == {"count": 1}
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname = 'idx_schedules_site_week'
+            """
+        ) == {"count": 1}
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname IN (
+                  'uq_schedules_employee_site_week',
+                  'uq_schedules_employee_legacy_name_week'
+              )
+            """
+        ) == {"count": 0}
+
+        api.db.execute(
+            "DELETE FROM schedules WHERE customer_name = 'Renamed Snapshot'"
+        )
+        api.db.execute(
+            """
+            CREATE INDEX uq_schedules_employee_site_week
+            ON schedules(customer_name)
+            """
+        )
+        wrong_catalog_rows = api.db.query_all(
+            "SELECT * FROM schedules ORDER BY id"
+        )
+        with pytest.raises(
+            RaiseException,
+            match="weekly schedule Site identity index is invalid",
+        ):
+            api._ensure_weekly_schedule_site_schema()
+
+        assert api.db.query_all(
+            "SELECT * FROM schedules ORDER BY id"
+        ) == wrong_catalog_rows
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_constraint
+            WHERE conrelid = 'schedules'::regclass
+              AND contype = 'u'
+              AND pg_get_constraintdef(oid) LIKE '%%customer_name%%'
+            """
+        ) == {"count": 1}
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname = 'idx_schedules_site_week'
+            """
+        ) == {"count": 1}
+        assert api.db.query_one(
+            """
+            SELECT indexdef
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname = 'uq_schedules_employee_site_week'
+            """
+        )["indexdef"].startswith("CREATE INDEX ")
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname = 'uq_schedules_employee_legacy_name_week'
+            """
+        ) == {"count": 0}
+
+        api.db.execute("DROP INDEX uq_schedules_employee_site_week")
+        api.db.execute(
+            """
+            CREATE UNIQUE INDEX uq_schedules_employee_site_week
+            ON schedules(employee_id, location_id, week_start)
+            WHERE location_id IS NOT NULL
+            """
+        )
+        api.db.execute(
+            """
+            CREATE INDEX uq_schedules_employee_legacy_name_week
+            ON schedules(customer_name)
+            """
+        )
+        with pytest.raises(
+            RaiseException,
+            match="weekly schedule legacy identity index is invalid",
+        ):
+            api._ensure_weekly_schedule_site_schema()
+
+        assert api.db.query_all(
+            "SELECT * FROM schedules ORDER BY id"
+        ) == wrong_catalog_rows
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_constraint
+            WHERE conrelid = 'schedules'::regclass
+              AND contype = 'u'
+              AND pg_get_constraintdef(oid) LIKE '%%customer_name%%'
+            """
+        ) == {"count": 1}
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname = 'idx_schedules_site_week'
+            """
+        ) == {"count": 1}
+        assert api.db.query_one(
+            """
+            SELECT indexdef
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname = 'uq_schedules_employee_legacy_name_week'
+            """
+        )["indexdef"].startswith("CREATE INDEX ")
+
+        api.db.execute(
+            """
+            DROP INDEX uq_schedules_employee_site_week;
+            DROP INDEX uq_schedules_employee_legacy_name_week;
+            """
+        )
+        with setup_conn.cursor() as cur:
+            cur.execute("LOCK TABLE schedules IN ROW EXCLUSIVE MODE")
+        monkeypatch.setattr(
+            api,
+            "WEEKLY_SCHEDULE_SCHEMA_LOCK_TIMEOUT",
+            "100ms",
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            migration = executor.submit(api._ensure_weekly_schedule_site_schema)
+            try:
+                with pytest.raises(LockNotAvailable):
+                    migration.result(timeout=2)
+            finally:
+                setup_conn.rollback()
+        assert api.db.query_all(
+            "SELECT * FROM schedules ORDER BY id"
+        ) == wrong_catalog_rows
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_constraint
+            WHERE conrelid = 'schedules'::regclass
+              AND contype = 'u'
+              AND pg_get_constraintdef(oid) LIKE '%%customer_name%%'
+            """
+        ) == {"count": 1}
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname = 'idx_schedules_site_week'
+            """
+        ) == {"count": 1}
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname IN (
+                  'uq_schedules_employee_site_week',
+                  'uq_schedules_employee_legacy_name_week'
+              )
+            """
+        ) == {"count": 0}
     finally:
         api.db._pool = old_pool
         if isolated_pool is not None:
