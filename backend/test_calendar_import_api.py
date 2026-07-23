@@ -3280,6 +3280,99 @@ def test_site_date_time_evidence_protects_job_without_shift_job_id(client, auth)
     )
 
 
+def test_same_day_shift_protects_only_the_overlapping_timed_occurrence(client, auth):
+    configure_canonical_sources(client, auth)
+    worked = google_occurrence(
+        "worked-same-day-occurrence",
+        calendar_id="residential@example.test",
+    )
+    to_reschedule = google_occurrence(
+        "unworked-same-day-reschedule",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(hours=5),
+    )
+    to_cancel = google_occurrence(
+        "unworked-same-day-cancel",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(hours=8),
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [worked, to_reschedule, to_cancel],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    assert created.json()["counts"]["create"] == 3
+
+    worked_job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_date
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (worked.source_key,),
+    )
+    employee_id = int(
+        db.query_one("SELECT id FROM employees WHERE name = 'Catalina Gomez'")["id"]
+    )
+    db.execute(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, local_date, time_category, notes, job_id
+        ) VALUES (
+            %s, %s, 'Test Customer', %s, %s, 2.0, %s, 'productive',
+            'canonical-calendar-test-evidence', NULL
+        )
+        """,
+        (
+            employee_id,
+            int(worked_job["location_id"]),
+            WINDOW_START,
+            WINDOW_START + timedelta(hours=2),
+            worked_job["scheduled_date"],
+        ),
+    )
+
+    moved = google_occurrence(
+        "unworked-same-day-reschedule",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=1, hours=5),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [
+        worked,
+        moved,
+        sparse_cancelled_occurrence(to_cancel),
+    ]
+    reconciled = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert reconciled.status_code == 200, reconciled.text
+    body = reconciled.json()
+    assert body["counts"]["update"] == 1
+    assert body["counts"]["cancel"] == 1
+    assert body["counts"]["unresolved"] == 0
+    assert body["exceptions"] == []
+    assert db.query_one(
+        """
+        SELECT scheduled_start, status
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (moved.source_key,),
+    ) == {
+        "scheduled_start": WINDOW_START + timedelta(days=1, hours=5),
+        "status": "scheduled",
+    }
+    assert (
+        db.query_one(
+            "SELECT status FROM jobs WHERE source_key = %s",
+            (to_cancel.source_key,),
+        )["status"]
+        == "cancelled"
+    )
+
+
 def test_overnight_job_protects_work_evidence_on_second_service_date(client, auth):
     configure_canonical_sources(client, auth)
     local_start = datetime(
@@ -4099,6 +4192,7 @@ def test_delayed_source_writes_reject_a_replaced_calendar(client, auth):
     replaced = store.replace_calendar_sources(
         connection_id=int(connection["id"]),
         expected_credential_version=int(connection["credential_version"]),
+        reconciliation_range_start=WINDOW_START - timedelta(days=14),
         bindings=[
             {
                 "role": store.RESIDENTIAL_MORNING_ROLE,
@@ -4169,6 +4263,91 @@ def test_delayed_source_writes_reject_a_replaced_calendar(client, auth):
         db.query_one("SELECT COUNT(*) AS n FROM google_calendar_event_mappings")["n"]
         == 0
     )
+
+
+def test_source_replacement_respects_the_canonical_reconciliation_lookback(
+    client, auth, monkeypatch
+):
+    recent_start = datetime.now(UTC) - timedelta(days=1)
+    recent_end = recent_start + timedelta(hours=2)
+    range_state = {"start": recent_start - timedelta(days=14)}
+    monkeypatch.setattr(
+        calendar_api,
+        "_canonical_sync_window",
+        lambda _time_zone_name: (
+            range_state["start"],
+            recent_start + timedelta(days=90),
+        ),
+    )
+    sources = configure_canonical_sources(client, auth)
+    residential = sources[store.RESIDENTIAL_MORNING_ROLE]
+    recent = google_occurrence(
+        "recent-source-replacement-identity",
+        calendar_id="residential@example.test",
+        start=recent_start,
+        end=recent_end,
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [recent],
+        "commercial@example.test": [],
+    }
+    synced = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["counts"]["create"] == 1
+
+    FakeGoogleClient.calendars = [
+        CalendarSummary(
+            calendar_id="replacement-residential@example.test",
+            summary="Replacement Residential",
+            primary=False,
+            selected=True,
+            access_role="owner",
+            time_zone="America/Chicago",
+        ),
+        CalendarSummary(
+            calendar_id="commercial@example.test",
+            summary="Commercial Calendar",
+            primary=False,
+            selected=True,
+            access_role="reader",
+            time_zone="America/Chicago",
+        ),
+    ]
+    request = {
+        "residentialMorningCalendarId": "replacement-residential@example.test",
+        "commercialEveningNightCalendarId": "commercial@example.test",
+    }
+    blocked = client.put(
+        "/api/admin/google-calendar/sources",
+        headers=auth,
+        json=request,
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert "active reconciliation window" in blocked.json()["error"]
+    assert (
+        db.query_one(
+            "SELECT calendar_id FROM google_calendar_sources WHERE id = %s",
+            (int(residential["id"]),),
+        )["calendar_id"]
+        == "residential@example.test"
+    )
+
+    range_state["start"] = recent_end + timedelta(seconds=1)
+    replaced = client.put(
+        "/api/admin/google-calendar/sources",
+        headers=auth,
+        json=request,
+    )
+
+    assert replaced.status_code == 200, replaced.text
+    replaced_source = next(
+        source
+        for source in replaced.json()["sources"]
+        if source["role"] == store.RESIDENTIAL_MORNING_ROLE
+    )
+    assert int(replaced_source["id"]) == int(residential["id"])
+    assert replaced_source["calendarId"] == "replacement-residential@example.test"
 
 
 def test_provider_writes_reject_a_superseded_oauth_grant(client, auth):

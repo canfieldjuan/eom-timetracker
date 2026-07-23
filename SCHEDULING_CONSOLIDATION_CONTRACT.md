@@ -175,3 +175,66 @@ Report, with exact changed-file line citations:
 Lead with those gaps under Confirmed, Contradicted, and Could-not-determine.
 Then reconstruct the diff change by change and map every hunk to a requirement.
 Do not declare completion while any gap remains.
+
+## Exact-head review correction contract
+
+Status: derived before review-correction code on 2026-07-23
+
+### Root causes
+
+Five review findings expose mismatches between canonical service windows and
+the evidence reconciled against them:
+
+1. The weekly loader admits jobs only by `scheduled_date`, so a timed job that
+   starts before the requested local day but overlaps it is absent before
+   actual evidence is reconciled.
+2. A sole Site/date candidate is accepted before its service window is tested,
+   so non-overlapping labor can be assigned to a timed canonical occurrence.
+3. QR presence is suppressed by any overlapping employee shift without
+   checking which Site the shift or visit segment represents.
+4. Replacing a Calendar source reuses the source row after checking only future
+   work, while canonical reconciliation still reads recent identities from its
+   lookback window and can interpret them against the replacement Calendar.
+5. Unlinked same-Site shift evidence protects every occurrence on the same
+   service date, even when the shift does not overlap the occurrence's valid
+   service window.
+
+The separate review claim about source-job link and unlink routes does not
+identify a Calendar-job mutation. Those routes update the retained
+`shifts.job_id` association, and explicit links are authoritative actual-work
+evidence. Changing that behavior would cross the existing shift-mutation
+boundary rather than repair source-owned job fields.
+
+### Required corrections
+
+The correction must:
+
+1. Load timed jobs for Schedule when their half-open service window overlaps
+   the requested local range, while preserving date loading for legacy jobs and
+   preserving Forecast's date-based allocation query.
+2. Require a valid timed job window to overlap a heuristic labor segment before
+   accepting even a sole Site/date candidate. Preserve explicit shift links and
+   the sole-candidate fallback for jobs without a valid window.
+3. Suppress QR-only presence only when an already-derived segment for the same
+   employee and Site covers the scan.
+4. Refuse Calendar-source replacement while scheduled identities remain inside
+   the exact canonical reconciliation lookback.
+5. Treat an unlinked same-Site shift as work evidence for a job with a valid
+   window only when the intervals overlap. Preserve explicit links and the
+   legacy date fallback for jobs without a valid window.
+6. Add focused regressions for every correction and controls for each preserved
+   fallback or precedence rule.
+
+### Correction boundaries
+
+This correction must not change:
+
+- source-linked job update/delete ownership or Calendar sync semantics beyond
+  preventing source retargeting during the active lookback;
+- shift link, unlink, auto-link, clock, visit, departure, or QR evidence-write
+  semantics;
+- Forecast allocation or economic calculations;
+- OAuth, Calendar read scopes, Calendar event mutation, background scheduling,
+  portal behavior, authentication, payroll, receivables, or unrelated routes;
+- completed-work protection, explicit `shifts.job_id` precedence, Site/type
+  matching, historical retained rows, or legacy jobs without usable windows.

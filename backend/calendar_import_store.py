@@ -2025,6 +2025,7 @@ def replace_calendar_sources(
     *,
     connection_id: int,
     expected_credential_version: int,
+    reconciliation_range_start: datetime,
     bindings: Iterable[dict[str, str]],
     actor_id: int,
     actor_name: str,
@@ -2093,15 +2094,17 @@ def replace_calendar_sources(
                     SELECT 1
                     FROM jobs
                     WHERE calendar_source_id = %s
-                      AND status <> 'cancelled'
-                      AND COALESCE(scheduled_end, scheduled_start) > NOW()
+                      AND source_key IS NOT NULL
+                      AND status = 'scheduled'
+                      AND COALESCE(scheduled_end, scheduled_start) > %s
                     LIMIT 1
                     """,
-                    (int(existing["id"]),),
+                    (int(existing["id"]), reconciliation_range_start),
                 )
                 if cur.fetchone():
                     raise CalendarStoreError(
-                        "Resolve future scheduled work before replacing a Calendar source"
+                        "Resolve scheduled work in the active reconciliation window "
+                        "before replacing a Calendar source"
                     )
             # Move changed IDs out of the unique-key space before either role is
             # updated. This keeps a no-work role swap atomic instead of letting
@@ -2394,13 +2397,37 @@ def _canonical_job_service_dates(existing_job: dict[str, Any]) -> list[date]:
 
 
 def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> bool:
-    """Conservatively protect every local service date touched by a job."""
+    """Protect explicit work and Site evidence for the occurrence."""
 
     job_id = int(existing_job["id"])
     location_id = int(existing_job["location_id"])
     service_dates = _canonical_job_service_dates(existing_job)
-    cur.execute(
+    scheduled_start = existing_job.get("scheduled_start")
+    scheduled_end = existing_job.get("scheduled_end")
+    has_valid_window = (
+        scheduled_start is not None
+        and scheduled_end is not None
+        and scheduled_end > scheduled_start
+    )
+    if has_valid_window:
+        unlinked_shift_predicate = """
+                  AND clock_in < %s
+                  AND (clock_out IS NULL OR clock_out > %s)
         """
+        unlinked_shift_params: tuple[Any, ...] = (
+            scheduled_end,
+            scheduled_start,
+        )
+    else:
+        unlinked_shift_predicate = """
+                  AND COALESCE(
+                      local_date,
+                      (clock_in AT TIME ZONE 'America/Chicago')::date
+                  ) = ANY(%s)
+        """
+        unlinked_shift_params = (service_dates,)
+    cur.execute(
+        f"""
         SELECT (
             EXISTS (
                 SELECT 1 FROM shifts
@@ -2410,18 +2437,7 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
                 SELECT 1 FROM shifts
                 WHERE location_id = %s
                   AND time_category = 'productive'
-                  AND (
-                      COALESCE(
-                          local_date,
-                          (clock_in AT TIME ZONE 'America/Chicago')::date
-                      ) = ANY(%s)
-                      OR (
-                          %s IS NOT NULL
-                          AND %s IS NOT NULL
-                          AND clock_in < %s
-                          AND (clock_out IS NULL OR clock_out > %s)
-                      )
-                  )
+                  {unlinked_shift_predicate}
             )
             OR EXISTS (
                 SELECT 1 FROM visits
@@ -2449,11 +2465,7 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
         (
             job_id,
             location_id,
-            service_dates,
-            existing_job.get("scheduled_start"),
-            existing_job.get("scheduled_end"),
-            existing_job.get("scheduled_end"),
-            existing_job.get("scheduled_start"),
+            *unlinked_shift_params,
             location_id,
             service_dates,
             location_id,

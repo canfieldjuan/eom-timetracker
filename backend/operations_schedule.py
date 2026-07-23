@@ -99,9 +99,38 @@ def allocate_monthly_cents(
     }
 
 
-def _load_jobs(start_date: date, end_date: date) -> List[Dict[str, Any]]:
-    return db.query_all(
+def _load_jobs(
+    start_date: date,
+    end_date: date,
+    *,
+    window_start: Optional[datetime] = None,
+    window_end: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    if (window_start is None) != (window_end is None):
+        raise ValueError("Both job window bounds are required")
+    job_filter = "j.scheduled_date BETWEEN %s AND %s"
+    params: Tuple[Any, ...] = (start_date, end_date)
+    if window_start is not None and window_end is not None:
+        job_filter = """
+                (
+                    j.scheduled_start IS NOT NULL
+                    AND j.scheduled_end IS NOT NULL
+                    AND j.scheduled_end > j.scheduled_start
+                    AND j.scheduled_start < %s
+                    AND j.scheduled_end > %s
+                )
+                OR (
+                    (
+                        j.scheduled_start IS NULL
+                        OR j.scheduled_end IS NULL
+                        OR j.scheduled_end <= j.scheduled_start
+                    )
+                    AND j.scheduled_date BETWEEN %s AND %s
+                )
         """
+        params = (window_end, window_start, start_date, end_date)
+    return db.query_all(
+        f"""
         SELECT j.id, j.location_id, j.customer_name, j.scheduled_date,
                j.expected_hours AS legacy_expected_hours,
                j.revenue AS legacy_revenue, j.notes, j.status, j.created_at,
@@ -120,12 +149,12 @@ def _load_jobs(start_date: date, end_date: date) -> List[Dict[str, Any]]:
         LEFT JOIN google_calendar_sources cs ON cs.id = j.calendar_source_id
         LEFT JOIN locations l ON l.id = j.location_id
         LEFT JOIN customers c ON c.id = l.customer_id
-        WHERE j.scheduled_date BETWEEN %s AND %s
+        WHERE ({job_filter})
         ORDER BY j.scheduled_date,
                  j.scheduled_start NULLS LAST,
                  j.id
         """,
-        (start_date, end_date),
+        params,
     )
 
 
@@ -325,25 +354,33 @@ def _load_time_evidence(
 
 def _qr_only_presence_segments(
     qr_rows: List[Dict[str, Any]],
-    shifts: List[Dict[str, Any]],
+    represented_segments: List[Dict[str, Any]],
     observed_at: datetime,
 ) -> List[Dict[str, Any]]:
-    """Keep Site presence that has no overlapping productive shift."""
+    """Keep Site presence not represented by a same-Site productive segment."""
 
-    shifts_by_employee: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for shift in shifts:
-        shifts_by_employee[int(shift["employee_id"])].append(shift)
+    segments_by_employee_site: Dict[Tuple[int, int], List[Dict[str, Any]]] = (
+        defaultdict(list)
+    )
+    for segment in represented_segments:
+        location_id = segment.get("location_id")
+        if location_id is None:
+            continue
+        segments_by_employee_site[
+            (int(segment["employee_id"]), int(location_id))
+        ].append(segment)
 
     output: List[Dict[str, Any]] = []
     for row in qr_rows:
         employee_id = int(row["employee_id"])
+        location_id = int(row["location_id"])
         checked_in_at = row["server_checked_in_at"]
-        covered_by_shift = any(
-            shift["clock_in"] <= checked_in_at
-            and (shift.get("clock_out") or observed_at) > checked_in_at
-            for shift in shifts_by_employee.get(employee_id, [])
+        covered_by_segment = any(
+            segment["start"] <= checked_in_at
+            and (segment.get("end") or observed_at) > checked_in_at
+            for segment in segments_by_employee_site.get((employee_id, location_id), [])
         )
-        if covered_by_shift:
+        if covered_by_segment:
             continue
         output.append(
             {
@@ -352,7 +389,7 @@ def _qr_only_presence_segments(
                 "employee_id": employee_id,
                 "employee_name": str(row["employee_name"]),
                 "hourly_rate": row.get("hourly_rate"),
-                "location_id": int(row["location_id"]),
+                "location_id": location_id,
                 "location_label": str(row.get("location_label") or ""),
                 "start": checked_in_at,
                 "end": checked_in_at + timedelta(microseconds=1),
@@ -688,8 +725,6 @@ def _match_segment_to_job(
         (job for job in all_candidates.values() if job.get("status") != "cancelled"),
         key=lambda row: int(row["id"]),
     )
-    if len(ordered) == 1:
-        return ordered[0], "unique_site_date", [int(ordered[0]["id"])]
     if not ordered:
         cancelled_ids = sorted(all_candidates)
         if cancelled_ids:
@@ -704,6 +739,19 @@ def _match_segment_to_job(
         and job["scheduled_start"] < segment["end"]
         and job["scheduled_end"] > segment["start"]
     ]
+    if len(ordered) == 1:
+        sole_candidate = ordered[0]
+        has_valid_window = (
+            sole_candidate.get("scheduled_start") is not None
+            and sole_candidate.get("scheduled_end") is not None
+            and sole_candidate["scheduled_end"] > sole_candidate["scheduled_start"]
+        )
+        if has_valid_window and not overlapping:
+            return None, "no_scheduled_job", [int(sole_candidate["id"])]
+        match_reason = (
+            "unique_service_window" if has_valid_window else "unique_site_date"
+        )
+        return sole_candidate, match_reason, [int(sole_candidate["id"])]
     if len(overlapping) == 1:
         return (
             overlapping[0],
@@ -811,7 +859,7 @@ def _decorate_schedule_jobs(
                     range_end,
                 )
             )
-    segments.extend(_qr_only_presence_segments(qr_rows, shifts, observed_at))
+    segments.extend(_qr_only_presence_segments(qr_rows, segments, observed_at))
 
     workers_by_job: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
     unmatched: List[Dict[str, Any]] = []
@@ -1199,7 +1247,12 @@ def build_operations_schedule_router(
             resolved_end,
             app_timezone,
         )
-        jobs = _load_jobs(resolved_start, resolved_end)
+        jobs = _load_jobs(
+            resolved_start,
+            resolved_end,
+            window_start=range_start,
+            window_end=range_end,
+        )
         scheduled_starts = [
             job["scheduled_start"]
             for job in jobs

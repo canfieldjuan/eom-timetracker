@@ -1681,9 +1681,13 @@ def build_calendar_import_router(
                 }
             )
         try:
+            reconciliation_range_start, _ = _canonical_sync_window(
+                config.timezone_name
+            )
             sources = store.replace_calendar_sources(
                 connection_id=int(connection["id"]),
                 expected_credential_version=int(connection["credential_version"]),
+                reconciliation_range_start=reconciliation_range_start,
                 bindings=bindings,
                 actor_id=int(admin["id"]),
                 actor_name=str(admin["name"]),

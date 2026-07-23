@@ -13,6 +13,7 @@ from operations_schedule import (
     _forecast_job_values,
     _job_issues,
     _match_segment_to_job,
+    _qr_only_presence_segments,
     allocate_monthly_cents,
 )
 
@@ -251,6 +252,67 @@ def test_actual_matching_fails_closed_when_two_service_windows_overlap():
     assert candidate_ids == [1, 2]
 
 
+def test_single_timed_candidate_requires_overlap_and_legacy_keeps_date_fallback():
+    service_day = date(2026, 7, 20)
+    app_timezone = ZoneInfo("America/Chicago")
+    timed_job = {
+        "id": 1,
+        "location_id": 77,
+        "scheduled_date": service_day,
+        "scheduled_start": datetime(2026, 7, 20, 23, tzinfo=timezone.utc),
+        "scheduled_end": datetime(2026, 7, 21, 1, tzinfo=timezone.utc),
+        "status": "scheduled",
+    }
+    morning_segment = {
+        "location_id": 77,
+        "start": datetime(2026, 7, 20, 14, tzinfo=timezone.utc),
+        "end": datetime(2026, 7, 20, 16, tzinfo=timezone.utc),
+    }
+
+    match, reason, candidate_ids = _match_segment_to_job(
+        morning_segment,
+        {(77, service_day): [timed_job]},
+        {1: timed_job},
+        app_timezone,
+    )
+
+    assert match is None
+    assert reason == "no_scheduled_job"
+    assert candidate_ids == [1]
+
+    overlapping_segment = {
+        **morning_segment,
+        "start": timed_job["scheduled_start"],
+        "end": timed_job["scheduled_end"],
+    }
+    match, reason, candidate_ids = _match_segment_to_job(
+        overlapping_segment,
+        {(77, service_day): [timed_job]},
+        {1: timed_job},
+        app_timezone,
+    )
+
+    assert match == timed_job
+    assert reason == "unique_service_window"
+    assert candidate_ids == [1]
+
+    legacy_job = {
+        **timed_job,
+        "scheduled_start": None,
+        "scheduled_end": None,
+    }
+    match, reason, candidate_ids = _match_segment_to_job(
+        morning_segment,
+        {(77, service_day): [legacy_job]},
+        {1: legacy_job},
+        app_timezone,
+    )
+
+    assert match == legacy_job
+    assert reason == "unique_site_date"
+    assert candidate_ids == [1]
+
+
 def test_linked_shift_does_not_override_an_explicit_different_site_segment():
     service_day = date(2026, 7, 20)
     linked_job = {
@@ -284,8 +346,39 @@ def test_linked_shift_does_not_override_an_explicit_different_site_segment():
     )
 
     assert match == visited_job
-    assert reason == "unique_site_date"
+    assert reason == "unique_service_window"
     assert candidate_ids == [visited_job["id"]]
+
+
+def test_qr_presence_is_suppressed_only_by_a_same_site_segment():
+    checked_in_at = datetime(2026, 7, 20, 15, tzinfo=timezone.utc)
+    represented_segment = {
+        "employee_id": 5,
+        "location_id": 77,
+        "start": checked_in_at - timedelta(hours=1),
+        "end": checked_in_at + timedelta(hours=1),
+    }
+    qr_rows = [
+        {
+            "employee_id": 5,
+            "employee_name": "Worker",
+            "hourly_rate": Decimal("18.00"),
+            "location_id": location_id,
+            "location_label": f"Site {location_id}",
+            "server_checked_in_at": checked_in_at,
+        }
+        for location_id in (77, 88)
+    ]
+
+    output = _qr_only_presence_segments(
+        qr_rows,
+        [represented_segment],
+        checked_in_at + timedelta(hours=2),
+    )
+
+    assert [segment["location_id"] for segment in output] == [88]
+    assert output[0]["presence_only"] is True
+    assert output[0]["evidence"] == ["qr_check_in"]
 
 
 def test_missing_site_does_not_report_site_economics_issues():
@@ -739,7 +832,7 @@ def test_schedule_open_shift_identifies_worker_without_finalized_hours(client, a
                     "finalized": False,
                     "presenceOnly": False,
                     "evidence": ["clock_in", "qr_check_in"],
-                    "match": "unique_site_date",
+                    "match": "unique_service_window",
                 }
             ],
             "status": "in_progress",
@@ -843,7 +936,7 @@ def test_qr_establishes_site_presence_without_creating_paid_time(client, auth):
                     "finalized": False,
                     "presenceOnly": True,
                     "evidence": ["qr_check_in"],
-                    "match": "unique_site_date",
+                    "match": "unique_service_window",
                 }
             ],
             "status": "observed",
@@ -1001,7 +1094,7 @@ def test_qr_only_presence_without_shift_is_retained_with_zero_hours(client, auth
                     "finalized": False,
                     "presenceOnly": True,
                     "evidence": ["qr_check_in"],
-                    "match": "unique_site_date",
+                    "match": "unique_service_window",
                 }
             ],
             "status": "observed",
@@ -1085,17 +1178,41 @@ def test_saturday_night_job_keeps_post_midnight_actual(client, auth):
                     start + timedelta(hours=1),
                 ),
             )
+            next_service_day = service_day + timedelta(days=1)
+            cur.execute(
+                """
+                INSERT INTO jobs (
+                    location_id, customer_name, scheduled_date, status,
+                    calendar_source_id
+                )
+                VALUES (%s, %s, %s, 'scheduled', %s)
+                RETURNING id
+                """,
+                (
+                    site_id,
+                    f"{TEST_PREFIX} Customer Legacy Date",
+                    next_service_day,
+                    source_id,
+                ),
+            )
+            legacy_job_id = int(cur.fetchone()[0])
 
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={
+            "start_date": str(next_service_day),
+            "end_date": str(next_service_day),
+        },
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    job = next(row for row in body["jobs"] if row["id"] == job_id)
+    jobs = {row["id"]: row for row in body["jobs"]}
+    job = jobs[job_id]
 
     assert job["scheduledDate"] == str(service_day)
+    assert jobs[legacy_job_id]["scheduledDate"] == str(next_service_day)
+    assert jobs[legacy_job_id]["scheduledStart"] is None
     assert job["actualHours"] == 2
     assert job["varianceHours"] == 0
     intervals = job["workers"][0]["intervals"]
