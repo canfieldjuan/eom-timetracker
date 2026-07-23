@@ -150,8 +150,9 @@ class TestSiteQr:
     ):
         first = create_site_qr(client, auth, location_id)
         assert first["site"]["id"] == location_id
-        assert first["checkInUrl"].startswith("http://testserver/")
-        assert "?checkIn=eom1." in first["checkInUrl"]
+        assert first["checkInUrl"].startswith(
+            "https://portal.example.test/portal?checkIn=eom1."
+        )
         assert "<svg" in first["qrSvg"]
 
         resolved = client.post(

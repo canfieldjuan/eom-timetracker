@@ -50,11 +50,15 @@ this backend's own host:
   backend therefore land in the canonical portal without reprinting.
 
 When `PUBLIC_APP_URL` is unset (or points at this backend's own host, which
-would otherwise redirect the backend to itself), both behaviors fall back to
-the legacy shape: generated URLs use `{origin}/?checkIn=<token>` and the
-remaining legacy page is served directly. That page no longer implements
-employee QR resolution or submission, so this fallback is not a functional QR
-check-in path and unsetting `PUBLIC_APP_URL` is no longer a cutover rollback.
+would otherwise redirect the backend to itself), QR behavior fails closed:
+
+- scanned backend links receive `503 QR check-in portal is not configured`
+  with `Cache-Control: no-store`;
+- admin QR generation receives the same `503` before a token can be created or
+  rotated; and
+- requests without a non-empty `checkIn` parameter still serve the remaining
+  legacy page for ordinary time entry.
+
 Production must keep `PUBLIC_APP_URL` pointed at the canonical EOM portal.
 
 ## Geofence and accuracy policy
