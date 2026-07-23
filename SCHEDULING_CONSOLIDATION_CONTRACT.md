@@ -238,3 +238,72 @@ This correction must not change:
   portal behavior, authentication, payroll, receivables, or unrelated routes;
 - completed-work protection, explicit `shifts.job_id` precedence, Site/type
   matching, historical retained rows, or legacy jobs without usable windows.
+
+## Second exact-head review correction contract
+
+Status: derived before second-round review-correction code on 2026-07-23
+
+### Root causes
+
+Three remaining paths can turn reviewed or timed source identity into the wrong
+canonical result:
+
+1. Job auto-link persists an authoritative `shifts.job_id` after matching only
+   Site and local date. It does not load or compare the closed shift interval
+   with a timed job's service window, although the Schedule projection later
+   trusts that persisted link before heuristic window matching.
+2. Saving a mapping for a recurring series supersedes the submitted
+   occurrence-level choice only when that occurrence mapping has a different
+   fingerprint. A current-fingerprint occurrence override can therefore remain
+   ahead of the newly saved series mapping and keep resolving the submitted
+   occurrence to the old Site.
+3. The retained preview/approval path and mappings created before fingerprint
+   support can leave occurrence mappings with a null `source_fingerprint`.
+   Canonical sync treats every such value as stale, even when a linked retained
+   visit or migrated job proves the exact same reviewed occurrence fingerprint
+   and Site.
+
+The first item narrows the earlier correction boundary that left auto-link
+unchanged. The defect is in heuristic auto-link candidate eligibility; explicit
+operator link and unlink actions remain authoritative.
+
+### Required corrections
+
+The correction must:
+
+1. Make auto-link compare half-open intervals for jobs with a valid timed
+   service window, apply the existing uniqueness rule after that filtering, and
+   retain the current Site/date fallback for jobs without a usable window.
+2. When an operator saves the submitted occurrence as a series decision,
+   always supersede that occurrence mapping regardless of fingerprint. Reuse it
+   as the series row when no series row exists; otherwise repoint retained visit
+   references to the existing series row before deleting only the superseded
+   occurrence row.
+3. Persist the exact reviewed occurrence fingerprint on retained
+   preview/approval mappings going forward. Repair a historical null
+   fingerprint only when matching retained source key, connection, Calendar,
+   Site, and stored visit/job fingerprint prove it; never treat an unproven null
+   or a changed occurrence as current.
+4. Add focused regressions for non-overlapping and overlapping timed auto-link,
+   date-only auto-link compatibility, occurrence-to-series supersession in both
+   row-reuse and existing-series cases, intentional series-to-occurrence
+   overrides, new retained mapping fingerprints, safe historical backfill, and
+   changed-fingerprint rejection.
+
+### Correction boundaries
+
+This correction must not change:
+
+- explicit job link/unlink behavior or its precedence in Schedule;
+- exact-Site and unique-name auto-link resolution, cancelled-job exclusion,
+  `job_id IS NULL` overwrite protection, locking, or response shape;
+- Calendar occurrence creation, update, cancellation, protected-work, or
+  current-snapshot guards;
+- occurrence-over-series precedence when an operator deliberately saves a later
+  one-off override;
+- credential, source, timezone, active-Site, Site-type, fingerprint, or
+  non-recurring mapping validation;
+- historical planned visits, mappings, jobs, audit provenance, or actual-work
+  evidence except for the narrowly proven mapping-reference reconciliation;
+- clock, visit, departure, QR, payroll, Forecast economics, authentication,
+  receivables, portal behavior, schema constraints, or unrelated routes.

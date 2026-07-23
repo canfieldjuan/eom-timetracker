@@ -1623,7 +1623,8 @@ def test_retryable_google_not_found_maps_to_retryable_service_response(client):
 
 def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, auth):
     connect_selected_calendar()
-    FakeGoogleClient.occurrences = [google_occurrence("service-1")]
+    raw_occurrence = google_occurrence("service-1")
+    FakeGoogleClient.occurrences = [raw_occurrence]
     evidence_before = {
         "shifts": db.query_one("SELECT COUNT(*) AS n FROM shifts")["n"],
         "checkins": db.query_one("SELECT COUNT(*) AS n FROM site_check_ins")["n"],
@@ -1664,6 +1665,21 @@ def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, aut
     assert retry.status_code == 200
     assert retry.json() == approved.json()
     assert db.query_one("SELECT COUNT(*) AS n FROM planned_service_visits")["n"] == 1
+    expected_fingerprint = calendar_api.occurrence_fingerprint(
+        calendar_api._source_occurrence(raw_occurrence)
+    )
+    assert db.query_one(
+        """
+        SELECT mapping.source_fingerprint AS mapping_fingerprint,
+               visit.source_fingerprint AS visit_fingerprint
+        FROM planned_service_visits AS visit
+        JOIN google_calendar_event_mappings AS mapping
+          ON mapping.id = visit.mapping_id
+        """
+    ) == {
+        "mapping_fingerprint": expected_fingerprint,
+        "visit_fingerprint": expected_fingerprint,
+    }
     assert (
         db.query_one(
             "SELECT COUNT(*) AS n FROM planned_visit_assignments WHERE active = true"
@@ -1684,6 +1700,143 @@ def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, aut
         )["n"],
     }
     assert evidence_after == evidence_before
+
+
+def test_retained_mapping_fingerprint_backfill_is_guarded_and_idempotent(
+    client, auth
+):
+    sources = configure_canonical_sources(client, auth)
+    source = sources[store.RESIDENTIAL_MORNING_ROLE]
+    connection_id = int(source["connectionId"])
+    source_id = int(source["id"])
+    calendar_id = str(source["calendarId"])
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    safe = calendar_api._source_occurrence(
+        google_occurrence("safe-null-mapping", calendar_id=calendar_id)
+    )
+    changed = calendar_api._source_occurrence(
+        google_occurrence("changed-null-mapping", calendar_id=calendar_id)
+    )
+    orphan = calendar_api._source_occurrence(
+        google_occurrence("orphan-null-mapping", calendar_id=calendar_id)
+    )
+
+    def insert_null_mapping(occurrence):
+        return int(
+            db.query_one(
+                """
+                INSERT INTO google_calendar_event_mappings (
+                    connection_id, calendar_id, source_key, source_series_id,
+                    mapping_scope, source_fingerprint, location_id,
+                    created_by, updated_by
+                ) VALUES (%s, %s, %s, %s, 'occurrence', NULL, %s, 1, 1)
+                RETURNING id
+                """,
+                (
+                    connection_id,
+                    calendar_id,
+                    occurrence.source_key,
+                    occurrence.series_id,
+                    location_id,
+                ),
+            )["id"]
+        )
+
+    safe_mapping_id = insert_null_mapping(safe)
+    changed_mapping_id = insert_null_mapping(changed)
+    insert_null_mapping(orphan)
+    safe_fingerprint = calendar_api.occurrence_fingerprint(safe)
+    changed_visit_fingerprint = calendar_api.occurrence_fingerprint(changed)
+    changed_job_fingerprint = "f" * 64
+    assert changed_job_fingerprint != changed_visit_fingerprint
+    changed_job_id = int(
+        db.query_one(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date,
+                scheduled_start, scheduled_end, status, calendar_source_id,
+                source_calendar_id, source_event_id, source_series_id,
+                source_occurrence_id, source_key, source_fingerprint
+            ) VALUES (
+                %s, 'Changed fingerprint proof', %s, %s, %s, 'scheduled', %s,
+                %s, %s, %s, %s, %s, %s
+            )
+            RETURNING id
+            """,
+            (
+                location_id,
+                changed.service_date,
+                changed.starts_at,
+                changed.ends_at,
+                source_id,
+                calendar_id,
+                changed.event_id,
+                changed.series_id,
+                changed.occurrence_id,
+                changed.source_key,
+                changed_job_fingerprint,
+            ),
+        )["id"]
+    )
+
+    for occurrence, mapping_id, fingerprint, migrated_job_id in (
+        (safe, safe_mapping_id, safe_fingerprint, None),
+        (
+            changed,
+            changed_mapping_id,
+            changed_visit_fingerprint,
+            changed_job_id,
+        ),
+    ):
+        db.execute(
+            """
+            INSERT INTO planned_service_visits (
+                connection_id, mapping_id, source_calendar_id, source_event_id,
+                source_series_id, source_occurrence_id, source_key,
+                source_fingerprint, title, location_id, approximate_start,
+                approximate_end, source_timezone, migrated_job_id
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                connection_id,
+                mapping_id,
+                calendar_id,
+                occurrence.event_id,
+                occurrence.series_id,
+                occurrence.occurrence_id,
+                occurrence.source_key,
+                fingerprint,
+                occurrence.title,
+                location_id,
+                occurrence.starts_at,
+                occurrence.ends_at,
+                occurrence.time_zone,
+                migrated_job_id,
+            ),
+        )
+
+    assert store._backfill_retained_mapping_fingerprints() == 1
+    assert {
+        row["source_key"]: row["source_fingerprint"]
+        for row in db.query_all(
+            """
+            SELECT source_key, source_fingerprint
+            FROM google_calendar_event_mappings
+            ORDER BY source_key
+            """
+        )
+    } == {
+        safe.source_key: safe_fingerprint,
+        changed.source_key: None,
+        orphan.source_key: None,
+    }
+    assert store._backfill_retained_mapping_fingerprints() == 0
 
 
 def test_source_change_after_preview_fails_closed_without_planned_write(client, auth):
@@ -2074,13 +2227,12 @@ def test_future_update_and_cancellation_preserve_rows_and_assignment_history(
     )["id"]
 
     moved_start = WINDOW_START + timedelta(hours=1)
-    FakeGoogleClient.occurrences = [
-        google_occurrence(
-            "lifecycle-1",
-            start=moved_start,
-            updated="2026-07-18T13:00:00Z",
-        )
-    ]
+    moved_occurrence = google_occurrence(
+        "lifecycle-1",
+        start=moved_start,
+        updated="2026-07-18T13:00:00Z",
+    )
+    FakeGoogleClient.occurrences = [moved_occurrence]
     preview = client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
@@ -2095,6 +2247,13 @@ def test_future_update_and_cancellation_preserve_rows_and_assignment_history(
         )["approximate_start"]
         == moved_start
     )
+    assert db.query_one(
+        "SELECT source_fingerprint FROM google_calendar_event_mappings"
+    ) == {
+        "source_fingerprint": calendar_api.occurrence_fingerprint(
+            calendar_api._source_occurrence(moved_occurrence)
+        )
+    }
 
     FakeGoogleClient.occurrences = [
         google_occurrence("lifecycle-1", cancelled=True, updated="2026-07-18T14:00:00Z")
@@ -3944,10 +4103,15 @@ def test_non_recurring_mapping_defaults_to_fingerprint_guarded_occurrence_scope(
 @pytest.mark.parametrize(
     "existing_series_mapping",
     [False, True],
-    ids=["reuse-stale-occurrence", "merge-into-existing-series"],
+    ids=["reuse-occurrence-row", "merge-into-existing-series"],
 )
-def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
-    client, auth, existing_series_mapping
+@pytest.mark.parametrize(
+    "occurrence_mapping_is_fresh",
+    [False, True],
+    ids=["historical-null-fingerprint", "current-fingerprint"],
+)
+def test_series_save_supersedes_the_submitted_occurrence_mapping(
+    client, auth, existing_series_mapping, occurrence_mapping_is_fresh
 ):
     sources = configure_canonical_sources(client, auth)
     source = sources[store.RESIDENTIAL_MORNING_ROLE]
@@ -3967,26 +4131,41 @@ def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
     FakeGoogleClient.targeted_recurring_occurrences = {
         ("retained-series", original_start.isoformat()): raw_occurrence
     }
-    location_id = int(
+    occurrence_location_id = int(
         db.query_one(
             "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
         )["id"]
     )
-    stale_mapping_id = int(
+    series_location_id = int(
+        db.query_one(
+            """
+            INSERT INTO locations (
+                address, customer_name, location_type, active
+            ) VALUES (
+                '789 Pine St, Effingham', 'Series decision',
+                'Residential', true
+            )
+            RETURNING id
+            """
+        )["id"]
+    )
+    occurrence_mapping_id = int(
         db.query_one(
             """
             INSERT INTO google_calendar_event_mappings (
                 connection_id, calendar_id, source_key, source_series_id,
                 mapping_scope, source_fingerprint, location_id,
                 created_by, updated_by
-            ) VALUES (%s, %s, %s, NULL, 'occurrence', NULL, %s, 1, 1)
+            ) VALUES (%s, %s, %s, %s, 'occurrence', %s, %s, 1, 1)
             RETURNING id
             """,
             (
                 int(connection["id"]),
                 str(source["calendarId"]),
                 occurrence.source_key,
-                location_id,
+                occurrence.series_id if occurrence_mapping_is_fresh else None,
+                fingerprint if occurrence_mapping_is_fresh else None,
+                occurrence_location_id,
             ),
         )["id"]
     )
@@ -3995,7 +4174,7 @@ def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
         calendar_id=str(source["calendarId"]),
         source_series_id=occurrence.series_id,
     )
-    series_mapping_id = stale_mapping_id
+    series_mapping_id = occurrence_mapping_id
     if existing_series_mapping:
         series_mapping_id = int(
             db.query_one(
@@ -4013,7 +4192,7 @@ def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
                     series_mapping_key,
                     occurrence.series_id,
                     "0" * 64,
-                    location_id,
+                    occurrence_location_id,
                 ),
             )["id"]
         )
@@ -4034,7 +4213,7 @@ def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
             """,
             (
                 int(connection["id"]),
-                stale_mapping_id,
+                occurrence_mapping_id,
                 occurrence.calendar_id,
                 occurrence.event_id,
                 occurrence.series_id,
@@ -4046,7 +4225,7 @@ def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
                 occurrence.title,
                 occurrence.description,
                 occurrence.location_text,
-                location_id,
+                occurrence_location_id,
                 occurrence.starts_at,
                 occurrence.ends_at,
                 occurrence.time_zone,
@@ -4064,7 +4243,7 @@ def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
             "eventId": occurrence.event_id,
             "seriesId": occurrence.series_id,
             "occurrenceId": occurrence.occurrence_id,
-            "locationId": location_id,
+            "locationId": series_location_id,
             "applyToSeries": True,
         },
     )
@@ -4072,6 +4251,7 @@ def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
     assert saved.status_code == 200, saved.text
     assert saved.json()["mapping"]["id"] == series_mapping_id
     assert saved.json()["mapping"]["scope"] == "series"
+    assert saved.json()["mapping"]["locationId"] == series_location_id
     assert db.query_one(
         "SELECT mapping_id FROM planned_service_visits WHERE id = %s",
         (retained_visit_id,),
@@ -4090,7 +4270,7 @@ def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
             "source_series_id": occurrence.series_id,
             "mapping_scope": "series",
             "source_fingerprint": fingerprint,
-            "location_id": location_id,
+            "location_id": series_location_id,
         }
     ]
     synced = store.sync_calendar_source(
@@ -4104,6 +4284,10 @@ def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
     )
     assert synced["counts"]["create"] == 1
     assert synced["exceptions"] == []
+    assert db.query_one(
+        "SELECT location_id FROM jobs WHERE source_key = %s",
+        (occurrence.source_key,),
+    ) == {"location_id": series_location_id}
 
 
 def test_occurrence_override_preserves_the_recurring_series_default(client, auth):

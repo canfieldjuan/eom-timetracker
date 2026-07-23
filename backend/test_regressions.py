@@ -7,7 +7,7 @@ Run:  cd backend && pytest -v test_regressions.py
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -161,8 +161,180 @@ class TestRequestFieldBounds:
 
 
 # ===============================================================================
-# admin_auto_link_jobs -- WHERE job_id IS NULL guard
+# admin_auto_link_jobs -- interval-aware matching and job_id IS NULL guard
 # ===============================================================================
+
+def _insert_auto_link_job(
+    *,
+    location_id,
+    service_date,
+    scheduled_start=None,
+    scheduled_end=None,
+    source_key=None,
+):
+    import db
+
+    return db.execute_returning(
+        """
+        INSERT INTO jobs (
+            location_id, customer_name, scheduled_date, scheduled_start,
+            scheduled_end, notes, status, source_key
+        )
+        VALUES (%s, 'Auto Link Regression', %s, %s, %s, '', 'scheduled', %s)
+        RETURNING id
+        """,
+        (
+            location_id,
+            service_date,
+            scheduled_start,
+            scheduled_end,
+            source_key,
+        ),
+    )
+
+
+def _insert_auto_link_shift(
+    *,
+    employee_id,
+    location_id,
+    service_date,
+    clock_in,
+    clock_out,
+):
+    import db
+
+    return db.execute_returning(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, notes, local_date, timezone, time_category
+        )
+        VALUES (
+            %s, %s, '123 Main St, Effingham', %s, %s, 2,
+            'interval-aware auto-link regression', %s,
+            'America/Chicago', 'productive'
+        )
+        RETURNING id
+        """,
+        (employee_id, location_id, clock_in, clock_out, service_date),
+    )
+
+
+def _delete_auto_link_rows(*, job_ids, shift_ids):
+    import db
+
+    db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
+    db.execute("DELETE FROM jobs WHERE id = ANY(%s)", (job_ids,))
+
+
+class TestAutoLinkServiceWindows:
+    def test_nonoverlapping_timed_calendar_job_is_not_linked(
+        self, client, auth, employee_id, location_id
+    ):
+        import db
+
+        service_date = datetime(2036, 2, 10).date()
+        shift_start = datetime(2036, 2, 10, 14, tzinfo=timezone.utc)
+        shift_end = datetime(2036, 2, 10, 16, tzinfo=timezone.utc)
+        job_id = _insert_auto_link_job(
+            location_id=location_id,
+            service_date=service_date,
+            scheduled_start=shift_end,
+            scheduled_end=shift_end + timedelta(hours=2),
+            source_key="e" * 64,
+        )
+        shift_id = _insert_auto_link_shift(
+            employee_id=employee_id,
+            location_id=location_id,
+            service_date=service_date,
+            clock_in=shift_start,
+            clock_out=shift_end,
+        )
+        try:
+            response = client.post("/api/admin/jobs/auto-link", headers=auth)
+
+            assert response.status_code == 200, response.text
+            assert (
+                db.query_one(
+                    "SELECT job_id FROM shifts WHERE id = %s",
+                    (shift_id,),
+                )["job_id"]
+                is None
+            )
+        finally:
+            _delete_auto_link_rows(job_ids=[job_id], shift_ids=[shift_id])
+
+    def test_overlap_filter_runs_before_existing_uniqueness_rule(
+        self, client, auth, employee_id, location_id
+    ):
+        import db
+
+        service_date = datetime(2036, 2, 11).date()
+        shift_start = datetime(2036, 2, 11, 15, tzinfo=timezone.utc)
+        shift_end = datetime(2036, 2, 11, 17, tzinfo=timezone.utc)
+        nonoverlapping_job_id = _insert_auto_link_job(
+            location_id=location_id,
+            service_date=service_date,
+            scheduled_start=shift_end + timedelta(hours=1),
+            scheduled_end=shift_end + timedelta(hours=3),
+            source_key="f" * 64,
+        )
+        overlapping_job_id = _insert_auto_link_job(
+            location_id=location_id,
+            service_date=service_date,
+            scheduled_start=shift_start - timedelta(hours=1),
+            scheduled_end=shift_end + timedelta(hours=1),
+            source_key="9" * 64,
+        )
+        shift_id = _insert_auto_link_shift(
+            employee_id=employee_id,
+            location_id=location_id,
+            service_date=service_date,
+            clock_in=shift_start,
+            clock_out=shift_end,
+        )
+        job_ids = [nonoverlapping_job_id, overlapping_job_id]
+        try:
+            response = client.post("/api/admin/jobs/auto-link", headers=auth)
+
+            assert response.status_code == 200, response.text
+            assert db.query_one(
+                "SELECT job_id FROM shifts WHERE id = %s",
+                (shift_id,),
+            )["job_id"] == overlapping_job_id
+        finally:
+            _delete_auto_link_rows(job_ids=job_ids, shift_ids=[shift_id])
+
+    def test_date_only_job_keeps_site_date_fallback(
+        self, client, auth, employee_id, location_id
+    ):
+        import db
+
+        service_date = datetime(2036, 2, 12).date()
+        shift_start = datetime(2036, 2, 12, 15, tzinfo=timezone.utc)
+        shift_end = shift_start + timedelta(hours=2)
+        job_id = _insert_auto_link_job(
+            location_id=location_id,
+            service_date=service_date,
+        )
+        shift_id = _insert_auto_link_shift(
+            employee_id=employee_id,
+            location_id=location_id,
+            service_date=service_date,
+            clock_in=shift_start,
+            clock_out=shift_end,
+        )
+        try:
+            response = client.post("/api/admin/jobs/auto-link", headers=auth)
+
+            assert response.status_code == 200, response.text
+            assert db.query_one(
+                "SELECT job_id FROM shifts WHERE id = %s",
+                (shift_id,),
+            )["job_id"] == job_id
+        finally:
+            _delete_auto_link_rows(job_ids=[job_id], shift_ids=[shift_id])
+
 
 class TestAutoLinkPreservesManualLink:
     def test_auto_link_does_not_overwrite_manual_link(

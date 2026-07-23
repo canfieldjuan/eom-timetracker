@@ -10577,10 +10577,11 @@ def admin_auto_link_jobs(
     request: Request,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    """Auto-link only when an exact Site/date match is unambiguous."""
+    """Auto-link only when an exact Site/date and timed-window match is unambiguous."""
     jobs = db.query_all(
         """
-        SELECT j.id, j.location_id, j.customer_name, j.scheduled_date
+        SELECT j.id, j.location_id, j.customer_name, j.scheduled_date,
+               j.scheduled_start, j.scheduled_end
         FROM jobs j
         WHERE j.status != 'cancelled'
         """
@@ -10633,7 +10634,7 @@ def admin_auto_link_jobs(
 
     unlinked = db.query_all(
         """
-        SELECT s.id, s.local_date, s.location_id,
+        SELECT s.id, s.local_date, s.location_id, s.clock_in, s.clock_out,
                COALESCE(l.address, s.location_label, '') AS location
         FROM shifts s
         LEFT JOIN locations l ON s.location_id = l.id
@@ -10675,6 +10676,19 @@ def admin_auto_link_jobs(
                                 (normalized_customer, shift_date),
                                 [],
                             )
+                    candidates = [
+                        job
+                        for job in candidates
+                        if (
+                            job.get("scheduled_start") is None
+                            or job.get("scheduled_end") is None
+                            or job["scheduled_end"] <= job["scheduled_start"]
+                            or (
+                                job["scheduled_start"] < shift["clock_out"]
+                                and job["scheduled_end"] > shift["clock_in"]
+                            )
+                        )
+                    ]
                     if len(candidates) != 1:
                         continue
                     cur.execute(

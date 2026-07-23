@@ -394,7 +394,43 @@ def ensure_schema() -> None:
             ON planned_visit_audit_events(planned_visit_id, created_at);
         """
     )
+    _backfill_retained_mapping_fingerprints()
     migrate_legacy_planned_visits()
+
+
+def _backfill_retained_mapping_fingerprints() -> int:
+    """Repair only null mapping fingerprints proven by linked retained identity."""
+
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE google_calendar_event_mappings AS mapping
+                SET source_fingerprint = visit.source_fingerprint
+                FROM planned_service_visits AS visit
+                LEFT JOIN jobs AS migrated_job
+                  ON migrated_job.id = visit.migrated_job_id
+                WHERE mapping.source_fingerprint IS NULL
+                  AND mapping.mapping_scope = 'occurrence'
+                  AND visit.mapping_id = mapping.id
+                  AND visit.source_key = mapping.source_key
+                  AND visit.connection_id = mapping.connection_id
+                  AND visit.source_calendar_id = mapping.calendar_id
+                  AND visit.location_id = mapping.location_id
+                  AND (
+                      visit.migrated_job_id IS NULL
+                      OR (
+                          migrated_job.source_key = visit.source_key
+                          AND migrated_job.source_calendar_id =
+                              visit.source_calendar_id
+                          AND migrated_job.location_id = visit.location_id
+                          AND migrated_job.source_fingerprint =
+                              visit.source_fingerprint
+                      )
+                  )
+                """
+            )
+            return int(cur.rowcount)
 
 
 def _state_hash(state: str) -> str:
@@ -1370,6 +1406,7 @@ def _upsert_mapping(
     connection_id: int,
     calendar_id: str,
     source_key: str,
+    source_fingerprint: str,
     location_id: int,
     actor_id: int,
     actor_name: str,
@@ -1377,7 +1414,7 @@ def _upsert_mapping(
 ) -> int:
     cur.execute(
         """
-        SELECT id, connection_id, location_id
+        SELECT id, connection_id, source_fingerprint, location_id
         FROM google_calendar_event_mappings
         WHERE source_key = %s
         FOR UPDATE
@@ -1389,18 +1426,21 @@ def _upsert_mapping(
         mapping_id = int(before["id"])
         if (
             int(before["connection_id"]) != connection_id
+            or str(before.get("source_fingerprint") or "") != source_fingerprint
             or int(before["location_id"]) != location_id
         ):
             cur.execute(
                 """
                 UPDATE google_calendar_event_mappings
                 SET connection_id = %s, calendar_id = %s,
-                    location_id = %s, updated_by = %s, updated_at = NOW()
+                    source_fingerprint = %s, location_id = %s,
+                    updated_by = %s, updated_at = NOW()
                 WHERE id = %s
                 """,
                 (
                     connection_id,
                     calendar_id,
+                    source_fingerprint,
                     location_id,
                     actor_id,
                     mapping_id,
@@ -1419,6 +1459,7 @@ def _upsert_mapping(
                     "connection_id": connection_id,
                     "calendar_id": calendar_id,
                     "source_key": source_key,
+                    "source_fingerprint": source_fingerprint,
                     "location_id": location_id,
                 },
             )
@@ -1426,15 +1467,16 @@ def _upsert_mapping(
     cur.execute(
         """
         INSERT INTO google_calendar_event_mappings (
-            connection_id, calendar_id, source_key,
+            connection_id, calendar_id, source_key, source_fingerprint,
             location_id, created_by, updated_by
-        ) VALUES (%s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
             connection_id,
             calendar_id,
             source_key,
+            source_fingerprint,
             location_id,
             actor_id,
             actor_id,
@@ -1453,6 +1495,7 @@ def _upsert_mapping(
             "connection_id": connection_id,
             "calendar_id": calendar_id,
             "source_key": source_key,
+            "source_fingerprint": source_fingerprint,
             "location_id": location_id,
         },
     )
@@ -1670,6 +1713,8 @@ def apply_reviewed_preview(
     actor_name: str,
 ) -> dict[str, Any]:
     """Apply an exact rebuilt preview transactionally and idempotently."""
+    from planned_visits import occurrence_fingerprint
+
     action_list = list(actions)
     items_by_key = {item.source_key: item for item in preview.items}
     with db.get_conn() as conn:
@@ -1759,6 +1804,7 @@ def apply_reviewed_preview(
                     connection_id=int(preview_row["connection_id"]),
                     calendar_id=str(preview_row["calendar_id"]),
                     source_key=item.source_key,
+                    source_fingerprint=occurrence_fingerprint(occurrence),
                     location_id=int(item.location_resolution.location_id),
                     actor_id=actor_id,
                     actor_name=actor_name,
@@ -3249,7 +3295,7 @@ def upsert_canonical_mapping(
                 existing = cur.fetchone()
                 cur.execute(
                     """
-                    SELECT id, source_key, mapping_scope, source_fingerprint
+                    SELECT id, source_key, mapping_scope
                     FROM google_calendar_event_mappings
                     WHERE connection_id = %s AND calendar_id = %s
                       AND mapping_scope = 'occurrence' AND source_key = %s
@@ -3262,20 +3308,13 @@ def upsert_canonical_mapping(
                     ),
                 )
                 occurrence_mapping = cur.fetchone()
-                stale_occurrence_mapping = (
-                    occurrence_mapping
-                    if occurrence_mapping
-                    and str(occurrence_mapping.get("source_fingerprint") or "")
-                    != source_fingerprint
-                    else None
-                )
-                stale_occurrence_mapping_id: int | None = None
-                if existing is None and stale_occurrence_mapping is not None:
-                    existing = stale_occurrence_mapping
-                elif stale_occurrence_mapping is not None:
-                    stale_occurrence_mapping_id = int(stale_occurrence_mapping["id"])
+                superseded_occurrence_mapping_id: int | None = None
+                if existing is None and occurrence_mapping is not None:
+                    existing = occurrence_mapping
+                elif occurrence_mapping is not None:
+                    superseded_occurrence_mapping_id = int(occurrence_mapping["id"])
             else:
-                stale_occurrence_mapping_id = None
+                superseded_occurrence_mapping_id = None
                 cur.execute(
                     """
                     UPDATE google_calendar_event_mappings
@@ -3356,18 +3395,18 @@ def upsert_canonical_mapping(
                     ),
                 )
                 mapping_id = int(cur.fetchone()["id"])
-            if stale_occurrence_mapping_id is not None:
+            if superseded_occurrence_mapping_id is not None:
                 cur.execute(
                     """
                     UPDATE planned_service_visits
                     SET mapping_id = %s
                     WHERE mapping_id = %s
                     """,
-                    (mapping_id, stale_occurrence_mapping_id),
+                    (mapping_id, superseded_occurrence_mapping_id),
                 )
                 cur.execute(
                     "DELETE FROM google_calendar_event_mappings WHERE id = %s",
-                    (stale_occurrence_mapping_id,),
+                    (superseded_occurrence_mapping_id,),
                 )
             cur.execute(
                 """
