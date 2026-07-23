@@ -2,10 +2,10 @@
 
 GET / and GET /timetracker-mobile.html must 302 QR deep links
 (?checkIn=<token>) to {PUBLIC_APP_URL}/portal when PUBLIC_APP_URL points at
-the canonical EOM portal, and keep serving the legacy Firefly page in every
-other state (env unset, param absent or empty, self-origin configuration).
-The redirect must forward ONLY the checkIn value and must never be cacheable,
-so unsetting PUBLIC_APP_URL rolls the cutover back completely.
+the canonical EOM portal. Requests without a usable external portal
+configuration keep serving the remaining legacy Firefly page, but that page no
+longer processes employee QR check-ins. The redirect must forward ONLY the
+checkIn value and must never be cacheable.
 """
 
 from __future__ import annotations

@@ -793,15 +793,6 @@
             </div>
 
             <div class="panel">
-                <h3>Site Check-In</h3>
-                <p id="siteCheckInPrompt" class="meta">
-                    Scan the printed site QR with your phone camera. Return here, then tap Check in to share your current location once.
-                </p>
-                <button id="siteCheckInButton" class="btn-success" type="button" disabled>Check in</button>
-                <div id="siteCheckInMessage" class="message"></div>
-            </div>
-
-            <div class="panel">
                 <h3>Time Entry</h3>
 
                 <label for="locationSelect">Location</label>
@@ -864,7 +855,6 @@
             correctionSelection: null,
             sites: [],
             adminEmployees: [],
-            pendingSiteCheckIn: null,
             siteQrObjectUrl: '',
             siteCheckInActivityDatesInitialized: false
         };
@@ -994,110 +984,6 @@
                     }
                 );
             });
-        }
-
-        function capturePendingSiteQr() {
-            const queryParams = new URLSearchParams(window.location.search);
-            const token = queryParams.get('checkIn');
-            state.pendingSiteCheckIn = token
-                ? { token, scannedAt: new Date().toISOString(), site: null }
-                : null;
-        }
-
-        function renderPendingSiteCheckIn() {
-            const prompt = document.getElementById('siteCheckInPrompt');
-            const button = document.getElementById('siteCheckInButton');
-            const pending = state.pendingSiteCheckIn;
-            if (pending && pending.site) {
-                prompt.textContent = `Ready to check in at ${pending.site.name}. Location is requested only when you tap Check in.`;
-                button.disabled = false;
-                return;
-            }
-
-            prompt.textContent = pending
-                ? 'Resolving the scanned site QR. Sign in if prompted.'
-                : 'Scan the printed site QR with your phone camera. Return here, then tap Check in to share your current location once.';
-            button.disabled = true;
-        }
-
-        async function resolvePendingSiteCheckIn() {
-            renderPendingSiteCheckIn();
-            if (!state.token || !state.pendingSiteCheckIn) {
-                return;
-            }
-
-            const message = document.getElementById('siteCheckInMessage');
-            clearMessage(message);
-            try {
-                const payload = await apiRequest(
-                    '/timesheet/site-check-in/resolve',
-                    'POST',
-                    { token: state.pendingSiteCheckIn.token },
-                    true
-                );
-                state.pendingSiteCheckIn.site = payload.site;
-                renderPendingSiteCheckIn();
-                setMessage(message, 'success', `Site QR recognized: ${payload.site.name}.`);
-            } catch (error) {
-                state.pendingSiteCheckIn.site = null;
-                renderPendingSiteCheckIn();
-                setMessage(message, 'error', error.message);
-            }
-        }
-
-        function clearPendingSiteCheckIn() {
-            state.pendingSiteCheckIn = null;
-            const url = new URL(window.location.href);
-            url.searchParams.delete('checkIn');
-            window.history.replaceState({}, '', url);
-            renderPendingSiteCheckIn();
-        }
-
-        function siteCheckInResultMessage(checkIn, duplicate) {
-            const prefix = duplicate ? 'This scan was already recorded.' : 'Site check-in recorded.';
-            if (checkIn.classification === 'on_time') {
-                return `${prefix} Marked on time at ${checkIn.siteName}.`;
-            }
-            if (checkIn.classification === 'late') {
-                return `${prefix} Marked late at ${checkIn.siteName}.`;
-            }
-            return `${prefix} Sent to admin review at ${checkIn.siteName}.`;
-        }
-
-        async function handleSiteCheckIn() {
-            const message = document.getElementById('siteCheckInMessage');
-            clearMessage(message);
-            if (!state.pendingSiteCheckIn || !state.pendingSiteCheckIn.site) {
-                setMessage(message, 'error', 'Scan a valid site QR first.');
-                return;
-            }
-
-            const button = document.getElementById('siteCheckInButton');
-            button.disabled = true;
-            try {
-                const coords = await getCurrentCoordinates();
-                const payload = await apiRequest('/timesheet/site-check-in', 'POST', {
-                    employeeId: state.user.id,
-                    siteId: state.pendingSiteCheckIn.site.id,
-                    token: state.pendingSiteCheckIn.token,
-                    scannedAt: state.pendingSiteCheckIn.scannedAt,
-                    latitude: coords.latitude,
-                    longitude: coords.longitude,
-                    accuracy: coords.accuracy
-                }, true);
-                const resultText = siteCheckInResultMessage(payload.checkIn, payload.duplicate);
-                clearPendingSiteCheckIn();
-                setMessage(message, 'success', resultText);
-                if (hasAdminSession()) {
-                    await loadSiteCheckInReviews();
-                }
-            } catch (error) {
-                const text = error instanceof TypeError
-                    ? 'No check-in was recorded. An internet connection is required; reconnect and try again.'
-                    : error.message;
-                setMessage(message, 'error', text);
-                renderPendingSiteCheckIn();
-            }
         }
 
         function readGpsOverrideFields() {
@@ -1241,7 +1127,6 @@
                 departButton.disabled = true;
                 clockOutButton.disabled = true;
             }
-            renderPendingSiteCheckIn();
         }
 
         function captureStaleShiftReview(error) {
@@ -2143,7 +2028,6 @@
         async function refreshEmployeePanels() {
             clearMessage(document.getElementById('entryMessage'));
             await loadLocations();
-            await resolvePendingSiteCheckIn();
             await loadCurrentStatus();
             if (hasAdminSession()) {
                 await loadAdminCheckInEmployees();
@@ -2276,8 +2160,6 @@
             state.sites = [];
             state.adminEmployees = [];
             clearSiteQrPreview();
-            capturePendingSiteQr();
-
             localStorage.removeItem(STORAGE_TOKEN);
             localStorage.removeItem(STORAGE_USER);
             renderAuthState();
@@ -2288,8 +2170,6 @@
             document.getElementById('buildCorrectionPlanButton').disabled = true;
             invalidateCorrectionPlan();
             clearMessage(document.getElementById('entryMessage'));
-            clearMessage(document.getElementById('siteCheckInMessage'));
-            renderPendingSiteCheckIn();
             hideGpsOverridePanel(true);
         }
 
@@ -2753,9 +2633,6 @@
         async function bootstrap() {
             state.apiBaseUrl = defaultApiBaseUrl();
             document.getElementById('apiBaseUrl').value = state.apiBaseUrl;
-            capturePendingSiteQr();
-            renderPendingSiteCheckIn();
-
             const now = new Date();
             document.getElementById('adminLogDate').value = currentDateIso();
             document.getElementById('reportMonth').value = String(now.getMonth() + 1);
@@ -2797,7 +2674,6 @@
             await loadDashboard();
         });
         document.getElementById('loginButton').addEventListener('click', handleLogin);
-        document.getElementById('siteCheckInButton').addEventListener('click', handleSiteCheckIn);
         document.getElementById('clockInButton').addEventListener('click', handleClockIn);
         document.getElementById('arriveButton').addEventListener('click', handleArrive);
         document.getElementById('departButton').addEventListener('click', handleDepart);

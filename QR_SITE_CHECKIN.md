@@ -9,7 +9,7 @@ source of paid time until those two workflows are intentionally joined.
 
 1. An admin prints a QR for a registered site.
 2. The employee scans it with the phone's normal Camera app. The QR opens the
-   existing web app with an opaque, signed site token.
+   canonical EOM portal with an opaque, signed site token.
 3. The employee signs in through the normal session if needed. Resolving the QR
    requires that session but does not request location.
 4. The employee taps **Check in**. Only then does the browser request one GPS
@@ -52,9 +52,10 @@ this backend's own host:
 When `PUBLIC_APP_URL` is unset (or points at this backend's own host, which
 would otherwise redirect the backend to itself), both behaviors fall back to
 the legacy shape: generated URLs use `{origin}/?checkIn=<token>` and the
-legacy page is served directly. Unsetting the variable is the complete
-rollback for the portal cutover; the temporary 302 plus `no-store` means no
-phone has cached the redirect.
+remaining legacy page is served directly. That page no longer implements
+employee QR resolution or submission, so this fallback is not a functional QR
+check-in path and unsetting `PUBLIC_APP_URL` is no longer a cutover rollback.
+Production must keep `PUBLIC_APP_URL` pointed at the canonical EOM portal.
 
 ## Geofence and accuracy policy
 
