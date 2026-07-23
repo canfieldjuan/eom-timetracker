@@ -34,8 +34,27 @@ immediately invalidates older printed copies.
 The encoded value is an HTTPS app URL with the token in the `checkIn` query
 parameter. This lets iPhone and Android users scan with the built-in Camera
 instead of granting the web app continuous camera access.
-`PUBLIC_APP_URL` should be set to the production HTTPS app origin so printed
-codes stay canonical behind a reverse proxy.
+
+## Canonical portal destination (issue #35)
+
+`PUBLIC_APP_URL` names the canonical EOM portal origin
+(`https://effinghamofficemaids.com`). When it is set to an origin other than
+this backend's own host:
+
+- Newly generated QR URLs are `{PUBLIC_APP_URL}/portal?checkIn=<token>`
+  (`/portal`, not `/portal.html` — the website deploy uses cleanUrls).
+- `GET /` and `GET /timetracker-mobile.html` answer any request carrying a
+  non-empty `checkIn` parameter with a `302` to that same portal URL,
+  forwarding only the `checkIn` value and marking the response
+  `Cache-Control: no-store`. Already-printed QR codes that point at this
+  backend therefore land in the canonical portal without reprinting.
+
+When `PUBLIC_APP_URL` is unset (or points at this backend's own host, which
+would otherwise redirect the backend to itself), both behaviors fall back to
+the legacy shape: generated URLs use `{origin}/?checkIn=<token>` and the
+legacy page is served directly. Unsetting the variable is the complete
+rollback for the portal cutover; the temporary 302 plus `no-store` means no
+phone has cached the redirect.
 
 ## Geofence and accuracy policy
 
