@@ -3184,11 +3184,17 @@ def _ensure_customer_site_schema() -> None:
                 """
             )
 
+WEEKLY_SCHEDULE_SCHEMA_LOCK_TIMEOUT = "5s"
+
 
 def _ensure_weekly_schedule_site_schema() -> None:
     """Finalize weekly schedule identity after the Site-aware rollout."""
     with db.get_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "SET LOCAL lock_timeout = %s",
+                (WEEKLY_SCHEDULE_SCHEMA_LOCK_TIMEOUT,),
+            )
             _lock_customer_site_mutations(cur)
             cur.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",

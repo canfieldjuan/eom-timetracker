@@ -27,6 +27,8 @@ shield around that obsolete arbiter, not the permanent business rule.
 - The migration must install the replacement unique indexes before dropping
   the legacy name-based table constraint, perform the change transactionally,
   and be safe to rerun.
+- Lock acquisition must have a bounded transaction-local wait so deployment
+  fails closed instead of hanging indefinitely behind an active schedule write.
 - If existing exact-Site duplicates or a conflicting catalog object prevent
   the replacement indexes from being proven correct, the migration must fail
   closed and retain the legacy constraint, old index, and all schedule rows.

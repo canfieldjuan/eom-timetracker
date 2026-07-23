@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from uuid import uuid4
 
 import pytest
 from psycopg2 import sql
-from psycopg2.errors import RaiseException, UniqueViolation
+from psycopg2.errors import LockNotAvailable, RaiseException, UniqueViolation
 from psycopg2.pool import ThreadedConnectionPool
 
 from conftest import TEST_DB_URL, _raw_conn
@@ -802,6 +803,7 @@ def test_customer_site_and_schedule_migrations_upgrade_the_legacy_shape(
 
 def test_schedule_site_identity_migration_rolls_back_without_proven_replacements(
     client,
+    monkeypatch,
 ):
     """A bad legacy state cannot remove the old arbiter without replacement."""
     import time_tracker_api as api
@@ -1008,6 +1010,60 @@ def test_schedule_site_identity_migration_rolls_back_without_proven_replacements
               AND indexname = 'uq_schedules_employee_legacy_name_week'
             """
         )["indexdef"].startswith("CREATE INDEX ")
+
+        api.db.execute(
+            """
+            DROP INDEX uq_schedules_employee_site_week;
+            DROP INDEX uq_schedules_employee_legacy_name_week;
+            """
+        )
+        with setup_conn.cursor() as cur:
+            cur.execute("LOCK TABLE schedules IN ROW EXCLUSIVE MODE")
+        monkeypatch.setattr(
+            api,
+            "WEEKLY_SCHEDULE_SCHEMA_LOCK_TIMEOUT",
+            "100ms",
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            migration = executor.submit(api._ensure_weekly_schedule_site_schema)
+            try:
+                with pytest.raises(LockNotAvailable):
+                    migration.result(timeout=2)
+            finally:
+                setup_conn.rollback()
+        assert api.db.query_all(
+            "SELECT * FROM schedules ORDER BY id"
+        ) == wrong_catalog_rows
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_constraint
+            WHERE conrelid = 'schedules'::regclass
+              AND contype = 'u'
+              AND pg_get_constraintdef(oid) LIKE '%%customer_name%%'
+            """
+        ) == {"count": 1}
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname = 'idx_schedules_site_week'
+            """
+        ) == {"count": 1}
+        assert api.db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'schedules'
+              AND indexname IN (
+                  'uq_schedules_employee_site_week',
+                  'uq_schedules_employee_legacy_name_week'
+              )
+            """
+        ) == {"count": 0}
     finally:
         api.db._pool = old_pool
         if isolated_pool is not None:
