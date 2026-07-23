@@ -1751,6 +1751,28 @@ def enforce_dashboard_access(request: Request) -> Optional[JSONResponse]:
     return None
 
 
+def enforce_clock_action_hours(request: Request) -> None:
+    """Reject employee time-recording actions outside the configured window.
+
+    Applies the same day + hour window as the dashboard gate
+    (ALLOWED_DAYS / ACCESS_START_HOUR..ACCESS_END_HOUR, company timezone) but
+    deliberately NOT the IP allowlist — field phones have churning mobile IPs.
+    Disabled instantly via ENFORCE_CLOCK_HOURS=false (no deploy needed).
+    """
+    if not ENFORCE_CLOCK_HOURS:
+        return
+    allowed_by_time, time_reason, current_time = check_schedule_access()
+    if not allowed_by_time:
+        append_access_log(request, "CLOCK_TIME_RESTRICTION", False, time_reason)
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Time entry is only allowed between {ACCESS_START_HOUR}:00 and "
+                f"{ACCESS_END_HOUR}:00 ({TIMEZONE_NAME}). Current time: {current_time}."
+            ),
+        )
+
+
 def parse_report_path(stdout_text: str) -> str:
     for line in stdout_text.splitlines():
         if "Report available at:" in line:
@@ -2364,6 +2386,11 @@ TRUST_PROXY = parse_bool(os.getenv("TRUST_PROXY"), False)
 # Used to pick the real client IP from the RIGHT of X-Forwarded-For (Render's
 # edge = 1). Increase only if you add another trusted proxy (e.g. a CDN).
 TRUSTED_PROXY_HOPS = max(1, parse_int(os.getenv("TRUSTED_PROXY_HOPS"), 1))
+# Gate employee clock actions (clock-in/out, arrive, depart, QR check-in) to the
+# ACCESS_START_HOUR..ACCESS_END_HOUR window on ALLOWED_DAYS. Deliberately does NOT
+# apply the IP allowlist (field phones have churning mobile IPs). Kill switch:
+# set ENFORCE_CLOCK_HOURS=false to disable without a deploy.
+ENFORCE_CLOCK_HOURS = parse_bool(os.getenv("ENFORCE_CLOCK_HOURS"), True)
 BOOTSTRAP_ADMIN_IDS = [
     int(x) for x in os.getenv("BOOTSTRAP_ADMIN_IDS", "").split(",") if x.strip().isdigit()
 ]
@@ -5042,6 +5069,7 @@ def record_site_check_in(
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
+    enforce_clock_action_hours(request)
     if int(payload.employeeId) != int(employee["id"]):
         append_access_log(
             request,
@@ -6227,6 +6255,7 @@ def clock_in(
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
+    enforce_clock_action_hours(request)
     notes = payload.notes.strip()
     has_gps = payload.latitude is not None and payload.longitude is not None
     now_utc = utc_now()
@@ -6387,6 +6416,7 @@ def log_visit(
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     """Auto-log an arrival at a new location during an active shift."""
+    enforce_clock_action_hours(request)
     has_gps = payload.latitude is not None and payload.longitude is not None
     now_utc = utc_now()
 
