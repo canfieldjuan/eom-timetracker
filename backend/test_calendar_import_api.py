@@ -2889,7 +2889,7 @@ def test_status_downgrades_success_when_a_canonical_sync_window_is_stale(
     stale = client.get("/api/admin/google-calendar/status", headers=auth)
 
     assert stale.status_code == 200, stale.text
-    assert stale.json()["syncStatus"] == "partial"
+    assert stale.json()["syncStatus"] == "stale"
     assert {source["lastSyncStatus"] for source in stale.json()["sources"]} == {
         "success"
     }

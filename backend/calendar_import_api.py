@@ -1501,7 +1501,7 @@ def build_calendar_import_router(
         elif source_statuses == {"success"} and sync_window_current:
             sync_status = "success"
         elif source_statuses == {"success"}:
-            sync_status = "partial"
+            sync_status = "stale"
         elif "failed" in source_statuses and "success" in source_statuses:
             sync_status = "partial"
         elif "failed" in source_statuses:
