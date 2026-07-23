@@ -302,3 +302,30 @@ class TestLoginRateLimit:
         finally:
             with tta._RATE_LIMIT_LOCK:
                 tta._RATE_LIMIT_BUCKETS.clear()
+
+
+class TestRemovedOrphanEndpoints:
+    """Five endpoints with no production caller were deliberately removed
+    (2026-07-22, refs issue #21). These assert they stay gone, and that the
+    kept sibling variants still respond."""
+
+    REMOVED = [
+        "/api/admin/receivables/allocation-suggestions",
+        "/api/admin/corrections/time-data/history",
+        "/api/admin/logs",
+        "/api/admin/analytics/customers",
+        "/api/admin/analytics/flagged",
+    ]
+
+    def test_removed_endpoints_are_gone(self, client, auth):
+        for path in self.REMOVED:
+            r = client.get(path, headers=auth)
+            assert r.status_code == 404, f"{path} should be removed, got {r.status_code}"
+
+    def test_kept_sibling_variants_still_work(self, client, auth):
+        # Dated logs variant (used by timetracker-mobile.html) still serves.
+        r = client.get("/api/admin/logs/2026-01-01", headers=auth)
+        assert r.status_code == 200, r.text
+        # Main analytics endpoint (used by portal.html) still serves.
+        r = client.get("/api/admin/analytics?period=day", headers=auth)
+        assert r.status_code == 200, r.text
