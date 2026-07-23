@@ -10613,24 +10613,41 @@ def admin_auto_link_jobs(
                 int(row["id"])
             )
 
-    jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = {}
-    legacy_jobs_by_name_date: Dict[Tuple[str, date], List[Dict[str, Any]]] = {}
+    timed_jobs_by_site: Dict[int, List[Dict[str, Any]]] = {}
+    fallback_jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = {}
+    timed_legacy_jobs_by_name: Dict[str, List[Dict[str, Any]]] = {}
+    fallback_legacy_jobs_by_name_date: Dict[
+        Tuple[str, date], List[Dict[str, Any]]
+    ] = {}
     for job in jobs:
         scheduled_date = job.get("scheduled_date")
         if not scheduled_date:
             continue
+        scheduled_start = job.get("scheduled_start")
+        scheduled_end = job.get("scheduled_end")
+        has_valid_window = (
+            scheduled_start is not None
+            and scheduled_end is not None
+            and scheduled_end > scheduled_start
+        )
         if job.get("location_id") is not None:
-            jobs_by_site_date.setdefault(
-                (int(job["location_id"]), scheduled_date),
-                [],
-            ).append(job)
+            if has_valid_window:
+                timed_jobs_by_site.setdefault(int(job["location_id"]), []).append(job)
+            else:
+                fallback_jobs_by_site_date.setdefault(
+                    (int(job["location_id"]), scheduled_date),
+                    [],
+                ).append(job)
             continue
         normalized_name = str(job.get("customer_name") or "").strip().casefold()
         if normalized_name:
-            legacy_jobs_by_name_date.setdefault(
-                (normalized_name, scheduled_date),
-                [],
-            ).append(job)
+            if has_valid_window:
+                timed_legacy_jobs_by_name.setdefault(normalized_name, []).append(job)
+            else:
+                fallback_legacy_jobs_by_name_date.setdefault(
+                    (normalized_name, scheduled_date),
+                    [],
+                ).append(job)
 
     unlinked = db.query_all(
         """
@@ -10647,9 +10664,7 @@ def admin_auto_link_jobs(
             with conn.cursor() as cur:
                 linked = 0
                 for shift in unlinked:
-                    shift_date = shift["local_date"]
-                    if not shift_date:
-                        continue
+                    shift_date = shift.get("local_date")
                     location = str(shift.get("location") or "")
                     shift_site_id = (
                         int(shift["location_id"])
@@ -10665,30 +10680,55 @@ def admin_auto_link_jobs(
                     if shift_site_id is None and len(active_name_site_ids) == 1:
                         shift_site_id = next(iter(active_name_site_ids))
 
-                    candidates = (
-                        jobs_by_site_date.get((shift_site_id, shift_date), [])
-                        if shift_site_id is not None
-                        else []
-                    )
-                    if not candidates and len(active_name_site_ids) == 1:
-                        if shift_site_id in active_name_site_ids:
-                            candidates = legacy_jobs_by_name_date.get(
-                                (normalized_customer, shift_date),
-                                [],
-                            )
-                    candidates = [
-                        job
-                        for job in candidates
-                        if (
-                            job.get("scheduled_start") is None
-                            or job.get("scheduled_end") is None
-                            or job["scheduled_end"] <= job["scheduled_start"]
-                            or (
+                    def eligible_candidates(
+                        timed_candidates: List[Dict[str, Any]],
+                        fallback_candidates: List[Dict[str, Any]],
+                    ) -> List[Dict[str, Any]]:
+                        eligible_by_id = {
+                            int(job["id"]): job
+                            for job in timed_candidates
+                            if (
                                 job["scheduled_start"] < shift["clock_out"]
                                 and job["scheduled_end"] > shift["clock_in"]
                             )
+                        }
+                        for job in fallback_candidates:
+                            eligible_by_id[int(job["id"])] = job
+                        return list(eligible_by_id.values())
+
+                    site_fallback_candidates = (
+                        fallback_jobs_by_site_date.get(
+                            (shift_site_id, shift_date),
+                            [],
                         )
-                    ]
+                        if shift_site_id is not None and shift_date is not None
+                        else []
+                    )
+                    candidates = eligible_candidates(
+                        (
+                            timed_jobs_by_site.get(shift_site_id, [])
+                            if shift_site_id is not None
+                            else []
+                        ),
+                        site_fallback_candidates,
+                    )
+                    if not candidates and len(active_name_site_ids) == 1:
+                        if shift_site_id in active_name_site_ids:
+                            legacy_fallback_candidates = (
+                                fallback_legacy_jobs_by_name_date.get(
+                                    (normalized_customer, shift_date),
+                                    [],
+                                )
+                                if shift_date is not None
+                                else []
+                            )
+                            candidates = eligible_candidates(
+                                timed_legacy_jobs_by_name.get(
+                                    normalized_customer,
+                                    [],
+                                ),
+                                legacy_fallback_candidates,
+                            )
                     if len(candidates) != 1:
                         continue
                     cur.execute(

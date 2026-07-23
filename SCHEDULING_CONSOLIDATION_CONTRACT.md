@@ -307,3 +307,77 @@ This correction must not change:
   evidence except for the narrowly proven mapping-reference reconciliation;
 - clock, visit, departure, QR, payroll, Forecast economics, authentication,
   receivables, portal behavior, schema constraints, or unrelated routes.
+
+## Third exact-head review correction contract
+
+Status: derived before third-round review-correction code on 2026-07-23
+
+### Root causes
+
+Four remaining paths confuse a range-limited view of canonical identity with
+the identity itself:
+
+1. Timed auto-link candidates are admitted through one persisted job date and
+   one persisted shift date before their intervals are compared. A job or shift
+   that crosses local midnight can therefore overlap without ever becoming a
+   candidate.
+2. Completed-work protection narrows unlinked shifts to a valid job window but
+   narrows visit, departure, and QR point evidence only to the same Site and
+   local service date. Unrelated work at that Site can protect a later
+   occurrence from a Calendar move or cancellation.
+3. Schedule projection loads only jobs in the requested range. When an evidence
+   segment carries an explicit `job_id` whose row is outside that range, the
+   missing projection row is treated like no link and Site/date heuristics can
+   credit the segment to a different visible job.
+4. The portal renders Agenda's Previous, This Week, and Next controls in
+   Forecast. Those controls mutate the Agenda week and reload Schedule, while
+   Forecast is intentionally an as-of-now 4/8/12-week horizon with no selected
+   week input. Reloading the same Forecast endpoint would not make the changed
+   Agenda label true.
+
+### Required corrections
+
+The correction must:
+
+1. Admit valid timed auto-link candidates by exact Site, or by the existing
+   uniquely resolved legacy name, without first requiring one local-date key.
+   Apply half-open interval overlap to the entire closed shift and deduplicate
+   by job ID before the existing exactly-one rule. Keep invalid or missing job
+   windows on the existing Site/name plus `shift.local_date` fallback.
+2. For a job with a valid window, require unlinked visit arrivals, departures,
+   and QR check-ins to fall within `[scheduled_start, scheduled_end)` before
+   they protect the occurrence. Keep the current service-date fallback for a
+   job without a usable window, and keep explicit linked shifts authoritative.
+3. Resolve metadata for an evidence segment's explicit linked job separately
+   from the visible job list. When the link applies to the segment's Site but
+   its job is outside the selected Schedule range, emit an unmatched
+   explicit-link exception carrying that job ID and never rematch the segment
+   to a visible job. Preserve heuristic matching for a proven different-Site
+   segment in a multi-stop shift.
+4. In Forecast, hide Agenda-only Previous, This Week, and Next controls and
+   display the period returned by the Forecast response (with returned week
+   buckets as a compatibility fallback). Keep Refresh, Calendar Settings, and
+   the 4/8/12-week selector. Returning to Agenda must restore its unchanged
+   selected week and controls.
+5. Add focused regressions for both directions of cross-midnight overlap,
+   de-duplication and boundary non-overlap, inside/outside/boundary point
+   evidence across midnight, explicit out-of-range link preservation and
+   different-Site multi-stop fallback, and the view-specific Forecast period
+   and controls.
+
+### Correction boundaries
+
+This correction must not change:
+
+- explicit link/unlink mutation endpoints, loaded-link precedence, or
+  different-Site multi-stop matching;
+- cancelled-job exclusion, exact-Site and unique-name resolution,
+  `job_id IS NULL` overwrite protection, auto-link locking, or response shape;
+- which QR/geofence/review states are accepted or any clock, visit, departure,
+  QR, job, or Calendar evidence-write semantics;
+- completed or in-progress work protection, invalid-window date fallback,
+  Calendar source ownership, snapshot guards, or sync transaction behavior;
+- Forecast API parameters, current-relative horizon, Calendar coverage window,
+  allocation, economics, or response shape;
+- authentication, payroll, receivables, Customers/Sites, Calendar settings,
+  legacy planners, schema constraints, or unrelated routes and portal tabs.

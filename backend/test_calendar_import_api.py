@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import psycopg2.extras
 import pytest
 
 import calendar_import_api as calendar_api
@@ -3415,6 +3416,185 @@ def test_source_sync_loads_site_matching_snapshot_once(client, auth, monkeypatch
 
     assert result["counts"]["create"] == 2
     assert load_count == 1
+
+
+def _insert_point_work_evidence(
+    cur,
+    *,
+    evidence_kind: str,
+    employee_id: int,
+    location_id: int,
+    observed_at: datetime,
+) -> tuple[int | None, int | None]:
+    if evidence_kind == "qr":
+        cur.execute(
+            """
+            INSERT INTO site_check_ins (
+                employee_id, location_id, server_checked_in_at,
+                device_scanned_at, latitude, longitude, accuracy_m,
+                geofence_radius_m, distance_m, geofence_status,
+                classification, classification_reason,
+                device_clock_skew_seconds, review_status
+            ) VALUES (
+                %s, %s, %s, %s, 39.1203, -88.54335, 5,
+                100, 0, 'inside', 'on_time', 'point_evidence_test',
+                0, 'not_required'
+            )
+            RETURNING id
+            """,
+            (employee_id, location_id, observed_at, observed_at),
+        )
+        return None, int(cur.fetchone()["id"])
+
+    cur.execute(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, local_date, time_category, non_productive_type,
+            notes, job_id
+        ) VALUES (
+            %s, NULL, '', %s, %s, 0.03, %s, 'non_productive', 'other',
+            'canonical-calendar-test-evidence', NULL
+        )
+        RETURNING id
+        """,
+        (
+            employee_id,
+            observed_at - timedelta(minutes=1),
+            observed_at + timedelta(minutes=1),
+            observed_at.astimezone(ZoneInfo("America/Chicago")).date(),
+        ),
+    )
+    shift_id = int(cur.fetchone()["id"])
+    if evidence_kind == "visit":
+        cur.execute(
+            """
+            INSERT INTO visits (
+                shift_id, location_id, location_label, customer_name,
+                arrival_time
+            ) VALUES (%s, %s, 'Point Evidence Site', 'Test Customer', %s)
+            """,
+            (shift_id, location_id, observed_at),
+        )
+    elif evidence_kind == "departure":
+        cur.execute(
+            """
+            INSERT INTO departures (
+                shift_id, location_id, location_label, customer_name,
+                departure_time
+            ) VALUES (%s, %s, 'Point Evidence Site', 'Test Customer', %s)
+            """,
+            (shift_id, location_id, observed_at),
+        )
+    else:
+        raise AssertionError(f"Unknown evidence kind: {evidence_kind}")
+    return shift_id, None
+
+
+@pytest.mark.parametrize("evidence_kind", ["visit", "departure", "qr"])
+@pytest.mark.parametrize(
+    ("position", "offset", "expected"),
+    [
+        ("before", timedelta(hours=-1), False),
+        ("start", timedelta(0), True),
+        ("cross_midnight_inside", timedelta(hours=1, minutes=15), True),
+        ("end", timedelta(hours=2), False),
+        ("after", timedelta(hours=3), False),
+    ],
+)
+def test_valid_window_point_evidence_uses_half_open_job_interval(
+    evidence_kind,
+    position,
+    offset,
+    expected,
+):
+    del position
+    product_zone = ZoneInfo("America/Chicago")
+    scheduled_start = datetime(2037, 2, 10, 23, tzinfo=product_zone)
+    scheduled_end = scheduled_start + timedelta(hours=2)
+    observed_at = scheduled_start + offset
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT l.id AS location_id, e.id AS employee_id
+                FROM locations l
+                CROSS JOIN employees e
+                WHERE l.address = '123 Main St, Effingham'
+                  AND e.name = 'Catalina Gomez'
+                """
+            )
+            identity = cur.fetchone()
+            shift_id, check_in_id = _insert_point_work_evidence(
+                cur,
+                evidence_kind=evidence_kind,
+                employee_id=int(identity["employee_id"]),
+                location_id=int(identity["location_id"]),
+                observed_at=observed_at,
+            )
+            existing_job = {
+                "id": -1,
+                "location_id": int(identity["location_id"]),
+                "scheduled_date": scheduled_start.date(),
+                "scheduled_start": scheduled_start,
+                "scheduled_end": scheduled_end,
+            }
+            try:
+                assert (
+                    store._canonical_job_has_work_evidence(cur, existing_job)
+                    is expected
+                )
+            finally:
+                if check_in_id is not None:
+                    cur.execute(
+                        "DELETE FROM site_check_ins WHERE id = %s",
+                        (check_in_id,),
+                    )
+                if shift_id is not None:
+                    cur.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+
+
+@pytest.mark.parametrize("evidence_kind", ["visit", "departure", "qr"])
+def test_invalid_window_point_evidence_keeps_service_date_fallback(evidence_kind):
+    product_zone = ZoneInfo("America/Chicago")
+    service_date = datetime(2037, 2, 12, tzinfo=product_zone).date()
+    observed_at = datetime(2037, 2, 12, 20, tzinfo=product_zone)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT l.id AS location_id, e.id AS employee_id
+                FROM locations l
+                CROSS JOIN employees e
+                WHERE l.address = '123 Main St, Effingham'
+                  AND e.name = 'Catalina Gomez'
+                """
+            )
+            identity = cur.fetchone()
+            shift_id, check_in_id = _insert_point_work_evidence(
+                cur,
+                evidence_kind=evidence_kind,
+                employee_id=int(identity["employee_id"]),
+                location_id=int(identity["location_id"]),
+                observed_at=observed_at,
+            )
+            existing_job = {
+                "id": -1,
+                "location_id": int(identity["location_id"]),
+                "scheduled_date": service_date,
+                "scheduled_start": None,
+                "scheduled_end": None,
+            }
+            try:
+                assert store._canonical_job_has_work_evidence(cur, existing_job) is True
+            finally:
+                if check_in_id is not None:
+                    cur.execute(
+                        "DELETE FROM site_check_ins WHERE id = %s",
+                        (check_in_id,),
+                    )
+                if shift_id is not None:
+                    cur.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
 
 
 def test_site_date_time_evidence_protects_job_without_shift_job_id(client, auth):

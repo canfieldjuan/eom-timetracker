@@ -158,6 +158,26 @@ def _load_jobs(
     )
 
 
+def _load_linked_job_metadata(job_ids: Iterable[int]) -> Dict[int, Dict[str, Any]]:
+    """Load explicit-link identity independently of the visible job window."""
+
+    ids = sorted(set(int(job_id) for job_id in job_ids))
+    if not ids:
+        return {}
+    return {
+        int(row["id"]): row
+        for row in db.query_all(
+            """
+            SELECT id, location_id, status
+            FROM jobs
+            WHERE id = ANY(%s)
+            ORDER BY id
+            """,
+            (ids,),
+        )
+    }
+
+
 def _job_issues(job: Dict[str, Any]) -> List[Dict[str, str]]:
     issues: List[Dict[str, str]] = []
     if job.get("location_id") is None:
@@ -694,23 +714,32 @@ def _match_segment_to_job(
     jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]],
     jobs_by_id: Dict[int, Dict[str, Any]],
     app_timezone: ZoneInfo,
+    *,
+    linked_jobs_by_id: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str, List[int]]:
     linked_job_id = segment.get("job_id")
     if linked_job_id is not None:
-        linked_job = jobs_by_id.get(int(linked_job_id))
-        segment_location_id = segment.get("location_id")
-        linked_location_id = (
-            linked_job.get("location_id") if linked_job is not None else None
+        normalized_linked_job_id = int(linked_job_id)
+        linked_job_lookup = (
+            jobs_by_id if linked_jobs_by_id is None else linked_jobs_by_id
         )
+        linked_job = linked_job_lookup.get(normalized_linked_job_id)
+        if linked_job is None:
+            return None, "linked_job_unavailable", [normalized_linked_job_id]
+        segment_location_id = segment.get("location_id")
+        linked_location_id = linked_job.get("location_id")
         link_applies_to_segment = (
             segment_location_id is None
             or linked_location_id is None
             or int(segment_location_id) == int(linked_location_id)
         )
-        if linked_job is not None and link_applies_to_segment:
+        if link_applies_to_segment:
             if linked_job.get("status") == "cancelled":
-                return None, "cancelled_job", [int(linked_job_id)]
-            return linked_job, "linked_shift", [int(linked_job_id)]
+                return None, "cancelled_job", [normalized_linked_job_id]
+            visible_linked_job = jobs_by_id.get(normalized_linked_job_id)
+            if visible_linked_job is not None:
+                return visible_linked_job, "linked_shift", [normalized_linked_job_id]
+            return None, "linked_job_outside_range", [normalized_linked_job_id]
 
     location_id = segment.get("location_id")
     if location_id is None:
@@ -832,6 +861,15 @@ def _decorate_schedule_jobs(
         range_end,
         observed_at,
     )
+    linked_jobs_by_id = dict(jobs_by_id)
+    linked_jobs_by_id.update(
+        _load_linked_job_metadata(
+            int(shift["job_id"])
+            for shift in shifts
+            if shift.get("job_id") is not None
+            and int(shift["job_id"]) not in jobs_by_id
+        )
+    )
     segments: List[Dict[str, Any]] = []
     for shift in shifts:
         shift_id = int(shift["id"])
@@ -869,6 +907,7 @@ def _decorate_schedule_jobs(
             jobs_by_site_date,
             jobs_by_id,
             app_timezone,
+            linked_jobs_by_id=linked_jobs_by_id,
         )
         if job is None:
             if (

@@ -341,13 +341,55 @@ def test_linked_shift_does_not_override_an_explicit_different_site_segment():
     match, reason, candidate_ids = _match_segment_to_job(
         segment,
         {(visited_job["location_id"], service_day): [visited_job]},
-        {linked_job["id"]: linked_job, visited_job["id"]: visited_job},
+        {visited_job["id"]: visited_job},
         ZoneInfo("America/Chicago"),
+        linked_jobs_by_id={
+            linked_job["id"]: linked_job,
+            visited_job["id"]: visited_job,
+        },
     )
 
     assert match == visited_job
     assert reason == "unique_service_window"
     assert candidate_ids == [visited_job["id"]]
+
+
+def test_linked_shift_outside_visible_range_never_rematches_same_site_segment():
+    service_day = date(2026, 7, 20)
+    linked_job = {
+        "id": 1,
+        "location_id": 77,
+        "status": "scheduled",
+    }
+    visible_job = {
+        "id": 2,
+        "location_id": 77,
+        "scheduled_date": service_day,
+        "scheduled_start": datetime(2026, 7, 20, 14, tzinfo=timezone.utc),
+        "scheduled_end": datetime(2026, 7, 20, 16, tzinfo=timezone.utc),
+        "status": "scheduled",
+    }
+    segment = {
+        "job_id": linked_job["id"],
+        "location_id": visible_job["location_id"],
+        "start": visible_job["scheduled_start"],
+        "end": visible_job["scheduled_end"],
+    }
+
+    match, reason, candidate_ids = _match_segment_to_job(
+        segment,
+        {(visible_job["location_id"], service_day): [visible_job]},
+        {visible_job["id"]: visible_job},
+        ZoneInfo("America/Chicago"),
+        linked_jobs_by_id={
+            linked_job["id"]: linked_job,
+            visible_job["id"]: visible_job,
+        },
+    )
+
+    assert match is None
+    assert reason == "linked_job_outside_range"
+    assert candidate_ids == [linked_job["id"]]
 
 
 def test_qr_presence_is_suppressed_only_by_a_same_site_segment():
@@ -1024,6 +1066,92 @@ def test_explicit_shift_job_link_wins_when_site_matching_is_ambiguous(client, au
     assert jobs[linked_job_id]["actualHours"] == 2
     assert jobs[linked_job_id]["workers"][0]["intervals"][0]["match"] == "linked_shift"
     assert jobs[other_job_id]["actualHours"] == 0
+
+
+def test_explicit_out_of_range_link_is_not_credited_to_visible_same_site_job(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)
+    shift_start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    shift_end = shift_start + timedelta(hours=2)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "linked_outside_range_residential",
+                "residential_morning",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "Linked Outside Range",
+                site_type="Residential",
+                rate=125,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+            linked_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Linked Outside Range",
+                start=shift_start - timedelta(days=7),
+                end=shift_end - timedelta(days=7),
+                source_seed="linked-outside-range-target",
+            )
+            visible_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Linked Outside Range",
+                start=shift_start - timedelta(hours=1),
+                end=shift_end + timedelta(hours=1),
+                source_seed="linked-outside-range-visible",
+            )
+            employee_id = _employee(cur, "Linked Outside Range", 18)
+            cur.execute(
+                """
+                INSERT INTO shifts (
+                    employee_id, job_id, location_id, clock_in, clock_out,
+                    total_hours, local_date, timezone, time_category
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, 2, %s,
+                    'America/Chicago', 'productive'
+                )
+                RETURNING id
+                """,
+                (
+                    employee_id,
+                    linked_job_id,
+                    site_id,
+                    shift_start,
+                    shift_end,
+                    service_day,
+                ),
+            )
+            shift_id = int(cur.fetchone()[0])
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(service_day), "end_date": str(service_day)},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    jobs = {row["id"]: row for row in body["jobs"]}
+
+    assert linked_job_id not in jobs
+    assert jobs[visible_job_id]["actualHours"] == 0
+    unmatched = [
+        row
+        for row in body["unmatchedActualSegments"]
+        if row["reason"] == "linked_job_outside_range"
+    ]
+    assert len(unmatched) == 1
+    assert unmatched[0]["candidateJobIds"] == [linked_job_id]
+    assert unmatched[0]["shiftId"] == shift_id
+    assert unmatched[0]["hours"] == 2
 
 
 def test_qr_only_presence_without_shift_is_retained_with_zero_hours(client, auth):

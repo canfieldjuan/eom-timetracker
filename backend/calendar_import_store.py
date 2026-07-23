@@ -2464,6 +2464,22 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
             scheduled_end,
             scheduled_start,
         )
+        visit_predicate = """
+                  AND arrival_time >= %s
+                  AND arrival_time < %s
+        """
+        departure_predicate = """
+                  AND departure_time >= %s
+                  AND departure_time < %s
+        """
+        check_in_predicate = """
+                  AND server_checked_in_at >= %s
+                  AND server_checked_in_at < %s
+        """
+        point_evidence_params: tuple[Any, ...] = (
+            scheduled_start,
+            scheduled_end,
+        )
     else:
         unlinked_shift_predicate = """
                   AND COALESCE(
@@ -2472,6 +2488,22 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
                   ) = ANY(%s)
         """
         unlinked_shift_params = (service_dates,)
+        visit_predicate = """
+                  AND (
+                      arrival_time AT TIME ZONE 'America/Chicago'
+                  )::date = ANY(%s)
+        """
+        departure_predicate = """
+                  AND (
+                      departure_time AT TIME ZONE 'America/Chicago'
+                  )::date = ANY(%s)
+        """
+        check_in_predicate = """
+                  AND (
+                      server_checked_in_at AT TIME ZONE 'America/Chicago'
+                  )::date = ANY(%s)
+        """
+        point_evidence_params = (service_dates,)
     cur.execute(
         f"""
         SELECT (
@@ -2488,23 +2520,17 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
             OR EXISTS (
                 SELECT 1 FROM visits
                 WHERE location_id = %s
-                  AND (
-                      arrival_time AT TIME ZONE 'America/Chicago'
-                  )::date = ANY(%s)
+                  {visit_predicate}
             )
             OR EXISTS (
                 SELECT 1 FROM departures
                 WHERE location_id = %s
-                  AND (
-                      departure_time AT TIME ZONE 'America/Chicago'
-                  )::date = ANY(%s)
+                  {departure_predicate}
             )
             OR EXISTS (
                 SELECT 1 FROM site_check_ins
                 WHERE location_id = %s
-                  AND (
-                      server_checked_in_at AT TIME ZONE 'America/Chicago'
-                  )::date = ANY(%s)
+                  {check_in_predicate}
             )
         ) AS has_work
         """,
@@ -2513,11 +2539,11 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
             location_id,
             *unlinked_shift_params,
             location_id,
-            service_dates,
+            *point_evidence_params,
             location_id,
-            service_dates,
+            *point_evidence_params,
             location_id,
-            service_dates,
+            *point_evidence_params,
         ),
     )
     row = cur.fetchone()

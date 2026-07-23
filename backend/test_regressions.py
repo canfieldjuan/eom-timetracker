@@ -8,6 +8,7 @@ Run:  cd backend && pytest -v test_regressions.py
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -171,6 +172,7 @@ def _insert_auto_link_job(
     scheduled_start=None,
     scheduled_end=None,
     source_key=None,
+    customer_name="Auto Link Regression",
 ):
     import db
 
@@ -180,11 +182,12 @@ def _insert_auto_link_job(
             location_id, customer_name, scheduled_date, scheduled_start,
             scheduled_end, notes, status, source_key
         )
-        VALUES (%s, 'Auto Link Regression', %s, %s, %s, '', 'scheduled', %s)
+        VALUES (%s, %s, %s, %s, %s, '', 'scheduled', %s)
         RETURNING id
         """,
         (
             location_id,
+            customer_name,
             service_date,
             scheduled_start,
             scheduled_end,
@@ -228,6 +231,169 @@ def _delete_auto_link_rows(*, job_ids, shift_ids):
 
 
 class TestAutoLinkServiceWindows:
+    def test_overnight_job_links_shift_that_starts_on_second_local_date(
+        self, client, auth, employee_id, location_id
+    ):
+        import db
+
+        product_zone = ZoneInfo("America/Chicago")
+        job_start = datetime(2036, 2, 10, 23, tzinfo=product_zone)
+        job_end = job_start + timedelta(hours=2)
+        shift_start = job_start + timedelta(hours=1, minutes=15)
+        shift_end = shift_start + timedelta(minutes=30)
+        job_id = _insert_auto_link_job(
+            location_id=location_id,
+            service_date=job_start.date(),
+            scheduled_start=job_start,
+            scheduled_end=job_end,
+            source_key="a" * 64,
+        )
+        shift_id = _insert_auto_link_shift(
+            employee_id=employee_id,
+            location_id=location_id,
+            service_date=shift_start.date(),
+            clock_in=shift_start,
+            clock_out=shift_end,
+        )
+        try:
+            response = client.post("/api/admin/jobs/auto-link", headers=auth)
+
+            assert response.status_code == 200, response.text
+            assert db.query_one(
+                "SELECT job_id FROM shifts WHERE id = %s",
+                (shift_id,),
+            )["job_id"] == job_id
+        finally:
+            _delete_auto_link_rows(job_ids=[job_id], shift_ids=[shift_id])
+
+    def test_shift_started_previous_day_links_after_midnight_job(
+        self, client, auth, employee_id, location_id
+    ):
+        import db
+
+        product_zone = ZoneInfo("America/Chicago")
+        job_start = datetime(2036, 2, 12, 0, 15, tzinfo=product_zone)
+        job_end = job_start + timedelta(hours=1)
+        shift_start = job_start - timedelta(minutes=30)
+        shift_end = shift_start + timedelta(hours=1)
+        job_id = _insert_auto_link_job(
+            location_id=location_id,
+            service_date=job_start.date(),
+            scheduled_start=job_start,
+            scheduled_end=job_end,
+            source_key="b" * 64,
+        )
+        shift_id = _insert_auto_link_shift(
+            employee_id=employee_id,
+            location_id=location_id,
+            service_date=shift_start.date(),
+            clock_in=shift_start,
+            clock_out=shift_end,
+        )
+        try:
+            response = client.post("/api/admin/jobs/auto-link", headers=auth)
+
+            assert response.status_code == 200, response.text
+            assert db.query_one(
+                "SELECT job_id FROM shifts WHERE id = %s",
+                (shift_id,),
+            )["job_id"] == job_id
+        finally:
+            _delete_auto_link_rows(job_ids=[job_id], shift_ids=[shift_id])
+
+    def test_cross_midnight_candidate_is_deduplicated_before_uniqueness(
+        self, client, auth, employee_id, location_id, monkeypatch
+    ):
+        import db
+
+        product_zone = ZoneInfo("America/Chicago")
+        job_start = datetime(2036, 2, 13, 22, 30, tzinfo=product_zone)
+        job_end = job_start + timedelta(hours=3)
+        shift_start = job_start + timedelta(hours=1)
+        shift_end = shift_start + timedelta(hours=1)
+        job_id = _insert_auto_link_job(
+            location_id=location_id,
+            service_date=job_start.date(),
+            scheduled_start=job_start,
+            scheduled_end=job_end,
+            source_key="c" * 64,
+        )
+        shift_id = _insert_auto_link_shift(
+            employee_id=employee_id,
+            location_id=location_id,
+            service_date=shift_start.date(),
+            clock_in=shift_start,
+            clock_out=shift_end,
+        )
+        real_query_all = db.query_all
+
+        def query_with_duplicate_job(sql, params=()):
+            rows = real_query_all(sql, params)
+            if "FROM jobs j" in sql and "j.status != 'cancelled'" in sql:
+                duplicate = [row for row in rows if int(row["id"]) == job_id]
+                return [*rows, *duplicate]
+            return rows
+
+        monkeypatch.setattr(db, "query_all", query_with_duplicate_job)
+        try:
+            response = client.post("/api/admin/jobs/auto-link", headers=auth)
+
+            assert response.status_code == 200, response.text
+            assert response.json()["linkedCount"] >= 1
+            assert db.query_one(
+                "SELECT job_id FROM shifts WHERE id = %s",
+                (shift_id,),
+            )["job_id"] == job_id
+        finally:
+            _delete_auto_link_rows(job_ids=[job_id], shift_ids=[shift_id])
+
+    def test_overnight_unique_name_job_keeps_legacy_resolution(
+        self, client, auth, employee_id, location_id
+    ):
+        import db
+
+        product_zone = ZoneInfo("America/Chicago")
+        job_start = datetime(2036, 2, 14, 23, tzinfo=product_zone)
+        job_end = job_start + timedelta(hours=2)
+        shift_start = job_start + timedelta(hours=1, minutes=15)
+        shift_end = shift_start + timedelta(minutes=30)
+        customer_name = str(
+            db.query_one(
+                """
+                SELECT COALESCE(c.name, l.customer_name, l.address) AS customer_name
+                FROM locations l
+                LEFT JOIN customers c ON c.id = l.customer_id
+                WHERE l.id = %s
+                """,
+                (location_id,),
+            )["customer_name"]
+        )
+        job_id = _insert_auto_link_job(
+            location_id=None,
+            customer_name=customer_name,
+            service_date=job_start.date(),
+            scheduled_start=job_start,
+            scheduled_end=job_end,
+            source_key="d" * 64,
+        )
+        shift_id = _insert_auto_link_shift(
+            employee_id=employee_id,
+            location_id=location_id,
+            service_date=shift_start.date(),
+            clock_in=shift_start,
+            clock_out=shift_end,
+        )
+        try:
+            response = client.post("/api/admin/jobs/auto-link", headers=auth)
+
+            assert response.status_code == 200, response.text
+            assert db.query_one(
+                "SELECT job_id FROM shifts WHERE id = %s",
+                (shift_id,),
+            )["job_id"] == job_id
+        finally:
+            _delete_auto_link_rows(job_ids=[job_id], shift_ids=[shift_id])
+
     def test_nonoverlapping_timed_calendar_job_is_not_linked(
         self, client, auth, employee_id, location_id
     ):
