@@ -3101,36 +3101,34 @@ def sync_calendar_source(
                     occurrence.time_zone or str(source["calendar_timezone"]),
                     bool(occurrence.all_day),
                 )
-                if existing is None:
-                    cur.execute(
-                        """
-                        SELECT id
-                        FROM jobs
-                        WHERE source_key IS NULL
-                          AND location_id = %s
-                          AND scheduled_date = %s
-                          AND status <> 'cancelled'
-                        ORDER BY id
-                        LIMIT 2
-                        """,
-                        (location_id, scheduled_date),
-                    )
-                    collisions = [int(row["id"]) for row in cur.fetchall()]
-                    if collisions:
-                        counts["unresolved"] += 1
-                        exceptions.append(
-                            _canonical_exception(
-                                source=source,
-                                occurrence=occurrence,
-                                fingerprint=fingerprint,
-                                code="legacy_job_collision",
-                                candidate_sites=_calendar_sites_by_id(
-                                    cur, (location_id,)
-                                ),
-                                conflicting_job_ids=collisions,
-                            )
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM jobs
+                    WHERE source_key IS NULL
+                      AND location_id = %s
+                      AND scheduled_date = %s
+                      AND status <> 'cancelled'
+                    ORDER BY id
+                    LIMIT 2
+                    """,
+                    (location_id, scheduled_date),
+                )
+                collisions = [int(row["id"]) for row in cur.fetchall()]
+                if collisions:
+                    counts["unresolved"] += 1
+                    exceptions.append(
+                        _canonical_exception(
+                            source=source,
+                            occurrence=occurrence,
+                            fingerprint=fingerprint,
+                            code="legacy_job_collision",
+                            candidate_sites=_calendar_sites_by_id(cur, (location_id,)),
+                            conflicting_job_ids=collisions,
                         )
-                        continue
+                    )
+                    continue
+                if existing is None:
                     cur.execute(
                         """
                         INSERT INTO jobs (

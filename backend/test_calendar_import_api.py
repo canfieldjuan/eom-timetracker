@@ -1173,6 +1173,70 @@ def test_reauthorization_failure_retains_connection_without_revoking_uncertain_g
     assert FakeGoogleClient.revoked_tokens == []
 
 
+def test_reauthorization_rejects_free_busy_only_access_to_a_configured_source(
+    client, auth
+):
+    configure_canonical_sources(client, auth)
+    before = store.active_connection()
+    assert before is not None
+    retained = db.query_one(
+        """
+        SELECT credential_ciphertext, credential_version
+        FROM google_calendar_connections
+        WHERE id = %s
+        """,
+        (int(before["id"]),),
+    )
+    started = client.post("/api/admin/google-calendar/connect", headers=auth)
+    assert started.status_code == 200, started.text
+    state = parse_qs(urlsplit(started.json()["authorizationUrl"]).query)["state"][0]
+    FakeGoogleClient.calendars = [
+        CalendarSummary(
+            calendar_id="residential@example.test",
+            summary="Residential Calendar",
+            primary=True,
+            selected=True,
+            access_role="owner",
+            time_zone="America/Chicago",
+        ),
+        CalendarSummary(
+            calendar_id="commercial@example.test",
+            summary="Commercial Calendar",
+            primary=False,
+            selected=True,
+            access_role="freeBusyReader",
+            time_zone="America/Chicago",
+        ),
+    ]
+
+    callback = client.get(
+        "/api/google-calendar/oauth/callback",
+        params={"state": state, "code": "free-busy-only-source"},
+        follow_redirects=False,
+    )
+
+    assert callback.status_code == 303
+    assert callback.headers["location"].endswith("calendarImport=error")
+    assert db.query_one(
+        """
+        SELECT credential_ciphertext, credential_version
+        FROM google_calendar_connections
+        WHERE id = %s
+        """,
+        (int(before["id"]),),
+    ) == retained
+    assert (
+        db.query_one(
+            """
+            SELECT COUNT(*) AS n
+            FROM planned_visit_audit_events
+            WHERE action = 'calendar_reauthorized'
+            """
+        )["n"]
+        == 0
+    )
+
+
 def test_reauthorization_callback_is_bound_to_original_connection(client, auth):
     original_connection_id = connect_selected_calendar()
     started = client.post("/api/admin/google-calendar/connect", headers=auth).json()
@@ -3149,6 +3213,114 @@ def test_two_source_sync_is_idempotent_and_reconciles_reschedule_and_cancel(
     )
 
 
+def test_retained_profitability_uses_current_site_economics_for_source_jobs(
+    client, auth
+):
+    configure_canonical_sources(client, auth)
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    db.execute(
+        """
+        UPDATE locations
+        SET rate = 100.01, rate_type = 'monthly', expected_hours = 2.5
+        WHERE id = %s
+        """,
+        (location_id,),
+    )
+    first = google_occurrence(
+        "profitability-current-site-first",
+        calendar_id="residential@example.test",
+    )
+    second = google_occurrence(
+        "profitability-current-site-second",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=7),
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [first, second],
+        "commercial@example.test": [],
+    }
+    synced = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["counts"]["create"] == 2
+    stored = db.query_all(
+        """
+        SELECT id, source_key, expected_hours, revenue
+        FROM jobs
+        WHERE source_key = ANY(%s)
+        ORDER BY scheduled_start, id
+        """,
+        ([first.source_key, second.source_key],),
+    )
+    assert [(row["expected_hours"], row["revenue"]) for row in stored] == [
+        (None, None),
+        (None, None),
+    ]
+    first_job_id = int(stored[0]["id"])
+    service_date = calendar_api._source_occurrence(first).service_date
+
+    def retained_report() -> dict:
+        response = client.get(
+            "/api/admin/jobs/profitability",
+            headers=auth,
+            params={
+                "customer": "Test Customer",
+                "start_date": str(service_date),
+                "end_date": str(service_date),
+            },
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    monthly = retained_report()
+    assert monthly["jobs"] == [
+        {
+            "jobId": first_job_id,
+            "customerName": "Test Customer",
+            "scheduledDate": str(service_date),
+            "status": "scheduled",
+            "expectedHours": 2.5,
+            "actualHours": 0.0,
+            "varianceHours": 2.5,
+            "revenue": 50.01,
+            "laborCost": 0.0,
+            "netProfit": 50.01,
+            "grossMarginPct": 100.0,
+            "laborPct": 0.0,
+            "employeeCount": 0,
+            "shiftCount": 0,
+        }
+    ]
+    assert monthly["summary"]["totalRevenue"] == 50.01
+
+    db.execute(
+        """
+        UPDATE locations
+        SET rate = 40.00, rate_type = 'hourly', expected_hours = 3.0
+        WHERE id = %s
+        """,
+        (location_id,),
+    )
+    hourly = retained_report()
+    assert hourly["jobs"][0]["expectedHours"] == 3.0
+    assert hourly["jobs"][0]["revenue"] == 120.0
+
+    db.execute(
+        """
+        UPDATE locations
+        SET rate = 80.00, rate_type = 'per_visit', expected_hours = 3.0
+        WHERE id = %s
+        """,
+        (location_id,),
+    )
+    per_visit = retained_report()
+    assert per_visit["jobs"][0]["expectedHours"] == 3.0
+    assert per_visit["jobs"][0]["revenue"] == 80.0
+
+
 def test_canonical_reconciliation_stops_targeting_a_job_moved_beyond_the_window(
     client, auth, monkeypatch
 ):
@@ -4509,6 +4681,68 @@ def test_sync_collision_reports_job_ids_separately_from_site_candidates(client, 
         }
     ]
     db.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
+
+
+def test_reschedule_to_manual_job_collision_preserves_source_job(client, auth):
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "reschedule-manual-job-collision",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    source_job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_start
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    moved = google_occurrence(
+        original.event_id,
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=1),
+        updated="2026-07-24T12:00:00Z",
+    )
+    manual_job_id = int(
+        db.query_one(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date, status
+            ) VALUES (%s, 'Test Customer', %s, 'scheduled')
+            RETURNING id
+            """,
+            (
+                int(source_job["location_id"]),
+                calendar_api._source_occurrence(moved).service_date,
+            ),
+        )["id"]
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [moved]
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    collision = next(
+        row
+        for row in response.json()["exceptions"]
+        if row["sourceKey"] == original.source_key
+    )
+    assert collision["code"] == "legacy_job_collision"
+    assert collision["conflictingJobIds"] == [manual_job_id]
+    assert db.query_one(
+        "SELECT scheduled_start, status FROM jobs WHERE id = %s",
+        (int(source_job["id"]),),
+    ) == {
+        "scheduled_start": source_job["scheduled_start"],
+        "status": "scheduled",
+    }
+    db.execute("DELETE FROM jobs WHERE id = %s", (manual_job_id,))
 
 
 def test_mapping_is_fingerprint_guarded_and_recurring_series_is_reused(client, auth):

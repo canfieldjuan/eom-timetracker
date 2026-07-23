@@ -1623,7 +1623,9 @@ def build_calendar_import_router(
                     store.reauthorize_active_connection(
                         connection_id=reconnect_connection_id,
                         accessible_calendar_ids=(
-                            calendar.calendar_id for calendar in calendars
+                            calendar.calendar_id
+                            for calendar in calendars
+                            if calendar.access_role in {"reader", "writer", "owner"}
                         ),
                         **connection_arguments,
                     )

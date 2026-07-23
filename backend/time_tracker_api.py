@@ -23,6 +23,7 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from datetime import date, datetime, time as clock_time, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
@@ -10742,6 +10743,114 @@ def admin_auto_link_jobs(
     return {"success": True, "linkedCount": linked}
 
 
+def _profitability_money_cents(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    return int(
+        (Decimal(str(value)) * Decimal("100")).quantize(
+            Decimal("1"),
+            rounding=ROUND_HALF_UP,
+        )
+    )
+
+
+def _source_profitability_monthly_allocations(
+    rows: List[Dict[str, Any]],
+) -> Dict[int, int]:
+    targets = [
+        row
+        for row in rows
+        if row.get("source_key") is not None
+        and row.get("location_id") is not None
+        and row.get("site_rate_type") == "monthly"
+    ]
+    if not targets:
+        return {}
+    location_ids = sorted({int(row["location_id"]) for row in targets})
+    target_dates = [row["scheduled_date"] for row in targets]
+    allocation_start = min(target_dates).replace(day=1)
+    last_target = max(target_dates)
+    allocation_end = (
+        date(last_target.year + 1, 1, 1)
+        if last_target.month == 12
+        else date(last_target.year, last_target.month + 1, 1)
+    ) - timedelta(days=1)
+    allocation_rows = db.query_all(
+        """
+        SELECT j.id, j.location_id, j.scheduled_date, j.scheduled_start,
+               l.rate AS site_rate
+        FROM jobs j
+        JOIN locations l ON l.id = j.location_id
+        WHERE j.source_key IS NOT NULL
+          AND j.status <> 'cancelled'
+          AND l.rate_type = 'monthly'
+          AND j.location_id = ANY(%s)
+          AND j.scheduled_date BETWEEN %s AND %s
+        ORDER BY j.location_id, j.scheduled_date,
+                 j.scheduled_start NULLS LAST, j.id
+        """,
+        (location_ids, allocation_start, allocation_end),
+    )
+    groups: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = {}
+    for row in allocation_rows:
+        scheduled_date = row["scheduled_date"]
+        key = (
+            int(row["location_id"]),
+            scheduled_date.year,
+            scheduled_date.month,
+        )
+        groups.setdefault(key, []).append(row)
+
+    allocations: Dict[int, int] = {}
+    for jobs_in_month in groups.values():
+        monthly_cents = _profitability_money_cents(jobs_in_month[0]["site_rate"])
+        if monthly_cents is not None:
+            allocations.update(
+                allocate_monthly_cents(
+                    monthly_cents,
+                    (int(job["id"]) for job in jobs_in_month),
+                )
+            )
+    return allocations
+
+
+def _profitability_job_values(
+    row: Dict[str, Any],
+    monthly_allocations: Dict[int, int],
+) -> Tuple[Optional[float], float]:
+    if row.get("source_key") is None:
+        expected_hours = (
+            float(row["expected_hours"])
+            if row.get("expected_hours") is not None
+            else None
+        )
+        return expected_hours, float(row.get("revenue") or 0)
+
+    expected_hours = (
+        float(row["site_expected_hours"])
+        if row.get("site_expected_hours") is not None
+        else None
+    )
+    revenue_cents: Optional[int] = None
+    rate_cents = _profitability_money_cents(row.get("site_rate"))
+    if row.get("status") == "cancelled":
+        revenue_cents = 0
+    elif rate_cents is not None:
+        rate_type = row.get("site_rate_type")
+        if rate_type == "per_visit":
+            revenue_cents = rate_cents
+        elif rate_type == "hourly" and expected_hours is not None:
+            revenue_cents = int(
+                (Decimal(rate_cents) * Decimal(str(expected_hours))).quantize(
+                    Decimal("1"),
+                    rounding=ROUND_HALF_UP,
+                )
+            )
+        elif rate_type == "monthly":
+            revenue_cents = monthly_allocations.get(int(row["id"]))
+    return expected_hours, (revenue_cents or 0) / 100
+
+
 @app.get("/api/admin/jobs/profitability")
 def admin_jobs_profitability(
     request: Request,
@@ -10771,15 +10880,18 @@ def admin_jobs_profitability(
 
     rows = db.query_all(
         f"""
-        SELECT j.id, j.customer_name, j.scheduled_date, j.expected_hours,
-               j.revenue, j.status, j.notes,
+        SELECT j.id, j.location_id, j.customer_name, j.scheduled_date,
+               j.expected_hours, j.revenue, j.status, j.notes, j.source_key,
+               l.rate AS site_rate, l.rate_type AS site_rate_type,
+               l.expected_hours AS site_expected_hours,
                COALESCE(SUM(s.total_hours), 0) AS actual_hours,
                COUNT(DISTINCT s.employee_id) AS employee_count,
                COUNT(s.id) AS shift_count
         FROM jobs j
+        LEFT JOIN locations l ON l.id = j.location_id
         LEFT JOIN shifts s ON s.job_id = j.id AND s.clock_out IS NOT NULL
         {where}
-        GROUP BY j.id
+        GROUP BY j.id, l.id
         ORDER BY j.scheduled_date DESC, j.id DESC
         """,
         tuple(params),
@@ -10811,12 +10923,12 @@ def admin_jobs_profitability(
     total_rev = 0.0
     total_labor = 0.0
     total_hours = 0.0
+    monthly_allocations = _source_profitability_monthly_allocations(rows)
     for r in rows:
         labor_cost = labor_by_job.get(r["id"], 0.0)
-        rev = float(r["revenue"] or 0)
+        exp_h, rev = _profitability_job_values(r, monthly_allocations)
         hours = float(r["actual_hours"] or 0)
         net = round(rev - labor_cost, 2)
-        exp_h = float(r["expected_hours"]) if r["expected_hours"] is not None else None
 
         jobs_out.append({
             "jobId": r["id"],
@@ -11700,7 +11812,7 @@ def admin_analytics_customer(
 # Canonical operational Schedule and Forecast are read-only projections over
 # jobs and existing time evidence.  Their focused router deliberately has no
 # access to timekeeping mutation helpers.
-from operations_schedule import build_operations_schedule_router
+from operations_schedule import allocate_monthly_cents, build_operations_schedule_router
 
 app.include_router(
     build_operations_schedule_router(

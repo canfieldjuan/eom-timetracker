@@ -526,3 +526,60 @@ This correction must not change:
 - shift, visit, departure, clock, timecard, payroll, Forecast economics,
   receivables, authentication, portal behavior, schema constraints, or
   unrelated routes and modules.
+
+## Sixth exact-head review correction contract
+
+Status: derived before sixth-round review-correction code on 2026-07-23
+
+### Root causes
+
+Three retained paths do not yet preserve the canonical schedule's identity,
+economics, or provider-access boundaries:
+
+1. The manual-job collision guard runs only when a source occurrence creates a
+   new job. A reschedule or restoration of an existing source job can therefore
+   move onto a Site/date already occupied by an active manual job.
+2. Canonical sync deliberately leaves the legacy job economics columns empty
+   because current Site data owns source-linked economics, but the retained
+   Jobs profitability endpoint reads only those legacy columns. During the
+   staged backend-before-portal rollout, synced jobs therefore appear with zero
+   revenue and no expected hours despite complete Site configuration.
+3. Reauthorization passes every Calendar returned by Google to the retained
+   source-access guard, including calendars whose access role cannot read
+   events. That is weaker than initial source configuration and can replace a
+   working grant with one that cannot synchronize a configured source.
+
+### Required corrections
+
+The correction must:
+
+1. Apply the existing active manual-job collision guard to both new and
+   existing source jobs before create, move, or restoration. Preserve the
+   source job unchanged and return `legacy_job_collision` with the conflicting
+   manual job IDs.
+2. Keep source-linked job economics owned by current Site data while preserving
+   the retained profitability response shape. Use current Site expected hours
+   and rate semantics for per-visit, hourly, and monthly Sites; divide monthly
+   cents exactly across all non-cancelled source jobs for that Site/month,
+   independently of report filters.
+3. Pass only `reader`, `writer`, or `owner` Calendar IDs into reauthorization's
+   source-access guard, matching initial source configuration and preserving
+   the prior credential when any configured source is no longer readable.
+4. Add reachable regressions for reschedule-to-manual collision, immediate
+   retained profitability updates from current monthly Site economics, and a
+   reconnect grant that lists a configured source with free/busy-only access.
+
+### Correction boundaries
+
+This correction must not change:
+
+- first-time collision exception shape, Calendar authority over unblocked
+  source updates, manual job mutation semantics, or protected-work precedence;
+- canonical Schedule/Forecast economics, legacy manual-job profitability,
+  response keys, shift linking, timecard/payroll behavior, or Site mutation
+  semantics;
+- OAuth scopes, initial connection behavior, Calendar writes, source role
+  bindings, credential fencing, disconnect behavior, or successful readable
+  reauthorization;
+- schema constraints, Customers/Sites identity, QR evidence, receivables,
+  authentication, portal behavior, or unrelated routes and modules.
