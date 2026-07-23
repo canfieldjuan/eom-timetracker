@@ -460,3 +460,69 @@ This correction must not change:
 - schema constraints, OAuth scopes, Calendar writes, shifts/timecards/QR writes,
   payroll, receivables, Customers/Sites, authentication, portal behavior, or
   unrelated routes and modules.
+
+## Fifth exact-head review correction contract
+
+Status: derived before fifth-round review-correction code on 2026-07-23
+
+### Root causes
+
+Three remaining read paths admit identity or evidence outside the boundary that
+gives it meaning:
+
+1. Canonical targeted reconciliation reads every scheduled source identity
+   after the lookback floor, while the provider list is bounded by both the
+   start and end of the current sync window. Once a retained occurrence is
+   moved beyond that end, it is absent from later bounded lists but remains a
+   targeted-reconciliation candidate on each sync whose rolling lookback still
+   precedes that retained future occurrence, and can consume the finite
+   reconciliation safety budget.
+2. A Google occurrence key is stable across reconnects and stored with a
+   global uniqueness constraint, but automatic canonical Site resolution
+   filters even an exact occurrence mapping by the current connection before
+   consulting it. The existing global upsert can rebind the mapping only after
+   an operator repeats the decision, so the retained decision is unavailable
+   during the first sync on the replacement connection.
+3. Schedule actual projection and Calendar completed-work protection read all
+   QR check-ins by Site and time. QR ingestion deliberately marks questionable
+   evidence `pending`, and an administrator may reject it; neither state is
+   accepted evidence of work.
+
+### Required corrections
+
+The correction must:
+
+1. Bound canonical source identities to half-open overlap with the exact
+   current sync window. Preserve the lower overlap condition for an occurrence
+   already in progress at the window start, and pass the same provider
+   `window_end` used by canonical listing into the identity reader.
+2. Resolve an occurrence-scoped mapping by its globally stable `source_key`
+   before considering a series mapping scoped to the current connection and
+   Calendar. Preserve occurrence-over-series precedence and every existing
+   fingerprint, active-Site, Site-type, and existing-job Site-change guard.
+3. Admit QR check-ins to Schedule actuals and Calendar work protection only
+   when their reachable accepted state pair is either `on_time`/`late` with
+   `review_status = 'not_required'`, or `needs_review` with
+   `review_status = 'approved'`. Keep accepted needs-review evidence usable
+   after approval and fail closed on inconsistent stored state pairs.
+4. Add focused regressions for a moved-beyond-horizon identity no longer being
+   targeted on the next sync while in-window and window-crossing identities
+   remain eligible; automatic reuse of an unchanged occurrence decision on the
+   first sync after reconnect; and pending, rejected, approved, and
+   not-required QR evidence in both affected projections.
+
+### Correction boundaries
+
+This correction must not change:
+
+- Google list or targeted-fetch windows, reconciliation caps, provider
+  deletion/move handling, source status, source replacement, credential
+  fencing, or Calendar job create/update/cancel ownership;
+- connection-scoped recurring-series decisions, mapping-write/rebind behavior,
+  occurrence fingerprints, exact address/name fallback, active/type checks, or
+  existing-job Site-change protection;
+- QR classification, geofence evaluation, ingestion, review mutations,
+  reconciliation outcomes, stored evidence, or accepted evidence semantics;
+- shift, visit, departure, clock, timecard, payroll, Forecast economics,
+  receivables, authentication, portal behavior, schema constraints, or
+  unrelated routes and modules.

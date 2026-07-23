@@ -2342,7 +2342,7 @@ def mark_calendar_source_sync_failed(
 
 
 def read_canonical_source_identities(
-    *, source_id: int, range_start: datetime
+    *, source_id: int, range_start: datetime, range_end: datetime
 ) -> list[dict[str, Any]]:
     """Return source jobs that require targeted provider reconciliation."""
 
@@ -2359,9 +2359,10 @@ def read_canonical_source_identities(
           AND source_key IS NOT NULL
           AND status = 'scheduled'
           AND COALESCE(scheduled_end, scheduled_start) > %s
+          AND COALESCE(scheduled_start, scheduled_end) < %s
         ORDER BY source_key
         """,
-        (source_id, range_start),
+        (source_id, range_start, range_end),
     )
 
 
@@ -2532,6 +2533,16 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
             OR EXISTS (
                 SELECT 1 FROM site_check_ins
                 WHERE location_id = %s
+                  AND (
+                      (
+                          classification IN ('on_time', 'late')
+                          AND review_status = 'not_required'
+                      )
+                      OR (
+                          classification = 'needs_review'
+                          AND review_status = 'approved'
+                      )
+                  )
                   {check_in_predicate}
             )
         ) AS has_work
@@ -2597,13 +2608,13 @@ def _resolve_canonical_location(
         """
         SELECT location_id, mapping_scope, source_fingerprint
         FROM google_calendar_event_mappings
-        WHERE connection_id = %s AND calendar_id = %s
-          AND (
-              (mapping_scope = 'occurrence' AND source_key = %s)
-              OR (
-                  mapping_scope = 'series'
-                  AND source_series_id = %s
-              )
+        WHERE (
+              mapping_scope = 'occurrence' AND source_key = %s
+          )
+          OR (
+              connection_id = %s AND calendar_id = %s
+              AND mapping_scope = 'series'
+              AND source_series_id = %s
           )
         ORDER BY CASE
                      WHEN mapping_scope = 'occurrence' AND source_key = %s THEN 0
@@ -2613,9 +2624,9 @@ def _resolve_canonical_location(
         LIMIT 1
         """,
         (
+            occurrence.source_key,
             int(source["connection_id"]),
             str(source["calendar_id"]),
-            occurrence.source_key,
             occurrence.series_id,
             occurrence.source_key,
         ),

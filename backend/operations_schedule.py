@@ -359,6 +359,16 @@ def _load_time_evidence(
         LEFT JOIN locations l ON l.id = sci.location_id
         WHERE sci.server_checked_in_at >= %s
           AND sci.server_checked_in_at < %s
+          AND (
+              (
+                  sci.classification IN ('on_time', 'late')
+                  AND sci.review_status = 'not_required'
+              )
+              OR (
+                  sci.classification = 'needs_review'
+                  AND sci.review_status = 'approved'
+              )
+          )
         ORDER BY sci.employee_id, sci.location_id,
                  sci.server_checked_in_at, sci.id
         """,

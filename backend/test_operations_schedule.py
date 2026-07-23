@@ -1218,7 +1218,22 @@ def test_explicit_out_of_range_link_is_not_credited_to_visible_same_site_job(
     assert unmatched[0]["hours"] == 2
 
 
-def test_qr_only_presence_without_shift_is_retained_with_zero_hours(client, auth):
+@pytest.mark.parametrize(
+    ("classification", "review_status", "accepted"),
+    [
+        ("on_time", "not_required", True),
+        ("needs_review", "approved", True),
+        ("needs_review", "pending", False),
+        ("needs_review", "rejected", False),
+    ],
+)
+def test_schedule_uses_only_accepted_qr_presence_without_paid_time(
+    client,
+    auth,
+    classification,
+    review_status,
+    accepted,
+):
     service_day = date(2026, 7, 20)
     checked_in_at = datetime(2026, 7, 20, 15, tzinfo=timezone.utc)
     with db.get_conn() as conn:
@@ -1257,11 +1272,17 @@ def test_qr_only_presence_without_shift_is_retained_with_zero_hours(client, auth
                 )
                 VALUES (
                     %s, %s, %s, %s, 39.12, -88.54, 5,
-                    100, 3, 'inside', 'on_time', 'test', 0,
-                    'not_required'
+                    100, 3, 'inside', %s, 'test', 0, %s
                 )
                 """,
-                (employee_id, site_id, checked_in_at, checked_in_at),
+                (
+                    employee_id,
+                    site_id,
+                    checked_in_at,
+                    checked_in_at,
+                    classification,
+                    review_status,
+                ),
             )
 
     response = client.get(
@@ -1273,6 +1294,10 @@ def test_qr_only_presence_without_shift_is_retained_with_zero_hours(client, auth
     job = next(row for row in response.json()["jobs"] if row["id"] == job_id)
 
     assert job["actualHours"] == 0
+    assert job["executionStatus"] == "scheduled"
+    if not accepted:
+        assert job["workers"] == []
+        return
     assert job["workers"] == [
         {
             "employeeId": employee_id,

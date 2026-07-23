@@ -1255,6 +1255,7 @@ def _canonical_source_occurrences(
     identities = store.read_canonical_source_identities(
         source_id=int(source["id"]),
         range_start=window_start,
+        range_end=window_end,
     )
     identity_by_key = {str(row["source_key"]): row for row in identities}
     missing = [
