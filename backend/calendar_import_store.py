@@ -60,6 +60,7 @@ class ConsumedOAuthState:
 @dataclass(frozen=True)
 class _CanonicalLocationSnapshot:
     by_id: dict[int, dict[str, Any]]
+    by_normalized_address: dict[str, tuple[dict[str, Any], ...]]
     by_normalized_hint: dict[str, tuple[dict[str, Any], ...]]
 
 
@@ -2514,6 +2515,7 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
             OR EXISTS (
                 SELECT 1 FROM shifts
                 WHERE location_id = %s
+                  AND job_id IS NULL
                   AND time_category = 'productive'
                   {unlinked_shift_predicate}
             )
@@ -2633,16 +2635,25 @@ def _resolve_canonical_location(
             return None, "wrong_site_type", (int(selected["id"]),)
         return int(selected["id"]), None, (int(selected["id"]),)
 
+    location_hint = normalize_match_text(occurrence.location_text)
+    address_matches = (
+        location_snapshot.by_normalized_address.get(location_hint, ())
+        if location_hint
+        else ()
+    )
     hints = {
         value
         for raw in (occurrence.location_text, occurrence.title)
         if (value := normalize_match_text(raw))
     }
-    matches_by_id: dict[int, dict[str, Any]] = {}
-    for hint in hints:
-        for row in location_snapshot.by_normalized_hint.get(hint, ()):
-            matches_by_id[int(row["id"])] = row
-    matches = [matches_by_id[row_id] for row_id in sorted(matches_by_id)]
+    if address_matches:
+        matches = sorted(address_matches, key=lambda row: int(row["id"]))
+    else:
+        matches_by_id: dict[int, dict[str, Any]] = {}
+        for hint in hints:
+            for row in location_snapshot.by_normalized_hint.get(hint, ()):
+                matches_by_id[int(row["id"])] = row
+        matches = [matches_by_id[row_id] for row_id in sorted(matches_by_id)]
     valid = [
         row
         for row in matches
@@ -2708,14 +2719,21 @@ def _read_canonical_locations(cur: Any) -> _CanonicalLocationSnapshot:
         """
     )
     locations = tuple(dict(row) for row in cur.fetchall())
+    by_normalized_address: dict[str, list[dict[str, Any]]] = {}
     by_normalized_hint: dict[str, list[dict[str, Any]]] = {}
     for row in locations:
+        normalized_address = normalize_match_text(row.get("address"))
+        if normalized_address:
+            by_normalized_address.setdefault(normalized_address, []).append(row)
         for raw_hint in (row.get("address"), row.get("customer_name")):
             normalized_hint = normalize_match_text(raw_hint)
             if normalized_hint:
                 by_normalized_hint.setdefault(normalized_hint, []).append(row)
     return _CanonicalLocationSnapshot(
         by_id={int(row["id"]): row for row in locations},
+        by_normalized_address={
+            hint: tuple(rows) for hint, rows in by_normalized_address.items()
+        },
         by_normalized_hint={
             hint: tuple(rows) for hint, rows in by_normalized_hint.items()
         },
@@ -2726,6 +2744,8 @@ def sync_calendar_source(
     *,
     source_id: int,
     expected_credential_version: int,
+    expected_calendar_id: str,
+    expected_calendar_timezone: str,
     occurrences: Iterable[Any],
     window_start: datetime,
     window_end: datetime,
@@ -2793,6 +2813,11 @@ def sync_calendar_source(
             if not source_row:
                 raise CalendarStoreError("Google Calendar source is no longer active")
             source = dict(source_row)
+            if (
+                str(source["calendar_id"]) != expected_calendar_id
+                or str(source["calendar_timezone"]) != expected_calendar_timezone
+            ):
+                raise CalendarStoreError("Google Calendar source changed; sync again")
             location_snapshot = _read_canonical_locations(cur)
             for occurrence in occurrence_rows:
                 if occurrence.calendar_id != str(source["calendar_id"]):
@@ -3323,15 +3348,10 @@ def upsert_canonical_mapping(
                     """
                     SELECT id, source_key, mapping_scope
                     FROM google_calendar_event_mappings
-                    WHERE connection_id = %s AND calendar_id = %s
-                      AND mapping_scope = 'occurrence' AND source_key = %s
+                    WHERE mapping_scope = 'occurrence' AND source_key = %s
                     FOR UPDATE
                     """,
-                    (
-                        int(source["connection_id"]),
-                        str(source["calendar_id"]),
-                        source_key,
-                    ),
+                    (source_key,),
                 )
                 occurrence_mapping = cur.fetchone()
                 superseded_occurrence_mapping_id: int | None = None
@@ -3362,15 +3382,10 @@ def upsert_canonical_mapping(
                     """
                     SELECT id, source_key, mapping_scope
                     FROM google_calendar_event_mappings
-                    WHERE connection_id = %s AND calendar_id = %s
-                      AND mapping_scope = 'occurrence' AND source_key = %s
+                    WHERE mapping_scope = 'occurrence' AND source_key = %s
                     FOR UPDATE
                     """,
-                    (
-                        int(source["connection_id"]),
-                        str(source["calendar_id"]),
-                        source_key,
-                    ),
+                    (source_key,),
                 )
                 existing = cur.fetchone()
             if existing:
@@ -3383,12 +3398,15 @@ def upsert_canonical_mapping(
                 cur.execute(
                     """
                     UPDATE google_calendar_event_mappings
-                    SET source_key = %s, source_series_id = %s,
+                    SET connection_id = %s, calendar_id = %s,
+                        source_key = %s, source_series_id = %s,
                         mapping_scope = %s, source_fingerprint = %s,
                         location_id = %s, updated_by = %s, updated_at = NOW()
                     WHERE id = %s
                     """,
                     (
+                        int(source["connection_id"]),
+                        str(source["calendar_id"]),
                         stored_source_key,
                         source_series_id,
                         mapping_scope,

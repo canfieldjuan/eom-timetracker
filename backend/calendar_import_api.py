@@ -1745,6 +1745,8 @@ def build_calendar_import_router(
                     expected_credential_version=int(
                         connection["credential_version"]
                     ),
+                    expected_calendar_id=str(source["calendar_id"]),
+                    expected_calendar_timezone=str(source["calendar_timezone"]),
                     occurrences=occurrences,
                     window_start=window_start,
                     window_end=window_end,

@@ -760,34 +760,35 @@ def _match_segment_to_job(
             return None, "cancelled_job", cancelled_ids
         return None, "no_scheduled_job", []
 
-    overlapping = [
-        job
-        for job in ordered
-        if job.get("scheduled_start") is not None
-        and job.get("scheduled_end") is not None
-        and job["scheduled_start"] < segment["end"]
-        and job["scheduled_end"] > segment["start"]
-    ]
-    if len(ordered) == 1:
-        sole_candidate = ordered[0]
+    overlapping: List[Dict[str, Any]] = []
+    windowless: List[Dict[str, Any]] = []
+    for job in ordered:
+        scheduled_start = job.get("scheduled_start")
+        scheduled_end = job.get("scheduled_end")
         has_valid_window = (
-            sole_candidate.get("scheduled_start") is not None
-            and sole_candidate.get("scheduled_end") is not None
-            and sole_candidate["scheduled_end"] > sole_candidate["scheduled_start"]
+            scheduled_start is not None
+            and scheduled_end is not None
+            and scheduled_end > scheduled_start
         )
-        if has_valid_window and not overlapping:
-            return None, "no_scheduled_job", [int(sole_candidate["id"])]
+        if not has_valid_window:
+            windowless.append(job)
+        elif (
+            scheduled_start < segment["end"] and scheduled_end > segment["start"]
+        ):
+            overlapping.append(job)
+
+    eligible = overlapping or windowless
+    if not eligible:
+        return None, "no_scheduled_job", [int(job["id"]) for job in ordered]
+
+    eligible_ids = [int(job["id"]) for job in eligible]
+    if len(eligible) == 1:
+        sole_candidate = eligible[0]
         match_reason = (
-            "unique_service_window" if has_valid_window else "unique_site_date"
+            "unique_service_window" if overlapping else "unique_site_date"
         )
-        return sole_candidate, match_reason, [int(sole_candidate["id"])]
-    if len(overlapping) == 1:
-        return (
-            overlapping[0],
-            "unique_service_window",
-            [int(job["id"]) for job in ordered],
-        )
-    return None, "ambiguous_job", [int(job["id"]) for job in ordered]
+        return sole_candidate, match_reason, eligible_ids
+    return None, "ambiguous_job", eligible_ids
 
 
 def _serialize_unmatched(

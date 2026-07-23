@@ -313,6 +313,70 @@ def test_single_timed_candidate_requires_overlap_and_legacy_keeps_date_fallback(
     assert candidate_ids == [1]
 
 
+def test_matching_prefers_overlapping_timed_jobs_then_windowless_fallbacks():
+    service_day = date(2026, 7, 20)
+    app_timezone = ZoneInfo("America/Chicago")
+    segment = {
+        "location_id": 77,
+        "start": datetime(2026, 7, 20, 14, tzinfo=timezone.utc),
+        "end": datetime(2026, 7, 20, 16, tzinfo=timezone.utc),
+    }
+    nonoverlapping_timed_job = {
+        "id": 1,
+        "location_id": 77,
+        "scheduled_date": service_day,
+        "scheduled_start": datetime(2026, 7, 20, 18, tzinfo=timezone.utc),
+        "scheduled_end": datetime(2026, 7, 20, 20, tzinfo=timezone.utc),
+        "status": "scheduled",
+    }
+    legacy_job = {
+        "id": 2,
+        "location_id": 77,
+        "scheduled_date": service_day,
+        "scheduled_start": None,
+        "scheduled_end": None,
+        "status": "scheduled",
+    }
+
+    match, reason, candidate_ids = _match_segment_to_job(
+        segment,
+        {(77, service_day): [nonoverlapping_timed_job, legacy_job]},
+        {1: nonoverlapping_timed_job, 2: legacy_job},
+        app_timezone,
+    )
+
+    assert match == legacy_job
+    assert reason == "unique_site_date"
+    assert candidate_ids == [2]
+
+    overlapping_timed_job = {
+        **nonoverlapping_timed_job,
+        "scheduled_start": datetime(2026, 7, 20, 15, tzinfo=timezone.utc),
+        "scheduled_end": datetime(2026, 7, 20, 17, tzinfo=timezone.utc),
+    }
+    match, reason, candidate_ids = _match_segment_to_job(
+        segment,
+        {(77, service_day): [overlapping_timed_job, legacy_job]},
+        {1: overlapping_timed_job, 2: legacy_job},
+        app_timezone,
+    )
+
+    assert match == overlapping_timed_job
+    assert reason == "unique_service_window"
+    assert candidate_ids == [1]
+
+    match, reason, candidate_ids = _match_segment_to_job(
+        segment,
+        {(77, service_day): [nonoverlapping_timed_job]},
+        {1: nonoverlapping_timed_job},
+        app_timezone,
+    )
+
+    assert match is None
+    assert reason == "no_scheduled_job"
+    assert candidate_ids == [1]
+
+
 def test_linked_shift_does_not_override_an_explicit_different_site_segment():
     service_day = date(2026, 7, 20)
     linked_job = {
@@ -764,7 +828,7 @@ def test_schedule_segments_multi_stop_and_multi_worker_actuals(client, auth):
         if row["presenceOnly"] and row["evidence"] == ["qr_check_in"]
     ]
     assert len(unmatched_qr_presence) == 1
-    assert unmatched_qr_presence[0]["reason"] == "ambiguous_job"
+    assert unmatched_qr_presence[0]["reason"] == "no_scheduled_job"
     assert unmatched_qr_presence[0]["hours"] is None
 
     after = db.query_one(

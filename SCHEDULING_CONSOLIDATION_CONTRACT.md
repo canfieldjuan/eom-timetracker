@@ -381,3 +381,82 @@ This correction must not change:
   allocation, economics, or response shape;
 - authentication, payroll, receivables, Customers/Sites, Calendar settings,
   legacy planners, schema constraints, or unrelated routes and portal tabs.
+
+## Fourth exact-head review correction contract
+
+Status: derived before fourth-round review-correction code on 2026-07-23
+
+### Root causes
+
+Five remaining fallback paths discard identity or evidence strength before
+making a canonical decision:
+
+1. Same-Site shift evidence does not distinguish an unlinked shift from a shift
+   explicitly assigned to another job. That lets one occurrence's work protect
+   a different occurrence from source reconciliation.
+2. A Calendar source is read before the provider fetch, but the fetched source
+   identity is not carried into the transactional apply. Per-occurrence checks
+   happen to catch a changed source only when the fetched snapshot is nonempty;
+   an empty stale snapshot can mark the replacement source successfully synced.
+3. Schedule matching counts every active Site/date job when deciding ambiguity,
+   even after a valid timed job has failed the interval-overlap requirement.
+   An ineligible timed job can therefore hide the sole eligible legacy fallback.
+4. Site resolution combines exact address evidence and broader customer-name
+   evidence into one unordered candidate set. A unique exact address can be
+   diluted into ambiguity by a shared customer name.
+5. A Google occurrence key is globally stable across reconnects and globally
+   unique in persistence, but canonical mapping lookup scopes that identity to
+   the current connection. A retained mapping is missed and then collides when
+   the same occurrence is reviewed after reconnect.
+
+### Required corrections
+
+The correction must:
+
+1. Keep an exact `shifts.job_id` link authoritative only for its own job, and
+   admit only `job_id IS NULL` shifts through same-Site/date-or-window fallback
+   evidence.
+2. Carry the expected Calendar ID and timezone from the source snapshot used
+   for the provider fetch into canonical apply. After locking the source and
+   before any reconciliation or success write, fail closed if either identity
+   changed, including for an empty occurrence snapshot.
+3. Form heuristic Schedule eligibility in evidence-strength tiers before
+   uniqueness. When valid timed jobs overlap the segment, decide only among
+   those overlapping windows. Only when no timed window overlaps may
+   windowless jobs use the Site/date fallback. Non-overlapping timed jobs never
+   create ambiguity. Match one candidate in the winning tier, report ambiguity
+   for multiple candidates in that tier, and report no scheduled job when both
+   tiers are empty.
+4. Prefer exact normalized Site-address matches from Calendar location evidence
+   before customer-name fallback. Apply the existing active-Site, expected-type,
+   and existing-job Site-change guards to the winning evidence tier, and keep
+   name-only multi-Site matches ambiguous.
+5. Find occurrence mappings by their global source key across connections,
+   reuse the retained row, and rebind its connection and Calendar ownership.
+   Apply the same global occurrence reuse when promoting a one-off decision to a
+   series decision; do not weaken current source, fingerprint, Site, or type
+   validation.
+6. Add focused regressions for a shift linked to a different same-Site job; an
+   empty stale source snapshot after Calendar or timezone replacement; mixed
+   windowless/non-overlapping and windowless/overlapping job candidates,
+   including preserved unique timed-window precedence; unique exact address
+   versus a shared customer name; name-only ambiguity; and occurrence mapping
+   reuse after reconnect.
+
+### Correction boundaries
+
+This correction must not change:
+
+- explicit shift link/unlink endpoints, exact-link precedence for the linked
+  job, unlinked shift interval/date fallbacks, or visit/departure/QR evidence;
+- Google provider fetch windows, cancellation/update ownership, source status
+  meanings, partial-sync isolation, credential fencing, or source replacement
+  rules beyond rejecting a stale fetched identity;
+- explicit linked-job Schedule matching, cancelled-job treatment, Site/date
+  indexing, segment derivation, unmatched evidence shape, or Forecast behavior;
+- operator mapping precedence, active/type/Site-change failures, legacy mapping
+  fingerprints, series-over-occurrence semantics, audit history, or retained
+  planned-visit references;
+- schema constraints, OAuth scopes, Calendar writes, shifts/timecards/QR writes,
+  payroll, receivables, Customers/Sites, authentication, portal behavior, or
+  unrelated routes and modules.
