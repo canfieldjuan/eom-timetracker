@@ -285,20 +285,20 @@ def build_site_check_in_token(site_id: int, nonce: str) -> str:
 def parse_site_check_in_token(token: str) -> Tuple[int, str]:
     parts = str(token or "").strip().split(".")
     if len(parts) != 4 or parts[0] != SITE_CHECK_IN_QR_VERSION:
-        raise ValueError("Invalid or expired site QR code")
+        raise ValueError("Invalid or revoked site QR code")
 
     try:
         site_id = int(parts[1])
     except (TypeError, ValueError) as exc:
-        raise ValueError("Invalid or expired site QR code") from exc
+        raise ValueError("Invalid or revoked site QR code") from exc
 
     nonce, signature = parts[2], parts[3]
     if site_id <= 0 or not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", nonce):
-        raise ValueError("Invalid or expired site QR code")
+        raise ValueError("Invalid or revoked site QR code")
 
     expected = _site_check_in_signature(site_id, nonce)
     if not hmac.compare_digest(signature, expected):
-        raise ValueError("Invalid or expired site QR code")
+        raise ValueError("Invalid or revoked site QR code")
     return site_id, nonce
 
 
@@ -3779,7 +3779,7 @@ def _resolve_site_check_in_qr(
         site = dict(row) if row else None
     configured_nonce = str(site.get("check_in_token_nonce") or "") if site else ""
     if not site or not configured_nonce or not hmac.compare_digest(configured_nonce, nonce):
-        raise HTTPException(status_code=404, detail="Invalid or expired site QR code")
+        raise HTTPException(status_code=404, detail="Invalid or revoked site QR code")
     return site
 
 
