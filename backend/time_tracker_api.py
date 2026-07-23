@@ -26,6 +26,7 @@ from datetime import date, datetime, time as clock_time, timedelta, timezone
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote, urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -37,10 +38,10 @@ import requests
 import qrcode
 import qrcode.image.svg
 import db
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -3805,7 +3806,28 @@ def startup_event() -> None:
     )
 
 
+def _canonical_portal_base(request: Request) -> Optional[str]:
+    """PUBLIC_APP_URL when it points somewhere other than this backend.
+
+    Hostname-only comparison: behind the Render proxy the request scheme can
+    differ from the public one, and a scheme-sensitive check would let a
+    misconfigured PUBLIC_APP_URL redirect the backend to itself in a loop.
+    """
+    if not PUBLIC_APP_URL:
+        return None
+    portal_host = (urlsplit(PUBLIC_APP_URL).hostname or "").lower()
+    request_host = (request.url.hostname or "").lower()
+    if not portal_host or portal_host == request_host:
+        return None
+    return PUBLIC_APP_URL
+
+
 def _site_check_in_url(request: Request, token: str) -> str:
+    portal_base = _canonical_portal_base(request)
+    if portal_base:
+        # Canonical EOM portal (issue #35): /portal, not /portal.html — the
+        # website deploy uses cleanUrls and 308-hops the .html form.
+        return f"{portal_base}/portal?checkIn={quote(token, safe='')}"
     app_url = PUBLIC_APP_URL or str(request.base_url).rstrip("/")
     return f"{app_url}/?checkIn={token}"
 
@@ -4738,7 +4760,21 @@ def _classify_site_check_in(
 
 @app.get("/", include_in_schema=False)
 @app.get("/timetracker-mobile.html", include_in_schema=False)
-def time_tracker_page() -> FileResponse:
+def time_tracker_page(
+    request: Request,
+    check_in: Optional[str] = Query(default=None, alias="checkIn"),
+) -> Response:
+    # QR check-in deep links belong to the canonical EOM portal (issue #35).
+    # Forward ONLY the checkIn value — other params (e.g. apiBaseUrl) must not
+    # ride a printed-QR redirect. 302 + no-store so rollback (unsetting
+    # PUBLIC_APP_URL) is not defeated by phone browsers caching the redirect.
+    portal_base = _canonical_portal_base(request)
+    if check_in and portal_base:
+        return RedirectResponse(
+            f"{portal_base}/portal?checkIn={quote(check_in, safe='')}",
+            status_code=302,
+            headers={"Cache-Control": "no-store"},
+        )
     return FileResponse(str(FRONTEND_FILE), media_type="text/html")
 
 
