@@ -1628,12 +1628,6 @@ class TestAnalyticsRegression:
             assert "customer" not in row
             assert "location" not in row
 
-    def test_analytics_customers_endpoint(self, client, auth):
-        r = client.get("/api/admin/analytics/customers?period=all", headers=auth)
-        assert r.status_code == 200, r.text
-        assert "customers" in r.json()
-
-
 # ===============================================================================
 # Phase 3 - Jobs
 # ===============================================================================
@@ -1748,27 +1742,6 @@ class TestJobs:
             "notes": "", "status": "invalid_status",
         })
         assert r.status_code in (400, 422)
-
-
-# ===============================================================================
-# Phase 4 - Account Health / Flagged Accounts
-# ===============================================================================
-
-class TestAccountHealth:
-    def test_flagged_accounts(self, client, auth):
-        r = client.get("/api/admin/analytics/flagged", headers=auth)
-        assert r.status_code == 200, r.text
-        data = r.json()
-        assert "customers" in data
-        assert isinstance(data["customers"], list)
-
-    def test_flagged_has_expected_keys(self, client, auth, completed_shift_id):
-        r = client.get("/api/admin/analytics/flagged", headers=auth)
-        customers = r.json()["customers"]
-        if customers:
-            row = customers[0]
-            assert "customer" in row
-            assert "flags" in row
 
 
 # ===============================================================================

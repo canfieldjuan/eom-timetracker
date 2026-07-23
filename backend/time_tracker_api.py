@@ -4570,24 +4570,6 @@ def receivables_open_invoices(
     )
 
 
-@app.get("/api/admin/receivables/allocation-suggestions")
-def receivables_allocation_suggestions(
-    request: Request,
-    contact_id: str = Query(min_length=1, max_length=64),
-    total_amount_cents: int = Query(gt=0),
-    admin: Dict[str, Any] = Depends(get_current_admin),
-) -> Any:
-    return _atlas_receivables_request(
-        "GET",
-        "/receivables/allocation-suggestions",
-        admin,
-        params={
-            "contact_id": contact_id,
-            "total_amount_cents": total_amount_cents,
-        },
-    )
-
-
 @app.get("/api/admin/receivables/payments")
 def receivables_payments(
     request: Request,
@@ -8595,35 +8577,6 @@ def admin_apply_time_data_correction(
     }
 
 
-@app.get("/api/admin/corrections/time-data/history")
-def admin_time_data_correction_history(
-    request: Request,
-    _: Dict[str, Any] = Depends(get_current_admin),
-) -> Dict[str, Any]:
-    rows = db.query_all(
-        """
-        SELECT id, applied_by_name, reason, result, created_at
-        FROM time_data_correction_batches
-        ORDER BY created_at DESC, id DESC
-        LIMIT 50
-        """
-    )
-    append_access_log(request, "TIME_DATA_CORRECTION_HISTORY", True, f"rows={len(rows)}")
-    return {
-        "success": True,
-        "batches": [
-            {
-                "batchId": int(row["id"]),
-                "appliedBy": row["applied_by_name"],
-                "reason": row["reason"],
-                "result": row.get("result") or {},
-                "createdAt": to_utc_iso(row["created_at"]),
-            }
-            for row in rows
-        ],
-    }
-
-
 def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
         return []
@@ -8633,15 +8586,6 @@ def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:
     if not isinstance(payload, list):
         return []
     return payload
-
-
-@app.get("/api/admin/logs")
-def admin_logs_today(
-    request: Request,
-    _: Dict[str, Any] = Depends(get_current_admin),
-) -> Dict[str, Any]:
-    date_text = local_date_for_logs()
-    return {"success": True, "date": date_text, "logs": read_access_logs_for_date(date_text)}
 
 
 @app.get("/api/admin/logs/{date_text}")
@@ -11137,68 +11081,6 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         },
         "byCustomer": by_customer,
         "byDay": by_day,
-    }
-
-
-@app.get("/api/admin/analytics/customers")
-def admin_analytics_customers(
-    request: Request,
-    period: str = "all",
-    date: Optional[str] = None,
-    _: Dict[str, Any] = Depends(get_current_admin),
-) -> Dict[str, Any]:
-    """Customer profitability table. period=all (default) returns all-time data."""
-    data = _compute_analytics(period, date)
-    return {
-        "success": True,
-        "period": data["period"],
-        "startDate": data["startDate"],
-        "endDate": data["endDate"],
-        "laborPctTarget": data["laborPctTarget"],
-        "summary": data["summary"],
-        "customers": data["byCustomer"],
-    }
-
-
-@app.get("/api/admin/analytics/flagged")
-def admin_analytics_flagged(
-    request: Request,
-    period: str = "all",
-    date: Optional[str] = None,
-    flag: Optional[str] = None,
-    _: Dict[str, Any] = Depends(get_current_admin),
-) -> Dict[str, Any]:
-    """Return only flagged (non-Healthy) customers, sorted by severity."""
-    data = _compute_analytics(period, date)
-    severity_order = {"Drop": 0, "Fix": 1, "Raise Price": 2, "Watch": 3, "Healthy": 4}
-    flagged = [c for c in data["byCustomer"] if c["flag"] != "Healthy"]
-    if flag:
-        flagged = [c for c in flagged if c["flag"] == flag]
-    flagged.sort(key=lambda c: (severity_order.get(c["flag"], 99), -(c.get("revenue") or 0)))
-    counts = {}
-    for c in data["byCustomer"]:
-        counts[c["flag"]] = counts.get(c["flag"], 0) + 1
-    settings = load_settings()
-    return {
-        "success": True,
-        "period": data["period"],
-        "startDate": data["startDate"],
-        "endDate": data["endDate"],
-        "thresholds": {
-            "laborPctTarget": settings["laborPctTarget"],
-            "laborPctWatch": settings["laborPctWatch"],
-            "laborPctFix": settings["laborPctFix"],
-            "laborPctDrop": settings["laborPctDrop"],
-            "grossMarginMin": settings["grossMarginMin"],
-            "grossMarginFix": settings["grossMarginFix"],
-            "grossMarginDrop": settings["grossMarginDrop"],
-            "hourOverrunWatch": settings["hourOverrunWatch"],
-            "hourOverrunFix": settings["hourOverrunFix"],
-            "rplhMin": settings["rplhMin"],
-        },
-        "flagCounts": counts,
-        "flaggedCount": len(flagged),
-        "customers": flagged,
     }
 
 
