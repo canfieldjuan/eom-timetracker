@@ -2844,6 +2844,57 @@ def test_canonical_sources_are_distinct_readable_and_reported_in_status(client, 
     assert status["selectedCalendarId"] == "residential@example.test"
 
 
+def test_status_downgrades_success_when_a_canonical_sync_window_is_stale(
+    client, auth, monkeypatch
+):
+    configure_canonical_sources(client, auth)
+    required_start = WINDOW_START - timedelta(days=14)
+    required_end = WINDOW_START + timedelta(days=90)
+    monkeypatch.setattr(
+        calendar_api,
+        "_canonical_sync_window",
+        lambda _time_zone_name: (required_start, required_end),
+    )
+    db.execute(
+        """
+        UPDATE google_calendar_sources
+        SET last_sync_status = 'success',
+            last_sync_window_start = %s,
+            last_sync_window_end = %s
+        """,
+        (required_start, required_end),
+    )
+
+    current = client.get("/api/admin/google-calendar/status", headers=auth)
+
+    assert current.status_code == 200, current.text
+    assert current.json()["syncStatus"] == "success"
+
+    residential_source_id = int(
+        next(
+            source["id"]
+            for source in current.json()["sources"]
+            if source["role"] == store.RESIDENTIAL_MORNING_ROLE
+        )
+    )
+    db.execute(
+        """
+        UPDATE google_calendar_sources
+        SET last_sync_window_end = %s
+        WHERE id = %s
+        """,
+        (required_end - timedelta(microseconds=1), residential_source_id),
+    )
+
+    stale = client.get("/api/admin/google-calendar/status", headers=auth)
+
+    assert stale.status_code == 200, stale.text
+    assert stale.json()["syncStatus"] == "partial"
+    assert {source["lastSyncStatus"] for source in stale.json()["sources"]} == {
+        "success"
+    }
+
+
 def test_two_source_sync_is_idempotent_and_reconciles_reschedule_and_cancel(
     client, auth
 ):

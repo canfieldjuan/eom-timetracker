@@ -1482,12 +1482,26 @@ def build_calendar_import_router(
         source_statuses = {
             str(source.get("last_sync_status") or "never") for source in source_rows
         }
+        sync_window_current = False
+        if sources_ready:
+            required_window_start, required_window_end = _canonical_sync_window(
+                config.timezone_name
+            )
+            sync_window_current = all(
+                source.get("last_sync_window_start") is not None
+                and source["last_sync_window_start"] <= required_window_start
+                and source.get("last_sync_window_end") is not None
+                and source["last_sync_window_end"] >= required_window_end
+                for source in source_rows
+            )
         if not connection:
             sync_status = "disconnected"
         elif not sources_ready:
             sync_status = "incomplete"
-        elif source_statuses == {"success"}:
+        elif source_statuses == {"success"} and sync_window_current:
             sync_status = "success"
+        elif source_statuses == {"success"}:
+            sync_status = "partial"
         elif "failed" in source_statuses and "success" in source_statuses:
             sync_status = "partial"
         elif "failed" in source_statuses:
