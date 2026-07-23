@@ -276,7 +276,7 @@ class TestSiteCheckInDecision:
             ),
         )
         assert expired.status_code == 404
-        assert "expired" in expired.json()["error"]
+        assert "revoked" in expired.json()["error"]
 
         current = client.post(
             "/api/timesheet/site-check-in",
