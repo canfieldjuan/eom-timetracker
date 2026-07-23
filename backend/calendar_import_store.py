@@ -2410,10 +2410,18 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
                 SELECT 1 FROM shifts
                 WHERE location_id = %s
                   AND time_category = 'productive'
-                  AND COALESCE(
-                      local_date,
-                      (clock_in AT TIME ZONE 'America/Chicago')::date
-                  ) = ANY(%s)
+                  AND (
+                      COALESCE(
+                          local_date,
+                          (clock_in AT TIME ZONE 'America/Chicago')::date
+                      ) = ANY(%s)
+                      OR (
+                          %s IS NOT NULL
+                          AND %s IS NOT NULL
+                          AND clock_in < %s
+                          AND (clock_out IS NULL OR clock_out > %s)
+                      )
+                  )
             )
             OR EXISTS (
                 SELECT 1 FROM visits
@@ -2442,6 +2450,10 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
             job_id,
             location_id,
             service_dates,
+            existing_job.get("scheduled_start"),
+            existing_job.get("scheduled_end"),
+            existing_job.get("scheduled_end"),
+            existing_job.get("scheduled_start"),
             location_id,
             service_dates,
             location_id,
@@ -2575,18 +2587,27 @@ def _resolve_canonical_location(
     wrong_type = [row for row in matches if bool(row["active"])]
     if wrong_type:
         return None, "wrong_site_type", tuple(int(row["id"]) for row in wrong_type)
-    if existing_job:
-        prior = location_snapshot.by_id.get(int(existing_job["location_id"]))
-        if (
-            prior
-            and bool(prior["active"])
-            and str(prior.get("location_type") or "") == expected_type
-        ):
-            return (
-                int(existing_job["location_id"]),
-                None,
-                (int(existing_job["location_id"]),),
+    if existing_job and hints:
+        prior_hints = {
+            value
+            for raw in (
+                existing_job.get("source_location_text"),
+                existing_job.get("source_title"),
             )
+            if (value := normalize_match_text(raw))
+        }
+        if prior_hints == hints:
+            prior = location_snapshot.by_id.get(int(existing_job["location_id"]))
+            if (
+                prior
+                and bool(prior["active"])
+                and str(prior.get("location_type") or "") == expected_type
+            ):
+                return (
+                    int(existing_job["location_id"]),
+                    None,
+                    (int(existing_job["location_id"]),),
+                )
     return None, "missing_site", ()
 
 
@@ -3214,7 +3235,35 @@ def upsert_canonical_mapping(
                     ),
                 )
                 existing = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT id, source_key, mapping_scope, source_fingerprint
+                    FROM google_calendar_event_mappings
+                    WHERE connection_id = %s AND calendar_id = %s
+                      AND mapping_scope = 'occurrence' AND source_key = %s
+                    FOR UPDATE
+                    """,
+                    (
+                        int(source["connection_id"]),
+                        str(source["calendar_id"]),
+                        source_key,
+                    ),
+                )
+                occurrence_mapping = cur.fetchone()
+                stale_occurrence_mapping = (
+                    occurrence_mapping
+                    if occurrence_mapping
+                    and str(occurrence_mapping.get("source_fingerprint") or "")
+                    != source_fingerprint
+                    else None
+                )
+                stale_occurrence_mapping_id: int | None = None
+                if existing is None and stale_occurrence_mapping is not None:
+                    existing = stale_occurrence_mapping
+                elif stale_occurrence_mapping is not None:
+                    stale_occurrence_mapping_id = int(stale_occurrence_mapping["id"])
             else:
+                stale_occurrence_mapping_id = None
                 cur.execute(
                     """
                     UPDATE google_calendar_event_mappings
@@ -3295,6 +3344,19 @@ def upsert_canonical_mapping(
                     ),
                 )
                 mapping_id = int(cur.fetchone()["id"])
+            if stale_occurrence_mapping_id is not None:
+                cur.execute(
+                    """
+                    UPDATE planned_service_visits
+                    SET mapping_id = %s
+                    WHERE mapping_id = %s
+                    """,
+                    (mapping_id, stale_occurrence_mapping_id),
+                )
+                cur.execute(
+                    "DELETE FROM google_calendar_event_mappings WHERE id = %s",
+                    (stale_occurrence_mapping_id,),
+                )
             cur.execute(
                 """
                 INSERT INTO planned_visit_audit_events (

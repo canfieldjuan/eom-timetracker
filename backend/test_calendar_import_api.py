@@ -3019,6 +3019,122 @@ def test_late_older_or_equal_conflicting_snapshot_cannot_regress_job(client, aut
     )
 
 
+def test_changed_source_without_a_current_site_match_stays_unresolved(client, auth):
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "lost-site-match",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    stored = db.query_one(
+        """
+        SELECT location_id, source_fingerprint, source_title,
+               source_location_text, scheduled_start, scheduled_end
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+
+    changed = google_occurrence(
+        original.event_id,
+        calendar_id="residential@example.test",
+        summary="No matching customer",
+        location="No matching Site address",
+        updated="2026-07-22T12:00:00Z",
+    )
+    assert changed.source_key == original.source_key
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [changed]
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["unresolved"] == 1
+    assert response.json()["exceptions"][0]["code"] == "missing_site"
+    assert response.json()["exceptions"][0]["candidateSites"] == []
+    assert (
+        db.query_one(
+            """
+            SELECT location_id, source_fingerprint, source_title,
+                   source_location_text, scheduled_start, scheduled_end
+            FROM jobs
+            WHERE source_key = %s
+            """,
+            (original.source_key,),
+        )
+        == stored
+    )
+
+
+def test_non_site_source_change_keeps_site_when_normalized_hints_are_unchanged(
+    client, auth
+):
+    configure_canonical_sources(client, auth)
+    location_id = int(
+        db.query_one(
+            """
+            INSERT INTO locations (
+                address, customer_name, location_type, active
+            ) VALUES (
+                '789 Pine St, Effingham', 'Continuity Customer',
+                'Residential', true
+            )
+            RETURNING id
+            """
+        )["id"]
+    )
+    original = google_occurrence(
+        "site-continuity",
+        calendar_id="residential@example.test",
+        summary="Continuity Customer",
+        location="Continuity Customer",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_start
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    assert int(job["location_id"]) == location_id
+    db.execute(
+        "UPDATE locations SET customer_name = 'Renamed Customer' WHERE id = %s",
+        (location_id,),
+    )
+    changed = replace(
+        original,
+        start=(WINDOW_START + timedelta(days=1)).isoformat(),
+        end=(WINDOW_START + timedelta(days=1, hours=2)).isoformat(),
+        updated="2026-07-22T12:00:00Z",
+        description="Changed service details",
+        etag='"2026-07-22T12:00:00Z"',
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [changed]
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["update"] == 1
+    assert response.json()["exceptions"] == []
+    updated = db.query_one(
+        "SELECT location_id, scheduled_start FROM jobs WHERE id = %s",
+        (int(job["id"]),),
+    )
+    assert int(updated["location_id"]) == location_id
+    assert updated["scheduled_start"] == WINDOW_START + timedelta(days=1)
+
+
 def test_source_sync_commits_one_calendar_when_the_other_fetch_fails(client, auth):
     configure_canonical_sources(client, auth)
     residential = google_occurrence(
@@ -3223,6 +3339,85 @@ def test_overnight_job_protects_work_evidence_on_second_service_date(client, aut
 
     moved = google_occurrence(
         "overnight-protected-work",
+        calendar_id="commercial@example.test",
+        summary="Commercial Customer",
+        location="456 Oak St, Effingham",
+        start=(local_start + timedelta(days=7)).astimezone(timezone.utc),
+        end=(local_start + timedelta(days=7, hours=2)).astimezone(timezone.utc),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["commercial@example.test"] = [moved]
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["unresolved"] == 1
+    assert response.json()["exceptions"][0]["code"] == "protected_work"
+    assert (
+        db.query_one(
+            "SELECT scheduled_start FROM jobs WHERE id = %s",
+            (int(job["id"]),),
+        )["scheduled_start"]
+        == job["scheduled_start"]
+    )
+
+
+def test_after_midnight_job_protects_shift_that_started_previous_day(client, auth):
+    configure_canonical_sources(client, auth)
+    local_start = datetime(
+        2026,
+        7,
+        26,
+        0,
+        30,
+        tzinfo=ZoneInfo("America/Chicago"),
+    )
+    original = google_occurrence(
+        "after-midnight-overlap",
+        calendar_id="commercial@example.test",
+        summary="Commercial Customer",
+        location="456 Oak St, Effingham",
+        start=local_start.astimezone(timezone.utc),
+        end=(local_start + timedelta(hours=2)).astimezone(timezone.utc),
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [],
+        "commercial@example.test": [original],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_start
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    employee_id = int(
+        db.query_one("SELECT id FROM employees WHERE name = 'Catalina Gomez'")["id"]
+    )
+    evidence_start = local_start - timedelta(minutes=45)
+    db.execute(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, local_date, time_category, notes, job_id
+        ) VALUES (
+            %s, %s, 'Commercial Customer', %s, %s, 1.0, %s, 'productive',
+            'canonical-calendar-test-evidence', NULL
+        )
+        """,
+        (
+            employee_id,
+            int(job["location_id"]),
+            evidence_start.astimezone(timezone.utc),
+            (evidence_start + timedelta(hours=1)).astimezone(timezone.utc),
+            evidence_start.date(),
+        ),
+    )
+
+    moved = google_occurrence(
+        "after-midnight-overlap",
         calendar_id="commercial@example.test",
         summary="Commercial Customer",
         location="456 Oak St, Effingham",
@@ -3521,7 +3716,9 @@ def test_mapping_is_fingerprint_guarded_and_recurring_series_is_reused(client, a
     )
 
 
-def test_occurrence_mapping_becomes_stale_when_the_calendar_event_changes(client, auth):
+def test_non_recurring_mapping_defaults_to_fingerprint_guarded_occurrence_scope(
+    client, auth
+):
     sources = configure_canonical_sources(client, auth)
     original = google_occurrence(
         "stale-occurrence-mapping",
@@ -3551,7 +3748,6 @@ def test_occurrence_mapping_becomes_stale_when_the_calendar_event_changes(client
         "seriesId": original.event_id,
         "occurrenceId": original.event_id,
         "locationId": location_id,
-        "applyToSeries": False,
     }
     saved = client.put(
         "/api/admin/google-calendar/mappings",
@@ -3599,6 +3795,171 @@ def test_occurrence_mapping_becomes_stale_when_the_calendar_event_changes(client
     applied = client.post("/api/admin/google-calendar/sync", headers=auth).json()
     assert applied["counts"]["create"] == 1
     assert applied["exceptions"] == []
+
+
+@pytest.mark.parametrize(
+    "existing_series_mapping",
+    [False, True],
+    ids=["reuse-stale-occurrence", "merge-into-existing-series"],
+)
+def test_series_save_reconciles_a_stale_retained_occurrence_mapping(
+    client, auth, existing_series_mapping
+):
+    sources = configure_canonical_sources(client, auth)
+    source = sources[store.RESIDENTIAL_MORNING_ROLE]
+    connection = store.active_connection()
+    assert connection is not None
+    original_start = WINDOW_START
+    raw_occurrence = google_occurrence(
+        "retained-series-instance",
+        calendar_id="residential@example.test",
+        summary="Needs retained mapping",
+        location="Calendar-only retained note",
+        recurring_event_id="retained-series",
+        original_start=original_start,
+    )
+    occurrence = calendar_api._source_occurrence(raw_occurrence)
+    fingerprint = calendar_api.occurrence_fingerprint(occurrence)
+    FakeGoogleClient.targeted_recurring_occurrences = {
+        ("retained-series", original_start.isoformat()): raw_occurrence
+    }
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    stale_mapping_id = int(
+        db.query_one(
+            """
+            INSERT INTO google_calendar_event_mappings (
+                connection_id, calendar_id, source_key, source_series_id,
+                mapping_scope, source_fingerprint, location_id,
+                created_by, updated_by
+            ) VALUES (%s, %s, %s, NULL, 'occurrence', NULL, %s, 1, 1)
+            RETURNING id
+            """,
+            (
+                int(connection["id"]),
+                str(source["calendarId"]),
+                occurrence.source_key,
+                location_id,
+            ),
+        )["id"]
+    )
+    series_mapping_key = store._canonical_series_mapping_key(
+        connection_id=int(connection["id"]),
+        calendar_id=str(source["calendarId"]),
+        source_series_id=occurrence.series_id,
+    )
+    series_mapping_id = stale_mapping_id
+    if existing_series_mapping:
+        series_mapping_id = int(
+            db.query_one(
+                """
+                INSERT INTO google_calendar_event_mappings (
+                    connection_id, calendar_id, source_key, source_series_id,
+                    mapping_scope, source_fingerprint, location_id,
+                    created_by, updated_by
+                ) VALUES (%s, %s, %s, %s, 'series', %s, %s, 1, 1)
+                RETURNING id
+                """,
+                (
+                    int(connection["id"]),
+                    str(source["calendarId"]),
+                    series_mapping_key,
+                    occurrence.series_id,
+                    "0" * 64,
+                    location_id,
+                ),
+            )["id"]
+        )
+    retained_visit_id = int(
+        db.query_one(
+            """
+            INSERT INTO planned_service_visits (
+                connection_id, mapping_id, source_calendar_id, source_event_id,
+                source_series_id, source_occurrence_id, source_key,
+                source_fingerprint, source_etag, source_updated_at, title,
+                description, source_location_text, location_id,
+                approximate_start, approximate_end, all_day, source_timezone
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, false, %s
+            )
+            RETURNING id
+            """,
+            (
+                int(connection["id"]),
+                stale_mapping_id,
+                occurrence.calendar_id,
+                occurrence.event_id,
+                occurrence.series_id,
+                occurrence.occurrence_id,
+                occurrence.source_key,
+                fingerprint,
+                occurrence.revision,
+                occurrence.updated_at,
+                occurrence.title,
+                occurrence.description,
+                occurrence.location_text,
+                location_id,
+                occurrence.starts_at,
+                occurrence.ends_at,
+                occurrence.time_zone,
+            ),
+        )["id"]
+    )
+
+    saved = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json={
+            "sourceId": source["id"],
+            "sourceKey": occurrence.source_key,
+            "sourceFingerprint": fingerprint,
+            "eventId": occurrence.event_id,
+            "seriesId": occurrence.series_id,
+            "occurrenceId": occurrence.occurrence_id,
+            "locationId": location_id,
+            "applyToSeries": True,
+        },
+    )
+
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["mapping"]["id"] == series_mapping_id
+    assert saved.json()["mapping"]["scope"] == "series"
+    assert db.query_one(
+        "SELECT mapping_id FROM planned_service_visits WHERE id = %s",
+        (retained_visit_id,),
+    ) == {"mapping_id": series_mapping_id}
+    mappings = db.query_all(
+        """
+        SELECT id, source_key, source_series_id, mapping_scope,
+               source_fingerprint, location_id
+        FROM google_calendar_event_mappings
+        """
+    )
+    assert mappings == [
+        {
+            "id": series_mapping_id,
+            "source_key": series_mapping_key,
+            "source_series_id": occurrence.series_id,
+            "mapping_scope": "series",
+            "source_fingerprint": fingerprint,
+            "location_id": location_id,
+        }
+    ]
+    synced = store.sync_calendar_source(
+        source_id=int(source["id"]),
+        expected_credential_version=int(connection["credential_version"]),
+        occurrences=[occurrence],
+        window_start=WINDOW_START,
+        window_end=WINDOW_START + timedelta(days=30),
+        actor_id=1,
+        actor_name="Juan Canfield",
+    )
+    assert synced["counts"]["create"] == 1
+    assert synced["exceptions"] == []
 
 
 def test_occurrence_override_preserves_the_recurring_series_default(client, auth):

@@ -1885,7 +1885,10 @@ def build_calendar_import_router(
                 source_series_id=payload.seriesId,
                 source_fingerprint=current_fingerprint,
                 location_id=payload.locationId,
-                apply_to_series=payload.applyToSeries,
+                apply_to_series=(
+                    payload.applyToSeries
+                    and occurrence.series_id != occurrence.event_id
+                ),
                 actor_id=int(admin["id"]),
                 actor_name=str(admin["name"]),
             )
