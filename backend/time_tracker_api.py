@@ -10474,6 +10474,20 @@ def _job_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _require_manual_job_mutation(row: Dict[str, Any]) -> None:
+    if row.get("source_key") is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "CALENDAR_JOB_READ_ONLY",
+                "message": (
+                    "Calendar-owned jobs are read-only; update the Google Calendar "
+                    "occurrence instead"
+                ),
+            },
+        )
+
+
 @app.post("/api/admin/jobs")
 def admin_create_job(
     payload: JobCreateRequest,
@@ -10850,52 +10864,68 @@ def admin_update_job(
     request: Request,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    existing = db.query_one("SELECT * FROM jobs WHERE id = %s", (job_id,))
-    if not existing:
-        raise HTTPException(status_code=404, detail="Job not found")
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM jobs WHERE id = %s FOR UPDATE", (job_id,))
+            existing = cur.fetchone()
+            if not existing:
+                raise HTTPException(status_code=404, detail="Job not found")
+            _require_manual_job_mutation(existing)
 
-    sets = []
-    params: list = []
-    if payload.customerName is not None:
-        sets.append("customer_name = %s")
-        params.append(payload.customerName.strip())
-    if payload.scheduledDate is not None:
-        try:
-            datetime.strptime(payload.scheduledDate, "%Y-%m-%d")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="scheduledDate must be YYYY-MM-DD")
-        sets.append("scheduled_date = %s")
-        params.append(payload.scheduledDate)
-    if payload.expectedHours is not None:
-        if payload.expectedHours < 0:
-            raise HTTPException(status_code=400, detail="expectedHours cannot be negative")
-        sets.append("expected_hours = %s")
-        params.append(payload.expectedHours)
-    if payload.revenue is not None:
-        if payload.revenue < 0:
-            raise HTTPException(status_code=400, detail="revenue cannot be negative")
-        sets.append("revenue = %s")
-        params.append(payload.revenue)
-    if payload.notes is not None:
-        sets.append("notes = %s")
-        params.append(payload.notes)
-    if payload.status is not None:
-        if payload.status not in ("scheduled", "in_progress", "completed", "cancelled"):
-            raise HTTPException(status_code=400, detail="Invalid status")
-        sets.append("status = %s")
-        params.append(payload.status)
-    if payload.locationId is not None:
-        sets.append("location_id = %s")
-        params.append(payload.locationId)
+            sets = []
+            params: list = []
+            if payload.customerName is not None:
+                sets.append("customer_name = %s")
+                params.append(payload.customerName.strip())
+            if payload.scheduledDate is not None:
+                try:
+                    datetime.strptime(payload.scheduledDate, "%Y-%m-%d")
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="scheduledDate must be YYYY-MM-DD"
+                    )
+                sets.append("scheduled_date = %s")
+                params.append(payload.scheduledDate)
+            if payload.expectedHours is not None:
+                if payload.expectedHours < 0:
+                    raise HTTPException(
+                        status_code=400, detail="expectedHours cannot be negative"
+                    )
+                sets.append("expected_hours = %s")
+                params.append(payload.expectedHours)
+            if payload.revenue is not None:
+                if payload.revenue < 0:
+                    raise HTTPException(
+                        status_code=400, detail="revenue cannot be negative"
+                    )
+                sets.append("revenue = %s")
+                params.append(payload.revenue)
+            if payload.notes is not None:
+                sets.append("notes = %s")
+                params.append(payload.notes)
+            if payload.status is not None:
+                if payload.status not in (
+                    "scheduled",
+                    "in_progress",
+                    "completed",
+                    "cancelled",
+                ):
+                    raise HTTPException(status_code=400, detail="Invalid status")
+                sets.append("status = %s")
+                params.append(payload.status)
+            if payload.locationId is not None:
+                sets.append("location_id = %s")
+                params.append(payload.locationId)
 
-    if not sets:
-        raise HTTPException(status_code=400, detail="No fields to update")
+            if not sets:
+                raise HTTPException(status_code=400, detail="No fields to update")
 
-    params.append(job_id)
-    row = db.query_one(
-        f"UPDATE jobs SET {', '.join(sets)} WHERE id = %s RETURNING *",
-        tuple(params),
-    )
+            params.append(job_id)
+            cur.execute(
+                f"UPDATE jobs SET {', '.join(sets)} WHERE id = %s RETURNING *",
+                tuple(params),
+            )
+            row = cur.fetchone()
     append_access_log(request, "JOB_UPDATED", True, f"Job {job_id}")
     return {"success": True, "job": _job_row_to_dict(row)}
 
@@ -10907,13 +10937,17 @@ def admin_delete_job(
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     """Delete a job. Unlinks any associated shifts first."""
-    existing = db.query_one("SELECT id FROM jobs WHERE id = %s", (job_id,))
-    if not existing:
-        raise HTTPException(status_code=404, detail="Job not found")
-
     with TIMESHEET_WRITE_LOCK:
         with db.get_conn() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, source_key FROM jobs WHERE id = %s FOR UPDATE",
+                    (job_id,),
+                )
+                existing = cur.fetchone()
+                if not existing:
+                    raise HTTPException(status_code=404, detail="Job not found")
+                _require_manual_job_mutation(existing)
                 cur.execute("UPDATE shifts SET job_id = NULL WHERE job_id = %s", (job_id,))
                 cur.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
 

@@ -1700,6 +1700,64 @@ class TestJobs:
         r2 = client.get(f"/api/admin/jobs/{job_id}", headers=auth)
         assert r2.status_code == 404
 
+    def test_calendar_owned_job_rejects_update_and_delete_without_unlinking_actuals(
+        self, client, auth, location_id, completed_shift_id
+    ):
+        job_id = int(
+            db.query_one(
+                """
+                INSERT INTO jobs (
+                    location_id, customer_name, scheduled_date, expected_hours,
+                    revenue, notes, status, source_key, source_fingerprint
+                ) VALUES (
+                    %s, 'Calendar Customer', '2026-04-04', 2.0, 100.0,
+                    'Calendar authority', 'scheduled', %s, %s
+                )
+                RETURNING id
+                """,
+                (location_id, "c" * 64, "d" * 64),
+            )["id"]
+        )
+        db.execute(
+            "UPDATE shifts SET job_id = %s WHERE id = %s",
+            (job_id, completed_shift_id),
+        )
+        original = db.query_one("SELECT * FROM jobs WHERE id = %s", (job_id,))
+        try:
+            updated = client.put(
+                f"/api/admin/jobs/{job_id}",
+                headers=auth,
+                json={
+                    "customerName": "Local override",
+                    "scheduledDate": "2026-04-05",
+                    "expectedHours": 9.0,
+                    "revenue": 999.0,
+                    "notes": "Local override",
+                    "status": "completed",
+                    "locationId": location_id,
+                },
+            )
+            deleted = client.delete(f"/api/admin/jobs/{job_id}", headers=auth)
+
+            assert updated.status_code == 409, updated.text
+            assert deleted.status_code == 409, deleted.text
+            assert updated.json()["code"] == "CALENDAR_JOB_READ_ONLY"
+            assert deleted.json()["code"] == "CALENDAR_JOB_READ_ONLY"
+            assert db.query_one("SELECT * FROM jobs WHERE id = %s", (job_id,)) == original
+            assert (
+                db.query_one(
+                    "SELECT job_id FROM shifts WHERE id = %s",
+                    (completed_shift_id,),
+                )["job_id"]
+                == job_id
+            )
+        finally:
+            db.execute(
+                "UPDATE shifts SET job_id = NULL WHERE id = %s",
+                (completed_shift_id,),
+            )
+            db.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
+
     def test_jobs_profitability(self, client, auth):
         r = client.get("/api/admin/jobs/profitability", headers=auth)
         assert r.status_code == 200, r.text

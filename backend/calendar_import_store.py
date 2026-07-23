@@ -834,24 +834,22 @@ def disconnect_calendar(
                 raise CalendarStoreError(
                     "Google Calendar credentials changed; retry disconnecting"
                 )
-            selected_calendar_id = str(row["selected_calendar_id"] or "").strip()
-            if selected_calendar_id:
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM planned_service_visits
-                    WHERE status = 'planned'
-                      AND approximate_end > NOW()
-                      AND source_calendar_id = %s
-                    LIMIT 1
-                    """,
-                    (selected_calendar_id,),
+            cur.execute(
+                """
+                SELECT 1
+                FROM planned_service_visits
+                WHERE connection_id = %s
+                  AND status = 'planned'
+                  AND approximate_end > NOW()
+                LIMIT 1
+                """,
+                (connection_id,),
+            )
+            if cur.fetchone():
+                raise CalendarStoreError(
+                    "Resolve or cancel future planned visits before disconnecting "
+                    "Google Calendar"
                 )
-                if cur.fetchone():
-                    raise CalendarStoreError(
-                        "Resolve or cancel future planned visits before disconnecting "
-                        "Google Calendar"
-                    )
             cur.execute(
                 """
                 SELECT 1
@@ -2489,6 +2487,7 @@ def _resolve_canonical_location(
     *,
     source: dict[str, Any],
     occurrence: Any,
+    fingerprint: str,
     existing_job: dict[str, Any] | None,
     location_snapshot: _CanonicalLocationSnapshot,
 ) -> tuple[int | None, str | None, tuple[int, ...]]:
@@ -2498,17 +2497,21 @@ def _resolve_canonical_location(
 
     cur.execute(
         """
-        SELECT location_id
+        SELECT location_id, mapping_scope, source_fingerprint
         FROM google_calendar_event_mappings
         WHERE connection_id = %s AND calendar_id = %s
           AND (
-              source_key = %s
+              (mapping_scope = 'occurrence' AND source_key = %s)
               OR (
                   mapping_scope = 'series'
                   AND source_series_id = %s
               )
           )
-        ORDER BY CASE WHEN source_key = %s THEN 0 ELSE 1 END, id
+        ORDER BY CASE
+                     WHEN mapping_scope = 'occurrence' AND source_key = %s THEN 0
+                     ELSE 1
+                 END,
+                 id
         LIMIT 1
         """,
         (
@@ -2522,6 +2525,11 @@ def _resolve_canonical_location(
     mapping = cur.fetchone()
     expected_type = CALENDAR_ROLE_LOCATION_TYPES[str(source["role"])]
     if mapping:
+        if (
+            str(mapping["mapping_scope"]) == "occurrence"
+            and str(mapping.get("source_fingerprint") or "") != fingerprint
+        ):
+            return None, "stale_site_mapping", (int(mapping["location_id"]),)
         selected = location_snapshot.by_id.get(int(mapping["location_id"]))
         if not selected or not bool(selected["active"]):
             return None, "archived_site", (int(mapping["location_id"]),)
@@ -2878,6 +2886,7 @@ def sync_calendar_source(
                     cur,
                     source=source,
                     occurrence=occurrence,
+                    fingerprint=fingerprint,
                     existing_job=existing,
                     location_snapshot=location_snapshot,
                 )
@@ -3097,6 +3106,21 @@ def sync_calendar_source(
     }
 
 
+def _canonical_series_mapping_key(
+    *, connection_id: int, calendar_id: str, source_series_id: str
+) -> str:
+    payload = json.dumps(
+        {
+            "calendarId": calendar_id,
+            "connectionId": connection_id,
+            "seriesId": source_series_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(f"canonical-series-mapping:{payload}".encode()).hexdigest()
+
+
 def upsert_canonical_mapping(
     *,
     source_id: int,
@@ -3169,6 +3193,11 @@ def upsert_canonical_mapping(
                     f"Selected Site must be {expected_type} for this Calendar"
                 )
             mapping_scope = "series" if apply_to_series else "occurrence"
+            series_mapping_key = _canonical_series_mapping_key(
+                connection_id=int(source["connection_id"]),
+                calendar_id=str(source["calendar_id"]),
+                source_series_id=source_series_id,
+            )
             if apply_to_series:
                 cur.execute(
                     """
@@ -3185,33 +3214,44 @@ def upsert_canonical_mapping(
                     ),
                 )
                 existing = cur.fetchone()
-                if not existing:
-                    cur.execute(
-                        """
-                        SELECT id, source_key, mapping_scope
-                        FROM google_calendar_event_mappings
-                        WHERE source_key = %s
-                        FOR UPDATE
-                        """,
-                        (source_key,),
-                    )
-                    existing = cur.fetchone()
             else:
+                cur.execute(
+                    """
+                    UPDATE google_calendar_event_mappings
+                    SET source_key = %s, updated_by = %s, updated_at = NOW()
+                    WHERE connection_id = %s AND calendar_id = %s
+                      AND mapping_scope = 'series' AND source_series_id = %s
+                      AND source_key <> %s
+                    """,
+                    (
+                        series_mapping_key,
+                        actor_id,
+                        int(source["connection_id"]),
+                        str(source["calendar_id"]),
+                        source_series_id,
+                        series_mapping_key,
+                    ),
+                )
                 cur.execute(
                     """
                     SELECT id, source_key, mapping_scope
                     FROM google_calendar_event_mappings
-                    WHERE source_key = %s
+                    WHERE connection_id = %s AND calendar_id = %s
+                      AND mapping_scope = 'occurrence' AND source_key = %s
                     FOR UPDATE
                     """,
-                    (source_key,),
+                    (
+                        int(source["connection_id"]),
+                        str(source["calendar_id"]),
+                        source_key,
+                    ),
                 )
                 existing = cur.fetchone()
             if existing:
                 mapping_id = int(existing["id"])
                 stored_source_key = (
-                    str(existing["source_key"])
-                    if str(existing["mapping_scope"]) == "series"
+                    series_mapping_key
+                    if mapping_scope == "series"
                     else source_key
                 )
                 cur.execute(
@@ -3245,7 +3285,7 @@ def upsert_canonical_mapping(
                     (
                         int(source["connection_id"]),
                         str(source["calendar_id"]),
-                        source_key,
+                        series_mapping_key if apply_to_series else source_key,
                         source_series_id,
                         mapping_scope,
                         source_fingerprint,
