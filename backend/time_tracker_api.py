@@ -6449,7 +6449,6 @@ def log_visit(
         customer = timesheet_data.get("location_customers", {}).get(location, "")
 
         # Avoid duplicate: skip if location matches the most recent visit
-        existing_visits = open_entry.get("visits") or []
         active_visit = get_active_visit(open_entry)
         if active_visit and active_visit.get("location") == location:
             return False, "already_at_location"
@@ -10060,9 +10059,6 @@ def admin_unmatched_shifts(
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     """Return individual productive shifts with no location assigned, plus all registered locations for the assignment dropdown."""
-    timesheet_data = load_timesheets()
-    location_customers = timesheet_data.get("location_customers", {})
-
     rows = db.query_all(
         """
         SELECT s.id, s.clock_in, s.clock_out, s.total_hours,
@@ -11148,7 +11144,6 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                 reasons.append(f"Overrun {overrun}h >= {watch_thresh}h (watch)")
                 severity = max(severity, 1)
 
-        has_overrun = False
         if rplh is not None:
             rplh_min = settings.get("rplhMin", _SETTINGS_DEFAULTS["rplhMin"])
             if rplh < rplh_min:

@@ -54,9 +54,10 @@ jobs:
         env:
           DATABASE_URL: postgresql://eom_test:eom_test@localhost:5433/eom_test
 
-  # Warn-first quality signal. Non-blocking today (reports but does not fail the
-  # build) so a large unlinted production codebase does not flood every PR. Ratchet
-  # to blocking (drop the `|| true` / add `--strict`) once the backlog is triaged.
+  # BLOCKING quality gate (ratcheted from warn-first 2026-07-22 after the backlog
+  # reached zero: ruff findings fixed, brittleness scan clean). A failure here
+  # fails the build. Rules stay narrow (real-bug ruff rules in ruff.toml; the
+  # brittleness scan targets patterns this codebase has actually been bitten by).
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -72,11 +73,11 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Ruff (warn-first — real-bug rules only, see ruff.toml)
+      - name: Ruff (blocking — real-bug rules only, see ruff.toml)
         run: |
           python -m pip install --upgrade pip
           pip install ruff
-          ruff check backend --output-format=github || true
+          ruff check backend --output-format=github
 
-      - name: Brittle-pattern scan (warn-first)
-        run: node scripts/check_brittle_patterns.mjs backend/time_tracker_api.py backend/monthly_report_main.py backend/report_generator.py backend/timetracker-mobile.html
+      - name: Brittle-pattern scan (blocking)
+        run: node scripts/check_brittle_patterns.mjs --strict backend/time_tracker_api.py backend/monthly_report_main.py backend/report_generator.py backend/timetracker-mobile.html
