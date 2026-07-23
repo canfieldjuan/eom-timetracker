@@ -25,6 +25,16 @@ services:
         value: "6"
       - key: ACCESS_END_HOUR
         value: "22"
+      # Explicit all-days: the code default is Mon–Fri, which would 403 the
+      # dashboard AND (now) Saturday clock-ins — crews work Saturdays. Tighten by
+      # removing day numbers (0=Sun..6=Sat) if policy changes.
+      - key: ALLOWED_DAYS
+        value: "0,1,2,3,4,5,6"
+      # Block clock-in/arrive/QR-check-in outside ACCESS hours (clock-OUT and
+      # depart are never blocked, so nobody gets trapped in an open shift).
+      # Kill switch: set to "false" to disable without a deploy.
+      - key: ENFORCE_CLOCK_HOURS
+        value: "true"
       - key: DATABASE_URL
         fromDatabase:
           name: eom-timetracker-db
