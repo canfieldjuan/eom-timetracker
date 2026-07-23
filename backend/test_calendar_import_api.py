@@ -19,6 +19,7 @@ from google_calendar import (
     CALENDAR_READONLY_SCOPES,
     CalendarOccurrence,
     CalendarSummary,
+    GoogleCalendarOAuthError,
     GoogleCalendarTransportError,
     GoogleCalendarResponseError,
     OAuthTokenSet,
@@ -51,6 +52,9 @@ class FakeGoogleClient:
     revoked_tokens: list[str] = []
     revoke_error: Exception | None = None
     authorization_error: Exception | None = None
+    refresh_error: Exception | None = None
+    exchange_refresh_token = "refresh-secret"
+    login_hints: list[str | None] = []
     batch_calls = 0
 
     def __init__(self, **_: object) -> None:
@@ -62,7 +66,7 @@ class FakeGoogleClient:
         if self.authorization_error is not None:
             raise self.authorization_error
         assert len(code_challenge) == 43
-        assert login_hint is None
+        self.login_hints.append(login_hint)
         return (
             f"https://accounts.google.com/o/oauth2/v2/auth?state={state}&scope=readonly"
         )
@@ -72,13 +76,15 @@ class FakeGoogleClient:
         self.exchanged_codes.append(code)
         return OAuthTokenSet(
             access_token="access-secret",
-            refresh_token="refresh-secret",
+            refresh_token=self.exchange_refresh_token,
             expires_in=3600,
             token_type="Bearer",
             scopes=CALENDAR_READONLY_SCOPES,
         )
 
     def refresh_access_token(self, *, refresh_token: str) -> OAuthTokenSet:
+        if self.refresh_error is not None:
+            raise self.refresh_error
         assert refresh_token == "refresh-secret"
         return OAuthTokenSet(
             access_token="refreshed-secret",
@@ -189,6 +195,32 @@ def google_occurrence(
     )
 
 
+def sparse_cancelled_occurrence(
+    original: CalendarOccurrence,
+    *,
+    updated: str = "2026-07-20T18:00:00Z",
+) -> CalendarOccurrence:
+    return CalendarOccurrence(
+        source_key=original.source_key,
+        calendar_id=original.calendar_id,
+        event_id=original.event_id,
+        recurring_event_id=original.recurring_event_id,
+        original_start=original.original_start,
+        summary="(Untitled event)",
+        location="",
+        status="cancelled",
+        cancelled=True,
+        all_day=False,
+        start=None,
+        end=None,
+        time_zone=original.time_zone,
+        updated=updated,
+        description="",
+        etag=f'"{updated}"',
+        original_start_query=original.original_start_query,
+    )
+
+
 @pytest.fixture(autouse=True)
 def isolated_calendar_domain(monkeypatch):
     monkeypatch.setattr(calendar_api, "GoogleCalendarClient", FakeGoogleClient)
@@ -217,6 +249,9 @@ def isolated_calendar_domain(monkeypatch):
     FakeGoogleClient.revoked_tokens = []
     FakeGoogleClient.revoke_error = None
     FakeGoogleClient.authorization_error = None
+    FakeGoogleClient.refresh_error = None
+    FakeGoogleClient.exchange_refresh_token = "refresh-secret"
+    FakeGoogleClient.login_hints = []
     FakeGoogleClient.batch_calls = 0
     with db.get_conn() as conn:
         with conn.cursor() as cur:
@@ -286,6 +321,7 @@ def connect_unselected_calendar() -> int:
     if active:
         store.disconnect_calendar(
             connection_id=int(active["id"]),
+            expected_credential_version=int(active["credential_version"]),
             admin_id=1,
             admin_name="Juan Canfield",
         )
@@ -308,11 +344,13 @@ def connect_unselected_calendar() -> int:
 
 def connect_selected_calendar() -> int:
     connection_id = connect_unselected_calendar()
+    credential_version = int(store.active_connection()["credential_version"])
     store.select_calendar(
         connection_id=connection_id,
         calendar_id="operations@example.test",
         calendar_name="Operations",
         calendar_timezone="America/Chicago",
+        expected_credential_version=credential_version,
     )
     return connection_id
 
@@ -660,8 +698,11 @@ def test_status_calendar_selection_and_morning_crew_resolution(client, auth):
 
     connect_selected_calendar()
     reconnect = client.post("/api/admin/google-calendar/connect", headers=auth)
-    assert reconnect.status_code == 409
-    assert "Disconnect" in reconnect.json()["error"]
+    assert reconnect.status_code == 200
+    assert reconnect.json()["authorizationUrl"].startswith(
+        "https://accounts.google.com/"
+    )
+    assert FakeGoogleClient.login_hints == ["operations@example.test"]
     calendars = client.get("/api/admin/google-calendar/calendars", headers=auth)
     assert calendars.status_code == 200
     assert calendars.json()["calendars"][0]["name"] == "Operations"
@@ -678,6 +719,323 @@ def test_status_calendar_selection_and_morning_crew_resolution(client, auth):
     assert crews.json()["morningCrew"]["ready"] is True
     assert crews.json()["morningCrew"]["identityIssues"] == []
     assert len(crews.json()["morningCrew"]["memberIds"]) == 3
+
+
+def test_invalid_grant_reauthorizes_exact_connection_with_future_visit(
+    client, auth, monkeypatch
+):
+    future_start = datetime.now(UTC) + timedelta(days=1)
+    monkeypatch.setattr(
+        calendar_api,
+        "_preview_window_bounds",
+        lambda _time_zone_name, **_kwargs: (
+            future_start - timedelta(hours=1),
+            future_start + timedelta(days=30),
+        ),
+    )
+    connection_id = connect_selected_calendar()
+    original = google_occurrence("reauthorize-future", start=future_start)
+    FakeGoogleClient.occurrences = [original]
+    approve_current_preview(client, auth)
+
+    cipher = store.CredentialCipher("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=")
+    store.update_connection_credentials(
+        connection_id,
+        {
+            "access_token": "expired-access",
+            "refresh_token": "refresh-secret",
+            "expires_at": "2020-01-01T00:00:00+00:00",
+            "token_type": "Bearer",
+            "scopes": list(CALENDAR_READONLY_SCOPES),
+        },
+        expected_credential_version=int(
+            store.active_connection()["credential_version"]
+        ),
+        cipher=cipher,
+    )
+    retained_ciphertext = db.query_one(
+        "SELECT credential_ciphertext FROM google_calendar_connections WHERE id = %s",
+        (connection_id,),
+    )["credential_ciphertext"]
+    FakeGoogleClient.refresh_error = GoogleCalendarOAuthError(
+        "Google authorization is invalid or expired"
+    )
+
+    unavailable = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={"resolutions": []},
+    )
+    assert unavailable.status_code == 409
+    assert "reconnect" in unavailable.json()["error"]
+    blocked_disconnect = client.delete(
+        "/api/admin/google-calendar/connection", headers=auth
+    )
+    assert blocked_disconnect.status_code == 409
+    assert FakeGoogleClient.revoked_tokens == []
+
+    started = client.post("/api/admin/google-calendar/connect", headers=auth)
+    assert started.status_code == 200, started.text
+    state = parse_qs(urlsplit(started.json()["authorizationUrl"]).query)["state"][0]
+    stored_state = db.query_one(
+        "SELECT reconnect_connection_id FROM google_calendar_oauth_states"
+    )
+    assert int(stored_state["reconnect_connection_id"]) == connection_id
+    assert FakeGoogleClient.login_hints == ["operations@example.test"]
+
+    callback = client.get(
+        "/api/google-calendar/oauth/callback",
+        params={"state": state, "code": "replacement-grant"},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 303
+    assert callback.headers["location"].endswith("calendarImport=connected")
+    active = store.active_connection()
+    assert int(active["id"]) == connection_id
+    assert active["selected_calendar_id"] == "operations@example.test"
+    assert (
+        db.query_one(
+            "SELECT credential_ciphertext FROM google_calendar_connections WHERE id = %s",
+            (connection_id,),
+        )["credential_ciphertext"]
+        != retained_ciphertext
+    )
+    assert db.query_one("SELECT connection_id, status FROM planned_service_visits") == {
+        "connection_id": connection_id,
+        "status": "planned",
+    }
+    assert (
+        db.query_one(
+            "SELECT action FROM planned_visit_audit_events WHERE action = 'calendar_reauthorized'"
+        )["action"]
+        == "calendar_reauthorized"
+    )
+
+    FakeGoogleClient.occurrences = [sparse_cancelled_occurrence(original)]
+    cancellation = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={"resolutions": []},
+    )
+    assert cancellation.status_code == 200, cancellation.text
+    cancellation_body = cancellation.json()
+    assert cancellation_body["counts"]["cancel"] == 1
+    approved = client.post(
+        "/api/admin/google-calendar/approve",
+        headers=auth,
+        json={
+            "previewId": cancellation_body["previewId"],
+            "previewFingerprint": cancellation_body["previewFingerprint"],
+        },
+    )
+    assert approved.status_code == 200, approved.text
+    assert (
+        db.query_one("SELECT status FROM planned_service_visits")["status"]
+        == "cancelled"
+    )
+
+
+def test_reauthorization_failure_retains_connection_without_revoking_uncertain_grant(
+    client, auth
+):
+    connection_id = connect_selected_calendar()
+    retained = db.query_one(
+        "SELECT credential_ciphertext FROM google_calendar_connections WHERE id = %s",
+        (connection_id,),
+    )["credential_ciphertext"]
+    started = client.post("/api/admin/google-calendar/connect", headers=auth).json()
+    state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
+    FakeGoogleClient.calendars = [
+        CalendarSummary(
+            calendar_id="other@example.test",
+            summary="Other",
+            primary=True,
+            selected=True,
+            access_role="owner",
+            time_zone="America/Chicago",
+        )
+    ]
+    FakeGoogleClient.exchange_refresh_token = "wrong-account-refresh"
+
+    callback = client.get(
+        "/api/google-calendar/oauth/callback",
+        params={"state": state, "code": "wrong-calendar-grant"},
+        follow_redirects=False,
+    )
+
+    assert callback.status_code == 303
+    assert callback.headers["location"].endswith("calendarImport=error")
+    active = store.active_connection()
+    assert int(active["id"]) == connection_id
+    assert active["selected_calendar_id"] == "operations@example.test"
+    assert (
+        db.query_one(
+            "SELECT credential_ciphertext FROM google_calendar_connections WHERE id = %s",
+            (connection_id,),
+        )["credential_ciphertext"]
+        == retained
+    )
+    assert (
+        db.query_one(
+            "SELECT COUNT(*) AS n FROM planned_visit_audit_events WHERE action = 'calendar_reauthorized'"
+        )["n"]
+        == 0
+    )
+    # Calendar-only OAuth exposes no stable principal identifier. Revoking this
+    # token could revoke the retained grant if the account's email was renamed.
+    assert FakeGoogleClient.revoked_tokens == []
+
+
+def test_reauthorization_callback_is_bound_to_original_connection(client, auth):
+    original_connection_id = connect_selected_calendar()
+    started = client.post("/api/admin/google-calendar/connect", headers=auth).json()
+    state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
+    db.execute(
+        """
+        UPDATE google_calendar_connections
+        SET revoked_at = NOW(), credential_ciphertext = NULL
+        WHERE id = %s
+        """,
+        (original_connection_id,),
+    )
+    replacement_connection_id = connect_unselected_calendar()
+
+    callback = client.get(
+        "/api/google-calendar/oauth/callback",
+        params={"state": state, "code": "stale-reconnect"},
+        follow_redirects=False,
+    )
+
+    assert callback.status_code == 303
+    assert callback.headers["location"].endswith("calendarImport=error")
+    assert FakeGoogleClient.exchanged_codes == []
+    assert int(store.active_connection()["id"]) == replacement_connection_id
+
+
+def test_stale_refresh_cannot_overwrite_reauthorized_credentials():
+    connection_id = connect_selected_calendar()
+    before = store.active_connection()
+    cipher = store.CredentialCipher("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=")
+    replacement_credentials = {
+        "access_token": "replacement-access",
+        "refresh_token": "replacement-refresh",
+        "expires_at": "2099-01-01T00:00:00+00:00",
+        "token_type": "Bearer",
+        "scopes": list(CALENDAR_READONLY_SCOPES),
+    }
+    store.reauthorize_active_connection(
+        connection_id=connection_id,
+        account_email="operations@example.test",
+        credentials=replacement_credentials,
+        scopes=CALENDAR_READONLY_SCOPES,
+        accessible_calendar_ids=("operations@example.test",),
+        admin_id=1,
+        admin_name="Juan Canfield",
+        cipher=cipher,
+    )
+
+    with pytest.raises(
+        store.CalendarStoreError, match="credentials changed during refresh"
+    ):
+        store.update_connection_credentials(
+            connection_id,
+            {
+                "access_token": "stale-refreshed-access",
+                "refresh_token": "refresh-secret",
+                "expires_at": "2099-01-01T00:00:00+00:00",
+                "token_type": "Bearer",
+                "scopes": list(CALENDAR_READONLY_SCOPES),
+            },
+            expected_credential_version=int(before["credential_version"]),
+            cipher=cipher,
+        )
+
+    active = store.active_connection()
+    assert int(active["credential_version"]) == int(before["credential_version"]) + 1
+    assert (
+        store.connection_credentials(active, cipher=cipher) == replacement_credentials
+    )
+
+
+def test_stale_calendar_choice_cannot_cross_reauthorization():
+    connection_id = connect_selected_calendar()
+    listed_under_version = int(store.active_connection()["credential_version"])
+    cipher = store.CredentialCipher("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=")
+    store.reauthorize_active_connection(
+        connection_id=connection_id,
+        account_email="operations@example.test",
+        credentials={
+            "access_token": "replacement-access",
+            "refresh_token": "replacement-refresh",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "token_type": "Bearer",
+            "scopes": list(CALENDAR_READONLY_SCOPES),
+        },
+        scopes=CALENDAR_READONLY_SCOPES,
+        accessible_calendar_ids=("operations@example.test",),
+        admin_id=1,
+        admin_name="Juan Canfield",
+        cipher=cipher,
+    )
+
+    with pytest.raises(store.CalendarStoreError, match="credentials changed; reload"):
+        store.select_calendar(
+            connection_id=connection_id,
+            calendar_id="dispatch@example.test",
+            calendar_name="Dispatch",
+            calendar_timezone="America/Chicago",
+            expected_credential_version=listed_under_version,
+        )
+
+    assert (
+        store.active_connection()["selected_calendar_id"] == "operations@example.test"
+    )
+
+
+def test_stale_disconnect_cannot_revoke_or_scrub_reauthorized_credentials():
+    connection_id = connect_selected_calendar()
+    disconnect_version = int(store.active_connection()["credential_version"])
+    cipher = store.CredentialCipher("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=")
+    replacement_credentials = {
+        "access_token": "replacement-access",
+        "refresh_token": "replacement-refresh",
+        "expires_at": "2099-01-01T00:00:00+00:00",
+        "token_type": "Bearer",
+        "scopes": list(CALENDAR_READONLY_SCOPES),
+    }
+    store.reauthorize_active_connection(
+        connection_id=connection_id,
+        account_email="operations@example.test",
+        credentials=replacement_credentials,
+        scopes=CALENDAR_READONLY_SCOPES,
+        accessible_calendar_ids=("operations@example.test",),
+        admin_id=1,
+        admin_name="Juan Canfield",
+        cipher=cipher,
+    )
+    revocation_attempts = 0
+
+    def mark_revocation() -> None:
+        nonlocal revocation_attempts
+        revocation_attempts += 1
+
+    with pytest.raises(
+        store.CalendarStoreError, match="credentials changed; retry disconnecting"
+    ):
+        store.disconnect_calendar(
+            connection_id=connection_id,
+            expected_credential_version=disconnect_version,
+            admin_id=1,
+            admin_name="Juan Canfield",
+            before_disconnect=mark_revocation,
+        )
+
+    active = store.active_connection()
+    assert revocation_attempts == 0
+    assert active["credential_ciphertext"] is not None
+    assert (
+        store.connection_credentials(active, cipher=cipher) == replacement_credentials
+    )
 
 
 def test_calendar_switch_preserves_future_planned_visit_reconciliation(
@@ -737,8 +1095,7 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
     assert blocked_switch.status_code == 409
     assert "Resolve future planned visits" in blocked_switch.json()["error"]
     assert (
-        store.active_connection()["selected_calendar_id"]
-        == "operations@example.test"
+        store.active_connection()["selected_calendar_id"] == "operations@example.test"
     )
 
     active_connection_id = int(store.active_connection()["id"])
@@ -746,9 +1103,9 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
         "/api/admin/google-calendar/connection", headers=auth
     )
     assert blocked_disconnect.status_code == 409, blocked_disconnect.text
-    assert "Resolve or cancel future planned visits" in blocked_disconnect.json()[
-        "error"
-    ]
+    assert (
+        "Resolve or cancel future planned visits" in blocked_disconnect.json()["error"]
+    )
     assert FakeGoogleClient.revoked_tokens == []
     retained_connection = db.query_one(
         """
@@ -838,7 +1195,10 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
         },
     )
     assert cancelled.status_code == 200, cancelled.text
-    assert db.query_one("SELECT status FROM planned_service_visits")["status"] == "cancelled"
+    assert (
+        db.query_one("SELECT status FROM planned_service_visits")["status"]
+        == "cancelled"
+    )
     assert (
         db.query_one(
             """
@@ -856,10 +1216,7 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
         json={"calendarId": "dispatch@example.test"},
     )
     assert recovered_switch.status_code == 200, recovered_switch.text
-    assert (
-        store.active_connection()["selected_calendar_id"]
-        == "dispatch@example.test"
-    )
+    assert store.active_connection()["selected_calendar_id"] == "dispatch@example.test"
     disconnected_after_reconciliation = client.delete(
         "/api/admin/google-calendar/connection", headers=auth
     )
@@ -1095,26 +1452,32 @@ def test_connection_change_after_rebuild_fails_closed_inside_approval_transactio
 
     def change_connection_then_apply(**kwargs):
         if connection_change == "disconnect":
+            active = store.active_connection()
             store.disconnect_calendar(
                 connection_id=connection_id,
+                expected_credential_version=int(active["credential_version"]),
                 admin_id=1,
                 admin_name="Juan Canfield",
             )
         elif connection_change == "reconnect":
             connect_selected_calendar()
         elif connection_change == "switch":
+            credential_version = int(store.active_connection()["credential_version"])
             store.select_calendar(
                 connection_id=connection_id,
                 calendar_id="different@example.test",
                 calendar_name="Different calendar",
                 calendar_timezone="America/Chicago",
+                expected_credential_version=credential_version,
             )
         else:
+            credential_version = int(store.active_connection()["credential_version"])
             store.select_calendar(
                 connection_id=connection_id,
                 calendar_id="operations@example.test",
                 calendar_name="Operations",
                 calendar_timezone="America/New_York",
+                expected_credential_version=credential_version,
             )
         return real_apply(**kwargs)
 
@@ -1422,6 +1785,61 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, au
     assert stored["approximate_start"] == moved_start
     assert stored["status"] == "planned"
 
+    FakeGoogleClient.calendars = [
+        *FakeGoogleClient.calendars,
+        CalendarSummary(
+            calendar_id="dispatch@example.test",
+            summary="Dispatch",
+            primary=False,
+            selected=True,
+            access_role="owner",
+            time_zone="America/Chicago",
+        ),
+    ]
+    blocked_switch = client.put(
+        "/api/admin/google-calendar/calendar",
+        headers=auth,
+        json={"calendarId": "dispatch@example.test"},
+    )
+    assert blocked_switch.status_code == 409
+    blocked_disconnect = client.delete(
+        "/api/admin/google-calendar/connection", headers=auth
+    )
+    assert blocked_disconnect.status_code == 409
+
+    FakeGoogleClient.targeted_recurring_occurrences = {
+        ("recurring-series", original.original_start_query): None
+    }
+    cancellation = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={"resolutions": []},
+    )
+    assert cancellation.status_code == 200, cancellation.text
+    cancellation_body = cancellation.json()
+    assert cancellation_body["counts"]["cancel"] == 1
+    assert cancellation_body["items"][0]["start"] == moved_start.isoformat()
+    approved_cancellation = client.post(
+        "/api/admin/google-calendar/approve",
+        headers=auth,
+        json={
+            "previewId": cancellation_body["previewId"],
+            "previewFingerprint": cancellation_body["previewFingerprint"],
+        },
+    )
+    assert approved_cancellation.status_code == 200, approved_cancellation.text
+
+    recovered_switch = client.put(
+        "/api/admin/google-calendar/calendar",
+        headers=auth,
+        json={"calendarId": "dispatch@example.test"},
+    )
+    assert recovered_switch.status_code == 200, recovered_switch.text
+    recovered_disconnect = client.delete(
+        "/api/admin/google-calendar/connection", headers=auth
+    )
+    assert recovered_disconnect.status_code == 200, recovered_disconnect.text
+
 
 @pytest.mark.parametrize("recurring", [False, True])
 def test_provider_confirmed_missing_occurrence_is_previewed_and_applied_as_cancelled(
@@ -1474,6 +1892,79 @@ def test_provider_confirmed_missing_occurrence_is_previewed_and_applied_as_cance
         )["status"]
         == "cancelled"
     )
+
+
+@pytest.mark.parametrize("delivery", ["listed", "targeted"])
+def test_explicit_sparse_cancellation_preserves_reviewed_context(
+    client, auth, delivery
+):
+    connect_selected_calendar()
+    original = google_occurrence(
+        "sparse-instance",
+        summary="Rich Customer Name",
+        location="123 Main St, Effingham",
+        recurring_event_id="sparse-series",
+        original_start=WINDOW_START,
+    )
+    FakeGoogleClient.occurrences = [original]
+    approve_current_preview(client, auth)
+    before = db.query_one(
+        """
+        SELECT title, description, source_location_text,
+               approximate_start, approximate_end, all_day, source_timezone
+        FROM planned_service_visits
+        """
+    )
+    sparse = sparse_cancelled_occurrence(original)
+    FakeGoogleClient.occurrences = [sparse] if delivery == "listed" else []
+    if delivery == "targeted":
+        FakeGoogleClient.targeted_recurring_occurrences = {
+            ("sparse-series", original.original_start_query): sparse
+        }
+
+    preview_response = client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={"resolutions": []},
+    )
+
+    assert preview_response.status_code == 200, preview_response.text
+    preview = preview_response.json()
+    assert preview["counts"]["cancel"] == 1
+    assert preview["counts"]["unresolved"] == 0
+    item = preview["items"][0]
+    assert item["summary"] == before["title"]
+    assert item["description"] == before["description"]
+    assert item["calendarLocation"] == before["source_location_text"]
+    assert datetime.fromisoformat(item["start"]) == before["approximate_start"]
+    assert datetime.fromisoformat(item["end"]) == before["approximate_end"]
+    approved = client.post(
+        "/api/admin/google-calendar/approve",
+        headers=auth,
+        json={
+            "previewId": preview["previewId"],
+            "previewFingerprint": preview["previewFingerprint"],
+        },
+    )
+    assert approved.status_code == 200, approved.text
+    after = db.query_one(
+        """
+        SELECT title, description, source_location_text,
+               approximate_start, approximate_end, all_day, source_timezone, status
+        FROM planned_service_visits
+        """
+    )
+    assert after["status"] == "cancelled"
+    for field in (
+        "title",
+        "description",
+        "source_location_text",
+        "approximate_start",
+        "approximate_end",
+        "all_day",
+        "source_timezone",
+    ):
+        assert after[field] == before[field]
 
 
 def test_more_than_ten_missing_occurrences_are_targeted_and_updated(client, auth):
@@ -1691,8 +2182,17 @@ def test_location_only_resolution_preserves_default_assignment_through_approval(
 
 
 def test_morning_crew_identity_issue_blocks_until_admin_sets_explicit_membership(
-    client, auth
+    client, auth, monkeypatch
 ):
+    future_start = datetime.now(UTC) + timedelta(days=1)
+    monkeypatch.setattr(
+        calendar_api,
+        "_preview_window_bounds",
+        lambda _time_zone_name, **_kwargs: (
+            future_start - timedelta(hours=1),
+            future_start + timedelta(days=30),
+        ),
+    )
     connect_selected_calendar()
     db.execute("UPDATE employees SET active = false WHERE name = 'Pamela Brown'")
 
@@ -1706,7 +2206,9 @@ def test_morning_crew_identity_issue_blocks_until_admin_sets_explicit_membership
         for issue in unresolved_crew["identityIssues"]
     )
 
-    FakeGoogleClient.occurrences = [google_occurrence("crew-needs-resolution")]
+    FakeGoogleClient.occurrences = [
+        google_occurrence("crew-needs-resolution", start=future_start)
+    ]
     blocked_preview = client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,

@@ -264,6 +264,8 @@ CREATE TABLE google_calendar_connections (
     selected_calendar_id   TEXT,
     selected_calendar_name TEXT,
     selected_calendar_timezone TEXT,
+    credential_version     BIGINT NOT NULL DEFAULT 1
+                               CHECK (credential_version > 0),
     connected_by           INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     connected_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -275,12 +277,14 @@ CREATE UNIQUE INDEX uq_google_calendar_active_connection
     WHERE revoked_at IS NULL;
 
 -- OAuth callbacks cannot carry the portal bearer token. A random state value
--- is stored only as a hash, bound to the initiating admin, and consumed once.
+-- is stored only as a hash, bound to the initiating admin and (for recovery)
+-- one exact active connection, and consumed once.
 CREATE TABLE google_calendar_oauth_states (
     state_hash                 VARCHAR(64) PRIMARY KEY
                                    CHECK (state_hash ~ '^[0-9a-f]{64}$'),
     admin_employee_id          INTEGER NOT NULL REFERENCES employees(id),
     pkce_verifier_ciphertext   TEXT NOT NULL,
+    reconnect_connection_id    BIGINT REFERENCES google_calendar_connections(id),
     expires_at                 TIMESTAMPTZ NOT NULL,
     consumed_at                TIMESTAMPTZ,
     created_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW()

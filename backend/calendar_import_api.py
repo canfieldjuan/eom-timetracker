@@ -336,7 +336,13 @@ def _revoke_issued_token(client: GoogleCalendarClient, token: OAuthTokenSet) -> 
 def _revoke_uninstalled_token(
     client: GoogleCalendarClient, token: OAuthTokenSet
 ) -> None:
-    """Revoke only when no concurrently installed connection can share the grant."""
+    """Revoke only when no installed connection can share the Google grant.
+
+    Calendar-only OAuth does not provide a stable Google principal identifier.
+    When a connection remains active, revoking a newly issued token could also
+    invalidate the retained grant for that same principal, so cleanup must
+    prefer the still-installed connection over speculative provider revocation.
+    """
 
     try:
         if store.active_connection():
@@ -394,8 +400,11 @@ def _access_context(
             raise _google_failure(exc) from exc
         credentials = _token_payload(refreshed, prior_refresh_token=refresh_token)
         try:
-            store.update_connection_credentials(
-                int(connection["id"]), credentials, cipher=cipher
+            credential_version = store.update_connection_credentials(
+                int(connection["id"]),
+                credentials,
+                expected_credential_version=int(connection["credential_version"]),
+                cipher=cipher,
             )
         except store.CalendarStoreError as exc:
             raise HTTPException(
@@ -403,6 +412,7 @@ def _access_context(
                 detail="Google Calendar connection changed; reconnect the calendar",
             ) from exc
         access_token = str(credentials["access_token"])
+        connection = {**connection, "credential_version": credential_version}
     return client, connection, access_token
 
 
@@ -595,6 +605,53 @@ def _source_occurrence(occurrence: CalendarOccurrence) -> SourceOccurrence:
     )
 
 
+def _cancelled_occurrence_with_stored_context(
+    occurrence: SourceOccurrence, existing: dict[str, Any] | None
+) -> SourceOccurrence:
+    """Keep explicit provider cancellation evidence readable to the operator."""
+
+    if not occurrence.cancelled or existing is None:
+        return occurrence
+    provider_has_range = (
+        occurrence.starts_at is not None and occurrence.ends_at is not None
+    )
+    title = occurrence.title
+    if title in {"", "(Untitled event)"}:
+        title = str(existing.get("title") or title)
+    description = occurrence.description or str(existing.get("description") or "")
+    location_text = occurrence.location_text or str(
+        existing.get("source_location_text") or ""
+    )
+    starts_at = (
+        occurrence.starts_at
+        if provider_has_range
+        else existing.get("approximate_start")
+    )
+    ends_at = (
+        occurrence.ends_at if provider_has_range else existing.get("approximate_end")
+    )
+    all_day = occurrence.all_day if provider_has_range else bool(existing["all_day"])
+    time_zone = occurrence.time_zone or str(existing.get("source_timezone") or "")
+    return SourceOccurrence(
+        calendar_id=occurrence.calendar_id,
+        event_id=occurrence.event_id,
+        series_id=occurrence.series_id,
+        occurrence_id=occurrence.occurrence_id,
+        source_key_value=occurrence.source_key,
+        title=title,
+        description=description,
+        location_text=location_text,
+        time_zone=time_zone,
+        starts_at=starts_at,
+        ends_at=ends_at,
+        updated_at=occurrence.updated_at,
+        match_hints=tuple(hint for hint in (location_text, title) if hint),
+        all_day=all_day,
+        cancelled=True,
+        revision=occurrence.revision,
+    )
+
+
 def _deleted_source_occurrence(
     *, identity: dict[str, Any], calendar_id: str, time_zone: str
 ) -> SourceOccurrence:
@@ -677,6 +734,7 @@ def _read_source_window(
                 calendar_id=calendar_id,
                 calendar_name=selected_calendar.summary,
                 calendar_timezone=calendar_time_zone,
+                expected_credential_version=int(connection["credential_version"]),
             )
             connection = {
                 **connection,
@@ -710,7 +768,6 @@ def _read_source_window(
         identities = store.read_planned_source_identities(
             calendar_id=calendar_id,
             range_start=window_start,
-            range_end=window_end,
         )
         missing_identities = [
             identity
@@ -761,6 +818,16 @@ def _read_source_window(
                 )
             source_rows_by_key[source_key] = _source_occurrence(targeted)
         occurrences = [source_rows_by_key[key] for key in sorted(source_rows_by_key)]
+        context_by_key = store.read_source_contexts(
+            calendar_id=calendar_id,
+            source_keys=(occurrence.source_key for occurrence in occurrences),
+        )
+        occurrences = [
+            _cancelled_occurrence_with_stored_context(
+                occurrence, context_by_key.get(occurrence.source_key)
+            )
+            for occurrence in occurrences
+        ]
     except GoogleCalendarError as exc:
         raise _google_failure(exc) from exc
     except PlanningContractError as exc:
@@ -1192,15 +1259,15 @@ def build_calendar_import_router(
         admin: dict[str, Any] = Depends(get_current_admin),
     ) -> dict[str, Any]:
         client = _client(config)
-        if store.active_connection():
-            raise HTTPException(
-                status_code=409,
-                detail="Disconnect the active Google Calendar before reconnecting",
-            )
+        connection = store.active_connection()
         cipher = _cipher(config)
         try:
             raw_state, verifier = store.create_oauth_state(
-                admin_id=int(admin["id"]), cipher=cipher
+                admin_id=int(admin["id"]),
+                cipher=cipher,
+                reconnect_connection_id=(
+                    int(connection["id"]) if connection is not None else None
+                ),
             )
         except store.CalendarStoreError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1208,6 +1275,11 @@ def build_calendar_import_router(
             authorization_url = client.authorization_url(
                 state=raw_state,
                 code_challenge=pkce_challenge(verifier),
+                login_hint=(
+                    str(connection.get("google_account_email") or "").strip() or None
+                    if connection is not None
+                    else None
+                ),
             )
         except GoogleCalendarError as exc:
             store.abandon_oauth_state(raw_state)
@@ -1232,7 +1304,12 @@ def build_calendar_import_router(
             _require_runtime_config(config)
             if error or not code:
                 return _portal_redirect(config, "error")
-            if store.active_connection():
+            active = store.active_connection()
+            reconnect_connection_id = consumed.reconnect_connection_id
+            if reconnect_connection_id is None:
+                if active is not None:
+                    return _portal_redirect(config, "error")
+            elif active is None or int(active["id"]) != reconnect_connection_id:
                 return _portal_redirect(config, "error")
             client = _client(config)
             token: OAuthTokenSet | None = None
@@ -1253,14 +1330,24 @@ def build_calendar_import_router(
                 (calendar for calendar in calendars if calendar.primary), None
             )
             try:
-                store.create_active_connection(
-                    account_email=primary.calendar_id if primary else None,
-                    credentials=_token_payload(token),
-                    scopes=token.scopes or CALENDAR_READONLY_SCOPES,
-                    admin_id=consumed.admin_id,
-                    admin_name=consumed.admin_name,
-                    cipher=_cipher(config),
-                )
+                connection_arguments = {
+                    "account_email": primary.calendar_id if primary else None,
+                    "credentials": _token_payload(token),
+                    "scopes": token.scopes or CALENDAR_READONLY_SCOPES,
+                    "admin_id": consumed.admin_id,
+                    "admin_name": consumed.admin_name,
+                    "cipher": _cipher(config),
+                }
+                if reconnect_connection_id is None:
+                    store.create_active_connection(**connection_arguments)
+                else:
+                    store.reauthorize_active_connection(
+                        connection_id=reconnect_connection_id,
+                        accessible_calendar_ids=(
+                            calendar.calendar_id for calendar in calendars
+                        ),
+                        **connection_arguments,
+                    )
             except store.CalendarStoreError:
                 _revoke_uninstalled_token(client, token)
                 return _portal_redirect(config, "error")
@@ -1305,6 +1392,7 @@ def build_calendar_import_router(
                 calendar_id=selected.calendar_id,
                 calendar_name=selected.summary,
                 calendar_timezone=selected.time_zone,
+                expected_credential_version=int(connection["credential_version"]),
             )
         except store.CalendarStoreError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1337,6 +1425,7 @@ def build_calendar_import_router(
         try:
             disconnected = store.disconnect_calendar(
                 connection_id=int(connection["id"]),
+                expected_credential_version=int(connection["credential_version"]),
                 admin_id=int(admin["id"]),
                 admin_name=str(admin["name"]),
                 before_disconnect=lambda: _client(config).revoke_token(

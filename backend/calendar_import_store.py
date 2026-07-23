@@ -41,6 +41,7 @@ class ConsumedOAuthState:
     admin_id: int
     admin_name: str
     pkce_verifier: str
+    reconnect_connection_id: int | None
 
 
 class CredentialCipher:
@@ -98,6 +99,8 @@ def ensure_schema() -> None:
             selected_calendar_id   TEXT,
             selected_calendar_name TEXT,
             selected_calendar_timezone TEXT,
+            credential_version     BIGINT NOT NULL DEFAULT 1
+                                       CHECK (credential_version > 0),
             connected_by           INTEGER REFERENCES employees(id) ON DELETE SET NULL,
             connected_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -106,6 +109,10 @@ def ensure_schema() -> None:
 
         ALTER TABLE google_calendar_connections
             ADD COLUMN IF NOT EXISTS selected_calendar_timezone TEXT;
+
+        ALTER TABLE google_calendar_connections
+            ADD COLUMN IF NOT EXISTS credential_version BIGINT NOT NULL DEFAULT 1
+                CHECK (credential_version > 0);
 
         CREATE UNIQUE INDEX IF NOT EXISTS uq_google_calendar_active_connection
             ON google_calendar_connections ((revoked_at IS NULL))
@@ -116,10 +123,15 @@ def ensure_schema() -> None:
                                            CHECK (state_hash ~ '^[0-9a-f]{64}$'),
             admin_employee_id          INTEGER NOT NULL REFERENCES employees(id),
             pkce_verifier_ciphertext   TEXT NOT NULL,
+            reconnect_connection_id    BIGINT REFERENCES google_calendar_connections(id),
             expires_at                 TIMESTAMPTZ NOT NULL,
             consumed_at                TIMESTAMPTZ,
             created_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        ALTER TABLE google_calendar_oauth_states
+            ADD COLUMN IF NOT EXISTS reconnect_connection_id
+                BIGINT REFERENCES google_calendar_connections(id);
 
         CREATE TABLE IF NOT EXISTS crews (
             id          BIGSERIAL PRIMARY KEY,
@@ -276,7 +288,11 @@ def _state_hash(state: str) -> str:
 
 
 def create_oauth_state(
-    *, admin_id: int, cipher: CredentialCipher, ttl_minutes: int = 10
+    *,
+    admin_id: int,
+    cipher: CredentialCipher,
+    reconnect_connection_id: int | None = None,
+    ttl_minutes: int = 10,
 ) -> tuple[str, str]:
     """Persist a one-use OAuth state and return its raw value and PKCE verifier."""
     raw_state = secrets.token_urlsafe(32)
@@ -308,13 +324,14 @@ def create_oauth_state(
                 """
                 INSERT INTO google_calendar_oauth_states (
                     state_hash, admin_employee_id,
-                    pkce_verifier_ciphertext, expires_at
-                ) VALUES (%s, %s, %s, %s)
+                    pkce_verifier_ciphertext, reconnect_connection_id, expires_at
+                ) VALUES (%s, %s, %s, %s, %s)
                 """,
                 (
                     _state_hash(raw_state),
                     admin_id,
                     cipher.encrypt_text(pkce_verifier),
+                    reconnect_connection_id,
                     expires_at,
                 ),
             )
@@ -330,6 +347,7 @@ def consume_oauth_state(
             cur.execute(
                 """
                 SELECT s.state_hash, s.pkce_verifier_ciphertext,
+                       s.reconnect_connection_id,
                        e.id AS admin_id, e.name AS admin_name,
                        e.active, e.role
                 FROM google_calendar_oauth_states s
@@ -360,6 +378,11 @@ def consume_oauth_state(
         admin_id=int(row["admin_id"]),
         admin_name=str(row["admin_name"]),
         pkce_verifier=verifier,
+        reconnect_connection_id=(
+            int(row["reconnect_connection_id"])
+            if row["reconnect_connection_id"] is not None
+            else None
+        ),
     )
 
 
@@ -383,7 +406,7 @@ def active_connection() -> dict[str, Any] | None:
         """
         SELECT id, google_account_email, credential_ciphertext, granted_scopes,
                selected_calendar_id, selected_calendar_name,
-               selected_calendar_timezone, connected_by,
+               selected_calendar_timezone, credential_version, connected_by,
                connected_at, updated_at
         FROM google_calendar_connections
         WHERE revoked_at IS NULL
@@ -424,7 +447,8 @@ def create_active_connection(
                     google_account_email, credential_ciphertext, granted_scopes,
                     connected_by
                 ) VALUES (%s, %s, %s, %s)
-                RETURNING id, google_account_email, granted_scopes, connected_at
+                RETURNING id, google_account_email, granted_scopes,
+                          credential_version, connected_at
                 """,
                 (
                     account_email,
@@ -455,6 +479,91 @@ def create_active_connection(
             return connection
 
 
+def reauthorize_active_connection(
+    *,
+    connection_id: int,
+    account_email: str | None,
+    credentials: dict[str, Any],
+    scopes: Iterable[str],
+    accessible_calendar_ids: Iterable[str],
+    admin_id: int,
+    admin_name: str,
+    cipher: CredentialCipher,
+) -> dict[str, Any]:
+    """Replace one exact active grant without changing its source ownership."""
+
+    accessible = {
+        str(calendar_id).strip()
+        for calendar_id in accessible_calendar_ids
+        if str(calendar_id).strip()
+    }
+    normalized_scopes = sorted(set(scopes))
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", ("google-calendar",)
+            )
+            cur.execute(
+                """
+                SELECT id, google_account_email, granted_scopes,
+                       selected_calendar_id, selected_calendar_name,
+                       selected_calendar_timezone, credential_version, connected_by,
+                       connected_at
+                FROM google_calendar_connections
+                WHERE id = %s AND revoked_at IS NULL
+                FOR UPDATE
+                """,
+                (connection_id,),
+            )
+            before = cur.fetchone()
+            if not before:
+                raise CalendarStoreError(
+                    "Google Calendar connection changed during reauthorization"
+                )
+            selected_calendar_id = str(before.get("selected_calendar_id") or "").strip()
+            if selected_calendar_id and selected_calendar_id not in accessible:
+                raise CalendarStoreError(
+                    "The reauthorized Google account cannot access the selected Calendar"
+                )
+            cur.execute(
+                """
+                UPDATE google_calendar_connections
+                SET google_account_email = %s, credential_ciphertext = %s,
+                    granted_scopes = %s, connected_by = %s,
+                    credential_version = credential_version + 1,
+                    updated_at = NOW()
+                WHERE id = %s AND revoked_at IS NULL
+                RETURNING id, google_account_email, granted_scopes,
+                          selected_calendar_id, selected_calendar_name,
+                          selected_calendar_timezone, credential_version, connected_by,
+                          connected_at, updated_at
+                """,
+                (
+                    account_email,
+                    cipher.encrypt_json(credentials),
+                    normalized_scopes,
+                    admin_id,
+                    connection_id,
+                ),
+            )
+            connection = dict(cur.fetchone())
+            cur.execute(
+                """
+                INSERT INTO planned_visit_audit_events (
+                    action, actor_employee_id, actor_name,
+                    before_state, after_state
+                ) VALUES ('calendar_reauthorized', %s, %s, %s::jsonb, %s::jsonb)
+                """,
+                (
+                    admin_id,
+                    admin_name,
+                    json.dumps(dict(before), default=str),
+                    json.dumps(connection, default=str),
+                ),
+            )
+            return connection
+
+
 def connection_credentials(
     connection: dict[str, Any], *, cipher: CredentialCipher
 ) -> dict[str, Any]:
@@ -465,19 +574,31 @@ def connection_credentials(
 
 
 def update_connection_credentials(
-    connection_id: int, credentials: dict[str, Any], *, cipher: CredentialCipher
-) -> None:
+    connection_id: int,
+    credentials: dict[str, Any],
+    *,
+    expected_credential_version: int,
+    cipher: CredentialCipher,
+) -> int:
     updated = db.execute_returning(
         """
         UPDATE google_calendar_connections
-        SET credential_ciphertext = %s, updated_at = NOW()
+        SET credential_ciphertext = %s,
+            credential_version = credential_version + 1,
+            updated_at = NOW()
         WHERE id = %s AND revoked_at IS NULL
-        RETURNING id
+          AND credential_version = %s
+        RETURNING credential_version
         """,
-        (cipher.encrypt_json(credentials), connection_id),
+        (
+            cipher.encrypt_json(credentials),
+            connection_id,
+            expected_credential_version,
+        ),
     )
     if not updated:
-        raise CalendarStoreError("Google Calendar connection is no longer active")
+        raise CalendarStoreError("Google Calendar credentials changed during refresh")
+    return int(updated)
 
 
 def select_calendar(
@@ -486,6 +607,7 @@ def select_calendar(
     calendar_id: str,
     calendar_name: str,
     calendar_timezone: str | None,
+    expected_credential_version: int,
 ) -> None:
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -494,7 +616,7 @@ def select_calendar(
             )
             cur.execute(
                 """
-                SELECT selected_calendar_id
+                SELECT selected_calendar_id, credential_version
                 FROM google_calendar_connections
                 WHERE id = %s AND revoked_at IS NULL
                 FOR UPDATE
@@ -505,6 +627,10 @@ def select_calendar(
             if not connection:
                 raise CalendarStoreError(
                     "Google Calendar connection is no longer active"
+                )
+            if int(connection["credential_version"]) != expected_credential_version:
+                raise CalendarStoreError(
+                    "Google Calendar credentials changed; reload the Calendar list"
                 )
 
             selected_calendar_id = str(
@@ -543,6 +669,7 @@ def select_calendar(
 def disconnect_calendar(
     *,
     connection_id: int,
+    expected_credential_version: int,
     admin_id: int,
     admin_name: str,
     before_disconnect: Callable[[], None] | None = None,
@@ -555,7 +682,7 @@ def disconnect_calendar(
             cur.execute(
                 """
                 SELECT id, selected_calendar_id, selected_calendar_name,
-                       selected_calendar_timezone
+                       selected_calendar_timezone, credential_version
                 FROM google_calendar_connections
                 WHERE id = %s AND revoked_at IS NULL
                 FOR UPDATE
@@ -565,6 +692,10 @@ def disconnect_calendar(
             row = cur.fetchone()
             if not row:
                 return False
+            if int(row["credential_version"]) != expected_credential_version:
+                raise CalendarStoreError(
+                    "Google Calendar credentials changed; retry disconnecting"
+                )
             selected_calendar_id = str(row["selected_calendar_id"] or "").strip()
             if selected_calendar_id:
                 cur.execute(
@@ -907,9 +1038,9 @@ def read_existing_visits(
 
 
 def read_planned_source_identities(
-    *, calendar_id: str, range_start: datetime, range_end: datetime
+    *, calendar_id: str, range_start: datetime
 ) -> list[dict[str, Any]]:
-    """Return active in-window identities that a bounded list must reconcile."""
+    """Return planned identities at or after the preview's local-day floor."""
 
     return db.query_all(
         """
@@ -921,11 +1052,33 @@ def read_planned_source_identities(
         WHERE source_calendar_id = %s
           AND status = 'planned'
           AND approximate_end > %s
-          AND approximate_start < %s
         ORDER BY source_key
         """,
-        (calendar_id, range_start, range_end),
+        (calendar_id, range_start),
     )
+
+
+def read_source_contexts(
+    *, calendar_id: str, source_keys: Iterable[str]
+) -> dict[str, dict[str, Any]]:
+    """Return last-reviewed display context for exact imported identities."""
+
+    keys = sorted(set(source_keys))
+    if not keys:
+        return {}
+    rows = db.query_all(
+        """
+        SELECT source_key, title, description, source_location_text,
+               approximate_start, approximate_end, all_day,
+               source_timezone, source_updated_at
+        FROM planned_service_visits
+        WHERE source_calendar_id = %s
+          AND source_key = ANY(%s)
+        ORDER BY source_key
+        """,
+        (calendar_id, keys),
+    )
+    return {str(row["source_key"]): row for row in rows}
 
 
 def create_preview(
