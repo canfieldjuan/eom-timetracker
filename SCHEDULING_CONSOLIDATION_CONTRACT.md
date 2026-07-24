@@ -637,8 +637,9 @@ The slice must:
    retired paths must return 404 without changing crew, membership, planned
    visit, or assignment state.
 4. Remove automatic Morning Crew membership bootstrap from application
-   startup. Starting the service, including against an empty schema, must not
-   invent employee membership or modify retained crew history.
+   startup and stop seeding a new default crew in an empty schema. Starting the
+   service must not invent a crew or employee membership, while every retained
+   crew and membership row remains untouched.
 5. Add focused route and startup regressions that prove the retired entry
    points are absent and the canonical status, Calendar listing, two-source
    configuration, sync, mapping, Schedule, Forecast, connection, and
