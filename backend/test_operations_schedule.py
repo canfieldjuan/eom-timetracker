@@ -957,11 +957,16 @@ def test_schedule_open_shift_identifies_worker_without_finalized_hours(client, a
     )
 
 
-def test_qr_establishes_site_presence_without_creating_paid_time(client, auth):
+def test_durable_qr_job_link_projects_presence_without_creating_paid_time(
+    client, auth
+):
     service_day = date(2026, 7, 20)
     shift_start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
     shift_end = shift_start + timedelta(hours=2)
     checked_in_at = shift_start + timedelta(hours=1)
+    scheduled_start = shift_start - timedelta(hours=2)
+    scheduled_end = shift_start
+    assert not scheduled_start <= checked_in_at < scheduled_end
     with db.get_conn() as conn:
         with conn.cursor() as cur:
             source_id = _source(
@@ -982,8 +987,8 @@ def test_qr_establishes_site_presence_without_creating_paid_time(client, auth):
                 source_id=source_id,
                 location_id=site_id,
                 customer_name=f"{TEST_PREFIX} Customer QR Presence",
-                start=shift_start - timedelta(hours=1),
-                end=shift_end + timedelta(hours=1),
+                start=scheduled_start,
+                end=scheduled_end,
                 source_seed="qr-presence",
             )
             employee_id = _employee(cur, "QR Presence", 18)
@@ -1002,19 +1007,19 @@ def test_qr_establishes_site_presence_without_creating_paid_time(client, auth):
             cur.execute(
                 """
                 INSERT INTO site_check_ins (
-                    employee_id, location_id, server_checked_in_at,
+                    employee_id, location_id, job_id, server_checked_in_at,
                     device_scanned_at, latitude, longitude, accuracy_m,
                     geofence_radius_m, distance_m, geofence_status,
                     classification, classification_reason,
                     device_clock_skew_seconds, review_status
                 )
                 VALUES (
-                    %s, %s, %s, %s, 39.12, -88.54, 5,
+                    %s, %s, %s, %s, %s, 39.12, -88.54, 5,
                     100, 3, 'inside', 'on_time', 'test', 0,
                     'not_required'
                 )
                 """,
-                (employee_id, site_id, checked_in_at, checked_in_at),
+                (employee_id, site_id, job_id, checked_in_at, checked_in_at),
             )
 
     response = client.get(
@@ -1042,7 +1047,7 @@ def test_qr_establishes_site_presence_without_creating_paid_time(client, auth):
                     "finalized": False,
                     "presenceOnly": True,
                     "evidence": ["qr_check_in"],
-                    "match": "unique_service_window",
+                    "match": "linked_shift",
                 }
             ],
             "status": "observed",
@@ -1052,6 +1057,15 @@ def test_qr_establishes_site_presence_without_creating_paid_time(client, auth):
     ]
     assert body["summary"]["actualHours"] == 0
     assert body["summary"]["unmatchedActualHours"] == 2
+    assert db.query_one(
+        """
+        SELECT job_id
+        FROM site_check_ins
+        WHERE employee_id = %s
+          AND server_checked_in_at = %s
+        """,
+        (employee_id, checked_in_at),
+    ) == {"job_id": job_id}
     assert any(
         row["shiftId"] == shift_id
         and row["finalized"]
@@ -1059,6 +1073,191 @@ def test_qr_establishes_site_presence_without_creating_paid_time(client, auth):
         and row["hours"] == 2
         for row in body["unmatchedActualSegments"]
     )
+
+
+def test_job_link_keeps_cross_day_qr_presence_on_the_calendar_job(client, auth):
+    service_day = date(2026, 7, 20)
+    scheduled_start = datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
+    scheduled_end = scheduled_start + timedelta(hours=2)
+    checked_in_at = scheduled_start - timedelta(hours=11)
+    assert checked_in_at.astimezone(ZoneInfo("America/Chicago")).date() < service_day
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "qr_cross_day_residential",
+                "residential_morning",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "QR Cross Day",
+                site_type="Residential",
+                rate=125,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+            job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer QR Cross Day",
+                start=scheduled_start,
+                end=scheduled_end,
+                source_seed="qr-cross-day",
+            )
+            employee_id = _employee(cur, "QR Cross Day", 18)
+            cur.execute(
+                """
+                INSERT INTO site_check_ins (
+                    employee_id, location_id, job_id, server_checked_in_at,
+                    device_scanned_at, latitude, longitude, accuracy_m,
+                    geofence_radius_m, distance_m, geofence_status,
+                    classification, classification_reason,
+                    device_clock_skew_seconds, review_status
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, 39.12, -88.54, 5,
+                    100, 3, 'inside', 'on_time',
+                    'verified_scheduled_site', 0, 'not_required'
+                )
+                """,
+                (employee_id, site_id, job_id, checked_in_at, checked_in_at),
+            )
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(service_day), "end_date": str(service_day)},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    job = next(row for row in body["jobs"] if row["id"] == job_id)
+
+    assert job["actualHours"] == 0
+    assert job["actualLaborCost"] == 0
+    assert job["workers"] == [
+        {
+            "employeeId": employee_id,
+            "employeeName": f"{TEST_PREFIX} Employee QR Cross Day",
+            "intervals": [
+                {
+                    "shiftId": None,
+                    "intervalStart": checked_in_at.isoformat().replace("+00:00", "Z"),
+                    "intervalEnd": None,
+                    "hours": None,
+                    "finalized": False,
+                    "presenceOnly": True,
+                    "evidence": ["qr_check_in"],
+                    "match": "linked_shift",
+                }
+            ],
+            "status": "observed",
+            "hours": 0,
+            "laborCost": 0,
+        }
+    ]
+
+
+def test_durable_qr_job_link_attaches_existing_paid_site_segment(client, auth):
+    service_day = date(2026, 7, 20)
+    scheduled_start = datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
+    scheduled_end = scheduled_start + timedelta(hours=1)
+    shift_start = scheduled_end + timedelta(hours=1)
+    shift_end = shift_start + timedelta(hours=2)
+    checked_in_at = shift_start + timedelta(hours=1)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "qr_attached_segment_residential",
+                "residential_morning",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "QR Attached Segment",
+                site_type="Residential",
+                rate=125,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+            job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer QR Attached Segment",
+                start=scheduled_start,
+                end=scheduled_end,
+                source_seed="qr-attached-segment",
+            )
+            employee_id = _employee(cur, "QR Attached Segment", 18)
+            cur.execute(
+                """
+                INSERT INTO shifts (
+                    employee_id, location_id, location_label,
+                    clock_in, clock_out, total_hours, local_date,
+                    timezone, time_category
+                )
+                VALUES (
+                    %s, %s, 'QR Attached Segment Site',
+                    %s, %s, 2, %s, 'America/Chicago', 'productive'
+                )
+                RETURNING id
+                """,
+                (employee_id, site_id, shift_start, shift_end, service_day),
+            )
+            shift_id = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                INSERT INTO site_check_ins (
+                    employee_id, location_id, job_id, server_checked_in_at,
+                    device_scanned_at, latitude, longitude, accuracy_m,
+                    geofence_radius_m, distance_m, geofence_status,
+                    classification, classification_reason,
+                    device_clock_skew_seconds, review_status
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, 39.12, -88.54, 5,
+                    100, 3, 'inside', 'on_time',
+                    'verified_scheduled_site', 0, 'not_required'
+                )
+                """,
+                (employee_id, site_id, job_id, checked_in_at, checked_in_at),
+            )
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(service_day), "end_date": str(service_day)},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    job = next(row for row in body["jobs"] if row["id"] == job_id)
+
+    assert job["actualHours"] == 2
+    assert job["actualLaborCost"] == 36
+    assert job["workers"] == [
+        {
+            "employeeId": employee_id,
+            "employeeName": f"{TEST_PREFIX} Employee QR Attached Segment",
+            "intervals": [
+                {
+                    "shiftId": shift_id,
+                    "intervalStart": shift_start.isoformat().replace("+00:00", "Z"),
+                    "intervalEnd": shift_end.isoformat().replace("+00:00", "Z"),
+                    "hours": 2,
+                    "finalized": True,
+                    "presenceOnly": False,
+                    "evidence": ["shift", "qr_check_in"],
+                    "match": "linked_shift",
+                }
+            ],
+            "status": "finalized",
+            "hours": 2,
+            "laborCost": 36,
+        }
+    ]
+    assert body["summary"]["actualHours"] == 2
+    assert body["summary"]["unmatchedActualHours"] == 0
 
 
 def test_explicit_shift_job_link_wins_when_site_matching_is_ambiguous(client, auth):

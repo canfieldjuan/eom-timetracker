@@ -297,6 +297,7 @@ def _load_time_evidence(
     range_start: datetime,
     range_end: datetime,
     observed_at: datetime,
+    visible_job_ids: Iterable[int],
 ) -> Tuple[
     List[Dict[str, Any]],
     Dict[int, List[Dict[str, Any]]],
@@ -304,6 +305,7 @@ def _load_time_evidence(
     Dict[Tuple[int, int], List[datetime]],
     List[Dict[str, Any]],
 ]:
+    linked_job_ids = [int(job_id) for job_id in visible_job_ids]
     shifts = db.query_all(
         """
         SELECT s.id, s.employee_id, e.name AS employee_name, e.hourly_rate,
@@ -352,13 +354,19 @@ def _load_time_evidence(
     qr_rows = db.query_all(
         """
         SELECT sci.id, sci.employee_id, e.name AS employee_name, e.hourly_rate,
-               sci.location_id, l.address AS location_label,
+               sci.location_id, sci.job_id, l.address AS location_label,
                sci.server_checked_in_at
         FROM site_check_ins sci
         JOIN employees e ON e.id = sci.employee_id
         LEFT JOIN locations l ON l.id = sci.location_id
-        WHERE sci.server_checked_in_at >= %s
-          AND sci.server_checked_in_at < %s
+        WHERE sci.server_checked_in_at < %s
+          AND (
+              (
+                  sci.server_checked_in_at >= %s
+                  AND sci.server_checked_in_at < %s
+              )
+              OR sci.job_id = ANY(%s)
+          )
           AND (
               (
                   sci.classification IN ('on_time', 'late')
@@ -372,7 +380,12 @@ def _load_time_evidence(
         ORDER BY sci.employee_id, sci.location_id,
                  sci.server_checked_in_at, sci.id
         """,
-        (range_start, min(range_end, observed_at)),
+        (
+            observed_at,
+            range_start,
+            range_end,
+            linked_job_ids,
+        ),
     )
     for row in qr_rows:
         qr_by_employee_site[(int(row["employee_id"]), int(row["location_id"]))].append(
@@ -408,6 +421,10 @@ def _qr_only_presence_segments(
         covered_by_segment = any(
             segment["start"] <= checked_in_at
             and (segment.get("end") or observed_at) > checked_in_at
+            and (
+                row.get("job_id") is None
+                or segment.get("job_id") == row.get("job_id")
+            )
             for segment in segments_by_employee_site.get((employee_id, location_id), [])
         )
         if covered_by_segment:
@@ -415,7 +432,7 @@ def _qr_only_presence_segments(
         output.append(
             {
                 "shift_id": None,
-                "job_id": None,
+                "job_id": row.get("job_id"),
                 "employee_id": employee_id,
                 "employee_name": str(row["employee_name"]),
                 "hourly_rate": row.get("hourly_rate"),
@@ -431,6 +448,33 @@ def _qr_only_presence_segments(
             }
         )
     return output
+
+
+def _apply_qr_job_links(
+    qr_rows: List[Dict[str, Any]],
+    represented_segments: List[Dict[str, Any]],
+) -> None:
+    """Attach a durable QR job identity to one matching unlinked Site segment."""
+
+    for row in qr_rows:
+        job_id = row.get("job_id")
+        if job_id is None:
+            continue
+        employee_id = int(row["employee_id"])
+        location_id = int(row["location_id"])
+        checked_in_at = row["server_checked_in_at"]
+        candidates = [
+            segment
+            for segment in represented_segments
+            if int(segment["employee_id"]) == employee_id
+            and segment.get("location_id") is not None
+            and int(segment["location_id"]) == location_id
+            and segment.get("job_id") is None
+            and segment["start"] <= checked_in_at < segment["end"]
+        ]
+        if len(candidates) != 1:
+            continue
+        candidates[0]["job_id"] = int(job_id)
 
 
 def _closed_shift_segments(
@@ -871,6 +915,7 @@ def _decorate_schedule_jobs(
         range_start,
         range_end,
         observed_at,
+        jobs_by_id,
     )
     linked_jobs_by_id = dict(jobs_by_id)
     linked_jobs_by_id.update(
@@ -908,6 +953,7 @@ def _decorate_schedule_jobs(
                     range_end,
                 )
             )
+    _apply_qr_job_links(qr_rows, segments)
     segments.extend(_qr_only_presence_segments(qr_rows, segments, observed_at))
 
     workers_by_job: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)

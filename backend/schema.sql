@@ -232,6 +232,7 @@ CREATE TABLE site_check_ins (
     id                       BIGSERIAL PRIMARY KEY,
     employee_id              INTEGER NOT NULL REFERENCES employees(id),
     location_id              INTEGER NOT NULL REFERENCES locations(id),
+    job_id                   INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
     server_checked_in_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     device_scanned_at        TIMESTAMPTZ NOT NULL,
     latitude                 NUMERIC(10, 7) NOT NULL,
@@ -579,6 +580,9 @@ CREATE INDEX idx_site_check_in_schedule_rules_lookup
     ON site_check_in_schedule_rules(employee_id, location_id, active, starts_on, ends_on);
 CREATE INDEX idx_site_check_ins_employee_time
     ON site_check_ins(employee_id, server_checked_in_at DESC);
+CREATE INDEX idx_site_check_ins_job_time
+    ON site_check_ins(job_id, server_checked_in_at DESC)
+    WHERE job_id IS NOT NULL;
 CREATE INDEX idx_site_check_ins_review
     ON site_check_ins(review_status, server_checked_in_at DESC);
 CREATE INDEX idx_site_check_in_reconciliation_reviews_lookup

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import psycopg2
+import psycopg2.extras
 import pytest
 
 from conftest import _raw_conn
@@ -15,6 +18,7 @@ from conftest import _raw_conn
 
 SITE_LATITUDE = 39.1203
 SITE_LONGITUDE = -88.54335
+CANONICAL_TEST_PREFIX = "SITE_CHECK_IN_CANONICAL_TEST"
 
 
 @pytest.fixture(autouse=True)
@@ -26,10 +30,39 @@ def isolate_site_check_in_data(setup_db):
             cur.execute("DELETE FROM site_check_in_schedule_rules")
             cur.execute("DELETE FROM site_check_in_schedules")
             cur.execute(
+                "DELETE FROM jobs WHERE source_calendar_id LIKE %s",
+                (f"{CANONICAL_TEST_PREFIX}%",),
+            )
+            cur.execute(
+                "DELETE FROM google_calendar_sources WHERE calendar_id LIKE %s",
+                (f"{CANONICAL_TEST_PREFIX}%",),
+            )
+            cur.execute(
+                "DELETE FROM google_calendar_connections "
+                "WHERE google_account_email LIKE %s",
+                (f"{CANONICAL_TEST_PREFIX}%",),
+            )
+            cur.execute(
+                "DELETE FROM employees WHERE name LIKE %s",
+                (f"{CANONICAL_TEST_PREFIX}%",),
+            )
+            cur.execute(
                 """
                 UPDATE locations
                 SET check_in_token_nonce = NULL,
-                    check_in_token_rotated_at = NULL
+                    check_in_token_rotated_at = NULL,
+                    location_type = CASE
+                        WHEN address = '123 Main St, Effingham' THEN NULL
+                        ELSE location_type
+                    END,
+                    lat = CASE
+                        WHEN address = '123 Main St, Effingham' THEN 39.1203
+                        ELSE lat
+                    END,
+                    lng = CASE
+                        WHEN address = '123 Main St, Effingham' THEN -88.54335
+                        ELSE lng
+                    END
                 """
             )
         conn.commit()
@@ -51,31 +84,35 @@ def create_site_qr(client, auth, location_id, *, rotate=False):
 
 
 def create_arrival_schedule(
-    client,
-    auth,
+    _client,
+    _auth,
     employee_id,
     location_id,
     scheduled_start,
     *,
     grace_minutes=10,
 ):
-    response = client.post(
-        "/api/admin/site-check-in-schedules",
-        headers=auth,
-        json={
-            "employeeId": employee_id,
-            "siteId": location_id,
-            "scheduledStart": scheduled_start.isoformat(),
-            "graceMinutes": grace_minutes,
-        },
-    )
-    assert response.status_code == 200, response.text
-    return response.json()["schedule"]
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO site_check_in_schedules (
+                employee_id, location_id, scheduled_start, grace_minutes
+            )
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (employee_id, location_id, scheduled_start, grace_minutes),
+        )
+        schedule_id = int(cur.fetchone()[0])
+    conn.commit()
+    conn.close()
+    return {"id": schedule_id}
 
 
 def create_recurring_schedule_rule(
-    client,
-    auth,
+    _client,
+    _auth,
     employee_id,
     location_id,
     *,
@@ -85,21 +122,141 @@ def create_recurring_schedule_rule(
     ends_on=None,
     grace_minutes=10,
 ):
-    response = client.post(
-        "/api/admin/site-check-in-schedule-rules",
-        headers=auth,
-        json={
-            "employeeId": employee_id,
-            "siteId": location_id,
-            "weekdays": weekdays,
-            "localStart": local_start,
-            "startsOn": starts_on,
-            "endsOn": ends_on,
-            "graceMinutes": grace_minutes,
-        },
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO site_check_in_schedule_rules (
+                employee_id, location_id, weekdays, local_start_time, timezone,
+                starts_on, ends_on, grace_minutes
+            )
+            VALUES (
+                %s, %s, %s, %s, 'America/Chicago', %s,
+                COALESCE(%s, 'infinity'::date), %s
+            )
+            RETURNING id
+            """,
+            (
+                employee_id,
+                location_id,
+                weekdays,
+                local_start,
+                starts_on,
+                ends_on,
+                grace_minutes,
+            ),
+        )
+        rule_id = int(cur.fetchone()[0])
+    conn.commit()
+    conn.close()
+    return {"id": rule_id}
+
+
+def create_canonical_job(
+    location_id,
+    start,
+    *,
+    end=None,
+    status="scheduled",
+    role="residential_morning",
+    suffix="job",
+    all_day=False,
+):
+    end = end or (start + timedelta(hours=2))
+    site_type = "Residential" if role == "residential_morning" else "Commercial"
+    source_identity = (
+        f"{CANONICAL_TEST_PREFIX}:{location_id}:{start.isoformat()}:{suffix}"
     )
-    assert response.status_code == 200, response.text
-    return response.json()["rule"]
+    source_key = hashlib.sha256(source_identity.encode("utf-8")).hexdigest()
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE locations SET location_type = %s WHERE id = %s",
+            (site_type, location_id),
+        )
+        cur.execute(
+            """
+            INSERT INTO google_calendar_connections (
+                google_account_email, granted_scopes, revoked_at
+            )
+            VALUES (%s, ARRAY['calendar.readonly'], NOW())
+            RETURNING id
+            """,
+            (f"{CANONICAL_TEST_PREFIX}_{suffix}@example.test",),
+        )
+        connection_id = int(cur.fetchone()[0])
+        calendar_id = f"{CANONICAL_TEST_PREFIX}_{suffix}"
+        cur.execute(
+            """
+            INSERT INTO google_calendar_sources (
+                connection_id, role, calendar_id, calendar_name,
+                calendar_timezone
+            )
+            VALUES (%s, %s, %s, %s, 'America/Chicago')
+            RETURNING id
+            """,
+            (connection_id, role, calendar_id, calendar_id),
+        )
+        source_id = int(cur.fetchone()[0])
+        cur.execute(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date,
+                scheduled_start, scheduled_end, status, calendar_source_id,
+                source_calendar_id, source_event_id, source_occurrence_id,
+                source_key, source_fingerprint, source_title, source_all_day
+            )
+            SELECT
+                l.id, COALESCE(l.customer_name, l.address),
+                (%s AT TIME ZONE 'America/Chicago')::date,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                COALESCE(l.customer_name, l.address), %s
+            FROM locations l
+            WHERE l.id = %s
+            RETURNING id
+            """,
+            (
+                start,
+                start,
+                end,
+                status,
+                source_id,
+                calendar_id,
+                source_identity,
+                source_identity,
+                source_key,
+                source_key,
+                all_day,
+                location_id,
+            ),
+        )
+        job_id = int(cur.fetchone()[0])
+    conn.commit()
+    conn.close()
+    return job_id
+
+
+def create_test_employee_auth(*, suffix):
+    from time_tracker_api import create_auth_token
+
+    employee_name = f"{CANONICAL_TEST_PREFIX} {suffix}"
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO employees (
+                name, password_hash, active, role, hourly_rate
+            )
+            VALUES (%s, 'unused-test-hash', true, 'employee', 16.00)
+            RETURNING id
+            """,
+            (employee_name,),
+        )
+        employee_id = int(cur.fetchone()[0])
+    conn.commit()
+    conn.close()
+    token = create_auth_token(employee_id, employee_name)
+    return employee_id, {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture
@@ -292,6 +449,11 @@ class TestSiteCheckInDecision:
         self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
         before = datetime.now(timezone.utc)
+        job_id = create_canonical_job(
+            location_id,
+            before - timedelta(hours=1),
+            suffix="exact-on-time",
+        )
         create_arrival_schedule(
             client,
             auth,
@@ -320,10 +482,23 @@ class TestSiteCheckInDecision:
         assert check_in["classification"] == "on_time"
         assert check_in["classificationReason"] == "within_grace_period"
         assert check_in["reviewStatus"] == "not_required"
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id FROM site_check_ins WHERE id = %s",
+                (check_in["id"],),
+            )
+            assert cur.fetchone()[0] == job_id
+        conn.close()
 
     def test_after_grace_period_is_late(
         self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
+        create_canonical_job(
+            location_id,
+            datetime.now(timezone.utc) - timedelta(hours=1),
+            suffix="exact-late",
+        )
         create_arrival_schedule(
             client,
             auth,
@@ -390,22 +565,27 @@ class TestSiteCheckInDecision:
         assert check_in["classificationReason"] == reason
         assert check_in["reviewStatus"] == "pending"
 
-    def test_missing_schedule_and_device_clock_skew_need_review(
+    def test_missing_job_and_device_clock_skew_need_review(
         self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
-        missing_schedule = client.post(
+        missing_job = client.post(
             "/api/timesheet/site-check-in",
             headers=emp_auth,
             json=site_check_in_payload(employee_id, location_id, site_qr_token),
         )
-        assert missing_schedule.status_code == 200, missing_schedule.text
-        assert missing_schedule.json()["checkIn"]["classificationReason"] == "no_matching_schedule"
+        assert missing_job.status_code == 200, missing_job.text
+        assert missing_job.json()["checkIn"]["classificationReason"] == "no_scheduled_job"
 
         conn = _raw_conn()
         with conn.cursor() as cur:
             cur.execute("DELETE FROM site_check_ins")
         conn.commit()
         conn.close()
+        create_canonical_job(
+            location_id,
+            datetime.now(timezone.utc) - timedelta(hours=1),
+            suffix="device-skew",
+        )
         create_arrival_schedule(
             client,
             auth,
@@ -426,21 +606,523 @@ class TestSiteCheckInDecision:
         assert skewed.status_code == 200, skewed.text
         assert skewed.json()["checkIn"]["classificationReason"] == "device_clock_skew"
 
+    def test_unique_canonical_job_accepts_unassigned_employee(
+        self, client, emp_auth, employee_id, location_id, site_qr_token
+    ):
+        job_id = create_canonical_job(
+            location_id,
+            datetime.now(timezone.utc) + timedelta(hours=8),
+            suffix="flexible-unassigned",
+        )
+        response = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(employee_id, location_id, site_qr_token),
+        )
+        assert response.status_code == 200, response.text
+        check_in = response.json()["checkIn"]
+        assert check_in["classification"] == "on_time"
+        assert check_in["classificationReason"] == "verified_scheduled_site"
+        assert check_in["reviewStatus"] == "not_required"
+        assert check_in["scheduleId"] is None
+        assert check_in["scheduleRuleId"] is None
+        assert check_in["scheduledStart"] is None
+        assert check_in["graceMinutes"] is None
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id FROM site_check_ins WHERE id = %s",
+                (check_in["id"],),
+            )
+            assert cur.fetchone()[0] == job_id
+            cur.execute("SELECT COUNT(*) FROM site_check_in_schedules")
+            assert cur.fetchone()[0] == 0
+            cur.execute("SELECT COUNT(*) FROM site_check_in_schedule_rules")
+            assert cur.fetchone()[0] == 0
+        conn.close()
+
+    def test_cancelled_and_ambiguous_jobs_fail_closed(
+        self,
+        client,
+        emp_auth,
+        employee_id,
+        location_id,
+        site_qr_token,
+        monkeypatch,
+    ):
+        import time_tracker_api
+
+        official_time = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
+        cancelled_job_id = create_canonical_job(
+            location_id,
+            official_time - timedelta(hours=1),
+            end=official_time + timedelta(hours=1),
+            status="cancelled",
+            suffix="cancelled-only",
+        )
+
+        cancelled = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id,
+                location_id,
+                site_qr_token,
+                scanned_at=official_time,
+            ),
+        )
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["checkIn"]["classification"] == "needs_review"
+        assert (
+            cancelled.json()["checkIn"]["classificationReason"]
+            == "cancelled_job"
+        )
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM site_check_ins")
+        conn.commit()
+        conn.close()
+        active_job_id = create_canonical_job(
+            location_id,
+            official_time - timedelta(hours=2),
+            end=official_time + timedelta(hours=2),
+            suffix="active-with-cancelled",
+        )
+        accepted = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id,
+                location_id,
+                site_qr_token,
+                scanned_at=official_time,
+            ),
+        )
+        assert accepted.status_code == 200, accepted.text
+        assert (
+            accepted.json()["checkIn"]["classificationReason"]
+            == "verified_scheduled_site"
+        )
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id FROM site_check_ins WHERE id = %s",
+                (accepted.json()["checkIn"]["id"],),
+            )
+            assert cur.fetchone()[0] == active_job_id
+            cur.execute("DELETE FROM site_check_ins")
+        conn.commit()
+        conn.close()
+        create_canonical_job(
+            location_id,
+            official_time - timedelta(minutes=30),
+            end=official_time + timedelta(minutes=30),
+            suffix="second-active",
+        )
+        ambiguous = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id,
+                location_id,
+                site_qr_token,
+                scanned_at=official_time,
+            ),
+        )
+        assert ambiguous.status_code == 200, ambiguous.text
+        assert ambiguous.json()["checkIn"]["classification"] == "needs_review"
+        assert (
+            ambiguous.json()["checkIn"]["classificationReason"]
+            == "ambiguous_job"
+        )
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id FROM site_check_ins WHERE id = %s",
+                (ambiguous.json()["checkIn"]["id"],),
+            )
+            assert cur.fetchone()[0] is None
+            cur.execute(
+                "SELECT status FROM jobs WHERE id = %s",
+                (cancelled_job_id,),
+            )
+            assert cur.fetchone()[0] == "cancelled"
+        conn.close()
+
+    def test_matching_job_is_locked_until_qr_transaction_finishes(
+        self, location_id
+    ):
+        from time_tracker_api import _matching_canonical_site_job
+
+        official_time = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
+        job_id = create_canonical_job(
+            location_id,
+            official_time - timedelta(hours=1),
+            end=official_time + timedelta(hours=1),
+            suffix="share-lock",
+        )
+        matcher_conn = _raw_conn()
+        try:
+            with matcher_conn.cursor(
+                cursor_factory=psycopg2.extras.RealDictCursor
+            ) as matcher_cur:
+                matched_job, reason = _matching_canonical_site_job(
+                    location_id,
+                    official_time,
+                    cur=matcher_cur,
+                )
+                assert matched_job is not None
+                assert int(matched_job["id"]) == job_id
+                assert reason == "verified_scheduled_site"
+
+                competing_conn = _raw_conn()
+                try:
+                    with competing_conn.cursor() as competing_cur:
+                        competing_cur.execute("SET LOCAL lock_timeout = '100ms'")
+                        with pytest.raises(psycopg2.errors.LockNotAvailable):
+                            competing_cur.execute(
+                                """
+                                UPDATE jobs
+                                SET status = 'cancelled'
+                                WHERE id = %s
+                                """,
+                                (job_id,),
+                            )
+                    competing_conn.rollback()
+                finally:
+                    competing_conn.close()
+            matcher_conn.commit()
+        finally:
+            matcher_conn.close()
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE jobs SET status = 'cancelled' WHERE id = %s",
+                (job_id,),
+            )
+        conn.commit()
+        conn.close()
+
+    def test_invalid_calendar_candidates_are_not_schedule_authority(
+        self,
+        client,
+        emp_auth,
+        employee_id,
+        location_id,
+        site_qr_token,
+        monkeypatch,
+    ):
+        import time_tracker_api
+
+        official_time = datetime(2026, 7, 23, 16, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
+        create_canonical_job(
+            location_id,
+            official_time - timedelta(hours=1),
+            end=official_time + timedelta(hours=1),
+            suffix="all-day",
+            all_day=True,
+        )
+        all_day = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id,
+                location_id,
+                site_qr_token,
+                scanned_at=official_time,
+            ),
+        )
+        assert all_day.status_code == 200, all_day.text
+        assert (
+            all_day.json()["checkIn"]["classificationReason"]
+            == "no_scheduled_job"
+        )
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM site_check_ins")
+            cur.execute(
+                "UPDATE locations SET location_type = 'Commercial' WHERE id = %s",
+                (location_id,),
+            )
+        conn.commit()
+        conn.close()
+        wrong_role = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id,
+                location_id,
+                site_qr_token,
+                scanned_at=official_time,
+            ),
+        )
+        assert wrong_role.status_code == 200, wrong_role.text
+        assert (
+            wrong_role.json()["checkIn"]["classificationReason"]
+            == "no_scheduled_job"
+        )
+
+    def test_overnight_commercial_job_uses_bounded_calendar_association(
+        self,
+        client,
+        emp_auth,
+        employee_id,
+        location_id,
+        site_qr_token,
+        monkeypatch,
+    ):
+        import time_tracker_api
+
+        official_time = datetime(2026, 7, 24, 5, 30, tzinfo=timezone.utc)
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
+        job_id = create_canonical_job(
+            location_id,
+            datetime(2026, 7, 24, 1, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 7, 24, 7, 0, tzinfo=timezone.utc),
+            role="commercial_evening_night",
+            suffix="overnight-commercial",
+        )
+        response = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id,
+                location_id,
+                site_qr_token,
+                scanned_at=official_time,
+            ),
+        )
+        assert response.status_code == 200, response.text
+        assert (
+            response.json()["checkIn"]["classificationReason"]
+            == "verified_scheduled_site"
+        )
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id FROM site_check_ins WHERE id = %s",
+                (response.json()["checkIn"]["id"],),
+            )
+            assert cur.fetchone()[0] == job_id
+        conn.close()
+
+    def test_two_employees_can_check_in_to_the_same_job(
+        self,
+        client,
+        emp_auth,
+        employee_id,
+        location_id,
+        site_qr_token,
+        monkeypatch,
+    ):
+        import time_tracker_api
+
+        official_time = datetime(2026, 7, 23, 17, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
+        job_id = create_canonical_job(
+            location_id,
+            official_time - timedelta(hours=1),
+            end=official_time + timedelta(hours=1),
+            suffix="shared-job",
+        )
+        second_employee_id, second_emp_auth = create_test_employee_auth(
+            suffix="Second Worker"
+        )
+
+        responses = [
+            client.post(
+                "/api/timesheet/site-check-in",
+                headers=headers,
+                json=site_check_in_payload(
+                    current_employee_id,
+                    location_id,
+                    site_qr_token,
+                    scanned_at=official_time,
+                ),
+            )
+            for current_employee_id, headers in (
+                (employee_id, emp_auth),
+                (second_employee_id, second_emp_auth),
+            )
+        ]
+        assert all(response.status_code == 200 for response in responses)
+        assert all(
+            response.json()["checkIn"]["classificationReason"]
+            == "verified_scheduled_site"
+            for response in responses
+        )
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT employee_id, job_id
+                FROM site_check_ins
+                WHERE job_id = %s
+                ORDER BY employee_id
+                """,
+                (job_id,),
+            )
+            assert cur.fetchall() == [
+                (employee_id, job_id),
+                (second_employee_id, job_id),
+            ]
+            cur.execute(
+                "SELECT status FROM jobs WHERE id = %s",
+                (job_id,),
+            )
+            assert cur.fetchone()[0] == "scheduled"
+            cur.execute("SELECT COUNT(*) FROM site_check_in_schedules")
+            assert cur.fetchone()[0] == 0
+            cur.execute("SELECT COUNT(*) FROM site_check_in_schedule_rules")
+            assert cur.fetchone()[0] == 0
+        conn.close()
+
+    def test_geofence_then_device_skew_precede_ambiguous_job(
+        self,
+        client,
+        emp_auth,
+        employee_id,
+        location_id,
+        site_qr_token,
+        monkeypatch,
+    ):
+        import time_tracker_api
+
+        official_time = datetime(2026, 7, 23, 18, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
+        for suffix in ("ambiguous-one", "ambiguous-two"):
+            create_canonical_job(
+                location_id,
+                official_time - timedelta(hours=1),
+                end=official_time + timedelta(hours=1),
+                suffix=suffix,
+            )
+
+        skewed = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id,
+                location_id,
+                site_qr_token,
+                scanned_at=official_time - timedelta(hours=1),
+            ),
+        )
+        assert skewed.status_code == 200, skewed.text
+        assert (
+            skewed.json()["checkIn"]["classificationReason"]
+            == "device_clock_skew"
+        )
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM site_check_ins")
+            cur.execute(
+                "UPDATE locations SET lat = NULL, lng = NULL WHERE id = %s",
+                (location_id,),
+            )
+        conn.commit()
+        conn.close()
+        unpinned = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(
+                employee_id,
+                location_id,
+                site_qr_token,
+                scanned_at=official_time - timedelta(hours=1),
+            ),
+        )
+        assert unpinned.status_code == 200, unpinned.text
+        assert (
+            unpinned.json()["checkIn"]["classificationReason"]
+            == "site_missing_location_pin"
+        )
+
     def test_retry_with_same_scan_evidence_is_idempotent(
         self, client, emp_auth, employee_id, location_id, site_qr_token
     ):
+        job_id = create_canonical_job(
+            location_id,
+            datetime.now(timezone.utc),
+            suffix="idempotent-link",
+        )
         payload = site_check_in_payload(employee_id, location_id, site_qr_token)
         first = client.post(
             "/api/timesheet/site-check-in", headers=emp_auth, json=payload
         )
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE jobs SET status = 'cancelled' WHERE id = %s",
+                (job_id,),
+            )
+        conn.commit()
+        conn.close()
         second = client.post(
             "/api/timesheet/site-check-in", headers=emp_auth, json=payload
         )
         assert first.status_code == 200, first.text
         assert second.status_code == 200, second.text
         assert first.json()["checkIn"]["id"] == second.json()["checkIn"]["id"]
+        assert first.json()["checkIn"]["classificationReason"] == "verified_scheduled_site"
+        assert second.json()["checkIn"]["classificationReason"] == "verified_scheduled_site"
         assert first.json()["duplicate"] is False
         assert second.json()["duplicate"] is True
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_id FROM site_check_ins WHERE id = %s",
+                (first.json()["checkIn"]["id"],),
+            )
+            assert cur.fetchone()[0] == job_id
+        conn.close()
+
+    def test_deleting_a_linked_job_preserves_immutable_qr_evidence(
+        self, client, emp_auth, employee_id, location_id, site_qr_token
+    ):
+        job_id = create_canonical_job(
+            location_id,
+            datetime.now(timezone.utc) - timedelta(hours=1),
+            suffix="delete-set-null",
+        )
+        response = client.post(
+            "/api/timesheet/site-check-in",
+            headers=emp_auth,
+            json=site_check_in_payload(employee_id, location_id, site_qr_token),
+        )
+        assert response.status_code == 200, response.text
+        check_in_id = response.json()["checkIn"]["id"]
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
+            cur.execute(
+                """
+                SELECT job_id, classification, classification_reason,
+                       review_status
+                FROM site_check_ins
+                WHERE id = %s
+                """,
+                (check_in_id,),
+            )
+            assert cur.fetchone() == (
+                None,
+                "on_time",
+                "verified_scheduled_site",
+                "not_required",
+            )
+        conn.commit()
+        conn.close()
 
 
 class TestRecurringSiteCheckInSchedules:
@@ -462,6 +1144,11 @@ class TestRecurringSiteCheckInSchedules:
             weekdays=[0, 1, 2, 3, 4],
         )
         official_time = datetime(2026, 7, 20, 12, 5, tzinfo=timezone.utc)
+        create_canonical_job(
+            location_id,
+            datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc),
+            suffix="recurring-on-time",
+        )
         import time_tracker_api
 
         monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
@@ -503,6 +1190,11 @@ class TestRecurringSiteCheckInSchedules:
         import time_tracker_api
 
         late_time = datetime(2026, 7, 20, 12, 11, tzinfo=timezone.utc)
+        create_canonical_job(
+            location_id,
+            datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc),
+            suffix="recurring-override",
+        )
         monkeypatch.setattr(time_tracker_api, "utc_now", lambda: late_time)
         late = client.post(
             "/api/timesheet/site-check-in",
@@ -560,11 +1252,18 @@ class TestRecurringSiteCheckInSchedules:
             ),
         )
         assert missing.status_code == 200, missing.text
-        assert missing.json()["checkIn"]["classificationReason"] == "no_matching_schedule"
+        assert missing.json()["checkIn"]["classificationReason"] == "no_scheduled_job"
 
-    def test_rule_admin_crud_is_validated_idempotent_and_soft_deleted(
+    def test_rule_history_is_readable_but_mutations_are_retired(
         self, client, auth, emp_auth, employee_id, location_id
     ):
+        rule = create_recurring_schedule_rule(
+            client,
+            auth,
+            employee_id,
+            location_id,
+            weekdays=[0, 1, 2, 3, 4],
+        )
         payload = {
             "employeeId": employee_id,
             "siteId": location_id,
@@ -572,66 +1271,34 @@ class TestRecurringSiteCheckInSchedules:
             "localStart": "07:00",
             "startsOn": "2026-07-20",
             "endsOn": None,
-            "graceMinutes": 10,
+            "graceMinutes": 15,
         }
-        forbidden = client.post(
-            "/api/admin/site-check-in-schedule-rules",
-            headers=emp_auth,
-            json=payload,
-        )
-        assert forbidden.status_code == 403
-
-        duplicate_days = client.post(
-            "/api/admin/site-check-in-schedule-rules",
-            headers=auth,
-            json={**payload, "weekdays": [0, 0]},
-        )
-        assert duplicate_days.status_code == 422
-        backwards = client.post(
-            "/api/admin/site-check-in-schedule-rules",
-            headers=auth,
-            json={**payload, "endsOn": "2026-07-19"},
-        )
-        assert backwards.status_code == 400
-
-        first = client.post(
-            "/api/admin/site-check-in-schedule-rules", headers=auth, json=payload
-        )
-        assert first.status_code == 200, first.text
-        rule = first.json()["rule"]
-        assert rule["weekdays"] == [0, 1, 2, 3, 4]
-        assert rule["localStart"] == "07:00"
-        assert rule["timezone"] == "America/Chicago"
-        assert rule["endsOn"] is None
-
-        updated = client.post(
-            "/api/admin/site-check-in-schedule-rules",
-            headers=auth,
-            json={**payload, "graceMinutes": 15},
-        )
-        assert updated.status_code == 200, updated.text
-        assert updated.json()["rule"]["id"] == rule["id"]
-        assert updated.json()["rule"]["graceMinutes"] == 15
-
-        active = client.get(
+        listed = client.get(
             "/api/admin/site-check-in-schedule-rules", headers=auth
         )
-        assert active.status_code == 200
-        assert [row["id"] for row in active.json()["rules"]] == [rule["id"]]
+        assert listed.status_code == 200
+        assert [row["id"] for row in listed.json()["rules"]] == [rule["id"]]
+        assert listed.json()["rules"][0]["graceMinutes"] == 10
 
-        ended = client.delete(
-            f"/api/admin/site-check-in-schedule-rules/{rule['id']}", headers=auth
-        )
-        assert ended.status_code == 200
-        active_after = client.get(
+        for headers in ({}, emp_auth, auth):
+            retired_post = client.post(
+                "/api/admin/site-check-in-schedule-rules",
+                headers=headers,
+                json=payload,
+            )
+            retired_delete = client.delete(
+                f"/api/admin/site-check-in-schedule-rules/{rule['id']}",
+                headers=headers,
+            )
+            assert retired_post.status_code == 405
+            assert retired_delete.status_code == 404
+
+        persisted = client.get(
             "/api/admin/site-check-in-schedule-rules", headers=auth
-        )
-        assert active_after.json()["rules"] == []
-        history = client.get(
-            "/api/admin/site-check-in-schedule-rules?activeOnly=false", headers=auth
-        )
-        assert history.status_code == 200
-        assert history.json()["rules"][0]["active"] is False
+        ).json()["rules"]
+        assert [row["id"] for row in persisted] == [rule["id"]]
+        assert persisted[0]["active"] is True
+        assert persisted[0]["graceMinutes"] == 10
 
     def test_rule_api_distinguishes_open_end_from_literal_max_date(
         self, client, auth, employee_id, location_id
@@ -652,9 +1319,6 @@ class TestRecurringSiteCheckInSchedules:
             weekdays=[1],
             ends_on="9999-12-31",
         )
-
-        assert open_ended["endsOn"] is None
-        assert max_dated["endsOn"] == "9999-12-31"
 
         listed = client.get(
             "/api/admin/site-check-in-schedule-rules", headers=auth
@@ -681,10 +1345,18 @@ class TestSiteCheckInAdminReview:
         )
         assert schedules.status_code == 200
         assert any(row["id"] == schedule["id"] for row in schedules.json()["schedules"])
-        deleted = client.delete(
-            f"/api/admin/site-check-in-schedules/{schedule['id']}", headers=auth
+        for headers in ({}, emp_auth, auth):
+            retired_delete = client.delete(
+                f"/api/admin/site-check-in-schedules/{schedule['id']}",
+                headers=headers,
+            )
+            assert retired_delete.status_code == 404
+        persisted_schedules = client.get(
+            "/api/admin/site-check-in-schedules", headers=auth
+        ).json()["schedules"]
+        assert any(
+            row["id"] == schedule["id"] for row in persisted_schedules
         )
-        assert deleted.status_code == 200
 
         check_in_response = client.post(
             "/api/timesheet/site-check-in",
@@ -813,7 +1485,7 @@ class TestSiteCheckInAdminReview:
         }
 
 
-def test_legacy_frontend_retires_employee_qr_flow_but_keeps_admin_controls():
+def test_legacy_frontend_keeps_qr_evidence_but_retires_duplicate_planning():
     html = (Path(__file__).parent / "timetracker-mobile.html").read_text()
 
     assert 'id="siteCheckInButton"' not in html
@@ -826,15 +1498,11 @@ def test_legacy_frontend_retires_employee_qr_flow_but_keeps_admin_controls():
     # GPS remains shared by ordinary clock/arrival actions.
     assert "await getCurrentCoordinates()" in html
 
-    # Admin QR, scheduling, evidence, and reconciliation controls are separate
-    # capabilities and remain available until the full legacy portal retires.
+    # Admin QR generation and immutable evidence/review remain available.
     assert 'id="loadSiteQrButton"' in html
     assert 'id="rotateSiteQrButton"' in html
     assert "siteQrDownload" in html
     assert "`/admin/locations/${siteId}/check-in-qr`" in html
-    assert "saveRecurringSiteCheckInSchedule" in html
-    assert "'/admin/site-check-in-schedule-rules'" in html
-    assert "siteCheckInWeekday" in html
     assert "Arrival Activity" in html
     assert "loadSiteCheckInActivity" in html
     assert "siteCheckInActivityClassification" in html
@@ -844,6 +1512,23 @@ def test_legacy_frontend_retires_employee_qr_flow_but_keeps_admin_controls():
     assert "filters.set('toDate', toDate)" in html
     assert "initializeSiteCheckInActivityDates" in html
     assert "data.siteCheckInPolicy.companyDate" in html
+
+    # Employee-specific arrival planning and its forward reconciliation are
+    # retired now that Calendar jobs are the only eligibility authority.
+    for retired_text in (
+        "saveRecurringSiteCheckInSchedule",
+        "'/admin/site-check-in-schedule-rules'",
+        "siteCheckInWeekday",
+        "saveSiteCheckInSchedule",
+        "'/admin/site-check-in-schedules'",
+        "siteCheckInScheduleEmployee",
+        'id="site-check-in-reconciliation"',
+        "Arrival vs. Timecard",
+        "loadSiteCheckInReconciliation",
+        "'/admin/site-check-in-reconciliation'",
+        "reviewSiteCheckInReconciliation",
+    ):
+        assert retired_text not in html
 
     # Retiring QR handling must not disturb the legacy page's ordinary
     # time-entry controls while the rest of that page remains available.

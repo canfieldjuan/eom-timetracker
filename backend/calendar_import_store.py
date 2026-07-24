@@ -2529,6 +2529,20 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
                 WHERE job_id = %s
             )
             OR EXISTS (
+                SELECT 1 FROM site_check_ins
+                WHERE job_id = %s
+                  AND (
+                      (
+                          classification IN ('on_time', 'late')
+                          AND review_status = 'not_required'
+                      )
+                      OR (
+                          classification = 'needs_review'
+                          AND review_status = 'approved'
+                      )
+                  )
+            )
+            OR EXISTS (
                 SELECT 1 FROM shifts
                 WHERE location_id = %s
                   AND job_id IS NULL
@@ -2563,6 +2577,7 @@ def _canonical_job_has_work_evidence(cur: Any, existing_job: dict[str, Any]) -> 
         ) AS has_work
         """,
         (
+            job_id,
             job_id,
             location_id,
             *unlinked_shift_params,
