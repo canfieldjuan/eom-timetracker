@@ -6,7 +6,6 @@ import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -1483,56 +1482,3 @@ class TestSiteCheckInAdminReview:
             "companyDate": "2026-07-17",
             "offlineQueue": False,
         }
-
-
-def test_legacy_frontend_keeps_qr_evidence_but_retires_duplicate_planning():
-    html = (Path(__file__).parent / "timetracker-mobile.html").read_text()
-
-    assert 'id="siteCheckInButton"' not in html
-    assert "pendingSiteCheckIn" not in html
-    assert "queryParams.get('checkIn')" not in html
-    assert "'/timesheet/site-check-in/resolve'" not in html
-    assert "apiRequest('/timesheet/site-check-in'" not in html
-    assert "handleSiteCheckIn" not in html
-
-    # GPS remains shared by ordinary clock/arrival actions.
-    assert "await getCurrentCoordinates()" in html
-
-    # Admin QR generation and immutable evidence/review remain available.
-    assert 'id="loadSiteQrButton"' in html
-    assert 'id="rotateSiteQrButton"' in html
-    assert "siteQrDownload" in html
-    assert "`/admin/locations/${siteId}/check-in-qr`" in html
-    assert "Arrival Activity" in html
-    assert "loadSiteCheckInActivity" in html
-    assert "siteCheckInActivityClassification" in html
-    assert "filters.set('employeeId', employeeId)" in html
-    assert "filters.set('siteId', siteId)" in html
-    assert "filters.set('fromDate', fromDate)" in html
-    assert "filters.set('toDate', toDate)" in html
-    assert "initializeSiteCheckInActivityDates" in html
-    assert "data.siteCheckInPolicy.companyDate" in html
-
-    # Employee-specific arrival planning and its forward reconciliation are
-    # retired now that Calendar jobs are the only eligibility authority.
-    for retired_text in (
-        "saveRecurringSiteCheckInSchedule",
-        "'/admin/site-check-in-schedule-rules'",
-        "siteCheckInWeekday",
-        "saveSiteCheckInSchedule",
-        "'/admin/site-check-in-schedules'",
-        "siteCheckInScheduleEmployee",
-        'id="site-check-in-reconciliation"',
-        "Arrival vs. Timecard",
-        "loadSiteCheckInReconciliation",
-        "'/admin/site-check-in-reconciliation'",
-        "reviewSiteCheckInReconciliation",
-    ):
-        assert retired_text not in html
-
-    # Retiring QR handling must not disturb the legacy page's ordinary
-    # time-entry controls while the rest of that page remains available.
-    assert 'id="clockInButton"' in html
-    assert 'id="arriveButton"' in html
-    assert 'id="departButton"' in html
-    assert 'id="clockOutButton"' in html

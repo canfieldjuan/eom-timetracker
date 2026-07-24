@@ -24,8 +24,8 @@ docs and PRs labeled `audit`/`review`.
 ## Working here
 
 - `backend/` is the deploy root (see `render.yaml`). The API is
-  `backend/time_tracker_api.py`; the backend-served portal is
-  `backend/timetracker-mobile.html`.
+  `backend/time_tracker_api.py`; `/` and `/timetracker-mobile.html` are
+  compatibility redirects to the canonical EOM website portal.
 - Tests: `cd backend && pytest`. They require PostgreSQL on `:5433` (see
   `backend/conftest.py`); CI provides a service container.
 - Branch off `main` (`agent/<topic>`); open a PR; let CI run; merge on green +

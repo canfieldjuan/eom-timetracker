@@ -661,7 +661,7 @@ class TestRemovedOrphanEndpoints:
             assert r.status_code == 404, f"{path} should be removed, got {r.status_code}"
 
     def test_kept_sibling_variants_still_work(self, client, auth):
-        # Dated logs variant (used by timetracker-mobile.html) still serves.
+        # Dated logs variant used by canonical admin diagnostics still serves.
         r = client.get("/api/admin/logs/2026-01-01", headers=auth)
         assert r.status_code == 200, r.text
         # Main analytics endpoint (used by portal.html) still serves.
