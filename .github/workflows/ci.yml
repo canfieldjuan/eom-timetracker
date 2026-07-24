@@ -72,4 +72,4 @@ jobs:
           ruff check backend --output-format=github
 
       - name: Brittle-pattern scan (blocking)
-        run: node scripts/check_brittle_patterns.mjs --strict backend/time_tracker_api.py backend/monthly_report_main.py backend/report_generator.py
+        run: node scripts/check_brittle_patterns.mjs --strict backend/time_tracker_api.py

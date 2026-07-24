@@ -213,7 +213,6 @@ def test_pdf_endpoint_propagates_all_criteria_once_and_sets_private_headers(
     client,
     auth,
     monkeypatch,
-    tmp_path,
 ):
     compute_calls: list[tuple[Any, ...]] = []
     render_calls: list[tuple[Any, ...]] = []
@@ -232,11 +231,9 @@ def test_pdf_endpoint_propagates_all_criteria_once_and_sets_private_headers(
     def forbidden_subprocess(*_args, **_kwargs):
         raise AssertionError("canonical PDF export invoked the legacy subprocess")
 
-    reports_dir = tmp_path / "reports-must-not-exist"
     monkeypatch.setattr(api, "_compute_hours_report", fake_compute)
     monkeypatch.setattr(api, "build_hours_report_pdf", fake_renderer)
     monkeypatch.setattr(api.subprocess, "run", forbidden_subprocess)
-    monkeypatch.setattr(api, "REPORTS_DIR", reports_dir)
 
     for period in ("day", "week", "month", "year"):
         response = client.get(
@@ -265,7 +262,6 @@ def test_pdf_endpoint_propagates_all_criteria_once_and_sets_private_headers(
     ]
     assert [call[1] for call in render_calls] == [17, 17, 17, 17]
     assert all(call[0]["exceptionsOnly"] is True for call in render_calls)
-    assert not reports_dir.exists()
 
 
 @pytest.mark.parametrize(
@@ -302,15 +298,12 @@ def test_pdf_endpoint_returns_real_in_memory_pdf_for_empty_report(
     client,
     auth,
     monkeypatch,
-    tmp_path,
 ):
-    reports_dir = tmp_path / "reports-must-not-exist"
     monkeypatch.setattr(
         api,
         "_compute_hours_report",
         lambda *_args, **_kwargs: report_payload(rows=False),
     )
-    monkeypatch.setattr(api, "REPORTS_DIR", reports_dir)
 
     response = client.get(
         PDF_ROUTE,
@@ -320,7 +313,6 @@ def test_pdf_endpoint_returns_real_in_memory_pdf_for_empty_report(
 
     assert response.status_code == 200
     assert_valid_pdf(response.content)
-    assert not reports_dir.exists()
 
 
 def test_employee_id_zero_keeps_canonical_all_employee_semantics(

@@ -42,7 +42,7 @@ import db
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from hours_report_pdf import build_hours_report_pdf
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
@@ -50,7 +50,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 _data_dir_env = os.environ.get("DATA_DIR", "")
 DATA_DIR = Path(_data_dir_env) if _data_dir_env else BASE_DIR / "data"
 LOGS_DIR = DATA_DIR / "logs"
-REPORTS_DIR = DATA_DIR / "reports"
 BACKEND_DIR = BASE_DIR / "backend"
 
 EMPLOYEES_FILE = DATA_DIR / "employees.json"
@@ -1775,13 +1774,6 @@ def enforce_clock_action_hours(request: Request) -> None:
         )
 
 
-def parse_report_path(stdout_text: str) -> str:
-    for line in stdout_text.splitlines():
-        if "Report available at:" in line:
-            return line.split("Report available at:", 1)[1].strip()
-    return ""
-
-
 def get_current_employee(
     request: Request,
     authorization: Optional[str] = Header(default=None),
@@ -2231,15 +2223,6 @@ class TimeDataCorrectionApplyRequest(TimeDataCorrectionPlanRequest):
     confirmation: str = Field(min_length=1, max_length=100)
 
 
-class ReportGenerateRequest(BaseModel):
-    month: int = Field(ge=1, le=12)
-    year: int = Field(ge=2000, le=2100)
-    emails: List[str] = Field(default=[])
-    company_name: str = "Effingham Office Maids"
-    send_email: bool = False
-    use_mock_data: bool = False
-
-
 class JobCreateRequest(BaseModel):
     customerName: str = Field(min_length=1)
     scheduledDate: str  # YYYY-MM-DD
@@ -2422,8 +2405,6 @@ ALLOWED_ORIGIN_REGEX = (
     or DEFAULT_PORTAL_ALLOWED_ORIGIN_REGEX
 )
 ALLOW_PUBLIC_REGISTRATION = parse_bool(os.getenv("ALLOW_PUBLIC_REGISTRATION"), False)
-MAX_REPORT_RECIPIENTS = parse_int(os.getenv("MAX_REPORT_RECIPIENTS"), 50)
-MAX_REPORT_EMAIL_LEN = parse_int(os.getenv("MAX_REPORT_EMAIL_LEN"), 320)
 ATLAS_RECEIVABLES_BASE_URL = os.getenv("ATLAS_RECEIVABLES_BASE_URL", "").strip().rstrip("/")
 ATLAS_RECEIVABLES_SERVICE_TOKEN = os.getenv(
     "ATLAS_RECEIVABLES_SERVICE_TOKEN", ""
@@ -8938,155 +8919,6 @@ def admin_logs_by_date(
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     return {"success": True, "date": date_text, "logs": read_access_logs_for_date(date_text)}
-
-
-_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-
-@app.post("/api/admin/generate-report")
-def admin_generate_report(
-    payload: ReportGenerateRequest,
-    request: Request,
-    _: Dict[str, Any] = Depends(get_current_admin),
-) -> Dict[str, Any]:
-
-    if payload.send_email and payload.emails:
-        if len(payload.emails) > MAX_REPORT_RECIPIENTS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Too many recipients (max {MAX_REPORT_RECIPIENTS})",
-            )
-        for email in payload.emails:
-            if not isinstance(email, str) or len(email) > MAX_REPORT_EMAIL_LEN or not _EMAIL_PATTERN.match(email):
-                raise HTTPException(status_code=400, detail=f"Invalid email: {email[:64]!r}")
-
-    append_access_log(request, "REPORT_GENERATION_STARTED", True, f"Month: {payload.month}/{payload.year}")
-
-    script_path = BACKEND_DIR / "monthly_report_main.py"
-    args = [
-        sys.executable,
-        str(script_path),
-        "--month",
-        str(payload.month),
-        "--year",
-        str(payload.year),
-        "--output-dir",
-        str(REPORTS_DIR),
-    ]
-
-    if payload.use_mock_data:
-        args.append("--mock-data")
-
-    if payload.company_name:
-        args.extend(["--company", payload.company_name])
-
-    if payload.send_email and payload.emails:
-        for email in payload.emails:
-            args.extend(["--email", email])
-    else:
-        args.append("--no-email")
-
-    try:
-        completed = subprocess.run(
-            args,
-            cwd=str(BASE_DIR),
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        append_access_log(request, "REPORT_GENERATION_FAILED", False, "Timed out")
-        raise HTTPException(status_code=408, detail="Report generation timed out")
-
-    stdout_text = completed.stdout or ""
-    stderr_text = completed.stderr or ""
-
-    if completed.returncode != 0:
-        # Log full subprocess output server-side for debugging, but do NOT
-        # return it to the client: stderr can carry tracebacks, file paths,
-        # or values pulled from environment variables (e.g. DB DSN parts).
-        print(
-            f"[report-gen] exit={completed.returncode}\n"
-            f"  stdout: {stdout_text}\n  stderr: {stderr_text}",
-            flush=True,
-        )
-        append_access_log(request, "REPORT_GENERATION_FAILED", False, f"Exit code: {completed.returncode}")
-        return {
-            "success": False,
-            "error": "Report generation failed",
-            "exitCode": completed.returncode,
-        }
-
-    report_path = parse_report_path(stdout_text).strip().strip("'\"")
-    if not report_path:
-        print(
-            f"[report-gen] no report path in stdout\n"
-            f"  stdout: {stdout_text}\n  stderr: {stderr_text}",
-            flush=True,
-        )
-        append_access_log(request, "REPORT_GENERATION_FAILED", False, "No report path returned by generator")
-        return {
-            "success": False,
-            "error": "Report generation failed",
-            "exitCode": completed.returncode,
-        }
-
-    absolute_report_path = Path(report_path)
-    if not absolute_report_path.is_absolute():
-        absolute_report_path = (BASE_DIR / report_path).resolve()
-    if not absolute_report_path.exists() or not absolute_report_path.is_file():
-        append_access_log(
-            request,
-            "REPORT_GENERATION_FAILED",
-            False,
-            f"Report file not found: {absolute_report_path}",
-        )
-        return {
-            "success": False,
-            "error": "Report generation failed",
-            "details": f"Report file not found: {absolute_report_path}",
-            "exitCode": completed.returncode,
-        }
-
-    if not absolute_report_path.is_relative_to(REPORTS_DIR.resolve()):
-        append_access_log(request, "REPORT_GENERATION_FAILED", False, "Report path outside reports directory")
-        return {
-            "success": False,
-            "error": "Report generation failed",
-            "details": "Unsafe report path returned by generator",
-            "exitCode": completed.returncode,
-        }
-
-    append_access_log(request, "REPORT_GENERATION_SUCCESS", True, f"Generated: {absolute_report_path}")
-    return {
-        "success": True,
-        "message": "Report generated successfully",
-        "reportPath": str(absolute_report_path),
-        "output": stdout_text,
-        "emailSent": payload.send_email and len(payload.emails) > 0,
-    }
-
-
-@app.get("/api/admin/download-report/{filename}")
-def admin_download_report(
-    filename: str,
-    request: Request,
-    _: Dict[str, Any] = Depends(get_current_admin),
-) -> FileResponse:
-
-    reports_root = REPORTS_DIR.resolve()
-    target_path = (REPORTS_DIR / filename).resolve()
-
-    if not target_path.is_relative_to(reports_root):
-        append_access_log(request, "DOWNLOAD_DENIED", False, "Path traversal attempt")
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    if not target_path.exists() or not target_path.is_file():
-        raise HTTPException(status_code=404, detail="Report not found")
-
-    append_access_log(request, "REPORT_DOWNLOAD", True, filename)
-    return FileResponse(str(target_path), media_type="application/pdf", filename=filename)
 
 
 def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Optional[int], exceptions_only: bool = False) -> Dict[str, Any]:
