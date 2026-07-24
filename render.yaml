@@ -39,12 +39,6 @@ services:
         fromDatabase:
           name: eom-timetracker-db
           property: connectionString
-      - key: RESEND_API_KEY
-        sync: false
-      - key: RESEND_FROM_EMAIL
-        sync: false
-      - key: RESEND_FROM_NAME
-        sync: false
       - key: ALLOWED_ORIGINS
         value: https://effinghamofficemaids.com,https://www.effinghamofficemaids.com,https://effingham-office-maids-website.vercel.app
       - key: ALLOWED_ORIGIN_REGEX

@@ -576,39 +576,6 @@ class TestAutoLinkPreservesManualLink:
 
 
 # ===============================================================================
-# /api/admin/generate-report -- email validation
-# ===============================================================================
-
-class TestReportEmailValidation:
-    def test_invalid_email_rejected(self, client, auth):
-        r = client.post(
-            "/api/admin/generate-report",
-            headers=auth,
-            json={
-                "month": 4,
-                "year": 2026,
-                "emails": ["not-an-email"],
-                "send_email": True,
-            },
-        )
-        assert r.status_code == 400, r.text
-
-    def test_too_many_recipients_rejected(self, client, auth):
-        emails = [f"user{i}@example.com" for i in range(51)]
-        r = client.post(
-            "/api/admin/generate-report",
-            headers=auth,
-            json={
-                "month": 4,
-                "year": 2026,
-                "emails": emails,
-                "send_email": True,
-            },
-        )
-        assert r.status_code == 400, r.text
-
-
-# ===============================================================================
 # Per-IP login rate limit
 # ===============================================================================
 
