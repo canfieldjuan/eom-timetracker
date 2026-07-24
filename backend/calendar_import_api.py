@@ -1316,12 +1316,14 @@ def _canonical_source_occurrences(
     ]
 
 
-def _register_preview_routes(
+def _register_retired_planner_routes_for_tests(
     *,
     router: APIRouter,
     config: CalendarImportConfig,
     get_current_admin: AdminDependency,
 ) -> None:
+    """Mount the retired reviewed-planner surface for retained behavior tests only."""
+
     @router.post("/api/admin/google-calendar/preview")
     def preview_google_calendar(
         payload: CalendarPreviewRequest,
@@ -1461,6 +1463,64 @@ def _register_preview_routes(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except store.CalendarStoreError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router.put("/api/admin/google-calendar/calendar")
+    def choose_google_calendar(
+        payload: CalendarSelectionRequest,
+        _: dict[str, Any] = Depends(get_current_admin),
+    ) -> dict[str, Any]:
+        connection, calendars = _list_calendars(config)
+        selected = next(
+            (
+                calendar
+                for calendar in calendars
+                if calendar.calendar_id == payload.calendarId
+            ),
+            None,
+        )
+        if not selected:
+            raise HTTPException(
+                status_code=422, detail="Selected Google Calendar is unavailable"
+            )
+        try:
+            store.select_calendar(
+                connection_id=int(connection["id"]),
+                calendar_id=selected.calendar_id,
+                calendar_name=selected.summary,
+                calendar_timezone=(
+                    str(selected.time_zone or "").strip() or config.timezone_name
+                ),
+                expected_credential_version=int(connection["credential_version"]),
+            )
+        except store.CalendarStoreError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"success": True, "calendar": _calendar_dict(selected)}
+
+    @router.get("/api/admin/planned-visits/crews")
+    def list_planned_visit_crews(
+        _: dict[str, Any] = Depends(get_current_admin),
+    ) -> dict[str, Any]:
+        return _crew_response(config)
+
+    @router.put("/api/admin/planned-visits/crews/{crew_id}/memberships")
+    def update_crew_memberships(
+        crew_id: int,
+        payload: CrewMembershipRequest,
+        admin: dict[str, Any] = Depends(get_current_admin),
+    ) -> dict[str, Any]:
+        if crew_id <= 0:
+            raise HTTPException(status_code=422, detail="Crew ID must be positive")
+        try:
+            result = store.replace_crew_memberships(
+                crew_id=crew_id,
+                employee_ids=payload.employeeIds,
+                actor_id=int(admin["id"]),
+                actor_name=str(admin["name"]),
+                effective_from=datetime.now(ZoneInfo(config.timezone_name)).date(),
+            )
+        except store.CalendarStoreError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"success": True, "changed": result["changed"], **_crew_response(config)}
 
 
 def build_calendar_import_router(
@@ -1921,38 +1981,6 @@ def build_calendar_import_router(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"success": True, "mapping": mapping}
 
-    @router.put("/api/admin/google-calendar/calendar")
-    def choose_google_calendar(
-        payload: CalendarSelectionRequest,
-        _: dict[str, Any] = Depends(get_current_admin),
-    ) -> dict[str, Any]:
-        connection, calendars = _list_calendars(config)
-        selected = next(
-            (
-                calendar
-                for calendar in calendars
-                if calendar.calendar_id == payload.calendarId
-            ),
-            None,
-        )
-        if not selected:
-            raise HTTPException(
-                status_code=422, detail="Selected Google Calendar is unavailable"
-            )
-        try:
-            store.select_calendar(
-                connection_id=int(connection["id"]),
-                calendar_id=selected.calendar_id,
-                calendar_name=selected.summary,
-                calendar_timezone=(
-                    str(selected.time_zone or "").strip() or config.timezone_name
-                ),
-                expected_credential_version=int(connection["credential_version"]),
-            )
-        except store.CalendarStoreError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"success": True, "calendar": _calendar_dict(selected)}
-
     @router.delete("/api/admin/google-calendar/connection")
     def disconnect_google_calendar(
         admin: dict[str, Any] = Depends(get_current_admin),
@@ -1993,35 +2021,4 @@ def build_calendar_import_router(
             raise _google_failure(exc) from exc
         return {"success": True, "disconnected": disconnected}
 
-    @router.get("/api/admin/planned-visits/crews")
-    def list_planned_visit_crews(
-        _: dict[str, Any] = Depends(get_current_admin),
-    ) -> dict[str, Any]:
-        return _crew_response(config)
-
-    @router.put("/api/admin/planned-visits/crews/{crew_id}/memberships")
-    def update_crew_memberships(
-        crew_id: int,
-        payload: CrewMembershipRequest,
-        admin: dict[str, Any] = Depends(get_current_admin),
-    ) -> dict[str, Any]:
-        if crew_id <= 0:
-            raise HTTPException(status_code=422, detail="Crew ID must be positive")
-        try:
-            result = store.replace_crew_memberships(
-                crew_id=crew_id,
-                employee_ids=payload.employeeIds,
-                actor_id=int(admin["id"]),
-                actor_name=str(admin["name"]),
-                effective_from=datetime.now(ZoneInfo(config.timezone_name)).date(),
-            )
-        except store.CalendarStoreError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return {"success": True, "changed": result["changed"], **_crew_response(config)}
-
-    _register_preview_routes(
-        router=router,
-        config=config,
-        get_current_admin=get_current_admin,
-    )
     return router

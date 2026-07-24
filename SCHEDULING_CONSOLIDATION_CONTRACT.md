@@ -599,3 +599,69 @@ This correction must not change:
   bindings, credential fencing/versioning, sync behavior, or OAuth redirects;
 - authentication, payroll, receivables, Customers/Sites, portal behavior,
   schema constraints, legacy planner data, or unrelated routes and modules.
+
+## Post-cutover legacy mutation quarantine contract
+
+Status: derived before implementation on 2026-07-23, after the canonical
+backend and portal reached production and an authenticated production Schedule
+load produced no legacy planner requests.
+
+### Root cause
+
+The canonical Calendar-backed `jobs` schedule is now the only operator-facing
+planning workflow, but the backend still exposes the retired reviewed-preview
+planner as a second write authority. A stale client can still select one
+Calendar, create and approve a preview, or change crew membership, and startup
+can still seed crew membership automatically. Those writes create or modify a
+parallel planned-visit model that canonical sync must later migrate into
+`jobs`. Removing the old portal controls did not remove that duplicate
+authority.
+
+The problem is not the retained historical rows or migration code. Existing
+planned visits, previews, assignments, mappings, and audit records are evidence
+that canonical sync, disconnect protection, and source reconciliation still
+need to read. The correct fix is therefore to close obsolete write entry
+points while keeping retained data readable and non-destructive.
+
+### Required changes
+
+The slice must:
+
+1. Stop registering the legacy reviewed-preview creation and approval routes.
+   Authenticated requests to those retired paths must return 404 and must not
+   create, update, cancel, or approve any planned visit.
+2. Stop registering the single-Calendar selection route superseded by the two
+   role-bound canonical source configuration. Its retired path must return 404
+   without changing connection or source state.
+3. Stop registering the legacy crew-list and crew-membership routes. Their
+   retired paths must return 404 without changing crew, membership, planned
+   visit, or assignment state.
+4. Remove automatic Morning Crew membership bootstrap from application
+   startup and stop seeding a new default crew in an empty schema. Starting the
+   service must not invent a crew or employee membership, while every retained
+   crew and membership row remains untouched.
+5. Add focused route and startup regressions that prove the retired entry
+   points are absent and the canonical status, Calendar listing, two-source
+   configuration, sync, mapping, Schedule, Forecast, connection, and
+   disconnect boundaries remain registered and protected by their existing
+   admin contract.
+
+### Boundaries
+
+This slice must not:
+
+- delete or rewrite any table, column, foreign key, preview, planned visit,
+  assignment, crew, membership, mapping, connection, source, job, or audit row;
+- remove or change the one-way legacy-to-`jobs` migration, its collision and
+  exception reporting, `legacyMigration` response data, disconnect protection,
+  canonical mapping reuse, source-key identity, or append-only audit behavior;
+- change Google OAuth scopes, connect/callback/reconnect/revoke behavior,
+  credential encryption or fencing, Calendar listing, the two canonical source
+  roles, matching, synchronization, cancellation, or source configuration;
+- change canonical Schedule or Forecast projections, job economics, actual
+  shift/visit/QR evidence, timecards, payroll, receivables, Customers/Sites,
+  authentication, portal code, schema constraints, or unrelated routes;
+- expand into a generalized deletion of now-unreachable legacy helpers or
+  storage functions. This slice removes external mutation authority and
+  automatic writes; retained internals stay until their historical readers and
+  constraints no longer depend on them.
