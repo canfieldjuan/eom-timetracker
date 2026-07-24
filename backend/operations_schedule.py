@@ -314,11 +314,42 @@ def _load_time_evidence(
         FROM shifts s
         JOIN employees e ON e.id = s.employee_id
         WHERE s.time_category = 'productive'
-          AND s.clock_in < %s
-          AND COALESCE(s.clock_out, %s) > %s
+          AND (
+              (
+                  s.clock_in < %s
+                  AND COALESCE(s.clock_out, %s) > %s
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM site_check_ins linked_sci
+                  WHERE linked_sci.employee_id = s.employee_id
+                    AND linked_sci.job_id = ANY(%s)
+                    AND linked_sci.server_checked_in_at < %s
+                    AND s.clock_in <= linked_sci.server_checked_in_at
+                    AND COALESCE(s.clock_out, %s)
+                        > linked_sci.server_checked_in_at
+                    AND (
+                        (
+                            linked_sci.classification IN ('on_time', 'late')
+                            AND linked_sci.review_status = 'not_required'
+                        )
+                        OR (
+                            linked_sci.classification = 'needs_review'
+                            AND linked_sci.review_status = 'approved'
+                        )
+                    )
+              )
+          )
         ORDER BY s.clock_in, s.id
         """,
-        (range_end, observed_at, range_start),
+        (
+            range_end,
+            observed_at,
+            range_start,
+            linked_job_ids,
+            observed_at,
+            observed_at,
+        ),
     )
 
     shift_ids = [int(row["id"]) for row in shifts]
@@ -366,6 +397,15 @@ def _load_time_evidence(
                   AND sci.server_checked_in_at < %s
               )
               OR sci.job_id = ANY(%s)
+              OR EXISTS (
+                  SELECT 1
+                  FROM shifts evidence_shift
+                  WHERE evidence_shift.id = ANY(%s)
+                    AND evidence_shift.employee_id = sci.employee_id
+                    AND evidence_shift.clock_in <= sci.server_checked_in_at
+                    AND COALESCE(evidence_shift.clock_out, %s)
+                        > sci.server_checked_in_at
+              )
           )
           AND (
               (
@@ -385,6 +425,8 @@ def _load_time_evidence(
             range_start,
             range_end,
             linked_job_ids,
+            shift_ids,
+            observed_at,
         ),
     )
     for row in qr_rows:
@@ -399,9 +441,11 @@ def _qr_only_presence_segments(
     qr_rows: List[Dict[str, Any]],
     represented_segments: List[Dict[str, Any]],
     observed_at: datetime,
+    represented_qr_ids: Optional[Iterable[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Keep Site presence not represented by a same-Site productive segment."""
 
+    represented_ids = {int(check_in_id) for check_in_id in (represented_qr_ids or ())}
     segments_by_employee_site: Dict[Tuple[int, int], List[Dict[str, Any]]] = (
         defaultdict(list)
     )
@@ -418,15 +462,18 @@ def _qr_only_presence_segments(
         employee_id = int(row["employee_id"])
         location_id = int(row["location_id"])
         checked_in_at = row["server_checked_in_at"]
-        covered_by_segment = any(
-            segment["start"] <= checked_in_at
-            and (segment.get("end") or observed_at) > checked_in_at
-            and (
-                row.get("job_id") is None
-                or segment.get("job_id") == row.get("job_id")
+        if row.get("job_id") is not None:
+            covered_by_segment = (
+                row.get("id") is not None and int(row["id"]) in represented_ids
             )
-            for segment in segments_by_employee_site.get((employee_id, location_id), [])
-        )
+        else:
+            covered_by_segment = any(
+                segment["start"] <= checked_in_at
+                and (segment.get("end") or observed_at) > checked_in_at
+                for segment in segments_by_employee_site.get(
+                    (employee_id, location_id), []
+                )
+            )
         if covered_by_segment:
             continue
         output.append(
@@ -445,36 +492,187 @@ def _qr_only_presence_segments(
                 "presence_only": True,
                 "evidence": ["qr_check_in"],
                 "unassigned_gap": False,
+                "qr_job_conflict_ids": row.get("qr_job_conflict_ids"),
             }
         )
     return output
 
 
+def _job_link_applies_to_segment(
+    segment: Dict[str, Any],
+    job_id: int,
+    linked_jobs_by_id: Dict[int, Dict[str, Any]],
+) -> bool:
+    """Mirror direct-link Site applicability without weakening unavailable links."""
+
+    linked_job = linked_jobs_by_id.get(job_id)
+    if linked_job is None:
+        return True
+    segment_location_id = segment.get("location_id")
+    linked_location_id = linked_job.get("location_id")
+    return bool(
+        segment_location_id is None
+        or linked_location_id is None
+        or int(segment_location_id) == int(linked_location_id)
+    )
+
+
+def _add_qr_evidence(segment: Dict[str, Any]) -> None:
+    raw_evidence = segment.get("evidence")
+    if isinstance(raw_evidence, list):
+        evidence = list(raw_evidence)
+    elif raw_evidence == "unassigned_gap":
+        evidence = ["shift"]
+    elif raw_evidence:
+        evidence = [str(raw_evidence)]
+    else:
+        evidence = ["shift"]
+    if "qr_check_in" not in evidence:
+        evidence.append("qr_check_in")
+    segment["evidence"] = evidence
+
+
+def _unique_visible_qr_shift_ids(
+    shifts: List[Dict[str, Any]],
+    qr_rows: List[Dict[str, Any]],
+    visible_job_ids: Iterable[int],
+    observed_at: datetime,
+) -> set[int]:
+    """Find cross-boundary shifts selected by exactly one visible-job QR."""
+
+    visible_ids = {int(job_id) for job_id in visible_job_ids}
+    selected: set[int] = set()
+    for row in qr_rows:
+        job_id = row.get("job_id")
+        if job_id is None or int(job_id) not in visible_ids:
+            continue
+        checked_in_at = row["server_checked_in_at"]
+        employee_id = int(row["employee_id"])
+        candidates = [
+            shift
+            for shift in shifts
+            if int(shift["employee_id"]) == employee_id
+            and shift["clock_in"] <= checked_in_at
+            and (shift.get("clock_out") or observed_at) > checked_in_at
+        ]
+        if len(candidates) == 1:
+            selected.add(int(candidates[0]["id"]))
+    return selected
+
+
 def _apply_qr_job_links(
     qr_rows: List[Dict[str, Any]],
     represented_segments: List[Dict[str, Any]],
-) -> None:
-    """Attach a durable QR job identity to one matching unlinked Site segment."""
+    linked_jobs_by_id: Dict[int, Dict[str, Any]],
+) -> set[int]:
+    """Use one unambiguous durable QR pair to identify one atomic shift segment."""
 
+    represented_qr_ids: set[int] = set()
+    rows_by_segment: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    segments_by_identity: Dict[int, Dict[str, Any]] = {}
     for row in qr_rows:
-        job_id = row.get("job_id")
-        if job_id is None:
+        if row.get("job_id") is None:
             continue
+        job_id = int(row["job_id"])
+        linked_job = linked_jobs_by_id.get(job_id)
+        if linked_job is not None and (
+            linked_job.get("location_id") is None
+            or int(linked_job["location_id"]) != int(row["location_id"])
+        ):
+            row["qr_job_conflict_ids"] = [job_id]
         employee_id = int(row["employee_id"])
-        location_id = int(row["location_id"])
         checked_in_at = row["server_checked_in_at"]
         candidates = [
             segment
             for segment in represented_segments
-            if int(segment["employee_id"]) == employee_id
-            and segment.get("location_id") is not None
-            and int(segment["location_id"]) == location_id
-            and segment.get("job_id") is None
+            if segment.get("shift_id") is not None
+            and not bool(segment.get("presence_only"))
+            and int(segment["employee_id"]) == employee_id
             and segment["start"] <= checked_in_at < segment["end"]
         ]
         if len(candidates) != 1:
             continue
-        candidates[0]["job_id"] = int(job_id)
+        segment = candidates[0]
+        segment_identity = id(segment)
+        segments_by_identity[segment_identity] = segment
+        rows_by_segment[segment_identity].append(row)
+
+    for segment_identity, rows in rows_by_segment.items():
+        segment = segments_by_identity[segment_identity]
+        segment_location_id = segment.get("location_id")
+        compatible_rows = [
+            row
+            for row in rows
+            if segment_location_id is None
+            or int(row["location_id"]) == int(segment_location_id)
+        ]
+        if not compatible_rows:
+            continue
+
+        existing_job_id = segment.get("job_id")
+        if existing_job_id is not None and _job_link_applies_to_segment(
+            segment,
+            int(existing_job_id),
+            linked_jobs_by_id,
+        ):
+            corroborating = [
+                row
+                for row in compatible_rows
+                if int(row["job_id"]) == int(existing_job_id)
+                and not row.get("qr_job_conflict_ids")
+            ]
+            if not corroborating:
+                continue
+            if segment_location_id is None:
+                segment["location_id"] = int(corroborating[0]["location_id"])
+                segment["location_label"] = str(
+                    corroborating[0].get("location_label") or ""
+                )
+                segment["unassigned_gap"] = False
+            _add_qr_evidence(segment)
+            represented_qr_ids.update(
+                int(row["id"]) for row in corroborating if row.get("id") is not None
+            )
+            continue
+
+        invalid_rows = [
+            row for row in compatible_rows if row.get("qr_job_conflict_ids")
+        ]
+        if invalid_rows:
+            segment["qr_job_conflict_ids"] = sorted(
+                {int(row["job_id"]) for row in compatible_rows}
+            )
+            continue
+
+        distinct_pairs = {
+            (int(row["location_id"]), int(row["job_id"])) for row in compatible_rows
+        }
+        if len(distinct_pairs) != 1:
+            segment["qr_job_conflict_ids"] = sorted(
+                {job_id for _, job_id in distinct_pairs}
+            )
+            continue
+
+        location_id, job_id = next(iter(distinct_pairs))
+        segment["location_id"] = location_id
+        segment["location_label"] = str(
+            next(
+                (
+                    row.get("location_label")
+                    for row in compatible_rows
+                    if int(row["location_id"]) == location_id
+                ),
+                "",
+            )
+            or ""
+        )
+        segment["job_id"] = job_id
+        segment["unassigned_gap"] = False
+        _add_qr_evidence(segment)
+        represented_qr_ids.update(
+            int(row["id"]) for row in compatible_rows if row.get("id") is not None
+        )
+    return represented_qr_ids
 
 
 def _closed_shift_segments(
@@ -521,52 +719,6 @@ def _closed_shift_segments(
             evidence.append("qr_check_in")
         return evidence
 
-    if not visits:
-        location_id = shift.get("location_id")
-        output = [
-            {
-                **common,
-                "location_id": location_id,
-                "location_label": str(shift.get("location_label") or ""),
-                "start": lower,
-                "end": upper,
-                "evidence": (
-                    "unassigned_gap"
-                    if location_id is None
-                    else evidence_for(
-                        "shift",
-                        location_id,
-                        lower,
-                        upper,
-                    )
-                ),
-                "unassigned_gap": location_id is None,
-                "presence_only": False,
-            }
-        ]
-        if location_id is None:
-            for checked_in_at, qr_location_id in _qr_sites_in_interval(
-                qr_by_employee_site,
-                employee_id=int(shift["employee_id"]),
-                start=lower,
-                end=upper,
-            ):
-                output.append(
-                    {
-                        **common,
-                        "location_id": qr_location_id,
-                        "location_label": "",
-                        "start": checked_in_at,
-                        "end": checked_in_at + timedelta(microseconds=1),
-                        "finalized": False,
-                        "in_progress": False,
-                        "presence_only": True,
-                        "evidence": ["qr_check_in"],
-                        "unassigned_gap": False,
-                    }
-                )
-        return output
-
     output: List[Dict[str, Any]] = []
 
     def append_interval(
@@ -596,31 +748,45 @@ def _closed_shift_segments(
                 "presence_only": False,
             }
         )
-        if not unassigned:
-            return
-        for checked_in_at, qr_location_id in _qr_sites_in_interval(
-            qr_by_employee_site,
-            employee_id=int(shift["employee_id"]),
-            start=start,
-            end=end,
-        ):
-            # A QR scan proves presence at one Site but supplies no paid-time
-            # duration. Keep the unknown closed interval unmatched and add a
-            # point-like, non-finalized presence record for the worker.
-            output.append(
-                {
-                    **common,
-                    "location_id": qr_location_id,
-                    "location_label": "",
-                    "start": checked_in_at,
-                    "end": checked_in_at + timedelta(microseconds=1),
-                    "finalized": False,
-                    "in_progress": False,
-                    "presence_only": True,
-                    "evidence": ["qr_check_in"],
-                    "unassigned_gap": False,
-                }
+
+    def initial_site_departure(before: datetime) -> Optional[Dict[str, Any]]:
+        initial_location_id = shift.get("location_id")
+        if initial_location_id is None:
+            return None
+        return next(
+            (
+                departure
+                for departure in departures
+                if departure.get("location_id") == initial_location_id
+                and clock_in <= departure["departure_time"] <= before
+            ),
+            None,
+        )
+
+    if not visits:
+        initial_location_id = shift.get("location_id")
+        initial_departure = initial_site_departure(clock_out)
+        initial_end = (
+            initial_departure["departure_time"]
+            if initial_departure is not None
+            else clock_out
+        )
+        append_interval(
+            location_id=initial_location_id,
+            location_label=str(shift.get("location_label") or ""),
+            start=lower,
+            end=min(initial_end, upper),
+            base_evidence="shift",
+        )
+        if initial_departure is not None:
+            append_interval(
+                location_id=None,
+                location_label="",
+                start=max(initial_end, lower),
+                end=upper,
+                base_evidence="unassigned_gap",
             )
+        return output
 
     cursor = lower
     used_departures: set[int] = set()
@@ -653,15 +819,30 @@ def _closed_shift_segments(
 
         visible_arrival = max(arrival, lower)
         if visible_arrival > cursor:
+            initial_departure = initial_site_departure(arrival) if index == 0 else None
+            initial_end = (
+                initial_departure["departure_time"]
+                if initial_departure is not None
+                else visible_arrival
+            )
             append_interval(
                 location_id=shift.get("location_id") if index == 0 else None,
                 location_label=(
                     str(shift.get("location_label") or "") if index == 0 else ""
                 ),
                 start=cursor,
-                end=min(visible_arrival, upper),
+                end=min(initial_end, visible_arrival, upper),
                 base_evidence="shift",
             )
+            if initial_departure is not None:
+                used_departures.add(int(initial_departure["id"]))
+                append_interval(
+                    location_id=None,
+                    location_label="",
+                    start=max(initial_end, cursor),
+                    end=min(visible_arrival, upper),
+                    base_evidence="unassigned_gap",
+                )
 
         segment_start = max(arrival, lower)
         segment_end = min(work_end, upper)
@@ -795,6 +976,12 @@ def _match_segment_to_job(
                 return visible_linked_job, "linked_shift", [normalized_linked_job_id]
             return None, "linked_job_outside_range", [normalized_linked_job_id]
 
+    qr_job_conflict_ids = sorted(
+        {int(job_id) for job_id in segment.get("qr_job_conflict_ids") or []}
+    )
+    if qr_job_conflict_ids:
+        return None, "ambiguous_job", qr_job_conflict_ids
+
     location_id = segment.get("location_id")
     if location_id is None:
         reason = "unassigned_gap" if segment.get("unassigned_gap") else "missing_site"
@@ -826,9 +1013,7 @@ def _match_segment_to_job(
         )
         if not has_valid_window:
             windowless.append(job)
-        elif (
-            scheduled_start < segment["end"] and scheduled_end > segment["start"]
-        ):
+        elif scheduled_start < segment["end"] and scheduled_end > segment["start"]:
             overlapping.append(job)
 
     eligible = overlapping or windowless
@@ -838,9 +1023,7 @@ def _match_segment_to_job(
     eligible_ids = [int(job["id"]) for job in eligible]
     if len(eligible) == 1:
         sole_candidate = eligible[0]
-        match_reason = (
-            "unique_service_window" if overlapping else "unique_site_date"
-        )
+        match_reason = "unique_service_window" if overlapping else "unique_site_date"
         return sole_candidate, match_reason, eligible_ids
     return None, "ambiguous_job", eligible_ids
 
@@ -920,17 +1103,39 @@ def _decorate_schedule_jobs(
     linked_jobs_by_id = dict(jobs_by_id)
     linked_jobs_by_id.update(
         _load_linked_job_metadata(
-            int(shift["job_id"])
-            for shift in shifts
-            if shift.get("job_id") is not None
-            and int(shift["job_id"]) not in jobs_by_id
+            [
+                int(shift["job_id"])
+                for shift in shifts
+                if shift.get("job_id") is not None
+                and int(shift["job_id"]) not in jobs_by_id
+            ]
+            + [
+                int(row["job_id"])
+                for row in qr_rows
+                if row.get("job_id") is not None
+                and int(row["job_id"]) not in jobs_by_id
+            ]
         )
+    )
+    cross_boundary_shift_ids = _unique_visible_qr_shift_ids(
+        shifts,
+        qr_rows,
+        jobs_by_id,
+        observed_at,
     )
     segments: List[Dict[str, Any]] = []
     for shift in shifts:
         shift_id = int(shift["id"])
+        shift_range_start = range_start
+        shift_range_end = range_end
+        if shift_id in cross_boundary_shift_ids:
+            shift_range_start = min(shift_range_start, shift["clock_in"])
+            shift_range_end = max(
+                shift_range_end,
+                shift.get("clock_out") or observed_at,
+            )
         if shift.get("clock_out") is None:
-            if range_start <= observed_at < range_end:
+            if shift_range_start <= observed_at < shift_range_end:
                 presence = _open_shift_presence(
                     shift,
                     visits.get(shift_id, []),
@@ -938,8 +1143,8 @@ def _decorate_schedule_jobs(
                     qr_by_employee_site,
                     observed_at,
                 )
-                presence["start"] = max(presence["start"], range_start)
-                presence["end"] = min(presence["end"], range_end)
+                presence["start"] = max(presence["start"], shift_range_start)
+                presence["end"] = min(presence["end"], shift_range_end)
                 if presence["end"] > presence["start"]:
                     segments.append(presence)
         else:
@@ -949,12 +1154,23 @@ def _decorate_schedule_jobs(
                     visits.get(shift_id, []),
                     departures.get(shift_id, []),
                     qr_by_employee_site,
-                    range_start,
-                    range_end,
+                    shift_range_start,
+                    shift_range_end,
                 )
             )
-    _apply_qr_job_links(qr_rows, segments)
-    segments.extend(_qr_only_presence_segments(qr_rows, segments, observed_at))
+    represented_qr_ids = _apply_qr_job_links(
+        qr_rows,
+        segments,
+        linked_jobs_by_id,
+    )
+    segments.extend(
+        _qr_only_presence_segments(
+            qr_rows,
+            segments,
+            observed_at,
+            represented_qr_ids,
+        )
+    )
 
     workers_by_job: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
     unmatched: List[Dict[str, Any]] = []
