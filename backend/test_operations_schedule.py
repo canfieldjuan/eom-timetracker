@@ -1159,19 +1159,25 @@ def test_schedule_open_shift_identifies_worker_without_finalized_hours(client, a
             cur.execute(
                 """
                 INSERT INTO site_check_ins (
-                    employee_id, location_id, server_checked_in_at,
+                    employee_id, location_id, job_id, server_checked_in_at,
                     device_scanned_at, latitude, longitude, accuracy_m,
                     geofence_radius_m, distance_m, geofence_status,
                     classification, classification_reason,
                     device_clock_skew_seconds, review_status
                 )
                 VALUES (
-                    %s, %s, %s, %s, 39.12, -88.54, 5,
+                    %s, %s, %s, %s, %s, 39.12, -88.54, 5,
                     100, 3, 'inside', 'on_time', 'test', 0,
                     'not_required'
                 )
                 """,
-                (employee_id, site_id, checked_in_at, checked_in_at),
+                (
+                    employee_id,
+                    site_id,
+                    job_id,
+                    checked_in_at,
+                    checked_in_at,
+                ),
             )
 
     response = client.get(
@@ -1200,7 +1206,19 @@ def test_schedule_open_shift_identifies_worker_without_finalized_hours(client, a
                     "presenceOnly": False,
                     "evidence": ["clock_in", "qr_check_in"],
                     "match": "unique_service_window",
-                }
+                },
+                {
+                    "shiftId": None,
+                    "intervalStart": checked_in_at.replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                    "intervalEnd": None,
+                    "hours": None,
+                    "finalized": False,
+                    "presenceOnly": True,
+                    "evidence": ["qr_check_in"],
+                    "match": "linked_shift",
+                },
             ],
             "status": "in_progress",
             "hours": 0,
@@ -1614,7 +1632,7 @@ def test_cross_boundary_shift_loads_conflicting_nonvisible_qr_and_fails_closed(
                 end=shift_end,
             )
             employee_id = _employee(cur, "QR Cross Boundary Conflict", 18)
-            _shift(
+            shift_id = _shift(
                 cur,
                 employee_id=employee_id,
                 start=shift_start,
@@ -1645,6 +1663,12 @@ def test_cross_boundary_shift_loads_conflicting_nonvisible_qr_and_fails_closed(
     assert job["workers"][0]["intervals"][0]["presenceOnly"] is True
     assert job["workers"][0]["intervals"][0]["hours"] is None
     assert body["summary"]["actualHours"] == 0
+    assert body["summary"]["unmatchedActualHours"] == 2
+    assert [
+        (row["shiftId"], row["hours"], row["reason"], row["candidateJobIds"])
+        for row in body["unmatchedActualSegments"]
+        if row["finalized"]
+    ] == [(shift_id, 2, "ambiguous_job", sorted([visible_job, hidden_job]))]
 
 
 def test_post_midnight_qr_attributes_whole_overnight_shift_to_visible_job(

@@ -586,6 +586,7 @@ def _apply_qr_job_links(
             segment
             for segment in represented_segments
             if segment.get("shift_id") is not None
+            and bool(segment.get("finalized"))
             and not bool(segment.get("presence_only"))
             and int(segment["employee_id"]) == employee_id
             and segment["start"] <= checked_in_at < segment["end"]
@@ -1183,8 +1184,13 @@ def _decorate_schedule_jobs(
             linked_jobs_by_id=linked_jobs_by_id,
         )
         if job is None:
+            shift_id = segment.get("shift_id")
+            is_cross_boundary_shift = (
+                shift_id is not None and int(shift_id) in cross_boundary_shift_ids
+            )
             if (
-                visible_range_start is not None
+                not is_cross_boundary_shift
+                and visible_range_start is not None
                 and visible_range_end is not None
                 and (
                     segment["end"] <= visible_range_start
