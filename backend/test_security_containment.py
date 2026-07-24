@@ -28,12 +28,18 @@ def test_default_portal_cors_is_limited_to_owned_frontends():
 
 
 @pytest.mark.parametrize("path", ["/", "/timetracker-mobile.html"])
-def test_secured_time_tracker_page_is_served_same_origin(client, path):
-    response = client.get(path)
-    assert response.status_code == 200
-    assert "Firefly Time Tracker" in response.text
-    assert "id=\"adminPanel\" class=\"panel hidden\"" in response.text
-    assert "window.location.origin}/api" in response.text
+def test_retired_time_tracker_page_redirects_to_owned_portal(
+    client, path, monkeypatch
+):
+    import time_tracker_api as api
+
+    portal = "https://portal.example.test"
+    monkeypatch.setattr(api, "PUBLIC_APP_URL", portal)
+    response = client.get(path, follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["location"] == f"{portal}/portal"
+    assert response.headers["cache-control"] == "no-store"
+    assert "Firefly Time Tracker" not in response.text
 
 
 @pytest.mark.parametrize("api_path", ["/api/hours", "/api/current-status"])

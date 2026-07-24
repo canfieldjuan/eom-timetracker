@@ -52,7 +52,6 @@ DATA_DIR = Path(_data_dir_env) if _data_dir_env else BASE_DIR / "data"
 LOGS_DIR = DATA_DIR / "logs"
 REPORTS_DIR = DATA_DIR / "reports"
 BACKEND_DIR = BASE_DIR / "backend"
-FRONTEND_FILE = BACKEND_DIR / "timetracker-mobile.html"
 
 EMPLOYEES_FILE = DATA_DIR / "employees.json"
 TIMESHEETS_FILE = DATA_DIR / "timesheets.json"
@@ -4841,19 +4840,19 @@ def time_tracker_page(
     request: Request,
     check_in: Optional[str] = Query(default=None, alias="checkIn"),
 ) -> Response:
-    # QR check-in deep links belong to the canonical EOM portal (issue #35).
-    # Forward ONLY the checkIn value — other params (e.g. apiBaseUrl) must not
-    # ride a printed-QR redirect. 302 + no-store prevents phone browsers from
-    # caching a cutover destination. If the canonical portal is unavailable,
-    # fail closed instead of serving a legacy page that cannot submit the QR.
+    # Both retired backend entry points belong to the canonical EOM portal
+    # (issue #35). Forward ONLY a non-empty checkIn value: apiBaseUrl and other
+    # legacy parameters must not ride a printed-QR redirect. 302 + no-store
+    # keeps the cutover reversible and prevents phone browsers from caching it.
+    portal_base = _require_canonical_portal_base(request)
+    destination = f"{portal_base}/portal"
     if check_in:
-        portal_base = _require_canonical_portal_base(request)
-        return RedirectResponse(
-            f"{portal_base}/portal?checkIn={quote(check_in, safe='')}",
-            status_code=302,
-            headers={"Cache-Control": "no-store"},
-        )
-    return FileResponse(str(FRONTEND_FILE), media_type="text/html")
+        destination = f"{destination}?checkIn={quote(check_in, safe='')}"
+    return RedirectResponse(
+        destination,
+        status_code=302,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/api/health")
