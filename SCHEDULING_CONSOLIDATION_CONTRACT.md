@@ -776,3 +776,110 @@ This slice must not:
   public registration, or unrelated backend/portal modules;
 - perform a destructive migration or seed, rewrite, deactivate, reactivate, or
   otherwise reinterpret retained employee schedule/rule rows.
+
+## QR-attributed productive-shift contract
+
+Status: derived before implementation on 2026-07-23, after canonical QR job
+matching and its neutral portal confirmation were live in production.
+
+### Root cause
+
+The system already stores the two facts needed for Schedule actuals: a
+productive shift supplies the employee's paid clock-in/clock-out bounds, and an
+accepted QR row supplies authenticated Site presence plus the exact canonical
+job. The read-only Schedule projection does not yet combine those facts.
+
+For a closed shift without a Site or Arrive event, the projection emits the
+entire paid interval as an unmatched gap. It separately emits a point-like QR
+presence row, and the later job-link pass can attach only an already-existing
+same-Site segment. The result is zero actual hours on the job and the whole
+productive shift left unmatched even though the employee clocked in, scanned
+the canonical Site QR, and clocked out.
+
+The defect is not missing employee scheduling, crew assignment, or another
+arrival control. Requiring the employee to tap Arrive after an authenticated QR
+scan would duplicate the same Site identity. Clock-in/out and retained
+Arrive/Depart rows already define time boundaries; QR must identify one existing
+atomic paid segment, not invent a new duration boundary.
+
+### Required changes
+
+The slice must:
+
+1. Build finalized atomic segments from productive shift clock bounds and the
+   existing Arrive/Depart boundaries before point-only QR fallbacks are
+   materialized. QR timestamps must not split, start, close, shorten, or extend
+   those segments.
+2. Treat an accepted QR row with a durable `job_id` as Site/job identity for
+   exactly one containing atomic segment. Use half-open segment boundaries so a
+   scan at a shared boundary selects at most one segment. If corrected data
+   leaves multiple containing segments or shifts, fail closed: apply the QR to
+   none of them and retain only zero-duration observed presence.
+3. Promote a wholly unassigned atomic segment to a QR's Site/job only when all
+   accepted job-linked QR rows contained by that segment identify one distinct
+   `(Site, job)` pair. Repeated scans for that pair are corroborating evidence,
+   not extra time. Two distinct pairs in one atomic segment are ambiguous; keep
+   its paid duration unmatched rather than splitting it by scan order.
+4. Preserve existing shift, Arrive, and Depart boundaries and Site identity. A
+   same-Site QR may add its durable job identity and `qr_check_in` evidence to an
+   otherwise unlinked segment without moving the segment's established start or
+   end. A different-Site QR must not override an explicit shift or Arrive Site
+   and remains point-like observed evidence.
+5. Preserve every applicable explicit `shift.job_id`. If an explicit Arrive
+   proves that an atomic segment is at a different Site, the inapplicable shift
+   link must not prevent one unambiguous same-Site QR job link from identifying
+   that segment. Cancelled, unavailable, or out-of-visible-range direct links
+   must continue to fail closed instead of silently rematching to another job.
+6. Extend the evidence load just enough to include the unique productive shift
+   that contains an accepted QR linked to a visible job, even when the configured
+   Calendar association margin places that scan and shift across the normal
+   Schedule evidence boundary.
+7. Keep accepted QR evidence without a containing closed productive shift,
+   without a durable job link, outside a unique atomic-segment association, or
+   in an ambiguous segment as point-like observed presence with zero finalized
+   hours. Keep open and non-productive shifts at zero QR-attributed finalized
+   hours, and keep pending and rejected QR evidence excluded under the existing
+   accepted-state rules.
+8. Keep each employee independent so multiple workers may contribute their own
+   non-overlapping intervals to one canonical job. One worker's scan must never
+   assign or relink another worker's interval.
+9. Preserve the read-only projection invariant for every closed shift before
+   visible-range filtering: finalized attributed intervals and finalized
+   unmatched intervals are disjoint, stay within the clipped clock-in/clock-out
+   bounds, and together cover those bounds exactly once. Their summed duration
+   must never exceed or fall short of the existing productive shift duration.
+10. Materialize standalone QR presence only after paid and unmatched shift
+    segments are complete, and suppress it only when a compatible
+    employee/Site/job segment already represents that scan. Do not leave a
+    duplicate QR point beside the interval it created.
+11. Add focused PostgreSQL-backed regressions for one unassigned closed shift,
+    repeated same-job scans, distinct-link ambiguity, explicit Arrive/Depart
+    boundaries, applicable and inapplicable shift links, overlapping shifts,
+    open/non-productive shifts, two employees on one job,
+    pending/rejected/unlinked scans, QR without a shift, cross-boundary and
+    cross-midnight evidence, and the exact no-double-count duration invariant.
+
+### Boundaries
+
+This slice may change only
+`SCHEDULING_CONSOLIDATION_CONTRACT.md`,
+`backend/operations_schedule.py`, and
+`backend/test_operations_schedule.py`.
+
+It must not:
+
+- create, extend, shorten, close, relink, or otherwise mutate a shift, visit,
+  departure, QR check-in, job, employee, Site, or audit row;
+- infer paid time from QR or Calendar data without a containing productive
+  shift, count an open shift as finalized, change payroll/timecard totals, or
+  change clock-in/out, Arrive/Depart, correction, wage, or labor-cost writes;
+- change QR resolution or ingestion, official/device timestamps, durable job
+  matching, classification, review, retry idempotency, geofence, clock-skew,
+  token/nonce, access-hours, authentication, or authorization behavior;
+- change Google OAuth, the two Calendar source roles, event fetching, mapping,
+  synchronization, cancellation/reschedule ownership, canonical job planning,
+  Site economics, Forecast calculations, receivables, invoices, or payments;
+- add employee/crew planning, revive exact or recurring arrival-schedule
+  mutations, require a second Arrive action, or add a new portal/admin surface;
+- change Schedule or Forecast response shapes, public route contracts, schema,
+  startup migrations, or unrelated backend/portal modules.
