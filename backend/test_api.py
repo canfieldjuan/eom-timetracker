@@ -1632,6 +1632,73 @@ class TestAnalyticsRegression:
 # Phase 3 - Jobs
 # ===============================================================================
 
+def _insert_profitability_site(
+    *,
+    address: str,
+    customer_name: str,
+    rate: float | None,
+    rate_type: str,
+    expected_hours: float | None,
+) -> int:
+    return int(
+        db.execute_returning(
+            """
+            INSERT INTO locations (
+                address, customer_name, location_type, rate, rate_type,
+                expected_hours
+            )
+            VALUES (%s, %s, 'Commercial', %s, %s, %s)
+            RETURNING id
+            """,
+            (address, customer_name, rate, rate_type, expected_hours),
+        )
+    )
+
+
+def _insert_profitability_job(
+    *,
+    location_id: int,
+    customer_name: str,
+    scheduled_date: str,
+    expected_hours: float | None = None,
+    revenue: float | None = None,
+    status: str = "scheduled",
+    source_key: str | None = None,
+) -> int:
+    return int(
+        db.execute_returning(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date, expected_hours,
+                revenue, notes, status, source_key
+            )
+            VALUES (%s, %s, %s, %s, %s, '', %s, %s)
+            RETURNING id
+            """,
+            (
+                location_id,
+                customer_name,
+                scheduled_date,
+                expected_hours,
+                revenue,
+                status,
+                source_key,
+            ),
+        )
+    )
+
+
+def _delete_profitability_rows(
+    *,
+    job_ids: list[int],
+    site_ids: list[int],
+) -> None:
+    if job_ids:
+        db.execute("DELETE FROM jobs WHERE id = ANY(%s)", (job_ids,))
+    if site_ids:
+        db.execute("DELETE FROM locations WHERE id = ANY(%s)", (site_ids,))
+
+
 class TestJobs:
     def test_create_job(self, client, auth, location_id):
         r = client.post("/api/admin/jobs", headers=auth, json={
@@ -1700,11 +1767,348 @@ class TestJobs:
         r2 = client.get(f"/api/admin/jobs/{job_id}", headers=auth)
         assert r2.status_code == 404
 
+    def test_calendar_owned_job_rejects_update_and_delete_without_unlinking_actuals(
+        self, client, auth, location_id, completed_shift_id
+    ):
+        job_id = int(
+            db.query_one(
+                """
+                INSERT INTO jobs (
+                    location_id, customer_name, scheduled_date, expected_hours,
+                    revenue, notes, status, source_key, source_fingerprint
+                ) VALUES (
+                    %s, 'Calendar Customer', '2026-04-04', 2.0, 100.0,
+                    'Calendar authority', 'scheduled', %s, %s
+                )
+                RETURNING id
+                """,
+                (location_id, "c" * 64, "d" * 64),
+            )["id"]
+        )
+        db.execute(
+            "UPDATE shifts SET job_id = %s WHERE id = %s",
+            (job_id, completed_shift_id),
+        )
+        original = db.query_one("SELECT * FROM jobs WHERE id = %s", (job_id,))
+        try:
+            updated = client.put(
+                f"/api/admin/jobs/{job_id}",
+                headers=auth,
+                json={
+                    "customerName": "Local override",
+                    "scheduledDate": "2026-04-05",
+                    "expectedHours": 9.0,
+                    "revenue": 999.0,
+                    "notes": "Local override",
+                    "status": "completed",
+                    "locationId": location_id,
+                },
+            )
+            deleted = client.delete(f"/api/admin/jobs/{job_id}", headers=auth)
+
+            assert updated.status_code == 409, updated.text
+            assert deleted.status_code == 409, deleted.text
+            assert updated.json()["code"] == "CALENDAR_JOB_READ_ONLY"
+            assert deleted.json()["code"] == "CALENDAR_JOB_READ_ONLY"
+            assert db.query_one("SELECT * FROM jobs WHERE id = %s", (job_id,)) == original
+            assert (
+                db.query_one(
+                    "SELECT job_id FROM shifts WHERE id = %s",
+                    (completed_shift_id,),
+                )["job_id"]
+                == job_id
+            )
+        finally:
+            db.execute(
+                "UPDATE shifts SET job_id = NULL WHERE id = %s",
+                (completed_shift_id,),
+            )
+            db.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
+
     def test_jobs_profitability(self, client, auth):
         r = client.get("/api/admin/jobs/profitability", headers=auth)
         assert r.status_code == 200, r.text
         data = r.json()
         assert "jobs" in data
+
+    def test_jobs_profitability_preserves_manual_values_and_projects_site_economics(
+        self, client, auth
+    ):
+        job_ids: list[int] = []
+        site_ids: list[int] = []
+        service_date = "2047-01-14"
+        try:
+            manual_site = _insert_profitability_site(
+                address="Profitability Contract Manual Site",
+                customer_name="Profitability Manual",
+                rate=200.00,
+                rate_type="per_visit",
+                expected_hours=8.0,
+            )
+            per_visit_site = _insert_profitability_site(
+                address="Profitability Contract Per Visit Site",
+                customer_name="Profitability Per Visit",
+                rate=125.55,
+                rate_type="per_visit",
+                expected_hours=2.75,
+            )
+            hourly_site = _insert_profitability_site(
+                address="Profitability Contract Hourly Site",
+                customer_name="Profitability Hourly",
+                rate=42.25,
+                rate_type="hourly",
+                expected_hours=3.5,
+            )
+            missing_site = _insert_profitability_site(
+                address="Profitability Contract Missing Site",
+                customer_name="Profitability Missing",
+                rate=None,
+                rate_type="per_visit",
+                expected_hours=None,
+            )
+            site_ids.extend(
+                [manual_site, per_visit_site, hourly_site, missing_site]
+            )
+
+            manual_job = _insert_profitability_job(
+                location_id=manual_site,
+                customer_name="Profitability Manual",
+                scheduled_date=service_date,
+                expected_hours=1.5,
+                revenue=75.00,
+            )
+            per_visit_job = _insert_profitability_job(
+                location_id=per_visit_site,
+                customer_name="Profitability Per Visit",
+                scheduled_date=service_date,
+                source_key="01" * 32,
+            )
+            hourly_job = _insert_profitability_job(
+                location_id=hourly_site,
+                customer_name="Profitability Hourly",
+                scheduled_date=service_date,
+                source_key="02" * 32,
+            )
+            missing_job = _insert_profitability_job(
+                location_id=missing_site,
+                customer_name="Profitability Missing",
+                scheduled_date=service_date,
+                source_key="03" * 32,
+            )
+            job_ids.extend(
+                [manual_job, per_visit_job, hourly_job, missing_job]
+            )
+
+            response = client.get(
+                "/api/admin/jobs/profitability",
+                headers=auth,
+                params={"start_date": service_date, "end_date": service_date},
+            )
+
+            assert response.status_code == 200, response.text
+            payload = response.json()
+            by_id = {row["jobId"]: row for row in payload["jobs"]}
+            assert set(by_id) == set(job_ids)
+            assert by_id[manual_job]["expectedHours"] == 1.5
+            assert by_id[manual_job]["revenue"] == 75.0
+            assert by_id[per_visit_job]["expectedHours"] == 2.75
+            assert by_id[per_visit_job]["revenue"] == 125.55
+            assert by_id[hourly_job]["expectedHours"] == 3.5
+            assert by_id[hourly_job]["revenue"] == 147.88
+            assert by_id[missing_job]["expectedHours"] is None
+            assert by_id[missing_job]["varianceHours"] is None
+            assert by_id[missing_job]["revenue"] is None
+            assert by_id[missing_job]["netProfit"] is None
+            assert by_id[missing_job]["grossMarginPct"] is None
+            assert by_id[missing_job]["laborPct"] is None
+            assert payload["summary"]["totalRevenue"] is None
+            assert payload["summary"]["totalNetProfit"] is None
+            assert payload["summary"]["grossMarginPct"] is None
+
+            stored = {
+                int(row["id"]): row
+                for row in db.query_all(
+                    """
+                    SELECT id, expected_hours, revenue
+                    FROM jobs
+                    WHERE id = ANY(%s)
+                    """,
+                    (job_ids,),
+                )
+            }
+            assert float(stored[manual_job]["expected_hours"]) == 1.5
+            assert float(stored[manual_job]["revenue"]) == 75.0
+            for source_job in (per_visit_job, hourly_job, missing_job):
+                assert stored[source_job]["expected_hours"] is None
+                assert stored[source_job]["revenue"] is None
+        finally:
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
+
+    def test_jobs_profitability_allocates_monthly_site_rate_across_full_month(
+        self, client, auth
+    ):
+        customer_name = "Profitability Monthly"
+        job_ids: list[int] = []
+        site_ids: list[int] = []
+        try:
+            site_id = _insert_profitability_site(
+                address="Profitability Contract Monthly Site",
+                customer_name=customer_name,
+                rate=100.01,
+                rate_type="monthly",
+                expected_hours=4.0,
+            )
+            site_ids.append(site_id)
+            first_job = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-02-01",
+                source_key="04" * 32,
+            )
+            cancelled_job = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-02-02",
+                status="cancelled",
+                source_key="05" * 32,
+            )
+            second_job = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-02-05",
+                source_key="06" * 32,
+            )
+            manual_job = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-02-07",
+                expected_hours=2.0,
+                revenue=25.0,
+            )
+            last_job = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-02-10",
+                source_key="07" * 32,
+            )
+            job_ids.extend(
+                [first_job, cancelled_job, second_job, manual_job, last_job]
+            )
+
+            full_month = client.get(
+                "/api/admin/jobs/profitability",
+                headers=auth,
+                params={
+                    "status": "scheduled",
+                    "customer": customer_name,
+                    "start_date": "2047-02-01",
+                    "end_date": "2047-02-28",
+                },
+            )
+
+            assert full_month.status_code == 200, full_month.text
+            payload = full_month.json()
+            by_id = {row["jobId"]: row for row in payload["jobs"]}
+            assert set(by_id) == {first_job, second_job, manual_job, last_job}
+            assert by_id[first_job]["expectedHours"] == 4.0
+            assert by_id[first_job]["revenue"] == 25.01
+            assert by_id[second_job]["revenue"] == 25.0
+            assert by_id[manual_job]["expectedHours"] == 2.0
+            assert by_id[manual_job]["revenue"] == 25.0
+            assert by_id[last_job]["revenue"] == 25.0
+            assert payload["summary"]["totalRevenue"] == 100.01
+            assert payload["summary"]["totalNetProfit"] == 100.01
+
+            filtered = client.get(
+                "/api/admin/jobs/profitability",
+                headers=auth,
+                params={
+                    "customer": customer_name,
+                    "start_date": "2047-02-10",
+                    "end_date": "2047-02-10",
+                },
+            )
+
+            assert filtered.status_code == 200, filtered.text
+            assert filtered.json()["jobs"] == [by_id[last_job]]
+            assert filtered.json()["summary"]["totalRevenue"] == 25.0
+
+            source_storage = db.query_all(
+                """
+                SELECT expected_hours, revenue
+                FROM jobs
+                WHERE id = ANY(%s)
+                """,
+                (
+                    [
+                        first_job,
+                        cancelled_job,
+                        second_job,
+                        last_job,
+                    ],
+                ),
+            )
+            assert all(
+                row["expected_hours"] is None and row["revenue"] is None
+                for row in source_storage
+            )
+        finally:
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
+
+    @pytest.mark.parametrize(
+        ("rate_type", "source_key_prefix"),
+        [
+            ("per_visit", "08"),
+            ("hourly", "09"),
+            ("monthly", "0a"),
+        ],
+    )
+    def test_jobs_profitability_zeroes_cancelled_source_revenue(
+        self, client, auth, rate_type, source_key_prefix
+    ):
+        customer_name = f"Profitability Cancelled {rate_type}"
+        job_ids: list[int] = []
+        site_ids: list[int] = []
+        try:
+            site_id = _insert_profitability_site(
+                address=f"Profitability Cancelled {rate_type} Site",
+                customer_name=customer_name,
+                rate=80.0,
+                rate_type=rate_type,
+                expected_hours=3.0,
+            )
+            site_ids.append(site_id)
+            job_id = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-03-01",
+                status="cancelled",
+                source_key=source_key_prefix * 32,
+            )
+            job_ids.append(job_id)
+
+            response = client.get(
+                "/api/admin/jobs/profitability",
+                headers=auth,
+                params={
+                    "status": "cancelled",
+                    "customer": customer_name,
+                    "start_date": "2047-03-01",
+                    "end_date": "2047-03-01",
+                },
+            )
+
+            assert response.status_code == 200, response.text
+            payload = response.json()
+            assert len(payload["jobs"]) == 1
+            assert payload["jobs"][0]["jobId"] == job_id
+            assert payload["jobs"][0]["expectedHours"] == 3.0
+            assert payload["jobs"][0]["revenue"] == 0.0
+            assert payload["jobs"][0]["netProfit"] == 0.0
+            assert payload["summary"]["totalRevenue"] == 0.0
+            assert payload["summary"]["totalNetProfit"] == 0.0
+        finally:
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
 
     def test_auto_link_jobs(self, client, auth, completed_shift_id, location_id):
         """Auto-link should run without error; returns linked count."""

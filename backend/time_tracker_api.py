@@ -23,6 +23,7 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from datetime import date, datetime, time as clock_time, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
@@ -10484,6 +10485,20 @@ def _job_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _require_manual_job_mutation(row: Dict[str, Any]) -> None:
+    if row.get("source_key") is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "CALENDAR_JOB_READ_ONLY",
+                "message": (
+                    "Calendar-owned jobs are read-only; update the Google Calendar "
+                    "occurrence instead"
+                ),
+            },
+        )
+
+
 @app.post("/api/admin/jobs")
 def admin_create_job(
     payload: JobCreateRequest,
@@ -10573,10 +10588,11 @@ def admin_auto_link_jobs(
     request: Request,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    """Auto-link only when an exact Site/date match is unambiguous."""
+    """Auto-link only when an exact Site/date and timed-window match is unambiguous."""
     jobs = db.query_all(
         """
-        SELECT j.id, j.location_id, j.customer_name, j.scheduled_date
+        SELECT j.id, j.location_id, j.customer_name, j.scheduled_date,
+               j.scheduled_start, j.scheduled_end
         FROM jobs j
         WHERE j.status != 'cancelled'
         """
@@ -10608,28 +10624,45 @@ def admin_auto_link_jobs(
                 int(row["id"])
             )
 
-    jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = {}
-    legacy_jobs_by_name_date: Dict[Tuple[str, date], List[Dict[str, Any]]] = {}
+    timed_jobs_by_site: Dict[int, List[Dict[str, Any]]] = {}
+    fallback_jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = {}
+    timed_legacy_jobs_by_name: Dict[str, List[Dict[str, Any]]] = {}
+    fallback_legacy_jobs_by_name_date: Dict[
+        Tuple[str, date], List[Dict[str, Any]]
+    ] = {}
     for job in jobs:
         scheduled_date = job.get("scheduled_date")
         if not scheduled_date:
             continue
+        scheduled_start = job.get("scheduled_start")
+        scheduled_end = job.get("scheduled_end")
+        has_valid_window = (
+            scheduled_start is not None
+            and scheduled_end is not None
+            and scheduled_end > scheduled_start
+        )
         if job.get("location_id") is not None:
-            jobs_by_site_date.setdefault(
-                (int(job["location_id"]), scheduled_date),
-                [],
-            ).append(job)
+            if has_valid_window:
+                timed_jobs_by_site.setdefault(int(job["location_id"]), []).append(job)
+            else:
+                fallback_jobs_by_site_date.setdefault(
+                    (int(job["location_id"]), scheduled_date),
+                    [],
+                ).append(job)
             continue
         normalized_name = str(job.get("customer_name") or "").strip().casefold()
         if normalized_name:
-            legacy_jobs_by_name_date.setdefault(
-                (normalized_name, scheduled_date),
-                [],
-            ).append(job)
+            if has_valid_window:
+                timed_legacy_jobs_by_name.setdefault(normalized_name, []).append(job)
+            else:
+                fallback_legacy_jobs_by_name_date.setdefault(
+                    (normalized_name, scheduled_date),
+                    [],
+                ).append(job)
 
     unlinked = db.query_all(
         """
-        SELECT s.id, s.local_date, s.location_id,
+        SELECT s.id, s.local_date, s.location_id, s.clock_in, s.clock_out,
                COALESCE(l.address, s.location_label, '') AS location
         FROM shifts s
         LEFT JOIN locations l ON s.location_id = l.id
@@ -10642,9 +10675,7 @@ def admin_auto_link_jobs(
             with conn.cursor() as cur:
                 linked = 0
                 for shift in unlinked:
-                    shift_date = shift["local_date"]
-                    if not shift_date:
-                        continue
+                    shift_date = shift.get("local_date")
                     location = str(shift.get("location") or "")
                     shift_site_id = (
                         int(shift["location_id"])
@@ -10660,16 +10691,54 @@ def admin_auto_link_jobs(
                     if shift_site_id is None and len(active_name_site_ids) == 1:
                         shift_site_id = next(iter(active_name_site_ids))
 
-                    candidates = (
-                        jobs_by_site_date.get((shift_site_id, shift_date), [])
-                        if shift_site_id is not None
+                    def eligible_candidates(
+                        timed_candidates: List[Dict[str, Any]],
+                        fallback_candidates: List[Dict[str, Any]],
+                    ) -> List[Dict[str, Any]]:
+                        eligible_by_id = {
+                            int(job["id"]): job
+                            for job in timed_candidates
+                            if (
+                                job["scheduled_start"] < shift["clock_out"]
+                                and job["scheduled_end"] > shift["clock_in"]
+                            )
+                        }
+                        for job in fallback_candidates:
+                            eligible_by_id[int(job["id"])] = job
+                        return list(eligible_by_id.values())
+
+                    site_fallback_candidates = (
+                        fallback_jobs_by_site_date.get(
+                            (shift_site_id, shift_date),
+                            [],
+                        )
+                        if shift_site_id is not None and shift_date is not None
                         else []
+                    )
+                    candidates = eligible_candidates(
+                        (
+                            timed_jobs_by_site.get(shift_site_id, [])
+                            if shift_site_id is not None
+                            else []
+                        ),
+                        site_fallback_candidates,
                     )
                     if not candidates and len(active_name_site_ids) == 1:
                         if shift_site_id in active_name_site_ids:
-                            candidates = legacy_jobs_by_name_date.get(
-                                (normalized_customer, shift_date),
-                                [],
+                            legacy_fallback_candidates = (
+                                fallback_legacy_jobs_by_name_date.get(
+                                    (normalized_customer, shift_date),
+                                    [],
+                                )
+                                if shift_date is not None
+                                else []
+                            )
+                            candidates = eligible_candidates(
+                                timed_legacy_jobs_by_name.get(
+                                    normalized_customer,
+                                    [],
+                                ),
+                                legacy_fallback_candidates,
                             )
                     if len(candidates) != 1:
                         continue
@@ -10682,6 +10751,133 @@ def admin_auto_link_jobs(
 
     append_access_log(request, "JOBS_AUTO_LINKED", True, f"{linked} shifts auto-linked")
     return {"success": True, "linkedCount": linked}
+
+
+def _profitability_nonnegative_decimal(value: Any) -> Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    return amount
+
+
+def _profitability_money_cents(value: Any) -> Optional[int]:
+    amount = _profitability_nonnegative_decimal(value)
+    if amount is None:
+        return None
+    quantized = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return int((quantized * 100).to_integral_value())
+
+
+def _source_job_profitability_economics(
+    rows: List[Dict[str, Any]],
+) -> Dict[int, Dict[str, Any]]:
+    economics: Dict[int, Dict[str, Any]] = {}
+    monthly_group_for_job: Dict[int, Tuple[int, int, int]] = {}
+    monthly_rates: Dict[Tuple[int, int, int], int] = {}
+
+    for row in rows:
+        if row.get("source_key") is None:
+            continue
+        job_id = int(row["id"])
+        expected = _profitability_nonnegative_decimal(
+            row.get("site_expected_hours")
+        )
+        rate_cents = _profitability_money_cents(row.get("site_rate"))
+        rate_type = str(row.get("site_rate_type") or "")
+        site_id = row.get("site_id")
+        revenue_cents: Optional[int] = None
+
+        if row.get("status") == "cancelled":
+            revenue_cents = 0
+        elif site_id is not None and rate_cents is not None:
+            if rate_type == "per_visit":
+                revenue_cents = rate_cents
+            elif rate_type == "hourly" and expected is not None:
+                revenue_cents = int(
+                    (Decimal(rate_cents) * expected).quantize(
+                        Decimal("1"),
+                        rounding=ROUND_HALF_UP,
+                    )
+                )
+            elif rate_type == "monthly":
+                scheduled_date = row["scheduled_date"]
+                group = (
+                    int(site_id),
+                    scheduled_date.year,
+                    scheduled_date.month,
+                )
+                monthly_group_for_job[job_id] = group
+                monthly_rates[group] = rate_cents
+
+        economics[job_id] = {
+            "expected_hours": float(expected) if expected is not None else None,
+            "revenue_cents": revenue_cents,
+        }
+
+    if not monthly_rates:
+        return economics
+
+    month_starts = [date(year, month, 1) for _, year, month in monthly_rates]
+    month_ends = [
+        date(year, month, calendar.monthrange(year, month)[1])
+        for _, year, month in monthly_rates
+    ]
+    candidate_rows = db.query_all(
+        """
+        SELECT id, location_id, scheduled_date, scheduled_start
+        FROM jobs
+        WHERE status <> 'cancelled'
+          AND location_id = ANY(%s)
+          AND scheduled_date BETWEEN %s AND %s
+        ORDER BY scheduled_date, scheduled_start NULLS FIRST, id
+        """,
+        (
+            sorted({group[0] for group in monthly_rates}),
+            min(month_starts),
+            max(month_ends),
+        ),
+    )
+    candidates_by_group: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = {}
+    for candidate in candidate_rows:
+        scheduled_date = candidate["scheduled_date"]
+        group = (
+            int(candidate["location_id"]),
+            scheduled_date.year,
+            scheduled_date.month,
+        )
+        if group in monthly_rates:
+            candidates_by_group.setdefault(group, []).append(candidate)
+
+    app_timezone = ZoneInfo(TIMEZONE_NAME)
+    allocations_by_group: Dict[Tuple[int, int, int], Dict[int, int]] = {}
+    for group, candidates in candidates_by_group.items():
+        ordered = sorted(
+            candidates,
+            key=lambda row: (
+                row.get("scheduled_start")
+                or datetime.combine(
+                    row["scheduled_date"],
+                    clock_time.min,
+                    tzinfo=app_timezone,
+                ).astimezone(timezone.utc),
+                int(row["id"]),
+            ),
+        )
+        allocations_by_group[group] = allocate_monthly_cents(
+            monthly_rates[group],
+            (int(row["id"]) for row in ordered),
+        )
+
+    for job_id, group in monthly_group_for_job.items():
+        economics[job_id]["revenue_cents"] = allocations_by_group.get(
+            group, {}
+        ).get(job_id)
+    return economics
 
 
 @app.get("/api/admin/jobs/profitability")
@@ -10708,20 +10904,23 @@ def admin_jobs_profitability(
     if end_date:
         clauses.append("j.scheduled_date <= %s")
         params.append(end_date)
-
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
     rows = db.query_all(
         f"""
-        SELECT j.id, j.customer_name, j.scheduled_date, j.expected_hours,
-               j.revenue, j.status, j.notes,
+        SELECT j.id, j.location_id, j.customer_name, j.scheduled_date,
+               j.expected_hours, j.revenue, j.status, j.notes, j.source_key,
+               l.id AS site_id, l.rate AS site_rate,
+               l.rate_type AS site_rate_type,
+               l.expected_hours AS site_expected_hours,
                COALESCE(SUM(s.total_hours), 0) AS actual_hours,
                COUNT(DISTINCT s.employee_id) AS employee_count,
                COUNT(s.id) AS shift_count
         FROM jobs j
+        LEFT JOIN locations l ON l.id = j.location_id
         LEFT JOIN shifts s ON s.job_id = j.id AND s.clock_out IS NOT NULL
         {where}
-        GROUP BY j.id
+        GROUP BY j.id, l.id
         ORDER BY j.scheduled_date DESC, j.id DESC
         """,
         tuple(params),
@@ -10749,16 +10948,34 @@ def admin_jobs_profitability(
                 emp_rates.get(sd["employee_id"], 0.0) * float(sd["total_hours"] or 0)
             )
 
+    source_economics = _source_job_profitability_economics(rows)
     jobs_out = []
     total_rev = 0.0
     total_labor = 0.0
     total_hours = 0.0
+    source_revenue_incomplete = False
     for r in rows:
         labor_cost = labor_by_job.get(r["id"], 0.0)
-        rev = float(r["revenue"] or 0)
+        if r.get("source_key") is not None:
+            economics = source_economics[int(r["id"])]
+            exp_h = economics["expected_hours"]
+            revenue_cents = economics["revenue_cents"]
+            rev = (
+                float(Decimal(revenue_cents) / Decimal(100))
+                if revenue_cents is not None
+                else None
+            )
+            if rev is None:
+                source_revenue_incomplete = True
+        else:
+            exp_h = (
+                float(r["expected_hours"])
+                if r["expected_hours"] is not None
+                else None
+            )
+            rev = float(r["revenue"] or 0)
         hours = float(r["actual_hours"] or 0)
-        net = round(rev - labor_cost, 2)
-        exp_h = float(r["expected_hours"]) if r["expected_hours"] is not None else None
+        net = round(rev - labor_cost, 2) if rev is not None else None
 
         jobs_out.append({
             "jobId": r["id"],
@@ -10768,28 +10985,50 @@ def admin_jobs_profitability(
             "expectedHours": exp_h,
             "actualHours": round(hours, 2),
             "varianceHours": round(exp_h - hours, 2) if exp_h is not None else None,
-            "revenue": round(rev, 2),
+            "revenue": round(rev, 2) if rev is not None else None,
             "laborCost": round(labor_cost, 2),
             "netProfit": net,
-            "grossMarginPct": round(net / rev * 100, 1) if rev > 0 else None,
-            "laborPct": round(labor_cost / rev * 100, 1) if rev > 0 else None,
+            "grossMarginPct": (
+                round(net / rev * 100, 1)
+                if rev is not None and rev > 0 and net is not None
+                else None
+            ),
+            "laborPct": (
+                round(labor_cost / rev * 100, 1)
+                if rev is not None and rev > 0
+                else None
+            ),
             "employeeCount": r["employee_count"],
             "shiftCount": r["shift_count"],
         })
 
-        total_rev += rev
+        if rev is not None:
+            total_rev += rev
         total_labor += labor_cost
         total_hours += hours
 
-    total_net = round(total_rev - total_labor, 2)
+    total_revenue = None if source_revenue_incomplete else round(total_rev, 2)
+    total_net = (
+        None
+        if source_revenue_incomplete
+        else round(total_rev - total_labor, 2)
+    )
     return {
         "success": True,
         "summary": {
             "jobCount": len(jobs_out),
-            "totalRevenue": round(total_rev, 2),
+            "totalRevenue": total_revenue,
             "totalLaborCost": round(total_labor, 2),
             "totalNetProfit": total_net,
-            "grossMarginPct": round(total_net / total_rev * 100, 1) if total_rev > 0 else None,
+            "grossMarginPct": (
+                round(total_net / total_rev * 100, 1)
+                if (
+                    total_net is not None
+                    and total_revenue is not None
+                    and total_rev > 0
+                )
+                else None
+            ),
             "totalHours": round(total_hours, 2),
         },
         "jobs": jobs_out,
@@ -10860,52 +11099,68 @@ def admin_update_job(
     request: Request,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    existing = db.query_one("SELECT * FROM jobs WHERE id = %s", (job_id,))
-    if not existing:
-        raise HTTPException(status_code=404, detail="Job not found")
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM jobs WHERE id = %s FOR UPDATE", (job_id,))
+            existing = cur.fetchone()
+            if not existing:
+                raise HTTPException(status_code=404, detail="Job not found")
+            _require_manual_job_mutation(existing)
 
-    sets = []
-    params: list = []
-    if payload.customerName is not None:
-        sets.append("customer_name = %s")
-        params.append(payload.customerName.strip())
-    if payload.scheduledDate is not None:
-        try:
-            datetime.strptime(payload.scheduledDate, "%Y-%m-%d")
-        except ValueError:
-            raise HTTPException(status_code=400, detail="scheduledDate must be YYYY-MM-DD")
-        sets.append("scheduled_date = %s")
-        params.append(payload.scheduledDate)
-    if payload.expectedHours is not None:
-        if payload.expectedHours < 0:
-            raise HTTPException(status_code=400, detail="expectedHours cannot be negative")
-        sets.append("expected_hours = %s")
-        params.append(payload.expectedHours)
-    if payload.revenue is not None:
-        if payload.revenue < 0:
-            raise HTTPException(status_code=400, detail="revenue cannot be negative")
-        sets.append("revenue = %s")
-        params.append(payload.revenue)
-    if payload.notes is not None:
-        sets.append("notes = %s")
-        params.append(payload.notes)
-    if payload.status is not None:
-        if payload.status not in ("scheduled", "in_progress", "completed", "cancelled"):
-            raise HTTPException(status_code=400, detail="Invalid status")
-        sets.append("status = %s")
-        params.append(payload.status)
-    if payload.locationId is not None:
-        sets.append("location_id = %s")
-        params.append(payload.locationId)
+            sets = []
+            params: list = []
+            if payload.customerName is not None:
+                sets.append("customer_name = %s")
+                params.append(payload.customerName.strip())
+            if payload.scheduledDate is not None:
+                try:
+                    datetime.strptime(payload.scheduledDate, "%Y-%m-%d")
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="scheduledDate must be YYYY-MM-DD"
+                    )
+                sets.append("scheduled_date = %s")
+                params.append(payload.scheduledDate)
+            if payload.expectedHours is not None:
+                if payload.expectedHours < 0:
+                    raise HTTPException(
+                        status_code=400, detail="expectedHours cannot be negative"
+                    )
+                sets.append("expected_hours = %s")
+                params.append(payload.expectedHours)
+            if payload.revenue is not None:
+                if payload.revenue < 0:
+                    raise HTTPException(
+                        status_code=400, detail="revenue cannot be negative"
+                    )
+                sets.append("revenue = %s")
+                params.append(payload.revenue)
+            if payload.notes is not None:
+                sets.append("notes = %s")
+                params.append(payload.notes)
+            if payload.status is not None:
+                if payload.status not in (
+                    "scheduled",
+                    "in_progress",
+                    "completed",
+                    "cancelled",
+                ):
+                    raise HTTPException(status_code=400, detail="Invalid status")
+                sets.append("status = %s")
+                params.append(payload.status)
+            if payload.locationId is not None:
+                sets.append("location_id = %s")
+                params.append(payload.locationId)
 
-    if not sets:
-        raise HTTPException(status_code=400, detail="No fields to update")
+            if not sets:
+                raise HTTPException(status_code=400, detail="No fields to update")
 
-    params.append(job_id)
-    row = db.query_one(
-        f"UPDATE jobs SET {', '.join(sets)} WHERE id = %s RETURNING *",
-        tuple(params),
-    )
+            params.append(job_id)
+            cur.execute(
+                f"UPDATE jobs SET {', '.join(sets)} WHERE id = %s RETURNING *",
+                tuple(params),
+            )
+            row = cur.fetchone()
     append_access_log(request, "JOB_UPDATED", True, f"Job {job_id}")
     return {"success": True, "job": _job_row_to_dict(row)}
 
@@ -10917,13 +11172,17 @@ def admin_delete_job(
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     """Delete a job. Unlinks any associated shifts first."""
-    existing = db.query_one("SELECT id FROM jobs WHERE id = %s", (job_id,))
-    if not existing:
-        raise HTTPException(status_code=404, detail="Job not found")
-
     with TIMESHEET_WRITE_LOCK:
         with db.get_conn() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, source_key FROM jobs WHERE id = %s FOR UPDATE",
+                    (job_id,),
+                )
+                existing = cur.fetchone()
+                if not existing:
+                    raise HTTPException(status_code=404, detail="Job not found")
+                _require_manual_job_mutation(existing)
                 cur.execute("UPDATE shifts SET job_id = NULL WHERE job_id = %s", (job_id,))
                 cur.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
 
@@ -11617,6 +11876,19 @@ def admin_analytics_customer(
         "byVisit": visits_list_sorted,
         "byWeek": by_week,
     }
+
+
+# Canonical operational Schedule and Forecast are read-only projections over
+# jobs and existing time evidence.  Their focused router deliberately has no
+# access to timekeeping mutation helpers.
+from operations_schedule import allocate_monthly_cents, build_operations_schedule_router
+
+app.include_router(
+    build_operations_schedule_router(
+        get_current_admin=get_current_admin,
+        timezone_name=TIMEZONE_NAME,
+    )
+)
 
 
 # Calendar import routes are registered through a focused factory so protocol,

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import logging
+from threading import Event
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import psycopg2.extras
 import pytest
 
 import calendar_import_api as calendar_api
@@ -34,6 +37,8 @@ REAL_PREVIEW_WINDOW_BOUNDS = calendar_api._preview_window_bounds
 
 class FakeGoogleClient:
     occurrences: list[CalendarOccurrence] = []
+    occurrences_by_calendar: dict[str, list[CalendarOccurrence]] = {}
+    occurrence_errors_by_calendar: dict[str, Exception] = {}
     targeted_occurrences: dict[str, CalendarOccurrence | None] = {}
     targeted_recurring_occurrences: dict[
         tuple[str, str], CalendarOccurrence | None
@@ -103,8 +108,13 @@ class FakeGoogleClient:
         assert access_token in {"access-secret", "refreshed-secret"}
         return list(self.calendars)
 
-    def list_occurrences(self, **_: object) -> list[CalendarOccurrence]:
-        return list(self.occurrences)
+    def list_occurrences(
+        self, *, calendar_id: str, **_: object
+    ) -> list[CalendarOccurrence]:
+        error = self.occurrence_errors_by_calendar.get(calendar_id)
+        if error is not None:
+            raise error
+        return list(self.occurrences_by_calendar.get(calendar_id, self.occurrences))
 
     def get_occurrence(self, *, event_id: str, **_: object) -> CalendarOccurrence:
         occurrence = self.targeted_occurrences.get(event_id)
@@ -168,6 +178,7 @@ def google_occurrence(
     updated: str = "2026-07-18T12:00:00Z",
     recurring_event_id: str | None = None,
     original_start: datetime | None = None,
+    calendar_id: str = "operations@example.test",
 ) -> CalendarOccurrence:
     raw: dict[str, object] = {"id": event_id}
     if recurring_event_id is not None:
@@ -175,8 +186,8 @@ def google_occurrence(
     if original_start is not None:
         raw["originalStartTime"] = {"dateTime": original_start.isoformat()}
     return CalendarOccurrence(
-        source_key=stable_occurrence_identity("operations@example.test", raw),
-        calendar_id="operations@example.test",
+        source_key=stable_occurrence_identity(calendar_id, raw),
+        calendar_id=calendar_id,
         event_id=event_id,
         recurring_event_id=recurring_event_id,
         original_start=original_start.isoformat() if original_start else None,
@@ -233,6 +244,8 @@ def isolated_calendar_domain(monkeypatch):
         ),
     )
     FakeGoogleClient.occurrences = []
+    FakeGoogleClient.occurrences_by_calendar = {}
+    FakeGoogleClient.occurrence_errors_by_calendar = {}
     FakeGoogleClient.targeted_occurrences = {}
     FakeGoogleClient.targeted_recurring_occurrences = {}
     FakeGoogleClient.calendars = [
@@ -263,9 +276,18 @@ def isolated_calendar_domain(monkeypatch):
                 DELETE FROM google_calendar_event_mappings;
                 DELETE FROM calendar_import_previews;
                 DELETE FROM google_calendar_oauth_states;
+                DELETE FROM shifts
+                WHERE notes = 'canonical-calendar-test-evidence';
+                DELETE FROM jobs WHERE source_key IS NOT NULL;
+                DELETE FROM google_calendar_sources;
                 DELETE FROM google_calendar_connections;
                 DELETE FROM crew_memberships;
-                DELETE FROM locations WHERE address = '456 Oak St, Effingham';
+                DELETE FROM locations
+                WHERE address IN (
+                    '456 Oak St, Effingham', '789 Pine St, Effingham'
+                );
+                UPDATE locations SET location_type = NULL
+                WHERE address = '123 Main St, Effingham';
                 DELETE FROM employees WHERE name IN (
                     'Carmen Alvarez', 'Pamela Brown', 'Tina Davis',
                     'Carmen Duplicate'
@@ -304,9 +326,18 @@ def isolated_calendar_domain(monkeypatch):
                 DELETE FROM google_calendar_event_mappings;
                 DELETE FROM calendar_import_previews;
                 DELETE FROM google_calendar_oauth_states;
+                DELETE FROM shifts
+                WHERE notes = 'canonical-calendar-test-evidence';
+                DELETE FROM jobs WHERE source_key IS NOT NULL;
+                DELETE FROM google_calendar_sources;
                 DELETE FROM google_calendar_connections;
                 DELETE FROM crew_memberships;
-                DELETE FROM locations WHERE address = '456 Oak St, Effingham';
+                DELETE FROM locations
+                WHERE address IN (
+                    '456 Oak St, Effingham', '789 Pine St, Effingham'
+                );
+                UPDATE locations SET location_type = NULL
+                WHERE address = '123 Main St, Effingham';
                 DELETE FROM employees WHERE name IN (
                     'Carmen Alvarez', 'Pamela Brown', 'Tina Davis',
                     'Carmen Duplicate'
@@ -355,6 +386,65 @@ def connect_selected_calendar() -> int:
     return connection_id
 
 
+def configure_canonical_sources(client, auth) -> dict[str, dict[str, object]]:
+    connection_id = connect_unselected_calendar()
+    FakeGoogleClient.calendars = [
+        CalendarSummary(
+            calendar_id="residential@example.test",
+            summary="Residential Calendar",
+            primary=False,
+            selected=True,
+            access_role="owner",
+            time_zone="America/Chicago",
+        ),
+        CalendarSummary(
+            calendar_id="commercial@example.test",
+            summary="Commercial Calendar",
+            primary=False,
+            selected=True,
+            access_role="reader",
+            time_zone="America/Chicago",
+        ),
+    ]
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE locations
+                SET location_type = 'Residential'
+                WHERE address = '123 Main St, Effingham'
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO locations (
+                    address, customer_name, location_type, rate, rate_type,
+                    expected_hours, active
+                ) VALUES (
+                    '456 Oak St, Effingham', 'Commercial Customer',
+                    'Commercial', 250.00, 'per_visit', 5.0, true
+                )
+                ON CONFLICT (address) DO UPDATE
+                SET customer_name = EXCLUDED.customer_name,
+                    location_type = EXCLUDED.location_type,
+                    active = true
+                """
+            )
+    configured = client.put(
+        "/api/admin/google-calendar/sources",
+        headers=auth,
+        json={
+            "residentialMorningCalendarId": "residential@example.test",
+            "commercialEveningNightCalendarId": "commercial@example.test",
+        },
+    )
+    assert configured.status_code == 200, configured.text
+    rows = configured.json()["sources"]
+    assert {row["role"] for row in rows} == set(store.CALENDAR_SOURCE_ROLES)
+    assert all(row["connectionId"] == connection_id for row in rows)
+    return {row["role"]: row for row in rows}
+
+
 def calendar_import_config(**overrides: object) -> calendar_api.CalendarImportConfig:
     values: dict[str, object] = {
         "client_id": "test-google-client",
@@ -392,6 +482,28 @@ def calendar_import_test_client(
         ("get", "/api/admin/google-calendar/status", None),
         ("post", "/api/admin/google-calendar/connect", {}),
         ("get", "/api/admin/google-calendar/calendars", None),
+        (
+            "put",
+            "/api/admin/google-calendar/sources",
+            {
+                "residentialMorningCalendarId": "residential@example.test",
+                "commercialEveningNightCalendarId": "commercial@example.test",
+            },
+        ),
+        ("post", "/api/admin/google-calendar/sync", {}),
+        (
+            "put",
+            "/api/admin/google-calendar/mappings",
+            {
+                "sourceId": 1,
+                "sourceKey": "a" * 64,
+                "sourceFingerprint": "b" * 64,
+                "eventId": "event",
+                "seriesId": "event",
+                "occurrenceId": "event",
+                "locationId": 1,
+            },
+        ),
         ("delete", "/api/admin/google-calendar/connection", None),
         ("get", "/api/admin/planned-visits/crews", None),
         ("post", "/api/admin/google-calendar/preview", {"resolutions": []}),
@@ -695,6 +807,10 @@ def test_status_calendar_selection_and_morning_crew_resolution(client, auth):
         "selectedCalendarId": None,
         "selectedCalendarName": None,
         "selectedCalendarTimeZone": None,
+        "capabilityVersion": "canonical-schedule.v1",
+        "sourcesReady": False,
+        "syncStatus": "disconnected",
+        "sources": [],
     }
 
     connection_id = connect_selected_calendar()
@@ -1054,6 +1170,90 @@ def test_reauthorization_failure_retains_connection_without_revoking_uncertain_g
     )
     # Calendar-only OAuth exposes no stable principal identifier. Revoking this
     # token could revoke the retained grant if the account's email was renamed.
+    assert FakeGoogleClient.revoked_tokens == []
+
+
+@pytest.mark.parametrize("unreadable_role", store.CALENDAR_SOURCE_ROLES)
+@pytest.mark.parametrize("unreadable_access_role", ["freeBusyReader", ""])
+def test_reauthorization_rejects_configured_calendars_without_readable_roles(
+    client, auth, unreadable_role, unreadable_access_role
+):
+    configured = configure_canonical_sources(client, auth)
+    connection = store.active_connection()
+    connection_id = int(connection["id"])
+    retained_version = int(connection["credential_version"])
+    retained_ciphertext = db.query_one(
+        "SELECT credential_ciphertext FROM google_calendar_connections WHERE id = %s",
+        (connection_id,),
+    )["credential_ciphertext"]
+    retained_sources = db.query_all(
+        """
+        SELECT role, calendar_id, connection_id
+        FROM google_calendar_sources
+        WHERE connection_id = %s
+        ORDER BY role
+        """,
+        (connection_id,),
+    )
+    started = client.post("/api/admin/google-calendar/connect", headers=auth).json()
+    state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
+    FakeGoogleClient.calendars = [
+        CalendarSummary(
+            calendar_id=str(source["calendarId"]),
+            summary=str(source["calendarName"]),
+            primary=index == 0,
+            selected=True,
+            access_role=(
+                unreadable_access_role
+                if source["role"] == unreadable_role
+                else "owner"
+            ),
+            time_zone="America/Chicago",
+        )
+        for index, source in enumerate(configured.values())
+    ]
+    FakeGoogleClient.exchange_refresh_token = "unreadable-refresh"
+
+    callback = client.get(
+        "/api/google-calendar/oauth/callback",
+        params={"state": state, "code": "unreadable-calendar-grant"},
+        follow_redirects=False,
+    )
+
+    assert callback.status_code == 303
+    assert callback.headers["location"].endswith("calendarImport=error")
+    active = store.active_connection()
+    assert int(active["id"]) == connection_id
+    assert int(active["credential_version"]) == retained_version
+    assert (
+        db.query_one(
+            "SELECT credential_ciphertext FROM google_calendar_connections WHERE id = %s",
+            (connection_id,),
+        )["credential_ciphertext"]
+        == retained_ciphertext
+    )
+    assert (
+        db.query_all(
+            """
+            SELECT role, calendar_id, connection_id
+            FROM google_calendar_sources
+            WHERE connection_id = %s
+            ORDER BY role
+            """,
+            (connection_id,),
+        )
+        == retained_sources
+    )
+    assert (
+        db.query_one(
+            """
+            SELECT COUNT(*) AS n
+            FROM planned_visit_audit_events
+            WHERE action = 'calendar_reauthorized'
+            """
+        )["n"]
+        == 0
+    )
     assert FakeGoogleClient.revoked_tokens == []
 
 
@@ -1508,7 +1708,8 @@ def test_retryable_google_not_found_maps_to_retryable_service_response(client):
 
 def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, auth):
     connect_selected_calendar()
-    FakeGoogleClient.occurrences = [google_occurrence("service-1")]
+    raw_occurrence = google_occurrence("service-1")
+    FakeGoogleClient.occurrences = [raw_occurrence]
     evidence_before = {
         "shifts": db.query_one("SELECT COUNT(*) AS n FROM shifts")["n"],
         "checkins": db.query_one("SELECT COUNT(*) AS n FROM site_check_ins")["n"],
@@ -1549,6 +1750,21 @@ def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, aut
     assert retry.status_code == 200
     assert retry.json() == approved.json()
     assert db.query_one("SELECT COUNT(*) AS n FROM planned_service_visits")["n"] == 1
+    expected_fingerprint = calendar_api.occurrence_fingerprint(
+        calendar_api._source_occurrence(raw_occurrence)
+    )
+    assert db.query_one(
+        """
+        SELECT mapping.source_fingerprint AS mapping_fingerprint,
+               visit.source_fingerprint AS visit_fingerprint
+        FROM planned_service_visits AS visit
+        JOIN google_calendar_event_mappings AS mapping
+          ON mapping.id = visit.mapping_id
+        """
+    ) == {
+        "mapping_fingerprint": expected_fingerprint,
+        "visit_fingerprint": expected_fingerprint,
+    }
     assert (
         db.query_one(
             "SELECT COUNT(*) AS n FROM planned_visit_assignments WHERE active = true"
@@ -1569,6 +1785,143 @@ def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, aut
         )["n"],
     }
     assert evidence_after == evidence_before
+
+
+def test_retained_mapping_fingerprint_backfill_is_guarded_and_idempotent(
+    client, auth
+):
+    sources = configure_canonical_sources(client, auth)
+    source = sources[store.RESIDENTIAL_MORNING_ROLE]
+    connection_id = int(source["connectionId"])
+    source_id = int(source["id"])
+    calendar_id = str(source["calendarId"])
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    safe = calendar_api._source_occurrence(
+        google_occurrence("safe-null-mapping", calendar_id=calendar_id)
+    )
+    changed = calendar_api._source_occurrence(
+        google_occurrence("changed-null-mapping", calendar_id=calendar_id)
+    )
+    orphan = calendar_api._source_occurrence(
+        google_occurrence("orphan-null-mapping", calendar_id=calendar_id)
+    )
+
+    def insert_null_mapping(occurrence):
+        return int(
+            db.query_one(
+                """
+                INSERT INTO google_calendar_event_mappings (
+                    connection_id, calendar_id, source_key, source_series_id,
+                    mapping_scope, source_fingerprint, location_id,
+                    created_by, updated_by
+                ) VALUES (%s, %s, %s, %s, 'occurrence', NULL, %s, 1, 1)
+                RETURNING id
+                """,
+                (
+                    connection_id,
+                    calendar_id,
+                    occurrence.source_key,
+                    occurrence.series_id,
+                    location_id,
+                ),
+            )["id"]
+        )
+
+    safe_mapping_id = insert_null_mapping(safe)
+    changed_mapping_id = insert_null_mapping(changed)
+    insert_null_mapping(orphan)
+    safe_fingerprint = calendar_api.occurrence_fingerprint(safe)
+    changed_visit_fingerprint = calendar_api.occurrence_fingerprint(changed)
+    changed_job_fingerprint = "f" * 64
+    assert changed_job_fingerprint != changed_visit_fingerprint
+    changed_job_id = int(
+        db.query_one(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date,
+                scheduled_start, scheduled_end, status, calendar_source_id,
+                source_calendar_id, source_event_id, source_series_id,
+                source_occurrence_id, source_key, source_fingerprint
+            ) VALUES (
+                %s, 'Changed fingerprint proof', %s, %s, %s, 'scheduled', %s,
+                %s, %s, %s, %s, %s, %s
+            )
+            RETURNING id
+            """,
+            (
+                location_id,
+                changed.service_date,
+                changed.starts_at,
+                changed.ends_at,
+                source_id,
+                calendar_id,
+                changed.event_id,
+                changed.series_id,
+                changed.occurrence_id,
+                changed.source_key,
+                changed_job_fingerprint,
+            ),
+        )["id"]
+    )
+
+    for occurrence, mapping_id, fingerprint, migrated_job_id in (
+        (safe, safe_mapping_id, safe_fingerprint, None),
+        (
+            changed,
+            changed_mapping_id,
+            changed_visit_fingerprint,
+            changed_job_id,
+        ),
+    ):
+        db.execute(
+            """
+            INSERT INTO planned_service_visits (
+                connection_id, mapping_id, source_calendar_id, source_event_id,
+                source_series_id, source_occurrence_id, source_key,
+                source_fingerprint, title, location_id, approximate_start,
+                approximate_end, source_timezone, migrated_job_id
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                connection_id,
+                mapping_id,
+                calendar_id,
+                occurrence.event_id,
+                occurrence.series_id,
+                occurrence.occurrence_id,
+                occurrence.source_key,
+                fingerprint,
+                occurrence.title,
+                location_id,
+                occurrence.starts_at,
+                occurrence.ends_at,
+                occurrence.time_zone,
+                migrated_job_id,
+            ),
+        )
+
+    assert store._backfill_retained_mapping_fingerprints() == 1
+    assert {
+        row["source_key"]: row["source_fingerprint"]
+        for row in db.query_all(
+            """
+            SELECT source_key, source_fingerprint
+            FROM google_calendar_event_mappings
+            ORDER BY source_key
+            """
+        )
+    } == {
+        safe.source_key: safe_fingerprint,
+        changed.source_key: None,
+        orphan.source_key: None,
+    }
+    assert store._backfill_retained_mapping_fingerprints() == 0
 
 
 def test_source_change_after_preview_fails_closed_without_planned_write(client, auth):
@@ -1959,13 +2312,12 @@ def test_future_update_and_cancellation_preserve_rows_and_assignment_history(
     )["id"]
 
     moved_start = WINDOW_START + timedelta(hours=1)
-    FakeGoogleClient.occurrences = [
-        google_occurrence(
-            "lifecycle-1",
-            start=moved_start,
-            updated="2026-07-18T13:00:00Z",
-        )
-    ]
+    moved_occurrence = google_occurrence(
+        "lifecycle-1",
+        start=moved_start,
+        updated="2026-07-18T13:00:00Z",
+    )
+    FakeGoogleClient.occurrences = [moved_occurrence]
     preview = client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
@@ -1980,6 +2332,13 @@ def test_future_update_and_cancellation_preserve_rows_and_assignment_history(
         )["approximate_start"]
         == moved_start
     )
+    assert db.query_one(
+        "SELECT source_fingerprint FROM google_calendar_event_mappings"
+    ) == {
+        "source_fingerprint": calendar_api.occurrence_fingerprint(
+            calendar_api._source_occurrence(moved_occurrence)
+        )
+    }
 
     FakeGoogleClient.occurrences = [
         google_occurrence("lifecycle-1", cancelled=True, updated="2026-07-18T14:00:00Z")
@@ -2663,3 +3022,3359 @@ def test_recurring_occurrence_location_decisions_do_not_overwrite_each_other(
     assert items[first.source_key]["location"]["locationId"] == first_location_id
     assert items[second.source_key]["classification"] == "unchanged"
     assert items[second.source_key]["location"]["locationId"] == second_location_id
+
+
+def test_canonical_sources_are_distinct_readable_and_reported_in_status(client, auth):
+    connect_unselected_calendar()
+    FakeGoogleClient.calendars = [
+        CalendarSummary(
+            calendar_id="residential@example.test",
+            summary="Residential Calendar",
+            primary=False,
+            selected=True,
+            access_role="owner",
+            time_zone="America/Chicago",
+        ),
+        CalendarSummary(
+            calendar_id="commercial@example.test",
+            summary="Commercial Calendar",
+            primary=False,
+            selected=True,
+            access_role="reader",
+            time_zone="America/Chicago",
+        ),
+    ]
+
+    duplicate = client.put(
+        "/api/admin/google-calendar/sources",
+        headers=auth,
+        json={
+            "residentialMorningCalendarId": "residential@example.test",
+            "commercialEveningNightCalendarId": "residential@example.test",
+        },
+    )
+    assert duplicate.status_code == 422
+    assert store.list_calendar_sources() == []
+
+    unavailable = client.put(
+        "/api/admin/google-calendar/sources",
+        headers=auth,
+        json={
+            "residentialMorningCalendarId": "residential@example.test",
+            "commercialEveningNightCalendarId": "missing@example.test",
+        },
+    )
+    assert unavailable.status_code == 422
+    assert store.list_calendar_sources() == []
+
+    configured = client.put(
+        "/api/admin/google-calendar/sources",
+        headers=auth,
+        json={
+            "residentialMorningCalendarId": "residential@example.test",
+            "commercialEveningNightCalendarId": "commercial@example.test",
+        },
+    )
+    assert configured.status_code == 200, configured.text
+    assert configured.json()["sourcesReady"] is True
+
+    status = client.get("/api/admin/google-calendar/status", headers=auth).json()
+    assert status["capabilityVersion"] == "canonical-schedule.v1"
+    assert status["sourcesReady"] is True
+    assert status["syncStatus"] == "never"
+    assert {source["role"] for source in status["sources"]} == set(
+        store.CALENDAR_SOURCE_ROLES
+    )
+    assert status["selectedCalendarId"] == "residential@example.test"
+
+
+def test_status_downgrades_success_when_a_canonical_sync_window_is_stale(
+    client, auth, monkeypatch
+):
+    configure_canonical_sources(client, auth)
+    required_start = WINDOW_START - timedelta(days=14)
+    required_end = WINDOW_START + timedelta(days=90)
+    monkeypatch.setattr(
+        calendar_api,
+        "_canonical_sync_window",
+        lambda _time_zone_name: (required_start, required_end),
+    )
+    db.execute(
+        """
+        UPDATE google_calendar_sources
+        SET last_sync_status = 'success',
+            last_sync_window_start = %s,
+            last_sync_window_end = %s
+        """,
+        (required_start, required_end),
+    )
+
+    current = client.get("/api/admin/google-calendar/status", headers=auth)
+
+    assert current.status_code == 200, current.text
+    assert current.json()["syncStatus"] == "success"
+
+    residential_source_id = int(
+        next(
+            source["id"]
+            for source in current.json()["sources"]
+            if source["role"] == store.RESIDENTIAL_MORNING_ROLE
+        )
+    )
+    db.execute(
+        """
+        UPDATE google_calendar_sources
+        SET last_sync_window_end = %s
+        WHERE id = %s
+        """,
+        (required_end - timedelta(microseconds=1), residential_source_id),
+    )
+
+    stale = client.get("/api/admin/google-calendar/status", headers=auth)
+
+    assert stale.status_code == 200, stale.text
+    assert stale.json()["syncStatus"] == "stale"
+    assert {source["lastSyncStatus"] for source in stale.json()["sources"]} == {
+        "success"
+    }
+
+
+def test_two_source_sync_is_idempotent_and_reconciles_reschedule_and_cancel(
+    client, auth
+):
+    sources = configure_canonical_sources(client, auth)
+    residential = google_occurrence(
+        "residential-job",
+        calendar_id="residential@example.test",
+    )
+    commercial = google_occurrence(
+        "commercial-job",
+        calendar_id="commercial@example.test",
+        summary="Commercial Customer",
+        location="456 Oak St, Effingham",
+        start=WINDOW_START + timedelta(hours=8),
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [residential],
+        "commercial@example.test": [commercial],
+    }
+    untouched_before = {
+        table: int(db.query_one(f"SELECT COUNT(*) AS n FROM {table}")["n"])
+        for table in (
+            "schedules",
+            "planned_service_visits",
+            "planned_visit_assignments",
+            "shifts",
+        )
+    }
+
+    first = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "success"
+    assert first.json()["counts"]["create"] == 2
+    jobs = db.query_all(
+        """
+        SELECT j.id, j.source_key, j.scheduled_start, j.status, s.role
+        FROM jobs j
+        JOIN google_calendar_sources s ON s.id = j.calendar_source_id
+        WHERE j.source_key IS NOT NULL
+        ORDER BY s.role
+        """
+    )
+    assert len(jobs) == 2
+    assert {job["role"] for job in jobs} == set(store.CALENDAR_SOURCE_ROLES)
+    assert {
+        table: int(db.query_one(f"SELECT COUNT(*) AS n FROM {table}")["n"])
+        for table in untouched_before
+    } == untouched_before
+    ids_by_key = {job["source_key"]: job["id"] for job in jobs}
+
+    retry = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert retry.status_code == 200
+    assert retry.json()["counts"]["unchanged"] == 2
+    assert retry.json()["counts"]["create"] == 0
+
+    moved = google_occurrence(
+        "residential-job",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=1),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [moved]
+    rescheduled = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert rescheduled.status_code == 200
+    assert rescheduled.json()["counts"]["update"] == 1
+    moved_job = db.query_one(
+        "SELECT id, scheduled_start FROM jobs WHERE source_key = %s",
+        (moved.source_key,),
+    )
+    assert moved_job["id"] == ids_by_key[moved.source_key]
+    assert moved_job["scheduled_start"] == WINDOW_START + timedelta(days=1)
+
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [
+        sparse_cancelled_occurrence(
+            moved,
+            updated="2026-07-23T12:00:00Z",
+        )
+    ]
+    cancelled = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert cancelled.status_code == 200
+    assert cancelled.json()["counts"]["cancel"] == 1
+    cancelled_job = db.query_one(
+        "SELECT status, cancellation_reason FROM jobs WHERE source_key = %s",
+        (moved.source_key,),
+    )
+    assert cancelled_job == {
+        "status": "cancelled",
+        "cancellation_reason": "source_cancelled",
+    }
+    assert sources[store.RESIDENTIAL_MORNING_ROLE]["calendarId"] == (
+        "residential@example.test"
+    )
+
+
+def test_retained_profitability_uses_current_site_economics_for_source_jobs(
+    client, auth
+):
+    configure_canonical_sources(client, auth)
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    db.execute(
+        """
+        UPDATE locations
+        SET rate = 100.01, rate_type = 'monthly', expected_hours = 2.5
+        WHERE id = %s
+        """,
+        (location_id,),
+    )
+    first = google_occurrence(
+        "profitability-current-site-first",
+        calendar_id="residential@example.test",
+    )
+    second = google_occurrence(
+        "profitability-current-site-second",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=7),
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [first, second],
+        "commercial@example.test": [],
+    }
+    synced = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["counts"]["create"] == 2
+    stored = db.query_all(
+        """
+        SELECT id, source_key, expected_hours, revenue
+        FROM jobs
+        WHERE source_key = ANY(%s)
+        ORDER BY scheduled_start, id
+        """,
+        ([first.source_key, second.source_key],),
+    )
+    assert [(row["expected_hours"], row["revenue"]) for row in stored] == [
+        (None, None),
+        (None, None),
+    ]
+    first_job_id = int(stored[0]["id"])
+    service_date = calendar_api._source_occurrence(first).service_date
+
+    def retained_report() -> dict:
+        response = client.get(
+            "/api/admin/jobs/profitability",
+            headers=auth,
+            params={
+                "customer": "Test Customer",
+                "start_date": str(service_date),
+                "end_date": str(service_date),
+            },
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    monthly = retained_report()
+    assert monthly["jobs"] == [
+        {
+            "jobId": first_job_id,
+            "customerName": "Test Customer",
+            "scheduledDate": str(service_date),
+            "status": "scheduled",
+            "expectedHours": 2.5,
+            "actualHours": 0.0,
+            "varianceHours": 2.5,
+            "revenue": 50.01,
+            "laborCost": 0.0,
+            "netProfit": 50.01,
+            "grossMarginPct": 100.0,
+            "laborPct": 0.0,
+            "employeeCount": 0,
+            "shiftCount": 0,
+        }
+    ]
+    assert monthly["summary"]["totalRevenue"] == 50.01
+
+    db.execute(
+        """
+        UPDATE locations
+        SET rate = 40.00, rate_type = 'hourly', expected_hours = 3.0
+        WHERE id = %s
+        """,
+        (location_id,),
+    )
+    hourly = retained_report()
+    assert hourly["jobs"][0]["expectedHours"] == 3.0
+    assert hourly["jobs"][0]["revenue"] == 120.0
+
+    db.execute(
+        """
+        UPDATE locations
+        SET rate = 80.00, rate_type = 'per_visit', expected_hours = 3.0
+        WHERE id = %s
+        """,
+        (location_id,),
+    )
+    per_visit = retained_report()
+    assert per_visit["jobs"][0]["expectedHours"] == 3.0
+    assert per_visit["jobs"][0]["revenue"] == 80.0
+
+
+def test_canonical_reconciliation_stops_targeting_a_job_moved_beyond_the_window(
+    client, auth, monkeypatch
+):
+    range_end = WINDOW_START + timedelta(days=30)
+    monkeypatch.setattr(
+        calendar_api,
+        "_canonical_sync_window",
+        lambda _time_zone_name: (WINDOW_START, range_end),
+    )
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "moved-beyond-canonical-window",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    assert created.json()["counts"]["create"] == 1
+
+    moved_start = range_end + timedelta(days=7)
+    moved = google_occurrence(
+        original.event_id,
+        calendar_id="residential@example.test",
+        start=moved_start,
+        updated="2026-07-22T12:00:00Z",
+    )
+    assert moved.source_key == original.source_key
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = []
+    FakeGoogleClient.targeted_occurrences = {original.event_id: moved}
+
+    reconciled = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert reconciled.status_code == 200, reconciled.text
+    assert reconciled.json()["counts"]["update"] == 1
+    assert FakeGoogleClient.batch_calls == 1
+    assert db.query_one(
+        "SELECT scheduled_start FROM jobs WHERE source_key = %s",
+        (original.source_key,),
+    ) == {"scheduled_start": moved_start}
+
+    FakeGoogleClient.targeted_occurrences = {}
+    repeated = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["success"] is True
+    assert FakeGoogleClient.batch_calls == 1
+    assert db.query_one(
+        "SELECT scheduled_start, status FROM jobs WHERE source_key = %s",
+        (original.source_key,),
+    ) == {
+        "scheduled_start": moved_start,
+        "status": "scheduled",
+    }
+
+
+def test_canonical_identity_reader_uses_half_open_sync_window_overlap(client, auth):
+    sources = configure_canonical_sources(client, auth)
+    source = sources[store.RESIDENTIAL_MORNING_ROLE]
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    range_end = WINDOW_START + timedelta(days=30)
+    windows = {
+        "crosses-window-start": (
+            WINDOW_START - timedelta(hours=2),
+            WINDOW_START + timedelta(hours=1),
+        ),
+        "inside-window": (
+            WINDOW_START + timedelta(days=1),
+            WINDOW_START + timedelta(days=1, hours=2),
+        ),
+        "crosses-window-end": (
+            range_end - timedelta(hours=1),
+            range_end + timedelta(hours=1),
+        ),
+        "ends-at-window-start": (
+            WINDOW_START - timedelta(hours=2),
+            WINDOW_START,
+        ),
+        "starts-at-window-end": (
+            range_end,
+            range_end + timedelta(hours=2),
+        ),
+        "after-window": (
+            range_end + timedelta(days=1),
+            range_end + timedelta(days=1, hours=2),
+        ),
+    }
+    for event_id, (scheduled_start, scheduled_end) in windows.items():
+        occurrence = calendar_api._source_occurrence(
+            google_occurrence(
+                event_id,
+                calendar_id="residential@example.test",
+                start=scheduled_start,
+                end=scheduled_end,
+            )
+        )
+        db.execute(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date,
+                scheduled_start, scheduled_end, status, calendar_source_id,
+                source_calendar_id, source_event_id, source_series_id,
+                source_occurrence_id, source_key, source_fingerprint,
+                source_etag, source_updated_at, source_title,
+                source_location_text, source_timezone, source_all_day
+            ) VALUES (
+                %s, 'Test Customer', %s, %s, %s, 'scheduled', %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                location_id,
+                occurrence.service_date,
+                occurrence.starts_at,
+                occurrence.ends_at,
+                int(source["id"]),
+                occurrence.calendar_id,
+                occurrence.event_id,
+                occurrence.series_id,
+                occurrence.occurrence_id,
+                occurrence.source_key,
+                calendar_api.occurrence_fingerprint(occurrence),
+                occurrence.revision,
+                occurrence.updated_at,
+                occurrence.title,
+                occurrence.location_text,
+                occurrence.time_zone,
+                occurrence.all_day,
+            ),
+        )
+
+    identities = store.read_canonical_source_identities(
+        source_id=int(source["id"]),
+        range_start=WINDOW_START,
+        range_end=range_end,
+    )
+
+    assert {row["source_event_id"] for row in identities} == {
+        "crosses-window-start",
+        "inside-window",
+        "crosses-window-end",
+    }
+
+
+def test_late_older_or_equal_conflicting_snapshot_cannot_regress_job(client, auth):
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "monotonic-source",
+        calendar_id="residential@example.test",
+        updated="2026-07-18T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    assert (
+        client.post("/api/admin/google-calendar/sync", headers=auth).json()["counts"][
+            "create"
+        ]
+        == 1
+    )
+
+    newest = google_occurrence(
+        "monotonic-source",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=2),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [newest]
+    assert (
+        client.post("/api/admin/google-calendar/sync", headers=auth).json()["counts"][
+            "update"
+        ]
+        == 1
+    )
+    stored = db.query_one(
+        """
+        SELECT scheduled_start, source_updated_at, source_fingerprint
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (newest.source_key,),
+    )
+
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [original]
+    older = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+    assert older["counts"]["unresolved"] == 1
+    assert older["exceptions"][0]["code"] == "stale_source_snapshot"
+    assert (
+        db.query_one(
+            """
+        SELECT scheduled_start, source_updated_at, source_fingerprint
+        FROM jobs
+        WHERE source_key = %s
+        """,
+            (newest.source_key,),
+        )
+        == stored
+    )
+
+    equal_timestamp_conflict = google_occurrence(
+        "monotonic-source",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=3),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [
+        equal_timestamp_conflict
+    ]
+    equal = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+    assert equal["counts"]["unresolved"] == 1
+    assert equal["exceptions"][0]["code"] == "stale_source_snapshot"
+    assert (
+        db.query_one(
+            """
+        SELECT scheduled_start, source_updated_at, source_fingerprint
+        FROM jobs
+        WHERE source_key = %s
+        """,
+            (newest.source_key,),
+        )
+        == stored
+    )
+
+
+def test_changed_source_without_a_current_site_match_stays_unresolved(client, auth):
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "lost-site-match",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    stored = db.query_one(
+        """
+        SELECT location_id, source_fingerprint, source_title,
+               source_location_text, scheduled_start, scheduled_end
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+
+    changed = google_occurrence(
+        original.event_id,
+        calendar_id="residential@example.test",
+        summary="No matching customer",
+        location="No matching Site address",
+        updated="2026-07-22T12:00:00Z",
+    )
+    assert changed.source_key == original.source_key
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [changed]
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["unresolved"] == 1
+    assert response.json()["exceptions"][0]["code"] == "missing_site"
+    assert response.json()["exceptions"][0]["candidateSites"] == []
+    assert (
+        db.query_one(
+            """
+            SELECT location_id, source_fingerprint, source_title,
+                   source_location_text, scheduled_start, scheduled_end
+            FROM jobs
+            WHERE source_key = %s
+            """,
+            (original.source_key,),
+        )
+        == stored
+    )
+
+
+def test_non_site_source_change_keeps_site_when_normalized_hints_are_unchanged(
+    client, auth
+):
+    configure_canonical_sources(client, auth)
+    location_id = int(
+        db.query_one(
+            """
+            INSERT INTO locations (
+                address, customer_name, location_type, active
+            ) VALUES (
+                '789 Pine St, Effingham', 'Continuity Customer',
+                'Residential', true
+            )
+            RETURNING id
+            """
+        )["id"]
+    )
+    original = google_occurrence(
+        "site-continuity",
+        calendar_id="residential@example.test",
+        summary="Continuity Customer",
+        location="Continuity Customer",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_start
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    assert int(job["location_id"]) == location_id
+    db.execute(
+        "UPDATE locations SET customer_name = 'Renamed Customer' WHERE id = %s",
+        (location_id,),
+    )
+    changed = replace(
+        original,
+        start=(WINDOW_START + timedelta(days=1)).isoformat(),
+        end=(WINDOW_START + timedelta(days=1, hours=2)).isoformat(),
+        updated="2026-07-22T12:00:00Z",
+        description="Changed service details",
+        etag='"2026-07-22T12:00:00Z"',
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [changed]
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["update"] == 1
+    assert response.json()["exceptions"] == []
+    updated = db.query_one(
+        "SELECT location_id, scheduled_start FROM jobs WHERE id = %s",
+        (int(job["id"]),),
+    )
+    assert int(updated["location_id"]) == location_id
+    assert updated["scheduled_start"] == WINDOW_START + timedelta(days=1)
+
+
+def test_source_sync_commits_one_calendar_when_the_other_fetch_fails(client, auth):
+    configure_canonical_sources(client, auth)
+    residential = google_occurrence(
+        "residential-success",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [residential],
+    }
+    FakeGoogleClient.occurrence_errors_by_calendar = {
+        "commercial@example.test": GoogleCalendarTransportError(
+            "Google Calendar is temporarily unavailable"
+        )
+    }
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200
+    assert response.json()["success"] is False
+    assert response.json()["status"] == "partial"
+    assert db.query_one(
+        "SELECT id FROM jobs WHERE source_key = %s", (residential.source_key,)
+    )
+    statuses = {
+        row["role"]: row["last_sync_status"]
+        for row in db.query_all(
+            "SELECT role, last_sync_status FROM google_calendar_sources"
+        )
+    }
+    assert statuses == {
+        store.RESIDENTIAL_MORNING_ROLE: "success",
+        store.COMMERCIAL_EVENING_NIGHT_ROLE: "failed",
+    }
+
+
+def test_source_sync_loads_site_matching_snapshot_once(client, auth, monkeypatch):
+    sources = configure_canonical_sources(client, auth)
+    connection = store.active_connection()
+    assert connection is not None
+    occurrences = [
+        calendar_api._source_occurrence(
+            google_occurrence(
+                f"site-snapshot-{index}",
+                calendar_id="residential@example.test",
+                start=WINDOW_START + timedelta(days=index),
+            )
+        )
+        for index in range(2)
+    ]
+    original_loader = store._read_canonical_locations
+    load_count = 0
+
+    def counted_loader(cur):
+        nonlocal load_count
+        load_count += 1
+        return original_loader(cur)
+
+    monkeypatch.setattr(store, "_read_canonical_locations", counted_loader)
+    result = store.sync_calendar_source(
+        source_id=int(sources[store.RESIDENTIAL_MORNING_ROLE]["id"]),
+        expected_credential_version=int(connection["credential_version"]),
+        expected_calendar_id=str(
+            sources[store.RESIDENTIAL_MORNING_ROLE]["calendarId"]
+        ),
+        expected_calendar_timezone=str(
+            sources[store.RESIDENTIAL_MORNING_ROLE]["calendarTimeZone"]
+        ),
+        occurrences=occurrences,
+        window_start=WINDOW_START,
+        window_end=WINDOW_START + timedelta(days=30),
+        actor_id=1,
+        actor_name="Juan Canfield",
+    )
+
+    assert result["counts"]["create"] == 2
+    assert load_count == 1
+
+
+def _insert_point_work_evidence(
+    cur,
+    *,
+    evidence_kind: str,
+    employee_id: int,
+    location_id: int,
+    observed_at: datetime,
+    qr_classification: str = "on_time",
+    qr_review_status: str = "not_required",
+) -> tuple[int | None, int | None]:
+    if evidence_kind == "qr":
+        cur.execute(
+            """
+            INSERT INTO site_check_ins (
+                employee_id, location_id, server_checked_in_at,
+                device_scanned_at, latitude, longitude, accuracy_m,
+                geofence_radius_m, distance_m, geofence_status,
+                classification, classification_reason,
+                device_clock_skew_seconds, review_status
+            ) VALUES (
+                %s, %s, %s, %s, 39.1203, -88.54335, 5,
+                100, 0, 'inside', %s, 'point_evidence_test',
+                0, %s
+            )
+            RETURNING id
+            """,
+            (
+                employee_id,
+                location_id,
+                observed_at,
+                observed_at,
+                qr_classification,
+                qr_review_status,
+            ),
+        )
+        return None, int(cur.fetchone()["id"])
+
+    cur.execute(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, local_date, time_category, non_productive_type,
+            notes, job_id
+        ) VALUES (
+            %s, NULL, '', %s, %s, 0.03, %s, 'non_productive', 'other',
+            'canonical-calendar-test-evidence', NULL
+        )
+        RETURNING id
+        """,
+        (
+            employee_id,
+            observed_at - timedelta(minutes=1),
+            observed_at + timedelta(minutes=1),
+            observed_at.astimezone(ZoneInfo("America/Chicago")).date(),
+        ),
+    )
+    shift_id = int(cur.fetchone()["id"])
+    if evidence_kind == "visit":
+        cur.execute(
+            """
+            INSERT INTO visits (
+                shift_id, location_id, location_label, customer_name,
+                arrival_time
+            ) VALUES (%s, %s, 'Point Evidence Site', 'Test Customer', %s)
+            """,
+            (shift_id, location_id, observed_at),
+        )
+    elif evidence_kind == "departure":
+        cur.execute(
+            """
+            INSERT INTO departures (
+                shift_id, location_id, location_label, customer_name,
+                departure_time
+            ) VALUES (%s, %s, 'Point Evidence Site', 'Test Customer', %s)
+            """,
+            (shift_id, location_id, observed_at),
+        )
+    else:
+        raise AssertionError(f"Unknown evidence kind: {evidence_kind}")
+    return shift_id, None
+
+
+@pytest.mark.parametrize("evidence_kind", ["visit", "departure", "qr"])
+@pytest.mark.parametrize(
+    ("position", "offset", "expected"),
+    [
+        ("before", timedelta(hours=-1), False),
+        ("start", timedelta(0), True),
+        ("cross_midnight_inside", timedelta(hours=1, minutes=15), True),
+        ("end", timedelta(hours=2), False),
+        ("after", timedelta(hours=3), False),
+    ],
+)
+def test_valid_window_point_evidence_uses_half_open_job_interval(
+    evidence_kind,
+    position,
+    offset,
+    expected,
+):
+    del position
+    product_zone = ZoneInfo("America/Chicago")
+    scheduled_start = datetime(2037, 2, 10, 23, tzinfo=product_zone)
+    scheduled_end = scheduled_start + timedelta(hours=2)
+    observed_at = scheduled_start + offset
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT l.id AS location_id, e.id AS employee_id
+                FROM locations l
+                CROSS JOIN employees e
+                WHERE l.address = '123 Main St, Effingham'
+                  AND e.name = 'Catalina Gomez'
+                """
+            )
+            identity = cur.fetchone()
+            shift_id, check_in_id = _insert_point_work_evidence(
+                cur,
+                evidence_kind=evidence_kind,
+                employee_id=int(identity["employee_id"]),
+                location_id=int(identity["location_id"]),
+                observed_at=observed_at,
+            )
+            existing_job = {
+                "id": -1,
+                "location_id": int(identity["location_id"]),
+                "scheduled_date": scheduled_start.date(),
+                "scheduled_start": scheduled_start,
+                "scheduled_end": scheduled_end,
+            }
+            try:
+                assert (
+                    store._canonical_job_has_work_evidence(cur, existing_job)
+                    is expected
+                )
+            finally:
+                if check_in_id is not None:
+                    cur.execute(
+                        "DELETE FROM site_check_ins WHERE id = %s",
+                        (check_in_id,),
+                    )
+                if shift_id is not None:
+                    cur.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+
+
+@pytest.mark.parametrize("evidence_kind", ["visit", "departure", "qr"])
+def test_invalid_window_point_evidence_keeps_service_date_fallback(evidence_kind):
+    product_zone = ZoneInfo("America/Chicago")
+    service_date = datetime(2037, 2, 12, tzinfo=product_zone).date()
+    observed_at = datetime(2037, 2, 12, 20, tzinfo=product_zone)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT l.id AS location_id, e.id AS employee_id
+                FROM locations l
+                CROSS JOIN employees e
+                WHERE l.address = '123 Main St, Effingham'
+                  AND e.name = 'Catalina Gomez'
+                """
+            )
+            identity = cur.fetchone()
+            shift_id, check_in_id = _insert_point_work_evidence(
+                cur,
+                evidence_kind=evidence_kind,
+                employee_id=int(identity["employee_id"]),
+                location_id=int(identity["location_id"]),
+                observed_at=observed_at,
+            )
+            existing_job = {
+                "id": -1,
+                "location_id": int(identity["location_id"]),
+                "scheduled_date": service_date,
+                "scheduled_start": None,
+                "scheduled_end": None,
+            }
+            try:
+                assert store._canonical_job_has_work_evidence(cur, existing_job) is True
+            finally:
+                if check_in_id is not None:
+                    cur.execute(
+                        "DELETE FROM site_check_ins WHERE id = %s",
+                        (check_in_id,),
+                    )
+                if shift_id is not None:
+                    cur.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+
+
+@pytest.mark.parametrize(
+    ("classification", "review_status", "expected"),
+    [
+        ("on_time", "not_required", True),
+        ("late", "not_required", True),
+        ("needs_review", "approved", True),
+        ("needs_review", "pending", False),
+        ("needs_review", "rejected", False),
+        ("on_time", "approved", False),
+    ],
+)
+def test_qr_work_evidence_requires_an_accepted_state_pair(
+    client, classification, review_status, expected
+):
+    del client
+    product_zone = ZoneInfo("America/Chicago")
+    scheduled_start = datetime(2037, 2, 13, 18, tzinfo=product_zone)
+    scheduled_end = scheduled_start + timedelta(hours=2)
+    observed_at = scheduled_start + timedelta(hours=1)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT l.id AS location_id, e.id AS employee_id
+                FROM locations l
+                CROSS JOIN employees e
+                WHERE l.address = '123 Main St, Effingham'
+                  AND e.name = 'Catalina Gomez'
+                """
+            )
+            identity = cur.fetchone()
+            _, check_in_id = _insert_point_work_evidence(
+                cur,
+                evidence_kind="qr",
+                employee_id=int(identity["employee_id"]),
+                location_id=int(identity["location_id"]),
+                observed_at=observed_at,
+                qr_classification=classification,
+                qr_review_status=review_status,
+            )
+            existing_job = {
+                "id": -1,
+                "location_id": int(identity["location_id"]),
+                "scheduled_date": scheduled_start.date(),
+                "scheduled_start": scheduled_start,
+                "scheduled_end": scheduled_end,
+            }
+            try:
+                assert (
+                    store._canonical_job_has_work_evidence(cur, existing_job)
+                    is expected
+                )
+            finally:
+                cur.execute(
+                    "DELETE FROM site_check_ins WHERE id = %s",
+                    (check_in_id,),
+                )
+
+
+def test_site_date_time_evidence_protects_job_without_shift_job_id(client, auth):
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "protected-by-site-date",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200
+    job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_date, scheduled_start
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    employee_id = int(
+        db.query_one("SELECT id FROM employees WHERE name = 'Catalina Gomez'")["id"]
+    )
+    db.execute(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, local_date, time_category, notes, job_id
+        ) VALUES (
+            %s, %s, 'Test Customer', %s, %s, 2.0, %s, 'productive',
+            'canonical-calendar-test-evidence', NULL
+        )
+        """,
+        (
+            employee_id,
+            int(job["location_id"]),
+            WINDOW_START,
+            WINDOW_START + timedelta(hours=2),
+            job["scheduled_date"],
+        ),
+    )
+
+    moved = google_occurrence(
+        "protected-by-site-date",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=1),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [moved]
+    reschedule = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+    assert reschedule["counts"]["unresolved"] == 1
+    assert reschedule["exceptions"][0]["code"] == "protected_work"
+    assert (
+        db.query_one(
+            "SELECT scheduled_start FROM jobs WHERE id = %s", (int(job["id"]),)
+        )["scheduled_start"]
+        == job["scheduled_start"]
+    )
+
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [
+        sparse_cancelled_occurrence(moved)
+    ]
+    cancellation = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+    assert cancellation["counts"]["unresolved"] == 1
+    assert cancellation["exceptions"][0]["code"] == "protected_work"
+    assert (
+        db.query_one("SELECT status FROM jobs WHERE id = %s", (int(job["id"]),))[
+            "status"
+        ]
+        == "scheduled"
+    )
+
+
+def test_same_day_shift_protects_only_the_overlapping_timed_occurrence(client, auth):
+    configure_canonical_sources(client, auth)
+    worked = google_occurrence(
+        "worked-same-day-occurrence",
+        calendar_id="residential@example.test",
+    )
+    to_reschedule = google_occurrence(
+        "unworked-same-day-reschedule",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(hours=5),
+    )
+    to_cancel = google_occurrence(
+        "unworked-same-day-cancel",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(hours=8),
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [worked, to_reschedule, to_cancel],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    assert created.json()["counts"]["create"] == 3
+
+    worked_job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_date
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (worked.source_key,),
+    )
+    employee_id = int(
+        db.query_one("SELECT id FROM employees WHERE name = 'Catalina Gomez'")["id"]
+    )
+    db.execute(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, local_date, time_category, notes, job_id
+        ) VALUES (
+            %s, %s, 'Test Customer', %s, %s, 2.0, %s, 'productive',
+            'canonical-calendar-test-evidence', NULL
+        )
+        """,
+        (
+            employee_id,
+            int(worked_job["location_id"]),
+            WINDOW_START,
+            WINDOW_START + timedelta(hours=2),
+            worked_job["scheduled_date"],
+        ),
+    )
+
+    moved = google_occurrence(
+        "unworked-same-day-reschedule",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=1, hours=5),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [
+        worked,
+        moved,
+        sparse_cancelled_occurrence(to_cancel),
+    ]
+    reconciled = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert reconciled.status_code == 200, reconciled.text
+    body = reconciled.json()
+    assert body["counts"]["update"] == 1
+    assert body["counts"]["cancel"] == 1
+    assert body["counts"]["unresolved"] == 0
+    assert body["exceptions"] == []
+    assert db.query_one(
+        """
+        SELECT scheduled_start, status
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (moved.source_key,),
+    ) == {
+        "scheduled_start": WINDOW_START + timedelta(days=1, hours=5),
+        "status": "scheduled",
+    }
+    assert (
+        db.query_one(
+            "SELECT status FROM jobs WHERE source_key = %s",
+            (to_cancel.source_key,),
+        )["status"]
+        == "cancelled"
+    )
+
+
+def test_same_site_shift_linked_to_another_job_protects_only_its_job(client, auth):
+    configure_canonical_sources(client, auth)
+    unworked = google_occurrence(
+        "same-site-unworked-occurrence",
+        calendar_id="residential@example.test",
+    )
+    worked = google_occurrence(
+        "same-site-explicitly-worked-occurrence",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [unworked, worked],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    assert created.json()["counts"]["create"] == 2
+    jobs = db.query_all(
+        """
+        SELECT id, source_key, location_id, scheduled_date, scheduled_start
+        FROM jobs
+        WHERE source_key = ANY(%s)
+        """,
+        ([unworked.source_key, worked.source_key],),
+    )
+    by_source = {row["source_key"]: row for row in jobs}
+    employee_id = int(
+        db.query_one("SELECT id FROM employees WHERE name = 'Catalina Gomez'")["id"]
+    )
+    db.execute(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, local_date, time_category, notes, job_id
+        ) VALUES (
+            %s, %s, 'Test Customer', %s, %s, 2.0, %s, 'productive',
+            'canonical-calendar-test-evidence', %s
+        )
+        """,
+        (
+            employee_id,
+            int(by_source[worked.source_key]["location_id"]),
+            WINDOW_START,
+            WINDOW_START + timedelta(hours=2),
+            by_source[worked.source_key]["scheduled_date"],
+            int(by_source[worked.source_key]["id"]),
+        ),
+    )
+
+    moved_unworked = google_occurrence(
+        "same-site-unworked-occurrence",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=1),
+        updated="2026-07-22T12:00:00Z",
+    )
+    moved_worked = google_occurrence(
+        "same-site-explicitly-worked-occurrence",
+        calendar_id="residential@example.test",
+        start=WINDOW_START + timedelta(days=1),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [
+        moved_unworked,
+        moved_worked,
+    ]
+
+    reconciled = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert reconciled.status_code == 200, reconciled.text
+    body = reconciled.json()
+    assert body["counts"]["update"] == 1
+    assert body["counts"]["unresolved"] == 1
+    assert [
+        (row["sourceKey"], row["code"]) for row in body["exceptions"]
+    ] == [(worked.source_key, "protected_work")]
+    stored = db.query_all(
+        """
+        SELECT source_key, scheduled_start
+        FROM jobs
+        WHERE source_key = ANY(%s)
+        """,
+        ([unworked.source_key, worked.source_key],),
+    )
+    starts_by_source = {row["source_key"]: row["scheduled_start"] for row in stored}
+    assert starts_by_source[unworked.source_key] == WINDOW_START + timedelta(days=1)
+    assert starts_by_source[worked.source_key] == WINDOW_START
+
+
+def test_overnight_job_protects_work_evidence_on_second_service_date(client, auth):
+    configure_canonical_sources(client, auth)
+    local_start = datetime(
+        2026,
+        7,
+        25,
+        23,
+        tzinfo=ZoneInfo("America/Chicago"),
+    )
+    original = google_occurrence(
+        "overnight-protected-work",
+        calendar_id="commercial@example.test",
+        summary="Commercial Customer",
+        location="456 Oak St, Effingham",
+        start=local_start.astimezone(timezone.utc),
+        end=(local_start + timedelta(hours=2)).astimezone(timezone.utc),
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [],
+        "commercial@example.test": [original],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_start
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    employee_id = int(
+        db.query_one("SELECT id FROM employees WHERE name = 'Catalina Gomez'")["id"]
+    )
+    second_service_date = (local_start + timedelta(days=1)).date()
+    evidence_start = (local_start + timedelta(hours=1, minutes=15)).astimezone(
+        timezone.utc
+    )
+    db.execute(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, local_date, time_category, notes, job_id
+        ) VALUES (
+            %s, %s, 'Commercial Customer', %s, %s, 0.5, %s, 'productive',
+            'canonical-calendar-test-evidence', NULL
+        )
+        """,
+        (
+            employee_id,
+            int(job["location_id"]),
+            evidence_start,
+            evidence_start + timedelta(minutes=30),
+            second_service_date,
+        ),
+    )
+
+    moved = google_occurrence(
+        "overnight-protected-work",
+        calendar_id="commercial@example.test",
+        summary="Commercial Customer",
+        location="456 Oak St, Effingham",
+        start=(local_start + timedelta(days=7)).astimezone(timezone.utc),
+        end=(local_start + timedelta(days=7, hours=2)).astimezone(timezone.utc),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["commercial@example.test"] = [moved]
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["unresolved"] == 1
+    assert response.json()["exceptions"][0]["code"] == "protected_work"
+    assert (
+        db.query_one(
+            "SELECT scheduled_start FROM jobs WHERE id = %s",
+            (int(job["id"]),),
+        )["scheduled_start"]
+        == job["scheduled_start"]
+    )
+
+
+def test_after_midnight_job_protects_shift_that_started_previous_day(client, auth):
+    configure_canonical_sources(client, auth)
+    local_start = datetime(
+        2026,
+        7,
+        26,
+        0,
+        30,
+        tzinfo=ZoneInfo("America/Chicago"),
+    )
+    original = google_occurrence(
+        "after-midnight-overlap",
+        calendar_id="commercial@example.test",
+        summary="Commercial Customer",
+        location="456 Oak St, Effingham",
+        start=local_start.astimezone(timezone.utc),
+        end=(local_start + timedelta(hours=2)).astimezone(timezone.utc),
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [],
+        "commercial@example.test": [original],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_start
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    employee_id = int(
+        db.query_one("SELECT id FROM employees WHERE name = 'Catalina Gomez'")["id"]
+    )
+    evidence_start = local_start - timedelta(minutes=45)
+    db.execute(
+        """
+        INSERT INTO shifts (
+            employee_id, location_id, location_label, clock_in, clock_out,
+            total_hours, local_date, time_category, notes, job_id
+        ) VALUES (
+            %s, %s, 'Commercial Customer', %s, %s, 1.0, %s, 'productive',
+            'canonical-calendar-test-evidence', NULL
+        )
+        """,
+        (
+            employee_id,
+            int(job["location_id"]),
+            evidence_start.astimezone(timezone.utc),
+            (evidence_start + timedelta(hours=1)).astimezone(timezone.utc),
+            evidence_start.date(),
+        ),
+    )
+
+    moved = google_occurrence(
+        "after-midnight-overlap",
+        calendar_id="commercial@example.test",
+        summary="Commercial Customer",
+        location="456 Oak St, Effingham",
+        start=(local_start + timedelta(days=7)).astimezone(timezone.utc),
+        end=(local_start + timedelta(days=7, hours=2)).astimezone(timezone.utc),
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["commercial@example.test"] = [moved]
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["unresolved"] == 1
+    assert response.json()["exceptions"][0]["code"] == "protected_work"
+    assert (
+        db.query_one(
+            "SELECT scheduled_start FROM jobs WHERE id = %s",
+            (int(job["id"]),),
+        )["scheduled_start"]
+        == job["scheduled_start"]
+    )
+
+
+def test_timed_job_changed_to_all_day_is_invalidated_in_canonical_plan(client, auth):
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "timed-to-all-day",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    original_job = db.query_one(
+        """
+        SELECT id, scheduled_start
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    all_day = replace(
+        original,
+        all_day=True,
+        start="2026-07-20",
+        end="2026-07-21",
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [all_day]
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["counts"]["unresolved"] == 1
+    assert response.json()["exceptions"][0]["code"] == "all_day"
+    stored = db.query_one(
+        """
+        SELECT scheduled_date, scheduled_start, scheduled_end, source_all_day,
+               source_fingerprint, status
+        FROM jobs
+        WHERE id = %s
+        """,
+        (int(original_job["id"]),),
+    )
+    assert stored["source_all_day"] is True
+    assert stored["scheduled_start"] != original_job["scheduled_start"]
+    assert stored["status"] == "scheduled"
+
+    schedule = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": str(stored["scheduled_date"]),
+            "end_date": str(stored["scheduled_date"]),
+        },
+    )
+    assert schedule.status_code == 200, schedule.text
+    scheduled_job = next(
+        row for row in schedule.json()["jobs"] if row["id"] == int(original_job["id"])
+    )
+    assert scheduled_job["includedInPlan"] is False
+    assert {issue["code"] for issue in scheduled_job["issues"]} >= {"all_day_event"}
+
+    retry = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert retry.status_code == 200, retry.text
+    assert (
+        db.query_one(
+            """
+            SELECT scheduled_date, scheduled_start, scheduled_end, source_all_day,
+                   source_fingerprint, status
+            FROM jobs
+            WHERE id = %s
+            """,
+            (int(original_job["id"]),),
+        )
+        == stored
+    )
+
+
+def test_exact_calendar_address_precedes_shared_customer_name(client, auth):
+    configure_canonical_sources(client, auth)
+    second_location_id = int(
+        db.query_one(
+            """
+            INSERT INTO locations (
+                address, customer_name, location_type, active
+            ) VALUES (
+                '789 Pine St, Effingham', 'Test Customer', 'Residential', true
+            )
+            RETURNING id
+            """
+        )["id"]
+    )
+    exact_address = google_occurrence(
+        "unique-address-shared-customer",
+        calendar_id="residential@example.test",
+        summary="Test Customer",
+        location="  123   MAIN ST, EFFINGHAM  ",
+    )
+    shared_name_only = google_occurrence(
+        "shared-customer-without-address",
+        calendar_id="residential@example.test",
+        summary="Test Customer",
+        location="Calendar-only note",
+        start=WINDOW_START + timedelta(days=1),
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [exact_address, shared_name_only],
+        "commercial@example.test": [],
+    }
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["counts"]["create"] == 1
+    assert body["counts"]["unresolved"] == 1
+    assert len(body["exceptions"]) == 1
+    ambiguous = body["exceptions"][0]
+    assert ambiguous["sourceKey"] == shared_name_only.source_key
+    assert ambiguous["code"] == "ambiguous_site"
+    assert {site["id"] for site in ambiguous["candidateSites"]} == {
+        second_location_id,
+        int(
+            db.query_one(
+                "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+            )["id"]
+        ),
+    }
+    assert db.query_one(
+        """
+        SELECT l.address
+        FROM jobs j
+        JOIN locations l ON l.id = j.location_id
+        WHERE j.source_key = %s
+        """,
+        (exact_address.source_key,),
+    ) == {"address": "123 Main St, Effingham"}
+    assert (
+        db.query_one(
+            "SELECT COUNT(*) AS n FROM jobs WHERE source_key = %s",
+            (shared_name_only.source_key,),
+        )["n"]
+        == 0
+    )
+
+
+def test_sync_surfaces_all_day_wrong_type_and_archived_site_exceptions(client, auth):
+    configure_canonical_sources(client, auth)
+    all_day_base = google_occurrence(
+        "all-day",
+        calendar_id="residential@example.test",
+    )
+    all_day = replace(
+        all_day_base,
+        all_day=True,
+        start="2026-07-20",
+        end="2026-07-21",
+    )
+    wrong_type = google_occurrence(
+        "wrong-type",
+        calendar_id="residential@example.test",
+        summary="Commercial Customer",
+        location="456 Oak St, Effingham",
+        start=WINDOW_START + timedelta(days=1),
+    )
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO locations (
+                    address, customer_name, location_type, active
+                ) VALUES (
+                    '789 Pine St, Effingham', 'Archived Commercial',
+                    'Commercial', false
+                )
+                """
+            )
+    archived = google_occurrence(
+        "archived",
+        calendar_id="commercial@example.test",
+        summary="Archived Commercial",
+        location="789 Pine St, Effingham",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [all_day, wrong_type],
+        "commercial@example.test": [archived],
+    }
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200
+    assert response.json()["counts"]["unresolved"] == 3
+    assert {row["code"] for row in response.json()["exceptions"]} == {
+        "all_day",
+        "wrong_site_type",
+        "archived_site",
+    }
+    exceptions = {row["code"]: row for row in response.json()["exceptions"]}
+    assert exceptions["wrong_site_type"]["candidateSites"][0]["address"] == (
+        "456 Oak St, Effingham"
+    )
+    assert exceptions["archived_site"]["candidateSites"][0]["address"] == (
+        "789 Pine St, Effingham"
+    )
+    assert {
+        site["address"]
+        for site in response.json()["eligibleSitesByRole"][
+            store.RESIDENTIAL_MORNING_ROLE
+        ]
+    } == {"123 Main St, Effingham"}
+    assert {
+        site["address"]
+        for site in response.json()["eligibleSitesByRole"][
+            store.COMMERCIAL_EVENING_NIGHT_ROLE
+        ]
+    } == {"456 Oak St, Effingham"}
+    assert (
+        db.query_one(
+            """
+            SELECT COUNT(*) AS n
+            FROM jobs
+            WHERE source_key = ANY(%s)
+            """,
+            ([all_day.source_key, wrong_type.source_key, archived.source_key],),
+        )["n"]
+        == 0
+    )
+
+
+def test_sync_collision_reports_job_ids_separately_from_site_candidates(client, auth):
+    configure_canonical_sources(client, auth)
+    occurrence = google_occurrence(
+        "manual-job-collision",
+        calendar_id="residential@example.test",
+    )
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    job_id = int(
+        db.query_one(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date, status
+            ) VALUES (%s, 'Test Customer', %s, 'scheduled')
+            RETURNING id
+            """,
+            (
+                location_id,
+                calendar_api._source_occurrence(occurrence).service_date,
+            ),
+        )["id"]
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [occurrence],
+        "commercial@example.test": [],
+    }
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+
+    collision = response["exceptions"][0]
+    assert collision["code"] == "legacy_job_collision"
+    assert collision["conflictingJobIds"] == [job_id]
+    assert collision["candidateSites"] == [
+        {
+            "id": location_id,
+            "customerName": "Test Customer",
+            "address": "123 Main St, Effingham",
+            "locationType": "Residential",
+            "active": True,
+        }
+    ]
+    db.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
+
+
+def test_sync_rejects_manual_job_collision_when_moving_an_existing_source_job(
+    client, auth
+):
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "moved-source-manual-collision",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    assert created.json()["counts"]["create"] == 1
+    source_before = db.query_one(
+        """
+        SELECT id, location_id, scheduled_date, scheduled_start, scheduled_end,
+               status, source_fingerprint
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    moved_start = WINDOW_START + timedelta(days=1)
+    manual_job_id = int(
+        db.query_one(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date, status
+            ) VALUES (%s, 'Manual collision', %s, 'scheduled')
+            RETURNING id
+            """,
+            (
+                int(source_before["location_id"]),
+                moved_start.astimezone(ZoneInfo("America/Chicago")).date(),
+            ),
+        )["id"]
+    )
+    moved = google_occurrence(
+        original.event_id,
+        calendar_id="residential@example.test",
+        start=moved_start,
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [moved]
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["counts"]["update"] == 0
+    assert body["counts"]["unresolved"] == 1
+    collision = next(
+        row
+        for row in body["exceptions"]
+        if row["sourceKey"] == original.source_key
+    )
+    assert collision["code"] == "legacy_job_collision"
+    assert collision["conflictingJobIds"] == [manual_job_id]
+    assert (
+        db.query_one(
+            """
+            SELECT id, location_id, scheduled_date, scheduled_start, scheduled_end,
+                   status, source_fingerprint
+            FROM jobs
+            WHERE source_key = %s
+            """,
+            (original.source_key,),
+        )
+        == source_before
+    )
+    assert db.query_one(
+        "SELECT status, source_key FROM jobs WHERE id = %s",
+        (manual_job_id,),
+    ) == {"status": "scheduled", "source_key": None}
+    db.execute("DELETE FROM jobs WHERE id = %s", (manual_job_id,))
+
+
+def test_sync_rejects_manual_job_collision_when_restoring_a_cancelled_source_job(
+    client, auth
+):
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "restored-source-manual-collision",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    assert created.json()["counts"]["create"] == 1
+
+    cancelled_occurrence = sparse_cancelled_occurrence(
+        original,
+        updated="2026-07-22T12:00:00Z",
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [
+        cancelled_occurrence
+    ]
+    cancelled = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["counts"]["cancel"] == 1
+    source_before_restore = db.query_one(
+        """
+        SELECT id, location_id, scheduled_date, scheduled_start, scheduled_end,
+               status, cancellation_reason, cancelled_at, source_fingerprint
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    assert source_before_restore["status"] == "cancelled"
+    assert source_before_restore["cancellation_reason"] == "source_cancelled"
+
+    manual_job_id = int(
+        db.query_one(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date, status
+            ) VALUES (%s, 'Manual collision', %s, 'scheduled')
+            RETURNING id
+            """,
+            (
+                int(source_before_restore["location_id"]),
+                source_before_restore["scheduled_date"],
+            ),
+        )["id"]
+    )
+    restored = google_occurrence(
+        original.event_id,
+        calendar_id="residential@example.test",
+        updated="2026-07-23T12:00:00Z",
+    )
+    assert restored.source_key == original.source_key
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [restored]
+
+    response = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["counts"]["update"] == 0
+    assert body["counts"]["unresolved"] == 1
+    collision = next(
+        row
+        for row in body["exceptions"]
+        if row["sourceKey"] == original.source_key
+    )
+    assert collision["code"] == "legacy_job_collision"
+    assert collision["conflictingJobIds"] == [manual_job_id]
+    assert (
+        db.query_one(
+            """
+            SELECT id, location_id, scheduled_date, scheduled_start, scheduled_end,
+                   status, cancellation_reason, cancelled_at, source_fingerprint
+            FROM jobs
+            WHERE source_key = %s
+            """,
+            (original.source_key,),
+        )
+        == source_before_restore
+    )
+    assert db.query_one(
+        "SELECT status, source_key FROM jobs WHERE id = %s",
+        (manual_job_id,),
+    ) == {"status": "scheduled", "source_key": None}
+    db.execute("DELETE FROM jobs WHERE id = %s", (manual_job_id,))
+
+
+def test_mapping_is_fingerprint_guarded_and_recurring_series_is_reused(client, auth):
+    sources = configure_canonical_sources(client, auth)
+    original_start = WINDOW_START
+    unresolved = google_occurrence(
+        "series-instance",
+        calendar_id="residential@example.test",
+        summary="Needs mapping",
+        location="Calendar-only note",
+        recurring_event_id="residential-series",
+        original_start=original_start,
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [unresolved],
+        "commercial@example.test": [],
+    }
+    FakeGoogleClient.targeted_recurring_occurrences = {
+        ("residential-series", original_start.isoformat()): unresolved
+    }
+    synced = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+    exception = next(
+        row for row in synced["exceptions"] if row["sourceKey"] == unresolved.source_key
+    )
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    request = {
+        "sourceId": sources[store.RESIDENTIAL_MORNING_ROLE]["id"],
+        "sourceKey": unresolved.source_key,
+        "sourceFingerprint": exception["sourceFingerprint"],
+        "eventId": unresolved.event_id,
+        "seriesId": unresolved.recurring_event_id,
+        "occurrenceId": unresolved.original_start_query,
+        "locationId": location_id,
+        "applyToSeries": True,
+    }
+    stale = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json={**request, "sourceFingerprint": "0" * 64},
+    )
+    assert stale.status_code == 409
+    assert (
+        db.query_one("SELECT COUNT(*) AS n FROM google_calendar_event_mappings")["n"]
+        == 0
+    )
+
+    saved = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json=request,
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["mapping"]["scope"] == "series"
+
+    applied = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert applied.status_code == 200
+    assert applied.json()["counts"]["create"] == 1
+    assert (
+        db.query_one(
+            "SELECT location_id FROM jobs WHERE source_key = %s",
+            (unresolved.source_key,),
+        )["location_id"]
+        == location_id
+    )
+
+
+def test_non_recurring_mapping_defaults_to_fingerprint_guarded_occurrence_scope(
+    client, auth
+):
+    sources = configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "stale-occurrence-mapping",
+        calendar_id="residential@example.test",
+        summary="Needs one-off mapping",
+        location="Calendar-only note",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    FakeGoogleClient.targeted_occurrences = {original.event_id: original}
+    first_sync = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+    exception = next(
+        row for row in first_sync["exceptions"] if row["sourceKey"] == original.source_key
+    )
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    mapping_request = {
+        "sourceId": sources[store.RESIDENTIAL_MORNING_ROLE]["id"],
+        "sourceKey": original.source_key,
+        "sourceFingerprint": exception["sourceFingerprint"],
+        "eventId": original.event_id,
+        "seriesId": original.event_id,
+        "occurrenceId": original.event_id,
+        "locationId": location_id,
+    }
+    saved = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json=mapping_request,
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["mapping"]["scope"] == "occurrence"
+
+    changed = google_occurrence(
+        original.event_id,
+        calendar_id="residential@example.test",
+        summary="Different customer",
+        location="Different Calendar-only note",
+        updated="2026-07-21T12:00:00Z",
+    )
+    assert changed.source_key == original.source_key
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [changed]
+    FakeGoogleClient.targeted_occurrences = {changed.event_id: changed}
+
+    stale_sync = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+
+    stale = next(
+        row for row in stale_sync["exceptions"] if row["sourceKey"] == changed.source_key
+    )
+    assert stale["code"] == "stale_site_mapping"
+    assert stale["candidateSites"][0]["id"] == location_id
+    assert (
+        db.query_one(
+            "SELECT COUNT(*) AS n FROM jobs WHERE source_key = %s",
+            (changed.source_key,),
+        )["n"]
+        == 0
+    )
+
+    remapped = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json={
+            **mapping_request,
+            "sourceFingerprint": stale["sourceFingerprint"],
+        },
+    )
+    assert remapped.status_code == 200, remapped.text
+    applied = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+    assert applied["counts"]["create"] == 1
+    assert applied["exceptions"] == []
+
+
+@pytest.mark.parametrize(
+    "existing_series_mapping",
+    [False, True],
+    ids=["reuse-occurrence-row", "merge-into-existing-series"],
+)
+@pytest.mark.parametrize(
+    "occurrence_mapping_is_fresh",
+    [False, True],
+    ids=["historical-null-fingerprint", "current-fingerprint"],
+)
+def test_series_save_supersedes_the_submitted_occurrence_mapping(
+    client, auth, existing_series_mapping, occurrence_mapping_is_fresh
+):
+    sources = configure_canonical_sources(client, auth)
+    source = sources[store.RESIDENTIAL_MORNING_ROLE]
+    connection = store.active_connection()
+    assert connection is not None
+    original_start = WINDOW_START
+    raw_occurrence = google_occurrence(
+        "retained-series-instance",
+        calendar_id="residential@example.test",
+        summary="Needs retained mapping",
+        location="Calendar-only retained note",
+        recurring_event_id="retained-series",
+        original_start=original_start,
+    )
+    occurrence = calendar_api._source_occurrence(raw_occurrence)
+    fingerprint = calendar_api.occurrence_fingerprint(occurrence)
+    FakeGoogleClient.targeted_recurring_occurrences = {
+        ("retained-series", original_start.isoformat()): raw_occurrence
+    }
+    occurrence_location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    series_location_id = int(
+        db.query_one(
+            """
+            INSERT INTO locations (
+                address, customer_name, location_type, active
+            ) VALUES (
+                '789 Pine St, Effingham', 'Series decision',
+                'Residential', true
+            )
+            RETURNING id
+            """
+        )["id"]
+    )
+    occurrence_mapping_id = int(
+        db.query_one(
+            """
+            INSERT INTO google_calendar_event_mappings (
+                connection_id, calendar_id, source_key, source_series_id,
+                mapping_scope, source_fingerprint, location_id,
+                created_by, updated_by
+            ) VALUES (%s, %s, %s, %s, 'occurrence', %s, %s, 1, 1)
+            RETURNING id
+            """,
+            (
+                int(connection["id"]),
+                str(source["calendarId"]),
+                occurrence.source_key,
+                occurrence.series_id if occurrence_mapping_is_fresh else None,
+                fingerprint if occurrence_mapping_is_fresh else None,
+                occurrence_location_id,
+            ),
+        )["id"]
+    )
+    series_mapping_key = store._canonical_series_mapping_key(
+        connection_id=int(connection["id"]),
+        calendar_id=str(source["calendarId"]),
+        source_series_id=occurrence.series_id,
+    )
+    series_mapping_id = occurrence_mapping_id
+    if existing_series_mapping:
+        series_mapping_id = int(
+            db.query_one(
+                """
+                INSERT INTO google_calendar_event_mappings (
+                    connection_id, calendar_id, source_key, source_series_id,
+                    mapping_scope, source_fingerprint, location_id,
+                    created_by, updated_by
+                ) VALUES (%s, %s, %s, %s, 'series', %s, %s, 1, 1)
+                RETURNING id
+                """,
+                (
+                    int(connection["id"]),
+                    str(source["calendarId"]),
+                    series_mapping_key,
+                    occurrence.series_id,
+                    "0" * 64,
+                    occurrence_location_id,
+                ),
+            )["id"]
+        )
+    retained_visit_id = int(
+        db.query_one(
+            """
+            INSERT INTO planned_service_visits (
+                connection_id, mapping_id, source_calendar_id, source_event_id,
+                source_series_id, source_occurrence_id, source_key,
+                source_fingerprint, source_etag, source_updated_at, title,
+                description, source_location_text, location_id,
+                approximate_start, approximate_end, all_day, source_timezone
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, false, %s
+            )
+            RETURNING id
+            """,
+            (
+                int(connection["id"]),
+                occurrence_mapping_id,
+                occurrence.calendar_id,
+                occurrence.event_id,
+                occurrence.series_id,
+                occurrence.occurrence_id,
+                occurrence.source_key,
+                fingerprint,
+                occurrence.revision,
+                occurrence.updated_at,
+                occurrence.title,
+                occurrence.description,
+                occurrence.location_text,
+                occurrence_location_id,
+                occurrence.starts_at,
+                occurrence.ends_at,
+                occurrence.time_zone,
+            ),
+        )["id"]
+    )
+
+    saved = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json={
+            "sourceId": source["id"],
+            "sourceKey": occurrence.source_key,
+            "sourceFingerprint": fingerprint,
+            "eventId": occurrence.event_id,
+            "seriesId": occurrence.series_id,
+            "occurrenceId": occurrence.occurrence_id,
+            "locationId": series_location_id,
+            "applyToSeries": True,
+        },
+    )
+
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["mapping"]["id"] == series_mapping_id
+    assert saved.json()["mapping"]["scope"] == "series"
+    assert saved.json()["mapping"]["locationId"] == series_location_id
+    assert db.query_one(
+        "SELECT mapping_id FROM planned_service_visits WHERE id = %s",
+        (retained_visit_id,),
+    ) == {"mapping_id": series_mapping_id}
+    mappings = db.query_all(
+        """
+        SELECT id, source_key, source_series_id, mapping_scope,
+               source_fingerprint, location_id
+        FROM google_calendar_event_mappings
+        """
+    )
+    assert mappings == [
+        {
+            "id": series_mapping_id,
+            "source_key": series_mapping_key,
+            "source_series_id": occurrence.series_id,
+            "mapping_scope": "series",
+            "source_fingerprint": fingerprint,
+            "location_id": series_location_id,
+        }
+    ]
+    synced = store.sync_calendar_source(
+        source_id=int(source["id"]),
+        expected_credential_version=int(connection["credential_version"]),
+        expected_calendar_id=str(source["calendarId"]),
+        expected_calendar_timezone=str(source["calendarTimeZone"]),
+        occurrences=[occurrence],
+        window_start=WINDOW_START,
+        window_end=WINDOW_START + timedelta(days=30),
+        actor_id=1,
+        actor_name="Juan Canfield",
+    )
+    assert synced["counts"]["create"] == 1
+    assert synced["exceptions"] == []
+    assert db.query_one(
+        "SELECT location_id FROM jobs WHERE source_key = %s",
+        (occurrence.source_key,),
+    ) == {"location_id": series_location_id}
+
+
+def test_occurrence_override_preserves_the_recurring_series_default(client, auth):
+    sources = configure_canonical_sources(client, auth)
+    first_start = WINDOW_START
+    second_start = WINDOW_START + timedelta(days=7)
+    first = google_occurrence(
+        "series-first-instance",
+        calendar_id="residential@example.test",
+        summary="Recurring needs mapping",
+        location="Calendar-only series note",
+        recurring_event_id="override-series",
+        original_start=first_start,
+        start=first_start,
+    )
+    second = google_occurrence(
+        "series-second-instance",
+        calendar_id="residential@example.test",
+        summary="Recurring needs mapping",
+        location="Calendar-only series note",
+        recurring_event_id="override-series",
+        original_start=second_start,
+        start=second_start,
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [first, second],
+        "commercial@example.test": [],
+    }
+    FakeGoogleClient.targeted_recurring_occurrences = {
+        ("override-series", first_start.isoformat()): first,
+        ("override-series", second_start.isoformat()): second,
+    }
+    exceptions = {
+        row["sourceKey"]: row
+        for row in client.post(
+            "/api/admin/google-calendar/sync", headers=auth
+        ).json()["exceptions"]
+    }
+    default_location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    override_location_id = int(
+        db.query_one(
+            """
+            INSERT INTO locations (
+                address, customer_name, location_type, active
+            ) VALUES (
+                '789 Pine St, Effingham', 'Residential Override',
+                'Residential', true
+            )
+            RETURNING id
+            """
+        )["id"]
+    )
+    base_request = {
+        "sourceId": sources[store.RESIDENTIAL_MORNING_ROLE]["id"],
+        "sourceKey": first.source_key,
+        "sourceFingerprint": exceptions[first.source_key]["sourceFingerprint"],
+        "eventId": first.event_id,
+        "seriesId": first.recurring_event_id,
+        "occurrenceId": first.original_start_query,
+        "locationId": default_location_id,
+    }
+    series_saved = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json={**base_request, "applyToSeries": True},
+    )
+    assert series_saved.status_code == 200, series_saved.text
+    override_saved = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json={
+            **base_request,
+            "locationId": override_location_id,
+            "applyToSeries": False,
+        },
+    )
+    assert override_saved.status_code == 200, override_saved.text
+
+    mappings = db.query_all(
+        """
+        SELECT source_key, mapping_scope, location_id
+        FROM google_calendar_event_mappings
+        ORDER BY mapping_scope
+        """
+    )
+    assert len(mappings) == 2
+    by_scope = {row["mapping_scope"]: row for row in mappings}
+    assert by_scope["series"]["location_id"] == default_location_id
+    assert by_scope["series"]["source_key"] != first.source_key
+    assert by_scope["occurrence"]["location_id"] == override_location_id
+    assert by_scope["occurrence"]["source_key"] == first.source_key
+
+    applied = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+
+    assert applied["counts"]["create"] == 2
+    assert applied["exceptions"] == []
+    jobs = db.query_all(
+        """
+        SELECT source_key, location_id
+        FROM jobs
+        WHERE source_key = ANY(%s)
+        """,
+        ([first.source_key, second.source_key],),
+    )
+    locations_by_key = {row["source_key"]: row["location_id"] for row in jobs}
+    assert locations_by_key == {
+        first.source_key: override_location_id,
+        second.source_key: default_location_id,
+    }
+
+    repeated = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json={
+            **base_request,
+            "locationId": override_location_id,
+            "applyToSeries": False,
+        },
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert (
+        db.query_one("SELECT COUNT(*) AS n FROM google_calendar_event_mappings")["n"]
+        == 2
+    )
+
+
+@pytest.mark.parametrize(
+    "promote_to_series",
+    [False, True],
+    ids=["retain-occurrence-scope", "promote-retained-occurrence-to-series"],
+)
+def test_occurrence_mapping_is_reused_across_reconnect(
+    client, auth, promote_to_series
+):
+    first_sources = configure_canonical_sources(client, auth)
+    first_source = first_sources[store.RESIDENTIAL_MORNING_ROLE]
+    first_connection = store.active_connection()
+    assert first_connection is not None
+    original_start = WINDOW_START + timedelta(days=2)
+    raw_occurrence = google_occurrence(
+        "reconnect-mapping-instance",
+        calendar_id="residential@example.test",
+        summary="Needs retained mapping",
+        location="Calendar-only retained note",
+        recurring_event_id="reconnect-mapping-series",
+        original_start=original_start,
+        start=original_start,
+    )
+    occurrence = calendar_api._source_occurrence(raw_occurrence)
+    fingerprint = calendar_api.occurrence_fingerprint(occurrence)
+    FakeGoogleClient.targeted_recurring_occurrences = {
+        (occurrence.series_id, occurrence.occurrence_id): raw_occurrence
+    }
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    mapping_request = {
+        "sourceId": first_source["id"],
+        "sourceKey": occurrence.source_key,
+        "sourceFingerprint": fingerprint,
+        "eventId": occurrence.event_id,
+        "seriesId": occurrence.series_id,
+        "occurrenceId": occurrence.occurrence_id,
+        "locationId": location_id,
+        "applyToSeries": False,
+    }
+    first_save = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json=mapping_request,
+    )
+    assert first_save.status_code == 200, first_save.text
+    mapping_id = int(first_save.json()["mapping"]["id"])
+    disconnected = client.delete(
+        "/api/admin/google-calendar/connection",
+        headers=auth,
+    )
+    assert disconnected.status_code == 200, disconnected.text
+
+    second_sources = configure_canonical_sources(client, auth)
+    second_source = second_sources[store.RESIDENTIAL_MORNING_ROLE]
+    second_connection = store.active_connection()
+    assert second_connection is not None
+    assert int(second_connection["id"]) != int(first_connection["id"])
+    rebound = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json={
+            **mapping_request,
+            "sourceId": second_source["id"],
+            "applyToSeries": promote_to_series,
+        },
+    )
+
+    assert rebound.status_code == 200, rebound.text
+    assert int(rebound.json()["mapping"]["id"]) == mapping_id
+    expected_scope = "series" if promote_to_series else "occurrence"
+    assert rebound.json()["mapping"]["scope"] == expected_scope
+    mapping = db.query_one(
+        """
+        SELECT id, connection_id, calendar_id, source_key, source_series_id,
+               mapping_scope, source_fingerprint, location_id,
+               COUNT(*) OVER () AS total
+        FROM google_calendar_event_mappings
+        """
+    )
+    assert int(mapping["id"]) == mapping_id
+    assert int(mapping["connection_id"]) == int(second_connection["id"])
+    assert mapping["calendar_id"] == second_source["calendarId"]
+    assert mapping["source_series_id"] == occurrence.series_id
+    assert mapping["mapping_scope"] == expected_scope
+    assert mapping["source_fingerprint"] == fingerprint
+    assert int(mapping["location_id"]) == location_id
+    assert int(mapping["total"]) == 1
+    expected_source_key = (
+        store._canonical_series_mapping_key(
+            connection_id=int(second_connection["id"]),
+            calendar_id=str(second_source["calendarId"]),
+            source_series_id=occurrence.series_id,
+        )
+        if promote_to_series
+        else occurrence.source_key
+    )
+    assert mapping["source_key"] == expected_source_key
+
+
+@pytest.mark.parametrize(
+    ("apply_to_series", "mapping_is_reused"),
+    [(False, True), (True, False)],
+    ids=["global-occurrence", "connection-scoped-series"],
+)
+def test_first_sync_after_reconnect_reuses_only_an_occurrence_mapping(
+    client, auth, apply_to_series, mapping_is_reused
+):
+    first_sources = configure_canonical_sources(client, auth)
+    first_source = first_sources[store.RESIDENTIAL_MORNING_ROLE]
+    first_connection = store.active_connection()
+    assert first_connection is not None
+    original_start = WINDOW_START + timedelta(days=2)
+    raw_occurrence = google_occurrence(
+        "first-sync-after-reconnect",
+        calendar_id="residential@example.test",
+        summary="Needs retained mapping",
+        location="Calendar-only retained note",
+        recurring_event_id="first-sync-after-reconnect-series",
+        original_start=original_start,
+        start=original_start,
+    )
+    occurrence = calendar_api._source_occurrence(raw_occurrence)
+    fingerprint = calendar_api.occurrence_fingerprint(occurrence)
+    FakeGoogleClient.targeted_recurring_occurrences = {
+        (occurrence.series_id, occurrence.occurrence_id): raw_occurrence
+    }
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    saved = client.put(
+        "/api/admin/google-calendar/mappings",
+        headers=auth,
+        json={
+            "sourceId": first_source["id"],
+            "sourceKey": occurrence.source_key,
+            "sourceFingerprint": fingerprint,
+            "eventId": occurrence.event_id,
+            "seriesId": occurrence.series_id,
+            "occurrenceId": occurrence.occurrence_id,
+            "locationId": location_id,
+            "applyToSeries": apply_to_series,
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["mapping"]["scope"] == (
+        "series" if apply_to_series else "occurrence"
+    )
+    mapping_id = int(saved.json()["mapping"]["id"])
+
+    disconnected = client.delete(
+        "/api/admin/google-calendar/connection",
+        headers=auth,
+    )
+    assert disconnected.status_code == 200, disconnected.text
+    second_sources = configure_canonical_sources(client, auth)
+    second_source = second_sources[store.RESIDENTIAL_MORNING_ROLE]
+    second_connection = store.active_connection()
+    assert second_connection is not None
+    assert int(second_connection["id"]) != int(first_connection["id"])
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [raw_occurrence],
+        "commercial@example.test": [],
+    }
+
+    synced = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert synced.status_code == 200, synced.text
+    body = synced.json()
+    assert body["counts"]["create"] == (1 if mapping_is_reused else 0)
+    assert body["counts"]["unresolved"] == (0 if mapping_is_reused else 1)
+    if mapping_is_reused:
+        assert body["exceptions"] == []
+        assert db.query_one(
+            """
+            SELECT location_id, calendar_source_id
+            FROM jobs
+            WHERE source_key = %s
+            """,
+            (occurrence.source_key,),
+        ) == {
+            "location_id": location_id,
+            "calendar_source_id": int(second_source["id"]),
+        }
+    else:
+        exception = next(
+            row
+            for row in body["exceptions"]
+            if row["sourceKey"] == occurrence.source_key
+        )
+        assert exception["code"] == "missing_site"
+        assert (
+            db.query_one(
+                "SELECT COUNT(*) AS n FROM jobs WHERE source_key = %s",
+                (occurrence.source_key,),
+            )["n"]
+            == 0
+        )
+    assert db.query_one(
+        """
+        SELECT id, connection_id
+        FROM google_calendar_event_mappings
+        WHERE id = %s
+        """,
+        (mapping_id,),
+    ) == {
+        "id": mapping_id,
+        "connection_id": int(first_connection["id"]),
+    }
+
+
+def test_delayed_source_writes_reject_a_replaced_calendar(client, auth):
+    sources = configure_canonical_sources(client, auth)
+    residential = sources[store.RESIDENTIAL_MORNING_ROLE]
+    commercial = sources[store.COMMERCIAL_EVENING_NIGHT_ROLE]
+    connection = store.active_connection()
+    assert connection is not None
+    replaced = store.replace_calendar_sources(
+        connection_id=int(connection["id"]),
+        expected_credential_version=int(connection["credential_version"]),
+        reconciliation_range_start=WINDOW_START - timedelta(days=14),
+        bindings=[
+            {
+                "role": store.RESIDENTIAL_MORNING_ROLE,
+                "calendar_id": "replacement-residential@example.test",
+                "calendar_name": "Replacement Residential",
+                "calendar_timezone": "America/Chicago",
+            },
+            {
+                "role": store.COMMERCIAL_EVENING_NIGHT_ROLE,
+                "calendar_id": str(commercial["calendarId"]),
+                "calendar_name": str(commercial["calendarName"]),
+                "calendar_timezone": str(commercial["calendarTimeZone"]),
+            },
+        ],
+        actor_id=1,
+        actor_name="Juan Canfield",
+    )
+    replaced_residential = next(
+        row for row in replaced if row["role"] == store.RESIDENTIAL_MORNING_ROLE
+    )
+    assert int(replaced_residential["id"]) == int(residential["id"])
+
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    with pytest.raises(
+        store.CalendarStoreError,
+        match="Google Calendar source changed",
+    ):
+        store.upsert_canonical_mapping(
+            source_id=int(residential["id"]),
+            expected_credential_version=int(connection["credential_version"]),
+            expected_calendar_id=str(residential["calendarId"]),
+            expected_calendar_timezone=str(residential["calendarTimeZone"]),
+            source_key="a" * 64,
+            source_series_id="stale-series",
+            source_fingerprint="b" * 64,
+            location_id=location_id,
+            apply_to_series=True,
+            actor_id=1,
+            actor_name="Juan Canfield",
+        )
+    recorded = store.mark_calendar_source_sync_failed(
+        source_id=int(residential["id"]),
+        expected_credential_version=int(connection["credential_version"]),
+        expected_calendar_id=str(residential["calendarId"]),
+        expected_calendar_timezone=str(residential["calendarTimeZone"]),
+        window_start=WINDOW_START,
+        window_end=WINDOW_START + timedelta(days=30),
+        message="stale provider failure",
+    )
+    assert recorded is False
+    assert db.query_one(
+        """
+        SELECT calendar_id, last_sync_status, last_sync_error
+        FROM google_calendar_sources
+        WHERE id = %s
+        """,
+        (int(residential["id"]),),
+    ) == {
+        "calendar_id": "replacement-residential@example.test",
+        "last_sync_status": "never",
+        "last_sync_error": None,
+    }
+    assert (
+        db.query_one("SELECT COUNT(*) AS n FROM google_calendar_event_mappings")["n"]
+        == 0
+    )
+
+
+@pytest.mark.parametrize(
+    ("replacement_calendar_id", "replacement_timezone"),
+    [
+        ("replacement-residential@example.test", "America/Chicago"),
+        ("residential@example.test", "America/New_York"),
+    ],
+    ids=["calendar-replaced", "timezone-replaced"],
+)
+def test_empty_source_snapshot_rejects_replaced_source_identity(
+    client, auth, replacement_calendar_id, replacement_timezone
+):
+    sources = configure_canonical_sources(client, auth)
+    residential = sources[store.RESIDENTIAL_MORNING_ROLE]
+    commercial = sources[store.COMMERCIAL_EVENING_NIGHT_ROLE]
+    connection = store.active_connection()
+    assert connection is not None
+    replaced = store.replace_calendar_sources(
+        connection_id=int(connection["id"]),
+        expected_credential_version=int(connection["credential_version"]),
+        reconciliation_range_start=WINDOW_START - timedelta(days=14),
+        bindings=[
+            {
+                "role": store.RESIDENTIAL_MORNING_ROLE,
+                "calendar_id": replacement_calendar_id,
+                "calendar_name": "Replacement Residential",
+                "calendar_timezone": replacement_timezone,
+            },
+            {
+                "role": store.COMMERCIAL_EVENING_NIGHT_ROLE,
+                "calendar_id": str(commercial["calendarId"]),
+                "calendar_name": str(commercial["calendarName"]),
+                "calendar_timezone": str(commercial["calendarTimeZone"]),
+            },
+        ],
+        actor_id=1,
+        actor_name="Juan Canfield",
+    )
+    replaced_residential = next(
+        row for row in replaced if row["role"] == store.RESIDENTIAL_MORNING_ROLE
+    )
+    assert int(replaced_residential["id"]) == int(residential["id"])
+
+    with pytest.raises(
+        store.CalendarStoreError,
+        match="Google Calendar source changed",
+    ):
+        store.sync_calendar_source(
+            source_id=int(residential["id"]),
+            expected_credential_version=int(connection["credential_version"]),
+            expected_calendar_id=str(residential["calendarId"]),
+            expected_calendar_timezone=str(residential["calendarTimeZone"]),
+            occurrences=[],
+            window_start=WINDOW_START,
+            window_end=WINDOW_START + timedelta(days=30),
+            actor_id=1,
+            actor_name="Juan Canfield",
+        )
+
+    assert db.query_one(
+        """
+        SELECT calendar_id, calendar_timezone, last_sync_status,
+               last_synced_at, last_sync_counts
+        FROM google_calendar_sources
+        WHERE id = %s
+        """,
+        (int(residential["id"]),),
+    ) == {
+        "calendar_id": replacement_calendar_id,
+        "calendar_timezone": replacement_timezone,
+        "last_sync_status": "never",
+        "last_synced_at": None,
+        "last_sync_counts": None,
+    }
+
+
+def test_source_replacement_respects_the_canonical_reconciliation_lookback(
+    client, auth, monkeypatch
+):
+    recent_start = datetime.now(UTC) - timedelta(days=1)
+    recent_end = recent_start + timedelta(hours=2)
+    range_state = {"start": recent_start - timedelta(days=14)}
+    monkeypatch.setattr(
+        calendar_api,
+        "_canonical_sync_window",
+        lambda _time_zone_name: (
+            range_state["start"],
+            recent_start + timedelta(days=90),
+        ),
+    )
+    sources = configure_canonical_sources(client, auth)
+    residential = sources[store.RESIDENTIAL_MORNING_ROLE]
+    recent = google_occurrence(
+        "recent-source-replacement-identity",
+        calendar_id="residential@example.test",
+        start=recent_start,
+        end=recent_end,
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [recent],
+        "commercial@example.test": [],
+    }
+    synced = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["counts"]["create"] == 1
+
+    FakeGoogleClient.calendars = [
+        CalendarSummary(
+            calendar_id="replacement-residential@example.test",
+            summary="Replacement Residential",
+            primary=False,
+            selected=True,
+            access_role="owner",
+            time_zone="America/Chicago",
+        ),
+        CalendarSummary(
+            calendar_id="commercial@example.test",
+            summary="Commercial Calendar",
+            primary=False,
+            selected=True,
+            access_role="reader",
+            time_zone="America/Chicago",
+        ),
+    ]
+    request = {
+        "residentialMorningCalendarId": "replacement-residential@example.test",
+        "commercialEveningNightCalendarId": "commercial@example.test",
+    }
+    blocked = client.put(
+        "/api/admin/google-calendar/sources",
+        headers=auth,
+        json=request,
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert "active reconciliation window" in blocked.json()["error"]
+    assert (
+        db.query_one(
+            "SELECT calendar_id FROM google_calendar_sources WHERE id = %s",
+            (int(residential["id"]),),
+        )["calendar_id"]
+        == "residential@example.test"
+    )
+
+    range_state["start"] = recent_end + timedelta(seconds=1)
+    replaced = client.put(
+        "/api/admin/google-calendar/sources",
+        headers=auth,
+        json=request,
+    )
+
+    assert replaced.status_code == 200, replaced.text
+    replaced_source = next(
+        source
+        for source in replaced.json()["sources"]
+        if source["role"] == store.RESIDENTIAL_MORNING_ROLE
+    )
+    assert int(replaced_source["id"]) == int(residential["id"])
+    assert replaced_source["calendarId"] == "replacement-residential@example.test"
+
+
+def test_provider_writes_reject_a_superseded_oauth_grant(client, auth):
+    sources = configure_canonical_sources(client, auth)
+    residential = sources[store.RESIDENTIAL_MORNING_ROLE]
+    commercial = sources[store.COMMERCIAL_EVENING_NIGHT_ROLE]
+    connection = store.active_connection()
+    assert connection is not None
+    stale_version = int(connection["credential_version"])
+    reauthorized = store.reauthorize_active_connection(
+        connection_id=int(connection["id"]),
+        account_email="reauthorized@example.test",
+        credentials={
+            "access_token": "replacement-access",
+            "refresh_token": "replacement-refresh",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+            "token_type": "Bearer",
+            "scopes": list(CALENDAR_READONLY_SCOPES),
+        },
+        scopes=CALENDAR_READONLY_SCOPES,
+        accessible_calendar_ids=[
+            str(residential["calendarId"]),
+            str(commercial["calendarId"]),
+        ],
+        admin_id=1,
+        admin_name="Juan Canfield",
+        cipher=store.CredentialCipher("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="),
+    )
+    assert int(reauthorized["credential_version"]) == stale_version + 1
+    occurrence = calendar_api._source_occurrence(
+        google_occurrence(
+            "stale-oauth-snapshot",
+            calendar_id=str(residential["calendarId"]),
+        )
+    )
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+
+    with pytest.raises(
+        store.CalendarStoreError,
+        match="Google Calendar credentials changed",
+    ):
+        store.sync_calendar_source(
+            source_id=int(residential["id"]),
+            expected_credential_version=stale_version,
+            expected_calendar_id=str(residential["calendarId"]),
+            expected_calendar_timezone=str(residential["calendarTimeZone"]),
+            occurrences=[occurrence],
+            window_start=WINDOW_START,
+            window_end=WINDOW_START + timedelta(days=30),
+            actor_id=1,
+            actor_name="Juan Canfield",
+        )
+    with pytest.raises(
+        store.CalendarStoreError,
+        match="Google Calendar credentials changed",
+    ):
+        store.upsert_canonical_mapping(
+            source_id=int(residential["id"]),
+            expected_credential_version=stale_version,
+            expected_calendar_id=str(residential["calendarId"]),
+            expected_calendar_timezone=str(residential["calendarTimeZone"]),
+            source_key=occurrence.source_key,
+            source_series_id=occurrence.series_id,
+            source_fingerprint=calendar_api.occurrence_fingerprint(occurrence),
+            location_id=location_id,
+            apply_to_series=True,
+            actor_id=1,
+            actor_name="Juan Canfield",
+        )
+    assert (
+        store.mark_calendar_source_sync_failed(
+            source_id=int(residential["id"]),
+            expected_credential_version=stale_version,
+            expected_calendar_id=str(residential["calendarId"]),
+            expected_calendar_timezone=str(residential["calendarTimeZone"]),
+            window_start=WINDOW_START,
+            window_end=WINDOW_START + timedelta(days=30),
+            message="failure from stale grant",
+        )
+        is False
+    )
+    assert db.query_one(
+        """
+        SELECT last_sync_status, last_sync_error
+        FROM google_calendar_sources
+        WHERE id = %s
+        """,
+        (int(residential["id"]),),
+    ) == {"last_sync_status": "never", "last_sync_error": None}
+    assert (
+        db.query_one(
+            "SELECT COUNT(*) AS n FROM jobs WHERE source_key = %s",
+            (occurrence.source_key,),
+        )["n"]
+        == 0
+    )
+    assert (
+        db.query_one("SELECT COUNT(*) AS n FROM google_calendar_event_mappings")["n"]
+        == 0
+    )
+
+
+def test_disconnect_serializes_an_inflight_canonical_sync(client, auth):
+    sources = configure_canonical_sources(client, auth)
+    residential = sources[store.RESIDENTIAL_MORNING_ROLE]
+    connection = store.active_connection()
+    assert connection is not None
+    start = datetime.now(timezone.utc) + timedelta(days=7)
+    occurrence = calendar_api._source_occurrence(
+        google_occurrence(
+            "disconnect-sync-race",
+            calendar_id=str(residential["calendarId"]),
+            start=start,
+        )
+    )
+    disconnect_ready = Event()
+    allow_disconnect = Event()
+
+    def pause_before_disconnect() -> None:
+        disconnect_ready.set()
+        assert allow_disconnect.wait(timeout=5)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        disconnect_future = executor.submit(
+            store.disconnect_calendar,
+            connection_id=int(connection["id"]),
+            expected_credential_version=int(connection["credential_version"]),
+            admin_id=1,
+            admin_name="Juan Canfield",
+            before_disconnect=pause_before_disconnect,
+        )
+        assert disconnect_ready.wait(timeout=2)
+        sync_future = executor.submit(
+            store.sync_calendar_source,
+            source_id=int(residential["id"]),
+            expected_credential_version=int(connection["credential_version"]),
+            expected_calendar_id=str(residential["calendarId"]),
+            expected_calendar_timezone=str(residential["calendarTimeZone"]),
+            occurrences=[occurrence],
+            window_start=start - timedelta(days=1),
+            window_end=start + timedelta(days=30),
+            actor_id=1,
+            actor_name="Juan Canfield",
+        )
+        with pytest.raises(FutureTimeoutError):
+            sync_future.result(timeout=0.2)
+        allow_disconnect.set()
+        assert disconnect_future.result(timeout=5) is True
+        with pytest.raises(
+            store.CalendarStoreError,
+            match="Google Calendar source is no longer active",
+        ):
+            sync_future.result(timeout=5)
+
+    assert (
+        db.query_one(
+            "SELECT COUNT(*) AS n FROM jobs WHERE source_key = %s",
+            (occurrence.source_key,),
+        )["n"]
+        == 0
+    )
+
+
+def test_disconnect_blocks_future_retained_visit_from_the_commercial_calendar(
+    client, auth
+):
+    configure_canonical_sources(client, auth)
+    connection = store.active_connection()
+    assert connection is not None
+    assert connection["selected_calendar_id"] == "residential@example.test"
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    future_start = datetime.now(UTC) + timedelta(days=7)
+    occurrence = calendar_api._source_occurrence(
+        google_occurrence(
+            "retained-commercial-disconnect-guard",
+            calendar_id="commercial@example.test",
+            start=future_start,
+        )
+    )
+    planned_visit_id = int(
+        db.query_one(
+            """
+            INSERT INTO planned_service_visits (
+                connection_id, source_calendar_id, source_event_id,
+                source_series_id, source_occurrence_id, source_key,
+                source_fingerprint, title, location_id, approximate_start,
+                approximate_end, source_timezone, status
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'planned'
+            )
+            RETURNING id
+            """,
+            (
+                int(connection["id"]),
+                occurrence.calendar_id,
+                occurrence.event_id,
+                occurrence.series_id,
+                occurrence.occurrence_id,
+                occurrence.source_key,
+                calendar_api.occurrence_fingerprint(occurrence),
+                occurrence.title,
+                location_id,
+                occurrence.starts_at,
+                occurrence.ends_at,
+                occurrence.time_zone,
+            ),
+        )["id"]
+    )
+    migration = store.migrate_legacy_planned_visits()
+    assert migration["exceptions"] == [
+        {
+            "plannedVisitId": planned_visit_id,
+            "sourceKey": occurrence.source_key,
+            "code": "wrong_site_type",
+            "locationId": location_id,
+        }
+    ]
+    assert (
+        db.query_one(
+            "SELECT COUNT(*) AS n FROM jobs WHERE source_key = %s",
+            (occurrence.source_key,),
+        )["n"]
+        == 0
+    )
+
+    blocked = client.delete("/api/admin/google-calendar/connection", headers=auth)
+
+    assert blocked.status_code == 409, blocked.text
+    assert "Resolve or cancel future planned visits" in blocked.json()["error"]
+    assert FakeGoogleClient.revoked_tokens == []
+    retained = db.query_one(
+        """
+        SELECT revoked_at, credential_ciphertext
+        FROM google_calendar_connections
+        WHERE id = %s
+        """,
+        (int(connection["id"]),),
+    )
+    assert retained["revoked_at"] is None
+    assert retained["credential_ciphertext"] is not None
+    assert (
+        db.query_one(
+            """
+            SELECT COUNT(*) AS n
+            FROM planned_visit_audit_events
+            WHERE action = 'calendar_disconnected'
+            """
+        )["n"]
+        == 0
+    )
+
+    db.execute(
+        """
+        UPDATE planned_service_visits
+        SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
+        WHERE id = %s
+        """,
+        (planned_visit_id,),
+    )
+    recovered = client.delete("/api/admin/google-calendar/connection", headers=auth)
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json() == {"success": True, "disconnected": True}
+
+
+@pytest.mark.parametrize("visit_status", ["planned", "completed", "cancelled"])
+def test_legacy_migration_blocks_only_planned_work_from_revoked_connection(
+    client, auth, visit_status
+):
+    sources = configure_canonical_sources(client, auth)
+    residential = sources[store.RESIDENTIAL_MORNING_ROLE]
+    connection = store.active_connection()
+    assert connection is not None
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    occurrence = calendar_api._source_occurrence(
+        google_occurrence(
+            f"{visit_status}-revoked-legacy-migration",
+            calendar_id=str(residential["calendarId"]),
+        )
+    )
+    planned_visit_id = int(
+        db.query_one(
+            """
+            INSERT INTO planned_service_visits (
+                connection_id, source_calendar_id, source_event_id,
+                source_series_id, source_occurrence_id, source_key,
+                source_fingerprint, title, location_id, approximate_start,
+                approximate_end, source_timezone, status, completed_at, cancelled_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s
+            )
+            RETURNING id
+            """,
+            (
+                int(connection["id"]),
+                occurrence.calendar_id,
+                occurrence.event_id,
+                occurrence.series_id,
+                occurrence.occurrence_id,
+                occurrence.source_key,
+                calendar_api.occurrence_fingerprint(occurrence),
+                occurrence.title,
+                location_id,
+                occurrence.starts_at,
+                occurrence.ends_at,
+                occurrence.time_zone,
+                visit_status,
+                occurrence.ends_at if visit_status == "completed" else None,
+                occurrence.ends_at if visit_status == "cancelled" else None,
+            ),
+        )["id"]
+    )
+    assert store.disconnect_calendar(
+        connection_id=int(connection["id"]),
+        expected_credential_version=int(connection["credential_version"]),
+        admin_id=1,
+        admin_name="Juan Canfield",
+    )
+
+    migrated = store.migrate_legacy_planned_visits()
+
+    if visit_status == "planned":
+        assert migrated["counts"]["created"] == 0
+        assert migrated["exceptions"] == [
+            {
+                "plannedVisitId": planned_visit_id,
+                "sourceKey": occurrence.source_key,
+                "code": "source_disconnected",
+                "locationId": location_id,
+            }
+        ]
+        assert (
+            db.query_one(
+                "SELECT migrated_job_id FROM planned_service_visits WHERE id = %s",
+                (planned_visit_id,),
+            )["migrated_job_id"]
+            is None
+        )
+        assert (
+            db.query_one(
+                "SELECT COUNT(*) AS n FROM jobs WHERE source_key = %s",
+                (occurrence.source_key,),
+            )["n"]
+            == 0
+        )
+    else:
+        assert migrated["counts"]["created"] == 1
+        assert migrated["exceptions"] == []
+        migrated_row = db.query_one(
+            """
+            SELECT j.status, j.calendar_source_id, pv.migrated_job_id
+            FROM planned_service_visits pv
+            JOIN jobs j ON j.id = pv.migrated_job_id
+            WHERE pv.id = %s
+            """,
+            (planned_visit_id,),
+        )
+        assert migrated_row["status"] == visit_status
+        assert migrated_row["calendar_source_id"] == int(residential["id"])
+        assert migrated_row["migrated_job_id"] is not None
+
+
+def test_legacy_visit_migration_is_idempotent_and_refuses_manual_job_collision(
+    client, auth
+):
+    sources = configure_canonical_sources(client, auth)
+    connection_id = int(sources[store.RESIDENTIAL_MORNING_ROLE]["connectionId"])
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
+        )["id"]
+    )
+    occurrence = calendar_api._source_occurrence(
+        google_occurrence(
+            "legacy-migration",
+            calendar_id="residential@example.test",
+        )
+    )
+    fingerprint = calendar_api.occurrence_fingerprint(occurrence)
+    manual_job_id = int(
+        db.query_one(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date, status
+            ) VALUES (%s, 'Test Customer', %s, 'scheduled')
+            RETURNING id
+            """,
+            (location_id, occurrence.service_date),
+        )["id"]
+    )
+    planned_visit_id = int(
+        db.query_one(
+            """
+            INSERT INTO planned_service_visits (
+                connection_id, source_calendar_id, source_event_id,
+                source_series_id, source_occurrence_id, source_key,
+                source_fingerprint, title, location_id, approximate_start,
+                approximate_end, source_timezone
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            RETURNING id
+            """,
+            (
+                connection_id,
+                occurrence.calendar_id,
+                occurrence.event_id,
+                occurrence.series_id,
+                occurrence.occurrence_id,
+                occurrence.source_key,
+                fingerprint,
+                occurrence.title,
+                location_id,
+                occurrence.starts_at,
+                occurrence.ends_at,
+                occurrence.time_zone,
+            ),
+        )["id"]
+    )
+
+    collision = store.migrate_legacy_planned_visits()
+    assert collision["counts"]["collisions"] == 1
+    assert collision["collisions"][0]["jobIds"] == [manual_job_id]
+    assert (
+        db.query_one(
+            "SELECT migrated_job_id FROM planned_service_visits WHERE id = %s",
+            (planned_visit_id,),
+        )["migrated_job_id"]
+        is None
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [
+            google_occurrence(
+                "legacy-migration",
+                calendar_id="residential@example.test",
+            )
+        ],
+        "commercial@example.test": [],
+    }
+    surfaced = client.post("/api/admin/google-calendar/sync", headers=auth).json()
+    assert surfaced["legacyMigration"]["counts"]["collisions"] == 1
+    assert surfaced["exceptions"][0]["code"] == "legacy_job_collision"
+    assert surfaced["exceptions"][0]["conflictingJobIds"] == [manual_job_id]
+
+    db.execute("DELETE FROM jobs WHERE id = %s", (manual_job_id,))
+    migrated = store.migrate_legacy_planned_visits()
+    assert migrated["counts"]["created"] == 1
+    linked = db.query_one(
+        """
+        SELECT pv.migrated_job_id, j.source_key, j.expected_hours, j.revenue
+        FROM planned_service_visits pv
+        JOIN jobs j ON j.id = pv.migrated_job_id
+        WHERE pv.id = %s
+        """,
+        (planned_visit_id,),
+    )
+    assert linked["source_key"] == occurrence.source_key
+    assert linked["expected_hours"] is None
+    assert linked["revenue"] is None
+    audit = db.query_one(
+        """
+        SELECT action, actor_name, after_state
+        FROM planned_visit_audit_events
+        WHERE planned_visit_id = %s
+          AND action = 'canonical_job_migration_created'
+        """,
+        (planned_visit_id,),
+    )
+    assert audit["actor_name"] == "system:canonical-calendar-migration"
+    assert int(audit["after_state"]["jobId"]) == int(linked["migrated_job_id"])
+    retry = store.migrate_legacy_planned_visits()
+    assert retry["counts"] == {
+        "created": 0,
+        "linked": 0,
+        "collisions": 0,
+    }
+    assert retry["exceptions"] == []
+    assert (
+        db.query_one(
+            """
+        SELECT COUNT(*) AS n
+        FROM planned_visit_audit_events
+        WHERE planned_visit_id = %s
+          AND action LIKE 'canonical_job_migration_%%'
+        """,
+            (planned_visit_id,),
+        )["n"]
+        == 1
+    )
+
+
+def test_legacy_migration_preserves_historical_status_despite_current_site_rules(
+    client, auth
+):
+    sources = configure_canonical_sources(client, auth)
+    connection_id = int(sources[store.RESIDENTIAL_MORNING_ROLE]["connectionId"])
+    location_id = int(
+        db.query_one(
+            "SELECT id FROM locations WHERE address = '456 Oak St, Effingham'"
+        )["id"]
+    )
+    db.execute("UPDATE locations SET active = false WHERE id = %s", (location_id,))
+    occurrence = calendar_api._source_occurrence(
+        google_occurrence(
+            "legacy-completed",
+            calendar_id="residential@example.test",
+            summary="Commercial Customer",
+            location="456 Oak St, Effingham",
+        )
+    )
+    planned_visit_id = int(
+        db.query_one(
+            """
+            INSERT INTO planned_service_visits (
+                connection_id, source_calendar_id, source_event_id,
+                source_series_id, source_occurrence_id, source_key,
+                source_fingerprint, title, location_id, approximate_start,
+                approximate_end, all_day, source_timezone, status, completed_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, %s,
+                'completed', %s
+            )
+            RETURNING id
+            """,
+            (
+                connection_id,
+                occurrence.calendar_id,
+                occurrence.event_id,
+                occurrence.series_id,
+                occurrence.occurrence_id,
+                occurrence.source_key,
+                calendar_api.occurrence_fingerprint(occurrence),
+                occurrence.title,
+                location_id,
+                occurrence.starts_at,
+                occurrence.ends_at,
+                occurrence.time_zone,
+                occurrence.ends_at,
+            ),
+        )["id"]
+    )
+    db.execute(
+        "DELETE FROM google_calendar_sources WHERE connection_id = %s",
+        (connection_id,),
+    )
+
+    migrated = store.migrate_legacy_planned_visits()
+
+    assert migrated["counts"] == {
+        "created": 1,
+        "linked": 0,
+        "collisions": 0,
+    }
+    assert migrated["exceptions"] == []
+    migrated_row = db.query_one(
+        """
+        SELECT j.status, j.source_all_day, j.calendar_source_id,
+               pv.migrated_job_id
+        FROM planned_service_visits pv
+        JOIN jobs j ON j.id = pv.migrated_job_id
+        WHERE pv.id = %s
+        """,
+        (planned_visit_id,),
+    )
+    assert migrated_row["status"] == "completed"
+    assert migrated_row["source_all_day"] is True
+    assert migrated_row["calendar_source_id"] is None
+    assert migrated_row["migrated_job_id"] is not None

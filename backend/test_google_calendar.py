@@ -344,8 +344,32 @@ def test_list_calendars_paginates_and_normalizes_without_write_calls():
     assert recorder.calls[0][2]["headers"]["Authorization"] == "Bearer access-secret"
     assert "pageToken" not in recorder.calls[0][2]["params"]
     assert recorder.calls[1][2]["params"]["pageToken"] == "page-2"
+    assert all(
+        call[2]["params"]["minAccessRole"] == "reader"
+        for call in recorder.calls
+    )
     assert all(call[2]["timeout"] == 7.5 for call in recorder.calls)
     assert all(call[2]["allow_redirects"] is False for call in recorder.calls)
+
+
+@pytest.mark.parametrize("access_role", [None, "", "   "])
+def test_list_calendars_preserves_missing_or_blank_access_role_as_unknown(
+    access_role,
+):
+    raw_calendar = {
+        "id": "operations@example.com",
+        "summary": "Operations",
+    }
+    if access_role is not None:
+        raw_calendar["accessRole"] = access_role
+    recorder = RequestRecorder([StubResponse({"items": [raw_calendar]})])
+
+    calendars = calendar_client(recorder).list_calendars(
+        access_token="access-secret"
+    )
+
+    assert len(calendars) == 1
+    assert calendars[0].access_role == ""
 
 
 def test_list_occurrences_requests_fixed_30_days_and_normalizes_event_shapes():
