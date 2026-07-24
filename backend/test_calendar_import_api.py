@@ -665,9 +665,11 @@ def test_retired_planner_routes_are_absent_and_read_only(
 
 
 def test_production_route_set_excludes_only_retired_calendar_planner(client):
+    import time_tracker_api as api
+
     registered = {
         (method, route.path)
-        for route in client.app.routes
+        for route in api.app.routes
         for method in getattr(route, "methods", set())
     }
     retired = {
