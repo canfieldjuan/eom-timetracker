@@ -402,10 +402,7 @@ class GoogleCalendarClient:
                         or calendar_id,
                         primary=bool(raw.get("primary", False)),
                         selected=bool(raw.get("selected", False)),
-                        access_role=_required_upstream_text(
-                            raw.get("accessRole"),
-                            "calendar access role",
-                        ),
+                        access_role=_optional_text(raw.get("accessRole")) or "",
                         time_zone=_optional_text(raw.get("timeZone")),
                     )
                 )

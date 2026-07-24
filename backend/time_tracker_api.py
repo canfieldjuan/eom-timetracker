@@ -10782,7 +10782,9 @@ def _source_job_profitability_economics(
         site_id = row.get("site_id")
         revenue_cents: Optional[int] = None
 
-        if site_id is not None and rate_cents is not None:
+        if row.get("status") == "cancelled":
+            revenue_cents = 0
+        elif site_id is not None and rate_cents is not None:
             if rate_type == "per_visit":
                 revenue_cents = rate_cents
             elif rate_type == "hourly" and expected is not None:
@@ -10793,17 +10795,14 @@ def _source_job_profitability_economics(
                     )
                 )
             elif rate_type == "monthly":
-                if row.get("status") == "cancelled":
-                    revenue_cents = 0
-                else:
-                    scheduled_date = row["scheduled_date"]
-                    group = (
-                        int(site_id),
-                        scheduled_date.year,
-                        scheduled_date.month,
-                    )
-                    monthly_group_for_job[job_id] = group
-                    monthly_rates[group] = rate_cents
+                scheduled_date = row["scheduled_date"]
+                group = (
+                    int(site_id),
+                    scheduled_date.year,
+                    scheduled_date.month,
+                )
+                monthly_group_for_job[job_id] = group
+                monthly_rates[group] = rate_cents
 
         economics[job_id] = {
             "expected_hours": float(expected) if expected is not None else None,

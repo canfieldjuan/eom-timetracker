@@ -353,7 +353,9 @@ def test_list_calendars_paginates_and_normalizes_without_write_calls():
 
 
 @pytest.mark.parametrize("access_role", [None, "", "   "])
-def test_list_calendars_rejects_missing_or_blank_access_role(access_role):
+def test_list_calendars_preserves_missing_or_blank_access_role_as_unknown(
+    access_role,
+):
     raw_calendar = {
         "id": "operations@example.com",
         "summary": "Operations",
@@ -362,11 +364,12 @@ def test_list_calendars_rejects_missing_or_blank_access_role(access_role):
         raw_calendar["accessRole"] = access_role
     recorder = RequestRecorder([StubResponse({"items": [raw_calendar]})])
 
-    with pytest.raises(
-        GoogleCalendarResponseError,
-        match="invalid calendar access role",
-    ):
-        calendar_client(recorder).list_calendars(access_token="access-secret")
+    calendars = calendar_client(recorder).list_calendars(
+        access_token="access-secret"
+    )
+
+    assert len(calendars) == 1
+    assert calendars[0].access_role == ""
 
 
 def test_list_occurrences_requests_fixed_30_days_and_normalizes_event_shapes():

@@ -1978,6 +1978,13 @@ class TestJobs:
                 scheduled_date="2047-02-05",
                 source_key="06" * 32,
             )
+            manual_job = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-02-07",
+                expected_hours=2.0,
+                revenue=25.0,
+            )
             last_job = _insert_profitability_job(
                 location_id=site_id,
                 customer_name=customer_name,
@@ -1985,7 +1992,7 @@ class TestJobs:
                 source_key="07" * 32,
             )
             job_ids.extend(
-                [first_job, cancelled_job, second_job, last_job]
+                [first_job, cancelled_job, second_job, manual_job, last_job]
             )
 
             full_month = client.get(
@@ -2002,11 +2009,13 @@ class TestJobs:
             assert full_month.status_code == 200, full_month.text
             payload = full_month.json()
             by_id = {row["jobId"]: row for row in payload["jobs"]}
-            assert set(by_id) == {first_job, second_job, last_job}
+            assert set(by_id) == {first_job, second_job, manual_job, last_job}
             assert by_id[first_job]["expectedHours"] == 4.0
-            assert by_id[first_job]["revenue"] == 33.34
-            assert by_id[second_job]["revenue"] == 33.34
-            assert by_id[last_job]["revenue"] == 33.33
+            assert by_id[first_job]["revenue"] == 25.01
+            assert by_id[second_job]["revenue"] == 25.0
+            assert by_id[manual_job]["expectedHours"] == 2.0
+            assert by_id[manual_job]["revenue"] == 25.0
+            assert by_id[last_job]["revenue"] == 25.0
             assert payload["summary"]["totalRevenue"] == 100.01
             assert payload["summary"]["totalNetProfit"] == 100.01
 
@@ -2022,7 +2031,7 @@ class TestJobs:
 
             assert filtered.status_code == 200, filtered.text
             assert filtered.json()["jobs"] == [by_id[last_job]]
-            assert filtered.json()["summary"]["totalRevenue"] == 33.33
+            assert filtered.json()["summary"]["totalRevenue"] == 25.0
 
             source_storage = db.query_all(
                 """
@@ -2030,12 +2039,74 @@ class TestJobs:
                 FROM jobs
                 WHERE id = ANY(%s)
                 """,
-                (job_ids,),
+                (
+                    [
+                        first_job,
+                        cancelled_job,
+                        second_job,
+                        last_job,
+                    ],
+                ),
             )
             assert all(
                 row["expected_hours"] is None and row["revenue"] is None
                 for row in source_storage
             )
+        finally:
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
+
+    @pytest.mark.parametrize(
+        ("rate_type", "source_key_prefix"),
+        [
+            ("per_visit", "08"),
+            ("hourly", "09"),
+            ("monthly", "0a"),
+        ],
+    )
+    def test_jobs_profitability_zeroes_cancelled_source_revenue(
+        self, client, auth, rate_type, source_key_prefix
+    ):
+        customer_name = f"Profitability Cancelled {rate_type}"
+        job_ids: list[int] = []
+        site_ids: list[int] = []
+        try:
+            site_id = _insert_profitability_site(
+                address=f"Profitability Cancelled {rate_type} Site",
+                customer_name=customer_name,
+                rate=80.0,
+                rate_type=rate_type,
+                expected_hours=3.0,
+            )
+            site_ids.append(site_id)
+            job_id = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-03-01",
+                status="cancelled",
+                source_key=source_key_prefix * 32,
+            )
+            job_ids.append(job_id)
+
+            response = client.get(
+                "/api/admin/jobs/profitability",
+                headers=auth,
+                params={
+                    "status": "cancelled",
+                    "customer": customer_name,
+                    "start_date": "2047-03-01",
+                    "end_date": "2047-03-01",
+                },
+            )
+
+            assert response.status_code == 200, response.text
+            payload = response.json()
+            assert len(payload["jobs"]) == 1
+            assert payload["jobs"][0]["jobId"] == job_id
+            assert payload["jobs"][0]["expectedHours"] == 3.0
+            assert payload["jobs"][0]["revenue"] == 0.0
+            assert payload["jobs"][0]["netProfit"] == 0.0
+            assert payload["summary"]["totalRevenue"] == 0.0
+            assert payload["summary"]["totalNetProfit"] == 0.0
         finally:
             _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
 
