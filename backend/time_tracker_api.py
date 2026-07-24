@@ -193,11 +193,10 @@ def get_client_ip(request: Request) -> str:
         hops = [part.strip() for part in forwarded.split(",") if part.strip()]
         if hops:
             # A client can PREPEND fake entries on the left of X-Forwarded-For;
-            # only the rightmost entries are appended by our own proxy layer.
-            # Trust the hop TRUSTED_PROXY_HOPS from the right (default 1 = the
-            # address our proxy actually observed), never the leftmost/
-            # client-supplied value. For honest traffic (a single real hop) this
-            # is identical to before.
+            # trusted proxies append addresses on the right. Select
+            # TRUSTED_PROXY_HOPS from the right so the production chain ignores
+            # that client-supplied prefix. Production Render traffic has two
+            # trusted hops: Cloudflare and Render's load balancer.
             index = max(0, len(hops) - TRUSTED_PROXY_HOPS)
             return normalize_ip(hops[index])
 
@@ -2368,9 +2367,14 @@ ALLOWED_DAYS = parse_allowed_days(os.getenv("ALLOWED_DAYS"))
 ALLOWED_IPS = parse_allowed_ips(os.getenv("ALLOWED_IPS"))
 TRUST_PROXY = parse_bool(os.getenv("TRUST_PROXY"), False)
 # Number of trusted reverse-proxy hops between the app and the public internet.
-# Used to pick the real client IP from the RIGHT of X-Forwarded-For (Render's
-# edge = 1). Increase only if you add another trusted proxy (e.g. a CDN).
-TRUSTED_PROXY_HOPS = max(1, parse_int(os.getenv("TRUSTED_PROXY_HOPS"), 1))
+# Used to pick the real client IP from the RIGHT of X-Forwarded-For. Render's
+# production path is Cloudflare plus its load balancer, so its default is 2.
+# Override this only when the deployed proxy topology differs.
+DEFAULT_TRUSTED_PROXY_HOPS = 2
+TRUSTED_PROXY_HOPS = max(
+    1,
+    parse_int(os.getenv("TRUSTED_PROXY_HOPS"), DEFAULT_TRUSTED_PROXY_HOPS),
+)
 # Gate employee clock actions (clock-in/out, arrive, depart, QR check-in) to the
 # ACCESS_START_HOUR..ACCESS_END_HOUR window on ALLOWED_DAYS. Deliberately does NOT
 # apply the IP allowlist (field phones have churning mobile IPs). Kill switch:
