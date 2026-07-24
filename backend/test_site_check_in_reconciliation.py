@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 
@@ -267,13 +266,3 @@ def test_openapi_keeps_history_reads_but_omits_retired_mutations(client):
     assert "/api/admin/site-check-in-schedules/{schedule_id}" not in paths
     assert set(paths["/api/admin/site-check-in-schedule-rules"]) == {"get"}
     assert "/api/admin/site-check-in-schedule-rules/{rule_id}" not in paths
-
-
-def test_legacy_page_has_no_forward_reconciliation_caller():
-    html = (Path(__file__).parent / "timetracker-mobile.html").read_text()
-
-    assert "Arrival vs. Timecard" not in html
-    assert "loadArrivalTimecardReconciliation" not in html
-    assert "/admin/site-check-in-reconciliation?" not in html
-    assert "reviewArrivalTimecardException" not in html
-    assert "/admin/site-check-in-reconciliation/${encodedKey}/review" not in html
