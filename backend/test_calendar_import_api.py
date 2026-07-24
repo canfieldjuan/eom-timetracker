@@ -6,13 +6,17 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import logging
+import os
+from pathlib import Path
 from threading import Event
 from urllib.parse import parse_qs, urlsplit
+import uuid
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 import psycopg2.extras
+from psycopg2 import sql
 import pytest
 
 import calendar_import_api as calendar_api
@@ -304,7 +308,14 @@ def isolated_calendar_domain(monkeypatch):
                 """
             )
             employee_ids = [row[0] for row in cur.fetchall()]
-            cur.execute("SELECT id FROM crews WHERE name = 'Morning Crew'")
+            cur.execute(
+                """
+                INSERT INTO crews (name)
+                VALUES ('Morning Crew')
+                ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                RETURNING id
+                """
+            )
             crew_id = cur.fetchone()[0]
             for employee_id in employee_ids:
                 cur.execute(
@@ -476,6 +487,35 @@ def calendar_import_test_client(
     return TestClient(app, raise_server_exceptions=True)
 
 
+@pytest.fixture
+def retired_planner_client():
+    import time_tracker_api as api
+
+    config = calendar_import_config()
+    app = FastAPI()
+    app.add_exception_handler(HTTPException, api.http_exception_handler)
+
+    def get_current_admin() -> dict[str, object]:
+        return {
+            "id": 1,
+            "name": "Juan Canfield",
+            "role": "admin",
+        }
+
+    router = calendar_api.build_calendar_import_router(
+        config=config,
+        get_current_admin=get_current_admin,
+    )
+    calendar_api._register_retired_planner_routes_for_tests(
+        router=router,
+        config=config,
+        get_current_admin=get_current_admin,
+    )
+    app.include_router(router)
+    with TestClient(app, raise_server_exceptions=True) as test_client:
+        yield test_client
+
+
 @pytest.mark.parametrize(
     ("method", "path", "body"),
     [
@@ -505,8 +545,6 @@ def calendar_import_test_client(
             },
         ),
         ("delete", "/api/admin/google-calendar/connection", None),
-        ("get", "/api/admin/planned-visits/crews", None),
-        ("post", "/api/admin/google-calendar/preview", {"resolutions": []}),
     ],
 )
 def test_calendar_admin_routes_enforce_current_admin(
@@ -522,6 +560,165 @@ def test_calendar_admin_routes_enforce_current_admin(
 
     assert no_auth.status_code == 401
     assert employee.status_code == 403
+
+
+def _retired_planner_state() -> dict[str, list[dict[str, object]]]:
+    return {
+        "connections": db.query_all(
+            """
+            SELECT id, selected_calendar_id, selected_calendar_timezone,
+                   credential_version, revoked_at
+            FROM google_calendar_connections
+            ORDER BY id
+            """
+        ),
+        "sources": db.query_all(
+            """
+            SELECT id, connection_id, role, calendar_id, calendar_name,
+                   calendar_timezone, last_sync_status
+            FROM google_calendar_sources
+            ORDER BY id
+            """
+        ),
+        "previews": db.query_all(
+            "SELECT id, status, applied_at FROM calendar_import_previews ORDER BY id"
+        ),
+        "mappings": db.query_all(
+            """
+            SELECT id, connection_id, calendar_id, source_key, mapping_scope,
+                   source_fingerprint, location_id
+            FROM google_calendar_event_mappings
+            ORDER BY id
+            """
+        ),
+        "visits": db.query_all(
+            """
+            SELECT id, source_key, status, location_id, last_preview_id
+            FROM planned_service_visits
+            ORDER BY id
+            """
+        ),
+        "assignments": db.query_all(
+            """
+            SELECT id, planned_visit_id, crew_id, employee_id, active
+            FROM planned_visit_assignments
+            ORDER BY id
+            """
+        ),
+        "crews": db.query_all(
+            "SELECT id, name, active, created_by FROM crews ORDER BY id"
+        ),
+        "memberships": db.query_all(
+            """
+            SELECT id, crew_id, employee_id, effective_from, effective_to
+            FROM crew_memberships
+            ORDER BY id
+            """
+        ),
+        "audit": db.query_all(
+            """
+            SELECT id, planned_visit_id, preview_id, action
+            FROM planned_visit_audit_events
+            ORDER BY id
+            """
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("post", "/api/admin/google-calendar/preview", {"resolutions": []}),
+        (
+            "post",
+            "/api/admin/google-calendar/approve",
+            {"previewId": "retired", "previewFingerprint": "a" * 64},
+        ),
+        (
+            "put",
+            "/api/admin/google-calendar/calendar",
+            {"calendarId": "operations@example.test"},
+        ),
+        ("get", "/api/admin/planned-visits/crews", None),
+        (
+            "put",
+            "/api/admin/planned-visits/crews/1/memberships",
+            {"employeeIds": []},
+        ),
+    ],
+)
+def test_retired_planner_routes_are_absent_and_read_only(
+    client, auth, emp_auth, method, path, body
+):
+    before = _retired_planner_state()
+    request = getattr(client, method)
+
+    for headers in ({}, emp_auth, auth):
+        response = (
+            request(path, headers=headers, json=body)
+            if body is not None
+            else request(path, headers=headers)
+        )
+        assert response.status_code == 404
+
+    assert _retired_planner_state() == before
+
+
+def test_production_route_set_excludes_only_retired_calendar_planner(client):
+    registered = {
+        (method, route.path)
+        for route in client.app.routes
+        for method in getattr(route, "methods", set())
+    }
+    retired = {
+        ("POST", "/api/admin/google-calendar/preview"),
+        ("POST", "/api/admin/google-calendar/approve"),
+        ("PUT", "/api/admin/google-calendar/calendar"),
+        ("GET", "/api/admin/planned-visits/crews"),
+        ("PUT", "/api/admin/planned-visits/crews/{crew_id}/memberships"),
+    }
+    canonical = {
+        ("GET", "/api/admin/google-calendar/status"),
+        ("POST", "/api/admin/google-calendar/connect"),
+        ("GET", "/api/google-calendar/oauth/callback"),
+        ("GET", "/api/admin/google-calendar/calendars"),
+        ("PUT", "/api/admin/google-calendar/sources"),
+        ("POST", "/api/admin/google-calendar/sync"),
+        ("PUT", "/api/admin/google-calendar/mappings"),
+        ("DELETE", "/api/admin/google-calendar/connection"),
+        ("GET", "/api/admin/operations/schedule"),
+        ("GET", "/api/admin/operations/forecast"),
+    }
+
+    assert registered.isdisjoint(retired)
+    assert canonical <= registered
+
+
+def test_fresh_schema_does_not_seed_a_default_crew_or_membership():
+    schema_name = f"calendar_quarantine_{uuid.uuid4().hex}"
+    schema_sql = Path(__file__).with_name("schema.sql").read_text()
+    connection = psycopg2.connect(os.environ["DATABASE_URL"], sslmode="disable")
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+            )
+            cur.execute(
+                sql.SQL("SET LOCAL search_path TO {}").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+            cur.execute(schema_sql)
+            cur.execute(
+                """
+                SELECT (SELECT COUNT(*) FROM crews),
+                       (SELECT COUNT(*) FROM crew_memberships)
+                """
+            )
+            assert cur.fetchone() == (0, 0)
+    finally:
+        connection.rollback()
+        connection.close()
 
 
 @pytest.mark.parametrize(
@@ -794,8 +991,8 @@ def test_oauth_access_log_filter_redacts_callback_query_only():
     assert "/api/health?probe=1" in ordinary.getMessage()
 
 
-def test_status_calendar_selection_and_morning_crew_resolution(client, auth):
-    status = client.get("/api/admin/google-calendar/status", headers=auth)
+def test_status_calendar_selection_and_morning_crew_resolution(retired_planner_client, auth):
+    status = retired_planner_client.get("/api/admin/google-calendar/status", headers=auth)
     assert status.status_code == 200
     assert status.json() == {
         "configured": True,
@@ -814,34 +1011,34 @@ def test_status_calendar_selection_and_morning_crew_resolution(client, auth):
     }
 
     connection_id = connect_selected_calendar()
-    connected_status = client.get("/api/admin/google-calendar/status", headers=auth)
+    connected_status = retired_planner_client.get("/api/admin/google-calendar/status", headers=auth)
     assert connected_status.status_code == 200
     assert connected_status.json()["connectionId"] == connection_id
-    reconnect = client.post("/api/admin/google-calendar/connect", headers=auth)
+    reconnect = retired_planner_client.post("/api/admin/google-calendar/connect", headers=auth)
     assert reconnect.status_code == 200
     assert reconnect.json()["authorizationUrl"].startswith(
         "https://accounts.google.com/"
     )
     assert FakeGoogleClient.login_hints == ["operations@example.test"]
-    calendars = client.get("/api/admin/google-calendar/calendars", headers=auth)
+    calendars = retired_planner_client.get("/api/admin/google-calendar/calendars", headers=auth)
     assert calendars.status_code == 200
     assert calendars.json()["calendars"][0]["name"] == "Operations"
 
-    selected = client.put(
+    selected = retired_planner_client.put(
         "/api/admin/google-calendar/calendar",
         headers=auth,
         json={"calendarId": "operations@example.test"},
     )
     assert selected.status_code == 200
 
-    crews = client.get("/api/admin/planned-visits/crews", headers=auth)
+    crews = retired_planner_client.get("/api/admin/planned-visits/crews", headers=auth)
     assert crews.status_code == 200
     assert crews.json()["morningCrew"]["ready"] is True
     assert crews.json()["morningCrew"]["identityIssues"] == []
     assert len(crews.json()["morningCrew"]["memberIds"]) == 3
 
 
-def test_calendar_without_provider_timezone_uses_configured_fallback(client, auth):
+def test_calendar_without_provider_timezone_uses_configured_fallback(retired_planner_client, auth):
     connection_id = connect_unselected_calendar()
     FakeGoogleClient.calendars = [
         CalendarSummary(
@@ -854,20 +1051,20 @@ def test_calendar_without_provider_timezone_uses_configured_fallback(client, aut
         )
     ]
 
-    selected = client.put(
+    selected = retired_planner_client.put(
         "/api/admin/google-calendar/calendar",
         headers=auth,
         json={"calendarId": "operations@example.test"},
     )
 
     assert selected.status_code == 200, selected.text
-    status = client.get("/api/admin/google-calendar/status", headers=auth)
+    status = retired_planner_client.get("/api/admin/google-calendar/status", headers=auth)
     assert status.status_code == 200, status.text
     assert status.json()["connectionId"] == connection_id
     assert status.json()["selectedCalendarTimeZone"] == "America/Chicago"
 
     FakeGoogleClient.occurrences = [google_occurrence("timezone-fallback")]
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={
@@ -881,7 +1078,7 @@ def test_calendar_without_provider_timezone_uses_configured_fallback(client, aut
     assert preview.json()["calendarTimeZone"] == "America/Chicago"
 
 
-def test_preview_binds_and_returns_the_expected_source_identity(client, auth):
+def test_preview_binds_and_returns_the_expected_source_identity(retired_planner_client, auth):
     connection_id = connect_selected_calendar()
     FakeGoogleClient.occurrences = [google_occurrence("source-bound-preview")]
     payload = {
@@ -891,7 +1088,7 @@ def test_preview_binds_and_returns_the_expected_source_identity(client, auth):
         "resolutions": [],
     }
 
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview", headers=auth, json=payload
     )
 
@@ -900,7 +1097,7 @@ def test_preview_binds_and_returns_the_expected_source_identity(client, auth):
     assert preview.json()["calendarId"] == "operations@example.test"
     assert preview.json()["calendarTimeZone"] == "America/Chicago"
 
-    changed = client.post(
+    changed = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={**payload, "expectedConnectionId": connection_id + 1},
@@ -911,8 +1108,8 @@ def test_preview_binds_and_returns_the_expected_source_identity(client, auth):
     )
 
 
-def test_preview_rejects_partial_source_expectation(client, auth):
-    response = client.post(
+def test_preview_rejects_partial_source_expectation(retired_planner_client, auth):
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"expectedConnectionId": 1, "resolutions": []},
@@ -922,7 +1119,7 @@ def test_preview_rejects_partial_source_expectation(client, auth):
 
 
 def test_bound_preview_normalizes_disconnect_and_cleared_selection_conflicts(
-    client, auth
+    retired_planner_client, auth
 ):
     connection_id = connect_selected_calendar()
     payload = {
@@ -939,7 +1136,7 @@ def test_bound_preview_normalizes_disconnect_and_cleared_selection_conflicts(
         admin_name="Juan Canfield",
     )
 
-    disconnected = client.post(
+    disconnected = retired_planner_client.post(
         "/api/admin/google-calendar/preview", headers=auth, json=payload
     )
     assert disconnected.status_code == 409
@@ -958,7 +1155,7 @@ def test_bound_preview_normalizes_disconnect_and_cleared_selection_conflicts(
         """,
         (replacement_id,),
     )
-    no_selection = client.post(
+    no_selection = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={**payload, "expectedConnectionId": replacement_id},
@@ -970,7 +1167,7 @@ def test_bound_preview_normalizes_disconnect_and_cleared_selection_conflicts(
 
 
 def test_preview_insert_rechecks_the_active_source_after_provider_reads(
-    client, auth, monkeypatch
+    retired_planner_client, auth, monkeypatch
 ):
     connection_id = connect_selected_calendar()
     FakeGoogleClient.occurrences = [google_occurrence("preview-insert-race")]
@@ -989,7 +1186,7 @@ def test_preview_insert_rechecks_the_active_source_after_provider_reads(
 
     monkeypatch.setattr(store, "create_preview", switch_source_then_create)
 
-    response = client.post(
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={
@@ -1009,7 +1206,7 @@ def test_preview_insert_rechecks_the_active_source_after_provider_reads(
 
 
 def test_invalid_grant_reauthorizes_exact_connection_with_future_visit(
-    client, auth, monkeypatch
+    retired_planner_client, auth, monkeypatch
 ):
     future_start = datetime.now(UTC) + timedelta(days=1)
     monkeypatch.setattr(
@@ -1023,7 +1220,7 @@ def test_invalid_grant_reauthorizes_exact_connection_with_future_visit(
     connection_id = connect_selected_calendar()
     original = google_occurrence("reauthorize-future", start=future_start)
     FakeGoogleClient.occurrences = [original]
-    approve_current_preview(client, auth)
+    approve_current_preview(retired_planner_client, auth)
 
     cipher = store.CredentialCipher("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=")
     store.update_connection_credentials(
@@ -1048,20 +1245,20 @@ def test_invalid_grant_reauthorizes_exact_connection_with_future_visit(
         "Google authorization is invalid or expired"
     )
 
-    unavailable = client.post(
+    unavailable = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
     )
     assert unavailable.status_code == 409
     assert "reconnect" in unavailable.json()["error"]
-    blocked_disconnect = client.delete(
+    blocked_disconnect = retired_planner_client.delete(
         "/api/admin/google-calendar/connection", headers=auth
     )
     assert blocked_disconnect.status_code == 409
     assert FakeGoogleClient.revoked_tokens == []
 
-    started = client.post("/api/admin/google-calendar/connect", headers=auth)
+    started = retired_planner_client.post("/api/admin/google-calendar/connect", headers=auth)
     assert started.status_code == 200, started.text
     state = parse_qs(urlsplit(started.json()["authorizationUrl"]).query)["state"][0]
     stored_state = db.query_one(
@@ -1070,7 +1267,7 @@ def test_invalid_grant_reauthorizes_exact_connection_with_future_visit(
     assert int(stored_state["reconnect_connection_id"]) == connection_id
     assert FakeGoogleClient.login_hints == ["operations@example.test"]
 
-    callback = client.get(
+    callback = retired_planner_client.get(
         "/api/google-calendar/oauth/callback",
         params={"state": state, "code": "replacement-grant"},
         follow_redirects=False,
@@ -1099,7 +1296,7 @@ def test_invalid_grant_reauthorizes_exact_connection_with_future_visit(
     )
 
     FakeGoogleClient.occurrences = [sparse_cancelled_occurrence(original)]
-    cancellation = client.post(
+    cancellation = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -1107,7 +1304,7 @@ def test_invalid_grant_reauthorizes_exact_connection_with_future_visit(
     assert cancellation.status_code == 200, cancellation.text
     cancellation_body = cancellation.json()
     assert cancellation_body["counts"]["cancel"] == 1
-    approved = client.post(
+    approved = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -1123,14 +1320,14 @@ def test_invalid_grant_reauthorizes_exact_connection_with_future_visit(
 
 
 def test_reauthorization_failure_retains_connection_without_revoking_uncertain_grant(
-    client, auth
+    retired_planner_client, auth
 ):
     connection_id = connect_selected_calendar()
     retained = db.query_one(
         "SELECT credential_ciphertext FROM google_calendar_connections WHERE id = %s",
         (connection_id,),
     )["credential_ciphertext"]
-    started = client.post("/api/admin/google-calendar/connect", headers=auth).json()
+    started = retired_planner_client.post("/api/admin/google-calendar/connect", headers=auth).json()
     state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
     FakeGoogleClient.calendars = [
         CalendarSummary(
@@ -1144,7 +1341,7 @@ def test_reauthorization_failure_retains_connection_without_revoking_uncertain_g
     ]
     FakeGoogleClient.exchange_refresh_token = "wrong-account-refresh"
 
-    callback = client.get(
+    callback = retired_planner_client.get(
         "/api/google-calendar/oauth/callback",
         params={"state": state, "code": "wrong-calendar-grant"},
         follow_redirects=False,
@@ -1176,9 +1373,9 @@ def test_reauthorization_failure_retains_connection_without_revoking_uncertain_g
 @pytest.mark.parametrize("unreadable_role", store.CALENDAR_SOURCE_ROLES)
 @pytest.mark.parametrize("unreadable_access_role", ["freeBusyReader", ""])
 def test_reauthorization_rejects_configured_calendars_without_readable_roles(
-    client, auth, unreadable_role, unreadable_access_role
+    retired_planner_client, auth, unreadable_role, unreadable_access_role
 ):
-    configured = configure_canonical_sources(client, auth)
+    configured = configure_canonical_sources(retired_planner_client, auth)
     connection = store.active_connection()
     connection_id = int(connection["id"])
     retained_version = int(connection["credential_version"])
@@ -1195,7 +1392,7 @@ def test_reauthorization_rejects_configured_calendars_without_readable_roles(
         """,
         (connection_id,),
     )
-    started = client.post("/api/admin/google-calendar/connect", headers=auth).json()
+    started = retired_planner_client.post("/api/admin/google-calendar/connect", headers=auth).json()
     state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
     FakeGoogleClient.calendars = [
         CalendarSummary(
@@ -1214,7 +1411,7 @@ def test_reauthorization_rejects_configured_calendars_without_readable_roles(
     ]
     FakeGoogleClient.exchange_refresh_token = "unreadable-refresh"
 
-    callback = client.get(
+    callback = retired_planner_client.get(
         "/api/google-calendar/oauth/callback",
         params={"state": state, "code": "unreadable-calendar-grant"},
         follow_redirects=False,
@@ -1257,9 +1454,9 @@ def test_reauthorization_rejects_configured_calendars_without_readable_roles(
     assert FakeGoogleClient.revoked_tokens == []
 
 
-def test_reauthorization_callback_is_bound_to_original_connection(client, auth):
+def test_reauthorization_callback_is_bound_to_original_connection(retired_planner_client, auth):
     original_connection_id = connect_selected_calendar()
-    started = client.post("/api/admin/google-calendar/connect", headers=auth).json()
+    started = retired_planner_client.post("/api/admin/google-calendar/connect", headers=auth).json()
     state = parse_qs(urlsplit(started["authorizationUrl"]).query)["state"][0]
     db.execute(
         """
@@ -1271,7 +1468,7 @@ def test_reauthorization_callback_is_bound_to_original_connection(client, auth):
     )
     replacement_connection_id = connect_unselected_calendar()
 
-    callback = client.get(
+    callback = retired_planner_client.get(
         "/api/google-calendar/oauth/callback",
         params={"state": state, "code": "stale-reconnect"},
         follow_redirects=False,
@@ -1410,7 +1607,7 @@ def test_stale_disconnect_cannot_revoke_or_scrub_reauthorized_credentials():
 
 
 def test_calendar_switch_preserves_future_planned_visit_reconciliation(
-    client, auth, monkeypatch
+    retired_planner_client, auth, monkeypatch
 ):
     future_start = datetime.now(UTC) + timedelta(days=1)
     monkeypatch.setattr(
@@ -1436,12 +1633,12 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
     FakeGoogleClient.occurrences = [
         google_occurrence("future-switch-guard", start=future_start)
     ]
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
     ).json()
-    approved = client.post(
+    approved = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -1451,14 +1648,14 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
     )
     assert approved.status_code == 200, approved.text
 
-    same_calendar = client.put(
+    same_calendar = retired_planner_client.put(
         "/api/admin/google-calendar/calendar",
         headers=auth,
         json={"calendarId": "operations@example.test"},
     )
     assert same_calendar.status_code == 200, same_calendar.text
 
-    blocked_switch = client.put(
+    blocked_switch = retired_planner_client.put(
         "/api/admin/google-calendar/calendar",
         headers=auth,
         json={"calendarId": "dispatch@example.test"},
@@ -1470,7 +1667,7 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
     )
 
     active_connection_id = int(store.active_connection()["id"])
-    blocked_disconnect = client.delete(
+    blocked_disconnect = retired_planner_client.delete(
         "/api/admin/google-calendar/connection", headers=auth
     )
     assert blocked_disconnect.status_code == 409, blocked_disconnect.text
@@ -1510,7 +1707,7 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
         (active_connection_id,),
     )
     unselected_connection = connect_unselected_calendar()
-    recoverable_disconnect = client.delete(
+    recoverable_disconnect = retired_planner_client.delete(
         "/api/admin/google-calendar/connection", headers=auth
     )
     assert recoverable_disconnect.status_code == 200, recoverable_disconnect.text
@@ -1527,7 +1724,7 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
     assert released_unselected["revoked_at"] is not None
     assert released_unselected["credential_ciphertext"] is None
     connect_unselected_calendar()
-    blocked_after_reconnect = client.put(
+    blocked_after_reconnect = retired_planner_client.put(
         "/api/admin/google-calendar/calendar",
         headers=auth,
         json={"calendarId": "dispatch@example.test"},
@@ -1535,7 +1732,7 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
     assert blocked_after_reconnect.status_code == 409
     assert store.active_connection()["selected_calendar_id"] is None
 
-    restored_source = client.put(
+    restored_source = retired_planner_client.put(
         "/api/admin/google-calendar/calendar",
         headers=auth,
         json={"calendarId": "operations@example.test"},
@@ -1549,7 +1746,7 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
             updated="2026-07-20T18:00:00Z",
         )
     ]
-    cancellation = client.post(
+    cancellation = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -1557,7 +1754,7 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
     assert cancellation.status_code == 200, cancellation.text
     cancellation_body = cancellation.json()
     assert cancellation_body["counts"]["cancel"] == 1
-    cancelled = client.post(
+    cancelled = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -1581,14 +1778,14 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
         == 1
     )
 
-    recovered_switch = client.put(
+    recovered_switch = retired_planner_client.put(
         "/api/admin/google-calendar/calendar",
         headers=auth,
         json={"calendarId": "dispatch@example.test"},
     )
     assert recovered_switch.status_code == 200, recovered_switch.text
     assert store.active_connection()["selected_calendar_id"] == "dispatch@example.test"
-    disconnected_after_reconciliation = client.delete(
+    disconnected_after_reconciliation = retired_planner_client.delete(
         "/api/admin/google-calendar/connection", headers=auth
     )
     assert disconnected_after_reconciliation.status_code == 200
@@ -1599,8 +1796,85 @@ def test_calendar_switch_preserves_future_planned_visit_reconciliation(
     assert FakeGoogleClient.revoked_tokens == ["refresh-secret", "refresh-secret"]
 
 
+def _crew_history_state() -> dict[str, list[dict[str, object]]]:
+    return {
+        "crews": db.query_all(
+            """
+            SELECT id, name, active, created_by, created_at, updated_at
+            FROM crews
+            ORDER BY id
+            """
+        ),
+        "memberships": db.query_all(
+            """
+            SELECT id, crew_id, employee_id, effective_from, effective_to,
+                   created_by, created_at
+            FROM crew_memberships
+            ORDER BY id
+            """
+        ),
+        "audit": db.query_all(
+            """
+            SELECT id, action, actor_employee_id, actor_name,
+                   before_state, after_state, created_at
+            FROM planned_visit_audit_events
+            WHERE action LIKE 'crew_membership%%'
+            ORDER BY id
+            """
+        ),
+    }
+
+
+def _run_real_startup_without_pool_or_admin_side_effects(monkeypatch) -> None:
+    import time_tracker_api as api
+
+    monkeypatch.setattr(api.db, "init_pool", lambda _database_url: None)
+    monkeypatch.setattr(api, "apply_bootstrap_admins", lambda: None)
+    api.startup_event()
+
+
+def test_startup_does_not_seed_calendar_crew_or_membership(monkeypatch):
+    db.execute("DELETE FROM crew_memberships")
+    db.execute("DELETE FROM crews")
+    assert _crew_history_state() == {
+        "crews": [],
+        "memberships": [],
+        "audit": [],
+    }
+
+    _run_real_startup_without_pool_or_admin_side_effects(monkeypatch)
+
+    assert _crew_history_state() == {
+        "crews": [],
+        "memberships": [],
+        "audit": [],
+    }
+
+
+def test_startup_preserves_retained_crew_membership_and_audit(monkeypatch):
+    db.execute(
+        """
+        INSERT INTO planned_visit_audit_events (
+            action, actor_name, after_state
+        ) VALUES (
+            'crew_membership_confirmed',
+            'retained-history-test',
+            '{"source":"retained"}'::jsonb
+        )
+        """
+    )
+    before = _crew_history_state()
+    assert before["crews"]
+    assert before["memberships"]
+    assert before["audit"]
+
+    _run_real_startup_without_pool_or_admin_side_effects(monkeypatch)
+
+    assert _crew_history_state() == before
+
+
 def test_bootstrap_seeds_morning_crew_only_from_three_unique_active_identities(
-    client, auth
+    retired_planner_client, auth
 ):
     crew_id = db.query_one("SELECT id FROM crews WHERE name = 'Morning Crew'")["id"]
     db.execute("DELETE FROM crew_memberships WHERE crew_id = %s", (crew_id,))
@@ -1611,7 +1885,7 @@ def test_bootstrap_seeds_morning_crew_only_from_three_unique_active_identities(
 
     assert result["changed"] is True
     assert len(result["employee_ids"]) == 3
-    crew = client.get("/api/admin/planned-visits/crews", headers=auth).json()[
+    crew = retired_planner_client.get("/api/admin/planned-visits/crews", headers=auth).json()[
         "morningCrew"
     ]
     assert crew["ready"] is True
@@ -1628,7 +1902,7 @@ def test_bootstrap_seeds_morning_crew_only_from_three_unique_active_identities(
 
 
 def test_admin_can_affirm_same_legacy_membership_to_add_operator_provenance(
-    client, auth
+    retired_planner_client, auth
 ):
     duplicate_id = db.query_one(
         """
@@ -1638,14 +1912,14 @@ def test_admin_can_affirm_same_legacy_membership_to_add_operator_provenance(
         """
     )["id"]
     assert duplicate_id > 0
-    current = client.get("/api/admin/planned-visits/crews", headers=auth).json()[
+    current = retired_planner_client.get("/api/admin/planned-visits/crews", headers=auth).json()[
         "morningCrew"
     ]
     assert current["ready"] is False
     assert current["operatorResolved"] is False
     assert any(issue["name"] == "Carmen" for issue in current["identityIssues"])
 
-    confirmed = client.put(
+    confirmed = retired_planner_client.put(
         f"/api/admin/planned-visits/crews/{current['id']}/memberships",
         headers=auth,
         json={"employeeIds": current["memberIds"]},
@@ -1658,10 +1932,10 @@ def test_admin_can_affirm_same_legacy_membership_to_add_operator_provenance(
     assert crew["operatorResolved"] is True
 
 
-def test_disconnect_revokes_google_grant_then_scrubs_local_credentials(client, auth):
+def test_disconnect_revokes_google_grant_then_scrubs_local_credentials(retired_planner_client, auth):
     connection_id = connect_selected_calendar()
 
-    response = client.delete("/api/admin/google-calendar/connection", headers=auth)
+    response = retired_planner_client.delete("/api/admin/google-calendar/connection", headers=auth)
 
     assert response.status_code == 200
     assert response.json() == {"success": True, "disconnected": True}
@@ -1678,13 +1952,13 @@ def test_disconnect_revokes_google_grant_then_scrubs_local_credentials(client, a
     assert audit["action"] == "calendar_disconnected"
 
 
-def test_disconnect_retains_local_credential_when_revocation_is_retryable(client, auth):
+def test_disconnect_retains_local_credential_when_revocation_is_retryable(retired_planner_client, auth):
     connection_id = connect_selected_calendar()
     FakeGoogleClient.revoke_error = GoogleCalendarTransportError(
         "Google Calendar is temporarily unavailable"
     )
 
-    response = client.delete("/api/admin/google-calendar/connection", headers=auth)
+    response = retired_planner_client.delete("/api/admin/google-calendar/connection", headers=auth)
 
     assert response.status_code == 503
     connection = db.query_one(
@@ -1695,7 +1969,7 @@ def test_disconnect_retains_local_credential_when_revocation_is_retryable(client
     assert connection["credential_ciphertext"] is not None
 
 
-def test_retryable_google_not_found_maps_to_retryable_service_response(client):
+def test_retryable_google_not_found_maps_to_retryable_service_response(retired_planner_client):
     failure = calendar_api._google_failure(
         GoogleCalendarTransportError(
             "Google Calendar is temporarily unavailable", status_code=404
@@ -1706,7 +1980,7 @@ def test_retryable_google_not_found_maps_to_retryable_service_response(client):
     assert failure.headers == {"Retry-After": "5"}
 
 
-def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, auth):
+def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(retired_planner_client, auth):
     connect_selected_calendar()
     raw_occurrence = google_occurrence("service-1")
     FakeGoogleClient.occurrences = [raw_occurrence]
@@ -1718,7 +1992,7 @@ def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, aut
         )["n"],
     }
 
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -1730,7 +2004,7 @@ def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, aut
     assert body["items"][0]["timingSemantics"] == "approximate"
     assert db.query_one("SELECT COUNT(*) AS n FROM planned_service_visits")["n"] == 0
 
-    approved = client.post(
+    approved = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -1739,7 +2013,7 @@ def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, aut
         },
     )
     assert approved.status_code == 200, approved.text
-    retry = client.post(
+    retry = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -1788,9 +2062,9 @@ def test_preview_is_read_only_then_approval_is_atomic_and_idempotent(client, aut
 
 
 def test_retained_mapping_fingerprint_backfill_is_guarded_and_idempotent(
-    client, auth
+    retired_planner_client, auth
 ):
-    sources = configure_canonical_sources(client, auth)
+    sources = configure_canonical_sources(retired_planner_client, auth)
     source = sources[store.RESIDENTIAL_MORNING_ROLE]
     connection_id = int(source["connectionId"])
     source_id = int(source["id"])
@@ -1924,10 +2198,10 @@ def test_retained_mapping_fingerprint_backfill_is_guarded_and_idempotent(
     assert store._backfill_retained_mapping_fingerprints() == 0
 
 
-def test_source_change_after_preview_fails_closed_without_planned_write(client, auth):
+def test_source_change_after_preview_fails_closed_without_planned_write(retired_planner_client, auth):
     connect_selected_calendar()
     FakeGoogleClient.occurrences = [google_occurrence("stale-1")]
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -1936,7 +2210,7 @@ def test_source_change_after_preview_fails_closed_without_planned_write(client, 
         google_occurrence("stale-1", updated="2026-07-18T13:00:00Z")
     ]
 
-    response = client.post(
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -1961,13 +2235,13 @@ def test_source_change_after_preview_fails_closed_without_planned_write(client, 
     "connection_change", ["disconnect", "reconnect", "switch", "timezone"]
 )
 def test_connection_change_after_rebuild_fails_closed_inside_approval_transaction(
-    client, auth, monkeypatch, connection_change
+    retired_planner_client, auth, monkeypatch, connection_change
 ):
     connection_id = connect_selected_calendar()
     FakeGoogleClient.occurrences = [
         google_occurrence(f"connection-{connection_change}")
     ]
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2006,7 +2280,7 @@ def test_connection_change_after_rebuild_fails_closed_inside_approval_transactio
         return real_apply(**kwargs)
 
     monkeypatch.setattr(store, "apply_reviewed_preview", change_connection_then_apply)
-    response = client.post(
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2020,10 +2294,10 @@ def test_connection_change_after_rebuild_fails_closed_inside_approval_transactio
     assert db.query_one("SELECT COUNT(*) AS n FROM planned_service_visits")["n"] == 0
 
 
-def test_provider_timezone_change_invalidates_preview_before_any_write(client, auth):
+def test_provider_timezone_change_invalidates_preview_before_any_write(retired_planner_client, auth):
     connect_selected_calendar()
     FakeGoogleClient.occurrences = [google_occurrence("timezone-change")]
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2039,7 +2313,7 @@ def test_provider_timezone_change_invalidates_preview_before_any_write(client, a
         )
     ]
 
-    response = client.post(
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2054,7 +2328,7 @@ def test_provider_timezone_change_invalidates_preview_before_any_write(client, a
 
 
 def test_bound_preview_refreshes_metadata_then_recovers_from_timezone_change(
-    client, auth
+    retired_planner_client, auth
 ):
     connection_id = connect_selected_calendar()
     FakeGoogleClient.calendars = [
@@ -2069,7 +2343,7 @@ def test_bound_preview_refreshes_metadata_then_recovers_from_timezone_change(
     ]
     FakeGoogleClient.occurrences = [google_occurrence("metadata-refresh")]
 
-    response = client.post(
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={
@@ -2095,11 +2369,11 @@ def test_bound_preview_refreshes_metadata_then_recovers_from_timezone_change(
         "selected_calendar_name": "Updated Operations",
         "selected_calendar_timezone": "America/Denver",
     }
-    status = client.get("/api/admin/google-calendar/status", headers=auth)
+    status = retired_planner_client.get("/api/admin/google-calendar/status", headers=auth)
     assert status.json()["selectedCalendarName"] == "Updated Operations"
     assert status.json()["selectedCalendarTimeZone"] == "America/Denver"
 
-    recovered = client.post(
+    recovered = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={
@@ -2114,7 +2388,7 @@ def test_bound_preview_refreshes_metadata_then_recovers_from_timezone_change(
 
 
 def test_metadata_refresh_connection_race_returns_retryable_conflict(
-    client, auth, monkeypatch
+    retired_planner_client, auth, monkeypatch
 ):
     connect_selected_calendar()
     FakeGoogleClient.calendars = [
@@ -2134,7 +2408,7 @@ def test_metadata_refresh_connection_race_returns_retryable_conflict(
 
     monkeypatch.setattr(store, "select_calendar", reject_stale_metadata)
 
-    response = client.post(
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2147,7 +2421,7 @@ def test_metadata_refresh_connection_race_returns_retryable_conflict(
 
 
 def test_metadata_refresh_cannot_switch_back_a_concurrent_calendar_choice(
-    client, auth, monkeypatch
+    retired_planner_client, auth, monkeypatch
 ):
     connection_id = connect_selected_calendar()
     FakeGoogleClient.calendars = [
@@ -2176,7 +2450,7 @@ def test_metadata_refresh_cannot_switch_back_a_concurrent_calendar_choice(
 
     monkeypatch.setattr(store, "select_calendar", switch_then_refresh)
 
-    response = client.post(
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={
@@ -2194,7 +2468,7 @@ def test_metadata_refresh_cannot_switch_back_a_concurrent_calendar_choice(
     assert store.active_connection()["selected_calendar_id"] == "different@example.test"
 
 
-def test_reconnect_reconciles_the_same_occurrence_without_a_duplicate(client, auth):
+def test_reconnect_reconciles_the_same_occurrence_without_a_duplicate(retired_planner_client, auth):
     first_connection = connect_selected_calendar()
     first_occurrence = google_occurrence(
         "reconnect-1", summary="Unmatched customer", location="Unmatched location"
@@ -2204,7 +2478,7 @@ def test_reconnect_reconciles_the_same_occurrence_without_a_duplicate(client, au
         "SELECT id FROM locations WHERE address = '123 Main St, Effingham'"
     )["id"]
     crew_id = db.query_one("SELECT id FROM crews WHERE name = 'Morning Crew'")["id"]
-    first_preview = client.post(
+    first_preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={
@@ -2218,7 +2492,7 @@ def test_reconnect_reconciles_the_same_occurrence_without_a_duplicate(client, au
             ]
         },
     ).json()
-    first_approval = client.post(
+    first_approval = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2238,7 +2512,7 @@ def test_reconnect_reconciles_the_same_occurrence_without_a_duplicate(client, au
             updated="2026-07-18T13:00:00Z",
         )
     ]
-    approve_current_preview(client, auth)
+    approve_current_preview(retired_planner_client, auth)
 
     visit = db.query_one(
         "SELECT connection_id, COUNT(*) OVER () AS total FROM planned_service_visits"
@@ -2252,11 +2526,11 @@ def test_reconnect_reconciles_the_same_occurrence_without_a_duplicate(client, au
     assert mapping["connection_id"] == second_connection
 
 
-def test_concurrent_approvals_serialize_one_occurrence_creation(client, auth):
+def test_concurrent_approvals_serialize_one_occurrence_creation(retired_planner_client, auth):
     connect_selected_calendar()
     FakeGoogleClient.occurrences = [google_occurrence("concurrent-1")]
     previews = [
-        client.post(
+        retired_planner_client.post(
             "/api/admin/google-calendar/preview",
             headers=auth,
             json={"resolutions": []},
@@ -2265,7 +2539,7 @@ def test_concurrent_approvals_serialize_one_occurrence_creation(client, auth):
     ]
 
     def approve(preview):
-        return client.post(
+        return retired_planner_client.post(
             "/api/admin/google-calendar/approve",
             headers=auth,
             json={
@@ -2281,13 +2555,13 @@ def test_concurrent_approvals_serialize_one_occurrence_creation(client, auth):
     assert db.query_one("SELECT COUNT(*) AS n FROM planned_service_visits")["n"] == 1
 
 
-def approve_current_preview(client, auth) -> dict:
-    preview = client.post(
+def approve_current_preview(retired_planner_client, auth) -> dict:
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
     ).json()
-    response = client.post(
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2300,11 +2574,11 @@ def approve_current_preview(client, auth) -> dict:
 
 
 def test_future_update_and_cancellation_preserve_rows_and_assignment_history(
-    client, auth
+    retired_planner_client, auth
 ):
     connect_selected_calendar()
     FakeGoogleClient.occurrences = [google_occurrence("lifecycle-1")]
-    approve_current_preview(client, auth)
+    approve_current_preview(retired_planner_client, auth)
     visit = db.query_one("SELECT id, source_key FROM planned_service_visits")
     first_assignment = db.query_one(
         "SELECT id FROM planned_visit_assignments WHERE planned_visit_id = %s AND active = true",
@@ -2318,13 +2592,13 @@ def test_future_update_and_cancellation_preserve_rows_and_assignment_history(
         updated="2026-07-18T13:00:00Z",
     )
     FakeGoogleClient.occurrences = [moved_occurrence]
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
     ).json()
     assert preview["counts"]["update"] == 1
-    approve_current_preview(client, auth)
+    approve_current_preview(retired_planner_client, auth)
     assert (
         db.query_one(
             "SELECT approximate_start FROM planned_service_visits WHERE id = %s",
@@ -2343,13 +2617,13 @@ def test_future_update_and_cancellation_preserve_rows_and_assignment_history(
     FakeGoogleClient.occurrences = [
         google_occurrence("lifecycle-1", cancelled=True, updated="2026-07-18T14:00:00Z")
     ]
-    cancellation = client.post(
+    cancellation = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
     ).json()
     assert cancellation["counts"]["cancel"] == 1
-    response = client.post(
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2372,7 +2646,7 @@ def test_future_update_and_cancellation_preserve_rows_and_assignment_history(
     assert retired["retired_at"] is not None
 
 
-def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, auth):
+def test_occurrence_moved_outside_list_window_is_targeted_and_updated(retired_planner_client, auth):
     connect_selected_calendar()
     original = google_occurrence(
         "moved-instance-v1",
@@ -2380,7 +2654,7 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, au
         original_start=WINDOW_START,
     )
     FakeGoogleClient.occurrences = [original]
-    approve_current_preview(client, auth)
+    approve_current_preview(retired_planner_client, auth)
 
     moved_start = WINDOW_START + timedelta(days=45)
     moved = google_occurrence(
@@ -2396,7 +2670,7 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, au
     FakeGoogleClient.targeted_recurring_occurrences = {
         ("recurring-series", original.original_start_query): moved
     }
-    preview_response = client.post(
+    preview_response = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2407,7 +2681,7 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, au
     assert preview["counts"]["cancel"] == 0
     assert preview["items"][0]["start"] == moved_start.isoformat()
 
-    approved = client.post(
+    approved = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2433,13 +2707,13 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, au
             time_zone="America/Chicago",
         ),
     ]
-    blocked_switch = client.put(
+    blocked_switch = retired_planner_client.put(
         "/api/admin/google-calendar/calendar",
         headers=auth,
         json={"calendarId": "dispatch@example.test"},
     )
     assert blocked_switch.status_code == 409
-    blocked_disconnect = client.delete(
+    blocked_disconnect = retired_planner_client.delete(
         "/api/admin/google-calendar/connection", headers=auth
     )
     assert blocked_disconnect.status_code == 409
@@ -2447,7 +2721,7 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, au
     FakeGoogleClient.targeted_recurring_occurrences = {
         ("recurring-series", original.original_start_query): None
     }
-    cancellation = client.post(
+    cancellation = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2456,7 +2730,7 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, au
     cancellation_body = cancellation.json()
     assert cancellation_body["counts"]["cancel"] == 1
     assert cancellation_body["items"][0]["start"] == moved_start.isoformat()
-    approved_cancellation = client.post(
+    approved_cancellation = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2466,13 +2740,13 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, au
     )
     assert approved_cancellation.status_code == 200, approved_cancellation.text
 
-    recovered_switch = client.put(
+    recovered_switch = retired_planner_client.put(
         "/api/admin/google-calendar/calendar",
         headers=auth,
         json={"calendarId": "dispatch@example.test"},
     )
     assert recovered_switch.status_code == 200, recovered_switch.text
-    recovered_disconnect = client.delete(
+    recovered_disconnect = retired_planner_client.delete(
         "/api/admin/google-calendar/connection", headers=auth
     )
     assert recovered_disconnect.status_code == 200, recovered_disconnect.text
@@ -2480,7 +2754,7 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(client, au
 
 @pytest.mark.parametrize("recurring", [False, True])
 def test_provider_confirmed_missing_occurrence_is_previewed_and_applied_as_cancelled(
-    client, auth, recurring
+    retired_planner_client, auth, recurring
 ):
     connect_selected_calendar()
     original = google_occurrence(
@@ -2489,7 +2763,7 @@ def test_provider_confirmed_missing_occurrence_is_previewed_and_applied_as_cance
         original_start=WINDOW_START if recurring else None,
     )
     FakeGoogleClient.occurrences = [original]
-    approve_current_preview(client, auth)
+    approve_current_preview(retired_planner_client, auth)
 
     FakeGoogleClient.occurrences = []
     if recurring:
@@ -2498,7 +2772,7 @@ def test_provider_confirmed_missing_occurrence_is_previewed_and_applied_as_cance
         }
     else:
         FakeGoogleClient.targeted_occurrences = {original.event_id: None}
-    preview_response = client.post(
+    preview_response = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2513,7 +2787,7 @@ def test_provider_confirmed_missing_occurrence_is_previewed_and_applied_as_cance
     assert cancelled_item["calendarLocation"] == original.location
     assert cancelled_item["start"] == original.start
     assert cancelled_item["end"] == original.end
-    approved = client.post(
+    approved = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2533,7 +2807,7 @@ def test_provider_confirmed_missing_occurrence_is_previewed_and_applied_as_cance
 
 @pytest.mark.parametrize("delivery", ["listed", "targeted"])
 def test_explicit_sparse_cancellation_preserves_reviewed_context(
-    client, auth, delivery
+    retired_planner_client, auth, delivery
 ):
     connect_selected_calendar()
     original = google_occurrence(
@@ -2544,7 +2818,7 @@ def test_explicit_sparse_cancellation_preserves_reviewed_context(
         original_start=WINDOW_START,
     )
     FakeGoogleClient.occurrences = [original]
-    approve_current_preview(client, auth)
+    approve_current_preview(retired_planner_client, auth)
     before = db.query_one(
         """
         SELECT title, description, source_location_text,
@@ -2559,7 +2833,7 @@ def test_explicit_sparse_cancellation_preserves_reviewed_context(
             ("sparse-series", original.original_start_query): sparse
         }
 
-    preview_response = client.post(
+    preview_response = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2575,7 +2849,7 @@ def test_explicit_sparse_cancellation_preserves_reviewed_context(
     assert item["calendarLocation"] == before["source_location_text"]
     assert datetime.fromisoformat(item["start"]) == before["approximate_start"]
     assert datetime.fromisoformat(item["end"]) == before["approximate_end"]
-    approved = client.post(
+    approved = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2604,7 +2878,7 @@ def test_explicit_sparse_cancellation_preserves_reviewed_context(
         assert after[field] == before[field]
 
 
-def test_more_than_ten_missing_occurrences_are_targeted_and_updated(client, auth):
+def test_more_than_ten_missing_occurrences_are_targeted_and_updated(retired_planner_client, auth):
     connect_selected_calendar()
     originals = [
         google_occurrence(
@@ -2614,7 +2888,7 @@ def test_more_than_ten_missing_occurrences_are_targeted_and_updated(client, auth
         for index in range(11)
     ]
     FakeGoogleClient.occurrences = originals
-    approve_current_preview(client, auth)
+    approve_current_preview(retired_planner_client, auth)
 
     moved = [
         google_occurrence(
@@ -2629,7 +2903,7 @@ def test_more_than_ten_missing_occurrences_are_targeted_and_updated(client, auth
         occurrence.event_id: occurrence for occurrence in moved
     }
 
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2637,7 +2911,7 @@ def test_more_than_ten_missing_occurrences_are_targeted_and_updated(client, auth
 
     assert preview.status_code == 200, preview.text
     assert preview.json()["counts"]["update"] == 11
-    approved = client.post(
+    approved = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2657,7 +2931,7 @@ def test_more_than_ten_missing_occurrences_are_targeted_and_updated(client, auth
 
 
 def test_ongoing_occurrence_uses_interval_overlap_for_targeted_reconciliation(
-    client, auth
+    retired_planner_client, auth
 ):
     connect_selected_calendar()
     original = google_occurrence(
@@ -2666,7 +2940,7 @@ def test_ongoing_occurrence_uses_interval_overlap_for_targeted_reconciliation(
         end=WINDOW_START + timedelta(hours=1),
     )
     FakeGoogleClient.occurrences = [original]
-    approve_current_preview(client, auth)
+    approve_current_preview(retired_planner_client, auth)
 
     moved = google_occurrence(
         original.event_id,
@@ -2676,7 +2950,7 @@ def test_ongoing_occurrence_uses_interval_overlap_for_targeted_reconciliation(
     FakeGoogleClient.occurrences = []
     FakeGoogleClient.targeted_occurrences = {original.event_id: moved}
 
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2687,10 +2961,10 @@ def test_ongoing_occurrence_uses_interval_overlap_for_targeted_reconciliation(
     assert preview.json()["items"][0]["start"] == moved.start
 
 
-def test_completed_visit_is_never_cancelled_by_later_google_change(client, auth):
+def test_completed_visit_is_never_cancelled_by_later_google_change(retired_planner_client, auth):
     connect_selected_calendar()
     FakeGoogleClient.occurrences = [google_occurrence("completed-1")]
-    approve_current_preview(client, auth)
+    approve_current_preview(retired_planner_client, auth)
     db.execute(
         """
         UPDATE planned_service_visits
@@ -2699,14 +2973,14 @@ def test_completed_visit_is_never_cancelled_by_later_google_change(client, auth)
     )
     FakeGoogleClient.occurrences = [google_occurrence("completed-1", cancelled=True)]
 
-    preview = client.post(
+    preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
     ).json()
     assert preview["counts"]["unchanged"] == 1
     assert preview["items"][0]["completedVisitPreserved"] is True
-    response = client.post(
+    response = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2722,7 +2996,7 @@ def test_completed_visit_is_never_cancelled_by_later_google_change(client, auth)
 
 
 def test_unresolved_manual_mapping_and_overlap_warning_are_operator_controlled(
-    client, auth
+    retired_planner_client, auth
 ):
     connect_selected_calendar()
     second_start = WINDOW_START + timedelta(minutes=30)
@@ -2737,7 +3011,7 @@ def test_unresolved_manual_mapping_and_overlap_warning_are_operator_controlled(
             start=second_start,
         ),
     ]
-    unresolved = client.post(
+    unresolved = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2759,7 +3033,7 @@ def test_unresolved_manual_mapping_and_overlap_warning_are_operator_controlled(
         }
         for item in unresolved["items"]
     ]
-    resolved = client.post(
+    resolved = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": resolutions},
@@ -2769,7 +3043,7 @@ def test_unresolved_manual_mapping_and_overlap_warning_are_operator_controlled(
 
 
 def test_location_only_resolution_preserves_default_assignment_through_approval(
-    client, auth
+    retired_planner_client, auth
 ):
     connect_selected_calendar()
     occurrence = google_occurrence(
@@ -2783,7 +3057,7 @@ def test_location_only_resolution_preserves_default_assignment_through_approval(
     )["id"]
     crew_id = db.query_one("SELECT id FROM crews WHERE name = 'Morning Crew'")["id"]
 
-    preview_response = client.post(
+    preview_response = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={
@@ -2798,7 +3072,7 @@ def test_location_only_resolution_preserves_default_assignment_through_approval(
     assert preview["items"][0]["crewId"] == crew_id
     assert preview["items"][0]["employeeIds"] == []
 
-    approved = client.post(
+    approved = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2819,7 +3093,7 @@ def test_location_only_resolution_preserves_default_assignment_through_approval(
 
 
 def test_morning_crew_identity_issue_blocks_until_admin_sets_explicit_membership(
-    client, auth, monkeypatch
+    retired_planner_client, auth, monkeypatch
 ):
     future_start = datetime.now(UTC) + timedelta(days=1)
     monkeypatch.setattr(
@@ -2833,7 +3107,7 @@ def test_morning_crew_identity_issue_blocks_until_admin_sets_explicit_membership
     connect_selected_calendar()
     db.execute("UPDATE employees SET active = false WHERE name = 'Pamela Brown'")
 
-    unresolved_crew = client.get(
+    unresolved_crew = retired_planner_client.get(
         "/api/admin/planned-visits/crews", headers=auth
     ).json()["morningCrew"]
     assert unresolved_crew["ready"] is False
@@ -2846,7 +3120,7 @@ def test_morning_crew_identity_issue_blocks_until_admin_sets_explicit_membership
     FakeGoogleClient.occurrences = [
         google_occurrence("crew-needs-resolution", start=future_start)
     ]
-    blocked_preview = client.post(
+    blocked_preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2865,7 +3139,7 @@ def test_morning_crew_identity_issue_blocks_until_admin_sets_explicit_membership
             """
         )
     ]
-    resolved_response = client.put(
+    resolved_response = retired_planner_client.put(
         f"/api/admin/planned-visits/crews/{crew_id}/memberships",
         headers=auth,
         json={"employeeIds": active_expected_ids},
@@ -2880,7 +3154,7 @@ def test_morning_crew_identity_issue_blocks_until_admin_sets_explicit_membership
         for issue in resolved_crew["identityIssues"]
     )
 
-    approved_preview = client.post(
+    approved_preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2889,7 +3163,7 @@ def test_morning_crew_identity_issue_blocks_until_admin_sets_explicit_membership
     assert approved_preview["counts"]["create"] == 1
 
     db.execute("UPDATE employees SET active = false WHERE name = 'Tina Davis'")
-    stale_explicit_crew = client.get(
+    stale_explicit_crew = retired_planner_client.get(
         "/api/admin/planned-visits/crews", headers=auth
     ).json()["morningCrew"]
     assert stale_explicit_crew["ready"] is False
@@ -2897,7 +3171,7 @@ def test_morning_crew_identity_issue_blocks_until_admin_sets_explicit_membership
 
 
 def test_existing_per_visit_assignment_is_preserved_without_a_new_decision(
-    client, auth
+    retired_planner_client, auth
 ):
     connect_selected_calendar()
     occurrence = google_occurrence("assignment-override")
@@ -2909,7 +3183,7 @@ def test_existing_per_visit_assignment_is_preserved_without_a_new_decision(
         "SELECT id FROM employees WHERE name = 'Carmen Alvarez'"
     )["id"]
 
-    reviewed = client.post(
+    reviewed = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={
@@ -2923,7 +3197,7 @@ def test_existing_per_visit_assignment_is_preserved_without_a_new_decision(
             ]
         },
     ).json()
-    approved = client.post(
+    approved = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -2933,7 +3207,7 @@ def test_existing_per_visit_assignment_is_preserved_without_a_new_decision(
     )
     assert approved.status_code == 200, approved.text
 
-    next_preview = client.post(
+    next_preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},
@@ -2945,7 +3219,7 @@ def test_existing_per_visit_assignment_is_preserved_without_a_new_decision(
 
 
 def test_recurring_occurrence_location_decisions_do_not_overwrite_each_other(
-    client, auth
+    retired_planner_client, auth
 ):
     connect_selected_calendar()
     first = google_occurrence(
@@ -2976,7 +3250,7 @@ def test_recurring_occurrence_location_decisions_do_not_overwrite_each_other(
         """
     )["id"]
     crew_id = db.query_one("SELECT id FROM crews WHERE name = 'Morning Crew'")["id"]
-    reviewed = client.post(
+    reviewed = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={
@@ -2996,7 +3270,7 @@ def test_recurring_occurrence_location_decisions_do_not_overwrite_each_other(
             ]
         },
     ).json()
-    applied = client.post(
+    applied = retired_planner_client.post(
         "/api/admin/google-calendar/approve",
         headers=auth,
         json={
@@ -3012,7 +3286,7 @@ def test_recurring_occurrence_location_decisions_do_not_overwrite_each_other(
         == 2
     )
 
-    next_preview = client.post(
+    next_preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",
         headers=auth,
         json={"resolutions": []},

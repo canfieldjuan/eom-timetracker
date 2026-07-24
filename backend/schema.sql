@@ -377,8 +377,6 @@ CREATE TABLE crew_memberships (
     UNIQUE (crew_id, employee_id, effective_from)
 );
 
-INSERT INTO crews (name) VALUES ('Morning Crew') ON CONFLICT (name) DO NOTHING;
-
 -- A reviewed import is the immutable approval boundary. The source and full
 -- resolved plan fingerprints let approval fail closed if Google changes after
 -- preview, while an applied row makes an exact retry idempotent.

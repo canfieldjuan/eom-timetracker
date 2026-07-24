@@ -238,10 +238,6 @@ def ensure_schema() -> None:
             UNIQUE (crew_id, employee_id, effective_from)
         );
 
-        INSERT INTO crews (name)
-        VALUES ('Morning Crew')
-        ON CONFLICT (name) DO NOTHING;
-
         CREATE TABLE IF NOT EXISTS calendar_import_previews (
             id                  TEXT PRIMARY KEY,
             connection_id       BIGINT NOT NULL REFERENCES google_calendar_connections(id),

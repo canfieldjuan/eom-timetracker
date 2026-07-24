@@ -3800,11 +3800,6 @@ def startup_event() -> None:
     if imported_legacy_json:
         _ensure_customer_site_schema()
     apply_bootstrap_admins()
-    from calendar_import_store import bootstrap_morning_crew_memberships
-
-    bootstrap_morning_crew_memberships(
-        effective_from=datetime.now(APP_TIMEZONE).date()
-    )
 
 
 def _canonical_portal_base(request: Request) -> Optional[str]:
