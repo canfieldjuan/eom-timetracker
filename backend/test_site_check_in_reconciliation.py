@@ -139,7 +139,11 @@ def test_forward_reconciliation_routes_are_absent_from_registry_and_openapi(
 ):
     import time_tracker_api
 
-    registered_paths = {route.path for route in time_tracker_api.app.routes}
+    registered_paths = {
+        route.path
+        for route in time_tracker_api.app.routes
+        if getattr(route, "path", None) is not None
+    }
     assert "/api/admin/site-check-in-reconciliation" not in registered_paths
     assert (
         "/api/admin/site-check-in-reconciliation/{occurrence_key}/review"
