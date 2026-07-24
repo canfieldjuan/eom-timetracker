@@ -926,7 +926,6 @@ class TestSiteCheckInDecision:
         import time_tracker_api
 
         official_time = datetime(2026, 7, 23, 17, 0, tzinfo=timezone.utc)
-        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
         job_id = create_canonical_job(
             location_id,
             official_time - timedelta(hours=1),
@@ -936,6 +935,7 @@ class TestSiteCheckInDecision:
         second_employee_id, second_emp_auth = create_test_employee_auth(
             suffix="Second Worker"
         )
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
 
         responses = [
             client.post(
