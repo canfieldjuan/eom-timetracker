@@ -665,3 +665,114 @@ This slice must not:
   storage functions. This slice removes external mutation authority and
   automatic writes; retained internals stay until their historical readers and
   constraints no longer depend on them.
+
+## Canonical QR arrival matching contract
+
+Status: derived before implementation on 2026-07-23, after the two canonical
+Calendar sources were configured and synchronized in production.
+
+### Root cause
+
+Canonical Calendar synchronization now creates one Site-based `jobs` service
+obligation without employee or crew assignments. QR ingestion still decides
+whether evidence is accepted by looking for a second exact or recurring arrival
+row keyed to the signed-in employee and Site. A worker who was not separately
+preassigned is therefore sent to review even when the canonical schedule says
+that Site has work. Pending evidence is then absent from Schedule actuals.
+
+The defect is not missing crew-selection UI. The employee-specific arrival
+model is the wrong eligibility authority. The operator intentionally schedules
+the customer Site, while each authenticated employee's own QR scan establishes
+who actually worked there.
+
+Calendar start and end values remain approximate planning blocks. They may be
+used as a bounded association hint, but must not become a flexible employee's
+lateness deadline. Retained exact/rule rows may continue to refine punctuality
+for an already configured exception, but they must never be required to accept
+an otherwise valid employee at a canonical job.
+
+### Required changes
+
+The slice must:
+
+1. Match each new QR submission, using the official server timestamp, to
+   canonical Schedule-eligible jobs at the resolved active Site. A candidate
+   must have a valid timed, non-all-day occurrence; a readable canonical source
+   role compatible with the active Site type; and a status other than
+   `cancelled`.
+2. Treat Calendar time as an association window rather than a punctuality
+   promise. A timed job is a candidate when its interval overlaps the official
+   check-in timestamp expanded by the configured twelve-hour arrival-association
+   window. Do not select the nearest job when more than one eligible job
+   remains.
+3. Produce deterministic fail-closed outcomes after geofence and device-skew
+   checks: one eligible job is accepted; multiple eligible jobs are
+   `needs_review/ambiguous_job`; only cancelled candidates are
+   `needs_review/cancelled_job`; and no candidate is
+   `needs_review/no_scheduled_job`.
+4. For one canonical job, keep any retained matching exact/rule schedule as a
+   punctuality refinement, including its stored grace calculation. When no
+   retained refinement exists, accept the scan as
+   `on_time/verified_scheduled_site/not_required`; this accepted state means
+   verified scheduled-Site presence and does not infer punctuality from the
+   approximate Calendar block.
+5. Add an optional foreign-key link from immutable QR evidence to the matched
+   canonical job. Preserve the first stored link on an unchanged retry, clear
+   no historical schedule/rule snapshots, and set the link to null rather than
+   deleting evidence if a deletable job is removed.
+6. Make Schedule actual projection honor that durable QR job link while keeping
+   QR evidence presence-only. A QR scan can identify an observed worker and
+   attach an otherwise unlinked Site segment, but it must never invent paid
+   duration, actual hours, wages, or labor cost.
+7. Make accepted job-linked QR evidence protect that exact Calendar occurrence
+   from destructive move/cancellation reconciliation even when the scan falls
+   outside the approximate provider interval. Preserve the existing accepted
+   evidence-state rules.
+8. Stop registering the exact-schedule and recurring-rule mutation routes.
+   Keep authenticated read-only history, both retained tables, their foreign
+   keys, existing rows, and Site-archive soft retirement intact.
+9. Stop registering the forward-looking employee-schedule reconciliation and
+   review routes. Open-ended retained rules must not keep creating future
+   missing-employee exceptions after actual workers are determined by QR
+   evidence. Preserve all stored reconciliation review history.
+10. Remove the corresponding mutation and employee-schedule reconciliation
+    controls/callers from the backend-served legacy page while retaining Site QR
+    generation, immutable arrival activity, needs-review decisions, and normal
+    time-entry controls.
+11. In the canonical portal, display the flexible accepted reason as verified
+    on-site presence rather than telling the employee that an approximate
+    Calendar time made them on time. Preserve the existing on-time, late, and
+    needs-review messages for retained exact-policy and exception outcomes.
+12. Add focused PostgreSQL-backed, route-registry, history-preservation,
+    projection, and portal regressions for two different employees on one job,
+    overnight association, geofence/device-skew precedence, cancelled and
+    ambiguous jobs, unchanged retry, retained exact-rule punctuality, durable
+    job linking, zero QR-paid duration, retired-route non-mutation, and retained
+    history.
+
+### Boundaries
+
+This slice must not:
+
+- create employee or crew assignments, infer a planned worker, consume a job
+  after one scan, or prevent multiple authenticated employees from checking in
+  to the same service obligation;
+- use device time as official time, weaken signed-in employee equality, QR
+  signature/nonce rotation, active-Site enforcement, geofence evaluation,
+  device-skew precedence, clock-hours gates, idempotency, authentication, or
+  admin review authorization;
+- rewrite or delete existing QR check-ins, exact schedules, recurring rules,
+  reconciliation reviews, audit evidence, shifts, visits, departures, or
+  timecards;
+- replace retained exact/rule punctuality with a customer-name special case or
+  infer a new Site policy from historical rows. The live Firefly rule remains
+  effective through retained matching; a generalized fixed/window/flexible/
+  after-hours policy editor is a separate product decision;
+- change Calendar OAuth, source configuration, provider fetches, Site mapping,
+  source identity, synchronization, ordinary reschedule/cancellation handling,
+  job economics, Schedule/Forecast response shapes, or Customer/Site writes;
+- change clock-in/out, Arrive/Depart, paid-time calculation, wages, payroll,
+  time corrections, receivables, invoices, payments, authentication, reports,
+  public registration, or unrelated backend/portal modules;
+- perform a destructive migration or seed, rewrite, deactivate, reactivate, or
+  otherwise reinterpret retained employee schedule/rule rows.
