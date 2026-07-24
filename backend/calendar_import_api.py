@@ -49,6 +49,7 @@ from planned_visits import (
 AdminDependency = Callable[..., dict[str, Any]]
 MAX_TARGETED_RECONCILIATIONS = MAX_PREVIEW_OCCURRENCES
 OAUTH_CALLBACK_PATH = "/api/google-calendar/oauth/callback"
+READABLE_CALENDAR_ACCESS_ROLES = frozenset({"reader", "writer", "owner"})
 
 
 class CalendarOAuthAccessLogFilter(logging.Filter):
@@ -1625,7 +1626,8 @@ def build_calendar_import_router(
                         accessible_calendar_ids=(
                             calendar.calendar_id
                             for calendar in calendars
-                            if calendar.access_role in {"reader", "writer", "owner"}
+                            if calendar.access_role
+                            in READABLE_CALENDAR_ACCESS_ROLES
                         ),
                         **connection_arguments,
                     )
@@ -1664,7 +1666,7 @@ def build_calendar_import_router(
         calendars_by_id = {
             calendar.calendar_id: calendar
             for calendar in calendars
-            if calendar.access_role in {"reader", "writer", "owner"}
+            if calendar.access_role in READABLE_CALENDAR_ACCESS_ROLES
         }
         requested = {
             store.RESIDENTIAL_MORNING_ROLE: (

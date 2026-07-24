@@ -23,7 +23,7 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from datetime import date, datetime, time as clock_time, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
@@ -10743,112 +10743,132 @@ def admin_auto_link_jobs(
     return {"success": True, "linkedCount": linked}
 
 
-def _profitability_money_cents(value: Any) -> Optional[int]:
+def _profitability_nonnegative_decimal(value: Any) -> Optional[Decimal]:
     if value is None:
         return None
-    return int(
-        (Decimal(str(value)) * Decimal("100")).quantize(
-            Decimal("1"),
-            rounding=ROUND_HALF_UP,
-        )
-    )
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite() or amount < 0:
+        return None
+    return amount
 
 
-def _source_profitability_monthly_allocations(
+def _profitability_money_cents(value: Any) -> Optional[int]:
+    amount = _profitability_nonnegative_decimal(value)
+    if amount is None:
+        return None
+    quantized = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return int((quantized * 100).to_integral_value())
+
+
+def _source_job_profitability_economics(
     rows: List[Dict[str, Any]],
-) -> Dict[int, int]:
-    targets = [
-        row
-        for row in rows
-        if row.get("source_key") is not None
-        and row.get("location_id") is not None
-        and row.get("site_rate_type") == "monthly"
+) -> Dict[int, Dict[str, Any]]:
+    economics: Dict[int, Dict[str, Any]] = {}
+    monthly_group_for_job: Dict[int, Tuple[int, int, int]] = {}
+    monthly_rates: Dict[Tuple[int, int, int], int] = {}
+
+    for row in rows:
+        if row.get("source_key") is None:
+            continue
+        job_id = int(row["id"])
+        expected = _profitability_nonnegative_decimal(
+            row.get("site_expected_hours")
+        )
+        rate_cents = _profitability_money_cents(row.get("site_rate"))
+        rate_type = str(row.get("site_rate_type") or "")
+        site_id = row.get("site_id")
+        revenue_cents: Optional[int] = None
+
+        if site_id is not None and rate_cents is not None:
+            if rate_type == "per_visit":
+                revenue_cents = rate_cents
+            elif rate_type == "hourly" and expected is not None:
+                revenue_cents = int(
+                    (Decimal(rate_cents) * expected).quantize(
+                        Decimal("1"),
+                        rounding=ROUND_HALF_UP,
+                    )
+                )
+            elif rate_type == "monthly":
+                if row.get("status") == "cancelled":
+                    revenue_cents = 0
+                else:
+                    scheduled_date = row["scheduled_date"]
+                    group = (
+                        int(site_id),
+                        scheduled_date.year,
+                        scheduled_date.month,
+                    )
+                    monthly_group_for_job[job_id] = group
+                    monthly_rates[group] = rate_cents
+
+        economics[job_id] = {
+            "expected_hours": float(expected) if expected is not None else None,
+            "revenue_cents": revenue_cents,
+        }
+
+    if not monthly_rates:
+        return economics
+
+    month_starts = [date(year, month, 1) for _, year, month in monthly_rates]
+    month_ends = [
+        date(year, month, calendar.monthrange(year, month)[1])
+        for _, year, month in monthly_rates
     ]
-    if not targets:
-        return {}
-    location_ids = sorted({int(row["location_id"]) for row in targets})
-    target_dates = [row["scheduled_date"] for row in targets]
-    allocation_start = min(target_dates).replace(day=1)
-    last_target = max(target_dates)
-    allocation_end = (
-        date(last_target.year + 1, 1, 1)
-        if last_target.month == 12
-        else date(last_target.year, last_target.month + 1, 1)
-    ) - timedelta(days=1)
-    allocation_rows = db.query_all(
+    candidate_rows = db.query_all(
         """
-        SELECT j.id, j.location_id, j.scheduled_date, j.scheduled_start,
-               l.rate AS site_rate
-        FROM jobs j
-        JOIN locations l ON l.id = j.location_id
-        WHERE j.source_key IS NOT NULL
-          AND j.status <> 'cancelled'
-          AND l.rate_type = 'monthly'
-          AND j.location_id = ANY(%s)
-          AND j.scheduled_date BETWEEN %s AND %s
-        ORDER BY j.location_id, j.scheduled_date,
-                 j.scheduled_start NULLS LAST, j.id
+        SELECT id, location_id, scheduled_date, scheduled_start
+        FROM jobs
+        WHERE status <> 'cancelled'
+          AND location_id = ANY(%s)
+          AND scheduled_date BETWEEN %s AND %s
+        ORDER BY scheduled_date, scheduled_start NULLS FIRST, id
         """,
-        (location_ids, allocation_start, allocation_end),
+        (
+            sorted({group[0] for group in monthly_rates}),
+            min(month_starts),
+            max(month_ends),
+        ),
     )
-    groups: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = {}
-    for row in allocation_rows:
-        scheduled_date = row["scheduled_date"]
-        key = (
-            int(row["location_id"]),
+    candidates_by_group: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = {}
+    for candidate in candidate_rows:
+        scheduled_date = candidate["scheduled_date"]
+        group = (
+            int(candidate["location_id"]),
             scheduled_date.year,
             scheduled_date.month,
         )
-        groups.setdefault(key, []).append(row)
+        if group in monthly_rates:
+            candidates_by_group.setdefault(group, []).append(candidate)
 
-    allocations: Dict[int, int] = {}
-    for jobs_in_month in groups.values():
-        monthly_cents = _profitability_money_cents(jobs_in_month[0]["site_rate"])
-        if monthly_cents is not None:
-            allocations.update(
-                allocate_monthly_cents(
-                    monthly_cents,
-                    (int(job["id"]) for job in jobs_in_month),
-                )
-            )
-    return allocations
-
-
-def _profitability_job_values(
-    row: Dict[str, Any],
-    monthly_allocations: Dict[int, int],
-) -> Tuple[Optional[float], float]:
-    if row.get("source_key") is None:
-        expected_hours = (
-            float(row["expected_hours"])
-            if row.get("expected_hours") is not None
-            else None
+    app_timezone = ZoneInfo(TIMEZONE_NAME)
+    allocations_by_group: Dict[Tuple[int, int, int], Dict[int, int]] = {}
+    for group, candidates in candidates_by_group.items():
+        ordered = sorted(
+            candidates,
+            key=lambda row: (
+                row.get("scheduled_start")
+                or datetime.combine(
+                    row["scheduled_date"],
+                    clock_time.min,
+                    tzinfo=app_timezone,
+                ).astimezone(timezone.utc),
+                int(row["id"]),
+            ),
         )
-        return expected_hours, float(row.get("revenue") or 0)
+        allocations_by_group[group] = allocate_monthly_cents(
+            monthly_rates[group],
+            (int(row["id"]) for row in ordered),
+        )
 
-    expected_hours = (
-        float(row["site_expected_hours"])
-        if row.get("site_expected_hours") is not None
-        else None
-    )
-    revenue_cents: Optional[int] = None
-    rate_cents = _profitability_money_cents(row.get("site_rate"))
-    if row.get("status") == "cancelled":
-        revenue_cents = 0
-    elif rate_cents is not None:
-        rate_type = row.get("site_rate_type")
-        if rate_type == "per_visit":
-            revenue_cents = rate_cents
-        elif rate_type == "hourly" and expected_hours is not None:
-            revenue_cents = int(
-                (Decimal(rate_cents) * Decimal(str(expected_hours))).quantize(
-                    Decimal("1"),
-                    rounding=ROUND_HALF_UP,
-                )
-            )
-        elif rate_type == "monthly":
-            revenue_cents = monthly_allocations.get(int(row["id"]))
-    return expected_hours, (revenue_cents or 0) / 100
+    for job_id, group in monthly_group_for_job.items():
+        economics[job_id]["revenue_cents"] = allocations_by_group.get(
+            group, {}
+        ).get(job_id)
+    return economics
 
 
 @app.get("/api/admin/jobs/profitability")
@@ -10875,14 +10895,14 @@ def admin_jobs_profitability(
     if end_date:
         clauses.append("j.scheduled_date <= %s")
         params.append(end_date)
-
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
     rows = db.query_all(
         f"""
         SELECT j.id, j.location_id, j.customer_name, j.scheduled_date,
                j.expected_hours, j.revenue, j.status, j.notes, j.source_key,
-               l.rate AS site_rate, l.rate_type AS site_rate_type,
+               l.id AS site_id, l.rate AS site_rate,
+               l.rate_type AS site_rate_type,
                l.expected_hours AS site_expected_hours,
                COALESCE(SUM(s.total_hours), 0) AS actual_hours,
                COUNT(DISTINCT s.employee_id) AS employee_count,
@@ -10919,16 +10939,34 @@ def admin_jobs_profitability(
                 emp_rates.get(sd["employee_id"], 0.0) * float(sd["total_hours"] or 0)
             )
 
+    source_economics = _source_job_profitability_economics(rows)
     jobs_out = []
     total_rev = 0.0
     total_labor = 0.0
     total_hours = 0.0
-    monthly_allocations = _source_profitability_monthly_allocations(rows)
+    source_revenue_incomplete = False
     for r in rows:
         labor_cost = labor_by_job.get(r["id"], 0.0)
-        exp_h, rev = _profitability_job_values(r, monthly_allocations)
+        if r.get("source_key") is not None:
+            economics = source_economics[int(r["id"])]
+            exp_h = economics["expected_hours"]
+            revenue_cents = economics["revenue_cents"]
+            rev = (
+                float(Decimal(revenue_cents) / Decimal(100))
+                if revenue_cents is not None
+                else None
+            )
+            if rev is None:
+                source_revenue_incomplete = True
+        else:
+            exp_h = (
+                float(r["expected_hours"])
+                if r["expected_hours"] is not None
+                else None
+            )
+            rev = float(r["revenue"] or 0)
         hours = float(r["actual_hours"] or 0)
-        net = round(rev - labor_cost, 2)
+        net = round(rev - labor_cost, 2) if rev is not None else None
 
         jobs_out.append({
             "jobId": r["id"],
@@ -10938,28 +10976,50 @@ def admin_jobs_profitability(
             "expectedHours": exp_h,
             "actualHours": round(hours, 2),
             "varianceHours": round(exp_h - hours, 2) if exp_h is not None else None,
-            "revenue": round(rev, 2),
+            "revenue": round(rev, 2) if rev is not None else None,
             "laborCost": round(labor_cost, 2),
             "netProfit": net,
-            "grossMarginPct": round(net / rev * 100, 1) if rev > 0 else None,
-            "laborPct": round(labor_cost / rev * 100, 1) if rev > 0 else None,
+            "grossMarginPct": (
+                round(net / rev * 100, 1)
+                if rev is not None and rev > 0 and net is not None
+                else None
+            ),
+            "laborPct": (
+                round(labor_cost / rev * 100, 1)
+                if rev is not None and rev > 0
+                else None
+            ),
             "employeeCount": r["employee_count"],
             "shiftCount": r["shift_count"],
         })
 
-        total_rev += rev
+        if rev is not None:
+            total_rev += rev
         total_labor += labor_cost
         total_hours += hours
 
-    total_net = round(total_rev - total_labor, 2)
+    total_revenue = None if source_revenue_incomplete else round(total_rev, 2)
+    total_net = (
+        None
+        if source_revenue_incomplete
+        else round(total_rev - total_labor, 2)
+    )
     return {
         "success": True,
         "summary": {
             "jobCount": len(jobs_out),
-            "totalRevenue": round(total_rev, 2),
+            "totalRevenue": total_revenue,
             "totalLaborCost": round(total_labor, 2),
             "totalNetProfit": total_net,
-            "grossMarginPct": round(total_net / total_rev * 100, 1) if total_rev > 0 else None,
+            "grossMarginPct": (
+                round(total_net / total_rev * 100, 1)
+                if (
+                    total_net is not None
+                    and total_revenue is not None
+                    and total_rev > 0
+                )
+                else None
+            ),
             "totalHours": round(total_hours, 2),
         },
         "jobs": jobs_out,

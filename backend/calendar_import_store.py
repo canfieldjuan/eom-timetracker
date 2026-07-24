@@ -2421,6 +2421,25 @@ def _calendar_sites_by_id(
     return [_calendar_site_payload(dict(row)) for row in cur.fetchall()]
 
 
+def _canonical_manual_job_collisions(
+    cur: Any, *, location_id: int, scheduled_date: date
+) -> list[int]:
+    cur.execute(
+        """
+        SELECT id
+        FROM jobs
+        WHERE source_key IS NULL
+          AND location_id = %s
+          AND scheduled_date = %s
+          AND status <> 'cancelled'
+        ORDER BY id
+        LIMIT 2
+        """,
+        (location_id, scheduled_date),
+    )
+    return [int(row["id"]) for row in cur.fetchall()]
+
+
 def _canonical_job_service_dates(existing_job: dict[str, Any]) -> list[date]:
     """Return every local service date touched by the stored job window."""
 
@@ -3101,33 +3120,33 @@ def sync_calendar_source(
                     occurrence.time_zone or str(source["calendar_timezone"]),
                     bool(occurrence.all_day),
                 )
-                cur.execute(
-                    """
-                    SELECT id
-                    FROM jobs
-                    WHERE source_key IS NULL
-                      AND location_id = %s
-                      AND scheduled_date = %s
-                      AND status <> 'cancelled'
-                    ORDER BY id
-                    LIMIT 2
-                    """,
-                    (location_id, scheduled_date),
+                requires_manual_collision_check = (
+                    existing is None
+                    or existing["status"] == "cancelled"
+                    or int(existing["location_id"]) != location_id
+                    or existing["scheduled_date"] != scheduled_date
                 )
-                collisions = [int(row["id"]) for row in cur.fetchall()]
-                if collisions:
-                    counts["unresolved"] += 1
-                    exceptions.append(
-                        _canonical_exception(
-                            source=source,
-                            occurrence=occurrence,
-                            fingerprint=fingerprint,
-                            code="legacy_job_collision",
-                            candidate_sites=_calendar_sites_by_id(cur, (location_id,)),
-                            conflicting_job_ids=collisions,
-                        )
+                if requires_manual_collision_check:
+                    collisions = _canonical_manual_job_collisions(
+                        cur,
+                        location_id=location_id,
+                        scheduled_date=scheduled_date,
                     )
-                    continue
+                    if collisions:
+                        counts["unresolved"] += 1
+                        exceptions.append(
+                            _canonical_exception(
+                                source=source,
+                                occurrence=occurrence,
+                                fingerprint=fingerprint,
+                                code="legacy_job_collision",
+                                candidate_sites=_calendar_sites_by_id(
+                                    cur, (location_id,)
+                                ),
+                                conflicting_job_ids=collisions,
+                            )
+                        )
+                        continue
                 if existing is None:
                     cur.execute(
                         """
