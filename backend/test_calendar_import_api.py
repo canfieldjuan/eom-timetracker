@@ -4050,6 +4050,7 @@ def _insert_point_work_evidence(
     employee_id: int,
     location_id: int,
     observed_at: datetime,
+    job_id: int | None = None,
     qr_classification: str = "on_time",
     qr_review_status: str = "not_required",
 ) -> tuple[int | None, int | None]:
@@ -4057,13 +4058,13 @@ def _insert_point_work_evidence(
         cur.execute(
             """
             INSERT INTO site_check_ins (
-                employee_id, location_id, server_checked_in_at,
+                employee_id, location_id, job_id, server_checked_in_at,
                 device_scanned_at, latitude, longitude, accuracy_m,
                 geofence_radius_m, distance_m, geofence_status,
                 classification, classification_reason,
                 device_clock_skew_seconds, review_status
             ) VALUES (
-                %s, %s, %s, %s, 39.1203, -88.54335, 5,
+                %s, %s, %s, %s, %s, 39.1203, -88.54335, 5,
                 100, 0, 'inside', %s, 'point_evidence_test',
                 0, %s
             )
@@ -4072,6 +4073,7 @@ def _insert_point_work_evidence(
             (
                 employee_id,
                 location_id,
+                job_id,
                 observed_at,
                 observed_at,
                 qr_classification,
@@ -4361,6 +4363,109 @@ def test_site_date_time_evidence_protects_job_without_shift_job_id(client, auth)
         ]
         == "scheduled"
     )
+
+
+def test_durable_qr_job_link_protects_exact_job_outside_site_time_window(
+    client, auth
+):
+    configure_canonical_sources(client, auth)
+    original = google_occurrence(
+        "protected-by-durable-qr-job-link",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    job = db.query_one(
+        """
+        SELECT id, location_id, scheduled_start, scheduled_end, status
+        FROM jobs
+        WHERE source_key = %s
+        """,
+        (original.source_key,),
+    )
+    assert job is not None
+    employee_id = int(
+        db.query_one("SELECT id FROM employees WHERE name = 'Catalina Gomez'")["id"]
+    )
+    observed_at = job["scheduled_end"] + timedelta(days=7)
+    assert not job["scheduled_start"] <= observed_at < job["scheduled_end"]
+
+    check_in_id: int | None = None
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                _, check_in_id = _insert_point_work_evidence(
+                    cur,
+                    evidence_kind="qr",
+                    employee_id=employee_id,
+                    location_id=int(job["location_id"]),
+                    job_id=int(job["id"]),
+                    observed_at=observed_at,
+                )
+
+        moved = google_occurrence(
+            "protected-by-durable-qr-job-link",
+            calendar_id="residential@example.test",
+            start=WINDOW_START + timedelta(days=1),
+            updated="2026-07-22T12:00:00Z",
+        )
+        FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [moved]
+        reschedule = client.post(
+            "/api/admin/google-calendar/sync", headers=auth
+        )
+        assert reschedule.status_code == 200, reschedule.text
+        reschedule_body = reschedule.json()
+        assert reschedule_body["counts"]["unresolved"] == 1
+        assert [
+            (row["sourceKey"], row["code"])
+            for row in reschedule_body["exceptions"]
+        ] == [(original.source_key, "protected_work")]
+        assert db.query_one(
+            """
+            SELECT scheduled_start, status
+            FROM jobs
+            WHERE id = %s
+            """,
+            (int(job["id"]),),
+        ) == {
+            "scheduled_start": job["scheduled_start"],
+            "status": "scheduled",
+        }
+
+        FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [
+            sparse_cancelled_occurrence(moved)
+        ]
+        cancellation = client.post(
+            "/api/admin/google-calendar/sync", headers=auth
+        )
+        assert cancellation.status_code == 200, cancellation.text
+        cancellation_body = cancellation.json()
+        assert cancellation_body["counts"]["unresolved"] == 1
+        assert [
+            (row["sourceKey"], row["code"])
+            for row in cancellation_body["exceptions"]
+        ] == [(original.source_key, "protected_work")]
+        assert db.query_one(
+            """
+            SELECT scheduled_start, status
+            FROM jobs
+            WHERE id = %s
+            """,
+            (int(job["id"]),),
+        ) == {
+            "scheduled_start": job["scheduled_start"],
+            "status": "scheduled",
+        }
+    finally:
+        if check_in_id is not None:
+            db.execute(
+                "DELETE FROM site_check_ins WHERE id = %s",
+                (check_in_id,),
+            )
 
 
 def test_same_day_shift_protects_only_the_overlapping_timed_occurrence(client, auth):

@@ -435,7 +435,7 @@
 
             <h3>QR Site Check-In</h3>
             <p class="meta">
-                Create a printable QR for each site, schedule exact arrival times, and review uncertain check-ins.
+                Create a printable QR for each site and review immutable arrival evidence.
             </p>
             <label for="adminCheckInSiteSelect">Site QR</label>
             <select id="adminCheckInSiteSelect"></select>
@@ -450,79 +450,12 @@
                 <a id="siteQrDownload" download="site-check-in-qr.svg">Download SVG</a>
             </div>
 
-            <h3 style="margin-top: 16px;">Schedule an Arrival</h3>
-            <div class="row">
-                <div>
-                    <label for="siteCheckInEmployeeSelect">Employee</label>
-                    <select id="siteCheckInEmployeeSelect"></select>
-                </div>
-                <div>
-                    <label for="siteCheckInScheduleSiteSelect">Site</label>
-                    <select id="siteCheckInScheduleSiteSelect"></select>
-                </div>
-            </div>
-            <div class="row">
-                <div>
-                    <label for="siteCheckInScheduledStart">Scheduled start</label>
-                    <input id="siteCheckInScheduledStart" type="datetime-local">
-                </div>
-                <div>
-                    <label for="siteCheckInGraceMinutes">Grace minutes</label>
-                    <input id="siteCheckInGraceMinutes" type="number" min="0" max="120" value="10">
-                </div>
-            </div>
-            <button id="saveSiteCheckInScheduleButton" type="button">Save Arrival Schedule</button>
-            <div id="siteCheckInScheduleMessage" class="message"></div>
-
-            <h3 style="margin-top: 16px;">Repeat Weekly</h3>
-            <p class="meta">
-                Uses the employee and site selected above. Exact one-time arrivals override a weekly schedule.
-                Times use the company timezone.
-            </p>
-            <label>Arrival days</label>
-            <div class="weekday-picker" id="siteCheckInWeekdayPicker">
-                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="0" checked>Mon</label>
-                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="1" checked>Tue</label>
-                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="2" checked>Wed</label>
-                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="3" checked>Thu</label>
-                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="4" checked>Fri</label>
-                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="5">Sat</label>
-                <label class="weekday-option"><input class="siteCheckInWeekday" type="checkbox" value="6">Sun</label>
-            </div>
-            <div class="row">
-                <div>
-                    <label for="siteCheckInRecurringTime">Arrival time</label>
-                    <input id="siteCheckInRecurringTime" type="time" value="07:00" step="60">
-                </div>
-                <div>
-                    <label for="siteCheckInRecurringStart">Starts on</label>
-                    <input id="siteCheckInRecurringStart" type="date">
-                </div>
-                <div>
-                    <label for="siteCheckInRecurringEnd">Ends on (optional)</label>
-                    <input id="siteCheckInRecurringEnd" type="date">
-                </div>
-                <div>
-                    <label for="siteCheckInRecurringGraceMinutes">Grace minutes</label>
-                    <input id="siteCheckInRecurringGraceMinutes" type="number" min="0" max="120" value="10">
-                </div>
-            </div>
-            <div class="row">
-                <button id="saveRecurringSiteCheckInScheduleButton" type="button">Save Weekly Schedule</button>
-                <button id="refreshRecurringSiteCheckInSchedulesButton" type="button">Refresh Weekly Schedules</button>
-            </div>
-            <div id="recurringSiteCheckInScheduleMessage" class="message"></div>
-            <div id="recurringSiteCheckInScheduleList">
-                <p class="meta">No weekly schedules loaded.</p>
-            </div>
-
             <div class="row" style="margin-top: 16px;">
                 <h3>Arrival Activity</h3>
                 <button id="refreshSiteCheckInActivityButton" type="button">Apply Filters</button>
             </div>
             <p class="meta">
-                Shows official server-timed QR arrivals. Employee, site, and date filters
-                also control the timecard reconciliation below. Dates use the company timezone.
+                Shows official server-timed QR arrivals. Dates use the company timezone.
             </p>
             <div class="row">
                 <div>
@@ -561,39 +494,6 @@
             <p id="siteCheckInActivitySummary" class="meta">No arrival activity loaded.</p>
             <div id="siteCheckInActivityList">
                 <p class="meta">No arrival activity loaded.</p>
-            </div>
-
-            <div class="row" style="margin-top: 16px;">
-                <h3>Arrival vs. Timecard</h3>
-                <button id="refreshArrivalTimecardReconciliationButton" type="button">
-                    Refresh Reconciliation
-                </button>
-            </div>
-            <p class="meta">
-                Read-only comparison of scheduled QR arrivals against paid clock-ins and
-                Arrived events. This does not change timecards or wages.
-            </p>
-            <div class="row">
-                <div>
-                    <label for="arrivalTimecardReconciliationView">View</label>
-                    <select id="arrivalTimecardReconciliationView">
-                        <option value="open">Open exceptions</option>
-                        <option value="needs_correction">Needs correction</option>
-                        <option value="resolved">Resolved exceptions</option>
-                        <option value="reopened">Reopened exceptions</option>
-                        <option value="exceptions">All exceptions</option>
-                        <option value="all">All scheduled arrivals</option>
-                        <option value="matched">Matched</option>
-                        <option value="pending">Pending</option>
-                    </select>
-                </div>
-            </div>
-            <div id="arrivalTimecardReconciliationMessage" class="message"></div>
-            <p id="arrivalTimecardReconciliationSummary" class="meta">
-                No reconciliation loaded.
-            </p>
-            <div id="arrivalTimecardReconciliationList">
-                <p class="meta">No reconciliation loaded.</p>
             </div>
 
             <div class="row" style="margin-top: 16px;">
@@ -1391,7 +1291,6 @@
                 )).join('')
                 : '<option value="">No sites configured</option>';
             document.getElementById('adminCheckInSiteSelect').innerHTML = siteOptions;
-            document.getElementById('siteCheckInScheduleSiteSelect').innerHTML = siteOptions;
             const activitySiteSelect = document.getElementById('siteCheckInActivitySite');
             const selectedActivitySite = activitySiteSelect.value;
             activitySiteSelect.innerHTML = '<option value="">All sites</option>' + state.sites.map((site) => (
@@ -1409,11 +1308,6 @@
             const payload = await apiRequest('/admin/employees', 'GET', null, true);
             state.adminEmployees = (Array.isArray(payload.employees) ? payload.employees : [])
                 .filter((employee) => employee.active && employee.role === 'employee');
-            document.getElementById('siteCheckInEmployeeSelect').innerHTML = state.adminEmployees.length
-                ? state.adminEmployees.map((employee) => (
-                    `<option value="${escapeHtml(employee.id)}">${escapeHtml(employee.name)}</option>`
-                )).join('')
-                : '<option value="">No active employees</option>';
             const activityEmployeeSelect = document.getElementById('siteCheckInActivityEmployee');
             const selectedActivityEmployee = activityEmployeeSelect.value;
             activityEmployeeSelect.innerHTML = '<option value="">All employees</option>' + state.adminEmployees
@@ -1477,137 +1371,6 @@
                 );
             } catch (error) {
                 clearSiteQrPreview();
-                setMessage(message, 'error', error.message);
-            }
-        }
-
-        async function saveSiteCheckInSchedule() {
-            const message = document.getElementById('siteCheckInScheduleMessage');
-            clearMessage(message);
-            try {
-                const employeeId = Number(document.getElementById('siteCheckInEmployeeSelect').value);
-                const siteId = Number(document.getElementById('siteCheckInScheduleSiteSelect').value);
-                const localStart = document.getElementById('siteCheckInScheduledStart').value;
-                const graceMinutes = Number(document.getElementById('siteCheckInGraceMinutes').value);
-                if (!employeeId || !siteId || !localStart) {
-                    throw new Error('Employee, site, and scheduled start are required.');
-                }
-                const scheduledStart = new Date(localStart);
-                if (Number.isNaN(scheduledStart.getTime())) {
-                    throw new Error('Scheduled start is invalid.');
-                }
-                const payload = await apiRequest('/admin/site-check-in-schedules', 'POST', {
-                    employeeId,
-                    siteId,
-                    scheduledStart: scheduledStart.toISOString(),
-                    graceMinutes
-                }, true);
-                setMessage(
-                    message,
-                    'success',
-                    `Arrival scheduled for ${payload.schedule.employeeName} at ${payload.schedule.siteName}.`
-                );
-            } catch (error) {
-                setMessage(message, 'error', error.message);
-            }
-        }
-
-        const SITE_CHECK_IN_WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-
-        function renderRecurringSiteCheckInSchedules(rules) {
-            const list = document.getElementById('recurringSiteCheckInScheduleList');
-            if (!rules.length) {
-                list.innerHTML = '<p class="meta">No active weekly schedules.</p>';
-                return;
-            }
-            list.innerHTML = rules.map((rule) => {
-                const dayLabels = rule.weekdays.map((day) => SITE_CHECK_IN_WEEKDAY_LABELS[day]).join(', ');
-                const dateRange = rule.endsOn
-                    ? `${rule.startsOn} through ${rule.endsOn}`
-                    : `${rule.startsOn} onward`;
-                return `
-                    <div class="correction-card">
-                        <strong>${escapeHtml(rule.employeeName)}</strong> at ${escapeHtml(rule.siteName)}
-                        <p class="meta">
-                            ${escapeHtml(dayLabels)} at ${escapeHtml(rule.localStart)}
-                            (${escapeHtml(rule.timezone)}) | ${escapeHtml(dateRange)} |
-                            ${escapeHtml(rule.graceMinutes)} minute grace
-                        </p>
-                        <button class="btn-danger" type="button" data-site-schedule-rule-id="${escapeHtml(rule.id)}">
-                            End Weekly Schedule
-                        </button>
-                    </div>
-                `;
-            }).join('');
-        }
-
-        async function loadRecurringSiteCheckInSchedules() {
-            if (!hasAdminSession()) {
-                return;
-            }
-            const message = document.getElementById('recurringSiteCheckInScheduleMessage');
-            clearMessage(message);
-            try {
-                const payload = await apiRequest(
-                    '/admin/site-check-in-schedule-rules',
-                    'GET',
-                    null,
-                    true
-                );
-                renderRecurringSiteCheckInSchedules(Array.isArray(payload.rules) ? payload.rules : []);
-            } catch (error) {
-                setMessage(message, 'error', error.message);
-            }
-        }
-
-        async function saveRecurringSiteCheckInSchedule() {
-            const message = document.getElementById('recurringSiteCheckInScheduleMessage');
-            clearMessage(message);
-            try {
-                const employeeId = Number(document.getElementById('siteCheckInEmployeeSelect').value);
-                const siteId = Number(document.getElementById('siteCheckInScheduleSiteSelect').value);
-                const weekdays = Array.from(document.querySelectorAll('.siteCheckInWeekday:checked'))
-                    .map((checkbox) => Number(checkbox.value));
-                const localStart = document.getElementById('siteCheckInRecurringTime').value;
-                const startsOn = document.getElementById('siteCheckInRecurringStart').value;
-                const endsOn = document.getElementById('siteCheckInRecurringEnd').value || null;
-                const graceMinutes = Number(document.getElementById('siteCheckInRecurringGraceMinutes').value);
-                if (!employeeId || !siteId || !weekdays.length || !localStart || !startsOn) {
-                    throw new Error('Employee, site, at least one day, arrival time, and start date are required.');
-                }
-                if (endsOn && endsOn < startsOn) {
-                    throw new Error('End date must be on or after the start date.');
-                }
-                const payload = await apiRequest('/admin/site-check-in-schedule-rules', 'POST', {
-                    employeeId,
-                    siteId,
-                    weekdays,
-                    localStart,
-                    startsOn,
-                    endsOn,
-                    graceMinutes
-                }, true);
-                await loadRecurringSiteCheckInSchedules();
-                setMessage(
-                    message,
-                    'success',
-                    `Weekly arrival saved for ${payload.rule.employeeName} at ${payload.rule.siteName}.`
-                );
-            } catch (error) {
-                setMessage(message, 'error', error.message);
-            }
-        }
-
-        async function endRecurringSiteCheckInSchedule(ruleId) {
-            const message = document.getElementById('recurringSiteCheckInScheduleMessage');
-            if (!window.confirm('End this weekly arrival schedule? Existing check-in evidence will be kept.')) {
-                return;
-            }
-            try {
-                await apiRequest(`/admin/site-check-in-schedule-rules/${ruleId}`, 'DELETE', null, true);
-                await loadRecurringSiteCheckInSchedules();
-                setMessage(message, 'success', 'Weekly arrival schedule ended.');
-            } catch (error) {
                 setMessage(message, 'error', error.message);
             }
         }
@@ -1719,234 +1482,6 @@
             }
         }
 
-        function arrivalTimecardOutcomeStyle(outcome) {
-            if (outcome === 'matched') {
-                return 'status-on';
-            }
-            if (outcome === 'pending') {
-                return 'status-review';
-            }
-            return 'status-off';
-        }
-
-        function arrivalTimecardOutcomeLabel(outcome) {
-            const labels = {
-                matched: 'Matched',
-                pending: 'Pending',
-                missing_qr: 'Missing QR',
-                missing_time_entry: 'Missing time entry',
-                missing_both: 'Missing both',
-                site_mismatch: 'Site mismatch',
-                time_gap: 'Time gap',
-                qr_needs_review: 'QR needs review',
-                qr_rejected: 'QR rejected'
-            };
-            return labels[outcome] || humanizeSiteCheckInValue(outcome);
-        }
-
-        function formatArrivalTimecardDifference(minutes) {
-            if (minutes === null || minutes === undefined) {
-                return 'No timestamp comparison';
-            }
-            const numericMinutes = Number(minutes);
-            if (!Number.isFinite(numericMinutes)) {
-                return 'No timestamp comparison';
-            }
-            if (numericMinutes === 0) {
-                return 'Same minute as QR';
-            }
-            const direction = numericMinutes < 0 ? 'before' : 'after';
-            return `${Math.abs(numericMinutes)} min ${direction} QR`;
-        }
-
-        function arrivalTimecardReviewStateLabel(reviewState) {
-            const labels = {
-                open: 'Open - not reviewed',
-                reopened: 'Reopened - evidence changed',
-                resolved: 'Resolved - no timecard change',
-                needs_correction: 'Needs timecard correction',
-                not_applicable: 'No exception review needed'
-            };
-            return labels[reviewState] || humanizeSiteCheckInValue(reviewState);
-        }
-
-        function renderArrivalTimecardReconciliation(payload) {
-            const list = document.getElementById('arrivalTimecardReconciliationList');
-            const summaryElement = document.getElementById('arrivalTimecardReconciliationSummary');
-            const summary = payload && payload.summary ? payload.summary : {};
-            const reviewSummary = payload && payload.reviewSummary ? payload.reviewSummary : {};
-            const rows = payload && Array.isArray(payload.rows) ? payload.rows : [];
-            summaryElement.textContent = [
-                `${summary.total || 0} scheduled`,
-                `${summary.matched || 0} matched`,
-                `${summary.exceptions || 0} exception${summary.exceptions === 1 ? '' : 's'}`,
-                `${reviewSummary.open || 0} open`,
-                `${reviewSummary.resolved || 0} resolved`,
-                `${reviewSummary.needsCorrection || 0} need correction`,
-                `${summary.pending || 0} pending`,
-                `${payload.gapThresholdMinutes || 0}-minute allowed gap`
-            ].join(' | ');
-
-            if (!rows.length) {
-                list.innerHTML = '<p class="meta">No reconciliation rows match this view.</p>';
-                return;
-            }
-
-            list.innerHTML = rows.map((row) => {
-                const qr = row.qrCheckIn;
-                const timecard = row.timecardEvent;
-                const qrText = qr
-                    ? formatCorrectionTimestamp(qr.serverCheckedInAt)
-                    : 'Missing';
-                const timecardAction = timecard && timecard.eventType === 'visit'
-                    ? 'Arrived'
-                    : 'Clock in';
-                const timecardText = timecard
-                    ? `${timecardAction} ${formatCorrectionTimestamp(timecard.eventAt)}`
-                    : 'Missing';
-                const timecardSite = timecard
-                    ? (timecard.siteName || timecard.locationLabel || 'Unknown site')
-                    : '-';
-                const qrEvidence = qr
-                    ? `QR status: ${humanizeSiteCheckInValue(qr.classification)} | ` +
-                      `Geofence: ${humanizeSiteCheckInValue(qr.geofenceStatus)} | ` +
-                      `Review: ${humanizeSiteCheckInValue(qr.reviewStatus)}`
-                    : 'QR evidence: missing';
-                const review = row.review;
-                const reviewDetail = review
-                    ? `${arrivalTimecardReviewStateLabel(row.reviewState)} by ${review.reviewedBy} ` +
-                      `at ${formatCorrectionTimestamp(review.reviewedAt)}: ${review.note}`
-                    : arrivalTimecardReviewStateLabel(row.reviewState);
-                const reviewActions = row.hasException
-                    ? `
-                        <div class="row">
-                            <button
-                                type="button"
-                                data-arrival-review-key="${escapeHtml(row.key)}"
-                                data-arrival-review-fingerprint="${escapeHtml(row.evidenceFingerprint)}"
-                                data-arrival-review-disposition="resolved"
-                            >Resolve - no timecard change</button>
-                            <button
-                                class="btn-danger"
-                                type="button"
-                                data-arrival-review-key="${escapeHtml(row.key)}"
-                                data-arrival-review-fingerprint="${escapeHtml(row.evidenceFingerprint)}"
-                                data-arrival-review-disposition="needs_correction"
-                            >Flag timecard correction</button>
-                        </div>
-                    `
-                    : '';
-                const cardClass = row.hasOpenReview
-                    ? 'correction-card warning'
-                    : 'correction-card';
-                return `
-                    <div class="${cardClass}">
-                        <div class="activity-card-header">
-                            <strong>${escapeHtml(row.employeeName)} at ${escapeHtml(row.siteName)}</strong>
-                            <span class="status-chip ${arrivalTimecardOutcomeStyle(row.outcome)}">
-                                ${escapeHtml(arrivalTimecardOutcomeLabel(row.outcome))}
-                            </span>
-                        </div>
-                        <p class="meta">
-                            Scheduled: ${escapeHtml(formatCorrectionTimestamp(row.scheduledStart))} |
-                            QR: ${escapeHtml(qrText)} |
-                            Paid event: ${escapeHtml(timecardText)} |
-                            Paid site: ${escapeHtml(timecardSite)}
-                        </p>
-                        <p class="meta">
-                            ${escapeHtml(qrEvidence)} |
-                            Difference: ${escapeHtml(formatArrivalTimecardDifference(row.timecardDifferenceMinutes))}
-                        </p>
-                        <p class="meta">${escapeHtml(row.outcomeReason)}</p>
-                        <p class="meta">Review: ${escapeHtml(reviewDetail)}</p>
-                        ${reviewActions}
-                    </div>
-                `;
-            }).join('');
-        }
-
-        async function loadArrivalTimecardReconciliation() {
-            if (!hasAdminSession()) {
-                return;
-            }
-            const message = document.getElementById('arrivalTimecardReconciliationMessage');
-            clearMessage(message);
-            const fromDate = document.getElementById('siteCheckInActivityFromDate').value;
-            const toDate = document.getElementById('siteCheckInActivityToDate').value;
-            if (fromDate && toDate && fromDate > toDate) {
-                setMessage(message, 'error', 'From date must be on or before through date.');
-                return;
-            }
-
-            const filters = new URLSearchParams({ limit: '500' });
-            const employeeId = document.getElementById('siteCheckInActivityEmployee').value;
-            const siteId = document.getElementById('siteCheckInActivitySite').value;
-            const selectedView = document.getElementById('arrivalTimecardReconciliationView').value;
-            if (employeeId) filters.set('employeeId', employeeId);
-            if (siteId) filters.set('siteId', siteId);
-            if (fromDate) filters.set('fromDate', fromDate);
-            if (toDate) filters.set('toDate', toDate);
-            if (['open', 'reopened', 'resolved', 'needs_correction'].includes(selectedView)) {
-                filters.set('reviewState', selectedView);
-            } else if (selectedView === 'exceptions') {
-                filters.set('exceptionsOnly', 'true');
-            } else if (selectedView !== 'all') {
-                filters.set('outcome', selectedView);
-            }
-
-            try {
-                const payload = await apiRequest(
-                    `/admin/site-check-in-reconciliation?${filters.toString()}`,
-                    'GET',
-                    null,
-                    true
-                );
-                renderArrivalTimecardReconciliation(payload);
-                setMessage(message, 'success', 'Read-only reconciliation loaded. No timecards changed.');
-            } catch (error) {
-                setMessage(message, 'error', error.message);
-            }
-        }
-
-        async function reviewArrivalTimecardException(
-            occurrenceKey,
-            evidenceFingerprint,
-            disposition
-        ) {
-            const message = document.getElementById('arrivalTimecardReconciliationMessage');
-            const action = disposition === 'resolved'
-                ? 'resolved with no timecard change'
-                : 'flagged for timecard correction';
-            const note = window.prompt(`Why is this exception being ${action}?`);
-            if (note === null) {
-                return;
-            }
-            if (note.trim().length < 3) {
-                setMessage(message, 'error', 'Enter a review note with at least 3 characters.');
-                return;
-            }
-            try {
-                const encodedKey = encodeURIComponent(occurrenceKey);
-                const payload = await apiRequest(
-                    `/admin/site-check-in-reconciliation/${encodedKey}/review`,
-                    'POST',
-                    {
-                        evidenceFingerprint,
-                        disposition,
-                        note: note.trim()
-                    },
-                    true
-                );
-                if (payload.timecardsChanged !== false) {
-                    throw new Error('Review safety confirmation was missing');
-                }
-                await loadArrivalTimecardReconciliation();
-                setMessage(message, 'success', `Exception ${action}. No timecards changed.`);
-            } catch (error) {
-                setMessage(message, 'error', error.message);
-            }
-        }
-
         function renderSiteCheckInReviews(checkIns) {
             const list = document.getElementById('siteCheckInReviewList');
             if (!checkIns.length) {
@@ -2007,8 +1542,7 @@
                 }, true);
                 await Promise.all([
                     loadSiteCheckInReviews(),
-                    loadSiteCheckInActivity(),
-                    loadArrivalTimecardReconciliation()
+                    loadSiteCheckInActivity()
                 ]);
                 setMessage(message, 'success', `Check-in ${decision}.`);
             } catch (error) {
@@ -2033,9 +1567,7 @@
                 await loadAdminCheckInEmployees();
                 await Promise.all([
                     loadSiteCheckInActivity(),
-                    loadArrivalTimecardReconciliation(),
-                    loadSiteCheckInReviews(),
-                    loadRecurringSiteCheckInSchedules()
+                    loadSiteCheckInReviews()
                 ]);
             }
         }
@@ -2638,10 +2170,6 @@
             document.getElementById('reportMonth').value = String(now.getMonth() + 1);
             document.getElementById('reportYear').value = String(now.getFullYear());
             document.getElementById('reportCompany').value = 'Your Company';
-            document.getElementById('siteCheckInScheduledStart').value = toLocalDateTimeInput(
-                new Date(now.getTime() + 60 * 60 * 1000).toISOString()
-            );
-            document.getElementById('siteCheckInRecurringStart').value = currentDateIso();
 
             try {
                 const storedToken = localStorage.getItem(STORAGE_TOKEN) || '';
@@ -2696,47 +2224,10 @@
         document.getElementById('loadTimeDataAuditButton').addEventListener('click', loadTimeDataAudit);
         document.getElementById('loadSiteQrButton').addEventListener('click', () => loadOrRotateSiteQr(false));
         document.getElementById('rotateSiteQrButton').addEventListener('click', () => loadOrRotateSiteQr(true));
-        document.getElementById('saveSiteCheckInScheduleButton').addEventListener('click', saveSiteCheckInSchedule);
-        document.getElementById('saveRecurringSiteCheckInScheduleButton').addEventListener(
-            'click',
-            saveRecurringSiteCheckInSchedule
-        );
-        document.getElementById('refreshRecurringSiteCheckInSchedulesButton').addEventListener(
-            'click',
-            loadRecurringSiteCheckInSchedules
-        );
-        document.getElementById('recurringSiteCheckInScheduleList').addEventListener('click', (event) => {
-            const button = event.target.closest('[data-site-schedule-rule-id]');
-            if (button) {
-                endRecurringSiteCheckInSchedule(Number(button.dataset.siteScheduleRuleId));
-            }
-        });
         document.getElementById('refreshSiteCheckInReviewsButton').addEventListener('click', loadSiteCheckInReviews);
         document.getElementById('refreshSiteCheckInActivityButton').addEventListener(
             'click',
-            async () => {
-                await Promise.all([
-                    loadSiteCheckInActivity(),
-                    loadArrivalTimecardReconciliation()
-                ]);
-            }
-        );
-        document.getElementById('refreshArrivalTimecardReconciliationButton').addEventListener(
-            'click',
-            loadArrivalTimecardReconciliation
-        );
-        document.getElementById('arrivalTimecardReconciliationList').addEventListener(
-            'click',
-            (event) => {
-                const button = event.target.closest('[data-arrival-review-key]');
-                if (button) {
-                    reviewArrivalTimecardException(
-                        button.dataset.arrivalReviewKey,
-                        button.dataset.arrivalReviewFingerprint,
-                        button.dataset.arrivalReviewDisposition
-                    );
-                }
-            }
+            loadSiteCheckInActivity
         );
         document.getElementById('siteCheckInReviewList').addEventListener('click', (event) => {
             const button = event.target.closest('[data-site-review-id]');

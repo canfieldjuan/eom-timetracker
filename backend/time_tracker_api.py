@@ -3666,12 +3666,22 @@ def _ensure_schema_migrations() -> None:
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+    db.execute("""
+        ALTER TABLE site_check_ins
+        ADD COLUMN IF NOT EXISTS job_id
+            INTEGER REFERENCES jobs(id) ON DELETE SET NULL
+    """)
     db.execute(
         "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS job_id INTEGER REFERENCES jobs(id)"
     )
     db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_scheduled_date ON jobs(scheduled_date)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_customer ON jobs(customer_name)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_site_check_ins_job_time
+        ON site_check_ins(job_id, server_checked_in_at DESC)
+        WHERE job_id IS NOT NULL
+    """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_shifts_job_id ON shifts(job_id)")
     db.execute(
         "ALTER TABLE locations ADD COLUMN IF NOT EXISTS target_labor_pct NUMERIC(5,2)"
@@ -4636,6 +4646,61 @@ def build_site_check_in_reconciliation(
     )
 
 
+def _matching_canonical_site_job(
+    site_id: int,
+    checked_in_at: datetime,
+    *,
+    cur: Optional[Any] = None,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    sql = """
+        SELECT j.id, j.status, j.scheduled_start, j.scheduled_end
+        FROM jobs j
+        JOIN google_calendar_sources source ON source.id = j.calendar_source_id
+        JOIN locations site ON site.id = j.location_id
+        WHERE j.location_id = %s
+          AND site.active = true
+          AND (
+              (
+                  source.role = 'residential_morning'
+                  AND site.location_type = 'Residential'
+              )
+              OR (
+                  source.role = 'commercial_evening_night'
+                  AND site.location_type = 'Commercial'
+              )
+          )
+          AND j.source_all_day = false
+          AND j.scheduled_start IS NOT NULL
+          AND j.scheduled_end IS NOT NULL
+          AND j.scheduled_end > j.scheduled_start
+          AND j.scheduled_start < %s + (%s * INTERVAL '1 hour')
+          AND j.scheduled_end > %s - (%s * INTERVAL '1 hour')
+        ORDER BY j.source_key, j.id
+        FOR SHARE OF j
+        """
+    params = (
+        site_id,
+        checked_in_at,
+        SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
+        checked_in_at,
+        SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
+    )
+    if cur is None:
+        rows = db.query_all(sql, params)
+    else:
+        cur.execute(sql, params)
+        rows = [dict(row) for row in cur.fetchall()]
+
+    active = [row for row in rows if row["status"] != "cancelled"]
+    if len(active) == 1:
+        return active[0], "verified_scheduled_site"
+    if len(active) > 1:
+        return None, "ambiguous_job"
+    if rows:
+        return None, "cancelled_job"
+    return None, "no_scheduled_job"
+
+
 def _matching_site_check_in_schedule(
     employee_id: int,
     site_id: int,
@@ -4736,6 +4801,8 @@ def _matching_site_check_in_schedule(
 
 def _classify_site_check_in(
     geofence: Dict[str, Any],
+    job: Optional[Dict[str, Any]],
+    job_match_reason: str,
     schedule: Optional[Dict[str, Any]],
     checked_in_at: datetime,
     device_clock_skew_seconds: float,
@@ -4752,14 +4819,19 @@ def _classify_site_check_in(
     if device_clock_skew_seconds > SITE_CHECK_IN_DEVICE_SKEW_SECONDS:
         return "needs_review", "device_clock_skew", "pending"
 
-    if not schedule:
-        return "needs_review", "no_matching_schedule", "pending"
+    if not job:
+        return "needs_review", job_match_reason, "pending"
 
-    scheduled_start = schedule["scheduled_start"]
-    grace_deadline = scheduled_start + timedelta(minutes=int(schedule["grace_minutes"]))
-    if checked_in_at <= grace_deadline:
-        return "on_time", "within_grace_period", "not_required"
-    return "late", "after_grace_period", "not_required"
+    if schedule:
+        scheduled_start = schedule["scheduled_start"]
+        grace_deadline = scheduled_start + timedelta(
+            minutes=int(schedule["grace_minutes"])
+        )
+        if checked_in_at <= grace_deadline:
+            return "on_time", "within_grace_period", "not_required"
+        return "late", "after_grace_period", "not_required"
+
+    return "on_time", "verified_scheduled_site", "not_required"
 
 
 @app.get("/", include_in_schema=False)
@@ -5155,6 +5227,11 @@ def record_site_check_in(
                 longitude=payload.longitude,
                 accuracy=payload.accuracy,
             )
+            job, job_match_reason = _matching_canonical_site_job(
+                int(site["id"]),
+                official_time,
+                cur=cur,
+            )
             schedule = _matching_site_check_in_schedule(
                 int(employee["id"]),
                 int(site["id"]),
@@ -5168,6 +5245,8 @@ def record_site_check_in(
             )
             classification, reason, review_status = _classify_site_check_in(
                 geofence,
+                job,
+                job_match_reason,
                 schedule,
                 official_time,
                 device_clock_skew_seconds,
@@ -5175,7 +5254,7 @@ def record_site_check_in(
             cur.execute(
                 """
                 INSERT INTO site_check_ins (
-                    employee_id, location_id, server_checked_in_at,
+                    employee_id, location_id, job_id, server_checked_in_at,
                     device_scanned_at, latitude, longitude, accuracy_m,
                     geofence_radius_m, distance_m, geofence_status,
                     classification, classification_reason, schedule_id,
@@ -5184,6 +5263,7 @@ def record_site_check_in(
                 )
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s,
+                    %s,
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (employee_id, location_id, device_scanned_at)
@@ -5193,6 +5273,7 @@ def record_site_check_in(
                 (
                     int(employee["id"]),
                     int(site["id"]),
+                    int(job["id"]) if job else None,
                     official_time,
                     payload.scannedAt,
                     payload.latitude,
@@ -5246,7 +5327,6 @@ def record_site_check_in(
     }
 
 
-@app.post("/api/admin/site-check-in-schedules")
 def admin_create_site_check_in_schedule(
     payload: SiteCheckInScheduleRequest,
     request: Request,
@@ -5330,7 +5410,6 @@ def admin_list_site_check_in_schedules(
     }
 
 
-@app.delete("/api/admin/site-check-in-schedules/{schedule_id}")
 def admin_delete_site_check_in_schedule(
     schedule_id: int,
     request: Request,
@@ -5351,7 +5430,6 @@ def admin_delete_site_check_in_schedule(
     return {"success": True, "scheduleId": schedule_id}
 
 
-@app.post("/api/admin/site-check-in-schedule-rules")
 def admin_create_site_check_in_schedule_rule(
     payload: SiteCheckInScheduleRuleRequest,
     request: Request,
@@ -5458,7 +5536,6 @@ def admin_list_site_check_in_schedule_rules(
     }
 
 
-@app.delete("/api/admin/site-check-in-schedule-rules/{rule_id}")
 def admin_end_site_check_in_schedule_rule(
     rule_id: int,
     request: Request,
@@ -5553,7 +5630,6 @@ def admin_list_site_check_ins(
     }
 
 
-@app.get("/api/admin/site-check-in-reconciliation")
 def admin_site_check_in_reconciliation(
     employee_id: Optional[int] = Query(default=None, alias="employeeId", gt=0),
     site_id: Optional[int] = Query(default=None, alias="siteId", gt=0),
@@ -5696,7 +5772,6 @@ def _site_check_in_reconciliation_date_for_key(occurrence_key: str) -> date:
     raise HTTPException(status_code=400, detail="Invalid reconciliation occurrence key")
 
 
-@app.post("/api/admin/site-check-in-reconciliation/{occurrence_key}/review")
 def admin_review_site_check_in_reconciliation(
     occurrence_key: str,
     payload: SiteCheckInReconciliationReviewRequest,
