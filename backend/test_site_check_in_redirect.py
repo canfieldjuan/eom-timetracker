@@ -1,10 +1,10 @@
-"""Contract tests for the canonical-portal QR check-in redirect (issue #35).
+"""Contract tests for the canonical-portal entry cutover (issue #35).
 
-GET / and GET /timetracker-mobile.html must 302 QR deep links
-(?checkIn=<token>) to {PUBLIC_APP_URL}/portal when PUBLIC_APP_URL points at
-the canonical EOM portal. Requests without a usable external portal fail closed
-instead of serving or generating a nonfunctional backend QR path. The redirect
-must forward ONLY the checkIn value and must never be cacheable.
+GET / and GET /timetracker-mobile.html must always 302 to
+{PUBLIC_APP_URL}/portal when PUBLIC_APP_URL points at the canonical EOM portal.
+QR deep links preserve only the non-empty checkIn value. Requests without a
+usable external portal fail closed instead of serving the retired Firefly page
+or generating a nonfunctional backend QR path. Redirects must never be cacheable.
 """
 
 from __future__ import annotations
@@ -60,27 +60,41 @@ def test_redirect_url_encodes_the_token(client, portal_env):
     assert resp.headers["location"] == f"{PORTAL}/portal?checkIn=a%20b%2F%26%3F%23c"
 
 
-def test_without_param_serves_legacy_page(client, portal_env):
+def test_without_param_redirects_to_portal(client, portal_env):
     for path in ("/", "/timetracker-mobile.html"):
         resp = _get(client, path)
-        assert resp.status_code == 200
-        assert PAGE_MARKER in resp.text
+        assert resp.status_code == 302
+        assert resp.headers["location"] == f"{PORTAL}/portal"
+        assert resp.headers["cache-control"] == "no-store"
+        assert PAGE_MARKER not in resp.text
 
 
-def test_empty_param_serves_legacy_page(client, portal_env):
-    resp = _get(client, "/?checkIn=")
-    assert resp.status_code == 200
-    assert PAGE_MARKER in resp.text
+def test_empty_or_unrelated_params_are_not_forwarded(client, portal_env):
+    for path in ("/", "/timetracker-mobile.html"):
+        resp = _get(
+            client,
+            path,
+            params={
+                "checkIn": "",
+                "apiBaseUrl": "https://evil.example",
+                "extra": "1",
+            },
+        )
+        assert resp.status_code == 302
+        assert resp.headers["location"] == f"{PORTAL}/portal"
+        assert resp.headers["cache-control"] == "no-store"
+        assert PAGE_MARKER not in resp.text
 
 
 def test_unset_public_app_url_fails_closed(client, monkeypatch):
     monkeypatch.setattr(time_tracker_api, "PUBLIC_APP_URL", "")
     for path in ("/", "/timetracker-mobile.html"):
-        resp = _get(client, path, params={"checkIn": "tok"})
-        assert resp.status_code == 503
-        assert resp.json()["error"] == "QR check-in portal is not configured"
-        assert resp.headers["cache-control"] == "no-store"
-        assert PAGE_MARKER not in resp.text
+        for params in (None, {"checkIn": "tok"}):
+            resp = _get(client, path, params=params)
+            assert resp.status_code == 503
+            assert resp.json()["error"] == "QR check-in portal is not configured"
+            assert resp.headers["cache-control"] == "no-store"
+            assert PAGE_MARKER not in resp.text
 
 
 def test_self_origin_public_app_url_never_redirects(client, monkeypatch):
@@ -89,11 +103,23 @@ def test_self_origin_public_app_url_never_redirects(client, monkeypatch):
     # hostname-only: behind the proxy the request scheme can differ from the
     # public one, and a scheme-sensitive check would still loop.
     monkeypatch.setattr(time_tracker_api, "PUBLIC_APP_URL", "https://testserver")
-    resp = _get(client, "/", params={"checkIn": "tok"})
-    assert resp.status_code == 503
-    assert resp.json()["error"] == "QR check-in portal is not configured"
-    assert resp.headers["cache-control"] == "no-store"
-    assert PAGE_MARKER not in resp.text
+    for path in ("/", "/timetracker-mobile.html"):
+        for params in (None, {"checkIn": "tok"}):
+            resp = _get(client, path, params=params)
+            assert resp.status_code == 503
+            assert resp.json()["error"] == "QR check-in portal is not configured"
+            assert resp.headers["cache-control"] == "no-store"
+            assert PAGE_MARKER not in resp.text
+
+
+def test_public_app_url_without_a_hostname_fails_closed(client, monkeypatch):
+    monkeypatch.setattr(time_tracker_api, "PUBLIC_APP_URL", "https:///portal")
+    for path in ("/", "/timetracker-mobile.html"):
+        resp = _get(client, path)
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "QR check-in portal is not configured"
+        assert resp.headers["cache-control"] == "no-store"
+        assert PAGE_MARKER not in resp.text
 
 
 def test_generated_qr_url_targets_portal_when_configured(

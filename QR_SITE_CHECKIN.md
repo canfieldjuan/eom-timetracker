@@ -43,21 +43,20 @@ this backend's own host:
 
 - Newly generated QR URLs are `{PUBLIC_APP_URL}/portal?checkIn=<token>`
   (`/portal`, not `/portal.html` — the website deploy uses cleanUrls).
-- `GET /` and `GET /timetracker-mobile.html` answer any request carrying a
-  non-empty `checkIn` parameter with a `302` to that same portal URL,
-  forwarding only the `checkIn` value and marking the response
+- `GET /` and `GET /timetracker-mobile.html` always answer with a `302` to the
+  canonical portal. A non-empty `checkIn` value is forwarded; every other
+  legacy query value is discarded. All redirects are marked
   `Cache-Control: no-store`. Already-printed QR codes that point at this
-  backend therefore land in the canonical portal without reprinting.
+  backend therefore land in the canonical portal without reprinting, while
+  ordinary visits no longer receive a second login page.
 
 When `PUBLIC_APP_URL` is unset (or points at this backend's own host, which
 would otherwise redirect the backend to itself), QR behavior fails closed:
 
-- scanned backend links receive `503 QR check-in portal is not configured`
+- all backend entry links receive `503 QR check-in portal is not configured`
   with `Cache-Control: no-store`;
 - admin QR generation receives the same `503` before a token can be created or
-  rotated; and
-- requests without a non-empty `checkIn` parameter still serve the remaining
-  legacy page for ordinary time entry.
+  rotated.
 
 Production must keep `PUBLIC_APP_URL` pointed at the canonical EOM portal.
 
