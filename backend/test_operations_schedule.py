@@ -14,11 +14,140 @@ from operations_schedule import (
     _job_issues,
     _match_segment_to_job,
     _qr_only_presence_segments,
+    _schedule_execution_status,
     allocate_monthly_cents,
 )
 
 
 TEST_PREFIX = "OPS_CANONICAL_TEST"
+
+
+@pytest.mark.parametrize(
+    (
+        "status",
+        "in_progress",
+        "actual_hours",
+        "scheduled_start",
+        "scheduled_end",
+        "source_all_day",
+        "expected",
+    ),
+    [
+        (
+            "scheduled",
+            False,
+            0,
+            datetime(2026, 7, 23, 14, tzinfo=timezone.utc),
+            datetime(2026, 7, 23, 16, tzinfo=timezone.utc),
+            False,
+            "scheduled",
+        ),
+        (
+            "scheduled",
+            False,
+            0,
+            datetime(2026, 7, 23, 12, tzinfo=timezone.utc),
+            datetime(2026, 7, 23, 14, tzinfo=timezone.utc),
+            False,
+            "no_actual",
+        ),
+        (
+            "scheduled",
+            False,
+            0,
+            None,
+            datetime(2026, 7, 23, 13, tzinfo=timezone.utc),
+            False,
+            "scheduled",
+        ),
+        (
+            "scheduled",
+            False,
+            0,
+            datetime(2026, 7, 23, 13, tzinfo=timezone.utc),
+            None,
+            False,
+            "scheduled",
+        ),
+        (
+            "scheduled",
+            False,
+            0,
+            datetime(2026, 7, 23, 14, tzinfo=timezone.utc),
+            datetime(2026, 7, 23, 13, tzinfo=timezone.utc),
+            False,
+            "scheduled",
+        ),
+        (
+            "scheduled",
+            False,
+            0,
+            datetime(2026, 7, 23, 12, tzinfo=timezone.utc),
+            datetime(2026, 7, 23, 13, tzinfo=timezone.utc),
+            True,
+            "scheduled",
+        ),
+        (
+            "cancelled",
+            True,
+            2,
+            datetime(2026, 7, 23, 12, tzinfo=timezone.utc),
+            datetime(2026, 7, 23, 13, tzinfo=timezone.utc),
+            False,
+            "cancelled",
+        ),
+        (
+            "completed",
+            True,
+            2,
+            datetime(2026, 7, 23, 12, tzinfo=timezone.utc),
+            datetime(2026, 7, 23, 13, tzinfo=timezone.utc),
+            False,
+            "in_progress",
+        ),
+        (
+            "completed",
+            False,
+            0,
+            datetime(2026, 7, 23, 12, tzinfo=timezone.utc),
+            datetime(2026, 7, 23, 13, tzinfo=timezone.utc),
+            False,
+            "completed",
+        ),
+        (
+            "scheduled",
+            False,
+            2,
+            datetime(2026, 7, 23, 12, tzinfo=timezone.utc),
+            datetime(2026, 7, 23, 13, tzinfo=timezone.utc),
+            False,
+            "completed",
+        ),
+    ],
+)
+def test_schedule_execution_status_uses_elapsed_window_only_after_precedence(
+    status,
+    in_progress,
+    actual_hours,
+    scheduled_start,
+    scheduled_end,
+    source_all_day,
+    expected,
+):
+    assert (
+        _schedule_execution_status(
+            {
+                "status": status,
+                "scheduled_start": scheduled_start,
+                "scheduled_end": scheduled_end,
+                "source_all_day": source_all_day,
+            },
+            in_progress=in_progress,
+            actual_hours=actual_hours,
+            observed_at=datetime(2026, 7, 23, 14, tzinfo=timezone.utc),
+        )
+        == expected
+    )
 
 
 def _clean_rows() -> None:
@@ -2598,7 +2727,7 @@ def test_schedule_uses_only_accepted_qr_presence_without_paid_time(
     job = next(row for row in response.json()["jobs"] if row["id"] == job_id)
 
     assert job["actualHours"] == 0
-    assert job["executionStatus"] == "scheduled"
+    assert job["executionStatus"] == "no_actual"
     if not accepted:
         assert job["workers"] == []
         return

@@ -274,6 +274,36 @@ def _job_is_projection_eligible(job: Dict[str, Any]) -> bool:
     )
 
 
+def _schedule_execution_status(
+    job: Dict[str, Any],
+    *,
+    in_progress: bool,
+    actual_hours: float,
+    observed_at: datetime,
+) -> str:
+    """Derive the read-only execution state from planning and paid-time evidence."""
+
+    status = str(job.get("status") or "scheduled")
+    if status == "cancelled":
+        return "cancelled"
+    if in_progress:
+        return "in_progress"
+    if status == "completed" or actual_hours > 0:
+        return "completed"
+
+    scheduled_start = job.get("scheduled_start")
+    scheduled_end = job.get("scheduled_end")
+    has_valid_timed_window = bool(
+        not bool(job.get("source_all_day"))
+        and scheduled_start is not None
+        and scheduled_end is not None
+        and scheduled_end > scheduled_start
+    )
+    if has_valid_timed_window and scheduled_end <= observed_at:
+        return "no_actual"
+    return "scheduled"
+
+
 def _qr_sites_in_interval(
     qr_by_employee_site: Dict[Tuple[int, int], List[datetime]],
     *,
@@ -1306,18 +1336,11 @@ def _decorate_schedule_jobs(
         in_progress = any(worker["status"] == "in_progress" for worker in workers)
         status = str(job.get("status") or "scheduled")
         included_in_plan = status != "cancelled" and _job_is_projection_eligible(job)
-        execution_status = (
-            "cancelled"
-            if status == "cancelled"
-            else (
-                "in_progress"
-                if in_progress
-                else (
-                    "completed"
-                    if status == "completed" or actual_hours > 0
-                    else "scheduled"
-                )
-            )
+        execution_status = _schedule_execution_status(
+            job,
+            in_progress=in_progress,
+            actual_hours=actual_hours,
+            observed_at=observed_at,
         )
         output.append(
             {
