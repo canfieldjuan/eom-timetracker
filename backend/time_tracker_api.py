@@ -43,6 +43,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from hours_report_pdf import build_hours_report_pdf
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -9246,6 +9247,34 @@ def admin_reports_hours_export(
         iter([buf.getvalue()]),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/api/admin/reports/hours/pdf")
+def admin_reports_hours_pdf(
+    request: Request,
+    period: str = "week",
+    date: Optional[str] = None,
+    employee_id: Optional[int] = None,
+    exceptions_only: bool = False,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Response:
+    data = _compute_hours_report(period, date, employee_id, exceptions_only)
+    pdf_bytes = build_hours_report_pdf(data, employee_id=employee_id)
+    filename_parts = ["eom_hours", period, data["startDate"]]
+    if employee_id:
+        filename_parts.append(f"employee-{employee_id}")
+    if exceptions_only:
+        filename_parts.append("gps-exceptions")
+    filename = "_".join(filename_parts) + ".pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
