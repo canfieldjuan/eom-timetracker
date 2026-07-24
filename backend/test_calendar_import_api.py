@@ -668,9 +668,10 @@ def test_production_route_set_excludes_only_retired_calendar_planner(client):
     import time_tracker_api as api
 
     registered = {
-        (method, route.path)
-        for route in api.app.routes
-        for method in getattr(route, "methods", set())
+        (method.upper(), path)
+        for path, path_item in api.app.openapi()["paths"].items()
+        for method in path_item
+        if method != "parameters"
     }
     retired = {
         ("POST", "/api/admin/google-calendar/preview"),
