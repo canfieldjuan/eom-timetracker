@@ -38,6 +38,7 @@ import psycopg2.extras
 import requests
 import qrcode
 import qrcode.image.svg
+import arrival_policies
 import db
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
@@ -2169,6 +2170,66 @@ class SiteCheckInScheduleRuleRequest(BaseModel):
         return value
 
 
+class ArrivalPolicyPutRequest(BaseModel):
+    mode: str = Field(pattern="^(fixed|window|flexible|not_before)$")
+    timezone: str = Field(min_length=1, max_length=100)
+    fixedArrival: Optional[clock_time] = None
+    graceMinutes: Optional[int] = Field(default=None, ge=0, le=120)
+    windowStart: Optional[clock_time] = None
+    windowEnd: Optional[clock_time] = None
+    notBefore: Optional[clock_time] = None
+    expectedUpdateToken: Optional[str] = Field(
+        default=None,
+        pattern="^[0-9a-f]{64}$",
+    )
+    changeNote: str = Field(min_length=3, max_length=500)
+
+    @field_validator("timezone", "changeNote", mode="before")
+    @classmethod
+    def strip_arrival_policy_text(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("fixedArrival", "windowStart", "windowEnd", "notBefore")
+    @classmethod
+    def policy_times_use_minute_precision(
+        cls,
+        value: Optional[clock_time],
+    ) -> Optional[clock_time]:
+        if value is None:
+            return None
+        if value.tzinfo is not None:
+            raise ValueError("arrival policy times must not include a timezone")
+        if value.second or value.microsecond:
+            raise ValueError("arrival policy times must use HH:MM precision")
+        return value
+
+    @model_validator(mode="after")
+    def validate_mode_fields(self) -> "ArrivalPolicyPutRequest":
+        try:
+            arrival_policies.validate_policy_values(
+                mode=self.mode,
+                timezone_name=self.timezone,
+                fixed_arrival=self.fixedArrival,
+                grace_minutes=self.graceMinutes,
+                window_start=self.windowStart,
+                window_end=self.windowEnd,
+                not_before=self.notBefore,
+            )
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+
+class ArrivalPolicyRetireRequest(BaseModel):
+    expectedUpdateToken: str = Field(pattern="^[0-9a-f]{64}$")
+    changeNote: str = Field(min_length=3, max_length=500)
+
+    @field_validator("changeNote", mode="before")
+    @classmethod
+    def strip_arrival_policy_retirement_note(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class SiteCheckInReviewRequest(BaseModel):
     decision: str = Field(pattern="^(approved|rejected)$")
     note: str = Field(min_length=3, max_length=500)
@@ -3669,6 +3730,7 @@ def _ensure_schema_migrations() -> None:
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+    arrival_policies.ensure_schema()
     db.execute("""
         ALTER TABLE site_check_ins
         ADD COLUMN IF NOT EXISTS job_id
@@ -3992,6 +4054,12 @@ def _serialize_site_check_in(row: Dict[str, Any]) -> Dict[str, Any]:
         "classificationReason": str(row["classification_reason"]),
         "scheduleId": int(row["schedule_id"]) if row.get("schedule_id") else None,
         "scheduleRuleId": int(row["schedule_rule_id"]) if row.get("schedule_rule_id") else None,
+        "arrivalPolicyRevisionId": (
+            int(row["arrival_policy_revision_id"])
+            if row.get("arrival_policy_revision_id")
+            else None
+        ),
+        "arrivalPolicySnapshot": row.get("arrival_policy_snapshot"),
         "scheduledStart": to_utc_iso(scheduled_start) if scheduled_start else None,
         "graceMinutes": int(row["grace_minutes"]) if row.get("grace_minutes") is not None else None,
         "deviceClockSkewSeconds": float(row["device_clock_skew_seconds"]),
@@ -4656,7 +4724,7 @@ def _matching_canonical_site_job(
     cur: Optional[Any] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     sql = """
-        SELECT j.id, j.status, j.scheduled_start, j.scheduled_end
+        SELECT j.id, j.location_id, j.status, j.scheduled_start, j.scheduled_end
         FROM jobs j
         JOIN google_calendar_sources source ON source.id = j.calendar_source_id
         JOIN locations site ON site.id = j.location_id
@@ -4807,9 +4875,40 @@ def _classify_site_check_in(
     job: Optional[Dict[str, Any]],
     job_match_reason: str,
     schedule: Optional[Dict[str, Any]],
+    policy: Optional[Dict[str, Any]],
+    site_id: int,
     checked_in_at: datetime,
     device_clock_skew_seconds: float,
-) -> Tuple[str, str, str]:
+) -> Tuple[
+    str,
+    str,
+    str,
+    Dict[str, Any],
+    Optional[datetime],
+    Optional[int],
+]:
+    if policy:
+        snapshot = arrival_policies.snapshot_revision(policy)
+        snapshot["authority"] = str(policy["scope_type"])
+        snapshot["classifiedBy"] = "arrival_policy"
+    elif schedule:
+        snapshot = {
+            "authority": "legacy_employee_schedule",
+            "classifiedBy": (
+                "legacy_exact"
+                if schedule.get("id") is not None
+                else "legacy_recurring"
+            ),
+            "scheduleId": schedule.get("id"),
+            "scheduleRuleId": schedule.get("schedule_rule_id"),
+            "scheduledStart": to_utc_iso(schedule["scheduled_start"]),
+            "graceMinutes": int(schedule["grace_minutes"]),
+        }
+    else:
+        snapshot = {
+            "authority": "implicit_flexible_during_migration",
+            "classifiedBy": "implicit_flexible",
+        }
     geofence_reason = {
         "site_unpinned": "site_missing_location_pin",
         "low_accuracy": "location_accuracy_too_low",
@@ -4817,13 +4916,21 @@ def _classify_site_check_in(
         "uncertain": "geofence_boundary_uncertain",
     }.get(str(geofence["status"]))
     if geofence_reason:
-        return "needs_review", geofence_reason, "pending"
+        return "needs_review", geofence_reason, "pending", snapshot, None, None
 
     if device_clock_skew_seconds > SITE_CHECK_IN_DEVICE_SKEW_SECONDS:
-        return "needs_review", "device_clock_skew", "pending"
+        return "needs_review", "device_clock_skew", "pending", snapshot, None, None
 
     if not job:
-        return "needs_review", job_match_reason, "pending"
+        return "needs_review", job_match_reason, "pending", snapshot, None, None
+
+    if policy:
+        return arrival_policies.evaluate_policy(
+            policy,
+            site_id=site_id,
+            job=job,
+            checked_in_at=checked_in_at,
+        )
 
     if schedule:
         scheduled_start = schedule["scheduled_start"]
@@ -4831,10 +4938,24 @@ def _classify_site_check_in(
             minutes=int(schedule["grace_minutes"])
         )
         if checked_in_at <= grace_deadline:
-            return "on_time", "within_grace_period", "not_required"
-        return "late", "after_grace_period", "not_required"
+            result = ("on_time", "within_grace_period", "not_required")
+        else:
+            result = ("late", "after_grace_period", "not_required")
+        return (
+            *result,
+            snapshot,
+            scheduled_start,
+            int(schedule["grace_minutes"]),
+        )
 
-    return "on_time", "verified_scheduled_site", "not_required"
+    return (
+        "on_time",
+        "verified_scheduled_site",
+        "not_required",
+        snapshot,
+        None,
+        None,
+    )
 
 
 @app.get("/", include_in_schema=False)
@@ -5235,22 +5356,38 @@ def record_site_check_in(
                 official_time,
                 cur=cur,
             )
-            schedule = _matching_site_check_in_schedule(
-                int(employee["id"]),
-                int(site["id"]),
-                official_time,
-                cur=cur,
+            policy = arrival_policies.resolve_policy(
+                cur,
+                site_id=int(site["id"]),
+                job_id=int(job["id"]) if job else None,
             )
+            schedule = None
+            if policy is None:
+                schedule = _matching_site_check_in_schedule(
+                    int(employee["id"]),
+                    int(site["id"]),
+                    official_time,
+                    cur=cur,
+                )
             device_clock_skew_seconds = abs(
                 (
                     official_time - payload.scannedAt.astimezone(timezone.utc)
                 ).total_seconds()
             )
-            classification, reason, review_status = _classify_site_check_in(
+            (
+                classification,
+                reason,
+                review_status,
+                policy_snapshot,
+                policy_scheduled_start,
+                policy_grace_minutes,
+            ) = _classify_site_check_in(
                 geofence,
                 job,
                 job_match_reason,
                 schedule,
+                policy,
+                int(site["id"]),
                 official_time,
                 device_clock_skew_seconds,
             )
@@ -5261,13 +5398,15 @@ def record_site_check_in(
                     device_scanned_at, latitude, longitude, accuracy_m,
                     geofence_radius_m, distance_m, geofence_status,
                     classification, classification_reason, schedule_id,
-                    schedule_rule_id, scheduled_start, grace_minutes, device_clock_skew_seconds,
+                    schedule_rule_id, arrival_policy_revision_id,
+                    arrival_policy_snapshot, scheduled_start, grace_minutes,
+                    device_clock_skew_seconds,
                     review_status
                 )
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s,
                     %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (employee_id, location_id, device_scanned_at)
                 DO NOTHING
@@ -5289,8 +5428,18 @@ def record_site_check_in(
                     reason,
                     schedule.get("id") if schedule else None,
                     schedule.get("schedule_rule_id") if schedule else None,
-                    schedule["scheduled_start"] if schedule else None,
-                    schedule["grace_minutes"] if schedule else None,
+                    int(policy["id"]) if policy else None,
+                    psycopg2.extras.Json(policy_snapshot),
+                    (
+                        policy_scheduled_start
+                        if policy
+                        else (schedule["scheduled_start"] if schedule else None)
+                    ),
+                    (
+                        policy_grace_minutes
+                        if policy
+                        else (schedule["grace_minutes"] if schedule else None)
+                    ),
                     device_clock_skew_seconds,
                     review_status,
                 ),
@@ -5328,6 +5477,486 @@ def record_site_check_in(
         "duplicate": duplicate,
         "checkIn": _serialize_site_check_in(row),
     }
+
+
+def _arrival_policy_scope_target(
+    cur: Any,
+    *,
+    scope_type: str,
+    target_id: int,
+    for_update: bool,
+    require_canonical_appointment: bool = False,
+) -> Tuple[int, Optional[int]]:
+    lock_clause = " FOR SHARE" if for_update else ""
+    if scope_type == "site":
+        cur.execute(
+            """
+            SELECT id
+            FROM locations
+            WHERE id = %s AND active = true
+            """ + lock_clause,
+            (target_id,),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Active Site not found")
+        return target_id, None
+
+    appointment_lock_clause = " FOR SHARE OF j" if for_update else ""
+    cur.execute(
+        """
+        SELECT j.id, j.location_id,
+               (
+                   j.status != 'cancelled'
+                   AND site.active = true
+                   AND j.source_all_day = false
+                   AND j.scheduled_start IS NOT NULL
+                   AND j.scheduled_end IS NOT NULL
+                   AND j.scheduled_end > j.scheduled_start
+                   AND (
+                       (
+                           source.role = 'residential_morning'
+                           AND site.location_type = 'Residential'
+                       )
+                       OR (
+                           source.role = 'commercial_evening_night'
+                           AND site.location_type = 'Commercial'
+                       )
+                   )
+               ) AS is_canonical_appointment
+        FROM jobs j
+        LEFT JOIN google_calendar_sources source
+               ON source.id = j.calendar_source_id
+        LEFT JOIN locations site ON site.id = j.location_id
+        WHERE j.id = %s
+        """ + appointment_lock_clause,
+        (target_id,),
+    )
+    job = cur.fetchone()
+    if not job:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    if job.get("location_id") is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "arrival_policy_job_missing_site",
+                "message": "The appointment must resolve to one Site before it can own an arrival policy",
+                "details": {"jobId": target_id},
+            },
+        )
+    if require_canonical_appointment and not bool(
+        job.get("is_canonical_appointment")
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "arrival_policy_job_not_canonical",
+                "message": (
+                    "Only an active canonical Calendar appointment can own "
+                    "a new arrival policy revision"
+                ),
+                "details": {"jobId": target_id},
+            },
+        )
+    return int(job["location_id"]), target_id
+
+
+def _arrival_policy_history(
+    *,
+    scope_type: str,
+    site_id: int,
+    job_id: Optional[int],
+    cur: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    if scope_type == "site":
+        sql = """
+            SELECT *
+            FROM arrival_policy_revisions
+            WHERE scope_type = 'site' AND site_id = %s
+            ORDER BY version DESC, id DESC
+            """
+        params: Tuple[Any, ...] = (site_id,)
+    else:
+        sql = """
+            SELECT *
+            FROM arrival_policy_revisions
+            WHERE scope_type = 'appointment' AND job_id = %s
+            ORDER BY version DESC, id DESC
+            """
+        params = (job_id,)
+    if cur is None:
+        rows = db.query_all(sql, params)
+    else:
+        cur.execute(sql, params)
+        rows = [dict(row) for row in cur.fetchall()]
+    return [arrival_policies.serialize_revision(row) for row in rows]
+
+
+def _arrival_policy_scope_response(
+    *,
+    scope_type: str,
+    site_id: int,
+    job_id: Optional[int],
+    cur: Optional[Any] = None,
+    current_revision_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    history = _arrival_policy_history(
+        scope_type=scope_type,
+        site_id=site_id,
+        job_id=job_id,
+        cur=cur,
+    )
+    if current_revision_id is None:
+        current = history[0] if history else None
+    else:
+        current = next(
+            (row for row in history if row["id"] == current_revision_id),
+            None,
+        )
+        if current is None:
+            raise RuntimeError(
+                f"Arrival policy revision {current_revision_id} was not readable "
+                "inside its mutation transaction"
+            )
+    return {
+        "success": True,
+        "scopeType": scope_type,
+        "siteId": site_id,
+        "jobId": job_id,
+        "policy": current if current and current["state"] == "active" else None,
+        "currentRevision": current,
+        "history": history,
+    }
+
+
+def _arrival_policy_conflict(
+    *,
+    scope_type: str,
+    site_id: int,
+    job_id: Optional[int],
+) -> None:
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "stale_arrival_policy_update",
+            "message": "Arrival policy changed after it was read; reload before retrying",
+            "details": {
+                "scopeType": scope_type,
+                "siteId": site_id,
+                "jobId": job_id,
+            },
+        },
+    )
+
+
+def _write_arrival_policy(
+    *,
+    scope_type: str,
+    target_id: int,
+    payload: ArrivalPolicyPutRequest,
+    admin: Dict[str, Any],
+) -> Tuple[int, int, Optional[int], Dict[str, Any]]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            site_id, job_id = _arrival_policy_scope_target(
+                cur,
+                scope_type=scope_type,
+                target_id=target_id,
+                for_update=True,
+                require_canonical_appointment=scope_type == "appointment",
+            )
+            lock_identity = (
+                f"arrival-policy:{scope_type}:{job_id if job_id is not None else site_id}"
+            )
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_identity,))
+            current = arrival_policies.latest_revision(
+                cur,
+                scope_type=scope_type,
+                site_id=site_id,
+                job_id=job_id,
+                for_update=True,
+            )
+            expected = payload.expectedUpdateToken
+            if current is None:
+                if expected is not None:
+                    _arrival_policy_conflict(
+                        scope_type=scope_type,
+                        site_id=site_id,
+                        job_id=job_id,
+                    )
+                version = 1
+            else:
+                if expected is None or not arrival_policies.tokens_match(
+                    expected,
+                    str(current["update_token"]),
+                ):
+                    _arrival_policy_conflict(
+                        scope_type=scope_type,
+                        site_id=site_id,
+                        job_id=job_id,
+                    )
+                version = int(current["version"]) + 1
+
+            created_at = utc_now()
+            update_token = arrival_policies.policy_update_token(
+                scope_type,
+                site_id,
+                job_id,
+                version,
+                created_at,
+            )
+            cur.execute(
+                """
+                INSERT INTO arrival_policy_revisions (
+                    scope_type, site_id, job_id, version, state, mode,
+                    timezone, fixed_arrival, grace_minutes, window_start,
+                    window_end, not_before, update_token, change_note,
+                    created_by, created_by_name, created_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, 'active', %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s
+                )
+                RETURNING id
+                """,
+                (
+                    scope_type,
+                    site_id,
+                    job_id,
+                    version,
+                    payload.mode,
+                    payload.timezone,
+                    payload.fixedArrival,
+                    payload.graceMinutes,
+                    payload.windowStart,
+                    payload.windowEnd,
+                    payload.notBefore,
+                    update_token,
+                    payload.changeNote,
+                    int(admin["id"]),
+                    str(admin["name"]),
+                    created_at,
+                ),
+            )
+            revision_id = int(cur.fetchone()["id"])
+            response = _arrival_policy_scope_response(
+                scope_type=scope_type,
+                site_id=site_id,
+                job_id=job_id,
+                cur=cur,
+                current_revision_id=revision_id,
+            )
+    return revision_id, site_id, job_id, response
+
+
+def _retire_arrival_policy(
+    *,
+    scope_type: str,
+    target_id: int,
+    payload: ArrivalPolicyRetireRequest,
+    admin: Dict[str, Any],
+) -> Tuple[int, int, Optional[int], Dict[str, Any]]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            site_id, job_id = _arrival_policy_scope_target(
+                cur,
+                scope_type=scope_type,
+                target_id=target_id,
+                for_update=True,
+            )
+            lock_identity = (
+                f"arrival-policy:{scope_type}:{job_id if job_id is not None else site_id}"
+            )
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_identity,))
+            current = arrival_policies.latest_revision(
+                cur,
+                scope_type=scope_type,
+                site_id=site_id,
+                job_id=job_id,
+                for_update=True,
+            )
+            if (
+                current is None
+                or current["state"] != "active"
+                or not arrival_policies.tokens_match(
+                    payload.expectedUpdateToken,
+                    str(current["update_token"]),
+                )
+            ):
+                _arrival_policy_conflict(
+                    scope_type=scope_type,
+                    site_id=site_id,
+                    job_id=job_id,
+                )
+            version = int(current["version"]) + 1
+            created_at = utc_now()
+            update_token = arrival_policies.policy_update_token(
+                scope_type,
+                site_id,
+                job_id,
+                version,
+                created_at,
+            )
+            cur.execute(
+                """
+                INSERT INTO arrival_policy_revisions (
+                    scope_type, site_id, job_id, version, state,
+                    update_token, change_note, created_by, created_by_name,
+                    created_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, 'retired',
+                    %s, %s, %s, %s, %s
+                )
+                RETURNING id
+                """,
+                (
+                    scope_type,
+                    site_id,
+                    job_id,
+                    version,
+                    update_token,
+                    payload.changeNote,
+                    int(admin["id"]),
+                    str(admin["name"]),
+                    created_at,
+                ),
+            )
+            revision_id = int(cur.fetchone()["id"])
+            response = _arrival_policy_scope_response(
+                scope_type=scope_type,
+                site_id=site_id,
+                job_id=job_id,
+                cur=cur,
+                current_revision_id=revision_id,
+            )
+    return revision_id, site_id, job_id, response
+
+
+@app.get("/api/admin/locations/{site_id}/arrival-policy")
+def admin_get_site_arrival_policy(
+    site_id: int,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    site = db.query_one("SELECT id FROM locations WHERE id = %s", (site_id,))
+    if not site:
+        raise HTTPException(status_code=404, detail="Site not found")
+    return _arrival_policy_scope_response(
+        scope_type="site",
+        site_id=site_id,
+        job_id=None,
+    )
+
+
+@app.put("/api/admin/locations/{site_id}/arrival-policy")
+def admin_put_site_arrival_policy(
+    site_id: int,
+    payload: ArrivalPolicyPutRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    revision_id, resolved_site_id, _, response = _write_arrival_policy(
+        scope_type="site",
+        target_id=site_id,
+        payload=payload,
+        admin=admin,
+    )
+    append_access_log(
+        request,
+        "ARRIVAL_POLICY_SAVED",
+        True,
+        f"Site {resolved_site_id} revision {revision_id} by {admin['name']}",
+    )
+    return response
+
+
+@app.post("/api/admin/locations/{site_id}/arrival-policy/retire")
+def admin_retire_site_arrival_policy(
+    site_id: int,
+    payload: ArrivalPolicyRetireRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    revision_id, resolved_site_id, _, response = _retire_arrival_policy(
+        scope_type="site",
+        target_id=site_id,
+        payload=payload,
+        admin=admin,
+    )
+    append_access_log(
+        request,
+        "ARRIVAL_POLICY_RETIRED",
+        True,
+        f"Site {resolved_site_id} revision {revision_id} by {admin['name']}",
+    )
+    return response
+
+
+@app.get("/api/admin/jobs/{job_id}/arrival-policy")
+def admin_get_appointment_arrival_policy(
+    job_id: int,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            site_id, resolved_job_id = _arrival_policy_scope_target(
+                cur,
+                scope_type="appointment",
+                target_id=job_id,
+                for_update=False,
+            )
+    return _arrival_policy_scope_response(
+        scope_type="appointment",
+        site_id=site_id,
+        job_id=resolved_job_id,
+    )
+
+
+@app.put("/api/admin/jobs/{job_id}/arrival-policy")
+def admin_put_appointment_arrival_policy(
+    job_id: int,
+    payload: ArrivalPolicyPutRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    revision_id, site_id, resolved_job_id, response = _write_arrival_policy(
+        scope_type="appointment",
+        target_id=job_id,
+        payload=payload,
+        admin=admin,
+    )
+    append_access_log(
+        request,
+        "ARRIVAL_POLICY_SAVED",
+        True,
+        f"Appointment {job_id} revision {revision_id} by {admin['name']}",
+    )
+    return response
+
+
+@app.post("/api/admin/jobs/{job_id}/arrival-policy/retire")
+def admin_retire_appointment_arrival_policy(
+    job_id: int,
+    payload: ArrivalPolicyRetireRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    revision_id, site_id, resolved_job_id, response = _retire_arrival_policy(
+        scope_type="appointment",
+        target_id=job_id,
+        payload=payload,
+        admin=admin,
+    )
+    append_access_log(
+        request,
+        "ARRIVAL_POLICY_RETIRED",
+        True,
+        f"Appointment {job_id} revision {revision_id} by {admin['name']}",
+    )
+    return response
 
 
 def admin_create_site_check_in_schedule(

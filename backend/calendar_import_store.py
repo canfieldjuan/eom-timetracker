@@ -1,8 +1,10 @@
 """Durable storage and secret handling for read-only Calendar imports.
 
 Calendar synchronization writes canonical jobs and reads existing work evidence
-only to prevent unsafe moves or cancellations. It never mutates shifts, payroll,
-QR evidence, billing, or Customer/Site records.
+only to prevent unsafe moves or cancellations. When a canonical appointment
+moves Sites, it also appends an arrival-policy revision so the immutable policy
+history and current job stay aligned. It never mutates shifts, payroll, QR
+evidence, billing, Customer/Site records, or an existing policy revision.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from zoneinfo import ZoneInfo
 import psycopg2.extras
 from cryptography.fernet import Fernet, InvalidToken
 
+import arrival_policies
 import db
 
 
@@ -3159,6 +3162,7 @@ def sync_calendar_source(
                         )
                         continue
                 if existing is None:
+                    rebound_policy_revision_id = None
                     cur.execute(
                         """
                         INSERT INTO jobs (
@@ -3223,8 +3227,27 @@ def sync_calendar_source(
                         """,
                         (*source_values, job_id),
                     )
+                    rebound_policy_revision_id = None
+                    if int(existing["location_id"]) != location_id:
+                        rebound_policy_revision_id = (
+                            arrival_policies.rebind_active_appointment_policy(
+                                cur,
+                                job_id=job_id,
+                                new_site_id=location_id,
+                                actor_id=actor_id,
+                                actor_name=actor_name,
+                            )
+                        )
                     counts["update"] += 1
                     audit_action = "canonical_job_updated"
+                audit_after_state = {
+                    "jobId": job_id,
+                    "sourceId": int(source["id"]),
+                }
+                if rebound_policy_revision_id is not None:
+                    audit_after_state["arrivalPolicyRevisionId"] = (
+                        rebound_policy_revision_id
+                    )
                 cur.execute(
                     """
                     INSERT INTO planned_visit_audit_events (
@@ -3237,7 +3260,7 @@ def sync_calendar_source(
                         occurrence.source_key,
                         actor_id,
                         actor_name,
-                        json.dumps({"jobId": job_id, "sourceId": int(source["id"])}),
+                        json.dumps(audit_after_state),
                     ),
                 )
 
