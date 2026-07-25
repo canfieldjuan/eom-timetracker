@@ -2031,6 +2031,12 @@ class SiteUpdateRequest(BaseModel):
         max_length=64,
         pattern="^[0-9a-f]{64}$",
     )
+    expectedCustomerUpdateToken: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern="^[0-9a-f]{64}$",
+    )
     customerId: Optional[int] = Field(default=None, gt=0)
     customerName: Optional[str] = Field(default=None, min_length=1, max_length=CUSTOMER_NAME_MAX_LENGTH)
     address: Optional[str] = Field(default=None, min_length=1, max_length=SITE_ADDRESS_MAX_LENGTH)
@@ -7932,6 +7938,33 @@ def admin_patch_location(
                 existing,
                 payload.expectedUpdateToken,
             )
+            if payload.expectedCustomerUpdateToken is not None:
+                owning_customer_id = existing.get("customer_id")
+                if owning_customer_id is None:
+                    _raise_conflict(
+                        "site_customer_unlinked",
+                        "Site is not linked to a Customer; reload before retrying",
+                        {"siteId": site_id, "customerId": None},
+                    )
+                owning_customer = _customer_row(
+                    cur,
+                    int(owning_customer_id),
+                    for_update=True,
+                )
+                if not owning_customer:
+                    _raise_conflict(
+                        "site_customer_missing",
+                        "Site's Customer no longer exists; reload before retrying",
+                        {
+                            "siteId": site_id,
+                            "customerId": int(owning_customer_id),
+                        },
+                    )
+                _require_current_update_token(
+                    "customer",
+                    owning_customer,
+                    payload.expectedCustomerUpdateToken,
+                )
 
             assignments: List[str] = []
             params: List[Any] = []
