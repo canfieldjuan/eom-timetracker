@@ -564,6 +564,203 @@ def test_site_patch_rejects_a_stale_update_token_without_writing(client, auth):
     assert persisted["frequency"] == "Monthly"
 
 
+def test_site_patch_rejects_stale_owning_customer_token_before_writing(client, auth):
+    customer = _create_customer(
+        client,
+        auth,
+        "Owning Customer Token Drift",
+        atlasContactId="11111111-1111-1111-1111-111111111111",
+    )
+    site = _create_site(
+        client,
+        auth,
+        customer["id"],
+        "125 Customer Token Drift Way",
+        rate=97.0,
+        rateType="monthly",
+    )
+    original_site_row = _location_row(site["id"])
+
+    customer_update = client.patch(
+        f"/api/admin/customers/{customer['id']}",
+        headers=auth,
+        json={
+            "expectedUpdateToken": customer["updateToken"],
+            "atlasContactId": "22222222-2222-2222-2222-222222222222",
+        },
+    )
+    assert customer_update.status_code == 200, customer_update.text
+    assert customer_update.json()["customer"]["updateToken"] != customer["updateToken"]
+    unchanged_site = client.get(
+        f"/api/admin/customers/{customer['id']}",
+        headers=auth,
+    ).json()["customer"]["sites"][0]
+    assert unchanged_site["updateToken"] == site["updateToken"]
+
+    stale = client.patch(
+        f"/api/admin/locations/{site['id']}",
+        headers=auth,
+        json={
+            "expectedUpdateToken": site["updateToken"],
+            "expectedCustomerUpdateToken": customer["updateToken"],
+            "rate": 247.5,
+        },
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json() == {
+        "success": False,
+        "error": "Customer changed after it was read; reload before retrying",
+        "code": "stale_customer_update",
+        "details": {"customerId": customer["id"]},
+    }
+    persisted = _location_row(site["id"])
+    assert persisted["rate"] == original_site_row["rate"]
+    assert persisted["updated_at"] == original_site_row["updated_at"]
+
+
+def test_site_patch_accepts_current_site_and_owning_customer_tokens(client, auth):
+    customer = _create_customer(
+        client,
+        auth,
+        "Current Owning Customer Token",
+        atlasContactId="33333333-3333-3333-3333-333333333333",
+    )
+    site = _create_site(
+        client,
+        auth,
+        customer["id"],
+        "126 Current Customer Token Way",
+        rate=97.0,
+        rateType="monthly",
+    )
+
+    response = client.patch(
+        f"/api/admin/locations/{site['id']}",
+        headers=auth,
+        json={
+            "expectedUpdateToken": site["updateToken"],
+            "expectedCustomerUpdateToken": customer["updateToken"],
+            "rate": 247.5,
+            "rateType": "per_visit",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["location"]["rate"] == pytest.approx(247.5)
+    assert response.json()["location"]["rateType"] == "per_visit"
+
+
+def test_site_customer_guard_fails_closed_when_owning_customer_is_missing(
+    client,
+    auth,
+    monkeypatch,
+):
+    import time_tracker_api as api
+
+    customer = _create_customer(client, auth, "Missing Owning Customer")
+    site = _create_site(
+        client,
+        auth,
+        customer["id"],
+        "127 Missing Customer Way",
+        rate=97.0,
+    )
+    before = _location_row(site["id"])
+    monkeypatch.setattr(api, "_customer_row", lambda *_args, **_kwargs: None)
+
+    response = client.patch(
+        f"/api/admin/locations/{site['id']}",
+        headers=auth,
+        json={
+            "expectedCustomerUpdateToken": customer["updateToken"],
+            "rate": 247.5,
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "success": False,
+        "error": "Site's Customer no longer exists; reload before retrying",
+        "code": "site_customer_missing",
+        "details": {"siteId": site["id"], "customerId": customer["id"]},
+    }
+    persisted = _location_row(site["id"])
+    assert persisted["rate"] == before["rate"]
+    assert persisted["updated_at"] == before["updated_at"]
+
+
+def test_site_customer_guard_fails_closed_for_an_unlinked_site(client, auth):
+    customer = _create_customer(client, auth, "Unlinked Customer Guard")
+    site = _create_site(
+        client,
+        auth,
+        customer["id"],
+        "128 Unlinked Customer Guard Way",
+        rate=97.0,
+    )
+    conn = _raw_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE locations SET customer_id = NULL WHERE id = %s",
+                (site["id"],),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    before = _location_row(site["id"])
+
+    response = client.patch(
+        f"/api/admin/locations/{site['id']}",
+        headers=auth,
+        json={
+            "expectedCustomerUpdateToken": customer["updateToken"],
+            "rate": 247.5,
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "success": False,
+        "error": "Site is not linked to a Customer; reload before retrying",
+        "code": "site_customer_unlinked",
+        "details": {"siteId": site["id"], "customerId": None},
+    }
+    persisted = _location_row(site["id"])
+    assert persisted["rate"] == before["rate"]
+    assert persisted["updated_at"] == before["updated_at"]
+
+
+def test_site_patch_without_customer_token_preserves_unlinked_site_compatibility(
+    client,
+    auth,
+):
+    customer = _create_customer(client, auth, "Tokenless Unlinked Compatibility")
+    site = _create_site(
+        client,
+        auth,
+        customer["id"],
+        "129 Tokenless Unlinked Compatibility Way",
+        rate=97.0,
+    )
+    conn = _raw_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE locations SET customer_id = NULL WHERE id = %s",
+                (site["id"],),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = client.patch(
+        f"/api/admin/locations/{site['id']}",
+        headers=auth,
+        json={"rate": 247.5},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["location"]["customerId"] is None
+    assert response.json()["location"]["rate"] == pytest.approx(247.5)
+
+
 def test_patch_treats_an_explicitly_null_update_token_as_unguarded(client, auth):
     customer = _create_customer(client, auth, "Null Update Token")
     site = _create_site(client, auth, customer["id"], "126 Null Update Token Way")
