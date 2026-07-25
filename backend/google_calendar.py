@@ -1015,8 +1015,25 @@ def _parse_batch_json_response(
         raise GoogleCalendarResponseError(
             "Google Calendar returned an incomplete batch response"
         )
-    contents: List[_BatchJSONPart] = []
+    contents: List[Optional[_BatchJSONPart]] = [None] * expected_parts
     for part in parts:
+        raw_content_id = part.get("Content-ID")
+        if not isinstance(raw_content_id, str):
+            raise GoogleCalendarResponseError(
+                "Google Calendar returned an invalid batch response"
+            )
+        matched_content_id = re.fullmatch(
+            r"<(?:response-)?calendar-(\d+)>", raw_content_id.strip()
+        )
+        if not matched_content_id:
+            raise GoogleCalendarResponseError(
+                "Google Calendar returned an invalid batch response"
+            )
+        response_index = int(matched_content_id.group(1))
+        if response_index >= expected_parts or contents[response_index] is not None:
+            raise GoogleCalendarResponseError(
+                "Google Calendar returned an invalid batch response"
+            )
         payload = part.get_payload(decode=True)
         if not isinstance(payload, bytes):
             raise GoogleCalendarResponseError(
@@ -1044,8 +1061,14 @@ def _parse_batch_json_response(
             raise GoogleCalendarResponseError(
                 "Google Calendar returned an invalid batch response"
             )
-        contents.append(_BatchJSONPart(status_code=status_code, content=content))
-    return contents
+        contents[response_index] = _BatchJSONPart(
+            status_code=status_code, content=content
+        )
+    if any(part is None for part in contents):
+        raise GoogleCalendarResponseError(
+            "Google Calendar returned an incomplete batch response"
+        )
+    return [part for part in contents if part is not None]
 
 
 def _normalize_token_response(content: Mapping[str, Any]) -> OAuthTokenSet:

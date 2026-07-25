@@ -63,16 +63,19 @@ class RequestRecorder:
         return self.responses.pop(0)
 
 
-def batch_response(payloads, *, statuses=None):
+def batch_response(payloads, *, statuses=None, content_ids=None):
     boundary = "batch_response_boundary"
     statuses = statuses or [200] * len(payloads)
+    content_ids = content_ids or list(range(len(payloads)))
     parts = []
-    for index, (payload, status) in enumerate(zip(payloads, statuses, strict=True)):
+    for payload, status, content_id in zip(
+        payloads, statuses, content_ids, strict=True
+    ):
         parts.append(
             (
                 f"--{boundary}\r\n"
                 "Content-Type: application/http\r\n"
-                f"Content-ID: <response-calendar-{index}>\r\n\r\n"
+                f"Content-ID: <response-calendar-{content_id}>\r\n\r\n"
                 f"HTTP/1.1 {status} Status\r\n"
                 "Content-Type: application/json\r\n\r\n"
                 f"{json.dumps(payload)}\r\n"
@@ -786,13 +789,13 @@ def test_targeted_batch_continuations_remain_batched_and_keep_output_order():
         [
             batch_response(
                 [
-                    {"items": [], "nextPageToken": "first-next"},
                     {"items": [], "nextPageToken": "second-next"},
-                ]
+                    {"items": [], "nextPageToken": "first-next"},
+                ],
+                content_ids=[1, 0],
             ),
             batch_response(
                 [
-                    {"items": []},
                     {
                         "items": [
                             {
@@ -811,7 +814,9 @@ def test_targeted_batch_continuations_remain_batched_and_keep_output_order():
                             }
                         ]
                     },
-                ]
+                    {"items": []},
+                ],
+                content_ids=[1, 0],
             ),
         ]
     )
