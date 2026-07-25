@@ -509,30 +509,30 @@ class GoogleCalendarClient:
             original_start, "Google original start"
         )
         zone = _load_zone(time_zone)
-        content = self._request_json(
-            "GET",
-            (
-                f"{GOOGLE_CALENDAR_API_BASE_URL}/calendars/"
-                f"{quote(normalized_calendar_id, safe='')}/events/"
-                f"{quote(normalized_series_id, safe='')}/instances"
+        items: List[Mapping[str, Any]] = []
+        for content in self._paged_get(
+            _recurring_occurrence_url(
+                calendar_id=normalized_calendar_id,
+                recurring_event_id=normalized_series_id,
             ),
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {normalized_token}",
-            },
-            params={
-                "maxResults": 2,
-                "originalStart": normalized_original_start,
-                "showDeleted": "true",
-                "timeZone": zone.key,
-            },
+            access_token=normalized_token,
+            params=_recurring_occurrence_params(
+                original_start=normalized_original_start,
+                time_zone=zone.key,
+            ),
+        ):
+            items.extend(_response_items(content))
+        raw = _select_recurring_occurrence(
+            items,
+            recurring_event_id=normalized_series_id,
+            original_start=normalized_original_start,
+            zone=zone,
         )
-        items = _response_items(content)
-        if len(items) != 1 or content.get("nextPageToken"):
+        if raw is None:
             raise GoogleCalendarResponseError(
                 "Google Calendar could not reconcile a planned recurring occurrence"
             )
-        return _normalize_occurrence(normalized_calendar_id, items[0], zone)
+        return _normalize_occurrence(normalized_calendar_id, raw, zone)
 
     def get_occurrences_batch(
         self,
@@ -542,7 +542,7 @@ class GoogleCalendarClient:
         requests_: Iterable[TargetedOccurrenceRequest],
         time_zone: str,
     ) -> List[Optional[CalendarOccurrence]]:
-        """Read known identities in at most three bounded Calendar batch calls."""
+        """Read known identities with bounded, batched Calendar pagination."""
 
         normalized_token = _required_text(access_token, "Google access token")
         normalized_calendar_id = _required_text(calendar_id, "Calendar ID")
@@ -567,10 +567,17 @@ class GoogleCalendarClient:
                 access_token=normalized_token,
                 paths=paths,
             )
-            for request, part in zip(chunk, parts, strict=True):
+            raw_results: List[Optional[Mapping[str, Any]]] = [None] * len(chunk)
+            recurring_items: Dict[int, List[Mapping[str, Any]]] = {}
+            recurring_deleted: set[int] = set()
+            recurring_seen_tokens: Dict[int, set[str]] = {}
+            pending_tokens: Dict[int, str] = {}
+            for index, (request, part) in enumerate(
+                zip(chunk, parts, strict=True)
+            ):
                 reason = _google_error_reason_from_content(part.content)
                 if part.status_code == 410 and reason == "deleted":
-                    occurrences.append(None)
+                    recurring_deleted.add(index)
                     continue
                 if part.status_code >= 400:
                     _raise_google_status(
@@ -584,19 +591,80 @@ class GoogleCalendarClient:
                     )
                 content = part.content
                 if request.recurring_event_id is not None:
-                    items = _response_items(content)
-                    if content.get("nextPageToken") or len(items) > 1:
-                        raise GoogleCalendarResponseError(
-                            "Google Calendar could not reconcile a planned recurring occurrence"
-                        )
-                    if not items:
-                        occurrences.append(None)
-                        continue
-                    raw = items[0]
+                    recurring_items[index] = list(_response_items(content))
+                    next_page_token = _next_page_token(content)
+                    if next_page_token is not None:
+                        recurring_seen_tokens[index] = {next_page_token}
+                        pending_tokens[index] = next_page_token
                 else:
-                    raw = content
+                    raw_results[index] = content
+
+            for _ in range(1, MAX_GOOGLE_PAGES):
+                if not pending_tokens:
+                    break
+                pending_indices = list(pending_tokens)
+                continuation_paths = [
+                    _targeted_occurrence_path(
+                        calendar_id=normalized_calendar_id,
+                        request=chunk[index],
+                        time_zone=zone.key,
+                        page_token=pending_tokens[index],
+                    )
+                    for index in pending_indices
+                ]
+                continuation_parts = self._request_batch_json(
+                    access_token=normalized_token,
+                    paths=continuation_paths,
+                )
+                next_pending_tokens: Dict[int, str] = {}
+                for index, part in zip(
+                    pending_indices, continuation_parts, strict=True
+                ):
+                    reason = _google_error_reason_from_content(part.content)
+                    if part.status_code >= 400:
+                        _raise_google_status(
+                            part.status_code,
+                            reason=reason,
+                            oauth_request=False,
+                        )
+                    if part.status_code < 200 or part.status_code >= 300:
+                        raise GoogleCalendarResponseError(
+                            "Google Calendar returned an invalid batch response"
+                        )
+                    content = part.content
+                    recurring_items[index].extend(_response_items(content))
+                    next_page_token = _next_page_token(content)
+                    if next_page_token is None:
+                        continue
+                    seen_tokens = recurring_seen_tokens[index]
+                    if next_page_token in seen_tokens:
+                        raise GoogleCalendarResponseError(
+                            "Google Calendar returned invalid pagination"
+                        )
+                    seen_tokens.add(next_page_token)
+                    next_pending_tokens[index] = next_page_token
+                pending_tokens = next_pending_tokens
+            if pending_tokens:
+                raise GoogleCalendarResponseError(
+                    "Google Calendar returned too many pages"
+                )
+
+            for index, request in enumerate(chunk):
+                if index in recurring_deleted:
+                    occurrences.append(None)
+                    continue
+                raw = raw_results[index]
+                if request.recurring_event_id is not None:
+                    raw = _select_recurring_occurrence(
+                        recurring_items[index],
+                        recurring_event_id=request.recurring_event_id,
+                        original_start=request.original_start,
+                        zone=zone,
+                    )
                 occurrences.append(
                     _normalize_occurrence(normalized_calendar_id, raw, zone)
+                    if raw is not None
+                    else None
                 )
         return occurrences
 
@@ -781,6 +849,7 @@ def _targeted_occurrence_path(
     calendar_id: str,
     request: TargetedOccurrenceRequest,
     time_zone: str,
+    page_token: Optional[str] = None,
 ) -> str:
     event_id = _required_text(request.event_id, "Google event ID")
     recurring_event_id = _optional_text(request.recurring_event_id)
@@ -791,22 +860,112 @@ def _targeted_occurrence_path(
         )
     calendar_path = quote(calendar_id, safe="")
     if recurring_event_id and original_start:
-        query = urlencode(
-            {
-                "maxResults": 2,
-                "originalStart": original_start,
-                "showDeleted": "true",
-                "timeZone": time_zone,
-            }
+        params = _recurring_occurrence_params(
+            original_start=original_start,
+            time_zone=time_zone,
         )
+        if page_token is not None:
+            params["pageToken"] = _required_text(
+                page_token, "Google Calendar page token"
+            )
+        query = urlencode(params)
         return (
             f"/calendar/v3/calendars/{calendar_path}/events/"
             f"{quote(recurring_event_id, safe='')}/instances?{query}"
+        )
+    if page_token is not None:
+        raise GoogleCalendarConfigurationError(
+            "Calendar page token requires a recurring occurrence"
         )
     return (
         f"/calendar/v3/calendars/{calendar_path}/events/"
         f"{quote(event_id, safe='')}?{urlencode({'timeZone': time_zone})}"
     )
+
+
+def _recurring_occurrence_url(
+    *, calendar_id: str, recurring_event_id: str
+) -> str:
+    return (
+        f"{GOOGLE_CALENDAR_API_BASE_URL}/calendars/"
+        f"{quote(calendar_id, safe='')}/events/"
+        f"{quote(recurring_event_id, safe='')}/instances"
+    )
+
+
+def _recurring_occurrence_params(
+    *, original_start: str, time_zone: str
+) -> Dict[str, Any]:
+    return {
+        "maxResults": 2,
+        "originalStart": original_start,
+        "showDeleted": "true",
+        "timeZone": time_zone,
+    }
+
+
+def _next_page_token(content: Mapping[str, Any]) -> Optional[str]:
+    raw_token = content.get("nextPageToken")
+    if raw_token is None:
+        return None
+    if not isinstance(raw_token, str) or not raw_token.strip():
+        raise GoogleCalendarResponseError(
+            "Google Calendar returned invalid pagination"
+        )
+    return raw_token.strip()
+
+
+def _select_recurring_occurrence(
+    items: Iterable[Mapping[str, Any]],
+    *,
+    recurring_event_id: str,
+    original_start: Optional[str],
+    zone: ZoneInfo,
+) -> Optional[Mapping[str, Any]]:
+    normalized_series_id = _required_text(
+        recurring_event_id, "Google recurring event ID"
+    )
+    normalized_original_start = _normalized_recurring_start(
+        _required_text(original_start, "Google original start")
+    )
+    collected = list(items)
+    if not collected:
+        return None
+    if len(collected) != 1:
+        raise GoogleCalendarResponseError(
+            "Google Calendar could not reconcile a planned recurring occurrence"
+        )
+    item = collected[0]
+    item_series_id = _required_upstream_text(
+        item.get("recurringEventId"), "recurring event id"
+    )
+    item_original_start = _original_start_query(
+        item.get("originalStartTime"), zone
+    )
+    if (
+        item_original_start is None
+        or item_series_id != normalized_series_id
+        or _normalized_recurring_start(item_original_start)
+        != normalized_original_start
+    ):
+        raise GoogleCalendarResponseError(
+            "Google Calendar could not reconcile a planned recurring occurrence"
+        )
+    return item
+
+
+def _normalized_recurring_start(value: str) -> str:
+    try:
+        parsed = isoparse(value)
+    except (TypeError, ValueError, OverflowError):
+        raise GoogleCalendarResponseError(
+            "Google Calendar returned invalid recurrence identity"
+        ) from None
+    if parsed.tzinfo is None:
+        raise GoogleCalendarResponseError(
+            "Google Calendar returned invalid recurrence identity"
+        )
+    return _rfc3339_utc(parsed.astimezone(timezone.utc))
 
 
 def _raise_google_status(

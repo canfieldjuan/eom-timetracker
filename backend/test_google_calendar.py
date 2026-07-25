@@ -558,6 +558,135 @@ def test_get_recurring_occurrence_reads_by_series_and_original_start():
     assert kwargs["headers"]["Authorization"] == "Bearer token"
 
 
+def test_get_recurring_occurrence_follows_pages_and_selects_exact_identity():
+    recorder = RequestRecorder(
+        [
+            StubResponse(
+                {
+                    "items": [],
+                    "nextPageToken": "page-2",
+                }
+            ),
+            StubResponse(
+                {
+                    "items": [
+                        {
+                            "id": "instance-v2",
+                            "recurringEventId": "series+1",
+                            "originalStartTime": {
+                                "dateTime": "2026-07-20T09:00:00-05:00"
+                            },
+                            "status": "confirmed",
+                            "start": {"dateTime": "2026-09-01T09:00:00-05:00"},
+                            "end": {"dateTime": "2026-09-01T11:00:00-05:00"},
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+
+    occurrence = calendar_client(recorder).get_recurring_occurrence(
+        access_token="token",
+        calendar_id="ops@example.com",
+        recurring_event_id="series+1",
+        original_start="2026-07-20T14:00:00Z",
+        time_zone="America/Chicago",
+    )
+
+    assert occurrence.event_id == "instance-v2"
+    assert len(recorder.calls) == 2
+    assert recorder.calls[1][2]["params"]["pageToken"] == "page-2"
+
+
+def test_get_recurring_occurrence_rejects_nonmatching_nonempty_result():
+    recorder = RequestRecorder(
+        [
+            StubResponse(
+                {
+                    "items": [
+                        {
+                            "id": "wrong-instance",
+                            "recurringEventId": "series+1",
+                            "originalStartTime": {
+                                "dateTime": "2026-07-19T09:00:00-05:00"
+                            },
+                            "status": "confirmed",
+                            "start": {"dateTime": "2026-07-19T09:00:00-05:00"},
+                            "end": {"dateTime": "2026-07-19T11:00:00-05:00"},
+                        }
+                    ]
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(
+        GoogleCalendarResponseError, match="planned recurring occurrence"
+    ):
+        calendar_client(recorder).get_recurring_occurrence(
+            access_token="token",
+            calendar_id="ops@example.com",
+            recurring_event_id="series+1",
+            original_start="2026-07-20T14:00:00Z",
+            time_zone="America/Chicago",
+        )
+
+
+def test_get_recurring_occurrence_rejects_complete_paginated_miss():
+    recorder = RequestRecorder(
+        [
+            StubResponse({"items": [], "nextPageToken": "terminal-page"}),
+            StubResponse({"items": [], "nextSyncToken": "sync-token"}),
+        ]
+    )
+
+    with pytest.raises(
+        GoogleCalendarResponseError, match="planned recurring occurrence"
+    ):
+        calendar_client(recorder).get_recurring_occurrence(
+            access_token="token",
+            calendar_id="ops@example.com",
+            recurring_event_id="series+1",
+            original_start="2026-07-20T14:00:00Z",
+            time_zone="America/Chicago",
+        )
+
+    assert len(recorder.calls) == 2
+
+
+def test_get_recurring_occurrence_matches_all_day_original_start():
+    recorder = RequestRecorder(
+        [
+            StubResponse(
+                {
+                    "items": [
+                        {
+                            "id": "all-day-instance",
+                            "recurringEventId": "all-day-series",
+                            "originalStartTime": {"date": "2026-07-20"},
+                            "status": "confirmed",
+                            "start": {"date": "2026-07-20"},
+                            "end": {"date": "2026-07-21"},
+                        }
+                    ]
+                }
+            )
+        ]
+    )
+
+    occurrence = calendar_client(recorder).get_recurring_occurrence(
+        access_token="token",
+        calendar_id="ops@example.com",
+        recurring_event_id="all-day-series",
+        original_start="2026-07-20T00:00:00-05:00",
+        time_zone="America/Chicago",
+    )
+
+    assert occurrence.event_id == "all-day-instance"
+    assert occurrence.all_day is True
+
+
 def test_targeted_occurrences_use_one_bounded_batch_request():
     recorder = RequestRecorder(
         [
@@ -621,6 +750,208 @@ def test_targeted_occurrences_use_one_bounded_batch_request():
         in request_body
     )
     assert "originalStart=2026-07-20T14%3A00%3A00Z" in request_body
+
+
+def test_targeted_batch_consumes_empty_intermediate_recurring_page_before_tombstone():
+    recorder = RequestRecorder(
+        [
+            batch_response(
+                [{"items": [], "nextPageToken": "mary-terminal-page"}]
+            ),
+            batch_response([{"items": [], "nextSyncToken": "sync-token"}]),
+        ]
+    )
+
+    occurrences = calendar_client(recorder).get_occurrences_batch(
+        access_token="token",
+        calendar_id="ops@example.com",
+        requests_=[
+            TargetedOccurrenceRequest(
+                event_id="cancelled-mary-instance",
+                recurring_event_id="mary-old-series",
+                original_start="2026-07-29T17:45:00Z",
+            )
+        ],
+        time_zone="America/Chicago",
+    )
+
+    assert occurrences == [None]
+    assert len(recorder.calls) == 2
+    continuation_body = recorder.calls[1][2]["data"].decode("utf-8")
+    assert "pageToken=mary-terminal-page" in continuation_body
+
+
+def test_targeted_batch_continuations_remain_batched_and_keep_output_order():
+    recorder = RequestRecorder(
+        [
+            batch_response(
+                [
+                    {"items": [], "nextPageToken": "first-next"},
+                    {"items": [], "nextPageToken": "second-next"},
+                ]
+            ),
+            batch_response(
+                [
+                    {"items": []},
+                    {
+                        "items": [
+                            {
+                                "id": "second-instance-v2",
+                                "recurringEventId": "second-series",
+                                "originalStartTime": {
+                                    "dateTime": "2026-08-12T12:45:00-05:00"
+                                },
+                                "status": "confirmed",
+                                "start": {
+                                    "dateTime": "2026-08-12T12:45:00-05:00"
+                                },
+                                "end": {
+                                    "dateTime": "2026-08-12T13:15:00-05:00"
+                                },
+                            }
+                        ]
+                    },
+                ]
+            ),
+        ]
+    )
+
+    occurrences = calendar_client(recorder).get_occurrences_batch(
+        access_token="token",
+        calendar_id="ops@example.com",
+        requests_=[
+            TargetedOccurrenceRequest(
+                event_id="first-instance",
+                recurring_event_id="first-series",
+                original_start="2026-07-29T17:45:00Z",
+            ),
+            TargetedOccurrenceRequest(
+                event_id="second-instance",
+                recurring_event_id="second-series",
+                original_start="2026-08-12T17:45:00Z",
+            ),
+        ],
+        time_zone="America/Chicago",
+    )
+
+    assert occurrences[0] is None
+    assert occurrences[1].event_id == "second-instance-v2"
+    assert len(recorder.calls) == 2
+    continuation_body = recorder.calls[1][2]["data"].decode("utf-8")
+    assert "pageToken=first-next" in continuation_body
+    assert "pageToken=second-next" in continuation_body
+
+
+def test_targeted_batch_rejects_duplicate_exact_recurring_identities_across_pages():
+    exact_item = {
+        "id": "instance-v2",
+        "recurringEventId": "series-1",
+        "originalStartTime": {"dateTime": "2026-07-20T09:00:00-05:00"},
+        "status": "confirmed",
+        "start": {"dateTime": "2026-07-20T09:00:00-05:00"},
+        "end": {"dateTime": "2026-07-20T11:00:00-05:00"},
+    }
+    recorder = RequestRecorder(
+        [
+            batch_response(
+                [{"items": [exact_item], "nextPageToken": "duplicate-page"}]
+            ),
+            batch_response([{"items": [{**exact_item, "id": "instance-v3"}]}]),
+        ]
+    )
+
+    with pytest.raises(
+        GoogleCalendarResponseError, match="planned recurring occurrence"
+    ):
+        calendar_client(recorder).get_occurrences_batch(
+            access_token="token",
+            calendar_id="ops@example.com",
+            requests_=[
+                TargetedOccurrenceRequest(
+                    event_id="instance-v1",
+                    recurring_event_id="series-1",
+                    original_start="2026-07-20T14:00:00Z",
+                )
+            ],
+            time_zone="America/Chicago",
+        )
+
+
+def test_targeted_batch_rejects_repeated_recurring_page_token():
+    recorder = RequestRecorder(
+        [
+            batch_response([{"items": [], "nextPageToken": "same-token"}]),
+            batch_response([{"items": [], "nextPageToken": "same-token"}]),
+        ]
+    )
+
+    with pytest.raises(GoogleCalendarResponseError, match="invalid pagination"):
+        calendar_client(recorder).get_occurrences_batch(
+            access_token="token",
+            calendar_id="ops@example.com",
+            requests_=[
+                TargetedOccurrenceRequest(
+                    event_id="instance-v1",
+                    recurring_event_id="series-1",
+                    original_start="2026-07-20T14:00:00Z",
+                )
+            ],
+            time_zone="America/Chicago",
+        )
+
+
+def test_targeted_batch_fails_closed_when_identity_is_deleted_mid_pagination():
+    recorder = RequestRecorder(
+        [
+            batch_response([{"items": [], "nextPageToken": "page-2"}]),
+            batch_response(
+                [
+                    {
+                        "error": {
+                            "errors": [{"reason": "deleted"}],
+                            "message": "Resource was deleted during pagination",
+                        }
+                    }
+                ],
+                statuses=[410],
+            ),
+        ]
+    )
+
+    with pytest.raises(GoogleCalendarResponseError, match="request failed"):
+        calendar_client(recorder).get_occurrences_batch(
+            access_token="token",
+            calendar_id="ops@example.com",
+            requests_=[
+                TargetedOccurrenceRequest(
+                    event_id="instance-v1",
+                    recurring_event_id="series-1",
+                    original_start="2026-07-20T14:00:00Z",
+                )
+            ],
+            time_zone="America/Chicago",
+        )
+
+
+def test_targeted_batch_rejects_recurring_page_limit_exhaustion(monkeypatch):
+    monkeypatch.setattr(google_module, "MAX_GOOGLE_PAGES", 1)
+    recorder = RequestRecorder(
+        [batch_response([{"items": [], "nextPageToken": "page-2"}])]
+    )
+
+    with pytest.raises(GoogleCalendarResponseError, match="too many pages"):
+        calendar_client(recorder).get_occurrences_batch(
+            access_token="token",
+            calendar_id="ops@example.com",
+            requests_=[
+                TargetedOccurrenceRequest(
+                    event_id="instance-v1",
+                    recurring_event_id="series-1",
+                    original_start="2026-07-20T14:00:00Z",
+                )
+            ],
+            time_zone="America/Chicago",
+        )
 
 
 def test_targeted_batch_returns_tombstones_for_confirmed_deleted_identities():
