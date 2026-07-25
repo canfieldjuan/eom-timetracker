@@ -67,6 +67,7 @@ def _apply_schema(conn):
                 google_calendar_sources, google_calendar_connections,
                 receivables_operation_attempts,
                 time_data_correction_batches,
+                site_qr_action_receipts,
                 site_check_in_reconciliation_reviews, site_check_ins,
                 arrival_policy_revisions,
                 site_check_in_schedule_rules, site_check_in_schedules,

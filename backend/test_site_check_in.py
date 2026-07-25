@@ -6,6 +6,7 @@ import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -283,6 +284,896 @@ def site_check_in_payload(
     }
     payload.update(overrides)
     return payload
+
+
+@pytest.fixture
+def explicit_action_employee(client, isolate_site_check_in_data):
+    employee_id, employee_auth = create_test_employee_auth(suffix=f"action-{uuid4()}")
+    yield employee_id, employee_auth
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM site_qr_action_receipts WHERE employee_id = %s",
+            (employee_id,),
+        )
+        cur.execute("DELETE FROM site_check_ins WHERE employee_id = %s", (employee_id,))
+        cur.execute("DELETE FROM shifts WHERE employee_id = %s", (employee_id,))
+        cur.execute("DELETE FROM employees WHERE id = %s", (employee_id,))
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def second_action_site(explicit_action_employee):
+    employee_id, _ = explicit_action_employee
+    address = f"{CANONICAL_TEST_PREFIX} SECOND SITE {uuid4()}"
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO locations (
+                address, customer_name, lat, lng, active
+            )
+            VALUES (%s, 'Second Test Customer', %s, %s, true)
+            RETURNING id
+            """,
+            (address, SITE_LATITUDE, SITE_LONGITUDE),
+        )
+        site_id = int(cur.fetchone()[0])
+    conn.commit()
+    conn.close()
+    yield site_id, address
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM site_qr_action_receipts WHERE location_id = %s",
+            (site_id,),
+        )
+        cur.execute("DELETE FROM site_check_ins WHERE location_id = %s", (site_id,))
+        cur.execute("DELETE FROM shifts WHERE employee_id = %s", (employee_id,))
+        cur.execute("DELETE FROM locations WHERE id = %s", (site_id,))
+    conn.commit()
+    conn.close()
+
+
+def explicit_action_payload(
+    employee_id,
+    site_id,
+    token,
+    action_state,
+    *,
+    action=None,
+    idempotency_key=None,
+    scanned_at=None,
+    **overrides,
+):
+    payload = site_check_in_payload(
+        employee_id,
+        site_id,
+        token,
+        scanned_at=scanned_at,
+        action=action or action_state["recommendedAction"],
+        actionStateToken=action_state["stateToken"],
+        idempotencyKey=str(idempotency_key or uuid4()),
+    )
+    payload.update(overrides)
+    return payload
+
+
+def clock_in_action_employee(client, employee_auth):
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "location": "123 Main St, Effingham",
+            "latitude": SITE_LATITUDE,
+            "longitude": SITE_LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return int(response.json()["entry"]["id"])
+
+
+class TestExplicitSiteQrActions:
+    def test_resolve_and_submit_require_active_shift(
+        self,
+        client,
+        auth,
+        location_id,
+        explicit_action_employee,
+    ):
+        employee_id, employee_auth = explicit_action_employee
+        token = create_site_qr(client, auth, location_id)["token"]
+        resolved = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": token},
+        )
+        assert resolved.status_code == 200, resolved.text
+        state = resolved.json()["actionState"]
+        assert state == {
+            "status": "clock_in_required",
+            "recommendedAction": None,
+            "shiftId": None,
+            "activeVisit": None,
+            "missingDepartures": [],
+            "stateToken": None,
+            "blockReason": "active_shift_required",
+        }
+
+        rejected = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=site_check_in_payload(
+                employee_id,
+                location_id,
+                token,
+                action="arrive",
+                actionStateToken="invalid-but-long-enough",
+                idempotencyKey=str(uuid4()),
+            ),
+        )
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["code"] == "ACTIVE_SHIFT_REQUIRED"
+        assert rejected.json()["details"]["actionState"]["status"] == (
+            "clock_in_required"
+        )
+
+    def test_arrive_depart_and_exact_replay_are_explicitly_paired(
+        self,
+        client,
+        auth,
+        location_id,
+        explicit_action_employee,
+    ):
+        employee_id, employee_auth = explicit_action_employee
+        shift_id = clock_in_action_employee(client, employee_auth)
+        token = create_site_qr(client, auth, location_id)["token"]
+        resolved = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": token},
+        ).json()
+        assert resolved["actionState"]["recommendedAction"] == "arrive"
+
+        arrival_payload = explicit_action_payload(
+            employee_id,
+            location_id,
+            token,
+            resolved["actionState"],
+        )
+        arrived = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=arrival_payload,
+        )
+        assert arrived.status_code == 200, arrived.text
+        arrival_body = arrived.json()
+        assert arrival_body["outcome"] == "recorded"
+        assert arrival_body["replayed"] is False
+        assert arrival_body["shiftId"] == shift_id
+        assert arrival_body["visit"]["sequenceVersion"] == 2
+        assert arrival_body["visit"]["siteCheckInId"] == arrival_body["checkIn"]["id"]
+        assert arrival_body["actionState"]["recommendedAction"] == "depart"
+
+        replay = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=arrival_payload,
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["replayed"] is True
+        assert replay.json()["visit"]["id"] == arrival_body["visit"]["id"]
+
+        departure_payload = explicit_action_payload(
+            employee_id,
+            location_id,
+            token,
+            arrival_body["actionState"],
+        )
+        departed = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=departure_payload,
+        )
+        assert departed.status_code == 200, departed.text
+        departure_body = departed.json()
+        assert departure_body["action"] == "depart"
+        assert departure_body["departure"]["visitId"] == arrival_body["visit"]["id"]
+        assert departure_body["actionState"]["activeVisit"] is None
+        assert departure_body["actionState"]["recommendedAction"] == "arrive"
+
+        conn = _raw_conn()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT v.sequence_version, v.site_check_in_id,
+                       d.visit_id, receipt.outcome
+                FROM visits v
+                JOIN departures d ON d.visit_id = v.id
+                JOIN site_qr_action_receipts receipt
+                  ON receipt.departure_id = d.id
+                WHERE v.id = %s
+                """,
+                (arrival_body["visit"]["id"],),
+            )
+            stored = dict(cur.fetchone())
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM visits WHERE shift_id = %s",
+                (shift_id,),
+            )
+            assert int(cur.fetchone()["n"]) == 1
+        conn.close()
+        assert int(stored["sequence_version"]) == 2
+        assert int(stored["site_check_in_id"]) == arrival_body["checkIn"]["id"]
+        assert int(stored["visit_id"]) == arrival_body["visit"]["id"]
+        assert stored["outcome"] == "recorded"
+
+    @pytest.mark.parametrize(
+        "geofence_status",
+        ["outside", "uncertain", "low_accuracy", "site_unpinned"],
+    )
+    def test_weak_arrival_gps_is_evidence_only(
+        self,
+        client,
+        auth,
+        location_id,
+        explicit_action_employee,
+        monkeypatch,
+        geofence_status,
+    ):
+        import time_tracker_api
+
+        employee_id, employee_auth = explicit_action_employee
+        shift_id = clock_in_action_employee(client, employee_auth)
+        token = create_site_qr(client, auth, location_id)["token"]
+        state = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": token},
+        ).json()["actionState"]
+        monkeypatch.setattr(
+            time_tracker_api,
+            "evaluate_site_check_in_geofence",
+            lambda **_: {
+                "status": geofence_status,
+                "distanceM": 75.0,
+                "radiusM": 50,
+                "accuracyM": 125.0,
+            },
+        )
+        response = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                location_id,
+                token,
+                state,
+            ),
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["outcome"] == "evidence_only_review"
+        assert body["visit"] is None
+        assert body["checkIn"]["reviewStatus"] == "pending"
+        assert body["actionState"]["recommendedAction"] == "arrive"
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM visits WHERE shift_id = %s", (shift_id,))
+            assert int(cur.fetchone()[0]) == 0
+            cur.execute(
+                """
+                SELECT geofence_status, outcome, visit_id
+                FROM site_qr_action_receipts
+                WHERE employee_id = %s
+                """,
+                (employee_id,),
+            )
+            receipt = cur.fetchone()
+        conn.close()
+        assert receipt == (geofence_status, "evidence_only_review", None)
+
+    def test_cross_site_arrival_leaves_missing_departure_visible_without_revival(
+        self,
+        client,
+        auth,
+        location_id,
+        explicit_action_employee,
+        second_action_site,
+    ):
+        employee_id, employee_auth = explicit_action_employee
+        second_site_id, _ = second_action_site
+        shift_id = clock_in_action_employee(client, employee_auth)
+        first_token = create_site_qr(client, auth, location_id)["token"]
+        second_token = create_site_qr(client, auth, second_site_id)["token"]
+
+        first_state = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": first_token},
+        ).json()["actionState"]
+        first_arrival = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                location_id,
+                first_token,
+                first_state,
+            ),
+        ).json()
+        first_visit_id = first_arrival["visit"]["id"]
+
+        second_state = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": second_token},
+        ).json()["actionState"]
+        assert second_state["recommendedAction"] == "arrive"
+        assert [row["id"] for row in second_state["missingDepartures"]] == [
+            first_visit_id
+        ]
+        second_arrival = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                second_site_id,
+                second_token,
+                second_state,
+            ),
+        ).json()
+        second_visit_id = second_arrival["visit"]["id"]
+        departed = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                second_site_id,
+                second_token,
+                second_arrival["actionState"],
+            ),
+        )
+        assert departed.status_code == 200, departed.text
+        final_state = departed.json()["actionState"]
+        assert final_state["activeVisit"] is None
+        assert final_state["recommendedAction"] == "arrive"
+        assert [row["id"] for row in final_state["missingDepartures"]] == [
+            first_visit_id
+        ]
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT visit_id
+                FROM departures
+                WHERE shift_id = %s
+                ORDER BY id
+                """,
+                (shift_id,),
+            )
+            paired_ids = [int(row[0]) for row in cur.fetchall()]
+        conn.close()
+        assert paired_ids == [second_visit_id]
+
+    @pytest.mark.parametrize(
+        "geofence_status",
+        ["outside", "uncertain", "low_accuracy", "site_unpinned"],
+    )
+    def test_weak_departure_gps_is_evidence_only_and_keeps_depart_ready(
+        self,
+        client,
+        auth,
+        location_id,
+        explicit_action_employee,
+        monkeypatch,
+        geofence_status,
+    ):
+        import time_tracker_api
+
+        employee_id, employee_auth = explicit_action_employee
+        shift_id = clock_in_action_employee(client, employee_auth)
+        token = create_site_qr(client, auth, location_id)["token"]
+        arrival_state = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": token},
+        ).json()["actionState"]
+        arrived = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                location_id,
+                token,
+                arrival_state,
+            ),
+        )
+        assert arrived.status_code == 200, arrived.text
+        assert arrived.json()["actionState"]["recommendedAction"] == "depart"
+
+        monkeypatch.setattr(
+            time_tracker_api,
+            "evaluate_site_check_in_geofence",
+            lambda **_: {
+                "status": geofence_status,
+                "distanceM": 75.0,
+                "radiusM": 50,
+                "accuracyM": 125.0,
+            },
+        )
+        weak_depart = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                location_id,
+                token,
+                arrived.json()["actionState"],
+            ),
+        )
+        assert weak_depart.status_code == 200, weak_depart.text
+        body = weak_depart.json()
+        assert body["action"] == "depart"
+        assert body["outcome"] == "evidence_only_review"
+        assert body["departure"] is None
+        assert body["actionState"]["recommendedAction"] == "depart"
+        assert body["actionState"]["activeVisit"]["id"] == arrived.json()["visit"]["id"]
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM departures WHERE shift_id = %s",
+                (shift_id,),
+            )
+            assert int(cur.fetchone()[0]) == 0
+            cur.execute(
+                """
+                SELECT geofence_status, outcome, departure_id
+                FROM site_qr_action_receipts
+                WHERE employee_id = %s AND action = 'depart'
+                """,
+                (employee_id,),
+            )
+            receipt = cur.fetchone()
+        conn.close()
+        assert receipt == (geofence_status, "evidence_only_review", None)
+
+    def test_depart_bypasses_hours_gate_while_arrive_still_enforces_it(
+        self,
+        client,
+        auth,
+        location_id,
+        explicit_action_employee,
+        monkeypatch,
+    ):
+        from fastapi import HTTPException
+        import time_tracker_api
+
+        employee_id, employee_auth = explicit_action_employee
+        clock_in_action_employee(client, employee_auth)
+        token = create_site_qr(client, auth, location_id)["token"]
+        arrival_state = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": token},
+        ).json()["actionState"]
+        arrived = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                location_id,
+                token,
+                arrival_state,
+            ),
+        )
+        assert arrived.status_code == 200, arrived.text
+
+        gate_calls = 0
+
+        def reject_by_hours(_request):
+            nonlocal gate_calls
+            gate_calls += 1
+            raise HTTPException(status_code=403, detail="test hours gate")
+
+        monkeypatch.setattr(
+            time_tracker_api,
+            "enforce_clock_action_hours",
+            reject_by_hours,
+        )
+        departed = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                location_id,
+                token,
+                arrived.json()["actionState"],
+            ),
+        )
+        assert departed.status_code == 200, departed.text
+        assert departed.json()["action"] == "depart"
+        assert gate_calls == 0
+
+        rejected_arrival = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                location_id,
+                token,
+                departed.json()["actionState"],
+            ),
+        )
+        assert rejected_arrival.status_code == 403, rejected_arrival.text
+        assert rejected_arrival.json()["error"] == "test hours gate"
+        assert gate_calls == 1
+
+    def test_changed_state_and_changed_idempotency_input_return_fresh_409(
+        self,
+        client,
+        auth,
+        location_id,
+        explicit_action_employee,
+    ):
+        employee_id, employee_auth = explicit_action_employee
+        clock_in_action_employee(client, employee_auth)
+        token = create_site_qr(client, auth, location_id)["token"]
+        state = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": token},
+        ).json()["actionState"]
+        request_key = uuid4()
+        payload = explicit_action_payload(
+            employee_id,
+            location_id,
+            token,
+            state,
+            idempotency_key=request_key,
+        )
+        recorded = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=payload,
+        )
+        assert recorded.status_code == 200, recorded.text
+
+        changed = dict(payload)
+        changed["latitude"] = SITE_LATITUDE + 0.00001
+        conflict = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=changed,
+        )
+        assert conflict.status_code == 409, conflict.text
+        conflict_body = conflict.json()
+        assert conflict_body["code"] == "IDEMPOTENCY_KEY_REUSED"
+        assert (
+            conflict_body["details"]["actionState"]["recommendedAction"]
+            == "depart"
+        )
+
+        old_state_new_key = dict(payload)
+        old_state_new_key["idempotencyKey"] = str(uuid4())
+        old_state_new_key["scannedAt"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=1)
+        ).isoformat()
+        stale = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=old_state_new_key,
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["code"] == "SITE_ACTION_STATE_CHANGED"
+        assert (
+            stale.json()["details"]["actionState"]["recommendedAction"]
+            == "depart"
+        )
+
+    def test_new_manual_departure_closes_legacy_visit_once(
+        self,
+        client,
+        explicit_action_employee,
+    ):
+        employee_id, employee_auth = explicit_action_employee
+        shift_id = clock_in_action_employee(client, employee_auth)
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO visits (
+                    shift_id, location_id, location_label, customer_name,
+                    arrival_time, sequence_version
+                )
+                SELECT %s, id, address, customer_name, NOW(), 1
+                FROM locations
+                WHERE address = '123 Main St, Effingham'
+                RETURNING id
+                """,
+                (shift_id,),
+            )
+            legacy_visit_id = int(cur.fetchone()[0])
+        conn.commit()
+        conn.close()
+
+        first = client.post(
+            "/api/timesheet/depart",
+            headers=employee_auth,
+            json={
+                "latitude": SITE_LATITUDE,
+                "longitude": SITE_LONGITUDE,
+                "accuracy": 5,
+            },
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["departure"]["visitId"] == legacy_visit_id
+        second = client.post(
+            "/api/timesheet/depart",
+            headers=employee_auth,
+            json={
+                "latitude": SITE_LATITUDE,
+                "longitude": SITE_LONGITUDE,
+                "accuracy": 5,
+            },
+        )
+        assert second.status_code == 400, second.text
+        assert "No active arrival" in second.json()["error"]
+
+    def test_explicit_qr_depart_closes_legacy_visit_and_cannot_repeat(
+        self,
+        client,
+        auth,
+        location_id,
+        explicit_action_employee,
+    ):
+        employee_id, employee_auth = explicit_action_employee
+        shift_id = clock_in_action_employee(client, employee_auth)
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO visits (
+                    shift_id, location_id, location_label, customer_name,
+                    arrival_time, sequence_version
+                )
+                SELECT %s, id, address, customer_name, NOW(), 1
+                FROM locations
+                WHERE id = %s
+                RETURNING id
+                """,
+                (shift_id, location_id),
+            )
+            legacy_visit_id = int(cur.fetchone()[0])
+        conn.commit()
+        conn.close()
+
+        token = create_site_qr(client, auth, location_id)["token"]
+        resolved = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": token},
+        )
+        assert resolved.status_code == 200, resolved.text
+        depart_state = resolved.json()["actionState"]
+        assert depart_state["recommendedAction"] == "depart"
+        assert depart_state["activeVisit"]["id"] == legacy_visit_id
+
+        departed = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                location_id,
+                token,
+                depart_state,
+            ),
+        )
+        assert departed.status_code == 200, departed.text
+        assert departed.json()["departure"]["visitId"] == legacy_visit_id
+        assert departed.json()["actionState"]["recommendedAction"] == "arrive"
+        assert departed.json()["actionState"]["activeVisit"] is None
+
+        fresh = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": token},
+        )
+        assert fresh.status_code == 200, fresh.text
+        fresh_state = fresh.json()["actionState"]
+        assert fresh_state["recommendedAction"] == "arrive"
+        assert fresh_state["activeVisit"] is None
+
+        second_depart = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                location_id,
+                token,
+                fresh_state,
+                action="depart",
+            ),
+        )
+        assert second_depart.status_code == 409, second_depart.text
+        assert second_depart.json()["code"] == "SITE_ACTION_STATE_CHANGED"
+        assert (
+            second_depart.json()["details"]["actionState"]["recommendedAction"]
+            == "arrive"
+        )
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT visit_id FROM departures WHERE shift_id = %s",
+                (shift_id,),
+            )
+            assert [int(row[0]) for row in cur.fetchall()] == [legacy_visit_id]
+        conn.close()
+
+    def test_manual_and_qr_event_writers_serialize_without_lost_events(
+        self,
+        client,
+        auth,
+        location_id,
+        explicit_action_employee,
+        monkeypatch,
+    ):
+        import time_tracker_api
+
+        employee_id, employee_auth = explicit_action_employee
+        shift_id = clock_in_action_employee(client, employee_auth)
+        token = create_site_qr(client, auth, location_id)["token"]
+        initial_state = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": token},
+        ).json()["actionState"]
+        stale_qr_payload = explicit_action_payload(
+            employee_id,
+            location_id,
+            token,
+            initial_state,
+        )
+
+        manual_save_started = threading.Event()
+        allow_manual_save = threading.Event()
+        qr_action_started = threading.Event()
+        original_save = time_tracker_api._save_timesheets_to_db
+        original_qr_action = time_tracker_api._record_explicit_site_action
+
+        def blocking_manual_save(*args, **kwargs):
+            manual_save_started.set()
+            assert allow_manual_save.wait(timeout=10)
+            return original_save(*args, **kwargs)
+
+        def observed_qr_action(payload, request, employee):
+            qr_action_started.set()
+            return original_qr_action(payload, request, employee)
+
+        monkeypatch.setattr(
+            time_tracker_api,
+            "_save_timesheets_to_db",
+            blocking_manual_save,
+        )
+        monkeypatch.setattr(
+            time_tracker_api,
+            "_record_explicit_site_action",
+            observed_qr_action,
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            manual_future = executor.submit(
+                client.post,
+                "/api/timesheet/visit",
+                headers=employee_auth,
+                json={
+                    "location": "123 Main St, Effingham",
+                    "latitude": SITE_LATITUDE,
+                    "longitude": SITE_LONGITUDE,
+                    "accuracy": 5,
+                },
+            )
+            assert manual_save_started.wait(timeout=10)
+            try:
+                lock_conn = _raw_conn()
+                with lock_conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_try_advisory_lock(%s)",
+                        (time_tracker_api.TIMESHEET_PG_ADVISORY_LOCK_ID,),
+                    )
+                    unexpectedly_acquired = bool(cur.fetchone()[0])
+                    if unexpectedly_acquired:
+                        cur.execute(
+                            "SELECT pg_advisory_unlock(%s)",
+                            (time_tracker_api.TIMESHEET_PG_ADVISORY_LOCK_ID,),
+                        )
+                lock_conn.close()
+                assert unexpectedly_acquired is False
+
+                qr_future = executor.submit(
+                    client.post,
+                    "/api/timesheet/site-check-in",
+                    headers=employee_auth,
+                    json=stale_qr_payload,
+                )
+                assert qr_action_started.wait(timeout=10)
+                assert qr_future.done() is False
+            finally:
+                allow_manual_save.set()
+
+            manual_response = manual_future.result(timeout=10)
+            qr_response = qr_future.result(timeout=10)
+
+        assert manual_response.status_code == 200, manual_response.text
+        manual_visit_id = int(manual_response.json()["visit"]["id"])
+        assert qr_response.status_code == 409, qr_response.text
+        assert qr_response.json()["code"] == "SITE_ACTION_STATE_CHANGED"
+        refreshed_state = qr_response.json()["details"]["actionState"]
+        assert refreshed_state["recommendedAction"] == "depart"
+        assert refreshed_state["activeVisit"]["id"] == manual_visit_id
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM visits WHERE shift_id = %s", (shift_id,))
+            assert int(cur.fetchone()[0]) == 1
+            cur.execute(
+                "SELECT COUNT(*) FROM departures WHERE shift_id = %s",
+                (shift_id,),
+            )
+            assert int(cur.fetchone()[0]) == 0
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM site_qr_action_receipts
+                WHERE employee_id = %s
+                """,
+                (employee_id,),
+            )
+            assert int(cur.fetchone()[0]) == 0
+        conn.close()
+
+        confirmed_depart = client.post(
+            "/api/timesheet/site-check-in",
+            headers=employee_auth,
+            json=explicit_action_payload(
+                employee_id,
+                location_id,
+                token,
+                refreshed_state,
+            ),
+        )
+        assert confirmed_depart.status_code == 200, confirmed_depart.text
+        assert confirmed_depart.json()["departure"]["visitId"] == manual_visit_id
+
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM visits WHERE shift_id = %s", (shift_id,))
+            assert int(cur.fetchone()[0]) == 1
+            cur.execute(
+                """
+                SELECT visit_id
+                FROM departures
+                WHERE shift_id = %s
+                """,
+                (shift_id,),
+            )
+            assert [int(row[0]) for row in cur.fetchall()] == [manual_visit_id]
+            cur.execute(
+                """
+                SELECT action, outcome
+                FROM site_qr_action_receipts
+                WHERE employee_id = %s
+                """,
+                (employee_id,),
+            )
+            assert cur.fetchall() == [("depart", "recorded")]
+        conn.close()
 
 
 class TestSiteQr:

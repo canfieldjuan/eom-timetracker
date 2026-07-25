@@ -388,7 +388,7 @@ def _load_time_evidence(
         for row in db.query_all(
             """
             SELECT id, shift_id, location_id, location_label, customer_name,
-                   arrival_time
+                   arrival_time, sequence_version, site_check_in_id
             FROM visits
             WHERE shift_id = ANY(%s)
             ORDER BY shift_id, arrival_time, id
@@ -402,7 +402,7 @@ def _load_time_evidence(
         for row in db.query_all(
             """
             SELECT id, shift_id, location_id, location_label, customer_name,
-                   departure_time
+                   departure_time, visit_id
             FROM departures
             WHERE shift_id = ANY(%s)
             ORDER BY shift_id, departure_time, id
@@ -832,7 +832,20 @@ def _closed_shift_segments(
         )
         matching_departure: Optional[Dict[str, Any]] = None
         visit_site_id = visit.get("location_id")
-        if visit_site_id is not None:
+        sequence_version = int(visit.get("sequence_version") or 1)
+        if sequence_version >= 2:
+            matching_departure = next(
+                (
+                    departure
+                    for departure in departures
+                    if departure.get("visit_id") is not None
+                    and int(departure["visit_id"]) == int(visit["id"])
+                ),
+                None,
+            )
+            if matching_departure is not None:
+                used_departures.add(int(matching_departure["id"]))
+        elif visit_site_id is not None:
             for departure in departures:
                 if int(departure["id"]) in used_departures:
                     continue
@@ -842,11 +855,15 @@ def _closed_shift_segments(
                     matching_departure = departure
                     used_departures.add(int(departure["id"]))
                     break
-        work_end = (
-            matching_departure["departure_time"]
-            if matching_departure is not None
-            else next_arrival
-        )
+        if matching_departure is not None:
+            work_end = matching_departure["departure_time"]
+        elif sequence_version >= 2:
+            # A version-2 visit without its explicitly paired departure is
+            # incomplete evidence, not permission to invent an end at the next
+            # arrival or shift clock-out.
+            work_end = arrival
+        else:
+            work_end = next_arrival
 
         visible_arrival = max(arrival, lower)
         if visible_arrival > cursor:
@@ -910,6 +927,8 @@ def _open_shift_presence(
     current_label = str(shift.get("location_label") or "")
     current_since = shift["clock_in"]
     evidence = ["clock_in"]
+    current_visit_id: Optional[int] = None
+    current_sequence_version = 1
 
     events: List[Tuple[datetime, int, Dict[str, Any]]] = []
     events.extend((row["arrival_time"], 0, row) for row in visits)
@@ -922,11 +941,28 @@ def _open_shift_presence(
             current_label = str(row.get("location_label") or "")
             current_since = event_at
             evidence = ["clock_in", "visit"]
-        elif current_site is not None and row.get("location_id") == current_site:
-            current_site = None
-            current_label = ""
-            current_since = event_at
-            evidence = ["clock_in", "departure"]
+            current_visit_id = int(row["id"])
+            current_sequence_version = int(row.get("sequence_version") or 1)
+        else:
+            paired_visit_id = row.get("visit_id")
+            explicitly_closes_current = (
+                paired_visit_id is not None
+                and current_visit_id is not None
+                and int(paired_visit_id) == current_visit_id
+            )
+            legacy_closes_current = (
+                paired_visit_id is None
+                and current_sequence_version == 1
+                and current_site is not None
+                and row.get("location_id") == current_site
+            )
+            if explicitly_closes_current or legacy_closes_current:
+                current_site = None
+                current_label = ""
+                current_since = event_at
+                evidence = ["clock_in", "departure"]
+                current_visit_id = None
+                current_sequence_version = 1
 
     if current_site is None:
         unknown_site_check_ins = _qr_sites_in_interval(
