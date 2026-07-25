@@ -1975,6 +1975,12 @@ class CustomerCreateRequest(BaseModel):
 
 
 class CustomerUpdateRequest(BaseModel):
+    expectedUpdateToken: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern="^[0-9a-f]{64}$",
+    )
     name: Optional[str] = Field(default=None, min_length=1, max_length=CUSTOMER_NAME_MAX_LENGTH)
     primaryContactName: Optional[str] = Field(default=None, max_length=CUSTOMER_NAME_MAX_LENGTH)
     primaryPhone: Optional[str] = Field(default=None, max_length=CUSTOMER_PHONE_MAX_LENGTH)
@@ -2019,6 +2025,12 @@ class SiteCreateRequest(PrimarySiteCreateRequest):
 
 
 class SiteUpdateRequest(BaseModel):
+    expectedUpdateToken: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern="^[0-9a-f]{64}$",
+    )
     customerId: Optional[int] = Field(default=None, gt=0)
     customerName: Optional[str] = Field(default=None, min_length=1, max_length=CUSTOMER_NAME_MAX_LENGTH)
     address: Optional[str] = Field(default=None, min_length=1, max_length=SITE_ADDRESS_MAX_LENGTH)
@@ -6928,6 +6940,30 @@ def _raise_conflict(code: str, message: str, details: Dict[str, Any]) -> None:
     )
 
 
+def _entity_update_token(entity: str, row: Dict[str, Any]) -> str:
+    updated_at = row["updated_at"].astimezone(timezone.utc).isoformat(timespec="microseconds")
+    canonical = f"{entity}:{int(row['id'])}:{updated_at}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _require_current_update_token(
+    entity: str,
+    row: Dict[str, Any],
+    expected_token: Optional[str],
+) -> None:
+    if expected_token is None:
+        return
+    current_token = _entity_update_token(entity, row)
+    if hmac.compare_digest(expected_token, current_token):
+        return
+    entity_label = "Customer" if entity == "customer" else "Site"
+    _raise_conflict(
+        f"stale_{entity}_update",
+        f"{entity_label} changed after it was read; reload before retrying",
+        {f"{entity}Id": int(row["id"])},
+    )
+
+
 def _site_required_checklist(row: Dict[str, Any]) -> Dict[str, bool]:
     return {
         "address": bool(str(row.get("address") or "").strip()),
@@ -7010,6 +7046,7 @@ def _serialize_site(row: Dict[str, Any]) -> Dict[str, Any]:
         "migrationReview": migration_review,
         "createdAt": to_utc_iso(row["created_at"]),
         "updatedAt": to_utc_iso(row["updated_at"]),
+        "updateToken": _entity_update_token("site", row),
         "archivedAt": to_utc_iso(row["archived_at"]) if row.get("archived_at") else None,
         "archivedBy": int(row["archived_by"]) if row.get("archived_by") is not None else None,
     }
@@ -7073,6 +7110,7 @@ def _serialize_customer(row: Dict[str, Any], sites: List[Dict[str, Any]]) -> Dic
         "sites": sites,
         "createdAt": to_utc_iso(row["created_at"]),
         "updatedAt": to_utc_iso(row["updated_at"]),
+        "updateToken": _entity_update_token("customer", row),
         "archivedAt": to_utc_iso(row["archived_at"]) if row.get("archived_at") else None,
         "archivedBy": int(row["archived_by"]) if row.get("archived_by") is not None else None,
     }
@@ -7352,6 +7390,11 @@ def admin_patch_customer(
             existing = _customer_row(cur, customer_id, for_update=True)
             if not existing:
                 raise HTTPException(status_code=404, detail="Customer not found")
+            _require_current_update_token(
+                "customer",
+                existing,
+                payload.expectedUpdateToken,
+            )
             assignments: List[str] = []
             params: List[Any] = []
             for request_field, column in field_map.items():
@@ -7884,6 +7927,11 @@ def admin_patch_location(
             existing = _site_row(cur, site_id, for_update=True)
             if not existing:
                 raise HTTPException(status_code=404, detail="Location not found")
+            _require_current_update_token(
+                "site",
+                existing,
+                payload.expectedUpdateToken,
+            )
 
             assignments: List[str] = []
             params: List[Any] = []
