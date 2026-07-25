@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import db
 
@@ -95,6 +96,97 @@ def _seed_correction_candidates(employee_id, location_id):
         "allDuplicateIds": [canonical, duplicate_with_departure, duplicate_plain],
         "stale": stale,
         "staleStart": stale_start,
+    }
+
+
+def _attach_qr_arrive_depart_receipts(
+    employee_id,
+    location_id,
+    shift_id,
+    arrival_time,
+    departure_time,
+):
+    visit_id = db.execute_returning(
+        """
+        INSERT INTO visits (
+            shift_id,
+            location_id,
+            location_label,
+            customer_name,
+            arrival_time,
+            sequence_version
+        )
+        VALUES (%s, %s, %s, 'Test Customer', %s, 2)
+        RETURNING id
+        """,
+        (shift_id, location_id, "123 Main St, Effingham", arrival_time),
+    )
+    departure_id = db.query_one(
+        "SELECT id FROM departures WHERE shift_id = %s",
+        (shift_id,),
+    )["id"]
+    db.execute(
+        "UPDATE departures SET visit_id = %s WHERE id = %s",
+        (visit_id, departure_id),
+    )
+
+    receipt_ids = []
+    for sequence, (action, recorded_at, linked_departure_id) in enumerate(
+        (
+            ("arrive", arrival_time, None),
+            ("depart", departure_time, departure_id),
+        ),
+        start=1,
+    ):
+        receipt_ids.append(
+            db.execute_returning(
+                """
+                INSERT INTO site_qr_action_receipts (
+                    employee_id,
+                    location_id,
+                    shift_id,
+                    action,
+                    idempotency_key,
+                    request_fingerprint,
+                    server_recorded_at,
+                    device_scanned_at,
+                    latitude,
+                    longitude,
+                    accuracy_m,
+                    geofence_radius_m,
+                    distance_m,
+                    geofence_status,
+                    outcome,
+                    visit_id,
+                    departure_id,
+                    response_body
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    39.1203, -88.54335, 8.0, 75, 0.0,
+                    'inside', 'recorded', %s, %s, %s::jsonb
+                )
+                RETURNING id
+                """,
+                (
+                    employee_id,
+                    location_id,
+                    shift_id,
+                    action,
+                    str(uuid4()),
+                    str(sequence) * 64,
+                    recorded_at,
+                    recorded_at,
+                    visit_id,
+                    linked_departure_id,
+                    f'{{"action":"{action}","outcome":"recorded"}}',
+                ),
+            )
+        )
+    return {
+        "visitId": visit_id,
+        "departureId": departure_id,
+        "receiptIds": receipt_ids,
     }
 
 
@@ -198,6 +290,14 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
     reason = "test confirmed recoverable correction batch"
     candidates = _seed_correction_candidates(employee_id, location_id)
     candidate_ids = [*candidates["allDuplicateIds"], candidates["stale"]]
+    duplicate_start = datetime(2023, 2, 3, 15, 0, tzinfo=timezone.utc)
+    qr_events = _attach_qr_arrive_depart_receipts(
+        employee_id,
+        location_id,
+        candidates["duplicates"][0],
+        duplicate_start,
+        duplicate_start + timedelta(hours=2),
+    )
     selection = _selection(candidates, reason)
     try:
         preview = client.post(
@@ -285,6 +385,30 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
         }
         assert set(archived_by_id) == set(candidate_ids)
         assert archived_by_id[candidates["duplicates"][0]]["departures"]
+        archived_qr_shift = archived_by_id[candidates["duplicates"][0]]
+        archived_receipts = {
+            row["action"]: row for row in archived_qr_shift["siteQrActionReceipts"]
+        }
+        assert set(archived_receipts) == {"arrive", "depart"}
+        assert archived_receipts["arrive"]["visitId"] == qr_events["visitId"]
+        assert archived_receipts["arrive"]["departureId"] is None
+        assert archived_receipts["depart"]["visitId"] == qr_events["visitId"]
+        assert archived_receipts["depart"]["departureId"] == qr_events["departureId"]
+
+        preserved_receipts = db.query_all(
+            """
+            SELECT id, action, shift_id, visit_id, departure_id
+            FROM site_qr_action_receipts
+            WHERE id = ANY(%s)
+            ORDER BY action
+            """,
+            (qr_events["receiptIds"],),
+        )
+        assert len(preserved_receipts) == 2
+        assert {row["action"] for row in preserved_receipts} == {"arrive", "depart"}
+        assert all(row["shift_id"] is None for row in preserved_receipts)
+        assert all(row["visit_id"] is None for row in preserved_receipts)
+        assert all(row["departure_id"] is None for row in preserved_receipts)
         assert batch["result"]["deletedShiftIds"] == sorted(candidates["duplicates"])
 
         repeat = client.post(
@@ -299,3 +423,7 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
         assert repeat.status_code == 409
     finally:
         _cleanup_candidates(candidate_ids, reason)
+        db.execute(
+            "DELETE FROM site_qr_action_receipts WHERE id = ANY(%s)",
+            (qr_events["receiptIds"],),
+        )

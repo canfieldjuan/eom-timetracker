@@ -869,6 +869,70 @@ def test_closed_shift_preserves_initial_site_before_first_visit():
     ]
 
 
+def test_version_two_missing_departure_never_invents_visit_end():
+    shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    missing_arrival = shift_start + timedelta(hours=1)
+    paired_arrival = shift_start + timedelta(hours=2)
+    paired_departure = shift_start + timedelta(hours=3)
+    shift_end = shift_start + timedelta(hours=4)
+    segments = _closed_shift_segments(
+        {
+            "id": 1,
+            "employee_id": 2,
+            "employee_name": "Worker",
+            "hourly_rate": Decimal("18.00"),
+            "location_id": 10,
+            "location_label": "Initial Site",
+            "clock_in": shift_start,
+            "clock_out": shift_end,
+        },
+        [
+            {
+                "id": 30,
+                "location_id": 20,
+                "location_label": "Missing Departure Site",
+                "arrival_time": missing_arrival,
+                "sequence_version": 2,
+            },
+            {
+                "id": 31,
+                "location_id": 30,
+                "location_label": "Paired Site",
+                "arrival_time": paired_arrival,
+                "sequence_version": 2,
+            },
+        ],
+        [
+            {
+                "id": 40,
+                "visit_id": 31,
+                "location_id": 30,
+                "location_label": "Paired Site",
+                "departure_time": paired_departure,
+            }
+        ],
+        {},
+        shift_start,
+        shift_end,
+    )
+
+    assert [
+        (
+            segment["location_id"],
+            segment["start"],
+            segment["end"],
+            segment["evidence"],
+        )
+        for segment in segments
+    ] == [
+        (10, shift_start, missing_arrival, ["shift"]),
+        (None, missing_arrival, paired_arrival, "unassigned_gap"),
+        (30, paired_arrival, paired_departure, ["visit"]),
+        (None, paired_departure, shift_end, "unassigned_gap"),
+    ]
+    assert not any(segment["location_id"] == 20 for segment in segments)
+
+
 @pytest.mark.parametrize("with_later_visit", [False, True])
 def test_closed_shift_departure_splits_initial_site_before_qr_attribution(
     with_later_visit,

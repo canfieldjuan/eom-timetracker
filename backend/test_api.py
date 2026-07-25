@@ -1145,6 +1145,266 @@ class TestReceivablesProxy:
         assert audits[0][1] is True
 
 
+class TestQrEventSchemaMigration:
+    def test_startup_upgrades_legacy_visit_departure_event_shape(self, client):
+        import time_tracker_api as api
+
+        api.db.execute("""
+            DROP TABLE IF EXISTS site_qr_action_receipts;
+            DROP INDEX IF EXISTS uq_departures_visit_id;
+            DROP INDEX IF EXISTS uq_visits_site_check_in_id;
+            ALTER TABLE departures DROP COLUMN IF EXISTS visit_id;
+            ALTER TABLE visits DROP COLUMN IF EXISTS site_check_in_id;
+            ALTER TABLE visits DROP COLUMN IF EXISTS sequence_version;
+        """)
+        shift_id = api.db.execute_returning("""
+            INSERT INTO shifts (
+                employee_id, location_label, clock_in, local_date
+            )
+            SELECT id, 'Legacy migration fixture',
+                   TIMESTAMPTZ '2040-01-02 08:00:00-06', DATE '2040-01-02'
+            FROM employees
+            ORDER BY id
+            LIMIT 1
+            RETURNING id
+        """)
+        visit_id = api.db.execute_returning(
+            """
+            INSERT INTO visits (
+                shift_id, location_label, customer_name, arrival_time
+            )
+            VALUES (
+                %s, 'Legacy migration fixture', 'Legacy customer',
+                TIMESTAMPTZ '2040-01-02 08:30:00-06'
+            )
+            RETURNING id
+            """,
+            (shift_id,),
+        )
+        departure_id = api.db.execute_returning(
+            """
+            INSERT INTO departures (
+                shift_id, location_label, customer_name, departure_time
+            )
+            VALUES (
+                %s, 'Legacy migration fixture', 'Legacy customer',
+                TIMESTAMPTZ '2040-01-02 09:30:00-06'
+            )
+            RETURNING id
+            """,
+            (shift_id,),
+        )
+
+        try:
+            legacy_columns = api.db.query_all("""
+                SELECT table_name, column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND (
+                    (table_name = 'visits'
+                     AND column_name IN ('sequence_version', 'site_check_in_id'))
+                    OR
+                    (table_name = 'departures' AND column_name = 'visit_id')
+                  )
+            """)
+            assert legacy_columns == []
+            assert api.db.query_one(
+                "SELECT to_regclass('site_qr_action_receipts') AS table_name"
+            ) == {"table_name": None}
+
+            api._ensure_schema_migrations()
+
+            pairing_columns = {
+                (row["table_name"], row["column_name"]): row
+                for row in api.db.query_all("""
+                    SELECT table_name, column_name, udt_name,
+                           is_nullable, column_default
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND (
+                        (table_name = 'visits'
+                         AND column_name IN (
+                           'sequence_version', 'site_check_in_id'
+                         ))
+                        OR
+                        (table_name = 'departures' AND column_name = 'visit_id')
+                      )
+                """)
+            }
+            assert set(pairing_columns) == {
+                ("visits", "sequence_version"),
+                ("visits", "site_check_in_id"),
+                ("departures", "visit_id"),
+            }
+            assert pairing_columns[("visits", "sequence_version")] == {
+                "table_name": "visits",
+                "column_name": "sequence_version",
+                "udt_name": "int2",
+                "is_nullable": "NO",
+                "column_default": "1",
+            }
+            assert pairing_columns[("visits", "site_check_in_id")]["udt_name"] == "int8"
+            assert pairing_columns[("visits", "site_check_in_id")]["is_nullable"] == "YES"
+            assert pairing_columns[("departures", "visit_id")]["udt_name"] == "int4"
+            assert pairing_columns[("departures", "visit_id")]["is_nullable"] == "YES"
+
+            assert api.db.query_one(
+                """
+                SELECT sequence_version, site_check_in_id
+                FROM visits
+                WHERE id = %s
+                """,
+                (visit_id,),
+            ) == {"sequence_version": 1, "site_check_in_id": None}
+            assert api.db.query_one(
+                "SELECT visit_id FROM departures WHERE id = %s",
+                (departure_id,),
+            ) == {"visit_id": None}
+
+            sequence_check = api.db.query_one("""
+                SELECT convalidated AS validated,
+                       pg_get_constraintdef(oid) AS definition
+                FROM pg_constraint
+                WHERE conrelid = 'visits'::regclass
+                  AND conname = 'visits_sequence_version_check'
+            """)
+            assert sequence_check["validated"] is True
+            assert "sequence_version" in sequence_check["definition"]
+            assert "1" in sequence_check["definition"]
+            assert "2" in sequence_check["definition"]
+
+            visit_foreign_keys = "\n".join(
+                row["definition"]
+                for row in api.db.query_all("""
+                    SELECT pg_get_constraintdef(oid) AS definition
+                    FROM pg_constraint
+                    WHERE contype = 'f'
+                      AND conrelid IN (
+                        'visits'::regclass, 'departures'::regclass
+                      )
+                """)
+            )
+            assert (
+                "FOREIGN KEY (site_check_in_id) "
+                "REFERENCES site_check_ins(id) ON DELETE SET NULL"
+            ) in visit_foreign_keys
+            assert (
+                "FOREIGN KEY (visit_id) "
+                "REFERENCES visits(id) ON DELETE SET NULL"
+            ) in visit_foreign_keys
+
+            pairing_indexes = {
+                row["indexname"]: row["indexdef"]
+                for row in api.db.query_all("""
+                    SELECT indexname, indexdef
+                    FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND indexname IN (
+                        'uq_departures_visit_id',
+                        'uq_visits_site_check_in_id'
+                      )
+                """)
+            }
+            assert set(pairing_indexes) == {
+                "uq_departures_visit_id",
+                "uq_visits_site_check_in_id",
+            }
+            assert "UNIQUE INDEX" in pairing_indexes["uq_departures_visit_id"]
+            assert "(visit_id)" in pairing_indexes["uq_departures_visit_id"]
+            assert (
+                "WHERE (visit_id IS NOT NULL)"
+                in pairing_indexes["uq_departures_visit_id"]
+            )
+            assert "UNIQUE INDEX" in pairing_indexes["uq_visits_site_check_in_id"]
+            assert "(site_check_in_id)" in pairing_indexes[
+                "uq_visits_site_check_in_id"
+            ]
+            assert (
+                "WHERE (site_check_in_id IS NOT NULL)"
+                in pairing_indexes["uq_visits_site_check_in_id"]
+            )
+
+            receipt_columns = {
+                row["column_name"]: row
+                for row in api.db.query_all("""
+                    SELECT column_name, udt_name, is_nullable, column_default
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'site_qr_action_receipts'
+                """)
+            }
+            assert {
+                name: column["udt_name"]
+                for name, column in receipt_columns.items()
+            } == {
+                "id": "int8",
+                "employee_id": "int4",
+                "location_id": "int4",
+                "shift_id": "int4",
+                "action": "varchar",
+                "idempotency_key": "uuid",
+                "request_fingerprint": "varchar",
+                "server_recorded_at": "timestamptz",
+                "device_scanned_at": "timestamptz",
+                "latitude": "numeric",
+                "longitude": "numeric",
+                "accuracy_m": "numeric",
+                "geofence_radius_m": "int4",
+                "distance_m": "numeric",
+                "geofence_status": "varchar",
+                "outcome": "varchar",
+                "site_check_in_id": "int8",
+                "visit_id": "int4",
+                "departure_id": "int4",
+                "missing_departure_visit_ids": "_int4",
+                "response_body": "jsonb",
+                "created_at": "timestamptz",
+            }
+            assert receipt_columns["missing_departure_visit_ids"][
+                "is_nullable"
+            ] == "NO"
+            assert receipt_columns["missing_departure_visit_ids"][
+                "column_default"
+            ] == "'{}'::integer[]"
+            assert receipt_columns["response_body"]["is_nullable"] == "NO"
+
+            receipt_constraints = "\n".join(
+                row["definition"]
+                for row in api.db.query_all("""
+                    SELECT pg_get_constraintdef(oid) AS definition
+                    FROM pg_constraint
+                    WHERE conrelid = 'site_qr_action_receipts'::regclass
+                """)
+            )
+            assert "UNIQUE (employee_id, idempotency_key)" in receipt_constraints
+            assert (
+                "UNIQUE (employee_id, location_id, device_scanned_at)"
+                in receipt_constraints
+            )
+            for required_value in (
+                "arrive",
+                "depart",
+                "inside",
+                "outside",
+                "uncertain",
+                "low_accuracy",
+                "site_unpinned",
+                "recorded",
+                "evidence_only_review",
+            ):
+                assert required_value in receipt_constraints
+
+            receipt_index = api.db.query_one("""
+                SELECT indexdef
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname = 'idx_site_qr_action_receipts_shift'
+            """)
+            assert "(shift_id, server_recorded_at DESC)" in receipt_index["indexdef"]
+        finally:
+            api.db.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+
+
 class TestTimesheetGpsFlow:
     def test_timesheet_locations_exposes_match_radius(self, client, emp_auth):
         r = client.get("/api/timesheet/locations", headers=emp_auth)

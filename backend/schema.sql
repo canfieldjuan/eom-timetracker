@@ -142,6 +142,8 @@ CREATE TABLE visits (
     arrival_time   TIMESTAMPTZ NOT NULL,
     gps            JSONB,
     gps_meta       JSONB,
+    sequence_version SMALLINT NOT NULL DEFAULT 1
+                         CHECK (sequence_version IN (1, 2)),
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -149,6 +151,7 @@ CREATE TABLE visits (
 CREATE TABLE departures (
     id             SERIAL PRIMARY KEY,
     shift_id       INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+    visit_id       INTEGER REFERENCES visits(id) ON DELETE SET NULL,
     location_id    INTEGER REFERENCES locations(id),
     location_label TEXT NOT NULL DEFAULT '',
     customer_name  TEXT,
@@ -329,6 +332,49 @@ CREATE TABLE site_check_ins (
     reviewed_at              TIMESTAMPTZ,
     review_note              TEXT NOT NULL DEFAULT '',
     created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (employee_id, location_id, device_scanned_at)
+);
+
+-- Version-2 visits link the authoritative arrival event to its immutable QR
+-- arrival evidence. Legacy/manual evidence remains nullable and readable.
+ALTER TABLE visits
+    ADD COLUMN site_check_in_id BIGINT
+        REFERENCES site_check_ins(id) ON DELETE SET NULL;
+
+-- Immutable request/decision envelopes for explicit QR Arrive/Depart actions.
+-- Visits and departures remain the authoritative time events; these rows make
+-- retries exact and retain rejected/weak-GPS evidence without inventing time.
+CREATE TABLE site_qr_action_receipts (
+    id                    BIGSERIAL PRIMARY KEY,
+    employee_id           INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    location_id           INTEGER REFERENCES locations(id) ON DELETE SET NULL,
+    shift_id              INTEGER REFERENCES shifts(id) ON DELETE SET NULL,
+    action                VARCHAR(16) NOT NULL
+                              CHECK (action IN ('arrive', 'depart')),
+    idempotency_key       UUID NOT NULL,
+    request_fingerprint   VARCHAR(64) NOT NULL
+                              CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+    server_recorded_at    TIMESTAMPTZ NOT NULL,
+    device_scanned_at     TIMESTAMPTZ NOT NULL,
+    latitude              NUMERIC(10, 7) NOT NULL,
+    longitude             NUMERIC(10, 7) NOT NULL,
+    accuracy_m            NUMERIC(10, 2) NOT NULL,
+    geofence_radius_m     INTEGER NOT NULL,
+    distance_m            NUMERIC(10, 2),
+    geofence_status       VARCHAR(32) NOT NULL
+                              CHECK (geofence_status IN
+                                 ('inside', 'outside', 'uncertain',
+                                  'low_accuracy', 'site_unpinned')),
+    outcome               VARCHAR(32) NOT NULL
+                              CHECK (outcome IN
+                                 ('recorded', 'evidence_only_review')),
+    site_check_in_id      BIGINT REFERENCES site_check_ins(id) ON DELETE SET NULL,
+    visit_id              INTEGER REFERENCES visits(id) ON DELETE SET NULL,
+    departure_id          INTEGER REFERENCES departures(id) ON DELETE SET NULL,
+    missing_departure_visit_ids INTEGER[] NOT NULL DEFAULT '{}',
+    response_body         JSONB NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (employee_id, idempotency_key),
     UNIQUE (employee_id, location_id, device_scanned_at)
 );
 
@@ -632,6 +678,10 @@ CREATE INDEX idx_visits_location_id ON visits(location_id);
 CREATE INDEX idx_departures_shift_id ON departures(shift_id);
 CREATE INDEX idx_departures_time     ON departures(departure_time);
 CREATE INDEX idx_departures_location_id ON departures(location_id);
+CREATE UNIQUE INDEX uq_departures_visit_id
+    ON departures(visit_id) WHERE visit_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_visits_site_check_in_id
+    ON visits(site_check_in_id) WHERE site_check_in_id IS NOT NULL;
 CREATE INDEX idx_jobs_location_id    ON jobs(location_id);
 CREATE INDEX idx_jobs_scheduled_date ON jobs(scheduled_date);
 CREATE INDEX idx_jobs_customer       ON jobs(customer_name);
@@ -656,6 +706,8 @@ CREATE INDEX idx_site_check_ins_job_time
     WHERE job_id IS NOT NULL;
 CREATE INDEX idx_site_check_ins_review
     ON site_check_ins(review_status, server_checked_in_at DESC);
+CREATE INDEX idx_site_qr_action_receipts_shift
+    ON site_qr_action_receipts(shift_id, server_recorded_at DESC);
 CREATE INDEX idx_site_check_in_reconciliation_reviews_lookup
     ON site_check_in_reconciliation_reviews(
         occurrence_key, evidence_fingerprint, reviewed_at DESC

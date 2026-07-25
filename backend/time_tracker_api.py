@@ -26,7 +26,7 @@ from datetime import date, datetime, time as clock_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from ipaddress import ip_address, ip_network
 from pathlib import Path
-from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Tuple
 from urllib.parse import quote, urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -66,6 +66,7 @@ DEFAULT_LOCATIONS = [
 JWT_ALGORITHM = "HS256"
 EMPLOYEE_WRITE_LOCK = threading.Lock()
 TIMESHEET_WRITE_LOCK = threading.Lock()
+TIMESHEET_PG_ADVISORY_LOCK_ID = 5_107_202_064
 ACCESS_LOG_WRITE_LOCK = threading.Lock()
 logger = logging.getLogger("eom.time_tracker")
 
@@ -811,21 +812,30 @@ def update_employees(mutator) -> Tuple[bool, Any]:
 
 def _row_to_visit(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
+        "id":             int(row["id"]) if row.get("id") is not None else None,
         "arrivalTime": to_utc_iso(row["arrival_time"]) if row.get("arrival_time") else "",
         "location":    row.get("location") or row.get("location_label") or "",
         "customer":    row["customer_name"] or "",
         "gps":         row["gps"],
         "gpsMeta":     row.get("gps_meta"),
+        "sequenceVersion": int(row.get("sequence_version") or 1),
+        "siteCheckInId": (
+            int(row["site_check_in_id"])
+            if row.get("site_check_in_id") is not None
+            else None
+        ),
     }
 
 
 def _row_to_departure(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
+        "id":             int(row["id"]) if row.get("id") is not None else None,
         "departureTime": to_utc_iso(row["departure_time"]) if row.get("departure_time") else "",
         "location":      row.get("location") or row.get("location_label") or "",
         "customer":      row["customer_name"] or "",
         "gps":           row["gps"],
         "gpsMeta":       row.get("gps_meta"),
+        "visitId":       int(row["visit_id"]) if row.get("visit_id") is not None else None,
     }
 
 
@@ -926,8 +936,9 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
 
     visit_rows = db.query_all(
         """
-        SELECT v.shift_id, COALESCE(l.address, '') AS location,
-               v.location_label, v.customer_name, v.arrival_time, v.gps, v.gps_meta
+        SELECT v.id, v.shift_id, COALESCE(l.address, '') AS location,
+               v.location_label, v.customer_name, v.arrival_time, v.gps, v.gps_meta,
+               v.sequence_version, v.site_check_in_id
         FROM visits v
         LEFT JOIN locations l ON v.location_id = l.id
         ORDER BY v.shift_id, v.arrival_time
@@ -939,7 +950,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
 
     departure_rows = db.query_all(
         """
-        SELECT d.shift_id, COALESCE(l.address, '') AS location,
+        SELECT d.id, d.shift_id, d.visit_id, COALESCE(l.address, '') AS location,
                d.location_label, d.customer_name, d.departure_time, d.gps, d.gps_meta
         FROM departures d
         LEFT JOIN locations l ON d.location_id = l.id
@@ -1097,8 +1108,13 @@ def _save_timesheets_to_db(
                 v_loc_id = addr_to_id.get(visit.get("location", ""))
                 cur.execute(
                     """
-                    INSERT INTO visits (shift_id, location_id, location_label, customer_name, arrival_time, gps, gps_meta)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO visits (
+                        shift_id, location_id, location_label, customer_name,
+                        arrival_time, gps, gps_meta, sequence_version,
+                        site_check_in_id
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
                     """,
                     (
                         entry["id"],
@@ -1108,8 +1124,11 @@ def _save_timesheets_to_db(
                         visit.get("arrivalTime"),
                         json.dumps(visit["gps"]) if visit.get("gps") else None,
                         json.dumps(visit["gpsMeta"]) if visit.get("gpsMeta") else None,
+                        int(visit.get("sequenceVersion") or 2),
+                        visit.get("siteCheckInId"),
                     ),
                 )
+                visit["id"] = int(cur.fetchone()[0])
                 # Auto-link shift to the first registered location visited
                 if v_loc_id:
                     cur.execute(
@@ -1122,11 +1141,16 @@ def _save_timesheets_to_db(
                 d_loc_id = addr_to_id.get(departure.get("location", ""))
                 cur.execute(
                     """
-                    INSERT INTO departures (shift_id, location_id, location_label, customer_name, departure_time, gps, gps_meta)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO departures (
+                        shift_id, visit_id, location_id, location_label,
+                        customer_name, departure_time, gps, gps_meta
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
                     """,
                     (
                         entry["id"],
+                        departure.get("visitId"),
                         d_loc_id,
                         departure.get("location", ""),
                         departure.get("customer") or None,
@@ -1135,6 +1159,7 @@ def _save_timesheets_to_db(
                         json.dumps(departure["gpsMeta"]) if departure.get("gpsMeta") else None,
                     ),
                 )
+                departure["id"] = int(cur.fetchone()[0])
 
         cur.execute(
             "SELECT setval('shifts_id_seq', COALESCE(MAX(id), 1)) FROM shifts"
@@ -1238,17 +1263,46 @@ def raise_timesheet_mutation_failure(result: Any) -> None:
     raise HTTPException(status_code=400, detail=str(result))
 
 
+@contextmanager
+def timesheet_postgres_advisory_lock():
+    """Serialize timesheet event writers across backend worker processes."""
+    with db.get_conn() as lock_conn:
+        with lock_conn.cursor() as lock_cur:
+            lock_cur.execute(
+                "SELECT pg_advisory_lock(%s)",
+                (TIMESHEET_PG_ADVISORY_LOCK_ID,),
+            )
+            try:
+                yield
+            finally:
+                lock_cur.execute(
+                    "SELECT pg_advisory_unlock(%s)",
+                    (TIMESHEET_PG_ADVISORY_LOCK_ID,),
+                )
+
+
 def update_timesheets(mutator) -> Tuple[bool, Any]:
     with TIMESHEET_WRITE_LOCK:
-        timesheet_data = _load_timesheets_from_db()
-        pre_shift_ids = {e["id"] for e in timesheet_data["entries"]}
-        pre_visit_counts = {e["id"]: len(e.get("visits", [])) for e in timesheet_data["entries"]}
-        pre_departure_counts = {e["id"]: len(e.get("departures", [])) for e in timesheet_data["entries"]}
+        with timesheet_postgres_advisory_lock():
+            timesheet_data = _load_timesheets_from_db()
+            pre_shift_ids = {e["id"] for e in timesheet_data["entries"]}
+            pre_visit_counts = {
+                e["id"]: len(e.get("visits", [])) for e in timesheet_data["entries"]
+            }
+            pre_departure_counts = {
+                e["id"]: len(e.get("departures", []))
+                for e in timesheet_data["entries"]
+            }
 
-        ok, payload = mutator(timesheet_data)
-        if ok:
-            _save_timesheets_to_db(timesheet_data, pre_shift_ids, pre_visit_counts, pre_departure_counts)
-        return ok, payload
+            ok, payload = mutator(timesheet_data)
+            if ok:
+                _save_timesheets_to_db(
+                    timesheet_data,
+                    pre_shift_ids,
+                    pre_visit_counts,
+                    pre_departure_counts,
+                )
+            return ok, payload
 
 
 def find_employee_by_name(employees: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
@@ -2116,6 +2170,9 @@ class SiteCheckInRequest(BaseModel):
     latitude: float = Field(ge=-90, le=90, allow_inf_nan=False)
     longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
     accuracy: float = Field(ge=0, le=100_000, allow_inf_nan=False)
+    action: Optional[Literal["arrive", "depart"]] = None
+    actionStateToken: Optional[str] = Field(default=None, min_length=20, max_length=2048)
+    idempotencyKey: Optional[UUID] = None
 
     @field_validator("scannedAt")
     @classmethod
@@ -2123,6 +2180,19 @@ class SiteCheckInRequest(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("scannedAt must include a timezone")
         return value.astimezone(timezone.utc)
+
+    @model_validator(mode="after")
+    def explicit_action_fields_are_all_or_none(self) -> "SiteCheckInRequest":
+        supplied = (
+            self.action is not None,
+            self.actionStateToken is not None,
+            self.idempotencyKey is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "action, actionStateToken, and idempotencyKey must be provided together"
+            )
+        return self
 
 
 class SiteCheckInScheduleRequest(BaseModel):
@@ -3775,6 +3845,25 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS location_label TEXT NOT NULL DEFAULT ''"
     )
+    db.execute(
+        "ALTER TABLE visits ADD COLUMN IF NOT EXISTS "
+        "sequence_version SMALLINT NOT NULL DEFAULT 1"
+    )
+    db.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conrelid = 'visits'::regclass
+                  AND conname = 'visits_sequence_version_check'
+            ) THEN
+                ALTER TABLE visits
+                    ADD CONSTRAINT visits_sequence_version_check
+                    CHECK (sequence_version IN (1, 2));
+            END IF;
+        END $$;
+    """)
     _ensure_weekly_schedule_site_schema()
     db.execute("""
         CREATE TABLE IF NOT EXISTS departures (
@@ -3795,6 +3884,61 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE departures ADD COLUMN IF NOT EXISTS gps_meta JSONB"
     )
+    db.execute(
+        "ALTER TABLE departures ADD COLUMN IF NOT EXISTS "
+        "visit_id INTEGER REFERENCES visits(id) ON DELETE SET NULL"
+    )
+    db.execute(
+        "ALTER TABLE visits ADD COLUMN IF NOT EXISTS "
+        "site_check_in_id BIGINT REFERENCES site_check_ins(id) ON DELETE SET NULL"
+    )
+    db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_departures_visit_id
+        ON departures(visit_id) WHERE visit_id IS NOT NULL
+    """)
+    db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_visits_site_check_in_id
+        ON visits(site_check_in_id) WHERE site_check_in_id IS NOT NULL
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS site_qr_action_receipts (
+            id                    BIGSERIAL PRIMARY KEY,
+            employee_id           INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            location_id           INTEGER REFERENCES locations(id) ON DELETE SET NULL,
+            shift_id              INTEGER REFERENCES shifts(id) ON DELETE SET NULL,
+            action                VARCHAR(16) NOT NULL
+                                      CHECK (action IN ('arrive', 'depart')),
+            idempotency_key       UUID NOT NULL,
+            request_fingerprint   VARCHAR(64) NOT NULL
+                                      CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+            server_recorded_at    TIMESTAMPTZ NOT NULL,
+            device_scanned_at     TIMESTAMPTZ NOT NULL,
+            latitude              NUMERIC(10, 7) NOT NULL,
+            longitude             NUMERIC(10, 7) NOT NULL,
+            accuracy_m            NUMERIC(10, 2) NOT NULL,
+            geofence_radius_m     INTEGER NOT NULL,
+            distance_m            NUMERIC(10, 2),
+            geofence_status       VARCHAR(32) NOT NULL
+                                      CHECK (geofence_status IN
+                                         ('inside', 'outside', 'uncertain',
+                                          'low_accuracy', 'site_unpinned')),
+            outcome               VARCHAR(32) NOT NULL
+                                      CHECK (outcome IN
+                                         ('recorded', 'evidence_only_review')),
+            site_check_in_id      BIGINT REFERENCES site_check_ins(id) ON DELETE SET NULL,
+            visit_id              INTEGER REFERENCES visits(id) ON DELETE SET NULL,
+            departure_id          INTEGER REFERENCES departures(id) ON DELETE SET NULL,
+            missing_departure_visit_ids INTEGER[] NOT NULL DEFAULT '{}',
+            response_body         JSONB NOT NULL,
+            created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (employee_id, idempotency_key),
+            UNIQUE (employee_id, location_id, device_scanned_at)
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_site_qr_action_receipts_shift
+        ON site_qr_action_receipts(shift_id, server_recorded_at DESC)
+    """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_week ON schedules(week_start)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_employee ON schedules(employee_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_departures_shift_id ON departures(shift_id)")
@@ -3938,6 +4082,278 @@ def _resolve_site_check_in_qr(
     if not site or not configured_nonce or not hmac.compare_digest(configured_nonce, nonce):
         raise HTTPException(status_code=404, detail="Invalid or revoked site QR code")
     return site
+
+
+SITE_ACTION_STATE_TOKEN_VERSION = "eom-action1"
+SITE_ACTION_STATE_TOKEN_TTL_SECONDS = 15 * 60
+
+
+def _site_action_state_signature(encoded_claims: str) -> str:
+    digest = hmac.new(
+        JWT_SECRET.encode("utf-8"),
+        b"site-action-state\0" + encoded_claims.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return _base64url_encode(digest)
+
+
+def _build_site_action_state_token(claims: Dict[str, Any]) -> str:
+    encoded = _base64url_encode(
+        json.dumps(claims, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return (
+        f"{SITE_ACTION_STATE_TOKEN_VERSION}.{encoded}."
+        f"{_site_action_state_signature(encoded)}"
+    )
+
+
+def _parse_site_action_state_token(token: str) -> Dict[str, Any]:
+    parts = str(token or "").split(".")
+    if len(parts) != 3 or parts[0] != SITE_ACTION_STATE_TOKEN_VERSION:
+        raise ValueError("Invalid action state token")
+    encoded, signature = parts[1], parts[2]
+    expected = _site_action_state_signature(encoded)
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("Invalid action state token")
+    padding = "=" * (-len(encoded) % 4)
+    try:
+        claims = json.loads(
+            base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
+        )
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid action state token") from exc
+    if not isinstance(claims, dict):
+        raise ValueError("Invalid action state token")
+    return claims
+
+
+def _site_action_visit_summary(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "siteId": (
+            int(row["location_id"])
+            if row.get("location_id") is not None
+            else None
+        ),
+        "siteName": str(row.get("site_name") or row.get("location_label") or ""),
+        "customerName": str(row.get("customer_name") or ""),
+        "arrivalTime": to_utc_iso(row["arrival_time"]),
+        "sequenceVersion": int(row.get("sequence_version") or 1),
+    }
+
+
+def _build_site_action_state(
+    cur: Any,
+    *,
+    employee_id: int,
+    site: Dict[str, Any],
+    reference_time: datetime,
+    lock_shifts: bool = False,
+) -> Dict[str, Any]:
+    lock_clause = " FOR UPDATE" if lock_shifts else ""
+    cur.execute(
+        """
+        SELECT id, employee_id, clock_in, clock_out
+        FROM shifts
+        WHERE employee_id = %s AND clock_out IS NULL
+        ORDER BY clock_in DESC, id DESC
+        """ + lock_clause,
+        (employee_id,),
+    )
+    open_shifts = [dict(row) for row in cur.fetchall()]
+    base: Dict[str, Any] = {
+        "status": "clock_in_required",
+        "recommendedAction": None,
+        "shiftId": None,
+        "activeVisit": None,
+        "missingDepartures": [],
+        "stateToken": None,
+        "blockReason": "active_shift_required",
+    }
+    if not open_shifts:
+        base["_fingerprint"] = hashlib.sha256(
+            f"no-shift:{employee_id}".encode("utf-8")
+        ).hexdigest()
+        return base
+
+    stale_shifts = [
+        row
+        for row in open_shifts
+        if (
+            reference_time - row["clock_in"].astimezone(timezone.utc)
+        ).total_seconds() > MAX_ACTIVE_SHIFT_HOURS * 3600
+    ]
+    if stale_shifts or len(open_shifts) > 1:
+        base.update(
+            {
+                "status": "review_required",
+                "shiftId": int(open_shifts[0]["id"]),
+                "blockReason": (
+                    "stale_shift_requires_review"
+                    if stale_shifts
+                    else "multiple_open_shifts_require_review"
+                ),
+            }
+        )
+        fingerprint_material = {
+            "employeeId": employee_id,
+            "siteId": int(site["id"]),
+            "openShiftIds": [int(row["id"]) for row in open_shifts],
+            "staleShiftIds": [int(row["id"]) for row in stale_shifts],
+        }
+        base["_fingerprint"] = hashlib.sha256(
+            json.dumps(
+                fingerprint_material, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        return base
+
+    shift_id = int(open_shifts[0]["id"])
+    cur.execute(
+        """
+        SELECT v.id, v.location_id, v.location_label, v.customer_name,
+               v.arrival_time, v.sequence_version, l.address AS site_name,
+               paired.id AS paired_departure_id
+        FROM visits v
+        LEFT JOIN locations l ON l.id = v.location_id
+        LEFT JOIN departures paired ON paired.visit_id = v.id
+        WHERE v.shift_id = %s
+        ORDER BY v.arrival_time DESC, v.id DESC
+        LIMIT 1
+        """,
+        (shift_id,),
+    )
+    latest_row = cur.fetchone()
+    latest_visit = dict(latest_row) if latest_row else None
+
+    active_visit: Optional[Dict[str, Any]] = None
+    if latest_visit:
+        if latest_visit.get("paired_departure_id") is not None:
+            active_visit = None
+        elif int(latest_visit.get("sequence_version") or 1) >= 2:
+            active_visit = latest_visit
+        else:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM visits
+                WHERE shift_id = %s AND sequence_version = 1
+                """,
+                (shift_id,),
+            )
+            legacy_visit_count = int(cur.fetchone()["n"])
+            cur.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM departures
+                WHERE shift_id = %s AND visit_id IS NULL
+                """,
+                (shift_id,),
+            )
+            legacy_departure_count = int(cur.fetchone()["n"])
+            if legacy_departure_count < legacy_visit_count:
+                active_visit = latest_visit
+
+    cur.execute(
+        """
+        SELECT v.id, v.location_id, v.location_label, v.customer_name,
+               v.arrival_time, v.sequence_version, l.address AS site_name
+        FROM visits v
+        LEFT JOIN locations l ON l.id = v.location_id
+        LEFT JOIN departures paired ON paired.visit_id = v.id
+        WHERE v.shift_id = %s
+          AND v.sequence_version >= 2
+          AND paired.id IS NULL
+        ORDER BY v.arrival_time, v.id
+        """,
+        (shift_id,),
+    )
+    missing_rows = [dict(row) for row in cur.fetchall()]
+    if active_visit and int(active_visit.get("sequence_version") or 1) == 1:
+        missing_rows.append(active_visit)
+
+    active_summary = (
+        _site_action_visit_summary(active_visit) if active_visit else None
+    )
+    recommended_action: Literal["arrive", "depart"] = "arrive"
+    if (
+        active_visit
+        and active_visit.get("location_id") is not None
+        and int(active_visit["location_id"]) == int(site["id"])
+    ):
+        recommended_action = "depart"
+
+    cur.execute(
+        "SELECT COALESCE(MAX(id), 0) AS latest_id FROM departures WHERE shift_id = %s",
+        (shift_id,),
+    )
+    latest_departure_id = int(cur.fetchone()["latest_id"])
+    fingerprint_material = {
+        "employeeId": employee_id,
+        "siteId": int(site["id"]),
+        "shiftId": shift_id,
+        "latestVisitId": int(latest_visit["id"]) if latest_visit else None,
+        "latestVisitSequenceVersion": (
+            int(latest_visit.get("sequence_version") or 1)
+            if latest_visit
+            else None
+        ),
+        "latestVisitPairedDepartureId": (
+            int(latest_visit["paired_departure_id"])
+            if latest_visit and latest_visit.get("paired_departure_id") is not None
+            else None
+        ),
+        "latestDepartureId": latest_departure_id,
+        "missingDepartureVisitIds": [int(row["id"]) for row in missing_rows],
+        "recommendedAction": recommended_action,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_material, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    claims = {
+        "employeeId": employee_id,
+        "siteId": int(site["id"]),
+        "action": recommended_action,
+        "stateFingerprint": fingerprint,
+        "expiresAt": int(reference_time.timestamp())
+        + SITE_ACTION_STATE_TOKEN_TTL_SECONDS,
+    }
+    return {
+        "status": "ready",
+        "recommendedAction": recommended_action,
+        "shiftId": shift_id,
+        "activeVisit": active_summary,
+        "missingDepartures": [
+            _site_action_visit_summary(row) for row in missing_rows
+        ],
+        "stateToken": _build_site_action_state_token(claims),
+        "blockReason": None,
+        "_fingerprint": fingerprint,
+    }
+
+
+def _public_site_action_state(state_row: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in state_row.items() if not key.startswith("_")}
+
+
+def _site_action_state_error(
+    *,
+    code: str,
+    message: str,
+    action_state: Dict[str, Any],
+) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": code,
+            "message": message,
+            "details": {
+                "actionState": _public_site_action_state(action_state),
+            },
+        },
+    )
 
 
 def _site_check_in_schedule_row(schedule_id: int) -> Optional[Dict[str, Any]]:
@@ -4958,6 +5374,144 @@ def _classify_site_check_in(
     )
 
 
+def _insert_site_arrival_evidence(
+    cur: Any,
+    *,
+    employee: Dict[str, Any],
+    site: Dict[str, Any],
+    payload: SiteCheckInRequest,
+    official_time: datetime,
+    geofence: Dict[str, Any],
+) -> Tuple[int, bool, Dict[str, Any]]:
+    job, job_match_reason = _matching_canonical_site_job(
+        int(site["id"]),
+        official_time,
+        cur=cur,
+    )
+    policy = arrival_policies.resolve_policy(
+        cur,
+        site_id=int(site["id"]),
+        job_id=int(job["id"]) if job else None,
+    )
+    schedule = None
+    if policy is None:
+        schedule = _matching_site_check_in_schedule(
+            int(employee["id"]),
+            int(site["id"]),
+            official_time,
+            cur=cur,
+        )
+    device_clock_skew_seconds = abs(
+        (
+            official_time - payload.scannedAt.astimezone(timezone.utc)
+        ).total_seconds()
+    )
+    (
+        classification,
+        reason,
+        review_status,
+        policy_snapshot,
+        policy_scheduled_start,
+        policy_grace_minutes,
+    ) = _classify_site_check_in(
+        geofence,
+        job,
+        job_match_reason,
+        schedule,
+        policy,
+        int(site["id"]),
+        official_time,
+        device_clock_skew_seconds,
+    )
+    cur.execute(
+        """
+        INSERT INTO site_check_ins (
+            employee_id, location_id, job_id, server_checked_in_at,
+            device_scanned_at, latitude, longitude, accuracy_m,
+            geofence_radius_m, distance_m, geofence_status,
+            classification, classification_reason, schedule_id,
+            schedule_rule_id, arrival_policy_revision_id,
+            arrival_policy_snapshot, scheduled_start, grace_minutes,
+            device_clock_skew_seconds, review_status
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        ON CONFLICT (employee_id, location_id, device_scanned_at)
+        DO NOTHING
+        RETURNING id
+        """,
+        (
+            int(employee["id"]),
+            int(site["id"]),
+            int(job["id"]) if job else None,
+            official_time,
+            payload.scannedAt,
+            payload.latitude,
+            payload.longitude,
+            payload.accuracy,
+            geofence["radiusM"],
+            geofence["distanceM"],
+            geofence["status"],
+            classification,
+            reason,
+            schedule.get("id") if schedule else None,
+            schedule.get("schedule_rule_id") if schedule else None,
+            int(policy["id"]) if policy else None,
+            psycopg2.extras.Json(policy_snapshot),
+            (
+                policy_scheduled_start
+                if policy
+                else (schedule["scheduled_start"] if schedule else None)
+            ),
+            (
+                policy_grace_minutes
+                if policy
+                else (schedule["grace_minutes"] if schedule else None)
+            ),
+            device_clock_skew_seconds,
+            review_status,
+        ),
+    )
+    inserted = cur.fetchone()
+    duplicate = inserted is None
+    if inserted:
+        check_in_id = int(inserted["id"])
+    else:
+        cur.execute(
+            """
+            SELECT id
+            FROM site_check_ins
+            WHERE employee_id = %s
+              AND location_id = %s
+              AND device_scanned_at = %s
+            """,
+            (int(employee["id"]), int(site["id"]), payload.scannedAt),
+        )
+        existing = cur.fetchone()
+        if not existing:
+            raise RuntimeError("Unable to reconcile duplicate site check-in")
+        check_in_id = int(existing["id"])
+
+    cur.execute(
+        """
+        SELECT ci.*, e.name AS employee_name, l.address AS site_name,
+               reviewer.name AS reviewed_by_name
+        FROM site_check_ins ci
+        JOIN employees e ON e.id = ci.employee_id
+        JOIN locations l ON l.id = ci.location_id
+        LEFT JOIN employees reviewer ON reviewer.id = ci.reviewed_by
+        WHERE ci.id = %s
+        """,
+        (check_in_id,),
+    )
+    check_in_row = cur.fetchone()
+    if not check_in_row:
+        raise RuntimeError("Site check-in was stored but could not be reloaded")
+    return check_in_id, duplicate, _serialize_site_check_in(dict(check_in_row))
+
+
 @app.get("/", include_in_schema=False)
 @app.get("/timetracker-mobile.html", include_in_schema=False)
 def time_tracker_page(
@@ -5281,6 +5835,391 @@ def admin_site_check_in_qr(
     }
 
 
+def _site_action_request_fingerprint(payload: SiteCheckInRequest) -> str:
+    material = payload.model_dump(mode="json")
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _site_action_gps_meta(
+    site: Dict[str, Any],
+    geofence: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "override": False,
+        "overrideReason": "",
+        "overrideDetail": "",
+        "matchedLocation": str(site.get("address") or ""),
+        "distanceM": geofence.get("distanceM"),
+        "withinRadius": geofence.get("status") == "inside",
+        "accuracyM": geofence.get("accuracyM"),
+    }
+
+
+def _current_site_action_state_for_id(
+    cur: Any,
+    *,
+    employee_id: int,
+    site_id: int,
+    reference_time: datetime,
+) -> Dict[str, Any]:
+    cur.execute(
+        """
+        SELECT id, address, customer_name, lat, lng
+        FROM locations
+        WHERE id = %s AND active = true
+        """,
+        (site_id,),
+    )
+    site_row = cur.fetchone()
+    if site_row:
+        return _build_site_action_state(
+            cur,
+            employee_id=employee_id,
+            site=dict(site_row),
+            reference_time=reference_time,
+            lock_shifts=True,
+        )
+    return {
+        "status": "review_required",
+        "recommendedAction": None,
+        "shiftId": None,
+        "activeVisit": None,
+        "missingDepartures": [],
+        "stateToken": None,
+        "blockReason": "site_unavailable",
+        "_fingerprint": hashlib.sha256(
+            f"site-unavailable:{employee_id}:{site_id}".encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _record_explicit_site_action(
+    payload: SiteCheckInRequest,
+    request: Request,
+    employee: Dict[str, Any],
+) -> Dict[str, Any]:
+    assert payload.action is not None
+    assert payload.actionStateToken is not None
+    assert payload.idempotencyKey is not None
+    fingerprint = _site_action_request_fingerprint(payload)
+    employee_id = int(employee["id"])
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (TIMESHEET_PG_ADVISORY_LOCK_ID,),
+            )
+            cur.execute(
+                """
+                SELECT id, request_fingerprint, response_body
+                FROM site_qr_action_receipts
+                WHERE employee_id = %s
+                  AND (
+                      idempotency_key = %s
+                      OR (location_id = %s AND device_scanned_at = %s)
+                  )
+                ORDER BY
+                    CASE WHEN idempotency_key = %s THEN 0 ELSE 1 END,
+                    id
+                """,
+                (
+                    employee_id,
+                    str(payload.idempotencyKey),
+                    int(payload.siteId),
+                    payload.scannedAt,
+                    str(payload.idempotencyKey),
+                ),
+            )
+            existing_rows = [dict(row) for row in cur.fetchall()]
+            if existing_rows:
+                if (
+                    len(existing_rows) == 1
+                    and hmac.compare_digest(
+                        str(existing_rows[0]["request_fingerprint"]),
+                        fingerprint,
+                    )
+                ):
+                    replay = dict(existing_rows[0]["response_body"])
+                    replay["replayed"] = True
+                    return replay
+                fresh_state = _current_site_action_state_for_id(
+                    cur,
+                    employee_id=employee_id,
+                    site_id=int(payload.siteId),
+                    reference_time=utc_now(),
+                )
+                raise _site_action_state_error(
+                    code="IDEMPOTENCY_KEY_REUSED",
+                    message=(
+                        "This QR action key or scan time already belongs to "
+                        "different action details."
+                    ),
+                    action_state=fresh_state,
+                )
+
+            # The official timestamp belongs to the serialized mutation order,
+            # not to time spent queued behind an earlier event writer.
+            official_time = utc_now()
+            site = _resolve_site_check_in_qr(
+                payload.token,
+                cur=cur,
+                for_update=True,
+            )
+            if int(site["id"]) != int(payload.siteId):
+                raise HTTPException(
+                    status_code=400,
+                    detail="siteId must match the scanned site QR",
+                )
+
+            current_state = _build_site_action_state(
+                cur,
+                employee_id=employee_id,
+                site=site,
+                reference_time=official_time,
+                lock_shifts=True,
+            )
+            if current_state["status"] == "clock_in_required":
+                raise _site_action_state_error(
+                    code="ACTIVE_SHIFT_REQUIRED",
+                    message="Clock in before recording this Site action.",
+                    action_state=current_state,
+                )
+            if current_state["status"] != "ready":
+                raise _site_action_state_error(
+                    code="SITE_ACTION_STATE_CHANGED",
+                    message=(
+                        "Your shift state needs review before this Site action "
+                        "can be recorded."
+                    ),
+                    action_state=current_state,
+                )
+
+            try:
+                claims = _parse_site_action_state_token(payload.actionStateToken)
+                token_matches = (
+                    int(claims.get("employeeId", 0)) == employee_id
+                    and int(claims.get("siteId", 0)) == int(site["id"])
+                    and str(claims.get("action") or "") == payload.action
+                    and hmac.compare_digest(
+                        str(claims.get("stateFingerprint") or ""),
+                        str(current_state["_fingerprint"]),
+                    )
+                    and int(claims.get("expiresAt", 0))
+                    >= int(official_time.timestamp())
+                )
+            except (TypeError, ValueError):
+                token_matches = False
+            if (
+                not token_matches
+                or current_state["recommendedAction"] != payload.action
+            ):
+                raise _site_action_state_error(
+                    code="SITE_ACTION_STATE_CHANGED",
+                    message=(
+                        "The Site action changed. Review the current action and "
+                        "confirm it again."
+                    ),
+                    action_state=current_state,
+                )
+
+            if payload.action == "arrive":
+                enforce_clock_action_hours(request)
+
+            geofence = evaluate_site_check_in_geofence(
+                site_latitude=(
+                    float(site["lat"]) if site.get("lat") is not None else None
+                ),
+                site_longitude=(
+                    float(site["lng"]) if site.get("lng") is not None else None
+                ),
+                latitude=payload.latitude,
+                longitude=payload.longitude,
+                accuracy=payload.accuracy,
+            )
+            records_time_event = geofence["status"] == "inside"
+            outcome = (
+                "recorded" if records_time_event else "evidence_only_review"
+            )
+            shift_id = int(current_state["shiftId"])
+            missing_visit_ids = [
+                int(row["id"]) for row in current_state["missingDepartures"]
+            ]
+            check_in_id: Optional[int] = None
+            check_in: Optional[Dict[str, Any]] = None
+            duplicate = False
+            visit: Optional[Dict[str, Any]] = None
+            departure: Optional[Dict[str, Any]] = None
+
+            if payload.action == "arrive":
+                check_in_id, duplicate, check_in = _insert_site_arrival_evidence(
+                    cur,
+                    employee=employee,
+                    site=site,
+                    payload=payload,
+                    official_time=official_time,
+                    geofence=geofence,
+                )
+                if records_time_event:
+                    gps = build_gps_point(
+                        payload.latitude,
+                        payload.longitude,
+                        payload.accuracy,
+                    )
+                    gps_meta = _site_action_gps_meta(site, geofence)
+                    cur.execute(
+                        """
+                        INSERT INTO visits (
+                            shift_id, location_id, location_label, customer_name,
+                            arrival_time, gps, gps_meta, sequence_version,
+                            site_check_in_id
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, 2, %s)
+                        RETURNING id
+                        """,
+                        (
+                            shift_id,
+                            int(site["id"]),
+                            str(site["address"]),
+                            str(site.get("customer_name") or "") or None,
+                            official_time,
+                            psycopg2.extras.Json(gps),
+                            psycopg2.extras.Json(gps_meta),
+                            check_in_id,
+                        ),
+                    )
+                    visit_id = int(cur.fetchone()["id"])
+                    cur.execute(
+                        """
+                        UPDATE shifts
+                        SET location_id = %s
+                        WHERE id = %s AND location_id IS NULL
+                        """,
+                        (int(site["id"]), shift_id),
+                    )
+                    visit = {
+                        "id": visit_id,
+                        "arrivalTime": to_utc_iso(official_time),
+                        "location": str(site["address"]),
+                        "customer": str(site.get("customer_name") or ""),
+                        "gps": gps,
+                        "gpsMeta": gps_meta,
+                        "sequenceVersion": 2,
+                        "siteCheckInId": check_in_id,
+                    }
+            elif records_time_event:
+                active_visit = current_state.get("activeVisit")
+                if not active_visit:
+                    raise _site_action_state_error(
+                        code="SITE_ACTION_STATE_CHANGED",
+                        message=(
+                            "There is no active Site arrival to depart from. "
+                            "Review the current action and confirm it again."
+                        ),
+                        action_state=current_state,
+                    )
+                visit_id = int(active_visit["id"])
+                gps = build_gps_point(
+                    payload.latitude,
+                    payload.longitude,
+                    payload.accuracy,
+                )
+                gps_meta = _site_action_gps_meta(site, geofence)
+                cur.execute(
+                    """
+                    INSERT INTO departures (
+                        shift_id, visit_id, location_id, location_label,
+                        customer_name, departure_time, gps, gps_meta
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        shift_id,
+                        visit_id,
+                        int(site["id"]),
+                        str(site["address"]),
+                        str(site.get("customer_name") or "") or None,
+                        official_time,
+                        psycopg2.extras.Json(gps),
+                        psycopg2.extras.Json(gps_meta),
+                    ),
+                )
+                departure_id = int(cur.fetchone()["id"])
+                departure = {
+                    "id": departure_id,
+                    "departureTime": to_utc_iso(official_time),
+                    "location": str(site["address"]),
+                    "customer": str(site.get("customer_name") or ""),
+                    "visitId": visit_id,
+                    "gps": gps,
+                    "gpsMeta": gps_meta,
+                }
+
+            fresh_state = _build_site_action_state(
+                cur,
+                employee_id=employee_id,
+                site=site,
+                reference_time=official_time,
+                lock_shifts=False,
+            )
+            response: Dict[str, Any] = {
+                "success": True,
+                "action": payload.action,
+                "outcome": outcome,
+                "replayed": False,
+                "duplicate": duplicate,
+                "shiftId": shift_id,
+                "actionState": _public_site_action_state(fresh_state),
+            }
+            if payload.action == "arrive":
+                response["checkIn"] = check_in
+                response["visit"] = visit
+            else:
+                response["departure"] = departure
+
+            cur.execute(
+                """
+                INSERT INTO site_qr_action_receipts (
+                    employee_id, location_id, shift_id, action,
+                    idempotency_key, request_fingerprint, server_recorded_at,
+                    device_scanned_at, latitude, longitude, accuracy_m,
+                    geofence_radius_m, distance_m, geofence_status, outcome,
+                    site_check_in_id, visit_id, departure_id,
+                    missing_departure_visit_ids, response_body
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    employee_id,
+                    int(site["id"]),
+                    shift_id,
+                    payload.action,
+                    str(payload.idempotencyKey),
+                    fingerprint,
+                    official_time,
+                    payload.scannedAt,
+                    payload.latitude,
+                    payload.longitude,
+                    payload.accuracy,
+                    geofence["radiusM"],
+                    geofence["distanceM"],
+                    geofence["status"],
+                    outcome,
+                    check_in_id,
+                    visit.get("id") if visit else None,
+                    departure.get("id") if departure else None,
+                    missing_visit_ids,
+                    psycopg2.extras.Json(response),
+                ),
+            )
+            return response
+
+
 @app.post("/api/timesheet/site-check-in/resolve")
 def resolve_site_check_in_qr(
     payload: SiteQrResolveRequest,
@@ -5288,6 +6227,14 @@ def resolve_site_check_in_qr(
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     site = _resolve_site_check_in_qr(payload.token)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            action_state = _build_site_action_state(
+                cur,
+                employee_id=int(employee["id"]),
+                site=site,
+                reference_time=utc_now(),
+            )
     append_access_log(
         request,
         "SITE_QR_RESOLVED",
@@ -5301,6 +6248,7 @@ def resolve_site_check_in_qr(
             "name": str(site["address"]),
             "customerName": str(site.get("customer_name") or ""),
         },
+        "actionState": _public_site_action_state(action_state),
     }
 
 
@@ -5310,7 +6258,8 @@ def record_site_check_in(
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
-    enforce_clock_action_hours(request)
+    if payload.action is None:
+        enforce_clock_action_hours(request)
     if int(payload.employeeId) != int(employee["id"]):
         append_access_log(
             request,
@@ -5319,6 +6268,19 @@ def record_site_check_in(
             f"Session employee {employee['id']} attempted employee {payload.employeeId}",
         )
         raise HTTPException(status_code=403, detail="employeeId must match the signed-in employee")
+
+    if payload.action is not None:
+        result = _record_explicit_site_action(payload, request, employee)
+        append_access_log(
+            request,
+            "SITE_QR_ACTION_REPLAYED" if result["replayed"] else "SITE_QR_ACTION_RECORDED",
+            True,
+            (
+                f"Employee {employee['name']} site {payload.siteId} "
+                f"action {result['action']} outcome {result['outcome']}"
+            ),
+        )
+        return result
 
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -7230,6 +8192,8 @@ def log_visit(
                 payload.gpsOverrideDetail,
                 payload.accuracy,
             ),
+            "sequenceVersion": 2,
+            "siteCheckInId": None,
         }
 
         if not isinstance(open_entry.get("visits"), list):
@@ -7254,13 +8218,38 @@ def get_active_visit(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not visits:
         return None
 
-    departures = entry.get("departures") or []
-    if len(departures) >= len(visits):
-        return None
-
     last_visit = visits[-1]
     arrival_time = str(last_visit.get("arrivalTime", "")).strip()
-    return last_visit if arrival_time else None
+    if not arrival_time:
+        return None
+
+    departures = entry.get("departures") or []
+    if last_visit.get("id"):
+        last_visit_id = int(last_visit["id"])
+        if any(
+            departure.get("visitId") is not None
+            and int(departure["visitId"]) == last_visit_id
+            for departure in departures
+            if isinstance(departure, dict)
+        ):
+            return None
+    if int(last_visit.get("sequenceVersion") or 1) >= 2:
+        return last_visit
+
+    # Version-1 rows predate explicit pairing. Keep their historical count
+    # interpretation, but never let an older legacy gap reactivate after a
+    # newer version-2 visit has been closed.
+    legacy_visits = [
+        visit
+        for visit in visits
+        if int(visit.get("sequenceVersion") or 1) == 1
+    ]
+    legacy_departures = [
+        departure
+        for departure in departures
+        if departure.get("visitId") is None
+    ]
+    return None if len(legacy_departures) >= len(legacy_visits) else last_visit
 
 
 @app.post("/api/timesheet/depart")
@@ -7299,6 +8288,7 @@ def depart_location(
             "departureTime": to_utc_iso(now_utc),
             "location": active_visit.get("location", ""),
             "customer": active_visit.get("customer", ""),
+            "visitId": active_visit.get("id"),
             "gps": None,
             "gpsMeta": build_gps_meta(
                 timesheet_data,
@@ -9047,6 +10037,8 @@ def _correction_shift_snapshots(
             v.arrival_time,
             v.gps,
             v.gps_meta,
+            v.sequence_version,
+            v.site_check_in_id,
             v.created_at
         FROM visits v
         LEFT JOIN locations l ON l.id = v.location_id
@@ -9068,11 +10060,44 @@ def _correction_shift_snapshots(
             d.departure_time,
             d.gps,
             d.gps_meta,
+            d.visit_id,
             d.created_at
         FROM departures d
         LEFT JOIN locations l ON l.id = d.location_id
         WHERE d.shift_id = ANY(%s)
         ORDER BY d.shift_id, d.departure_time, d.id
+        """,
+        (ids,),
+        cursor,
+    )
+    receipt_rows = _correction_query_all(
+        """
+        SELECT
+            receipt.id,
+            receipt.employee_id,
+            receipt.location_id,
+            receipt.shift_id,
+            receipt.action,
+            receipt.idempotency_key,
+            receipt.request_fingerprint,
+            receipt.server_recorded_at,
+            receipt.device_scanned_at,
+            receipt.latitude,
+            receipt.longitude,
+            receipt.accuracy_m,
+            receipt.geofence_radius_m,
+            receipt.distance_m,
+            receipt.geofence_status,
+            receipt.outcome,
+            receipt.site_check_in_id,
+            receipt.visit_id,
+            receipt.departure_id,
+            receipt.missing_departure_visit_ids,
+            receipt.response_body,
+            receipt.created_at
+        FROM site_qr_action_receipts receipt
+        WHERE receipt.shift_id = ANY(%s)
+        ORDER BY receipt.shift_id, receipt.server_recorded_at, receipt.id
         """,
         (ids,),
         cursor,
@@ -9090,6 +10115,12 @@ def _correction_shift_snapshots(
             "arrivalTime": to_utc_iso(row["arrival_time"]),
             "gps": row.get("gps"),
             "gpsMeta": row.get("gps_meta"),
+            "sequenceVersion": int(row.get("sequence_version") or 1),
+            "siteCheckInId": (
+                int(row["site_check_in_id"])
+                if row.get("site_check_in_id") is not None
+                else None
+            ),
             "createdAt": to_utc_iso(row["created_at"]),
         })
 
@@ -9105,6 +10136,65 @@ def _correction_shift_snapshots(
             "departureTime": to_utc_iso(row["departure_time"]),
             "gps": row.get("gps"),
             "gpsMeta": row.get("gps_meta"),
+            "visitId": (
+                int(row["visit_id"])
+                if row.get("visit_id") is not None
+                else None
+            ),
+            "createdAt": to_utc_iso(row["created_at"]),
+        })
+
+    receipts_by_shift: Dict[int, List[Dict[str, Any]]] = {}
+    for row in receipt_rows:
+        if row.get("shift_id") is None:
+            continue
+        receipts_by_shift.setdefault(int(row["shift_id"]), []).append({
+            "id": int(row["id"]),
+            "employeeId": (
+                int(row["employee_id"])
+                if row.get("employee_id") is not None
+                else None
+            ),
+            "locationId": (
+                int(row["location_id"])
+                if row.get("location_id") is not None
+                else None
+            ),
+            "shiftId": int(row["shift_id"]),
+            "action": str(row["action"]),
+            "idempotencyKey": str(row["idempotency_key"]),
+            "requestFingerprint": str(row["request_fingerprint"]),
+            "serverRecordedAt": to_utc_iso(row["server_recorded_at"]),
+            "deviceScannedAt": to_utc_iso(row["device_scanned_at"]),
+            "latitude": float(row["latitude"]),
+            "longitude": float(row["longitude"]),
+            "accuracyM": float(row["accuracy_m"]),
+            "geofenceRadiusM": int(row["geofence_radius_m"]),
+            "distanceM": (
+                float(row["distance_m"])
+                if row.get("distance_m") is not None
+                else None
+            ),
+            "geofenceStatus": str(row["geofence_status"]),
+            "outcome": str(row["outcome"]),
+            "siteCheckInId": (
+                int(row["site_check_in_id"])
+                if row.get("site_check_in_id") is not None
+                else None
+            ),
+            "visitId": (
+                int(row["visit_id"]) if row.get("visit_id") is not None else None
+            ),
+            "departureId": (
+                int(row["departure_id"])
+                if row.get("departure_id") is not None
+                else None
+            ),
+            "missingDepartureVisitIds": [
+                int(value)
+                for value in (row.get("missing_departure_visit_ids") or [])
+            ],
+            "responseBody": row.get("response_body"),
             "createdAt": to_utc_iso(row["created_at"]),
         })
 
@@ -9134,6 +10224,7 @@ def _correction_shift_snapshots(
             "createdAt": to_utc_iso(row["created_at"]),
             "visits": visits_by_shift.get(shift_id, []),
             "departures": departures_by_shift.get(shift_id, []),
+            "siteQrActionReceipts": receipts_by_shift.get(shift_id, []),
         })
     return snapshots
 
@@ -9142,7 +10233,14 @@ def _correction_metadata_signature(snapshot: Dict[str, Any]) -> str:
     comparable = {
         key: value
         for key, value in snapshot.items()
-        if key not in {"id", "createdAt", "employeeName", "visits", "departures"}
+        if key not in {
+            "id",
+            "createdAt",
+            "employeeName",
+            "visits",
+            "departures",
+            "siteQrActionReceipts",
+        }
     }
     comparable["visits"] = [
         {
@@ -9160,11 +10258,28 @@ def _correction_metadata_signature(snapshot: Dict[str, Any]) -> str:
         }
         for row in snapshot.get("departures", [])
     ]
+    comparable["siteQrActionReceipts"] = [
+        {
+            key: value
+            for key, value in row.items()
+            if key
+            not in {
+                "id",
+                "shiftId",
+                "siteCheckInId",
+                "visitId",
+                "departureId",
+                "createdAt",
+            }
+        }
+        for row in snapshot.get("siteQrActionReceipts", [])
+    ]
     return json.dumps(comparable, sort_keys=True, separators=(",", ":"))
 
 
 def _correction_richness_score(snapshot: Dict[str, Any]) -> int:
     score = 10 * (len(snapshot.get("visits", [])) + len(snapshot.get("departures", [])))
+    score += 5 * len(snapshot.get("siteQrActionReceipts", []))
     score += 8 if snapshot.get("jobId") is not None else 0
     score += 4 if str(snapshot.get("notes") or "").strip() else 0
     score += 3 if snapshot.get("timeCategory") != "productive" else 0
@@ -9508,6 +10623,10 @@ def admin_apply_time_data_correction(
 
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (TIMESHEET_PG_ADVISORY_LOCK_ID,),
+            )
             if requested_ids:
                 cur.execute(
                     "SELECT id FROM shifts WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
