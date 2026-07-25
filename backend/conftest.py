@@ -68,6 +68,7 @@ def _apply_schema(conn):
                 receivables_operation_attempts,
                 time_data_correction_batches,
                 site_check_in_reconciliation_reviews, site_check_ins,
+                arrival_policy_revisions,
                 site_check_in_schedule_rules, site_check_in_schedules,
                 schedules, departures, visits,
                 shifts, jobs, locations, customers, employees, settings CASCADE

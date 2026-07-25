@@ -226,6 +226,75 @@ CREATE TABLE site_check_in_schedule_rules (
     )
 );
 
+-- Append-only Site and canonical-appointment arrival-policy revisions. The
+-- latest revision is current; retirement is a new revision, never an update.
+CREATE TABLE arrival_policy_revisions (
+    id               BIGSERIAL PRIMARY KEY,
+    scope_type       VARCHAR(16) NOT NULL
+                         CHECK (scope_type IN ('site', 'appointment')),
+    site_id          INTEGER NOT NULL,
+    job_id           INTEGER,
+    version          INTEGER NOT NULL CHECK (version > 0),
+    state            VARCHAR(16) NOT NULL
+                         CHECK (state IN ('active', 'retired')),
+    mode             VARCHAR(16)
+                         CHECK (mode IN ('fixed', 'window', 'flexible', 'not_before')),
+    timezone         TEXT,
+    fixed_arrival    TIME,
+    grace_minutes    INTEGER CHECK (grace_minutes BETWEEN 0 AND 120),
+    window_start     TIME,
+    window_end       TIME,
+    not_before       TIME,
+    update_token     VARCHAR(64) NOT NULL UNIQUE
+                         CHECK (update_token ~ '^[0-9a-f]{64}$'),
+    change_note      TEXT NOT NULL CHECK (char_length(change_note) BETWEEN 3 AND 500),
+    created_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_by_name  TEXT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (
+        (scope_type = 'site' AND job_id IS NULL)
+        OR (scope_type = 'appointment' AND job_id IS NOT NULL)
+    ),
+    CHECK (
+        state = 'retired'
+        OR (
+            mode IS NOT NULL
+            AND timezone IS NOT NULL
+            AND (
+                (mode = 'fixed' AND fixed_arrival IS NOT NULL
+                 AND grace_minutes IS NOT NULL AND window_start IS NULL
+                 AND window_end IS NULL AND not_before IS NULL)
+                OR
+                (mode = 'window' AND fixed_arrival IS NULL
+                 AND grace_minutes IS NULL AND window_start IS NOT NULL
+                 AND window_end IS NOT NULL AND not_before IS NULL)
+                OR
+                (mode = 'flexible' AND fixed_arrival IS NULL
+                 AND grace_minutes IS NULL AND window_start IS NULL
+                 AND window_end IS NULL AND not_before IS NULL)
+                OR
+                (mode = 'not_before' AND fixed_arrival IS NULL
+                 AND grace_minutes IS NULL AND window_start IS NULL
+                 AND window_end IS NULL AND not_before IS NOT NULL)
+            )
+        )
+    ),
+    UNIQUE (scope_type, site_id, job_id, version)
+);
+
+CREATE UNIQUE INDEX uq_arrival_policy_site_version
+    ON arrival_policy_revisions(site_id, version)
+    WHERE scope_type = 'site';
+CREATE UNIQUE INDEX uq_arrival_policy_appointment_version
+    ON arrival_policy_revisions(job_id, version)
+    WHERE scope_type = 'appointment';
+CREATE INDEX idx_arrival_policy_site_latest
+    ON arrival_policy_revisions(site_id, version DESC)
+    WHERE scope_type = 'site';
+CREATE INDEX idx_arrival_policy_appointment_latest
+    ON arrival_policy_revisions(job_id, version DESC)
+    WHERE scope_type = 'appointment';
+
 -- Immutable evidence for each authenticated QR site check-in. Device time is
 -- retained as evidence; server_checked_in_at is the official timestamp.
 CREATE TABLE site_check_ins (
@@ -248,6 +317,8 @@ CREATE TABLE site_check_ins (
     classification_reason    VARCHAR(64) NOT NULL,
     schedule_id              BIGINT REFERENCES site_check_in_schedules(id) ON DELETE SET NULL,
     schedule_rule_id         BIGINT REFERENCES site_check_in_schedule_rules(id) ON DELETE SET NULL,
+    arrival_policy_revision_id BIGINT REFERENCES arrival_policy_revisions(id) ON DELETE SET NULL,
+    arrival_policy_snapshot  JSONB,
     scheduled_start          TIMESTAMPTZ,
     grace_minutes            INTEGER,
     device_clock_skew_seconds NUMERIC(12, 2) NOT NULL,

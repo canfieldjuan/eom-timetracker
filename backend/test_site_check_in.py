@@ -26,6 +26,7 @@ def isolate_site_check_in_data(setup_db):
         conn = _raw_conn()
         with conn.cursor() as cur:
             cur.execute("DELETE FROM site_check_ins")
+            cur.execute("DELETE FROM arrival_policy_revisions")
             cur.execute("DELETE FROM site_check_in_schedule_rules")
             cur.execute("DELETE FROM site_check_in_schedules")
             cur.execute(
