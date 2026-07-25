@@ -8,7 +8,14 @@ does not authorize a production legacy-data migration.
 - Policy revisions are append-only. A Site or canonical appointment owns the
   policy; employee identity is not part of the policy key.
 - Appointment policy takes precedence over Site policy.
+- When Calendar moves a canonical appointment to another Site, synchronization
+  appends an auditable revision that rebinds its active policy to the new Site;
+  prior revisions remain unchanged.
 - Check-ins store the exact selected policy revision and a JSON snapshot.
+- Every stored snapshot records `classifiedBy` as `arrival_policy`,
+  `legacy_exact`, `legacy_recurring`, or `implicit_flexible`. When a reviewed
+  policy is selected, the request does not consult or persist employee-specific
+  legacy schedule fields.
 - A Site without a reviewed new policy continues to use the retained legacy
   exact/recurring lookup during this stage. This preserves current production
   classification while owner review is incomplete.

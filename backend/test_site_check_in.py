@@ -482,6 +482,7 @@ class TestSiteCheckInDecision:
         assert check_in["classification"] == "on_time"
         assert check_in["classificationReason"] == "within_grace_period"
         assert check_in["reviewStatus"] == "not_required"
+        assert check_in["arrivalPolicySnapshot"]["classifiedBy"] == "legacy_exact"
         conn = _raw_conn()
         with conn.cursor() as cur:
             cur.execute(
@@ -628,6 +629,10 @@ class TestSiteCheckInDecision:
         assert check_in["scheduleRuleId"] is None
         assert check_in["scheduledStart"] is None
         assert check_in["graceMinutes"] is None
+        assert (
+            check_in["arrivalPolicySnapshot"]["classifiedBy"]
+            == "implicit_flexible"
+        )
 
         conn = _raw_conn()
         with conn.cursor() as cur:
@@ -1168,6 +1173,10 @@ class TestRecurringSiteCheckInSchedules:
         assert check_in["scheduleId"] is None
         assert check_in["scheduleRuleId"] == rule["id"]
         assert check_in["scheduledStart"] == "2026-07-20T12:00:00Z"
+        assert (
+            check_in["arrivalPolicySnapshot"]["classifiedBy"]
+            == "legacy_recurring"
+        )
 
     def test_rule_respects_grace_weekdays_and_exact_schedule_override(
         self,

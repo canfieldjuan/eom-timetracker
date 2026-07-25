@@ -354,6 +354,7 @@ def validate_owner_mapping(
     if not isinstance(entries, list):
         return [*errors, "mapping.entries must be a list"]
     seen: set[str] = set()
+    seen_policy_targets: dict[tuple[str, int], str] = {}
     for index, entry in enumerate(entries):
         prefix = f"mapping.entries[{index}]"
         if not isinstance(entry, dict):
@@ -380,12 +381,32 @@ def validate_owner_mapping(
                 errors.append(
                     f"{prefix} may map only to its sole eligible appointment"
                 )
+            else:
+                target = ("appointment", int(eligible))
+                prior_key = seen_policy_targets.get(target)
+                if prior_key is not None:
+                    errors.append(
+                        f"{prefix} duplicates appointment policy target {eligible} "
+                        f"already selected by {prior_key}"
+                    )
+                else:
+                    seen_policy_targets[target] = key
         if disposition == "promote_to_site" and not bool(
             entry.get("ownerConfirmedSitePromotion")
         ):
             errors.append(
                 f"{prefix}.ownerConfirmedSitePromotion must be true"
             )
+        if disposition == "promote_to_site":
+            target = ("site", int(source["siteId"]))
+            prior_key = seen_policy_targets.get(target)
+            if prior_key is not None:
+                errors.append(
+                    f"{prefix} duplicates Site policy target {source['siteId']} "
+                    f"already selected by {prior_key}"
+                )
+            else:
+                seen_policy_targets[target] = key
         if disposition in {"map_to_appointment", "promote_to_site"}:
             policy = entry.get("policy")
             if not isinstance(policy, dict):

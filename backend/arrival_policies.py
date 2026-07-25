@@ -247,6 +247,84 @@ def latest_revision(
     return dict(row) if row else None
 
 
+def rebind_active_appointment_policy(
+    cur: Any,
+    *,
+    job_id: int,
+    new_site_id: int,
+    actor_id: int,
+    actor_name: str,
+) -> Optional[int]:
+    """Append a revision when Calendar moves a policy-owning appointment."""
+
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (f"arrival-policy:appointment:{job_id}",),
+    )
+    current = latest_revision(
+        cur,
+        scope_type="appointment",
+        site_id=new_site_id,
+        job_id=job_id,
+        for_update=True,
+    )
+    if (
+        current is None
+        or current["state"] != "active"
+        or int(current["site_id"]) == new_site_id
+    ):
+        return None
+
+    version = int(current["version"]) + 1
+    created_at = datetime.now(timezone.utc)
+    update_token = policy_update_token(
+        "appointment",
+        new_site_id,
+        job_id,
+        version,
+        created_at,
+    )
+    change_note = (
+        "Calendar sync moved canonical appointment "
+        f"from Site {int(current['site_id'])} to Site {new_site_id}"
+    )
+    cur.execute(
+        """
+        INSERT INTO arrival_policy_revisions (
+            scope_type, site_id, job_id, version, state, mode,
+            timezone, fixed_arrival, grace_minutes, window_start,
+            window_end, not_before, update_token, change_note,
+            created_by, created_by_name, created_at
+        )
+        VALUES (
+            'appointment', %s, %s, %s, 'active', %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s
+        )
+        RETURNING id
+        """,
+        (
+            new_site_id,
+            job_id,
+            version,
+            current["mode"],
+            current["timezone"],
+            current["fixed_arrival"],
+            current["grace_minutes"],
+            current["window_start"],
+            current["window_end"],
+            current["not_before"],
+            update_token,
+            change_note,
+            actor_id,
+            actor_name,
+            created_at,
+        ),
+    )
+    return int(cur.fetchone()["id"])
+
+
 def resolve_policy(
     cur: Any,
     *,
@@ -334,6 +412,19 @@ def validate_policy_values(
         "window_end": window_end,
         "not_before": not_before,
     }
+    for field_name in (
+        "fixed_arrival",
+        "window_start",
+        "window_end",
+        "not_before",
+    ):
+        field_value = fields[field_name]
+        if field_value is None:
+            continue
+        if field_value.tzinfo is not None:
+            raise ValueError(f"{field_name} must not include a timezone")
+        if field_value.second or field_value.microsecond:
+            raise ValueError(f"{field_name} must use HH:MM precision")
     required = {
         "fixed": {"fixed_arrival", "grace_minutes"},
         "window": {"window_start", "window_end"},
@@ -364,6 +455,7 @@ def evaluate_policy(
     """Return classification, reason, review state, snapshot, start, grace."""
     snapshot = snapshot_revision(policy)
     snapshot["authority"] = str(policy["scope_type"])
+    snapshot["classifiedBy"] = "arrival_policy"
     snapshot["evaluatedAt"] = (
         checked_in_at.astimezone(timezone.utc)
         .replace(microsecond=0)

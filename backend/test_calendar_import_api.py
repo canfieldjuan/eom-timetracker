@@ -282,6 +282,7 @@ def isolated_calendar_domain(monkeypatch):
                 DELETE FROM google_calendar_oauth_states;
                 DELETE FROM shifts
                 WHERE notes = 'canonical-calendar-test-evidence';
+                DELETE FROM arrival_policy_revisions;
                 DELETE FROM jobs WHERE source_key IS NOT NULL;
                 DELETE FROM google_calendar_sources;
                 DELETE FROM google_calendar_connections;
@@ -339,6 +340,7 @@ def isolated_calendar_domain(monkeypatch):
                 DELETE FROM google_calendar_oauth_states;
                 DELETE FROM shifts
                 WHERE notes = 'canonical-calendar-test-evidence';
+                DELETE FROM arrival_policy_revisions;
                 DELETE FROM jobs WHERE source_key IS NOT NULL;
                 DELETE FROM google_calendar_sources;
                 DELETE FROM google_calendar_connections;
@@ -3963,6 +3965,124 @@ def test_non_site_source_change_keeps_site_when_normalized_hints_are_unchanged(
     )
     assert int(updated["location_id"]) == location_id
     assert updated["scheduled_start"] == WINDOW_START + timedelta(days=1)
+
+
+def test_sync_site_move_appends_active_appointment_policy_revision(client, auth):
+    sources = configure_canonical_sources(client, auth)
+    source = sources[store.RESIDENTIAL_MORNING_ROLE]
+    original = google_occurrence(
+        "appointment-policy-site-move",
+        calendar_id="residential@example.test",
+    )
+    FakeGoogleClient.occurrences_by_calendar = {
+        "residential@example.test": [original],
+        "commercial@example.test": [],
+    }
+    created = client.post("/api/admin/google-calendar/sync", headers=auth)
+    assert created.status_code == 200, created.text
+    job = db.query_one(
+        "SELECT id, location_id FROM jobs WHERE source_key = %s",
+        (original.source_key,),
+    )
+    policy = client.put(
+        f"/api/admin/jobs/{int(job['id'])}/arrival-policy",
+        headers=auth,
+        json={
+            "mode": "fixed",
+            "timezone": "America/Chicago",
+            "fixedArrival": "07:00",
+            "graceMinutes": 10,
+            "changeNote": "Owner-reviewed policy before Calendar Site move",
+        },
+    )
+    assert policy.status_code == 200, policy.text
+    first_revision = policy.json()["policy"]
+    new_site_id = int(
+        db.query_one(
+            """
+            INSERT INTO locations (
+                address, customer_name, location_type, active
+            ) VALUES (
+                '789 Pine St, Effingham', 'Moved Policy Customer',
+                'Residential', true
+            )
+            RETURNING id
+            """
+        )["id"]
+    )
+    moved = google_occurrence(
+        original.event_id,
+        calendar_id="residential@example.test",
+        summary="Moved Policy Customer",
+        location="789 Pine St, Effingham",
+        updated="2026-07-22T12:00:00Z",
+    )
+    moved_occurrence = calendar_api._source_occurrence(moved)
+    source_row = db.query_one(
+        "SELECT connection_id, calendar_id FROM google_calendar_sources WHERE id = %s",
+        (int(source["id"]),),
+    )
+    db.execute(
+        """
+        INSERT INTO google_calendar_event_mappings (
+            connection_id, calendar_id, source_key, mapping_scope,
+            source_fingerprint, location_id, created_by, updated_by
+        ) VALUES (%s, %s, %s, 'occurrence', %s, %s, 1, 1)
+        """,
+        (
+            int(source_row["connection_id"]),
+            str(source_row["calendar_id"]),
+            moved_occurrence.source_key,
+            calendar_api.occurrence_fingerprint(moved_occurrence),
+            new_site_id,
+        ),
+    )
+    FakeGoogleClient.occurrences_by_calendar["residential@example.test"] = [moved]
+
+    synced = client.post("/api/admin/google-calendar/sync", headers=auth)
+
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["counts"]["update"] == 1
+    assert synced.json()["exceptions"] == []
+    assert db.query_one(
+        "SELECT location_id FROM jobs WHERE id = %s",
+        (int(job["id"]),),
+    ) == {"location_id": new_site_id}
+    revisions = db.query_all(
+        """
+        SELECT id, site_id, version, state, mode, timezone, fixed_arrival,
+               grace_minutes, change_note, created_by_name
+        FROM arrival_policy_revisions
+        WHERE scope_type = 'appointment' AND job_id = %s
+        ORDER BY version
+        """,
+        (int(job["id"]),),
+    )
+    assert [row["version"] for row in revisions] == [1, 2]
+    assert revisions[0]["id"] == first_revision["id"]
+    assert revisions[0]["site_id"] == int(job["location_id"])
+    assert revisions[1]["site_id"] == new_site_id
+    assert revisions[1]["state"] == "active"
+    assert revisions[1]["mode"] == revisions[0]["mode"] == "fixed"
+    assert revisions[1]["timezone"] == revisions[0]["timezone"]
+    assert revisions[1]["fixed_arrival"] == revisions[0]["fixed_arrival"]
+    assert revisions[1]["grace_minutes"] == revisions[0]["grace_minutes"]
+    assert revisions[1]["created_by_name"] == "Juan Canfield"
+    assert revisions[1]["change_note"] == (
+        "Calendar sync moved canonical appointment "
+        f"from Site {int(job['location_id'])} to Site {new_site_id}"
+    )
+    audit = db.query_one(
+        """
+        SELECT after_state
+        FROM planned_visit_audit_events
+        WHERE source_key = %s AND action = 'canonical_job_updated'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (original.source_key,),
+    )
+    assert audit["after_state"]["arrivalPolicyRevisionId"] == revisions[1]["id"]
 
 
 def test_source_sync_commits_one_calendar_when_the_other_fetch_fails(client, auth):

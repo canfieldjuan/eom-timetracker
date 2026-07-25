@@ -8,6 +8,7 @@ from datetime import date, datetime, time, timedelta, timezone
 import pytest
 
 import arrival_policies
+import db
 from arrival_policy_inventory import build_inventory, validate_owner_mapping
 from conftest import _raw_conn
 from test_site_check_in import (
@@ -250,6 +251,32 @@ def test_dst_gap_and_fold_fail_closed():
     assert fold_reason == "ambiguous_policy_local_time"
 
 
+@pytest.mark.parametrize(
+    ("fixed_arrival", "message"),
+    [
+        (time(7, 0, 1), "fixed_arrival must use HH:MM precision"),
+        (
+            time(7, 0, tzinfo=timezone.utc),
+            "fixed_arrival must not include a timezone",
+        ),
+    ],
+)
+def test_shared_policy_validator_enforces_canonical_wall_times(
+    fixed_arrival,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        arrival_policies.validate_policy_values(
+            mode="fixed",
+            timezone_name="America/Chicago",
+            fixed_arrival=fixed_arrival,
+            grace_minutes=10,
+            window_start=None,
+            window_end=None,
+            not_before=None,
+        )
+
+
 def test_admin_revision_api_requires_tokens_notes_and_preserves_history(
     client,
     auth,
@@ -328,6 +355,208 @@ def test_admin_revision_api_requires_tokens_notes_and_preserves_history(
     assert [row["version"] for row in retired.json()["history"]] == [3, 2, 1]
 
 
+def test_appointment_policy_put_requires_canonical_job_but_history_can_retire(
+    client,
+    auth,
+    location_id,
+):
+    manual_job_id = int(
+        db.query_one(
+            """
+            INSERT INTO jobs (
+                location_id, customer_name, scheduled_date, scheduled_start,
+                scheduled_end, status, source_calendar_id, notes
+            ) VALUES (
+                %s, 'Manual policy target', '2026-07-20',
+                '2026-07-20T12:00:00Z', '2026-07-20T14:00:00Z',
+                'scheduled', %s, 'arrival-policy-noncanonical-test'
+            )
+            RETURNING id
+            """,
+            (location_id, f"{CANONICAL_TEST_PREFIX}-manual-policy-target"),
+        )["id"]
+    )
+    rejected = client.put(
+        f"/api/admin/jobs/{manual_job_id}/arrival-policy",
+        headers=auth,
+        json={
+            "mode": "flexible",
+            "timezone": "America/Chicago",
+            "changeNote": "Manual jobs are not canonical policy targets",
+        },
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["code"] == "arrival_policy_job_not_canonical"
+
+    canonical_job_id = create_canonical_job(
+        location_id,
+        datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc),
+        suffix="policy-history-after-source-removal",
+    )
+    created = client.put(
+        f"/api/admin/jobs/{canonical_job_id}/arrival-policy",
+        headers=auth,
+        json={
+            "mode": "flexible",
+            "timezone": "America/Chicago",
+            "changeNote": "Reviewed canonical appointment policy",
+        },
+    )
+    assert created.status_code == 200, created.text
+    first = created.json()["policy"]
+    db.execute(
+        "UPDATE jobs SET calendar_source_id = NULL WHERE id = %s",
+        (canonical_job_id,),
+    )
+
+    historical = client.get(
+        f"/api/admin/jobs/{canonical_job_id}/arrival-policy",
+        headers=auth,
+    )
+    assert historical.status_code == 200, historical.text
+    assert historical.json()["policy"]["id"] == first["id"]
+    blocked_update = client.put(
+        f"/api/admin/jobs/{canonical_job_id}/arrival-policy",
+        headers=auth,
+        json={
+            "mode": "fixed",
+            "timezone": "America/Chicago",
+            "fixedArrival": "07:00",
+            "graceMinutes": 10,
+            "expectedUpdateToken": first["updateToken"],
+            "changeNote": "This target is no longer canonical",
+        },
+    )
+    assert blocked_update.status_code == 409, blocked_update.text
+    retired = client.post(
+        f"/api/admin/jobs/{canonical_job_id}/arrival-policy/retire",
+        headers=auth,
+        json={
+            "expectedUpdateToken": first["updateToken"],
+            "changeNote": "Retire history after canonical source removal",
+        },
+    )
+    assert retired.status_code == 200, retired.text
+    assert retired.json()["currentRevision"]["state"] == "retired"
+
+
+def test_policy_mutation_responses_are_anchored_before_a_later_write(
+    client,
+    auth,
+    location_id,
+    monkeypatch,
+):
+    import time_tracker_api
+
+    created = client.put(
+        f"/api/admin/locations/{location_id}/arrival-policy",
+        headers=auth,
+        json={
+            "mode": "fixed",
+            "timezone": "America/Chicago",
+            "fixedArrival": "07:00",
+            "graceMinutes": 10,
+            "changeNote": "Initial policy before response race",
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_action = {"value": "ARRIVAL_POLICY_SAVED"}
+
+    def inject_later_revision(_request, action, _allowed, _reason=""):
+        if action != trigger_action["value"]:
+            return
+        trigger_action["value"] = ""
+        current = db.query_one(
+            """
+            SELECT version
+            FROM arrival_policy_revisions
+            WHERE scope_type = 'site' AND site_id = %s
+            ORDER BY version DESC, id DESC
+            LIMIT 1
+            """,
+            (location_id,),
+        )
+        version = int(current["version"]) + 1
+        created_at = datetime.now(timezone.utc)
+        db.execute(
+            """
+            INSERT INTO arrival_policy_revisions (
+                scope_type, site_id, job_id, version, state, mode, timezone,
+                update_token, change_note, created_by_name, created_at
+            ) VALUES (
+                'site', %s, NULL, %s, 'active', 'flexible',
+                'America/Chicago', %s, 'Concurrent later write',
+                'Concurrent Admin', %s
+            )
+            """,
+            (
+                location_id,
+                version,
+                arrival_policies.policy_update_token(
+                    "site",
+                    location_id,
+                    None,
+                    version,
+                    created_at,
+                ),
+                created_at,
+            ),
+        )
+
+    monkeypatch.setattr(time_tracker_api, "append_access_log", inject_later_revision)
+    updated = client.put(
+        f"/api/admin/locations/{location_id}/arrival-policy",
+        headers=auth,
+        json={
+            "mode": "flexible",
+            "timezone": "America/Chicago",
+            "expectedUpdateToken": created.json()["policy"]["updateToken"],
+            "changeNote": "Response must remain anchored to this revision",
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["currentRevision"]["version"] == 2
+    assert [row["version"] for row in updated.json()["history"]] == [2, 1]
+    latest = db.query_one(
+        """
+        SELECT version, update_token
+        FROM arrival_policy_revisions
+        WHERE scope_type = 'site' AND site_id = %s
+        ORDER BY version DESC, id DESC
+        LIMIT 1
+        """,
+        (location_id,),
+    )
+    assert int(latest["version"]) == 3
+
+    trigger_action["value"] = "ARRIVAL_POLICY_RETIRED"
+    retired = client.post(
+        f"/api/admin/locations/{location_id}/arrival-policy/retire",
+        headers=auth,
+        json={
+            "expectedUpdateToken": latest["update_token"],
+            "changeNote": "Retirement response must remain anchored",
+        },
+    )
+    assert retired.status_code == 200, retired.text
+    assert retired.json()["policy"] is None
+    assert retired.json()["currentRevision"]["version"] == 4
+    assert retired.json()["currentRevision"]["state"] == "retired"
+    assert [row["version"] for row in retired.json()["history"]] == [4, 3, 2, 1]
+    assert int(
+        db.query_one(
+            """
+            SELECT version
+            FROM arrival_policy_revisions
+            WHERE scope_type = 'site' AND site_id = %s
+            ORDER BY version DESC, id DESC
+            LIMIT 1
+            """,
+            (location_id,),
+        )["version"]
+    ) == 5
+
+
 def test_appointment_precedence_and_duplicate_snapshot_are_immutable(
     client,
     auth,
@@ -376,6 +605,14 @@ def test_appointment_precedence_and_duplicate_snapshot_are_immutable(
     assert appointment.status_code == 200, appointment.text
     first_revision = appointment.json()["policy"]
 
+    def fail_legacy_schedule_lookup(*_args, **_kwargs):
+        pytest.fail("active arrival policy must bypass legacy schedule lookup")
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_matching_site_check_in_schedule",
+        fail_legacy_schedule_lookup,
+    )
     token = create_site_qr(client, auth, location_id)["token"]
     monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
     payload = site_check_in_payload(
@@ -395,6 +632,9 @@ def test_appointment_precedence_and_duplicate_snapshot_are_immutable(
     assert evidence["classificationReason"] == "after_arrival_policy_grace"
     assert evidence["arrivalPolicyRevisionId"] == first_revision["id"]
     assert evidence["arrivalPolicySnapshot"]["authority"] == "appointment"
+    assert evidence["arrivalPolicySnapshot"]["classifiedBy"] == "arrival_policy"
+    assert evidence["scheduleId"] is None
+    assert evidence["scheduleRuleId"] is None
     assert "updateToken" not in evidence["arrivalPolicySnapshot"]
     assert "changeNote" not in evidence["arrivalPolicySnapshot"]
 
@@ -443,6 +683,13 @@ def test_read_only_inventory_requires_explicit_owner_dispositions(
         location_id,
         weekdays=[0],
         starts_on="2026-07-20",
+    )
+    second_exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start + timedelta(hours=1),
     )
     job_id = create_canonical_job(
         location_id,
@@ -511,8 +758,42 @@ def test_read_only_inventory_requires_explicit_owner_dispositions(
         for entry in mapping["entries"]
         if entry["legacyKey"] == f"exact:{exact['id']}"
     )
-    exact_mapping["targetJobId"] = job_id + 999
+    wrong_target = json.loads(json.dumps(mapping))
+    next(
+        entry
+        for entry in wrong_target["entries"]
+        if entry["legacyKey"] == f"exact:{exact['id']}"
+    )["targetJobId"] = job_id + 999
     assert any(
         "sole eligible appointment" in error
-        for error in validate_owner_mapping(inventory, mapping)
+        for error in validate_owner_mapping(inventory, wrong_target)
+    )
+
+    seconds_mapping = json.loads(json.dumps(mapping))
+    next(
+        entry
+        for entry in seconds_mapping["entries"]
+        if entry["legacyKey"] == f"exact:{exact['id']}"
+    )["policy"]["fixedArrival"] = "07:00:01"
+    assert any(
+        "fixed_arrival must use HH:MM precision" in error
+        for error in validate_owner_mapping(inventory, seconds_mapping)
+    )
+
+    duplicate_target = json.loads(json.dumps(mapping))
+    second_exact_mapping = next(
+        entry
+        for entry in duplicate_target["entries"]
+        if entry["legacyKey"] == f"exact:{second_exact['id']}"
+    )
+    second_exact_mapping.update(
+        {
+            "disposition": "map_to_appointment",
+            "targetJobId": job_id,
+            "policy": exact_mapping["policy"],
+        }
+    )
+    assert any(
+        "duplicates appointment policy target" in error
+        for error in validate_owner_mapping(inventory, duplicate_target)
     )
