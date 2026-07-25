@@ -324,6 +324,98 @@ def test_customer_patch_distinguishes_omission_from_explicit_null(client, auth):
     assert _customer_row(customer_id)["name"] == before["name"]
 
 
+def test_customer_patch_rejects_a_stale_update_token_without_writing(client, auth):
+    customer = _create_customer(
+        client,
+        auth,
+        "Customer Update Token",
+        primaryPhone="217-555-0100",
+        billingName="Original Billing",
+    )
+    original_token = customer["updateToken"]
+    assert len(original_token) == 64
+    int(original_token, 16)
+
+    updated = client.patch(
+        f"/api/admin/customers/{customer['id']}",
+        headers=auth,
+        json={
+            "expectedUpdateToken": original_token,
+            "primaryPhone": "217-555-0199",
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    updated_customer = updated.json()["customer"]
+    assert updated_customer["updateToken"] != original_token
+    assert updated_customer["primaryPhone"] == "217-555-0199"
+
+    stale = client.patch(
+        f"/api/admin/customers/{customer['id']}",
+        headers=auth,
+        json={
+            "expectedUpdateToken": original_token,
+            "billingName": "Stale Billing",
+        },
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json() == {
+        "success": False,
+        "error": "Customer changed after it was read; reload before retrying",
+        "code": "stale_customer_update",
+        "details": {"customerId": customer["id"]},
+    }
+    persisted = _customer_row(customer["id"])
+    assert persisted["primary_phone"] == "217-555-0199"
+    assert persisted["billing_name"] == "Original Billing"
+
+
+def test_update_token_distinguishes_changes_within_the_same_second(client, auth):
+    customer = _create_customer(
+        client,
+        auth,
+        "Same Second Update Token",
+        primaryPhone="217-555-0100",
+    )
+    timestamps = (
+        datetime(2026, 7, 24, 12, 34, 56, 123456, tzinfo=timezone.utc),
+        datetime(2026, 7, 24, 12, 34, 56, 123457, tzinfo=timezone.utc),
+    )
+
+    tokens = []
+    displayed_timestamps = []
+    for updated_at in timestamps:
+        conn = _raw_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE customers SET updated_at = %s WHERE id = %s",
+                    (updated_at, customer["id"]),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        current = client.get(
+            f"/api/admin/customers/{customer['id']}",
+            headers=auth,
+        ).json()["customer"]
+        tokens.append(current["updateToken"])
+        displayed_timestamps.append(current["updatedAt"])
+
+    assert displayed_timestamps[0] == displayed_timestamps[1]
+    assert tokens[0] != tokens[1]
+
+    stale = client.patch(
+        f"/api/admin/customers/{customer['id']}",
+        headers=auth,
+        json={
+            "expectedUpdateToken": tokens[0],
+            "primaryPhone": "217-555-0999",
+        },
+    )
+    assert stale.status_code == 409, stale.text
+    assert _customer_row(customer["id"])["primary_phone"] == "217-555-0100"
+
+
 def test_site_patch_distinguishes_omission_from_explicit_null(client, auth):
     customer = _create_customer(
         client,
@@ -422,6 +514,163 @@ def test_site_patch_distinguishes_omission_from_explicit_null(client, auth):
     assert rejected.json()["code"] == "validation_error"
     assert rejected.json()["details"]
     assert _location_row(site_id)["address"] == before["address"]
+
+
+def test_site_patch_rejects_a_stale_update_token_without_writing(client, auth):
+    customer = _create_customer(client, auth, "Site Update Token")
+    site = _create_site(
+        client,
+        auth,
+        customer["id"],
+        "125 Update Token Way",
+        rate=97.0,
+        rateType="monthly",
+        frequency="Monthly",
+    )
+    original_token = site["updateToken"]
+    assert len(original_token) == 64
+    int(original_token, 16)
+
+    updated = client.patch(
+        f"/api/admin/locations/{site['id']}",
+        headers=auth,
+        json={
+            "expectedUpdateToken": original_token,
+            "rate": 247.5,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    updated_site = updated.json()["location"]
+    assert updated_site["updateToken"] != original_token
+    assert updated_site["rate"] == pytest.approx(247.5)
+
+    stale = client.patch(
+        f"/api/admin/locations/{site['id']}",
+        headers=auth,
+        json={
+            "expectedUpdateToken": original_token,
+            "frequency": "Stale Frequency",
+        },
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json() == {
+        "success": False,
+        "error": "Site changed after it was read; reload before retrying",
+        "code": "stale_site_update",
+        "details": {"siteId": site["id"]},
+    }
+    persisted = _location_row(site["id"])
+    assert float(persisted["rate"]) == pytest.approx(247.5)
+    assert persisted["frequency"] == "Monthly"
+
+
+def test_patch_treats_an_explicitly_null_update_token_as_unguarded(client, auth):
+    customer = _create_customer(client, auth, "Null Update Token")
+    site = _create_site(client, auth, customer["id"], "126 Null Update Token Way")
+
+    customer_response = client.patch(
+        f"/api/admin/customers/{customer['id']}",
+        headers=auth,
+        json={"expectedUpdateToken": None, "primaryPhone": "217-555-0166"},
+    )
+    assert customer_response.status_code == 200, customer_response.text
+    assert customer_response.json()["customer"]["primaryPhone"] == "217-555-0166"
+
+    site_response = client.patch(
+        f"/api/admin/locations/{site['id']}",
+        headers=auth,
+        json={"expectedUpdateToken": None, "frequency": "Every Friday"},
+    )
+    assert site_response.status_code == 200, site_response.text
+    assert site_response.json()["location"]["frequency"] == "Every Friday"
+
+    malformed = client.patch(
+        f"/api/admin/customers/{customer['id']}",
+        headers=auth,
+        json={"expectedUpdateToken": "not-a-token"},
+    )
+    assert malformed.status_code == 422, malformed.text
+    assert "expectedUpdateToken" in malformed.json()["details"]["fields"]
+
+
+def test_concurrent_customer_patches_with_one_update_token_have_one_winner(
+    client,
+    auth,
+):
+    customer = _create_customer(
+        client,
+        auth,
+        "Concurrent Update Token",
+        primaryPhone="217-555-0100",
+    )
+    start = Barrier(2)
+
+    def update_phone(phone):
+        start.wait(timeout=10)
+        return client.patch(
+            f"/api/admin/customers/{customer['id']}",
+            headers=auth,
+            json={
+                "expectedUpdateToken": customer["updateToken"],
+                "primaryPhone": phone,
+            },
+        )
+
+    phones = ["217-555-0111", "217-555-0222"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = [
+            future.result(timeout=20)
+            for future in [pool.submit(update_phone, phone) for phone in phones]
+        ]
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    winner = next(response for response in responses if response.status_code == 200)
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.json()["code"] == "stale_customer_update"
+    assert _customer_row(customer["id"])["primary_phone"] == winner.json()["customer"][
+        "primaryPhone"
+    ]
+
+
+def test_concurrent_site_patches_with_one_update_token_have_one_winner(client, auth):
+    customer = _create_customer(client, auth, "Concurrent Site Update Token")
+    site = _create_site(
+        client,
+        auth,
+        customer["id"],
+        "127 Concurrent Update Token Way",
+        frequency="Original Frequency",
+    )
+    start = Barrier(2)
+
+    def update_frequency(frequency):
+        start.wait(timeout=10)
+        return client.patch(
+            f"/api/admin/locations/{site['id']}",
+            headers=auth,
+            json={
+                "expectedUpdateToken": site["updateToken"],
+                "frequency": frequency,
+            },
+        )
+
+    frequencies = ["Every Monday", "Every Thursday"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = [
+            future.result(timeout=20)
+            for future in [
+                pool.submit(update_frequency, frequency)
+                for frequency in frequencies
+            ]
+        ]
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    winner = next(response for response in responses if response.status_code == 200)
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.json()["code"] == "stale_site_update"
+    assert _location_row(site["id"])["frequency"] == winner.json()["location"][
+        "frequency"
+    ]
 
 
 def test_customer_rename_syncs_all_sites_and_explicit_id_reassigns_one_site(
