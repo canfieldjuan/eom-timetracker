@@ -34,6 +34,12 @@ def test_cannot_demote_or_deactivate_last_active_admin(client, auth):
     )
     assert r.status_code == 409, r.text
 
+    # The new payroll role is non-admin and must hit the same lockout guard.
+    r = client.patch(
+        f"/api/admin/employees/{juan['id']}", headers=auth, json={"role": "payroll"}
+    )
+    assert r.status_code == 409, r.text
+
     # Deactivating the sole active admin must also be blocked.
     r = client.patch(
         f"/api/admin/employees/{juan['id']}", headers=auth, json={"active": False}

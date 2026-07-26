@@ -8,7 +8,7 @@ CREATE TABLE employees (
     password_hash TEXT NOT NULL,
     active        BOOLEAN NOT NULL DEFAULT true,
     role          TEXT NOT NULL DEFAULT 'employee'
-                      CHECK (role IN ('admin', 'employee')),
+                      CHECK (role IN ('admin', 'employee', 'payroll')),
     hourly_rate   NUMERIC(8, 2),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_login_at TIMESTAMPTZ
