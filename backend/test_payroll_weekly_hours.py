@@ -84,6 +84,10 @@ def _delete_employees(employee_ids: list[int]) -> None:
 def _delete_payroll_verification_weeks(week_starts: list[date]) -> None:
     for week_start in week_starts:
         db.execute(
+            "DELETE FROM payroll_hour_corrections WHERE week_start = %s",
+            (week_start,),
+        )
+        db.execute(
             "DELETE FROM payroll_verification_batches WHERE week_start = %s",
             (week_start,),
         )
@@ -646,8 +650,235 @@ def test_payroll_verification_reports_stale_and_requires_reverify_before_finaliz
         _delete_employees([employee_id])
 
 
+def test_payroll_hour_correction_overlays_day_total_without_mutating_shift(client, auth):
+    week_start = date(2026, 8, 23)
+    correction_date = week_start + timedelta(days=2)
+    employee_id = _create_employee("Payroll Correction Overlay Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(correction_date, 8),
+            _local_dt(correction_date, 10),
+        )
+        before = _weekly_hours(client, auth, week_start)
+
+        response = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": correction_date.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Mayra confirmed the cleaner worked one extra hour.",
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["action"] == "correct"
+        assert body["idempotent"] is False
+        assert body["correction"]["employeeId"] == employee_id
+        assert body["correction"]["correctedTotalMinutes"] == 180
+        assert body["weeklyHours"]["sourceFingerprint"] != before["sourceFingerprint"]
+        assert body["weeklyHours"]["summary"]["correctionCount"] == 1
+
+        employee = _employees_by_name(body["weeklyHours"])["Payroll Correction Overlay Worker"]
+        assert employee["totalMinutes"] == 180
+        assert employee["totalHours"] == 3
+        assert employee["correctionCount"] == 1
+        corrected_day = employee["days"][2]
+        assert corrected_day["totalMinutes"] == 180
+        assert corrected_day["correction"]["sourceTotalMinutes"] == 120
+        assert corrected_day["correction"]["deltaMinutes"] == 60
+        assert corrected_day["correction"]["reason"] == (
+            "Mayra confirmed the cleaner worked one extra hour."
+        )
+
+        stored_shift = db.query_one(
+            "SELECT total_hours FROM shifts WHERE id = %s",
+            (shift_id,),
+        )
+        assert stored_shift is not None
+        assert float(stored_shift["total_hours"]) == 2
+
+        corrections = client.get(
+            f"/api/admin/payroll/weekly-hours/corrections?weekStart={week_start.isoformat()}",
+            headers=auth,
+        )
+        assert corrections.status_code == 200, corrections.text
+        assert [row["correctionId"] for row in corrections.json()["corrections"]] == [
+            body["correction"]["correctionId"]
+        ]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_payroll_corrections_require_reopen_after_verification_and_supersede(client, auth):
+    week_start = date(2026, 8, 30)
+    correction_date = week_start + timedelta(days=1)
+    employee_id = _create_employee("Payroll Correction Reopen Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(correction_date, 8),
+            _local_dt(correction_date, 9),
+        )
+        first_correction = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": correction_date.isoformat(),
+                "correctedTotalMinutes": 90,
+                "reason": "Initial correction from Mayra.",
+            },
+        )
+        assert first_correction.status_code == 200, first_correction.text
+        weekly = first_correction.json()["weeklyHours"]
+        verified = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": weekly["sourceFingerprint"],
+            },
+        )
+        assert verified.status_code == 200, verified.text
+
+        blocked = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": correction_date.isoformat(),
+                "correctedTotalMinutes": 120,
+                "reason": "Attempt before reopen should fail.",
+            },
+        )
+        assert blocked.status_code == 409, blocked.text
+        assert blocked.json()["error"] == "Reopen the payroll week before changing corrections"
+
+        reopened = client.post(
+            "/api/admin/payroll/weekly-hours/reopen",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "reason": "Need to change one corrected day.",
+            },
+        )
+        assert reopened.status_code == 200, reopened.text
+
+        second_correction = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": correction_date.isoformat(),
+                "correctedTotalMinutes": 120,
+                "reason": "Updated correction from Mayra.",
+            },
+        )
+        assert second_correction.status_code == 200, second_correction.text
+        assert second_correction.json()["weeklyHours"]["summary"]["correctionCount"] == 1
+        employee = _employees_by_name(second_correction.json()["weeklyHours"])[
+            "Payroll Correction Reopen Worker"
+        ]
+        assert employee["totalMinutes"] == 120
+
+        rows = db.query_all(
+            """
+            SELECT status, superseded_by
+            FROM payroll_hour_corrections
+            WHERE week_start = %s AND employee_id = %s
+            ORDER BY id
+            """,
+            (week_start, employee_id),
+        )
+        assert [row["status"] for row in rows] == ["superseded", "active"]
+        assert rows[0]["superseded_by"] == second_correction.json()["correction"]["correctionId"]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_void_payroll_correction_restores_shift_total_and_employee_role_is_denied(
+    client,
+    auth,
+    emp_auth,
+):
+    week_start = date(2026, 9, 6)
+    correction_date = week_start
+    employee_id = _create_employee("Payroll Correction Void Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(correction_date, 8),
+            _local_dt(correction_date, 10),
+        )
+        employee_denied = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=emp_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": correction_date.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Employees cannot write payroll corrections.",
+            },
+        )
+        assert employee_denied.status_code == 403, employee_denied.text
+
+        created = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": correction_date.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Temporary correction to void.",
+            },
+        )
+        assert created.status_code == 200, created.text
+        correction_id = created.json()["correction"]["correctionId"]
+
+        voided = client.post(
+            f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/void",
+            headers=auth,
+            json={"reason": "Correction was entered for the wrong employee."},
+        )
+        assert voided.status_code == 200, voided.text
+        assert voided.json()["correction"]["status"] == "voided"
+        assert voided.json()["weeklyHours"]["summary"]["correctionCount"] == 0
+        employee = _employees_by_name(voided.json()["weeklyHours"])[
+            "Payroll Correction Void Worker"
+        ]
+        assert employee["totalMinutes"] == 120
+        assert "correction" not in employee["days"][0]
+
+        corrections = client.get(
+            f"/api/admin/payroll/weekly-hours/corrections?weekStart={week_start.isoformat()}",
+            headers=auth,
+        )
+        assert corrections.status_code == 200, corrections.text
+        assert corrections.json()["corrections"] == []
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
 def test_payroll_verification_schema_migration_installs_existing_deployments():
-    db.execute("DROP TABLE IF EXISTS payroll_verification_events, payroll_verification_batches")
+    db.execute(
+        "DROP TABLE IF EXISTS payroll_hour_corrections, "
+        "payroll_verification_events, payroll_verification_batches"
+    )
     time_tracker_api._ensure_schema_migrations()
 
     batch_table = db.query_one(
@@ -655,6 +886,9 @@ def test_payroll_verification_schema_migration_installs_existing_deployments():
     )
     event_table = db.query_one(
         "SELECT to_regclass('payroll_verification_events') AS table_name"
+    )
+    correction_table = db.query_one(
+        "SELECT to_regclass('payroll_hour_corrections') AS table_name"
     )
     status_check = db.query_one(
         """
@@ -671,6 +905,8 @@ def test_payroll_verification_schema_migration_installs_existing_deployments():
     assert batch_table["table_name"] == "payroll_verification_batches"
     assert event_table is not None
     assert event_table["table_name"] == "payroll_verification_events"
+    assert correction_table is not None
+    assert correction_table["table_name"] == "payroll_hour_corrections"
     assert status_check == {"found": 1}
 
 

@@ -66,6 +66,7 @@ def _apply_schema(conn):
                 crew_memberships, crews, google_calendar_oauth_states,
                 google_calendar_sources, google_calendar_connections,
                 receivables_operation_attempts,
+                payroll_hour_corrections,
                 payroll_verification_events, payroll_verification_batches,
                 time_data_correction_batches,
                 site_qr_action_receipts,
