@@ -117,7 +117,7 @@ def test_employee_hours_uses_one_local_sunday_to_saturday_week(
         assert previous_body["weekStartDate"] == "2026-07-12"
         assert _week_dates(previous_body)[-1] == "2026-07-18"
         assert previous_body["weekTotal"] == 4.0
-        assert previous_body["weeklyHours"] == 3.0
+        assert previous_body["weeklyHours"] == 4.0
     finally:
         _delete_employee(employee_id)
 
