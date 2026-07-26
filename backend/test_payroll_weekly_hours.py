@@ -81,6 +81,14 @@ def _delete_employees(employee_ids: list[int]) -> None:
         db.execute("DELETE FROM employees WHERE id = %s", (employee_id,))
 
 
+def _delete_payroll_verification_weeks(week_starts: list[date]) -> None:
+    for week_start in week_starts:
+        db.execute(
+            "DELETE FROM payroll_verification_batches WHERE week_start = %s",
+            (week_start,),
+        )
+
+
 def _login(client, name: str, password: str = "payroll1234") -> dict[str, str]:
     response = client.post("/api/auth/login", json={"name": name, "password": password})
     assert response.status_code == 200, response.text
@@ -89,6 +97,19 @@ def _login(client, name: str, password: str = "payroll1234") -> dict[str, str]:
 
 def _employees_by_name(body: dict) -> dict[str, dict]:
     return {employee["employeeName"]: employee for employee in body["employees"]}
+
+
+def _weekly_hours(client, auth: dict[str, str], week_start: date) -> dict:
+    response = client.get(
+        f"/api/admin/payroll/weekly-hours?weekStart={week_start.isoformat()}",
+        headers=auth,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _different_fingerprint(fingerprint: str) -> str:
+    return ("0" * 64) if fingerprint != ("0" * 64) else ("1" * 64)
 
 
 def test_admin_can_create_update_and_log_in_payroll_role(client, auth):
@@ -382,6 +403,275 @@ def test_week_start_must_be_a_sunday(client, auth):
     )
     assert response.status_code == 400, response.text
     assert response.json()["error"] == "weekStart must be a Sunday"
+
+
+def test_payroll_week_verification_requires_current_fingerprint_and_records_audit(client, auth):
+    week_start = date(2026, 8, 2)
+    employee_id = _create_employee("Payroll Verification Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 10),
+        )
+        weekly = _weekly_hours(client, auth, week_start)
+
+        stale = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": _different_fingerprint(weekly["sourceFingerprint"]),
+            },
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["error"] == "Payroll weekly hours changed; refresh before verifying"
+
+        verified = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": weekly["sourceFingerprint"],
+                "reason": "Mayra checked the weekly total before Square entry.",
+            },
+        )
+        assert verified.status_code == 200, verified.text
+        body = verified.json()
+        assert body["action"] == "verify"
+        assert body["idempotent"] is False
+        assert body["weeklyHours"]["sourceFingerprint"] == weekly["sourceFingerprint"]
+        assert body["verification"]["status"] == "verified"
+        assert body["verification"]["sourceFingerprint"] == weekly["sourceFingerprint"]
+        assert body["verification"]["stale"] is False
+        assert body["verification"]["batchId"] is not None
+
+        repeated = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": weekly["sourceFingerprint"],
+            },
+        )
+        assert repeated.status_code == 200, repeated.text
+        assert repeated.json()["idempotent"] is True
+
+        status_response = client.get(
+            f"/api/admin/payroll/weekly-hours/verification?weekStart={week_start.isoformat()}",
+            headers=auth,
+        )
+        assert status_response.status_code == 200, status_response.text
+        status_body = status_response.json()
+        assert status_body["currentSourceFingerprint"] == weekly["sourceFingerprint"]
+        assert status_body["summary"]["totalMinutes"] >= 120
+        assert status_body["verification"]["status"] == "verified"
+        assert status_body["verification"]["stale"] is False
+
+        event_row = db.query_one(
+            """
+            SELECT COUNT(*) AS n
+            FROM payroll_verification_events
+            WHERE week_start = %s AND action = 'verify'
+            """,
+            (week_start,),
+        )
+        assert event_row is not None
+        assert event_row["n"] == 1
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_payroll_verification_blocks_issue_weeks_and_employee_role(client, auth, emp_auth):
+    week_start = date(2026, 7, 19)
+    employee_id = _create_employee("Payroll Verification Issue Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=2), 8),
+            None,
+        )
+        weekly = _weekly_hours(client, auth, week_start)
+        assert weekly["summary"]["hasBlockingIssues"] is True
+
+        employee_denied = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=emp_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": weekly["sourceFingerprint"],
+            },
+        )
+        assert employee_denied.status_code == 403, employee_denied.text
+
+        blocked = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": weekly["sourceFingerprint"],
+            },
+        )
+        assert blocked.status_code == 409, blocked.text
+        assert blocked.json()["error"] == "Resolve payroll hour issues before verifying this week"
+
+        event_row = db.query_one(
+            "SELECT COUNT(*) AS n FROM payroll_verification_events WHERE week_start = %s",
+            (week_start,),
+        )
+        assert event_row is not None
+        assert event_row["n"] == 0
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_payroll_verification_reports_stale_and_requires_reverify_before_finalize(client, auth):
+    week_start = date(2026, 8, 16)
+    employee_id = _create_employee("Payroll Verification Stale Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=3), 8),
+            _local_dt(week_start + timedelta(days=3), 10),
+        )
+        first_weekly = _weekly_hours(client, auth, week_start)
+        first_fingerprint = first_weekly["sourceFingerprint"]
+        verified = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": first_fingerprint,
+            },
+        )
+        assert verified.status_code == 200, verified.text
+
+        corrected_clock_out = _local_dt(week_start + timedelta(days=3), 11).astimezone(
+            timezone.utc
+        )
+        db.execute(
+            """
+            UPDATE shifts
+            SET
+                clock_out = %s,
+                total_hours = ROUND(
+                    (EXTRACT(EPOCH FROM (%s::timestamptz - clock_in)) / 3600.0)::numeric,
+                    2
+                )
+            WHERE id = %s
+            """,
+            (corrected_clock_out, corrected_clock_out, shift_id),
+        )
+
+        status_response = client.get(
+            f"/api/admin/payroll/weekly-hours/verification?weekStart={week_start.isoformat()}",
+            headers=auth,
+        )
+        assert status_response.status_code == 200, status_response.text
+        status_body = status_response.json()
+        assert status_body["currentSourceFingerprint"] != first_fingerprint
+        assert status_body["verification"]["sourceFingerprint"] == first_fingerprint
+        assert status_body["verification"]["stale"] is True
+
+        stale_finalize = client.post(
+            "/api/admin/payroll/weekly-hours/finalize",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": first_fingerprint,
+            },
+        )
+        assert stale_finalize.status_code == 409, stale_finalize.text
+        assert stale_finalize.json()["error"] == "Payroll weekly hours changed; refresh before finalizing"
+
+        reopened = client.post(
+            "/api/admin/payroll/weekly-hours/reopen",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "reason": "Clock-out was corrected before final payroll entry.",
+            },
+        )
+        assert reopened.status_code == 200, reopened.text
+        assert reopened.json()["verification"]["status"] == "reopened"
+
+        second_weekly = _weekly_hours(client, auth, week_start)
+        second_fingerprint = second_weekly["sourceFingerprint"]
+        assert second_fingerprint != first_fingerprint
+
+        reverified = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": second_fingerprint,
+            },
+        )
+        assert reverified.status_code == 200, reverified.text
+        assert reverified.json()["verification"]["status"] == "verified"
+
+        finalized = client.post(
+            "/api/admin/payroll/weekly-hours/finalize",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": second_fingerprint,
+            },
+        )
+        assert finalized.status_code == 200, finalized.text
+        assert finalized.json()["verification"]["status"] == "finalized"
+
+        events = db.query_all(
+            """
+            SELECT action
+            FROM payroll_verification_events
+            WHERE week_start = %s
+            ORDER BY id
+            """,
+            (week_start,),
+        )
+        assert [row["action"] for row in events] == [
+            "verify",
+            "reopen",
+            "verify",
+            "finalize",
+        ]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_payroll_verification_schema_migration_installs_existing_deployments():
+    db.execute("DROP TABLE IF EXISTS payroll_verification_events, payroll_verification_batches")
+    time_tracker_api._ensure_schema_migrations()
+
+    batch_table = db.query_one(
+        "SELECT to_regclass('payroll_verification_batches') AS table_name"
+    )
+    event_table = db.query_one(
+        "SELECT to_regclass('payroll_verification_events') AS table_name"
+    )
+    status_check = db.query_one(
+        """
+        SELECT 1 AS found
+        FROM pg_constraint
+        WHERE conrelid = 'payroll_verification_batches'::regclass
+          AND contype = 'c'
+          AND pg_get_constraintdef(oid) LIKE '%%finalized%%'
+        LIMIT 1
+        """
+    )
+
+    assert batch_table is not None
+    assert batch_table["table_name"] == "payroll_verification_batches"
+    assert event_table is not None
+    assert event_table["table_name"] == "payroll_verification_events"
+    assert status_check == {"found": 1}
 
 
 def test_payroll_weekly_hours_export_uses_same_model_and_hides_rates(client, auth):
