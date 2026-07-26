@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
+from fastapi import HTTPException
 
 import db
 from operations_schedule import (
@@ -15,7 +18,9 @@ from operations_schedule import (
     _closed_shift_segments,
     _forecast_job_values,
     _job_issues,
+    _load_utilization_shift_evidence,
     _match_segment_to_job,
+    _normalize_reviewed_departure_input,
     _qr_only_presence_segments,
     _schedule_execution_status,
     _utilization_rows,
@@ -24,6 +29,54 @@ from operations_schedule import (
 
 
 TEST_PREFIX = "OPS_CANONICAL_TEST"
+
+
+def test_reviewed_departure_local_time_is_central_and_fails_closed_at_dst_edges():
+    chicago = ZoneInfo("America/Chicago")
+    assert _normalize_reviewed_departure_input(
+        datetime(2026, 7, 20, 9, 30),
+        chicago,
+    ) == datetime(2026, 7, 20, 14, 30, tzinfo=timezone.utc)
+    with pytest.raises(HTTPException, match="not a valid Central Time"):
+        _normalize_reviewed_departure_input(
+            datetime(2026, 3, 8, 2, 30),
+            chicago,
+        )
+    with pytest.raises(HTTPException, match="ambiguous"):
+        _normalize_reviewed_departure_input(
+            datetime(2026, 11, 1, 1, 30),
+            chicago,
+        )
+
+
+def test_correction_evidence_locks_shift_before_joined_mutable_inputs():
+    class RecordingCursor:
+        def __init__(self):
+            self.queries = []
+
+        def execute(self, query, _params=None):
+            self.queries.append(" ".join(str(query).split()))
+
+        def fetchone(self):
+            return {"id": 17}
+
+        def fetchall(self):
+            return []
+
+    cursor = RecordingCursor()
+    shift, visits, departures = _load_utilization_shift_evidence(
+        cursor,
+        17,
+        lock_shift=True,
+    )
+
+    assert shift == {"id": 17}
+    assert visits == []
+    assert departures == []
+    assert "FOR UPDATE OF s" in cursor.queries[0]
+    assert cursor.queries[1] == "LOCK TABLE site_check_ins, jobs IN SHARE MODE"
+    assert "FROM visits v" in cursor.queries[2]
+    assert "FROM departures" in cursor.queries[3]
 
 
 @pytest.mark.parametrize(
@@ -157,6 +210,25 @@ def test_schedule_execution_status_uses_elapsed_window_only_after_precedence(
 def _clean_rows() -> None:
     with db.get_conn() as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM time_data_correction_batches
+                WHERE snapshot ->> 'correctionType' =
+                      'utilization_missing_departure.v1'
+                """
+            )
+            cur.execute(
+                """
+                DELETE FROM site_qr_action_receipts
+                WHERE employee_id IN (
+                    SELECT id FROM employees WHERE name LIKE %s
+                )
+                   OR location_id IN (
+                    SELECT id FROM locations WHERE address LIKE %s
+                )
+                """,
+                (f"{TEST_PREFIX}%", f"{TEST_PREFIX}%"),
+            )
             cur.execute(
                 """
                 DELETE FROM site_check_ins
@@ -4785,6 +4857,454 @@ def test_utilization_uses_elapsed_time_across_dst_transitions(
         )
         for interval in row["intervals"]
     ] == [("unclassified", 3 * 60 * 60, 180)]
+
+
+def _seed_missing_departure_correction_route() -> dict:
+    service_day = date(2026, 7, 20)
+    shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            site_a, job_a = _canonical_job(
+                cur,
+                suffix="Utilization Correction A",
+                start=shift_start + timedelta(minutes=30),
+                end=shift_start + timedelta(hours=1, minutes=30),
+            )
+            site_b, job_b = _canonical_job(
+                cur,
+                suffix="Utilization Correction B",
+                start=shift_start + timedelta(hours=2),
+                end=shift_start + timedelta(hours=3),
+            )
+            employee_id = _employee(cur, "Utilization Correction", 18)
+            shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=shift_start,
+                end=shift_start + timedelta(hours=4),
+                service_day=service_day,
+                location_id=site_a,
+                location_label=f"{TEST_PREFIX} Site Utilization Correction A",
+            )
+            check_in_a = _check_in(
+                cur,
+                employee_id=employee_id,
+                location_id=site_a,
+                checked_in_at=shift_start + timedelta(minutes=30),
+                job_id=job_a,
+            )
+            visit_a = _visit(
+                cur,
+                shift_id=shift_id,
+                location_id=site_a,
+                at=shift_start + timedelta(minutes=30),
+                suffix="Utilization Correction A",
+                sequence_version=2,
+                site_check_in_id=check_in_a,
+            )
+            visit_b, departure_b = _paired_version_two_visit(
+                cur,
+                employee_id=employee_id,
+                shift_id=shift_id,
+                location_id=site_b,
+                job_id=job_b,
+                arrival=shift_start + timedelta(hours=2),
+                departure=shift_start + timedelta(hours=3),
+                suffix="Utilization Correction B",
+            )
+            cur.execute(
+                """
+                INSERT INTO site_qr_action_receipts (
+                    employee_id, location_id, shift_id, action,
+                    idempotency_key, request_fingerprint,
+                    server_recorded_at, device_scanned_at,
+                    latitude, longitude, accuracy_m, geofence_radius_m,
+                    distance_m, geofence_status, outcome,
+                    site_check_in_id, visit_id, response_body
+                )
+                VALUES (
+                    %s, %s, %s, 'arrive', %s, %s, %s, %s,
+                    39.12, -88.54, 5, 100, 3, 'inside', 'recorded',
+                    %s, %s, '{"action":"arrive","outcome":"recorded"}'::jsonb
+                )
+                RETURNING id
+                """,
+                (
+                    employee_id,
+                    site_a,
+                    shift_id,
+                    str(uuid4()),
+                    hashlib.sha256(
+                        f"correction-arrive:{shift_id}:{visit_a}".encode()
+                    ).hexdigest(),
+                    shift_start + timedelta(minutes=30),
+                    shift_start + timedelta(minutes=30),
+                    check_in_a,
+                    visit_a,
+                ),
+            )
+            receipt_id = int(cur.fetchone()[0])
+    return {
+        "serviceDay": service_day,
+        "shiftStart": shift_start,
+        "employeeId": employee_id,
+        "shiftId": shift_id,
+        "siteA": site_a,
+        "siteB": site_b,
+        "visitA": visit_a,
+        "visitB": visit_b,
+        "departureB": departure_b,
+        "checkInA": check_in_a,
+        "receiptId": receipt_id,
+    }
+
+
+def _raw_correction_evidence_snapshot(seed: dict) -> dict:
+    return {
+        "shifts": db.query_all(
+            "SELECT * FROM shifts WHERE id = %s",
+            (seed["shiftId"],),
+        ),
+        "visits": db.query_all(
+            "SELECT * FROM visits WHERE shift_id = %s ORDER BY id",
+            (seed["shiftId"],),
+        ),
+        "departures": db.query_all(
+            "SELECT * FROM departures WHERE shift_id = %s ORDER BY id",
+            (seed["shiftId"],),
+        ),
+        "siteCheckIns": db.query_all(
+            """
+            SELECT *
+            FROM site_check_ins
+            WHERE employee_id = %s
+              AND server_checked_in_at >= %s
+              AND server_checked_in_at < %s
+            ORDER BY id
+            """,
+            (
+                seed["employeeId"],
+                seed["shiftStart"],
+                seed["shiftStart"] + timedelta(hours=4),
+            ),
+        ),
+        "qrReceipts": db.query_all(
+            "SELECT * FROM site_qr_action_receipts WHERE id = %s",
+            (seed["receiptId"],),
+        ),
+    }
+
+
+def test_missing_departure_correction_is_audited_idempotent_and_non_destructive(
+    client,
+    auth,
+):
+    seed = _seed_missing_departure_correction_route()
+    before = _raw_correction_evidence_snapshot(seed)
+    initial = _utilization_body(client, auth, seed["serviceDay"])
+    _assert_utilization_totals(
+        initial["summary"],
+        paid=240,
+        on_site=60,
+        travel=0,
+        categorized=0,
+        unclassified=180,
+    )
+    review = next(
+        item
+        for item in initial["reviewItems"]
+        if item["code"] == "missing_departure"
+        and item["visitId"] == seed["visitA"]
+    )
+    assert re.fullmatch(r"[0-9a-f]{64}", review["reviewKey"])
+    assert re.fullmatch(r"[0-9a-f]{64}", review["evidenceFingerprint"])
+    assert review["reviewState"] == "open"
+    assert review["hasOpenReview"] is True
+    assert review["canCorrect"] is True
+    assert review["correction"] is None
+
+    idempotency_key = str(uuid4())
+    payload = {
+        "shiftId": seed["shiftId"],
+        "visitId": seed["visitA"],
+        "evidenceFingerprint": review["evidenceFingerprint"],
+        # datetime-local values in the portal are explicitly Central Time.
+        "effectiveDepartureAt": "2026-07-20T09:30",
+        "reason": "Verified departure from supervisor time notes",
+        "idempotencyKey": idempotency_key,
+    }
+    applied = client.post(
+        f"/api{review['correctionPath']}",
+        headers=auth,
+        json=payload,
+    )
+    assert applied.status_code == 200, applied.text
+    applied_body = applied.json()
+    assert applied_body["idempotentReplay"] is False
+    assert applied_body["reviewStateAtApply"] == "corrected"
+    assert "reviewState" not in applied_body
+    batch_id = applied_body["batchId"]
+    assert _raw_correction_evidence_snapshot(seed) == before
+
+    corrected = _utilization_body(client, auth, seed["serviceDay"])
+    _assert_utilization_totals(
+        corrected["summary"],
+        paid=240,
+        on_site=120,
+        travel=30,
+        categorized=0,
+        unclassified=90,
+    )
+    corrected_review = next(
+        item
+        for item in corrected["reviewItems"]
+        if item["reviewKey"] == review["reviewKey"]
+    )
+    assert corrected_review["reviewState"] == "corrected"
+    assert corrected_review["hasOpenReview"] is False
+    assert corrected_review["correction"]["batchId"] == batch_id
+    assert corrected["summary"]["openReviewItemCount"] == 0
+    assert corrected["summary"]["correctedReviewItemCount"] == 1
+    corrected_row = _utilization_row(
+        corrected,
+        seed["employeeId"],
+        seed["serviceDay"],
+    )
+    reviewed_intervals = [
+        interval
+        for interval in corrected_row["intervals"]
+        if interval["correctionId"] == batch_id
+    ]
+    assert {interval["category"] for interval in reviewed_intervals} == {
+        "on_site",
+        "travel",
+    }
+    assert all(
+        "reviewed_departure" in interval["evidence"]
+        for interval in reviewed_intervals
+    )
+
+    batch = db.query_one(
+        """
+        SELECT applied_by_employee_id, applied_by_name, reason, snapshot, result
+        FROM time_data_correction_batches
+        WHERE id = %s
+        """,
+        (batch_id,),
+    )
+    assert batch["applied_by_employee_id"] is not None
+    assert batch["applied_by_name"]
+    assert batch["reason"] == payload["reason"]
+    assert batch["snapshot"]["reviewKey"] == review["reviewKey"]
+    assert (
+        batch["snapshot"]["evidenceFingerprint"]
+        == review["evidenceFingerprint"]
+    )
+    assert batch["snapshot"]["evidence"]["shifts"]
+    assert batch["result"]["visitId"] == seed["visitA"]
+    assert batch["result"]["evidence"] == ["reviewed_departure"]
+
+    repeated = client.post(
+        f"/api{review['correctionPath']}",
+        headers=auth,
+        json=payload,
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["idempotentReplay"] is True
+    assert repeated.json()["batchId"] == batch_id
+    assert db.query_one(
+        """
+        SELECT COUNT(*) AS count
+        FROM time_data_correction_batches
+        WHERE snapshot ->> 'reviewKey' = %s
+        """,
+        (review["reviewKey"],),
+    )["count"] == 1
+
+    changed_reuse = client.post(
+        f"/api{review['correctionPath']}",
+        headers=auth,
+        json={
+            **payload,
+            "effectiveDepartureAt": (
+                seed["shiftStart"] + timedelta(hours=1)
+            ).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    assert changed_reuse.status_code == 409
+
+    amended = client.post(
+        f"/api{review['correctionPath']}",
+        headers=auth,
+        json={
+            **payload,
+            "idempotencyKey": str(uuid4()),
+            "effectiveDepartureAt": (
+                seed["shiftStart"] + timedelta(hours=1, minutes=15)
+            ).isoformat().replace("+00:00", "Z"),
+            "reason": "Supervisor clarified the reviewed departure time",
+        },
+    )
+    assert amended.status_code == 200, amended.text
+    assert amended.json()["batchId"] != batch_id
+    amended_body = _utilization_body(client, auth, seed["serviceDay"])
+    amended_review = next(
+        item
+        for item in amended_body["reviewItems"]
+        if item["reviewKey"] == review["reviewKey"]
+    )
+    assert amended_review["correction"]["batchId"] == amended.json()["batchId"]
+    _assert_utilization_totals(
+        amended_body["summary"],
+        paid=240,
+        on_site=105,
+        travel=45,
+        categorized=0,
+        unclassified=90,
+    )
+    assert _raw_correction_evidence_snapshot(seed) == before
+
+    db.execute(
+        "UPDATE visits SET location_label = location_label || ' updated' WHERE id = %s",
+        (seed["visitA"],),
+    )
+    reopened = _utilization_body(client, auth, seed["serviceDay"])
+    reopened_review = next(
+        item
+        for item in reopened["reviewItems"]
+        if item["reviewKey"] == review["reviewKey"]
+    )
+    assert reopened_review["reviewState"] == "reopened"
+    assert reopened_review["hasOpenReview"] is True
+    assert reopened_review["evidenceFingerprint"] != review["evidenceFingerprint"]
+    assert (
+        reopened_review["previousCorrection"]["batchId"]
+        == amended.json()["batchId"]
+    )
+    assert reopened_review["correctionHistoryCount"] == 2
+    _assert_utilization_totals(
+        reopened["summary"],
+        paid=240,
+        on_site=60,
+        travel=0,
+        categorized=0,
+        unclassified=180,
+    )
+    stale = client.post(
+        f"/api{review['correctionPath']}",
+        headers=auth,
+        json={**payload, "idempotencyKey": str(uuid4())},
+    )
+    assert stale.status_code == 409
+
+    historical_replay = client.post(
+        f"/api{review['correctionPath']}",
+        headers=auth,
+        json=payload,
+    )
+    assert historical_replay.status_code == 200, historical_replay.text
+    assert historical_replay.json()["idempotentReplay"] is True
+    assert historical_replay.json()["batchId"] == batch_id
+    assert historical_replay.json()["reviewStateAtApply"] == "corrected"
+    assert "reviewState" not in historical_replay.json()
+    still_reopened = _utilization_body(client, auth, seed["serviceDay"])
+    still_reopened_review = next(
+        item
+        for item in still_reopened["reviewItems"]
+        if item["reviewKey"] == review["reviewKey"]
+    )
+    assert still_reopened_review["reviewState"] == "reopened"
+
+
+def test_missing_departure_correction_rejects_unauthorized_and_conflicting_time(
+    client,
+    auth,
+    emp_auth,
+):
+    seed = _seed_missing_departure_correction_route()
+    initial = _utilization_body(client, auth, seed["serviceDay"])
+    review = next(
+        item
+        for item in initial["reviewItems"]
+        if item["code"] == "missing_departure"
+        and item["visitId"] == seed["visitA"]
+    )
+    base_payload = {
+        "shiftId": seed["shiftId"],
+        "visitId": seed["visitA"],
+        "evidenceFingerprint": review["evidenceFingerprint"],
+        "reason": "Verified against the supervisor route notes",
+        "idempotencyKey": str(uuid4()),
+    }
+    unauthenticated = client.post(
+        f"/api{review['correctionPath']}",
+        json={
+            **base_payload,
+            "effectiveDepartureAt": (
+                seed["shiftStart"] + timedelta(hours=1)
+            ).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    employee = client.post(
+        f"/api{review['correctionPath']}",
+        headers=emp_auth,
+        json={
+            **base_payload,
+            "effectiveDepartureAt": (
+                seed["shiftStart"] + timedelta(hours=1)
+            ).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    assert unauthenticated.status_code == 401
+    assert employee.status_code == 403
+
+    future = client.post(
+        f"/api{review['correctionPath']}",
+        headers=auth,
+        json={
+            **base_payload,
+            "idempotencyKey": str(uuid4()),
+            "effectiveDepartureAt": (
+                datetime.now(timezone.utc).replace(microsecond=0)
+                + timedelta(days=1)
+            ).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    assert future.status_code == 400
+    assert future.json()["error"] == "Reviewed departure cannot be in the future"
+
+    before_arrival = client.post(
+        f"/api{review['correctionPath']}",
+        headers=auth,
+        json={
+            **base_payload,
+            "idempotencyKey": str(uuid4()),
+            "effectiveDepartureAt": (
+                seed["shiftStart"] + timedelta(minutes=15)
+            ).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    assert before_arrival.status_code == 400
+    conflicting = client.post(
+        f"/api{review['correctionPath']}",
+        headers=auth,
+        json={
+            **base_payload,
+            "idempotencyKey": str(uuid4()),
+            "effectiveDepartureAt": (
+                seed["shiftStart"] + timedelta(hours=2, minutes=30)
+            ).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    assert conflicting.status_code == 409
+    assert db.query_one(
+        """
+        SELECT COUNT(*) AS count
+        FROM time_data_correction_batches
+        WHERE snapshot ->> 'reviewKey' = %s
+        """,
+        (review["reviewKey"],),
+    )["count"] == 0
 
 
 def test_utilization_rejects_reversed_range(client, auth):

@@ -1,8 +1,8 @@
-"""Read-only canonical Schedule and Forecast views built from jobs.
+"""Canonical Schedule, measured Utilization, and Forecast operations views.
 
 Google Calendar synchronization owns source-linked job planning.  This module
-never mutates jobs or time evidence: it projects the existing rows into the
-operator-facing agenda and forecast.
+never mutates jobs or raw time evidence. Its one write appends an
+evidence-bound reviewed-departure overlay to the existing correction ledger.
 """
 
 from __future__ import annotations
@@ -10,11 +10,17 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
+import hashlib
+import json
+import re
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import db
 from fastapi import APIRouter, Depends, HTTPException, Query
+import psycopg2.extras
+from pydantic import BaseModel, Field
 
 
 MoneyCents = Optional[int]
@@ -28,6 +34,18 @@ UTILIZATION_CATEGORIES = (
     "categorized",
     "unclassified",
 )
+UTILIZATION_REVIEW_KEY_VERSION = "utilization-review.v1"
+UTILIZATION_EVIDENCE_VERSION = "utilization-classifier.v1"
+UTILIZATION_MISSING_DEPARTURE_CORRECTION = "utilization_missing_departure.v1"
+
+
+class UtilizationMissingDepartureCorrectionRequest(BaseModel):
+    shiftId: int = Field(gt=0)
+    visitId: int = Field(gt=0)
+    evidenceFingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    effectiveDepartureAt: datetime
+    reason: str = Field(min_length=10, max_length=500)
+    idempotencyKey: UUID
 
 
 def _utc_iso(value: Optional[datetime]) -> Optional[str]:
@@ -587,6 +605,263 @@ def _second_datetime(value: int) -> datetime:
     return datetime.fromtimestamp(value, tz=timezone.utc)
 
 
+def _utilization_evidence_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return _utc_iso(value)
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _utilization_evidence_value(item)
+            for key, item in sorted(value.items())
+        }
+    if isinstance(value, (list, tuple)):
+        return [_utilization_evidence_value(item) for item in value]
+    return value
+
+
+def _utilization_shift_evidence_snapshot(
+    shift: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    departures: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    shift_fields = (
+        "id",
+        "employee_id",
+        "location_id",
+        "location_label",
+        "job_id",
+        "clock_in",
+        "clock_out",
+        "time_category",
+        "non_productive_type",
+    )
+    visit_fields = (
+        "id",
+        "shift_id",
+        "location_id",
+        "location_label",
+        "arrival_time",
+        "sequence_version",
+        "site_check_in_id",
+        "check_in_employee_id",
+        "check_in_location_id",
+        "check_in_at",
+        "check_in_classification",
+        "check_in_review_status",
+        "job_id",
+    )
+    departure_fields = (
+        "id",
+        "shift_id",
+        "visit_id",
+        "location_id",
+        "location_label",
+        "departure_time",
+    )
+    return _utilization_evidence_value(
+        {
+            "shift": {field: shift.get(field) for field in shift_fields},
+            "visits": [
+                {field: row.get(field) for field in visit_fields}
+                for row in sorted(
+                    visits,
+                    key=lambda item: (
+                        item.get("arrival_time"),
+                        int(item.get("id") or 0),
+                    ),
+                )
+            ],
+            "departures": [
+                {field: row.get(field) for field in departure_fields}
+                for row in sorted(
+                    departures,
+                    key=lambda item: (
+                        item.get("departure_time"),
+                        int(item.get("id") or 0),
+                    ),
+                )
+            ],
+        }
+    )
+
+
+def _utilization_review_identity(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "version": UTILIZATION_REVIEW_KEY_VERSION,
+        "shiftId": int(item["shiftId"]),
+        "relatedShiftIds": sorted(
+            {
+                int(value)
+                for value in item.get("relatedShiftIds") or [item["shiftId"]]
+            }
+        ),
+        "code": str(item["code"]),
+        "visitId": (
+            int(item["visitId"]) if item.get("visitId") is not None else None
+        ),
+        "departureId": (
+            int(item["departureId"])
+            if item.get("departureId") is not None
+            else None
+        ),
+    }
+
+
+def _utilization_review_key(item: Dict[str, Any]) -> str:
+    payload = json.dumps(
+        _utilization_review_identity(item),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _utilization_review_evidence(
+    item: Dict[str, Any],
+    evidence_by_shift: Dict[int, Dict[str, Any]],
+) -> Dict[str, Any]:
+    shift_ids = sorted(
+        {
+            int(value)
+            for value in item.get("relatedShiftIds") or [item["shiftId"]]
+        }
+    )
+    return {
+        "evidenceVersion": UTILIZATION_EVIDENCE_VERSION,
+        "subject": _utilization_review_identity(item),
+        "shifts": [
+            evidence_by_shift[shift_id]
+            for shift_id in shift_ids
+            if shift_id in evidence_by_shift
+        ],
+    }
+
+
+def _utilization_evidence_fingerprint(evidence: Dict[str, Any]) -> str:
+    payload = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _prepare_utilization_review_items(
+    review_items: List[Dict[str, Any]],
+    evidence_by_shift: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    output = []
+    for item in review_items:
+        evidence = _utilization_review_evidence(item, evidence_by_shift)
+        output.append(
+            {
+                **item,
+                "reviewKey": _utilization_review_key(item),
+                "evidenceVersion": UTILIZATION_EVIDENCE_VERSION,
+                "evidenceFingerprint": _utilization_evidence_fingerprint(evidence),
+                "_evidenceSnapshot": evidence,
+            }
+        )
+    return output
+
+
+def _utilization_correction_rows(
+    review_keys: Iterable[str],
+    *,
+    cursor: Any = None,
+) -> List[Dict[str, Any]]:
+    keys = sorted({str(value) for value in review_keys if value})
+    if not keys:
+        return []
+    sql = """
+        SELECT id, plan_token, applied_by_employee_id, applied_by_name,
+               reason, snapshot, result, created_at
+        FROM time_data_correction_batches
+        WHERE snapshot ->> 'correctionType' = %s
+          AND snapshot ->> 'reviewKey' = ANY(%s)
+        ORDER BY id
+    """
+    params = (UTILIZATION_MISSING_DEPARTURE_CORRECTION, keys)
+    if cursor is None:
+        return db.query_all(sql, params)
+    cursor.execute(sql, params)
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def _public_utilization_correction(row: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(row.get("result") or {})
+    return {
+        "batchId": int(row["id"]),
+        "effectiveDepartureAt": result.get("effectiveDepartureAt"),
+        "reviewedByEmployeeId": (
+            int(row["applied_by_employee_id"])
+            if row.get("applied_by_employee_id") is not None
+            else None
+        ),
+        "reviewedByName": str(row.get("applied_by_name") or ""),
+        "reason": str(row.get("reason") or ""),
+        "reviewedAt": _utc_iso(row.get("created_at")),
+    }
+
+
+def _attach_utilization_correction_state(
+    review_items: List[Dict[str, Any]],
+    correction_rows: List[Dict[str, Any]],
+) -> None:
+    history_by_key: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in correction_rows:
+        snapshot = dict(row.get("snapshot") or {})
+        history_by_key[str(snapshot.get("reviewKey") or "")].append(row)
+
+    for item in review_items:
+        history = history_by_key.get(str(item["reviewKey"]), [])
+        matching = [
+            row
+            for row in history
+            if str((row.get("snapshot") or {}).get("evidenceFingerprint") or "")
+            == str(item["evidenceFingerprint"])
+        ]
+        current = matching[-1] if matching else None
+        if current is not None:
+            state = "corrected"
+        elif history:
+            state = "reopened"
+        else:
+            state = "open"
+        item["reviewState"] = state
+        item["hasOpenReview"] = current is None
+        item["canCorrect"] = item.get("code") == "missing_departure"
+        item["correctionPath"] = (
+            "/admin/operations/utilization/reviews/"
+            f"{item['reviewKey']}/missing-departure"
+            if item["canCorrect"]
+            else None
+        )
+        item["correction"] = (
+            _public_utilization_correction(current) if current is not None else None
+        )
+        item["previousCorrection"] = (
+            _public_utilization_correction(history[-1])
+            if current is None and history
+            else None
+        )
+        item["correctionHistoryCount"] = len(history)
+        item["_currentCorrection"] = current
+
+
+def _reviewed_departure_overlay(row: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(row.get("result") or {})
+    timestamp = datetime.fromisoformat(
+        str(result["effectiveDepartureAt"]).replace("Z", "+00:00")
+    ).astimezone(timezone.utc)
+    return {
+        "id": None,
+        "shift_id": int(result["shiftId"]),
+        "visit_id": int(result["visitId"]),
+        "location_id": int(result["locationId"]),
+        "location_label": str(result.get("locationLabel") or ""),
+        "departure_time": timestamp,
+        "reviewed_correction_id": int(row["id"]),
+    }
+
+
 def _utilization_review_item(
     shift: Dict[str, Any],
     *,
@@ -604,6 +879,11 @@ def _utilization_review_item(
         "message": message,
         "visitId": (
             int(visit["id"]) if visit is not None and visit.get("id") is not None else None
+        ),
+        "siteCheckInId": (
+            int(visit["site_check_in_id"])
+            if visit is not None and visit.get("site_check_in_id") is not None
+            else None
         ),
         "departureId": (
             int(departure["id"])
@@ -632,6 +912,7 @@ def _utilization_segment(
     to_job_id: Optional[int] = None,
     evidence: Optional[List[str]] = None,
     review_codes: Optional[Iterable[str]] = None,
+    correction_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     return {
         "shift_id": int(shift["id"]),
@@ -652,6 +933,7 @@ def _utilization_segment(
         "to_job_id": to_job_id,
         "evidence": evidence or ["paid_shift"],
         "review_codes": sorted(set(review_codes or ())),
+        "correction_id": correction_id,
     }
 
 
@@ -659,6 +941,7 @@ def _closed_shift_utilization(
     shift: Dict[str, Any],
     visits: List[Dict[str, Any]],
     departures: List[Dict[str, Any]],
+    reviewed_departures: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Partition one closed paid envelope without inferring missing events."""
 
@@ -749,6 +1032,7 @@ def _closed_shift_utilization(
             continue
         departures_by_visit[normalized_visit_id] = departure
 
+    reviewed_departures = reviewed_departures or {}
     valid_arrivals: List[Dict[str, Any]] = []
     pair_candidates: List[Dict[str, Any]] = []
     for visit in visits:
@@ -841,7 +1125,9 @@ def _closed_shift_utilization(
             ),
         }
         valid_arrivals.append(arrival)
-        departure = departures_by_visit.get(int(visit["id"]))
+        departure = departures_by_visit.get(int(visit["id"])) or reviewed_departures.get(
+            int(visit["id"])
+        )
         if departure is None:
             review_items.append(
                 _utilization_review_item(
@@ -946,6 +1232,14 @@ def _closed_shift_utilization(
                 conflicted_visit_ids.update(
                     (int(left["visit"]["id"]), int(right["visit"]["id"]))
                 )
+    classification_departures = [
+        *departures,
+        *[
+            row
+            for visit_id, row in reviewed_departures.items()
+            if visit_id not in departures_by_visit
+        ],
+    ]
     all_arrivals = [
         (int(visit["id"]), _epoch_second(visit["arrival_time"])) for visit in visits
     ]
@@ -959,11 +1253,11 @@ def _closed_shift_utilization(
             for visit_id, arrival_second in all_arrivals
         )
         contains_other_departure = any(
-            int(departure["id"]) != int(candidate["departure"]["id"])
+            departure is not candidate["departure"]
             and candidate["start_second"]
             < _epoch_second(departure["departure_time"])
             <= candidate["end_second"]
-            for departure in departures
+            for departure in classification_departures
         )
         if contains_other_arrival or contains_other_departure:
             conflicted_visit_ids.add(candidate_visit_id)
@@ -995,6 +1289,7 @@ def _closed_shift_utilization(
     ]
     claims: List[Dict[str, Any]] = []
     for candidate in usable_pairs:
+        correction_id = candidate["departure"].get("reviewed_correction_id")
         claims.append(
             _utilization_segment(
                 shift,
@@ -1005,14 +1300,28 @@ def _closed_shift_utilization(
                 location_label=str(candidate["visit"].get("location_label") or ""),
                 job_id=candidate["job_id"],
                 visit_id=int(candidate["visit"]["id"]),
-                departure_id=int(candidate["departure"]["id"]),
-                evidence=["visit_v2", "paired_departure"],
+                departure_id=(
+                    int(candidate["departure"]["id"])
+                    if candidate["departure"].get("id") is not None
+                    else None
+                ),
+                evidence=(
+                    ["visit_v2", "reviewed_departure"]
+                    if correction_id is not None
+                    else ["visit_v2", "paired_departure"]
+                ),
+                correction_id=(
+                    int(correction_id) if correction_id is not None else None
+                ),
             )
         )
 
     all_event_seconds = [
         _epoch_second(visit["arrival_time"]) for visit in visits
-    ] + [_epoch_second(departure["departure_time"]) for departure in departures]
+    ] + [
+        _epoch_second(departure["departure_time"])
+        for departure in classification_departures
+    ]
     for candidate in usable_pairs:
         departure_second = candidate["end_second"]
         next_arrival = next(
@@ -1036,9 +1345,10 @@ def _closed_shift_utilization(
         if any(
             _epoch_second(departure["departure_time"])
             == next_arrival["start_second"]
-            for departure in departures
+            for departure in classification_departures
         ):
             continue
+        correction_id = candidate["departure"].get("reviewed_correction_id")
         claims.append(
             _utilization_segment(
                 shift,
@@ -1050,8 +1360,19 @@ def _closed_shift_utilization(
                 from_job_id=candidate["job_id"],
                 to_job_id=next_arrival["job_id"],
                 visit_id=int(next_arrival["visit"]["id"]),
-                departure_id=int(candidate["departure"]["id"]),
-                evidence=["paired_departure", "next_visit_v2"],
+                departure_id=(
+                    int(candidate["departure"]["id"])
+                    if candidate["departure"].get("id") is not None
+                    else None
+                ),
+                evidence=(
+                    ["reviewed_departure", "next_visit_v2"]
+                    if correction_id is not None
+                    else ["paired_departure", "next_visit_v2"]
+                ),
+                correction_id=(
+                    int(correction_id) if correction_id is not None else None
+                ),
             )
         )
 
@@ -1209,6 +1530,7 @@ def _collapse_overlapping_paid_segments(
                     "to_job_id": None,
                     "evidence": ["overlapping_paid_shifts"],
                     "review_codes": sorted(review_codes),
+                    "correction_id": None,
                 }
             if (
                 pieces
@@ -1341,6 +1663,7 @@ def _serialize_utilization_interval(segment: Dict[str, Any]) -> Dict[str, Any]:
         "toJobId": segment.get("to_job_id"),
         "evidence": list(segment.get("evidence") or []),
         "reviewCodes": list(segment.get("review_codes") or []),
+        "correctionId": segment.get("correction_id"),
     }
 
 
@@ -1388,7 +1711,11 @@ def _serialize_utilization_review_item(
 ) -> Dict[str, Any]:
     occurred_at = item.get("occurredAt")
     return {
-        **{key: value for key, value in item.items() if key != "occurredAt"},
+        **{
+            key: value
+            for key, value in item.items()
+            if key != "occurredAt" and not key.startswith("_")
+        },
         "date": (
             str(occurred_at.astimezone(app_timezone).date())
             if occurred_at is not None
@@ -2525,11 +2852,252 @@ def _public_forecast_job(row: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in row.items() if not key.startswith("_")}
 
 
+def _load_utilization_shift_evidence(
+    cursor: Any,
+    shift_id: int,
+    *,
+    lock_shift: bool = False,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    cursor.execute(
+        f"""
+        SELECT s.id, s.employee_id, e.name AS employee_name,
+               s.location_id, s.location_label, s.job_id,
+               s.clock_in, s.clock_out, s.time_category,
+               s.non_productive_type
+        FROM shifts s
+        JOIN employees e ON e.id = s.employee_id
+        WHERE s.id = %s
+        {"FOR UPDATE OF s" if lock_shift else ""}
+        """,
+        (shift_id,),
+    )
+    shift_row = cursor.fetchone()
+    if not shift_row:
+        raise HTTPException(status_code=404, detail="Paid shift not found")
+    shift = dict(shift_row)
+    if lock_shift:
+        # The shift row is the first mutable evidence lock. Take table-level
+        # read locks only after it so job deletion cannot hold the shift while
+        # waiting to upgrade its jobs table lock. QR review and job editing do
+        # not share the timesheet advisory lock, so these locks freeze their
+        # classifier inputs through the append-only ledger insert.
+        cursor.execute("LOCK TABLE site_check_ins, jobs IN SHARE MODE")
+
+    cursor.execute(
+        """
+        SELECT v.id, v.shift_id, v.location_id, v.location_label,
+               v.arrival_time, v.sequence_version, v.site_check_in_id,
+               sci.employee_id AS check_in_employee_id,
+               sci.location_id AS check_in_location_id,
+               sci.server_checked_in_at AS check_in_at,
+               sci.classification AS check_in_classification,
+               sci.review_status AS check_in_review_status,
+               COALESCE(
+                   CASE
+                       WHEN check_in_job.location_id = v.location_id
+                       THEN sci.job_id
+                   END,
+                   CASE
+                       WHEN shift_job.location_id = v.location_id
+                       THEN evidence_shift.job_id
+                   END
+               ) AS job_id
+        FROM visits v
+        JOIN shifts evidence_shift ON evidence_shift.id = v.shift_id
+        LEFT JOIN jobs shift_job ON shift_job.id = evidence_shift.job_id
+        LEFT JOIN site_check_ins sci ON sci.id = v.site_check_in_id
+        LEFT JOIN jobs check_in_job ON check_in_job.id = sci.job_id
+        WHERE v.shift_id = %s
+        ORDER BY v.arrival_time, v.id
+        """,
+        (shift_id,),
+    )
+    visits = [dict(row) for row in cursor.fetchall()]
+    cursor.execute(
+        """
+        SELECT id, shift_id, visit_id, location_id, location_label,
+               departure_time
+        FROM departures
+        WHERE shift_id = %s
+        ORDER BY departure_time, id
+        """,
+        (shift_id,),
+    )
+    departures = [dict(row) for row in cursor.fetchall()]
+    return shift, visits, departures
+
+
+def _utilization_review_signature(item: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        int(item["shiftId"]),
+        str(item["code"]),
+        int(item["visitId"]) if item.get("visitId") is not None else None,
+        int(item["departureId"]) if item.get("departureId") is not None else None,
+        tuple(sorted(int(value) for value in item.get("relatedShiftIds") or ())),
+    )
+
+
+def _validate_reviewed_departure(
+    *,
+    shift: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    departures: List[Dict[str, Any]],
+    raw_review_items: List[Dict[str, Any]],
+    target_review: Dict[str, Any],
+    effective_departure_at: datetime,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    visit_id = int(target_review["visitId"])
+    visit = next(
+        (row for row in visits if int(row["id"]) == visit_id),
+        None,
+    )
+    if visit is None:
+        raise HTTPException(status_code=409, detail="Arrival evidence changed; refresh")
+    if shift.get("clock_out") is None or str(shift.get("time_category")) != "productive":
+        raise HTTPException(
+            status_code=409,
+            detail="Only a closed productive shift can receive this correction",
+        )
+    if effective_departure_at.tzinfo is None:
+        raise HTTPException(
+            status_code=400,
+            detail="effectiveDepartureAt must include a timezone",
+        )
+    normalized_departure = effective_departure_at.astimezone(timezone.utc)
+    if normalized_departure.microsecond:
+        raise HTTPException(
+            status_code=400,
+            detail="effectiveDepartureAt must use whole-second precision",
+        )
+    if not (visit["arrival_time"] < normalized_departure <= shift["clock_out"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Reviewed departure must be after arrival and no later than Clock Out",
+        )
+    if visit.get("location_id") is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Arrival Site identity changed; refresh",
+        )
+    if any(
+        row.get("visit_id") is not None and int(row["visit_id"]) == visit_id
+        for row in departures
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A recorded departure now exists; refresh",
+        )
+
+    overlay = {
+        "id": None,
+        "shift_id": int(shift["id"]),
+        "visit_id": visit_id,
+        "location_id": int(visit["location_id"]),
+        "location_label": str(visit.get("location_label") or ""),
+        "departure_time": normalized_departure,
+        "reviewed_correction_id": 0,
+    }
+    corrected_segments, corrected_reviews = _closed_shift_utilization(
+        shift,
+        visits,
+        departures,
+        reviewed_departures={visit_id: overlay},
+    )
+    target_signature = _utilization_review_signature(target_review)
+    expected_review_signatures = {
+        _utilization_review_signature(item)
+        for item in raw_review_items
+        if _utilization_review_signature(item) != target_signature
+    }
+    corrected_review_signatures = {
+        _utilization_review_signature(item) for item in corrected_reviews
+    }
+    if target_signature in corrected_review_signatures:
+        raise HTTPException(
+            status_code=409,
+            detail="The reviewed departure did not resolve this evidence gap",
+        )
+    if corrected_review_signatures != expected_review_signatures:
+        raise HTTPException(
+            status_code=409,
+            detail="The reviewed departure conflicts with other time evidence",
+        )
+    paid_seconds = _epoch_second(shift["clock_out"]) - _epoch_second(shift["clock_in"])
+    corrected_seconds = sum(
+        int(segment["end_second"]) - int(segment["start_second"])
+        for segment in corrected_segments
+    )
+    if corrected_seconds != paid_seconds:
+        raise HTTPException(
+            status_code=409,
+            detail="The reviewed departure does not reconcile to paid time",
+        )
+    return overlay, corrected_segments
+
+
+def _utilization_correction_response(
+    row: Dict[str, Any],
+    *,
+    idempotent_replay: bool,
+) -> Dict[str, Any]:
+    result = dict(row.get("result") or {})
+    return {
+        "success": True,
+        "archiveStored": True,
+        "idempotentReplay": idempotent_replay,
+        "batchId": int(row["id"]),
+        "reviewKey": result.get("reviewKey"),
+        "evidenceFingerprint": result.get("evidenceFingerprint"),
+        "shiftId": result.get("shiftId"),
+        "visitId": result.get("visitId"),
+        "effectiveDepartureAt": result.get("effectiveDepartureAt"),
+        # This receipt describes what the append-only correction established
+        # when it was recorded. Current review state is deliberately owned by
+        # GET /utilization, whose evidence fingerprint can reopen or remove the
+        # item after later raw evidence arrives.
+        "reviewStateAtApply": "corrected",
+    }
+
+
+def _normalize_reviewed_departure_input(
+    value: datetime,
+    app_timezone: ZoneInfo,
+) -> datetime:
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc)
+    candidates = {
+        value.replace(tzinfo=app_timezone, fold=fold).astimezone(timezone.utc)
+        for fold in (0, 1)
+        if (
+            value.replace(tzinfo=app_timezone, fold=fold)
+            .astimezone(timezone.utc)
+            .astimezone(app_timezone)
+            .replace(tzinfo=None)
+            == value
+        )
+    }
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail="effectiveDepartureAt is not a valid Central Time",
+        )
+    if len(candidates) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "effectiveDepartureAt is ambiguous at the Central Time change; "
+                "include an explicit UTC offset"
+            ),
+        )
+    return candidates.pop()
+
+
 def build_operations_schedule_router(
     *,
     get_current_admin: Callable[..., Dict[str, Any]],
     timezone_name: str = "America/Chicago",
     now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    timesheet_advisory_lock_id: int,
 ) -> APIRouter:
     router = APIRouter()
     app_timezone = ZoneInfo(timezone_name)
@@ -2664,8 +3232,16 @@ def build_operations_schedule_router(
             range_end,
             observed_at,
         )
-        segments: List[Dict[str, Any]] = []
-        review_items: List[Dict[str, Any]] = []
+        evidence_by_shift = {
+            int(shift["id"]): _utilization_shift_evidence_snapshot(
+                shift,
+                visits.get(int(shift["id"]), []),
+                departures.get(int(shift["id"]), []),
+            )
+            for shift in shifts
+        }
+        raw_by_shift: Dict[int, Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
+        shift_review_items: List[Dict[str, Any]] = []
         finalized_shift_ids: set[int] = set()
         open_shift_ids: set[int] = set()
         for shift in shifts:
@@ -2674,12 +3250,45 @@ def build_operations_schedule_router(
                 open_shift_ids.add(shift_id)
             else:
                 finalized_shift_ids.add(shift_id)
-            shift_segments, shift_review_items = _closed_shift_utilization(
+            raw_segments, raw_review_items = _closed_shift_utilization(
                 shift,
                 visits.get(shift_id, []),
                 departures.get(shift_id, []),
             )
-            review_items.extend(shift_review_items)
+            prepared_review_items = _prepare_utilization_review_items(
+                raw_review_items,
+                evidence_by_shift,
+            )
+            raw_by_shift[shift_id] = (raw_segments, prepared_review_items)
+            shift_review_items.extend(prepared_review_items)
+
+        correction_rows = _utilization_correction_rows(
+            item["reviewKey"] for item in shift_review_items
+        )
+        _attach_utilization_correction_state(shift_review_items, correction_rows)
+        reviewed_departures_by_shift: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(
+            dict
+        )
+        for item in shift_review_items:
+            correction = item.get("_currentCorrection")
+            if correction is None or item.get("visitId") is None:
+                continue
+            reviewed_departures_by_shift[int(item["shiftId"])][int(item["visitId"])] = (
+                _reviewed_departure_overlay(correction)
+            )
+
+        segments: List[Dict[str, Any]] = []
+        for shift in shifts:
+            shift_id = int(shift["id"])
+            if reviewed_departures_by_shift.get(shift_id):
+                shift_segments, _ = _closed_shift_utilization(
+                    shift,
+                    visits.get(shift_id, []),
+                    departures.get(shift_id, []),
+                    reviewed_departures=reviewed_departures_by_shift[shift_id],
+                )
+            else:
+                shift_segments = raw_by_shift[shift_id][0]
             for segment in shift_segments:
                 segments.extend(
                     _split_utilization_segment(
@@ -2691,7 +3300,12 @@ def build_operations_schedule_router(
                 )
 
         segments, overlap_review_items = _collapse_overlapping_paid_segments(segments)
-        review_items.extend(overlap_review_items)
+        prepared_overlap_items = _prepare_utilization_review_items(
+            overlap_review_items,
+            evidence_by_shift,
+        )
+        _attach_utilization_correction_state(prepared_overlap_items, [])
+        review_items = [*shift_review_items, *prepared_overlap_items]
         rows = _utilization_rows(segments)
         summary = _utilization_totals(segments)
         overlapping_shift_ids = {
@@ -2705,6 +3319,12 @@ def build_operations_schedule_router(
                 "openShiftCount": len(open_shift_ids),
                 "overlappingShiftCount": len(overlapping_shift_ids),
                 "reviewItemCount": len(review_items),
+                "openReviewItemCount": sum(
+                    1 for item in review_items if item["hasOpenReview"]
+                ),
+                "correctedReviewItemCount": sum(
+                    1 for item in review_items if item["reviewState"] == "corrected"
+                ),
             }
         )
         ordered_review_items = sorted(
@@ -2722,6 +3342,7 @@ def build_operations_schedule_router(
             "observedAt": _utc_iso(observed_at),
             "startDate": str(resolved_start),
             "endDate": str(resolved_end),
+            "evidenceVersion": UTILIZATION_EVIDENCE_VERSION,
             "summary": summary,
             "rows": rows,
             "reviewItems": [
@@ -2729,6 +3350,213 @@ def build_operations_schedule_router(
                 for item in ordered_review_items
             ],
         }
+
+    @router.post(
+        "/api/admin/operations/utilization/reviews/"
+        "{review_key}/missing-departure"
+    )
+    def correct_utilization_missing_departure(
+        review_key: str,
+        payload: UtilizationMissingDepartureCorrectionRequest,
+        current_admin: Dict[str, Any] = Depends(get_current_admin),
+    ) -> Dict[str, Any]:
+        if not re.fullmatch(r"[0-9a-f]{64}", review_key):
+            raise HTTPException(status_code=400, detail="Invalid utilization review key")
+        reason = payload.reason.strip()
+        if len(reason) < 10:
+            raise HTTPException(
+                status_code=400,
+                detail="Correction reason must be at least 10 non-space characters",
+            )
+        effective_departure_at = _normalize_reviewed_departure_input(
+            payload.effectiveDepartureAt,
+            app_timezone,
+        )
+        if effective_departure_at.microsecond:
+            raise HTTPException(
+                status_code=400,
+                detail="effectiveDepartureAt must use whole-second precision",
+            )
+        if effective_departure_at > now_provider().astimezone(timezone.utc):
+            raise HTTPException(
+                status_code=400,
+                detail="Reviewed departure cannot be in the future",
+            )
+
+        plan_token = hashlib.sha256(
+            (
+                f"{UTILIZATION_MISSING_DEPARTURE_CORRECTION}:"
+                f"{payload.idempotencyKey}"
+            ).encode("utf-8")
+        ).hexdigest()
+        normalized_request = {
+            "reviewKey": review_key,
+            "shiftId": int(payload.shiftId),
+            "visitId": int(payload.visitId),
+            "evidenceFingerprint": payload.evidenceFingerprint,
+            "effectiveDepartureAt": _utc_iso(effective_departure_at),
+            "reason": reason,
+        }
+        request_fingerprint = hashlib.sha256(
+            json.dumps(
+                normalized_request,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (timesheet_advisory_lock_id,),
+                )
+                cursor.execute(
+                    """
+                    SELECT id, plan_token, applied_by_employee_id, applied_by_name,
+                           reason, snapshot, result, created_at
+                    FROM time_data_correction_batches
+                    WHERE plan_token = %s
+                    """,
+                    (plan_token,),
+                )
+                existing_row = cursor.fetchone()
+                if existing_row:
+                    existing = dict(existing_row)
+                    existing_fingerprint = str(
+                        (existing.get("snapshot") or {}).get("requestFingerprint")
+                        or ""
+                    )
+                    if existing_fingerprint != request_fingerprint:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "This correction request identity was already used "
+                                "for different data"
+                            ),
+                        )
+                    return _utilization_correction_response(
+                        existing,
+                        idempotent_replay=True,
+                    )
+
+                shift, visits, departures = _load_utilization_shift_evidence(
+                    cursor,
+                    int(payload.shiftId),
+                    lock_shift=True,
+                )
+                _, raw_review_items = _closed_shift_utilization(
+                    shift,
+                    visits,
+                    departures,
+                )
+                evidence_by_shift = {
+                    int(shift["id"]): _utilization_shift_evidence_snapshot(
+                        shift,
+                        visits,
+                        departures,
+                    )
+                }
+                prepared_review_items = _prepare_utilization_review_items(
+                    raw_review_items,
+                    evidence_by_shift,
+                )
+                target_review = next(
+                    (
+                        item
+                        for item in prepared_review_items
+                        if item["reviewKey"] == review_key
+                        and item["code"] == "missing_departure"
+                        and item.get("visitId") == int(payload.visitId)
+                    ),
+                    None,
+                )
+                if target_review is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The missing-departure review changed or no longer "
+                            "exists; refresh before correcting"
+                        ),
+                    )
+                if (
+                    str(target_review["evidenceFingerprint"])
+                    != payload.evidenceFingerprint
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Utilization evidence changed; refresh before correcting",
+                    )
+
+                overlay, corrected_segments = _validate_reviewed_departure(
+                    shift=shift,
+                    visits=visits,
+                    departures=departures,
+                    raw_review_items=raw_review_items,
+                    target_review=target_review,
+                    effective_departure_at=effective_departure_at,
+                )
+                visit = next(
+                    row for row in visits if int(row["id"]) == int(payload.visitId)
+                )
+                snapshot = {
+                    "correctionType": UTILIZATION_MISSING_DEPARTURE_CORRECTION,
+                    "requestFingerprint": request_fingerprint,
+                    "reviewKey": review_key,
+                    "evidenceVersion": UTILIZATION_EVIDENCE_VERSION,
+                    "evidenceFingerprint": target_review["evidenceFingerprint"],
+                    "evidence": target_review["_evidenceSnapshot"],
+                    "request": normalized_request,
+                }
+                result = {
+                    "correctionType": UTILIZATION_MISSING_DEPARTURE_CORRECTION,
+                    "reviewKey": review_key,
+                    "evidenceVersion": UTILIZATION_EVIDENCE_VERSION,
+                    "evidenceFingerprint": target_review["evidenceFingerprint"],
+                    "shiftId": int(shift["id"]),
+                    "visitId": int(visit["id"]),
+                    "locationId": int(overlay["location_id"]),
+                    "locationLabel": str(overlay.get("location_label") or ""),
+                    "jobId": (
+                        int(visit["job_id"])
+                        if visit.get("job_id") is not None
+                        else None
+                    ),
+                    "effectiveDepartureAt": _utc_iso(
+                        overlay["departure_time"]
+                    ),
+                    "derivedIntervalCount": len(corrected_segments),
+                    "evidence": ["reviewed_departure"],
+                }
+                cursor.execute(
+                    """
+                    INSERT INTO time_data_correction_batches (
+                        plan_token,
+                        applied_by_employee_id,
+                        applied_by_name,
+                        reason,
+                        snapshot,
+                        result
+                    )
+                    VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                    RETURNING id, plan_token, applied_by_employee_id,
+                              applied_by_name, reason, snapshot, result, created_at
+                    """,
+                    (
+                        plan_token,
+                        int(current_admin["id"]),
+                        str(current_admin["name"]),
+                        reason,
+                        json.dumps(snapshot, sort_keys=True),
+                        json.dumps(result, sort_keys=True),
+                    ),
+                )
+                inserted = dict(cursor.fetchone())
+
+        return _utilization_correction_response(
+            inserted,
+            idempotent_replay=False,
+        )
 
     @router.get("/api/admin/operations/forecast")
     def operations_forecast(

@@ -13643,15 +13643,17 @@ def admin_analytics_customer(
     }
 
 
-# Canonical operational Schedule and Forecast are read-only projections over
-# jobs and existing time evidence.  Their focused router deliberately has no
-# access to timekeeping mutation helpers.
+# Canonical operational Schedule, Utilization, and Forecast share one focused
+# router. Utilization corrections append reviewed overlays to the existing
+# correction ledger; the router receives only the cross-process lock identity
+# and never receives a raw timekeeping mutation helper.
 from operations_schedule import allocate_monthly_cents, build_operations_schedule_router
 
 app.include_router(
     build_operations_schedule_router(
         get_current_admin=get_current_admin,
         timezone_name=TIMEZONE_NAME,
+        timesheet_advisory_lock_id=TIMESHEET_PG_ADVISORY_LOCK_ID,
     )
 )
 
