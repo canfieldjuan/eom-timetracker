@@ -167,6 +167,8 @@ def _load_jobs(
                l.customer_id, l.address AS site_address,
                l.location_type AS site_type, l.rate, l.rate_type,
                l.expected_hours AS site_expected_hours,
+               l.target_labor_pct AS site_target_labor_pct,
+               l.min_margin_pct AS site_min_margin_pct,
                l.active AS site_active,
                COALESCE(c.name, l.customer_name, j.customer_name) AS display_customer
         FROM jobs j
@@ -2845,6 +2847,329 @@ def _aggregate_forecast_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "incompleteJobCount": len(
             {int(row["jobId"]) for row in rows if row.get("issues")}
         ),
+    }
+
+
+def _monthly_revenue_allocations(
+    jobs: List[Dict[str, Any]],
+    app_timezone: ZoneInfo,
+) -> Dict[int, int]:
+    monthly_groups: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = defaultdict(list)
+    for job in jobs:
+        if (
+            job.get("status") != "cancelled"
+            and job.get("location_id") is not None
+            and str(job.get("rate_type") or "") == "monthly"
+        ):
+            scheduled_date = job["scheduled_date"]
+            monthly_groups[
+                (
+                    int(job["location_id"]),
+                    scheduled_date.year,
+                    scheduled_date.month,
+                )
+            ].append(job)
+
+    monthly_allocations: Dict[int, int] = {}
+    for jobs_in_month in monthly_groups.values():
+        ordered = sorted(
+            jobs_in_month,
+            key=lambda row: (
+                row.get("scheduled_start")
+                or datetime.combine(
+                    row["scheduled_date"],
+                    time.min,
+                    tzinfo=app_timezone,
+                ).astimezone(timezone.utc),
+                int(row["id"]),
+            ),
+        )
+        monthly_cents = _money_cents(ordered[0].get("rate"))
+        if monthly_cents is not None:
+            monthly_allocations.update(
+                allocate_monthly_cents(
+                    monthly_cents,
+                    (int(job["id"]) for job in ordered),
+                )
+            )
+    return monthly_allocations
+
+
+def _actual_profitability_revenue_cents(
+    row: Dict[str, Any],
+    monthly_allocations: Dict[int, int],
+) -> MoneyCents:
+    if not bool(row.get("includedInProfitability")):
+        return None
+
+    site_economics = dict(row.get("siteEconomics") or {})
+    rate_cents = _money_cents(site_economics.get("rate"))
+    rate_type = site_economics.get("rateType")
+    planned_hours = row.get("plannedHours")
+    if rate_cents is None:
+        return None
+    if rate_type == "per_visit":
+        return rate_cents
+    if rate_type == "hourly" and planned_hours is not None:
+        return int(
+            (Decimal(rate_cents) * Decimal(str(planned_hours))).quantize(
+                Decimal("1"),
+                rounding=ROUND_HALF_UP,
+            )
+        )
+    if rate_type == "monthly":
+        return monthly_allocations.get(int(row.get("jobId") or row["id"]))
+    return None
+
+
+def _percent(numerator: Optional[int], denominator: Optional[int]) -> Optional[float]:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return round(numerator / denominator * 100, 1)
+
+
+def _actual_profitability_row(
+    row: Dict[str, Any],
+    source_job: Dict[str, Any],
+    monthly_allocations: Dict[int, int],
+    *,
+    default_target_labor_pct: Optional[float],
+    default_min_margin_pct: Optional[float],
+) -> Dict[str, Any]:
+    included = bool(row["includedInPlan"]) and row.get("status") != "cancelled"
+    working_row = {**row, "includedInProfitability": included}
+    revenue_cents = _actual_profitability_revenue_cents(
+        working_row,
+        monthly_allocations,
+    )
+    actual_labor_cents = _money_cents(row.get("actualLaborCost"))
+    known_actual_labor_cents = _money_cents(row.get("knownActualLaborCost")) or 0
+    net_cents = (
+        revenue_cents - actual_labor_cents
+        if revenue_cents is not None and actual_labor_cents is not None
+        else None
+    )
+    actual_labor_pct = _percent(actual_labor_cents, revenue_cents)
+    target_labor_pct = (
+        float(source_job["site_target_labor_pct"])
+        if source_job.get("site_target_labor_pct") is not None
+        else default_target_labor_pct
+    )
+    min_margin_pct = (
+        float(source_job["site_min_margin_pct"])
+        if source_job.get("site_min_margin_pct") is not None
+        else default_min_margin_pct
+    )
+    issues = list(row.get("issues") or [])
+    if included and revenue_cents is None:
+        issues.append(
+            _issue(
+                "missing_revenue",
+                "Revenue cannot be calculated from this Site's rate card.",
+            )
+        )
+
+    return {
+        "jobId": int(row["id"]),
+        "locationId": row.get("locationId"),
+        "customerId": row.get("customerId"),
+        "customerName": row.get("customerName"),
+        "siteAddress": row.get("siteAddress"),
+        "siteType": row.get("siteType"),
+        "scheduledDate": row.get("scheduledDate"),
+        "scheduledStart": row.get("scheduledStart"),
+        "scheduledEnd": row.get("scheduledEnd"),
+        "status": row.get("status"),
+        "executionStatus": row.get("executionStatus"),
+        "includedInProfitability": included,
+        "plannedHours": row.get("plannedHours"),
+        "actualHours": row.get("actualHours"),
+        "varianceHours": row.get("varianceHours"),
+        "revenue": _money(revenue_cents),
+        "revenueComplete": revenue_cents is not None,
+        "actualLaborCost": _money(actual_labor_cents),
+        "knownActualLaborCost": _money(known_actual_labor_cents),
+        "laborCostComplete": actual_labor_cents is not None,
+        "netProfit": _money(net_cents),
+        "grossMarginPct": _percent(net_cents, revenue_cents),
+        "actualLaborPct": actual_labor_pct,
+        "targetLaborPct": target_labor_pct,
+        "laborTargetVariancePct": (
+            round(actual_labor_pct - target_labor_pct, 1)
+            if actual_labor_pct is not None and target_labor_pct is not None
+            else None
+        ),
+        "minMarginPct": min_margin_pct,
+        "workers": [
+            {
+                "employeeId": int(worker["employeeId"]),
+                "employeeName": worker["employeeName"],
+                "hours": worker["hours"],
+                "laborCost": worker["laborCost"],
+                "status": worker["status"],
+            }
+            for worker in row.get("workers", [])
+        ],
+        "issues": issues,
+    }
+
+
+def _aggregate_actual_profitability_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    included_rows = [row for row in rows if bool(row.get("includedInProfitability"))]
+    known_planned_hours = sum(
+        float(row["plannedHours"])
+        for row in included_rows
+        if row.get("plannedHours") is not None
+    )
+    planned_hours_incomplete = sum(
+        1 for row in included_rows if row.get("plannedHours") is None
+    )
+    actual_hours = sum(float(row["actualHours"] or 0) for row in included_rows)
+    known_revenue_cents = sum(
+        _money_cents(row["revenue"]) or 0
+        for row in included_rows
+        if row.get("revenue") is not None
+    )
+    revenue_incomplete = sum(
+        1 for row in included_rows if not bool(row.get("revenueComplete"))
+    )
+    known_labor_cents = sum(
+        _money_cents(row["knownActualLaborCost"]) or 0
+        for row in included_rows
+    )
+    labor_incomplete = sum(
+        1 for row in included_rows if not bool(row.get("laborCostComplete"))
+    )
+    revenue = _complete_total(known_revenue_cents, revenue_incomplete)
+    labor = _complete_total(known_labor_cents, labor_incomplete)
+    revenue_cents = _money_cents(revenue)
+    labor_cents = _money_cents(labor)
+    net_cents = (
+        revenue_cents - labor_cents
+        if revenue_cents is not None and labor_cents is not None
+        else None
+    )
+    return {
+        "jobCount": len(included_rows),
+        "visibleJobCount": len(rows),
+        "excludedJobCount": len(rows) - len(included_rows),
+        "plannedHours": _complete_hours(
+            known_planned_hours,
+            planned_hours_incomplete,
+        ),
+        "knownPlannedHours": round(known_planned_hours, 2),
+        "plannedHoursComplete": planned_hours_incomplete == 0,
+        "actualHours": round(actual_hours, 2),
+        "varianceHours": (
+            round(actual_hours - known_planned_hours, 2)
+            if planned_hours_incomplete == 0
+            else None
+        ),
+        "revenue": revenue,
+        "knownRevenue": _money(known_revenue_cents),
+        "revenueComplete": revenue_incomplete == 0,
+        "actualLaborCost": labor,
+        "knownActualLaborCost": _money(known_labor_cents),
+        "laborCostComplete": labor_incomplete == 0,
+        "netProfit": _money(net_cents),
+        "grossMarginPct": _percent(net_cents, revenue_cents),
+        "actualLaborPct": _percent(labor_cents, revenue_cents),
+        "incompleteJobCount": len(
+            {int(row["jobId"]) for row in rows if row.get("issues")}
+        ),
+    }
+
+
+def build_weekly_labor_profitability(
+    week_start: date,
+    *,
+    timezone_name: str = "America/Chicago",
+    now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    default_target_labor_pct: Optional[float] = None,
+    default_min_margin_pct: Optional[float] = None,
+) -> Dict[str, Any]:
+    app_timezone = ZoneInfo(timezone_name)
+    observed_at = now_provider().astimezone(timezone.utc)
+    week_end = week_start + timedelta(days=6)
+    range_start, range_end = _local_bounds(week_start, week_end, app_timezone)
+    allocation_start = date(week_start.year, week_start.month, 1)
+    allocation_end = _month_end(week_end)
+    jobs = _load_jobs(
+        week_start,
+        week_end,
+        window_start=range_start,
+        window_end=range_end,
+    )
+    allocation_jobs = _load_jobs(allocation_start, allocation_end)
+    monthly_allocations = _monthly_revenue_allocations(
+        allocation_jobs,
+        app_timezone,
+    )
+    schedule_jobs, unmatched = _decorate_schedule_jobs(
+        jobs,
+        range_start,
+        range_end,
+        observed_at,
+        app_timezone,
+        visible_range_start=range_start,
+        visible_range_end=range_end,
+    )
+    source_jobs = {int(job["id"]): job for job in jobs}
+    profit_jobs = [
+        _actual_profitability_row(
+            row,
+            source_jobs[int(row["id"])],
+            monthly_allocations,
+            default_target_labor_pct=default_target_labor_pct,
+            default_min_margin_pct=default_min_margin_pct,
+        )
+        for row in schedule_jobs
+    ]
+
+    by_site_rows: Dict[Optional[int], List[Dict[str, Any]]] = defaultdict(list)
+    for row in profit_jobs:
+        by_site_rows[row.get("locationId")].append(row)
+    by_site = []
+    for location_id, site_rows in by_site_rows.items():
+        first = site_rows[0]
+        by_site.append(
+            {
+                "locationId": location_id,
+                "customerId": first.get("customerId"),
+                "customerName": first.get("customerName"),
+                "siteAddress": first.get("siteAddress"),
+                "siteType": first.get("siteType"),
+                **_aggregate_actual_profitability_rows(site_rows),
+            }
+        )
+
+    unmatched_actual_hours = sum(
+        float(segment["hours"])
+        for segment in unmatched
+        if segment.get("finalized") and segment.get("hours") is not None
+    )
+    return {
+        "success": True,
+        "period": "week",
+        "timezone": timezone_name,
+        "observedAt": _utc_iso(observed_at),
+        "weekStart": str(week_start),
+        "weekEnd": str(week_end),
+        "summary": {
+            **_aggregate_actual_profitability_rows(profit_jobs),
+            "unmatchedActualHours": round(unmatched_actual_hours, 2),
+            "unmatchedActualSegmentCount": len(unmatched),
+        },
+        "bySite": sorted(
+            by_site,
+            key=lambda row: (
+                str(row.get("customerName") or "").casefold(),
+                str(row.get("siteAddress") or "").casefold(),
+                int(row.get("locationId") or 0),
+            ),
+        ),
+        "jobs": profit_jobs,
+        "unmatchedActualSegments": unmatched,
     }
 
 

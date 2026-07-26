@@ -113,6 +113,285 @@ def _weekly_hours(client, auth: dict[str, str], week_start: date) -> dict:
     return response.json()
 
 
+def _delete_payroll_labor_profitability_rows() -> None:
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM payroll_hour_corrections
+                WHERE employee_id IN (
+                    SELECT id FROM employees
+                    WHERE name LIKE 'Payroll Labor Profitability%'
+                )
+                """
+            )
+            cur.execute(
+                """
+                DELETE FROM site_check_ins
+                WHERE employee_id IN (
+                    SELECT id FROM employees
+                    WHERE name LIKE 'Payroll Labor Profitability%'
+                )
+                   OR location_id IN (
+                    SELECT id FROM locations
+                    WHERE address LIKE 'Payroll Labor Profitability%'
+                )
+                """
+            )
+            cur.execute(
+                """
+                DELETE FROM shifts
+                WHERE employee_id IN (
+                    SELECT id FROM employees
+                    WHERE name LIKE 'Payroll Labor Profitability%'
+                )
+                   OR location_id IN (
+                    SELECT id FROM locations
+                    WHERE address LIKE 'Payroll Labor Profitability%'
+                )
+                """
+            )
+            cur.execute(
+                "DELETE FROM jobs WHERE customer_name LIKE 'Payroll Labor Profitability%'"
+            )
+            cur.execute(
+                "DELETE FROM locations WHERE address LIKE 'Payroll Labor Profitability%'"
+            )
+            cur.execute(
+                "DELETE FROM customers WHERE name LIKE 'Payroll Labor Profitability%'"
+            )
+            cur.execute(
+                """
+                DELETE FROM google_calendar_sources
+                WHERE calendar_id LIKE 'payroll_labor_profitability%'
+                """
+            )
+            cur.execute(
+                """
+                DELETE FROM google_calendar_connections
+                WHERE google_account_email LIKE 'payroll_labor_profitability%'
+                """
+            )
+            cur.execute(
+                "DELETE FROM employees WHERE name LIKE 'Payroll Labor Profitability%'"
+            )
+
+
+def _create_payroll_profitability_source() -> int:
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO google_calendar_connections (
+                    google_account_email, granted_scopes, revoked_at
+                )
+                VALUES (
+                    'payroll_labor_profitability@example.test',
+                    ARRAY['calendar.readonly'],
+                    NOW()
+                )
+                RETURNING id
+                """
+            )
+            connection_id = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                INSERT INTO google_calendar_sources (
+                    connection_id, role, calendar_id, calendar_name,
+                    calendar_timezone
+                )
+                VALUES (
+                    %s,
+                    'residential_morning',
+                    'payroll_labor_profitability_calendar',
+                    'Payroll Labor Profitability Calendar',
+                    'America/Chicago'
+                )
+                RETURNING id
+                """,
+                (connection_id,),
+            )
+            return int(cur.fetchone()[0])
+
+
+def _create_payroll_profitability_site() -> tuple[int, int]:
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO customers (name)
+                VALUES ('Payroll Labor Profitability Customer')
+                RETURNING id
+                """
+            )
+            customer_id = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                INSERT INTO locations (
+                    customer_id, address, customer_name, location_type,
+                    rate, rate_type, expected_hours, target_labor_pct
+                )
+                VALUES (
+                    %s,
+                    'Payroll Labor Profitability Site',
+                    'Payroll Labor Profitability Customer',
+                    'Residential',
+                    150.00,
+                    'per_visit',
+                    3.00,
+                    40.00
+                )
+                RETURNING id
+                """,
+                (customer_id,),
+            )
+            return customer_id, int(cur.fetchone()[0])
+
+
+def _create_payroll_profitability_job_and_shift(
+    *,
+    employee_id: int,
+    site_id: int,
+    source_id: int,
+    service_day: date,
+) -> int:
+    start = _local_dt(service_day, 9)
+    end = _local_dt(service_day, 11)
+    source_key = "1" * 64
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO jobs (
+                    location_id, customer_name, scheduled_date,
+                    scheduled_start, scheduled_end, status, calendar_source_id,
+                    source_calendar_id, source_event_id, source_occurrence_id,
+                    source_key, source_fingerprint, source_title
+                )
+                VALUES (
+                    %s,
+                    'Payroll Labor Profitability Customer',
+                    %s,
+                    %s,
+                    %s,
+                    'scheduled',
+                    %s,
+                    'payroll_labor_profitability_calendar',
+                    'payroll-labor-profitability-event',
+                    'payroll-labor-profitability-occurrence',
+                    %s,
+                    %s,
+                    'Payroll Labor Profitability Customer'
+                )
+                RETURNING id
+                """,
+                (
+                    site_id,
+                    service_day,
+                    start.astimezone(timezone.utc),
+                    end.astimezone(timezone.utc),
+                    source_id,
+                    source_key,
+                    source_key,
+                ),
+            )
+            job_id = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                INSERT INTO shifts (
+                    employee_id, location_id, location_label, job_id,
+                    clock_in, clock_out, total_hours, local_date, timezone,
+                    time_category, notes
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'Payroll Labor Profitability Site',
+                    %s,
+                    %s,
+                    %s,
+                    2.00,
+                    %s,
+                    'America/Chicago',
+                    'productive',
+                    'payroll labor profitability test'
+                )
+                RETURNING id
+                """,
+                (
+                    employee_id,
+                    site_id,
+                    job_id,
+                    start.astimezone(timezone.utc),
+                    end.astimezone(timezone.utc),
+                    service_day,
+                ),
+            )
+            shift_id = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                INSERT INTO site_check_ins (
+                    employee_id, location_id, job_id, server_checked_in_at,
+                    device_scanned_at, latitude, longitude, accuracy_m,
+                    geofence_radius_m, distance_m, geofence_status,
+                    classification, classification_reason,
+                    device_clock_skew_seconds, review_status
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, 39.12, -88.54, 5,
+                    100, 3, 'inside', 'on_time', 'test', 0, 'not_required'
+                )
+                RETURNING id
+                """,
+                (
+                    employee_id,
+                    site_id,
+                    job_id,
+                    start.astimezone(timezone.utc),
+                    start.astimezone(timezone.utc),
+                ),
+            )
+            check_in_id = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                INSERT INTO visits (
+                    shift_id, location_id, location_label, customer_name,
+                    arrival_time, sequence_version, site_check_in_id
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    'Payroll Labor Profitability Site',
+                    'Payroll Labor Profitability Customer',
+                    %s,
+                    2,
+                    %s
+                )
+                RETURNING id
+                """,
+                (shift_id, site_id, start.astimezone(timezone.utc), check_in_id),
+            )
+            visit_id = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                INSERT INTO departures (
+                    shift_id, visit_id, location_id, location_label,
+                    customer_name, departure_time
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    'Payroll Labor Profitability Site',
+                    'Payroll Labor Profitability Customer',
+                    %s
+                )
+                """,
+                (shift_id, visit_id, site_id, end.astimezone(timezone.utc)),
+            )
+            return job_id
+
+
 def _assert_valid_pdf(payload: bytes) -> None:
     assert payload.startswith(b"%PDF-")
     assert b"%%EOF" in payload[-1024:]
@@ -1052,6 +1331,170 @@ def test_payroll_weekly_hours_pdf_includes_verification_and_corrections_without_
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_employees([employee_id])
+
+
+def test_payroll_labor_profitability_requires_payroll_before_computing(
+    client,
+    emp_auth,
+    monkeypatch,
+):
+    def forbidden_compute(*_args, **_kwargs):
+        raise AssertionError("payroll labor profitability computed before auth")
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "build_weekly_labor_profitability",
+        forbidden_compute,
+    )
+
+    assert client.get("/api/admin/payroll/labor-profitability").status_code == 401
+    assert (
+        client.get(
+            "/api/admin/payroll/labor-profitability",
+            headers=emp_auth,
+        ).status_code
+        == 403
+    )
+
+
+def test_payroll_labor_profitability_reports_actual_site_margin_without_rates(
+    client,
+):
+    week_start = date(2026, 7, 19)
+    service_day = date(2026, 7, 20)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    employee_id = None
+    payroll_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Mayra",
+            role="payroll",
+        )
+        employee_id = _create_employee(
+            "Payroll Labor Profitability Worker",
+            hourly_rate=20,
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Mayra")
+        source_id = _create_payroll_profitability_source()
+        _, site_id = _create_payroll_profitability_site()
+        job_id = _create_payroll_profitability_job_and_shift(
+            employee_id=employee_id,
+            site_id=site_id,
+            source_id=source_id,
+            service_day=service_day,
+        )
+
+        response = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["success"] is True
+        assert body["weekStart"] == "2026-07-19"
+        assert body["weekEnd"] == "2026-07-25"
+        assert body["verification"]["status"] == "unverified"
+        assert body["payrollHours"]["totalHours"] == 2.0
+        assert body["payrollHours"]["correctionCount"] == 0
+        assert body["issues"] == []
+
+        assert body["summary"]["jobCount"] == 1
+        assert body["summary"]["plannedHours"] == 3.0
+        assert body["summary"]["actualHours"] == 2.0
+        assert body["summary"]["varianceHours"] == -1.0
+        assert body["summary"]["revenue"] == 150.0
+        assert body["summary"]["actualLaborCost"] == 40.0
+        assert body["summary"]["netProfit"] == 110.0
+        assert body["summary"]["grossMarginPct"] == 73.3
+        assert body["summary"]["actualLaborPct"] == 26.7
+        assert body["summary"]["unmatchedActualHours"] == 0
+
+        jobs = {row["jobId"]: row for row in body["jobs"]}
+        job = jobs[job_id]
+        assert job["customerName"] == "Payroll Labor Profitability Customer"
+        assert job["plannedHours"] == 3.0
+        assert job["actualHours"] == 2.0
+        assert job["varianceHours"] == -1.0
+        assert job["revenue"] == 150.0
+        assert job["actualLaborCost"] == 40.0
+        assert job["knownActualLaborCost"] == 40.0
+        assert job["laborCostComplete"] is True
+        assert job["targetLaborPct"] == 40.0
+        assert job["laborTargetVariancePct"] == -13.3
+        assert job["workers"] == [
+            {
+                "employeeId": employee_id,
+                "employeeName": "Payroll Labor Profitability Worker",
+                "hours": 2.0,
+                "laborCost": 40.0,
+                "status": "finalized",
+            }
+        ]
+        assert "hourlyRate" not in response.text
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_labor_profitability_discloses_unallocated_hour_corrections(
+    client,
+):
+    week_start = date(2026, 7, 19)
+    service_day = date(2026, 7, 20)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    employee_id = None
+    payroll_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Mayra",
+            role="payroll",
+        )
+        employee_id = _create_employee(
+            "Payroll Labor Profitability Worker",
+            hourly_rate=20,
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Mayra")
+        source_id = _create_payroll_profitability_source()
+        _, site_id = _create_payroll_profitability_site()
+        _create_payroll_profitability_job_and_shift(
+            employee_id=employee_id,
+            site_id=site_id,
+            source_id=source_id,
+            service_day=service_day,
+        )
+
+        corrected = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": service_day.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Mayra corrected total hours.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+
+        response = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["payrollHours"]["totalHours"] == 3.0
+        assert body["payrollHours"]["correctionCount"] == 1
+        assert body["summary"]["actualHours"] == 2.0
+        assert [issue["code"] for issue in body["issues"]] == [
+            "payroll_hour_corrections_not_allocated_to_sites"
+        ]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
 def test_employee_role_migration_allows_payroll_on_existing_constraints():
