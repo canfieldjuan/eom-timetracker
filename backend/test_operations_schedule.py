@@ -9,12 +9,16 @@ import pytest
 
 import db
 from operations_schedule import (
+    _allocate_utilization_minutes,
+    _collapse_overlapping_paid_segments,
+    _closed_shift_utilization,
     _closed_shift_segments,
     _forecast_job_values,
     _job_issues,
     _match_segment_to_job,
     _qr_only_presence_segments,
     _schedule_execution_status,
+    _utilization_rows,
     allocate_monthly_cents,
 )
 
@@ -346,6 +350,7 @@ def _shift(
     location_label: str = "",
     job_id: int | None = None,
     time_category: str = "productive",
+    non_productive_type: str | None = None,
 ) -> int:
     total_hours = (
         round((end - start).total_seconds() / 3600, 2) if end is not None else None
@@ -355,11 +360,11 @@ def _shift(
         INSERT INTO shifts (
             employee_id, location_id, location_label, job_id,
             clock_in, clock_out, total_hours, local_date,
-            timezone, time_category
+            timezone, time_category, non_productive_type
         )
         VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s,
-            'America/Chicago', %s
+            'America/Chicago', %s, %s
         )
         RETURNING id
         """,
@@ -373,6 +378,7 @@ def _shift(
             total_hours,
             service_day,
             time_category,
+            non_productive_type,
         ),
     )
     return int(cur.fetchone()[0])
@@ -387,7 +393,7 @@ def _check_in(
     job_id: int | None,
     classification: str = "on_time",
     review_status: str = "not_required",
-) -> None:
+) -> int:
     cur.execute(
         """
         INSERT INTO site_check_ins (
@@ -401,6 +407,7 @@ def _check_in(
             %s, %s, %s, %s, %s, 39.12, -88.54, 5,
             100, 3, 'inside', %s, 'test', 0, %s
         )
+        RETURNING id
         """,
         (
             employee_id,
@@ -412,6 +419,7 @@ def _check_in(
             review_status,
         ),
     )
+    return int(cur.fetchone()[0])
 
 
 def _visit(
@@ -421,14 +429,17 @@ def _visit(
     location_id: int,
     at: datetime,
     suffix: str,
-) -> None:
+    sequence_version: int = 1,
+    site_check_in_id: int | None = None,
+) -> int:
     cur.execute(
         """
         INSERT INTO visits (
             shift_id, location_id, location_label, customer_name,
-            arrival_time
+            arrival_time, sequence_version, site_check_in_id
         )
-        VALUES (%s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
         """,
         (
             shift_id,
@@ -436,8 +447,11 @@ def _visit(
             f"{TEST_PREFIX} Site {suffix}",
             f"{TEST_PREFIX} Customer {suffix}",
             at,
+            sequence_version,
+            site_check_in_id,
         ),
     )
+    return int(cur.fetchone()[0])
 
 
 def _departure(
@@ -447,23 +461,65 @@ def _departure(
     location_id: int,
     at: datetime,
     suffix: str,
-) -> None:
+    visit_id: int | None = None,
+) -> int:
     cur.execute(
         """
         INSERT INTO departures (
-            shift_id, location_id, location_label, customer_name,
+            shift_id, visit_id, location_id, location_label, customer_name,
             departure_time
         )
-        VALUES (%s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id
         """,
         (
             shift_id,
+            visit_id,
             location_id,
             f"{TEST_PREFIX} Site {suffix}",
             f"{TEST_PREFIX} Customer {suffix}",
             at,
         ),
     )
+    return int(cur.fetchone()[0])
+
+
+def _paired_version_two_visit(
+    cur,
+    *,
+    employee_id: int,
+    shift_id: int,
+    location_id: int,
+    job_id: int,
+    arrival: datetime,
+    departure: datetime,
+    suffix: str,
+) -> tuple[int, int]:
+    check_in_id = _check_in(
+        cur,
+        employee_id=employee_id,
+        location_id=location_id,
+        checked_in_at=arrival,
+        job_id=job_id,
+    )
+    visit_id = _visit(
+        cur,
+        shift_id=shift_id,
+        location_id=location_id,
+        at=arrival,
+        suffix=suffix,
+        sequence_version=2,
+        site_check_in_id=check_in_id,
+    )
+    departure_id = _departure(
+        cur,
+        shift_id=shift_id,
+        location_id=location_id,
+        at=departure,
+        suffix=suffix,
+        visit_id=visit_id,
+    )
+    return visit_id, departure_id
 
 
 def _schedule_body(client, auth, service_day: date) -> dict:
@@ -474,6 +530,529 @@ def _schedule_body(client, auth, service_day: date) -> dict:
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _utilization_body(
+    client,
+    auth,
+    start_date: date,
+    end_date: date | None = None,
+) -> dict:
+    response = client.get(
+        "/api/admin/operations/utilization",
+        headers=auth,
+        params={
+            "start_date": str(start_date),
+            "end_date": str(end_date or start_date),
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+UTILIZATION_TOTAL_KEYS = {
+    "paidSeconds",
+    "paidMinutes",
+    "onSiteSeconds",
+    "onSiteMinutes",
+    "travelSeconds",
+    "travelMinutes",
+    "categorizedSeconds",
+    "categorizedMinutes",
+    "unclassifiedSeconds",
+    "unclassifiedMinutes",
+    "reconciles",
+}
+UTILIZATION_INTERVAL_KEYS = {
+    "shiftId",
+    "relatedShiftIds",
+    "category",
+    "categoryDetail",
+    "intervalStart",
+    "intervalEnd",
+    "durationSeconds",
+    "durationMinutes",
+    "locationId",
+    "jobId",
+    "visitId",
+    "departureId",
+    "evidence",
+    "reviewCodes",
+}
+
+
+def _assert_utilization_totals(
+    value: dict,
+    *,
+    paid: int,
+    on_site: int,
+    travel: int,
+    categorized: int,
+    unclassified: int,
+) -> None:
+    assert UTILIZATION_TOTAL_KEYS <= value.keys()
+    expected_minutes = {
+        "paidMinutes": paid,
+        "onSiteMinutes": on_site,
+        "travelMinutes": travel,
+        "categorizedMinutes": categorized,
+        "unclassifiedMinutes": unclassified,
+    }
+    for key, minutes in expected_minutes.items():
+        assert value[key] == minutes
+        assert value[key.removesuffix("Minutes") + "Seconds"] == minutes * 60
+    assert paid == on_site + travel + categorized + unclassified
+    assert value["reconciles"] is True
+
+
+def _utilization_row(body: dict, employee_id: int, service_day: date) -> dict:
+    return next(
+        row
+        for row in body["rows"]
+        if row["employeeId"] == employee_id and row["date"] == str(service_day)
+    )
+
+
+def _assert_interval_contract(intervals: list[dict]) -> None:
+    assert intervals
+    for interval in intervals:
+        assert UTILIZATION_INTERVAL_KEYS <= interval.keys()
+        assert interval["category"] in {
+            "on_site",
+            "travel",
+            "categorized",
+            "unclassified",
+        }
+        assert isinstance(interval["durationSeconds"], int)
+        assert isinstance(interval["durationMinutes"], int)
+        assert interval["durationSeconds"] >= 0
+        assert interval["durationMinutes"] >= 0
+        assert isinstance(interval["evidence"], list)
+        assert isinstance(interval["reviewCodes"], list)
+
+
+def test_utilization_minute_allocation_is_deterministic_and_reconciled():
+    segments = [
+        {
+            "start_second": index * 20,
+            "end_second": (index + 1) * 20,
+            "shift_id": 1,
+            "category": category,
+        }
+        for index, category in enumerate(("on_site", "travel", "unclassified"))
+    ]
+
+    _allocate_utilization_minutes(segments)
+
+    assert [segment["duration_seconds"] for segment in segments] == [20, 20, 20]
+    assert [segment["duration_minutes"] for segment in segments] == [1, 0, 0]
+    assert sum(segment["duration_minutes"] for segment in segments) == 1
+
+
+def test_utilization_minute_allocation_is_stable_per_employee_day():
+    service_day = date(2026, 7, 20)
+    segments = [
+        {
+            "employee_id": employee_id,
+            "employee_name": f"Worker {employee_id}",
+            "date": service_day,
+            "start_second": employee_id * 100,
+            "end_second": employee_id * 100 + 31,
+            "shift_id": employee_id,
+            "category": "unclassified",
+        }
+        for employee_id in (1, 2)
+    ]
+
+    rows = _utilization_rows(segments)
+
+    assert [row["paidSeconds"] for row in rows] == [31, 31]
+    assert [row["paidMinutes"] for row in rows] == [1, 1]
+    assert all(row["reconciles"] for row in rows)
+
+
+def test_utilization_mixed_legacy_arrival_invalidates_paired_site_interval():
+    shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    shift = {
+        "id": 1,
+        "employee_id": 2,
+        "employee_name": "Worker",
+        "clock_in": shift_start,
+        "clock_out": shift_start + timedelta(hours=3),
+        "time_category": "productive",
+    }
+    visits = [
+        {
+            "id": 10,
+            "location_id": 100,
+            "location_label": "Site A",
+            "arrival_time": shift_start + timedelta(minutes=30),
+            "sequence_version": 2,
+            "job_id": 1000,
+        },
+        {
+            "id": 11,
+            "location_id": 101,
+            "location_label": "Legacy Site",
+            "arrival_time": shift_start + timedelta(hours=1),
+            "sequence_version": 1,
+            "job_id": None,
+        },
+    ]
+    departures = [
+        {
+            "id": 20,
+            "visit_id": 10,
+            "location_id": 100,
+            "departure_time": shift_start + timedelta(hours=2),
+        }
+    ]
+
+    segments, review_items = _closed_shift_utilization(
+        shift,
+        visits,
+        departures,
+    )
+
+    assert {segment["category"] for segment in segments} == {"unclassified"}
+    assert {item["code"] for item in review_items} == {
+        "legacy_visit_evidence",
+        "overlapping_site_evidence",
+    }
+
+
+@pytest.mark.parametrize(
+    ("conflict_minute", "measured_sites", "review_codes"),
+    (
+        (
+            60,
+            [101],
+            {"legacy_unpaired_departure", "overlapping_site_evidence"},
+        ),
+        (90, [100, 101], {"legacy_unpaired_departure"}),
+    ),
+)
+def test_utilization_boundary_departure_conflict_fails_closed(
+    conflict_minute,
+    measured_sites,
+    review_codes,
+):
+    shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    shift = {
+        "id": 1,
+        "employee_id": 2,
+        "employee_name": "Worker",
+        "clock_in": shift_start,
+        "clock_out": shift_start + timedelta(hours=3),
+        "time_category": "productive",
+    }
+    visits = [
+        {
+            "id": 10,
+            "location_id": 100,
+            "location_label": "Site A",
+            "arrival_time": shift_start + timedelta(minutes=30),
+            "sequence_version": 2,
+            "job_id": 1000,
+        },
+        {
+            "id": 11,
+            "location_id": 101,
+            "location_label": "Site B",
+            "arrival_time": shift_start + timedelta(minutes=90),
+            "sequence_version": 2,
+            "job_id": 1001,
+        },
+    ]
+    departures = [
+        {
+            "id": 20,
+            "visit_id": 10,
+            "location_id": 100,
+            "departure_time": shift_start + timedelta(minutes=60),
+        },
+        {
+            "id": 21,
+            "visit_id": None,
+            "location_id": 102,
+            "departure_time": shift_start + timedelta(minutes=conflict_minute),
+        },
+        {
+            "id": 22,
+            "visit_id": 11,
+            "location_id": 101,
+            "departure_time": shift_start + timedelta(minutes=120),
+        },
+    ]
+
+    segments, review_items = _closed_shift_utilization(
+        shift,
+        visits,
+        departures,
+    )
+
+    assert [
+        segment.get("location_id")
+        for segment in segments
+        if segment["category"] != "unclassified"
+    ] == measured_sites
+    assert not any(segment["category"] == "travel" for segment in segments)
+    assert {item["code"] for item in review_items} == review_codes
+
+
+def test_utilization_simultaneous_arrivals_fail_closed():
+    shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    shift = {
+        "id": 1,
+        "employee_id": 2,
+        "employee_name": "Worker",
+        "clock_in": shift_start,
+        "clock_out": shift_start + timedelta(hours=3),
+        "time_category": "productive",
+    }
+    visits = [
+        {
+            "id": 10,
+            "location_id": 100,
+            "location_label": "Site A",
+            "arrival_time": shift_start + timedelta(minutes=15),
+            "sequence_version": 2,
+            "job_id": 1000,
+        },
+        {
+            "id": 11,
+            "location_id": 101,
+            "location_label": "Site B",
+            "arrival_time": shift_start + timedelta(hours=1),
+            "sequence_version": 2,
+            "job_id": 1001,
+        },
+        {
+            "id": 12,
+            "location_id": 102,
+            "location_label": "Site C",
+            "arrival_time": shift_start + timedelta(hours=1),
+            "sequence_version": 2,
+            "job_id": 1002,
+        },
+    ]
+    departures = [
+        {
+            "id": 20,
+            "visit_id": 10,
+            "location_id": 100,
+            "departure_time": shift_start + timedelta(minutes=30),
+        },
+        {
+            "id": 21,
+            "visit_id": 11,
+            "location_id": 101,
+            "departure_time": shift_start + timedelta(hours=2),
+        },
+    ]
+
+    segments, review_items = _closed_shift_utilization(
+        shift,
+        visits,
+        departures,
+    )
+
+    assert [
+        (segment["category"], segment.get("location_id"))
+        for segment in segments
+        if segment["category"] != "unclassified"
+    ] == [("on_site", 100)]
+    assert not any(segment["category"] == "travel" for segment in segments)
+    assert {item["code"] for item in review_items} >= {
+        "missing_departure",
+        "simultaneous_arrival_conflict",
+        "overlapping_site_evidence",
+    }
+    assert {
+        item["visitId"]
+        for item in review_items
+        if item["code"] == "simultaneous_arrival_conflict"
+    } == {11, 12}
+
+
+@pytest.mark.parametrize(
+    ("review_status", "measured"),
+    (("pending", False), ("rejected", False), ("approved", True)),
+)
+def test_utilization_qr_review_decision_controls_measurement(
+    review_status,
+    measured,
+):
+    shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    shift = {
+        "id": 1,
+        "employee_id": 2,
+        "employee_name": "Worker",
+        "clock_in": shift_start,
+        "clock_out": shift_start + timedelta(hours=2),
+        "time_category": "productive",
+    }
+    visits = [
+        {
+            "id": 10,
+            "location_id": 100,
+            "location_label": "Site A",
+            "arrival_time": shift_start + timedelta(minutes=30),
+            "sequence_version": 2,
+            "site_check_in_id": 30,
+            "check_in_employee_id": 2,
+            "check_in_location_id": 100,
+            "check_in_at": shift_start + timedelta(minutes=30),
+            "check_in_classification": "needs_review",
+            "check_in_review_status": review_status,
+            "job_id": 1000,
+        }
+    ]
+    departures = [
+        {
+            "id": 20,
+            "visit_id": 10,
+            "location_id": 100,
+            "departure_time": shift_start + timedelta(minutes=90),
+        }
+    ]
+
+    segments, review_items = _closed_shift_utilization(
+        shift,
+        visits,
+        departures,
+    )
+
+    if measured:
+        assert {segment["category"] for segment in segments} == {
+            "on_site",
+            "unclassified",
+        }
+        assert review_items == []
+    else:
+        assert {segment["category"] for segment in segments} == {"unclassified"}
+        assert [item["code"] for item in review_items] == [
+            "unaccepted_site_check_in"
+        ]
+
+
+@pytest.mark.parametrize("mismatch", ("employee", "site", "time"))
+def test_utilization_linked_qr_identity_mismatch_fails_closed(mismatch):
+    shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    arrival_time = shift_start + timedelta(minutes=30)
+    shift = {
+        "id": 1,
+        "employee_id": 2,
+        "employee_name": "Worker",
+        "clock_in": shift_start,
+        "clock_out": shift_start + timedelta(hours=2),
+        "time_category": "productive",
+    }
+    visit = {
+        "id": 10,
+        "location_id": 100,
+        "location_label": "Site A",
+        "arrival_time": arrival_time,
+        "sequence_version": 2,
+        "site_check_in_id": 30,
+        "check_in_employee_id": 2,
+        "check_in_location_id": 100,
+        "check_in_at": arrival_time,
+        "check_in_classification": "on_time",
+        "check_in_review_status": "not_required",
+        "job_id": 1000,
+    }
+    if mismatch == "employee":
+        visit["check_in_employee_id"] = 3
+    elif mismatch == "site":
+        visit["check_in_location_id"] = 101
+    else:
+        visit["check_in_at"] = arrival_time + timedelta(seconds=1)
+    departures = [
+        {
+            "id": 20,
+            "visit_id": 10,
+            "location_id": 100,
+            "departure_time": shift_start + timedelta(minutes=90),
+        }
+    ]
+
+    segments, review_items = _closed_shift_utilization(
+        shift,
+        [visit],
+        departures,
+    )
+
+    assert {segment["category"] for segment in segments} == {"unclassified"}
+    assert [item["code"] for item in review_items] == [
+        "site_check_in_identity_mismatch"
+    ]
+
+
+def test_utilization_overlapping_paid_shifts_are_counted_once():
+    service_day = date(2026, 7, 20)
+    common = {
+        "employee_id": 7,
+        "employee_name": "Worker",
+        "date": service_day,
+        "category_detail": None,
+        "location_label": "",
+        "job_id": None,
+        "visit_id": None,
+        "departure_id": None,
+        "from_location_id": None,
+        "to_location_id": None,
+        "from_job_id": None,
+        "to_job_id": None,
+        "evidence": ["test"],
+        "review_codes": [],
+    }
+    segments = [
+        {
+            **common,
+            "shift_id": 1,
+            "category": "on_site",
+            "start_second": 0,
+            "end_second": 120,
+            "location_id": 100,
+        },
+        {
+            **common,
+            "shift_id": 2,
+            "category": "categorized",
+            "category_detail": "drive_time",
+            "start_second": 60,
+            "end_second": 180,
+            "location_id": None,
+        },
+    ]
+
+    collapsed, review_items = _collapse_overlapping_paid_segments(segments)
+
+    assert [
+        (
+            segment["start_second"],
+            segment["end_second"],
+            segment["category"],
+            segment.get("related_shift_ids"),
+        )
+        for segment in collapsed
+    ] == [
+        (0, 60, "on_site", None),
+        (60, 120, "unclassified", [1, 2]),
+        (120, 180, "categorized", None),
+    ]
+    assert sum(
+        segment["end_second"] - segment["start_second"] for segment in collapsed
+    ) == 180
+    assert [
+        (
+            item["code"],
+            item["shiftId"],
+            item["relatedShiftIds"],
+        )
+        for item in review_items
+    ] == [("overlapping_paid_shifts", 1, [1, 2])]
 
 
 def _canonical_job(
@@ -3379,6 +3958,855 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
     assert schedule["summary"]["visibleJobCount"] == 8
     assert schedule["summary"]["excludedJobCount"] == 3
     assert schedule["summary"]["knownPlannedHours"] == pytest.approx(10)
+
+
+def test_utilization_reconciles_complete_route_split_crew_and_categorized_time(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)
+    worker_a_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    site_a_arrival = worker_a_start + timedelta(minutes=30)
+    site_a_departure = worker_a_start + timedelta(hours=2, minutes=30)
+    site_b_arrival = worker_a_start + timedelta(hours=3)
+    site_b_departure = worker_a_start + timedelta(hours=5)
+    worker_a_end = worker_a_start + timedelta(hours=6)
+    categorized_start = worker_a_end + timedelta(hours=1)
+    categorized_end = categorized_start + timedelta(minutes=30)
+
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            site_a, job_a = _canonical_job(
+                cur,
+                suffix="Utilization Route A",
+                start=site_a_arrival,
+                end=site_a_departure,
+            )
+            site_b, job_b = _canonical_job(
+                cur,
+                suffix="Utilization Route B",
+                start=site_b_arrival,
+                end=site_b_departure,
+            )
+            worker_a = _employee(cur, "Utilization Route A", 18)
+            worker_b = _employee(cur, "Utilization Route B", 20)
+            worker_a_shift = _shift(
+                cur,
+                employee_id=worker_a,
+                start=worker_a_start,
+                end=worker_a_end,
+                service_day=service_day,
+                # Explicit QR arrival writes the first Site onto an unassigned
+                # shift. Utilization must still leave the pre-arrival edge
+                # unclassified.
+                location_id=site_a,
+                location_label=f"{TEST_PREFIX} Site Utilization Route A",
+            )
+            visit_a, departure_a = _paired_version_two_visit(
+                cur,
+                employee_id=worker_a,
+                shift_id=worker_a_shift,
+                location_id=site_a,
+                job_id=job_a,
+                arrival=site_a_arrival,
+                departure=site_a_departure,
+                suffix="Utilization Route A",
+            )
+            visit_b, departure_b = _paired_version_two_visit(
+                cur,
+                employee_id=worker_a,
+                shift_id=worker_a_shift,
+                location_id=site_b,
+                job_id=job_b,
+                arrival=site_b_arrival,
+                departure=site_b_departure,
+                suffix="Utilization Route B",
+            )
+            worker_b_shift = _shift(
+                cur,
+                employee_id=worker_b,
+                start=site_a_arrival,
+                end=site_a_departure,
+                service_day=service_day,
+                location_id=site_a,
+                location_label=f"{TEST_PREFIX} Site Utilization Route A",
+                job_id=job_a,
+            )
+            # Manual Arrive/Depart evidence has no QR check-in. The shift's
+            # service occurrence is still valid because it belongs to this Site.
+            worker_b_visit = _visit(
+                cur,
+                shift_id=worker_b_shift,
+                location_id=site_a,
+                at=site_a_arrival,
+                suffix="Utilization Route A",
+                sequence_version=2,
+            )
+            worker_b_departure = _departure(
+                cur,
+                shift_id=worker_b_shift,
+                location_id=site_a,
+                at=site_a_departure,
+                suffix="Utilization Route A",
+                visit_id=worker_b_visit,
+            )
+            categorized_shift = _shift(
+                cur,
+                employee_id=worker_a,
+                start=categorized_start,
+                end=categorized_end,
+                service_day=service_day,
+                time_category="non_productive",
+                non_productive_type="drive_time",
+            )
+            cur.execute(
+                "UPDATE shifts SET total_hours = 99 WHERE id = %s",
+                (worker_a_shift,),
+            )
+
+    body = _utilization_body(client, auth, service_day)
+    assert body["startDate"] == str(service_day)
+    assert body["endDate"] == str(service_day)
+    assert body["reviewItems"] == []
+    _assert_utilization_totals(
+        body["summary"],
+        paid=510,
+        on_site=360,
+        travel=30,
+        categorized=30,
+        unclassified=90,
+    )
+
+    worker_a_row = _utilization_row(body, worker_a, service_day)
+    worker_b_row = _utilization_row(body, worker_b, service_day)
+    _assert_utilization_totals(
+        worker_a_row,
+        paid=390,
+        on_site=240,
+        travel=30,
+        categorized=30,
+        unclassified=90,
+    )
+    _assert_utilization_totals(
+        worker_b_row,
+        paid=120,
+        on_site=120,
+        travel=0,
+        categorized=0,
+        unclassified=0,
+    )
+    _assert_interval_contract(worker_a_row["intervals"])
+    _assert_interval_contract(worker_b_row["intervals"])
+
+    assert [
+        (
+            interval["category"],
+            interval["durationMinutes"],
+            interval["locationId"],
+            interval["jobId"],
+        )
+        for interval in worker_a_row["intervals"]
+    ] == [
+        ("unclassified", 30, None, None),
+        ("on_site", 120, site_a, job_a),
+        ("travel", 30, None, None),
+        ("on_site", 120, site_b, job_b),
+        ("unclassified", 60, None, None),
+        ("categorized", 30, None, None),
+    ]
+    categorized = next(
+        interval
+        for interval in worker_a_row["intervals"]
+        if interval["category"] == "categorized"
+    )
+    assert categorized["shiftId"] == categorized_shift
+    assert categorized["categoryDetail"] == "drive_time"
+
+    worker_a_on_site = [
+        interval
+        for interval in worker_a_row["intervals"]
+        if interval["category"] == "on_site"
+    ]
+    assert [
+        (
+            interval["visitId"],
+            interval["departureId"],
+            interval["reviewCodes"],
+        )
+        for interval in worker_a_on_site
+    ] == [
+        (visit_a, departure_a, []),
+        (visit_b, departure_b, []),
+    ]
+    assert len(worker_b_row["intervals"]) == 1
+    worker_b_interval = worker_b_row["intervals"][0]
+    assert {
+        "shiftId": worker_b_interval["shiftId"],
+        "category": worker_b_interval["category"],
+        "durationSeconds": worker_b_interval["durationSeconds"],
+        "durationMinutes": worker_b_interval["durationMinutes"],
+        "locationId": worker_b_interval["locationId"],
+        "jobId": worker_b_interval["jobId"],
+        "visitId": worker_b_interval["visitId"],
+        "departureId": worker_b_interval["departureId"],
+        "reviewCodes": worker_b_interval["reviewCodes"],
+    } == {
+        "shiftId": worker_b_shift,
+        "category": "on_site",
+        "durationSeconds": 120 * 60,
+        "durationMinutes": 120,
+        "locationId": site_a,
+        "jobId": job_a,
+        "visitId": worker_b_visit,
+        "departureId": worker_b_departure,
+        "reviewCodes": [],
+    }
+
+    all_on_site = [
+        interval
+        for row in body["rows"]
+        for interval in row["intervals"]
+        if interval["category"] == "on_site"
+    ]
+    assert sum(
+        interval["durationMinutes"]
+        for interval in all_on_site
+        if interval["locationId"] == site_a
+    ) == 240
+    assert sum(
+        interval["durationMinutes"]
+        for interval in all_on_site
+        if interval["locationId"] == site_b
+    ) == 120
+    assert {interval["jobId"] for interval in all_on_site} == {job_a, job_b}
+
+
+def test_utilization_endpoint_rejects_mismatched_linked_qr_identity(client, auth):
+    service_day = date(2026, 7, 20)
+    first_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            site_a, job_a = _canonical_job(
+                cur,
+                suffix="Utilization QR Identity A",
+                start=first_start,
+                end=first_start + timedelta(hours=6),
+            )
+            site_b, job_b = _canonical_job(
+                cur,
+                suffix="Utilization QR Identity B",
+                start=first_start,
+                end=first_start + timedelta(hours=6),
+            )
+            worker = _employee(cur, "Utilization QR Identity", 18)
+            other_worker = _employee(cur, "Utilization QR Other Worker", 19)
+            visit_ids: list[int] = []
+
+            for index, mismatch in enumerate(("employee", "site", "time")):
+                shift_start = first_start + timedelta(hours=index * 2)
+                arrival = shift_start + timedelta(minutes=10)
+                shift_id = _shift(
+                    cur,
+                    employee_id=worker,
+                    start=shift_start,
+                    end=shift_start + timedelta(hours=1),
+                    service_day=service_day,
+                    location_id=site_a,
+                    location_label=f"{TEST_PREFIX} Site Utilization QR Identity A",
+                    job_id=job_a,
+                )
+                check_in_id = _check_in(
+                    cur,
+                    employee_id=(
+                        other_worker if mismatch == "employee" else worker
+                    ),
+                    location_id=site_b if mismatch == "site" else site_a,
+                    checked_in_at=(
+                        arrival + timedelta(minutes=1)
+                        if mismatch == "time"
+                        else arrival
+                    ),
+                    job_id=job_b if mismatch == "site" else job_a,
+                )
+                visit_id = _visit(
+                    cur,
+                    shift_id=shift_id,
+                    location_id=site_a,
+                    at=arrival,
+                    suffix=f"Utilization QR Identity {mismatch}",
+                    sequence_version=2,
+                    site_check_in_id=check_in_id,
+                )
+                _departure(
+                    cur,
+                    shift_id=shift_id,
+                    location_id=site_a,
+                    at=shift_start + timedelta(minutes=50),
+                    suffix=f"Utilization QR Identity {mismatch}",
+                    visit_id=visit_id,
+                )
+                visit_ids.append(visit_id)
+
+    body = _utilization_body(client, auth, service_day)
+    _assert_utilization_totals(
+        body["summary"],
+        paid=180,
+        on_site=0,
+        travel=0,
+        categorized=0,
+        unclassified=180,
+    )
+    row = _utilization_row(body, worker, service_day)
+    _assert_utilization_totals(
+        row,
+        paid=180,
+        on_site=0,
+        travel=0,
+        categorized=0,
+        unclassified=180,
+    )
+    assert {interval["category"] for interval in row["intervals"]} == {
+        "unclassified"
+    }
+    assert {
+        (item["code"], item["visitId"])
+        for item in body["reviewItems"]
+    } == {
+        ("site_check_in_identity_mismatch", visit_id)
+        for visit_id in visit_ids
+    }
+
+
+def test_utilization_missing_departures_and_active_visit_fail_closed(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)
+    shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            site_a, job_a = _canonical_job(
+                cur,
+                suffix="Utilization Missing A",
+                start=shift_start + timedelta(minutes=30),
+                end=shift_start + timedelta(hours=2),
+            )
+            site_b, job_b = _canonical_job(
+                cur,
+                suffix="Utilization Missing B",
+                start=shift_start + timedelta(hours=2),
+                end=shift_start + timedelta(hours=3),
+            )
+            route_worker = _employee(cur, "Utilization Missing Route", 18)
+            active_worker = _employee(cur, "Utilization Active At Clock Out", 20)
+            route_shift = _shift(
+                cur,
+                employee_id=route_worker,
+                start=shift_start,
+                end=shift_start + timedelta(hours=4),
+                service_day=service_day,
+                location_id=site_a,
+                location_label=f"{TEST_PREFIX} Site Utilization Missing A",
+            )
+            missing_check_in = _check_in(
+                cur,
+                employee_id=route_worker,
+                location_id=site_a,
+                checked_in_at=shift_start + timedelta(minutes=30),
+                job_id=job_a,
+            )
+            missing_visit = _visit(
+                cur,
+                shift_id=route_shift,
+                location_id=site_a,
+                at=shift_start + timedelta(minutes=30),
+                suffix="Utilization Missing A",
+                sequence_version=2,
+                site_check_in_id=missing_check_in,
+            )
+            route_visit_b, _ = _paired_version_two_visit(
+                cur,
+                employee_id=route_worker,
+                shift_id=route_shift,
+                location_id=site_b,
+                job_id=job_b,
+                arrival=shift_start + timedelta(hours=2),
+                departure=shift_start + timedelta(hours=3),
+                suffix="Utilization Missing B",
+            )
+
+            active_shift = _shift(
+                cur,
+                employee_id=active_worker,
+                start=shift_start,
+                end=shift_start + timedelta(hours=2),
+                service_day=service_day,
+                location_id=site_a,
+                location_label=f"{TEST_PREFIX} Site Utilization Missing A",
+            )
+            active_check_in = _check_in(
+                cur,
+                employee_id=active_worker,
+                location_id=site_a,
+                checked_in_at=shift_start + timedelta(minutes=30),
+                job_id=job_a,
+            )
+            active_visit = _visit(
+                cur,
+                shift_id=active_shift,
+                location_id=site_a,
+                at=shift_start + timedelta(minutes=30),
+                suffix="Utilization Missing A",
+                sequence_version=2,
+                site_check_in_id=active_check_in,
+            )
+
+    body = _utilization_body(client, auth, service_day)
+    _assert_utilization_totals(
+        body["summary"],
+        paid=360,
+        on_site=60,
+        travel=0,
+        categorized=0,
+        unclassified=300,
+    )
+    route_row = _utilization_row(body, route_worker, service_day)
+    active_row = _utilization_row(body, active_worker, service_day)
+    _assert_utilization_totals(
+        route_row,
+        paid=240,
+        on_site=60,
+        travel=0,
+        categorized=0,
+        unclassified=180,
+    )
+    _assert_utilization_totals(
+        active_row,
+        paid=120,
+        on_site=0,
+        travel=0,
+        categorized=0,
+        unclassified=120,
+    )
+    _assert_interval_contract(route_row["intervals"])
+    _assert_interval_contract(active_row["intervals"])
+
+    assert not any(
+        interval["category"] == "on_site"
+        and interval["locationId"] == site_a
+        for interval in route_row["intervals"]
+    )
+    assert not any(
+        interval["category"] == "travel" for interval in route_row["intervals"]
+    )
+    assert [
+        (interval["locationId"], interval["visitId"], interval["durationMinutes"])
+        for interval in route_row["intervals"]
+        if interval["category"] == "on_site"
+    ] == [(site_b, route_visit_b, 60)]
+    assert {
+        interval["category"] for interval in active_row["intervals"]
+    } == {"unclassified"}
+    assert any(
+        "missing_departure" in interval["reviewCodes"]
+        for interval in route_row["intervals"]
+    )
+    assert any(
+        "missing_departure" in interval["reviewCodes"]
+        for interval in active_row["intervals"]
+    )
+    assert {
+        (
+            item["code"],
+            item["employeeId"],
+            item["date"],
+            item["shiftId"],
+            item["visitId"],
+        )
+        for item in body["reviewItems"]
+    } == {
+        (
+            "missing_departure",
+            route_worker,
+            str(service_day),
+            route_shift,
+            missing_visit,
+        ),
+        (
+            "missing_departure",
+            active_worker,
+            str(service_day),
+            active_shift,
+            active_visit,
+        ),
+    }
+
+
+def test_utilization_legacy_overlap_and_open_shift_fail_closed(client, auth):
+    service_day = date(2026, 7, 20)
+    shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            legacy_site, _ = _canonical_job(
+                cur,
+                suffix="Utilization Legacy",
+                start=shift_start,
+                end=shift_start + timedelta(hours=2),
+            )
+            overlap_site_a, overlap_job_a = _canonical_job(
+                cur,
+                suffix="Utilization Overlap A",
+                start=shift_start + timedelta(hours=3),
+                end=shift_start + timedelta(hours=5),
+            )
+            overlap_site_b, overlap_job_b = _canonical_job(
+                cur,
+                suffix="Utilization Overlap B",
+                start=shift_start + timedelta(hours=4),
+                end=shift_start + timedelta(hours=6),
+            )
+            legacy_worker = _employee(cur, "Utilization Legacy", 18)
+            overlap_worker = _employee(cur, "Utilization Overlap", 19)
+            open_worker = _employee(cur, "Utilization Open", 20)
+            reversed_worker = _employee(cur, "Utilization Reversed", 21)
+
+            legacy_shift = _shift(
+                cur,
+                employee_id=legacy_worker,
+                start=shift_start,
+                end=shift_start + timedelta(hours=2),
+                service_day=service_day,
+                location_id=legacy_site,
+                location_label=f"{TEST_PREFIX} Site Utilization Legacy",
+            )
+            _visit(
+                cur,
+                shift_id=legacy_shift,
+                location_id=legacy_site,
+                at=shift_start + timedelta(minutes=30),
+                suffix="Utilization Legacy",
+            )
+            _departure(
+                cur,
+                shift_id=legacy_shift,
+                location_id=legacy_site,
+                at=shift_start + timedelta(hours=1, minutes=30),
+                suffix="Utilization Legacy",
+            )
+
+            overlap_shift = _shift(
+                cur,
+                employee_id=overlap_worker,
+                start=shift_start + timedelta(hours=2, minutes=30),
+                end=shift_start + timedelta(hours=6, minutes=30),
+                service_day=service_day,
+            )
+            _paired_version_two_visit(
+                cur,
+                employee_id=overlap_worker,
+                shift_id=overlap_shift,
+                location_id=overlap_site_a,
+                job_id=overlap_job_a,
+                arrival=shift_start + timedelta(hours=3),
+                departure=shift_start + timedelta(hours=5),
+                suffix="Utilization Overlap A",
+            )
+            _paired_version_two_visit(
+                cur,
+                employee_id=overlap_worker,
+                shift_id=overlap_shift,
+                location_id=overlap_site_b,
+                job_id=overlap_job_b,
+                arrival=shift_start + timedelta(hours=4),
+                departure=shift_start + timedelta(hours=6),
+                suffix="Utilization Overlap B",
+            )
+
+            open_shift = _shift(
+                cur,
+                employee_id=open_worker,
+                # 11:30 p.m. Chicago time on the prior date. The still-open
+                # envelope overlaps this report after local midnight.
+                start=datetime(2026, 7, 20, 4, 30, tzinfo=timezone.utc),
+                end=None,
+                service_day=service_day - timedelta(days=1),
+            )
+            reversed_shift = _shift(
+                cur,
+                employee_id=reversed_worker,
+                start=shift_start + timedelta(hours=10),
+                end=shift_start + timedelta(hours=9),
+                service_day=service_day,
+            )
+
+    body = _utilization_body(client, auth, service_day)
+    _assert_utilization_totals(
+        body["summary"],
+        paid=360,
+        on_site=0,
+        travel=0,
+        categorized=0,
+        unclassified=360,
+    )
+    assert body["summary"]["finalizedShiftCount"] == 3
+    assert body["summary"]["openShiftCount"] == 1
+    assert body["summary"]["reviewItemCount"] == 6
+
+    legacy_row = _utilization_row(body, legacy_worker, service_day)
+    overlap_row = _utilization_row(body, overlap_worker, service_day)
+    _assert_utilization_totals(
+        legacy_row,
+        paid=120,
+        on_site=0,
+        travel=0,
+        categorized=0,
+        unclassified=120,
+    )
+    _assert_utilization_totals(
+        overlap_row,
+        paid=240,
+        on_site=0,
+        travel=0,
+        categorized=0,
+        unclassified=240,
+    )
+    assert not any(row["employeeId"] == open_worker for row in body["rows"])
+    assert not any(row["employeeId"] == reversed_worker for row in body["rows"])
+
+    review_codes = [item["code"] for item in body["reviewItems"]]
+    assert review_codes.count("legacy_visit_evidence") == 1
+    assert review_codes.count("legacy_unpaired_departure") == 1
+    assert review_codes.count("overlapping_site_evidence") == 2
+    assert review_codes.count("open_shift") == 1
+    assert review_codes.count("invalid_paid_interval") == 1
+    assert any(
+        item["code"] == "open_shift"
+        and item["shiftId"] == open_shift
+        and item["employeeId"] == open_worker
+        and item["date"] == str(service_day - timedelta(days=1))
+        for item in body["reviewItems"]
+    )
+    assert any(
+        item["code"] == "invalid_paid_interval"
+        and item["shiftId"] == reversed_shift
+        and item["employeeId"] == reversed_worker
+        for item in body["reviewItems"]
+    )
+    future_body = _utilization_body(
+        client,
+        auth,
+        date(2099, 1, 1),
+    )
+    assert not any(
+        item["shiftId"] == open_shift for item in future_body["reviewItems"]
+    )
+    assert {
+        interval["category"]
+        for row in (legacy_row, overlap_row)
+        for interval in row["intervals"]
+    } == {"unclassified"}
+
+
+def test_utilization_splits_paid_and_site_intervals_at_local_midnight(
+    client,
+    auth,
+):
+    app_timezone = ZoneInfo("America/Chicago")
+    first_day = date(2026, 7, 20)
+    second_day = first_day + timedelta(days=1)
+    local_start = datetime(2026, 7, 20, 23, 30, tzinfo=app_timezone)
+    local_arrival = datetime(2026, 7, 20, 23, 45, tzinfo=app_timezone)
+    local_departure = datetime(2026, 7, 21, 0, 45, tzinfo=app_timezone)
+    local_end = datetime(2026, 7, 21, 1, 30, tzinfo=app_timezone)
+    shift_start = local_start.astimezone(timezone.utc)
+    arrival = local_arrival.astimezone(timezone.utc)
+    departure = local_departure.astimezone(timezone.utc)
+    shift_end = local_end.astimezone(timezone.utc)
+    local_midnight_utc = datetime(
+        2026,
+        7,
+        21,
+        tzinfo=app_timezone,
+    ).astimezone(timezone.utc)
+
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            site_id, job_id = _canonical_job(
+                cur,
+                suffix="Utilization Midnight",
+                start=arrival,
+                end=departure,
+                site_type="Commercial",
+            )
+            employee_id = _employee(cur, "Utilization Midnight", 19)
+            shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=shift_start,
+                end=shift_end,
+                service_day=first_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Utilization Midnight",
+            )
+            visit_id, departure_id = _paired_version_two_visit(
+                cur,
+                employee_id=employee_id,
+                shift_id=shift_id,
+                location_id=site_id,
+                job_id=job_id,
+                arrival=arrival,
+                departure=departure,
+                suffix="Utilization Midnight",
+            )
+
+    body = _utilization_body(client, auth, first_day, second_day)
+    _assert_utilization_totals(
+        body["summary"],
+        paid=120,
+        on_site=60,
+        travel=0,
+        categorized=0,
+        unclassified=60,
+    )
+    first_row = _utilization_row(body, employee_id, first_day)
+    second_row = _utilization_row(body, employee_id, second_day)
+    _assert_utilization_totals(
+        first_row,
+        paid=30,
+        on_site=15,
+        travel=0,
+        categorized=0,
+        unclassified=15,
+    )
+    _assert_utilization_totals(
+        second_row,
+        paid=90,
+        on_site=45,
+        travel=0,
+        categorized=0,
+        unclassified=45,
+    )
+    _assert_interval_contract(first_row["intervals"])
+    _assert_interval_contract(second_row["intervals"])
+    assert [
+        (interval["category"], interval["durationMinutes"])
+        for interval in first_row["intervals"]
+    ] == [("unclassified", 15), ("on_site", 15)]
+    assert [
+        (interval["category"], interval["durationMinutes"])
+        for interval in second_row["intervals"]
+    ] == [("on_site", 45), ("unclassified", 45)]
+    assert first_row["intervals"][-1]["intervalEnd"] == (
+        local_midnight_utc.isoformat().replace("+00:00", "Z")
+    )
+    assert second_row["intervals"][0]["intervalStart"] == (
+        local_midnight_utc.isoformat().replace("+00:00", "Z")
+    )
+    split_site_intervals = [
+        interval
+        for row in (first_row, second_row)
+        for interval in row["intervals"]
+        if interval["category"] == "on_site"
+    ]
+    assert {
+        (
+            interval["locationId"],
+            interval["jobId"],
+            interval["visitId"],
+            interval["departureId"],
+        )
+        for interval in split_site_intervals
+    } == {(site_id, job_id, visit_id, departure_id)}
+
+
+@pytest.mark.parametrize(
+    ("local_start", "local_end"),
+    [
+        (
+            datetime(2026, 3, 8, 0, 30, tzinfo=ZoneInfo("America/Chicago")),
+            datetime(2026, 3, 8, 4, 30, tzinfo=ZoneInfo("America/Chicago")),
+        ),
+        (
+            datetime(2026, 11, 1, 0, 30, tzinfo=ZoneInfo("America/Chicago")),
+            datetime(2026, 11, 1, 2, 30, tzinfo=ZoneInfo("America/Chicago")),
+        ),
+    ],
+)
+def test_utilization_uses_elapsed_time_across_dst_transitions(
+    client,
+    auth,
+    local_start,
+    local_end,
+):
+    service_day = local_start.date()
+    shift_start = local_start.astimezone(timezone.utc)
+    shift_end = local_end.astimezone(timezone.utc)
+    assert shift_end - shift_start == timedelta(hours=3)
+
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            employee_id = _employee(
+                cur,
+                f"Utilization DST {service_day.isoformat()}",
+                18,
+            )
+            _shift(
+                cur,
+                employee_id=employee_id,
+                start=shift_start,
+                end=shift_end,
+                service_day=service_day,
+            )
+
+    body = _utilization_body(client, auth, service_day)
+    _assert_utilization_totals(
+        body["summary"],
+        paid=180,
+        on_site=0,
+        travel=0,
+        categorized=0,
+        unclassified=180,
+    )
+    row = _utilization_row(body, employee_id, service_day)
+    _assert_utilization_totals(
+        row,
+        paid=180,
+        on_site=0,
+        travel=0,
+        categorized=0,
+        unclassified=180,
+    )
+    _assert_interval_contract(row["intervals"])
+    assert [
+        (
+            interval["category"],
+            interval["durationSeconds"],
+            interval["durationMinutes"],
+        )
+        for interval in row["intervals"]
+    ] == [("unclassified", 3 * 60 * 60, 180)]
+
+
+def test_utilization_rejects_reversed_range(client, auth):
+    response = client.get(
+        "/api/admin/operations/utilization",
+        headers=auth,
+        params={"start_date": "2026-07-21", "end_date": "2026-07-20"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"] == "end_date must be on or after start_date"
+
+
+def test_utilization_requires_admin(client, emp_auth):
+    params = {"start_date": "2026-07-20", "end_date": "2026-07-20"}
+    missing = client.get("/api/admin/operations/utilization", params=params)
+    employee = client.get(
+        "/api/admin/operations/utilization",
+        headers=emp_auth,
+        params=params,
+    )
+    assert missing.status_code == 401
+    assert employee.status_code == 403
 
 
 def test_operations_routes_require_admin(client, emp_auth):
