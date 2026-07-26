@@ -45,6 +45,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from hours_report_pdf import build_hours_report_pdf
+from payroll_weekly_hours_pdf import build_payroll_weekly_hours_pdf
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -12182,6 +12183,24 @@ def admin_finalize_payroll_weekly_hours(
     return result
 
 
+def _payroll_weekly_hours_verification_for_pdf(
+    week_start: date,
+    source_fingerprint: str,
+) -> Dict[str, Any]:
+    row = db.query_one(
+        """
+        SELECT *
+        FROM payroll_verification_batches
+        WHERE week_start = %s
+        """,
+        (week_start,),
+    )
+    return _payroll_verification_state(
+        row,
+        current_source_fingerprint=source_fingerprint,
+    )
+
+
 @app.get("/api/admin/payroll/weekly-hours/export")
 def admin_payroll_weekly_hours_export(
     request: Request,
@@ -12221,6 +12240,40 @@ def admin_payroll_weekly_hours_export(
         iter([buf.getvalue()]),
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/api/admin/payroll/weekly-hours/pdf")
+def admin_payroll_weekly_hours_pdf(
+    request: Request,
+    week_start: Optional[str] = Query(default=None, alias="weekStart"),
+    _: Dict[str, Any] = Depends(get_current_payroll),
+) -> Response:
+    data = _compute_payroll_weekly_hours(_payroll_week_start_query(request, week_start))
+    parsed_week_start = _parse_payroll_week_start(data["weekStart"])
+    verification = _payroll_weekly_hours_verification_for_pdf(
+        parsed_week_start,
+        data["sourceFingerprint"],
+    )
+    pdf_bytes = build_payroll_weekly_hours_pdf(
+        data,
+        verification=verification,
+    )
+    append_access_log(
+        request,
+        "PAYROLL_WEEKLY_HOURS_PDF",
+        True,
+        f"week={data['weekStart']} employees={data['summary']['employeeCount']} corrections={data['summary'].get('correctionCount', 0)}",
+    )
+    filename = f"eom_payroll_weekly_hours_{data['weekStart']}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
