@@ -12183,6 +12183,88 @@ def admin_finalize_payroll_weekly_hours(
     return result
 
 
+@app.get("/api/admin/payroll/labor-profitability")
+def admin_payroll_labor_profitability(
+    request: Request,
+    week_start: Optional[str] = Query(default=None, alias="weekStart"),
+    _: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    parsed_week_start = _parse_payroll_week_start(
+        _payroll_week_start_query(request, week_start)
+    )
+    weekly_hours = _compute_payroll_weekly_hours(parsed_week_start.isoformat())
+    verification_row = db.query_one(
+        """
+        SELECT *
+        FROM payroll_verification_batches
+        WHERE week_start = %s
+        """,
+        (parsed_week_start,),
+    )
+    settings = load_settings()
+    result = build_weekly_labor_profitability(
+        parsed_week_start,
+        timezone_name=TIMEZONE_NAME,
+        now_provider=utc_now,
+        default_target_labor_pct=settings.get(
+            "laborPctTarget",
+            _SETTINGS_DEFAULTS["laborPctTarget"],
+        ),
+        default_min_margin_pct=settings.get(
+            "grossMarginMin",
+            _SETTINGS_DEFAULTS["grossMarginMin"],
+        ),
+    )
+    payroll_summary = weekly_hours["summary"]
+    issues: List[Dict[str, str]] = []
+    if payroll_summary["hasBlockingIssues"]:
+        issues.append(
+            {
+                "code": "payroll_weekly_hours_has_blocking_issues",
+                "message": (
+                    "Resolve payroll weekly-hours issues before relying on "
+                    "labor profitability."
+                ),
+            }
+        )
+    if payroll_summary["correctionCount"] > 0:
+        issues.append(
+            {
+                "code": "payroll_hour_corrections_not_allocated_to_sites",
+                "message": (
+                    "Payroll hour corrections adjust employee/day totals, but "
+                    "do not identify which customer or Site should receive the "
+                    "labor adjustment yet."
+                ),
+            }
+        )
+
+    result["payrollHours"] = {
+        "sourceFingerprint": weekly_hours["sourceFingerprint"],
+        "totalMinutes": payroll_summary["totalMinutes"],
+        "totalHours": payroll_summary["totalHours"],
+        "correctionCount": payroll_summary["correctionCount"],
+        "issueCount": payroll_summary["issueCount"],
+        "hasBlockingIssues": payroll_summary["hasBlockingIssues"],
+    }
+    result["verification"] = _payroll_verification_state(
+        verification_row,
+        current_source_fingerprint=weekly_hours["sourceFingerprint"],
+    )
+    result["issues"] = issues
+    append_access_log(
+        request,
+        "PAYROLL_LABOR_PROFITABILITY",
+        True,
+        (
+            f"week={result['weekStart']} jobs={result['summary']['jobCount']} "
+            f"unmatched={result['summary']['unmatchedActualSegmentCount']} "
+            f"corrections={payroll_summary['correctionCount']}"
+        ),
+    )
+    return result
+
+
 def _payroll_weekly_hours_verification_for_pdf(
     week_start: date,
     source_fingerprint: str,
@@ -15168,7 +15250,11 @@ def admin_analytics_customer(
 # router. Utilization corrections append reviewed overlays to the existing
 # correction ledger; the router receives only the cross-process lock identity
 # and never receives a raw timekeeping mutation helper.
-from operations_schedule import allocate_monthly_cents, build_operations_schedule_router
+from operations_schedule import (
+    allocate_monthly_cents,
+    build_operations_schedule_router,
+    build_weekly_labor_profitability,
+)
 
 app.include_router(
     build_operations_schedule_router(
