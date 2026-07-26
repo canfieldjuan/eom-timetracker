@@ -1483,7 +1483,8 @@ def build_dashboard_hours_data() -> Dict[str, Any]:
     employees_data = load_employees()
     timesheet_data = load_timesheets()
     now = utc_now()
-    week_start = datetime.now(APP_TIMEZONE).date() - timedelta(days=6)
+    week_start = local_sunday_week_start(now)
+    week_end = week_start + timedelta(days=7)
 
     active_employees = [employee for employee in employees_data["employees"] if employee.get("active", True)]
     employee_rows: List[Dict[str, Any]] = []
@@ -1514,7 +1515,7 @@ def build_dashboard_hours_data() -> Dict[str, Any]:
             shift_date = local_clock_in.date()
             calculated_hours = entry_hours(entry, now)
 
-            if shift_date >= week_start:
+            if week_start <= shift_date < week_end:
                 weekly_hours += calculated_hours
 
             clock_out_value = entry.get("clockOut")

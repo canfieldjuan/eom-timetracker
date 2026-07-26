@@ -157,6 +157,34 @@ def test_my_hours_uses_local_sunday_to_saturday_week(
         _delete_employee(employee_id)
 
 
+def test_dashboard_hours_summary_uses_local_sunday_to_saturday_week(
+    client,
+    auth,
+    monkeypatch,
+):
+    employee_name = "Dashboard Hours Sunday Employee"
+    employee_id = _create_employee(employee_name)
+    fixed_now = _utc_from_local(date(2026, 7, 22), 10)
+    monkeypatch.setattr(time_tracker_api, "utc_now", lambda: fixed_now)
+
+    try:
+        _create_shift(employee_id, date(2026, 7, 18), 23, 4.0)
+        _create_shift(employee_id, date(2026, 7, 19), 0, 1.0)
+        _create_shift(employee_id, date(2026, 7, 25), 23, 2.0)
+        _create_shift(employee_id, date(2026, 7, 26), 0, 8.0)
+
+        response = client.get("/api/hours", headers=auth)
+        assert response.status_code == 200, response.text
+        body = response.json()["data"]
+        employee_row = next(
+            row for row in body["employees"] if row["name"] == employee_name
+        )
+        assert employee_row["totalHours"] == 3.0
+        assert body["summary"]["totalHours"] >= employee_row["totalHours"]
+    finally:
+        _delete_employee(employee_id)
+
+
 @pytest.mark.parametrize(
     ("week_start", "reference_day"),
     [
