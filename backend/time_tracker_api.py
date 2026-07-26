@@ -183,6 +183,11 @@ def local_date_string(dt: datetime) -> str:
     return to_local(dt).strftime("%Y-%m-%d")
 
 
+def local_sunday_week_start(dt: datetime) -> date:
+    local_day = to_local(dt).date()
+    return local_day - timedelta(days=(local_day.weekday() + 1) % 7)
+
+
 def local_date_for_logs() -> str:
     return datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
 
@@ -8036,8 +8041,7 @@ def admin_employee_hours(
     now = utc_now()
 
     local_today = to_local(now).date()
-    days_since_sunday = (local_today.weekday() + 1) % 7
-    current_week_start_date = local_today - timedelta(days=days_since_sunday)
+    current_week_start_date = local_sunday_week_start(now)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     today_str = local_today.isoformat()
@@ -8616,10 +8620,17 @@ def my_timesheet_hours(
     employee_id = current_employee["id"]
     now = utc_now()
 
-    days_since_monday = now.weekday()
-    week_start = (now - timedelta(days=days_since_monday)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    week_start_date = local_sunday_week_start(now)
+    week_start = datetime.combine(
+        week_start_date,
+        clock_time.min,
+        tzinfo=APP_TIMEZONE,
+    ).astimezone(timezone.utc)
+    week_end = datetime.combine(
+        week_start_date + timedelta(days=7),
+        clock_time.min,
+        tzinfo=APP_TIMEZONE,
+    ).astimezone(timezone.utc)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     today_str = local_date_string(now)
@@ -8647,7 +8658,7 @@ def my_timesheet_hours(
         total = entry_hours(entry, now)
         entry_date = local_date_string(clock_in_dt)
 
-        if clock_in_dt >= week_start:
+        if week_start <= clock_in_dt < week_end:
             weekly_hours += total
         if entry_date == today_str:
             today_hours += total

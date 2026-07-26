@@ -122,6 +122,41 @@ def test_employee_hours_uses_one_local_sunday_to_saturday_week(
         _delete_employee(employee_id)
 
 
+def test_my_hours_uses_local_sunday_to_saturday_week(
+    client,
+    monkeypatch,
+):
+    employee_name = "Self Hours Sunday Employee"
+    employee_id = _create_employee(employee_name)
+    headers = {
+        "Authorization": (
+            f"Bearer {time_tracker_api.create_auth_token(employee_id, employee_name)}"
+        )
+    }
+    fixed_now = _utc_from_local(date(2026, 7, 22), 10)
+    monkeypatch.setattr(time_tracker_api, "utc_now", lambda: fixed_now)
+
+    try:
+        _create_shift(employee_id, date(2026, 7, 18), 23, 4.0)
+        _create_shift(employee_id, date(2026, 7, 19), 0, 1.0)
+        _create_shift(employee_id, date(2026, 7, 25), 23, 2.0)
+        _create_shift(employee_id, date(2026, 7, 26), 0, 8.0)
+
+        response = client.get("/api/timesheet/my-hours", headers=headers)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["weeklyHours"] == 3.0
+        assert body["todayHours"] == 0.0
+        assert {shift["date"] for shift in body["recentShifts"]} >= {
+            "2026-07-18",
+            "2026-07-19",
+            "2026-07-25",
+            "2026-07-26",
+        }
+    finally:
+        _delete_employee(employee_id)
+
+
 @pytest.mark.parametrize(
     ("week_start", "reference_day"),
     [
