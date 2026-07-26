@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import csv
 from datetime import date, datetime, timedelta, timezone
-from io import StringIO
+from io import BytesIO, StringIO
 from zoneinfo import ZoneInfo
 
 import bcrypt
 import pytest
+from pypdf import PdfReader
 
 import db
 import time_tracker_api
@@ -110,6 +111,23 @@ def _weekly_hours(client, auth: dict[str, str], week_start: date) -> dict:
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _assert_valid_pdf(payload: bytes) -> None:
+    assert payload.startswith(b"%PDF-")
+    assert b"%%EOF" in payload[-1024:]
+    assert len(payload) > 1000
+
+
+def _extract_pdf_text(payload: bytes) -> str:
+    return "\n".join(
+        page.extract_text() or ""
+        for page in PdfReader(BytesIO(payload)).pages
+    )
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(value.split())
 
 
 def _different_fingerprint(fingerprint: str) -> str:
@@ -940,6 +958,99 @@ def test_payroll_weekly_hours_export_uses_same_model_and_hides_rates(client, aut
         assert "22.5" not in text
         assert "22.50" not in text
     finally:
+        _delete_employees([employee_id])
+
+
+def test_payroll_weekly_hours_pdf_requires_payroll_before_computing(
+    client,
+    emp_auth,
+    monkeypatch,
+):
+    calls = 0
+
+    def forbidden_compute(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("unauthorized request reached payroll PDF computation")
+
+    monkeypatch.setattr(time_tracker_api, "_compute_payroll_weekly_hours", forbidden_compute)
+
+    assert client.get("/api/admin/payroll/weekly-hours/pdf").status_code == 401
+    assert client.get("/api/admin/payroll/weekly-hours/pdf", headers=emp_auth).status_code == 403
+    assert calls == 0
+
+
+def test_payroll_weekly_hours_pdf_includes_verification_and_corrections_without_rates(
+    client,
+    auth,
+):
+    week_start = date(2026, 9, 13)
+    correction_date = week_start + timedelta(days=1)
+    employee_id = _create_employee(
+        "Payroll PDF Worker",
+        hourly_rate=22.50,
+    )
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(correction_date, 8),
+            _local_dt(correction_date, 10),
+        )
+        corrected = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": correction_date.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Mayra confirmed PDF correction.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+        verified = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": corrected.json()["weeklyHours"]["sourceFingerprint"],
+            },
+        )
+        assert verified.status_code == 200, verified.text
+
+        response = client.get(
+            f"/api/admin/payroll/weekly-hours/pdf?weekStart={week_start.isoformat()}",
+            headers=auth,
+        )
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"] == "application/pdf"
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["content-disposition"] == (
+            'attachment; filename="eom_payroll_weekly_hours_2026-09-13.pdf"'
+        )
+        _assert_valid_pdf(response.content)
+
+        text = _extract_pdf_text(response.content)
+        normalized = _normalized_text(text)
+        assert "Payroll Weekly Hours" in text
+        assert "Horas semanales" in text
+        assert "Verified / Verificado" in text
+        assert "Payroll PDF Worker" in text
+        assert "Mayra confirmed PDF correction." in text
+        assert "Corrected from 2.00h" in normalized
+        assert "change +1.00h" in normalized
+        assert "3.00h" in normalized
+        assert "22.5" not in text
+        assert "22.50" not in text
+        assert "$" not in text
+        assert "Hourly rate" not in text
+        assert "Gross" not in text
+        assert "Net" not in text
+        assert "Overtime" not in text
+    finally:
+        _delete_payroll_verification_weeks([week_start])
         _delete_employees([employee_id])
 
 
