@@ -2415,6 +2415,27 @@ class PayrollReopenRequest(PayrollWeekRequest):
         return value.strip() if isinstance(value, str) else value
 
 
+class PayrollCorrectionRequest(PayrollWeekRequest):
+    employeeId: int = Field(gt=0)
+    date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    correctedTotalMinutes: int = Field(ge=0, le=24 * 60)
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("date", "reason", mode="before")
+    @classmethod
+    def strip_correction_text(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
+class PayrollCorrectionVoidRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_void_reason(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class JobCreateRequest(BaseModel):
     customerName: str = Field(min_length=1)
     scheduledDate: str  # YYYY-MM-DD
@@ -4106,6 +4127,28 @@ def _ensure_schema_migrations() -> None:
         )
     """)
     db.execute("""
+        CREATE TABLE IF NOT EXISTS payroll_hour_corrections (
+            id                       BIGSERIAL PRIMARY KEY,
+            week_start               DATE NOT NULL,
+            correction_date          DATE NOT NULL,
+            employee_id              INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            corrected_total_minutes  INTEGER NOT NULL CHECK (corrected_total_minutes BETWEEN 0 AND 1440),
+            reason                   TEXT NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 500),
+            status                   VARCHAR(16) NOT NULL DEFAULT 'active'
+                                         CHECK (status IN ('active', 'superseded', 'voided')),
+            created_by_employee_id   INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_by_name          TEXT NOT NULL,
+            voided_by_employee_id    INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            voided_by_name           TEXT,
+            voided_reason            TEXT,
+            voided_at                TIMESTAMPTZ,
+            superseded_by            BIGINT REFERENCES payroll_hour_corrections(id) ON DELETE SET NULL,
+            created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (correction_date >= week_start AND correction_date < week_start + 7)
+        )
+    """)
+    db.execute("""
         CREATE INDEX IF NOT EXISTS idx_payroll_verification_batches_status_week
         ON payroll_verification_batches(status, week_start)
     """)
@@ -4116,6 +4159,15 @@ def _ensure_schema_migrations() -> None:
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_payroll_verification_events_batch
         ON payroll_verification_events(batch_id, created_at)
+    """)
+    db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_payroll_hour_corrections_active_day
+        ON payroll_hour_corrections(week_start, employee_id, correction_date)
+        WHERE status = 'active'
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payroll_hour_corrections_week
+        ON payroll_hour_corrections(week_start, status, correction_date)
     """)
 
     # Seed threshold defaults if not already in settings
@@ -10960,6 +11012,7 @@ def _empty_payroll_employee(row: Dict[str, Any], week_start: date) -> Dict[str, 
         "totalHours": 0.0,
         "completedShiftCount": 0,
         "overlappingShiftCount": 0,
+        "correctionCount": 0,
         "issueCodes": [],
         "issues": [],
         "days": [
@@ -11056,6 +11109,7 @@ def _payroll_source_fingerprint(
     week_end: date,
     employees: List[Dict[str, Any]],
     shifts: List[Dict[str, Any]],
+    corrections: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     payload = {
         "timezone": TIMEZONE_NAME,
@@ -11079,6 +11133,18 @@ def _payroll_source_fingerprint(
             for row in shifts
         ],
     }
+    if corrections:
+        payload["corrections"] = [
+            {
+                "id": int(row["id"]),
+                "employee_id": int(row["employee_id"]),
+                "correction_date": row["correction_date"].isoformat(),
+                "corrected_total_minutes": int(row["corrected_total_minutes"]),
+                "reason": str(row["reason"]),
+                "created_at": to_utc_iso(row["created_at"]),
+            }
+            for row in corrections
+        ]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -11140,6 +11206,26 @@ def _compute_payroll_weekly_hours(
         ),
         cursor=cursor,
     )
+    correction_rows = _payroll_query_all(
+        """
+        SELECT
+            correction.id,
+            correction.week_start,
+            correction.correction_date,
+            correction.employee_id,
+            employee.name AS employee_name,
+            correction.corrected_total_minutes,
+            correction.reason,
+            correction.created_at
+        FROM payroll_hour_corrections correction
+        JOIN employees employee ON employee.id = correction.employee_id
+        WHERE correction.week_start = %s
+          AND correction.status = 'active'
+        ORDER BY correction.employee_id, correction.correction_date, correction.id
+        """,
+        (week_start,),
+        cursor=cursor,
+    )
 
     employee_lookup = {int(row["id"]): row for row in employee_rows}
     included: Dict[int, Dict[str, Any]] = {
@@ -11148,6 +11234,7 @@ def _compute_payroll_weekly_hours(
         if bool(row["active"])
     }
     shifted_employee_ids: set[int] = set()
+    corrected_employee_ids: set[int] = set()
 
     for shift_row in shift_rows:
         employee_id = int(shift_row["employee_id"])
@@ -11207,6 +11294,41 @@ def _compute_payroll_weekly_hours(
             day["completedShiftCount"] += 1
             employee_result["totalMinutes"] += minutes
 
+    for correction_row in correction_rows:
+        employee_id = int(correction_row["employee_id"])
+        employee_source = employee_lookup.get(employee_id)
+        if employee_source is None:
+            continue
+        corrected_employee_ids.add(employee_id)
+        included.setdefault(
+            employee_id,
+            _empty_payroll_employee(employee_source, week_start),
+        )
+        employee_result = included[employee_id]
+        correction_date = correction_row["correction_date"]
+        if not isinstance(correction_date, date):
+            correction_date = datetime.strptime(str(correction_date), "%Y-%m-%d").date()
+        day = _payroll_day_map(employee_result).get(correction_date.isoformat())
+        if day is None:
+            continue
+        source_minutes = int(day["totalMinutes"])
+        corrected_minutes = int(correction_row["corrected_total_minutes"])
+        delta_minutes = corrected_minutes - source_minutes
+        day["totalMinutes"] = corrected_minutes
+        day["totalHours"] = round(corrected_minutes / 60, 2)
+        day["correction"] = {
+            "correctionId": int(correction_row["id"]),
+            "sourceTotalMinutes": source_minutes,
+            "sourceTotalHours": round(source_minutes / 60, 2),
+            "correctedTotalMinutes": corrected_minutes,
+            "correctedTotalHours": round(corrected_minutes / 60, 2),
+            "deltaMinutes": delta_minutes,
+            "deltaHours": round(delta_minutes / 60, 2),
+            "reason": str(correction_row["reason"]),
+        }
+        employee_result["totalMinutes"] += delta_minutes
+        employee_result["correctionCount"] += 1
+
     employees = sorted(included.values(), key=lambda row: (row["employeeName"].lower(), row["employeeId"]))
     for employee in employees:
         employee["totalHours"] = round(employee["totalMinutes"] / 60, 2)
@@ -11218,10 +11340,15 @@ def _compute_payroll_weekly_hours(
     total_minutes = sum(int(employee["totalMinutes"]) for employee in employees)
     total_completed_shift_count = sum(int(employee["completedShiftCount"]) for employee in employees)
     total_overlapping_shift_count = sum(int(employee["overlappingShiftCount"]) for employee in employees)
+    total_correction_count = sum(int(employee["correctionCount"]) for employee in employees)
     fingerprint_rows = [
         row
         for row in employee_rows
-        if bool(row["active"]) or int(row["id"]) in shifted_employee_ids
+        if (
+            bool(row["active"])
+            or int(row["id"]) in shifted_employee_ids
+            or int(row["id"]) in corrected_employee_ids
+        )
     ]
 
     return {
@@ -11237,6 +11364,7 @@ def _compute_payroll_weekly_hours(
             week_end=week_end,
             employees=fingerprint_rows,
             shifts=shift_rows,
+            corrections=correction_rows,
         ),
         "employees": employees,
         "summary": {
@@ -11247,6 +11375,7 @@ def _compute_payroll_weekly_hours(
             "totalHours": round(total_minutes / 60, 2),
             "completedShiftCount": total_completed_shift_count,
             "overlappingShiftCount": total_overlapping_shift_count,
+            "correctionCount": total_correction_count,
             "issueCount": issue_count,
             "hasBlockingIssues": issue_count > 0,
         },
@@ -11261,7 +11390,7 @@ def _lock_payroll_verification_week(cur: Any, week_start: date) -> None:
 
 
 def _lock_payroll_source_rows(cur: Any) -> None:
-    cur.execute("LOCK TABLE employees, shifts IN SHARE MODE")
+    cur.execute("LOCK TABLE employees, shifts, payroll_hour_corrections IN SHARE MODE")
 
 
 def _get_payroll_verification_batch(
@@ -11474,6 +11603,77 @@ def _ensure_payroll_snapshot_has_no_blocking_issues(data: Dict[str, Any], action
         )
 
 
+def _parse_payroll_correction_date(date_text: str, week_start: date) -> date:
+    try:
+        correction_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid correction date, use YYYY-MM-DD") from exc
+    if not (week_start <= correction_date < week_start + timedelta(days=7)):
+        raise HTTPException(status_code=400, detail="Correction date must fall inside the payroll week")
+    return correction_date
+
+
+def _serialize_payroll_correction(row: Dict[str, Any]) -> Dict[str, Any]:
+    corrected_minutes = int(row["corrected_total_minutes"])
+    return {
+        "correctionId": int(row["id"]),
+        "weekStart": row["week_start"].isoformat(),
+        "date": row["correction_date"].isoformat(),
+        "employeeId": int(row["employee_id"]),
+        "employeeName": str(row.get("employee_name") or ""),
+        "correctedTotalMinutes": corrected_minutes,
+        "correctedTotalHours": round(corrected_minutes / 60, 2),
+        "reason": str(row["reason"]),
+        "status": str(row["status"]),
+        "createdByName": str(row["created_by_name"]),
+        "createdAt": _payroll_verification_iso(row.get("created_at")),
+        "voidedByName": (
+            str(row["voided_by_name"])
+            if row.get("voided_by_name") is not None
+            else None
+        ),
+        "voidedReason": row.get("voided_reason"),
+        "voidedAt": _payroll_verification_iso(row.get("voided_at")),
+        "supersededBy": (
+            int(row["superseded_by"])
+            if row.get("superseded_by") is not None
+            else None
+        ),
+    }
+
+
+def _payroll_correction_rows(
+    week_start: date,
+    *,
+    cursor: Optional[Any] = None,
+    active_only: bool = True,
+) -> List[Dict[str, Any]]:
+    status_clause = "AND correction.status = 'active'" if active_only else ""
+    return _payroll_query_all(
+        f"""
+        SELECT
+            correction.*,
+            employee.name AS employee_name
+        FROM payroll_hour_corrections correction
+        JOIN employees employee ON employee.id = correction.employee_id
+        WHERE correction.week_start = %s
+          {status_clause}
+        ORDER BY correction.correction_date, LOWER(employee.name), correction.id
+        """,
+        (week_start,),
+        cursor=cursor,
+    )
+
+
+def _ensure_payroll_week_corrections_editable(cur: Any, week_start: date) -> None:
+    batch = _get_payroll_verification_batch(cur, week_start, lock=True)
+    if batch and batch["status"] in {"verified", "finalized"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Reopen the payroll week before changing corrections",
+        )
+
+
 def _payroll_week_start_query(
     request: Request,
     week_start: Optional[str],
@@ -11530,6 +11730,209 @@ def admin_payroll_weekly_hours_verification(
             current_source_fingerprint=data["sourceFingerprint"],
         ),
     }
+
+
+@app.get("/api/admin/payroll/weekly-hours/corrections")
+def admin_payroll_weekly_hours_corrections(
+    request: Request,
+    week_start: Optional[str] = Query(default=None, alias="weekStart"),
+    _: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    parsed_week_start = _parse_payroll_week_start(_payroll_week_start_query(request, week_start))
+    rows = _payroll_correction_rows(parsed_week_start)
+    append_access_log(
+        request,
+        "PAYROLL_WEEKLY_HOURS_CORRECTIONS",
+        True,
+        f"week={parsed_week_start.isoformat()} corrections={len(rows)}",
+    )
+    return {
+        "success": True,
+        "weekStart": parsed_week_start.isoformat(),
+        "weekEnd": (parsed_week_start + timedelta(days=6)).isoformat(),
+        "corrections": [_serialize_payroll_correction(row) for row in rows],
+    }
+
+
+@app.post("/api/admin/payroll/weekly-hours/corrections")
+def admin_create_payroll_hour_correction(
+    payload: PayrollCorrectionRequest,
+    request: Request,
+    current_payroll: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    week_start = _parse_payroll_week_start(payload.weekStart)
+    correction_date = _parse_payroll_correction_date(payload.date, week_start)
+    result: Dict[str, Any]
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_payroll_verification_week(cur, week_start)
+            _ensure_payroll_week_corrections_editable(cur, week_start)
+            cur.execute("LOCK TABLE payroll_hour_corrections IN SHARE ROW EXCLUSIVE MODE")
+            cur.execute(
+                "SELECT id, name FROM employees WHERE id = %s FOR SHARE",
+                (payload.employeeId,),
+            )
+            employee = cur.fetchone()
+            if employee is None:
+                raise HTTPException(status_code=404, detail="Employee not found")
+            cur.execute(
+                """
+                SELECT *
+                FROM payroll_hour_corrections
+                WHERE week_start = %s
+                  AND employee_id = %s
+                  AND correction_date = %s
+                  AND status = 'active'
+                FOR UPDATE
+                """,
+                (week_start, int(payload.employeeId), correction_date),
+            )
+            existing = cur.fetchone()
+            if (
+                existing
+                and int(existing["corrected_total_minutes"]) == payload.correctedTotalMinutes
+                and str(existing["reason"]) == payload.reason
+            ):
+                saved = dict(existing)
+                saved["employee_name"] = str(employee["name"])
+                idempotent = True
+            else:
+                if existing:
+                    cur.execute(
+                        """
+                        UPDATE payroll_hour_corrections
+                        SET status = 'superseded', updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (int(existing["id"]),),
+                    )
+                cur.execute(
+                    """
+                    INSERT INTO payroll_hour_corrections (
+                        week_start,
+                        correction_date,
+                        employee_id,
+                        corrected_total_minutes,
+                        reason,
+                        created_by_employee_id,
+                        created_by_name
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        week_start,
+                        correction_date,
+                        int(payload.employeeId),
+                        int(payload.correctedTotalMinutes),
+                        payload.reason,
+                        int(current_payroll["id"]),
+                        str(current_payroll["name"]),
+                    ),
+                )
+                saved = dict(cur.fetchone())
+                saved["employee_name"] = str(employee["name"])
+                if existing:
+                    cur.execute(
+                        """
+                        UPDATE payroll_hour_corrections
+                        SET superseded_by = %s, updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (int(saved["id"]), int(existing["id"])),
+                    )
+                idempotent = False
+            _lock_payroll_source_rows(cur)
+            weekly_hours = _compute_payroll_weekly_hours(week_start.isoformat(), cursor=cur)
+            result = {
+                "success": True,
+                "action": "correct",
+                "idempotent": idempotent,
+                "correction": _serialize_payroll_correction(saved),
+                "weeklyHours": weekly_hours,
+            }
+
+    append_access_log(
+        request,
+        "PAYROLL_HOUR_CORRECTION",
+        True,
+        f"week={week_start.isoformat()} employee={payload.employeeId} date={correction_date.isoformat()} idempotent={result['idempotent']}",
+    )
+    return result
+
+
+@app.post("/api/admin/payroll/weekly-hours/corrections/{correction_id}/void")
+def admin_void_payroll_hour_correction(
+    correction_id: int,
+    payload: PayrollCorrectionVoidRequest,
+    request: Request,
+    current_payroll: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT week_start FROM payroll_hour_corrections WHERE id = %s",
+                (correction_id,),
+            )
+            identity = cur.fetchone()
+            if identity is None:
+                raise HTTPException(status_code=404, detail="Active payroll correction not found")
+            week_start = identity["week_start"]
+            _lock_payroll_verification_week(cur, week_start)
+            _ensure_payroll_week_corrections_editable(cur, week_start)
+            cur.execute("LOCK TABLE payroll_hour_corrections IN SHARE ROW EXCLUSIVE MODE")
+            cur.execute(
+                """
+                SELECT correction.*, employee.name AS employee_name
+                FROM payroll_hour_corrections correction
+                JOIN employees employee ON employee.id = correction.employee_id
+                WHERE correction.id = %s
+                  AND correction.status = 'active'
+                FOR UPDATE
+                """,
+                (correction_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Active payroll correction not found")
+            cur.execute(
+                """
+                UPDATE payroll_hour_corrections
+                SET
+                    status = 'voided',
+                    voided_by_employee_id = %s,
+                    voided_by_name = %s,
+                    voided_reason = %s,
+                    voided_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    int(current_payroll["id"]),
+                    str(current_payroll["name"]),
+                    payload.reason,
+                    correction_id,
+                ),
+            )
+            saved = dict(cur.fetchone())
+            saved["employee_name"] = str(row["employee_name"])
+            _lock_payroll_source_rows(cur)
+            weekly_hours = _compute_payroll_weekly_hours(week_start.isoformat(), cursor=cur)
+            result = {
+                "success": True,
+                "action": "void",
+                "correction": _serialize_payroll_correction(saved),
+                "weeklyHours": weekly_hours,
+            }
+
+    append_access_log(
+        request,
+        "PAYROLL_HOUR_CORRECTION_VOID",
+        True,
+        f"week={week_start.isoformat()} correction={correction_id}",
+    )
+    return result
 
 
 @app.post("/api/admin/payroll/weekly-hours/verify")

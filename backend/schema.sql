@@ -685,6 +685,27 @@ CREATE TABLE payroll_verification_events (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE payroll_hour_corrections (
+    id                       BIGSERIAL PRIMARY KEY,
+    week_start               DATE NOT NULL,
+    correction_date          DATE NOT NULL,
+    employee_id              INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    corrected_total_minutes  INTEGER NOT NULL CHECK (corrected_total_minutes BETWEEN 0 AND 1440),
+    reason                   TEXT NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 500),
+    status                   VARCHAR(16) NOT NULL DEFAULT 'active'
+                                 CHECK (status IN ('active', 'superseded', 'voided')),
+    created_by_employee_id   INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_by_name          TEXT NOT NULL,
+    voided_by_employee_id    INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    voided_by_name           TEXT,
+    voided_reason            TEXT,
+    voided_at                TIMESTAMPTZ,
+    superseded_by            BIGINT REFERENCES payroll_hour_corrections(id) ON DELETE SET NULL,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (correction_date >= week_start AND correction_date < week_start + 7)
+);
+
 -- Durable business-scoped operation identity for Atlas money writes. The row
 -- survives browser/tab/admin changes and is resolved only after Atlas confirms
 -- the result, so an ambiguous retry cannot mint a second receipt. Payment
@@ -764,6 +785,11 @@ CREATE INDEX idx_payroll_verification_events_week
     ON payroll_verification_events(week_start, created_at);
 CREATE INDEX idx_payroll_verification_events_batch
     ON payroll_verification_events(batch_id, created_at);
+CREATE UNIQUE INDEX uq_payroll_hour_corrections_active_day
+    ON payroll_hour_corrections(week_start, employee_id, correction_date)
+    WHERE status = 'active';
+CREATE INDEX idx_payroll_hour_corrections_week
+    ON payroll_hour_corrections(week_start, status, correction_date);
 CREATE INDEX idx_receivables_operation_attempts_state
     ON receivables_operation_attempts(state, updated_at);
 CREATE UNIQUE INDEX uq_receivables_operation_attempts_active_identity
