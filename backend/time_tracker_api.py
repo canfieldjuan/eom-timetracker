@@ -64,6 +64,11 @@ DEFAULT_LOCATIONS = [
 ]
 
 JWT_ALGORITHM = "HS256"
+ADMIN_ROLE = "admin"
+EMPLOYEE_ROLE = "employee"
+PAYROLL_ROLE = "payroll"
+EMPLOYEE_ROLES = (ADMIN_ROLE, EMPLOYEE_ROLE, PAYROLL_ROLE)
+PAYROLL_READ_ROLES = {ADMIN_ROLE, PAYROLL_ROLE}
 EMPLOYEE_WRITE_LOCK = threading.Lock()
 TIMESHEET_WRITE_LOCK = threading.Lock()
 TIMESHEET_PG_ADVISORY_LOCK_ID = 5_107_202_064
@@ -1766,8 +1771,18 @@ def get_current_admin(
     authorization: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     employee = get_current_employee(request, authorization)
-    if employee.get("role") != "admin":
+    if employee.get("role") != ADMIN_ROLE:
         raise HTTPException(status_code=403, detail="Admin access required")
+    return employee
+
+
+def get_current_payroll(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    employee = get_current_employee(request, authorization)
+    if employee.get("role") not in PAYROLL_READ_ROLES:
+        raise HTTPException(status_code=403, detail="Payroll access required")
     return employee
 
 
@@ -3548,9 +3563,63 @@ def _ensure_weekly_schedule_site_schema() -> None:
             )
 
 
+def _ensure_employee_role_schema() -> None:
+    """Allow the payroll role on existing employee tables without touching rows."""
+    db.execute(
+        """
+        DO $$
+        DECLARE
+            role_constraint RECORD;
+        BEGIN
+            FOR role_constraint IN
+                SELECT constraint_row.conname
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = 'employees'::regclass
+                  AND constraint_row.contype = 'c'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM unnest(constraint_row.conkey) AS key_row(attnum)
+                      JOIN pg_attribute attribute_row
+                        ON attribute_row.attrelid = constraint_row.conrelid
+                       AND attribute_row.attnum = key_row.attnum
+                      WHERE attribute_row.attname = 'role'
+                  )
+                  AND pg_get_constraintdef(constraint_row.oid) NOT LIKE '%%payroll%%'
+            LOOP
+                EXECUTE format(
+                    'ALTER TABLE employees DROP CONSTRAINT %%I',
+                    role_constraint.conname
+                );
+            END LOOP;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = 'employees'::regclass
+                  AND constraint_row.contype = 'c'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM unnest(constraint_row.conkey) AS key_row(attnum)
+                      JOIN pg_attribute attribute_row
+                        ON attribute_row.attrelid = constraint_row.conrelid
+                       AND attribute_row.attnum = key_row.attnum
+                      WHERE attribute_row.attname = 'role'
+                  )
+                  AND pg_get_constraintdef(constraint_row.oid) LIKE '%%payroll%%'
+            ) THEN
+                ALTER TABLE employees
+                    ADD CONSTRAINT employees_role_check
+                    CHECK (role IN ('admin', 'employee', 'payroll'));
+            END IF;
+        END $$;
+        """
+    )
+
+
 def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
+    _ensure_employee_role_schema()
     db.execute("""
         CREATE TABLE IF NOT EXISTS receivables_operation_attempts (
             attempt_id          BIGSERIAL PRIMARY KEY,
@@ -7654,8 +7723,11 @@ def admin_create_employee(
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     role = payload.role.strip().lower()
-    if role not in {"admin", "employee"}:
-        raise HTTPException(status_code=400, detail="Role must be admin or employee")
+    if role not in EMPLOYEE_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Role must be one of: {', '.join(EMPLOYEE_ROLES)}",
+        )
 
     hourly_rate = payload.hourlyRate
     if hourly_rate is not None and (not math.isfinite(hourly_rate) or hourly_rate < 0):
@@ -7682,10 +7754,9 @@ def admin_update_employee(
     request: Request,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    allowed_roles = {"admin", "employee"}
     new_role = payload.get("role", "").strip().lower()
-    if new_role and new_role not in allowed_roles:
-        raise HTTPException(status_code=400, detail=f"Role must be one of: {', '.join(allowed_roles)}")
+    if new_role and new_role not in EMPLOYEE_ROLES:
+        raise HTTPException(status_code=400, detail=f"Role must be one of: {', '.join(EMPLOYEE_ROLES)}")
 
     new_password = payload.get("password", "").strip()
     if new_password and len(new_password) < 4:
@@ -7717,7 +7788,7 @@ def admin_update_employee(
         # one active admin must remain. Checked inside the write lock (via
         # update_employees) so it is atomic against concurrent demotions.
         has_active_admin = any(
-            str(e.get("role") or "").lower() == "admin" and bool(e.get("active"))
+            str(e.get("role") or "").lower() == ADMIN_ROLE and bool(e.get("active"))
             for e in employees_data["employees"]
         )
         if not has_active_admin:
@@ -10754,6 +10825,395 @@ def admin_logs_by_date(
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     return {"success": True, "date": date_text, "logs": read_access_logs_for_date(date_text)}
+
+
+def _parse_payroll_week_start(week_start: Optional[str]) -> date:
+    if week_start:
+        try:
+            parsed = datetime.strptime(week_start, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid weekStart format, use YYYY-MM-DD") from exc
+    else:
+        local_today = to_local(utc_now()).date()
+        parsed = local_today - timedelta(days=(local_today.weekday() + 1) % 7)
+
+    if parsed.weekday() != 6:
+        raise HTTPException(status_code=400, detail="weekStart must be a Sunday")
+    return parsed
+
+
+def _payroll_week_bounds(week_start: date) -> Tuple[date, datetime, datetime]:
+    week_end = week_start + timedelta(days=6)
+    start_local = datetime.combine(week_start, clock_time.min, tzinfo=APP_TIMEZONE)
+    end_local_exclusive = datetime.combine(
+        week_start + timedelta(days=7),
+        clock_time.min,
+        tzinfo=APP_TIMEZONE,
+    )
+    return (
+        week_end,
+        start_local.astimezone(timezone.utc),
+        end_local_exclusive.astimezone(timezone.utc),
+    )
+
+
+def _empty_payroll_day(day: date) -> Dict[str, Any]:
+    return {
+        "date": day.isoformat(),
+        "totalMinutes": 0,
+        "totalHours": 0.0,
+        "completedShiftCount": 0,
+        "issueCodes": [],
+    }
+
+
+def _empty_payroll_employee(row: Dict[str, Any], week_start: date) -> Dict[str, Any]:
+    return {
+        "employeeId": int(row["id"]),
+        "employeeName": str(row["name"]),
+        "active": bool(row["active"]),
+        "totalMinutes": 0,
+        "totalHours": 0.0,
+        "completedShiftCount": 0,
+        "overlappingShiftCount": 0,
+        "issueCodes": [],
+        "issues": [],
+        "days": [
+            _empty_payroll_day(week_start + timedelta(days=offset))
+            for offset in range(7)
+        ],
+    }
+
+
+def _payroll_day_map(employee_row: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return {str(day["date"]): day for day in employee_row["days"]}
+
+
+def _add_payroll_issue(
+    employee_row: Dict[str, Any],
+    code: str,
+    shift_row: Dict[str, Any],
+    message: str,
+    issue_at_utc: datetime,
+) -> None:
+    issue_date = to_local(issue_at_utc).date().isoformat()
+    employee_row["issues"].append(
+        {
+            "code": code,
+            "shiftId": int(shift_row["id"]),
+            "date": issue_date,
+            "message": message,
+        }
+    )
+    if code not in employee_row["issueCodes"]:
+        employee_row["issueCodes"].append(code)
+
+    day = _payroll_day_map(employee_row).get(issue_date)
+    if day is not None and code not in day["issueCodes"]:
+        day["issueCodes"].append(code)
+
+
+def _iter_payroll_local_day_slices(
+    start_utc: datetime,
+    end_utc: datetime,
+) -> List[Tuple[date, float]]:
+    slices: List[Tuple[date, float]] = []
+    cursor = start_utc
+    while cursor < end_utc:
+        local_cursor = to_local(cursor)
+        local_day = local_cursor.date()
+        next_local_midnight = datetime.combine(
+            local_day + timedelta(days=1),
+            clock_time.min,
+            tzinfo=APP_TIMEZONE,
+        )
+        next_cursor = min(end_utc, next_local_midnight.astimezone(timezone.utc))
+        if next_cursor <= cursor:
+            break
+        seconds = max(0.0, (next_cursor - cursor).total_seconds())
+        if seconds > 0:
+            slices.append((local_day, seconds))
+        cursor = next_cursor
+    return slices
+
+
+def _allocate_payroll_shift_minutes(
+    day_slices: List[Tuple[date, float]],
+) -> List[Tuple[date, int]]:
+    total_minutes = int((sum(seconds for _, seconds in day_slices) + 30) // 60)
+    base_allocations = [
+        {
+            "index": index,
+            "day": local_day,
+            "minutes": int(seconds // 60),
+            "remainder": seconds % 60,
+        }
+        for index, (local_day, seconds) in enumerate(day_slices)
+    ]
+    allocated_minutes = sum(int(item["minutes"]) for item in base_allocations)
+    remaining_minutes = total_minutes - allocated_minutes
+    if remaining_minutes > 0:
+        by_remainder = sorted(
+            base_allocations,
+            key=lambda item: (-float(item["remainder"]), int(item["index"])),
+        )
+        for item in by_remainder[:remaining_minutes]:
+            item["minutes"] = int(item["minutes"]) + 1
+    base_allocations.sort(key=lambda item: int(item["index"]))
+    return [
+        (item["day"], int(item["minutes"]))
+        for item in base_allocations
+    ]
+
+
+def _payroll_source_fingerprint(
+    *,
+    week_start: date,
+    week_end: date,
+    employees: List[Dict[str, Any]],
+    shifts: List[Dict[str, Any]],
+) -> str:
+    payload = {
+        "timezone": TIMEZONE_NAME,
+        "weekStart": week_start.isoformat(),
+        "weekEnd": week_end.isoformat(),
+        "employees": [
+            {
+                "id": int(row["id"]),
+                "name": str(row["name"]),
+                "active": bool(row["active"]),
+            }
+            for row in employees
+        ],
+        "shifts": [
+            {
+                "id": int(row["id"]),
+                "employee_id": int(row["employee_id"]),
+                "clock_in": to_utc_iso(row["clock_in"]),
+                "clock_out": to_utc_iso(row["clock_out"]) if row.get("clock_out") else None,
+            }
+            for row in shifts
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _compute_payroll_weekly_hours(week_start_text: Optional[str]) -> Dict[str, Any]:
+    week_start = _parse_payroll_week_start(week_start_text)
+    week_end, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
+    now_utc = utc_now()
+
+    employee_rows = db.query_all(
+        """
+        SELECT id, name, active
+        FROM employees
+        ORDER BY LOWER(name), id
+        """
+    )
+    shift_rows = db.query_all(
+        """
+        SELECT id, employee_id, clock_in, clock_out
+        FROM shifts
+        WHERE clock_in < %s
+          AND (
+              (clock_out IS NULL AND clock_in < %s AND %s > %s)
+              OR (
+                  clock_out IS NOT NULL
+                  AND (
+                      clock_out > %s
+                      OR (clock_in >= %s AND clock_in < %s)
+                  )
+              )
+          )
+        ORDER BY employee_id, clock_in, id
+        """,
+        (
+            week_end_utc,
+            now_utc,
+            now_utc,
+            week_start_utc,
+            week_start_utc,
+            week_start_utc,
+            week_end_utc,
+        ),
+    )
+
+    employee_lookup = {int(row["id"]): row for row in employee_rows}
+    included: Dict[int, Dict[str, Any]] = {
+        int(row["id"]): _empty_payroll_employee(row, week_start)
+        for row in employee_rows
+        if bool(row["active"])
+    }
+    shifted_employee_ids: set[int] = set()
+
+    for shift_row in shift_rows:
+        employee_id = int(shift_row["employee_id"])
+        employee_source = employee_lookup.get(employee_id)
+        if employee_source is None:
+            continue
+        shifted_employee_ids.add(employee_id)
+        included.setdefault(
+            employee_id,
+            _empty_payroll_employee(employee_source, week_start),
+        )
+        employee_result = included[employee_id]
+        employee_result["overlappingShiftCount"] += 1
+
+        clock_in = shift_row["clock_in"].astimezone(timezone.utc)
+        clock_out = shift_row.get("clock_out")
+        issue_at_utc = max(clock_in, week_start_utc)
+        if issue_at_utc >= week_end_utc:
+            issue_at_utc = week_start_utc
+
+        if clock_out is None:
+            _add_payroll_issue(
+                employee_result,
+                "missing_clock_out",
+                shift_row,
+                "Shift overlaps this payroll week but has no clock-out.",
+                issue_at_utc,
+            )
+            continue
+
+        clock_out = clock_out.astimezone(timezone.utc)
+        if clock_out <= clock_in:
+            _add_payroll_issue(
+                employee_result,
+                "invalid_shift_duration",
+                shift_row,
+                "Shift clock-out is not after clock-in.",
+                issue_at_utc,
+            )
+            continue
+
+        overlap_start = max(clock_in, week_start_utc)
+        overlap_end = min(clock_out, week_end_utc)
+        if overlap_end <= overlap_start:
+            continue
+
+        employee_result["completedShiftCount"] += 1
+        day_map = _payroll_day_map(employee_result)
+        for local_day, minutes in _allocate_payroll_shift_minutes(
+            _iter_payroll_local_day_slices(overlap_start, overlap_end)
+        ):
+            day = day_map.get(local_day.isoformat())
+            if day is None:
+                continue
+            day["totalMinutes"] += minutes
+            day["totalHours"] = round(day["totalMinutes"] / 60, 2)
+            day["completedShiftCount"] += 1
+            employee_result["totalMinutes"] += minutes
+
+    employees = sorted(included.values(), key=lambda row: (row["employeeName"].lower(), row["employeeId"]))
+    for employee in employees:
+        employee["totalHours"] = round(employee["totalMinutes"] / 60, 2)
+        employee["issueCodes"].sort()
+        for day in employee["days"]:
+            day["issueCodes"].sort()
+
+    issue_count = sum(len(employee["issues"]) for employee in employees)
+    total_minutes = sum(int(employee["totalMinutes"]) for employee in employees)
+    total_completed_shift_count = sum(int(employee["completedShiftCount"]) for employee in employees)
+    total_overlapping_shift_count = sum(int(employee["overlappingShiftCount"]) for employee in employees)
+    fingerprint_rows = [
+        row
+        for row in employee_rows
+        if bool(row["active"]) or int(row["id"]) in shifted_employee_ids
+    ]
+
+    return {
+        "success": True,
+        "period": "week",
+        "timezone": TIMEZONE_NAME,
+        "weekStart": week_start.isoformat(),
+        "weekEnd": week_end.isoformat(),
+        "weekEndExclusive": (week_end + timedelta(days=1)).isoformat(),
+        "generatedAt": to_utc_iso(utc_now()),
+        "sourceFingerprint": _payroll_source_fingerprint(
+            week_start=week_start,
+            week_end=week_end,
+            employees=fingerprint_rows,
+            shifts=shift_rows,
+        ),
+        "employees": employees,
+        "summary": {
+            "employeeCount": len(employees),
+            "activeEmployeeCount": sum(1 for employee in employees if employee["active"]),
+            "employeesWithHours": sum(1 for employee in employees if employee["totalMinutes"] > 0),
+            "totalMinutes": total_minutes,
+            "totalHours": round(total_minutes / 60, 2),
+            "completedShiftCount": total_completed_shift_count,
+            "overlappingShiftCount": total_overlapping_shift_count,
+            "issueCount": issue_count,
+            "hasBlockingIssues": issue_count > 0,
+        },
+    }
+
+
+def _payroll_week_start_query(
+    request: Request,
+    week_start: Optional[str],
+) -> Optional[str]:
+    return week_start or request.query_params.get("week_start")
+
+
+@app.get("/api/admin/payroll/weekly-hours")
+def admin_payroll_weekly_hours(
+    request: Request,
+    week_start: Optional[str] = Query(default=None, alias="weekStart"),
+    _: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    data = _compute_payroll_weekly_hours(_payroll_week_start_query(request, week_start))
+    append_access_log(
+        request,
+        "PAYROLL_WEEKLY_HOURS",
+        True,
+        f"week={data['weekStart']} employees={data['summary']['employeeCount']} issues={data['summary']['issueCount']}",
+    )
+    return data
+
+
+@app.get("/api/admin/payroll/weekly-hours/export")
+def admin_payroll_weekly_hours_export(
+    request: Request,
+    week_start: Optional[str] = Query(default=None, alias="weekStart"),
+    _: Dict[str, Any] = Depends(get_current_payroll),
+) -> StreamingResponse:
+    data = _compute_payroll_weekly_hours(_payroll_week_start_query(request, week_start))
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["EOM Payroll Weekly Hours"])
+    writer.writerow(["Week Start", data["weekStart"], "Week End", data["weekEnd"]])
+    writer.writerow(["Timezone", data["timezone"], "Source Fingerprint", data["sourceFingerprint"]])
+    writer.writerow([])
+    writer.writerow(["Employee", "Status", "Total Hours", "Total Minutes", "Completed Shifts", "Issues"])
+    for employee in data["employees"]:
+        writer.writerow(
+            [
+                employee["employeeName"],
+                "Active" if employee["active"] else "Inactive",
+                f'{employee["totalHours"]:.2f}',
+                employee["totalMinutes"],
+                employee["completedShiftCount"],
+                "; ".join(employee["issueCodes"]),
+            ]
+        )
+
+    buf.seek(0)
+    append_access_log(
+        request,
+        "PAYROLL_WEEKLY_HOURS_EXPORT",
+        True,
+        f"week={data['weekStart']} employees={data['summary']['employeeCount']} issues={data['summary']['issueCount']}",
+    )
+    filename = f"eom_payroll_weekly_hours_{data['weekStart']}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Optional[int], exceptions_only: bool = False) -> Dict[str, Any]:
