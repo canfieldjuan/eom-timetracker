@@ -8038,7 +8038,6 @@ def admin_employee_hours(
     local_today = to_local(now).date()
     days_since_sunday = (local_today.weekday() + 1) % 7
     current_week_start_date = local_today - timedelta(days=days_since_sunday)
-    current_week_end_date = current_week_start_date + timedelta(days=7)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     today_str = local_today.isoformat()
@@ -8046,7 +8045,6 @@ def admin_employee_hours(
     emp_entries = [e for e in timesheet_data["entries"] if e.get("employeeId") == employee_id]
 
     today_hours = 0.0
-    weekly_hours = 0.0
     monthly_hours = 0.0
     yearly_hours = 0.0
     all_time_hours = 0.0
@@ -8070,8 +8068,6 @@ def admin_employee_hours(
             yearly_hours += total
         if clock_in_dt >= month_start:
             monthly_hours += total
-        if current_week_start_date <= entry_local_date < current_week_end_date:
-            weekly_hours += total
         if entry_date == today_str:
             today_hours += total
 
@@ -8171,7 +8167,7 @@ def admin_employee_hours(
         "employeeId": employee_id,
         "employeeName": emp["name"],
         "todayHours": round(today_hours, 2),
-        "weeklyHours": round(weekly_hours, 2),
+        "weeklyHours": round(week_total, 2),
         "monthlyHours": round(monthly_hours, 2),
         "yearlyHours": round(yearly_hours, 2),
         "allTimeHours": round(all_time_hours, 2),
