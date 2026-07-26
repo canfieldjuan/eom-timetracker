@@ -22,6 +22,12 @@ SOURCE_ROLE_SITE_TYPES = {
     "residential_morning": "Residential",
     "commercial_evening_night": "Commercial",
 }
+UTILIZATION_CATEGORIES = (
+    "on_site",
+    "travel",
+    "categorized",
+    "unclassified",
+)
 
 
 def _utc_iso(value: Optional[datetime]) -> Optional[str]:
@@ -465,6 +471,931 @@ def _load_time_evidence(
         )
 
     return shifts, visits, departures, qr_by_employee_site, qr_rows
+
+
+def _load_utilization_evidence(
+    range_start: datetime,
+    range_end: datetime,
+    observed_at: datetime,
+) -> Tuple[
+    List[Dict[str, Any]],
+    Dict[int, List[Dict[str, Any]]],
+    Dict[int, List[Dict[str, Any]]],
+]:
+    """Load the immutable event atoms needed for paid-time classification."""
+
+    shifts = db.query_all(
+        """
+        SELECT s.id, s.employee_id, e.name AS employee_name,
+               s.location_id, s.location_label, s.job_id,
+               s.clock_in, s.clock_out, s.time_category,
+               s.non_productive_type
+        FROM shifts s
+        JOIN employees e ON e.id = s.employee_id
+        WHERE (
+                s.clock_out IS NOT NULL
+                AND (
+                    (
+                        s.clock_in < %s
+                        AND s.clock_out > %s
+                    )
+                    OR (
+                        s.clock_out <= s.clock_in
+                        AND s.clock_in >= %s
+                        AND s.clock_in < %s
+                    )
+                )
+              )
+           OR (
+                s.clock_out IS NULL
+                AND s.clock_in < %s
+                AND s.clock_in < %s
+                AND %s > %s
+              )
+        ORDER BY s.employee_id, s.clock_in, s.id
+        """,
+        (
+            range_end,
+            range_start,
+            range_start,
+            range_end,
+            range_end,
+            observed_at,
+            observed_at,
+            range_start,
+        ),
+    )
+    shift_ids = [int(row["id"]) for row in shifts]
+    visits: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    departures: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    if not shift_ids:
+        return shifts, visits, departures
+
+    for row in db.query_all(
+        """
+        SELECT v.id, v.shift_id, v.location_id, v.location_label,
+               v.arrival_time, v.sequence_version, v.site_check_in_id,
+               sci.employee_id AS check_in_employee_id,
+               sci.location_id AS check_in_location_id,
+               sci.server_checked_in_at AS check_in_at,
+               sci.classification AS check_in_classification,
+               sci.review_status AS check_in_review_status,
+               COALESCE(
+                   CASE
+                       WHEN check_in_job.location_id = v.location_id
+                       THEN sci.job_id
+                   END,
+                   CASE
+                       WHEN shift_job.location_id = v.location_id
+                       THEN evidence_shift.job_id
+                   END
+               ) AS job_id
+        FROM visits v
+        JOIN shifts evidence_shift ON evidence_shift.id = v.shift_id
+        LEFT JOIN jobs shift_job ON shift_job.id = evidence_shift.job_id
+        LEFT JOIN site_check_ins sci ON sci.id = v.site_check_in_id
+        LEFT JOIN jobs check_in_job ON check_in_job.id = sci.job_id
+        WHERE v.shift_id = ANY(%s)
+        ORDER BY v.shift_id, v.arrival_time, v.id
+        """,
+        (shift_ids,),
+    ):
+        visits[int(row["shift_id"])].append(row)
+
+    for row in db.query_all(
+        """
+        SELECT id, shift_id, visit_id, location_id, location_label,
+               departure_time
+        FROM departures
+        WHERE shift_id = ANY(%s)
+        ORDER BY shift_id, departure_time, id
+        """,
+        (shift_ids,),
+    ):
+        departures[int(row["shift_id"])].append(row)
+
+    return shifts, visits, departures
+
+
+def _epoch_second(value: datetime) -> int:
+    """Normalize authoritative timestamps to the API's whole-second precision."""
+
+    return int(value.astimezone(timezone.utc).timestamp())
+
+
+def _second_datetime(value: int) -> datetime:
+    return datetime.fromtimestamp(value, tz=timezone.utc)
+
+
+def _utilization_review_item(
+    shift: Dict[str, Any],
+    *,
+    code: str,
+    message: str,
+    visit: Optional[Dict[str, Any]] = None,
+    departure: Optional[Dict[str, Any]] = None,
+    occurred_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    return {
+        "shiftId": int(shift["id"]),
+        "employeeId": int(shift["employee_id"]),
+        "employeeName": str(shift["employee_name"]),
+        "code": code,
+        "message": message,
+        "visitId": (
+            int(visit["id"]) if visit is not None and visit.get("id") is not None else None
+        ),
+        "departureId": (
+            int(departure["id"])
+            if departure is not None and departure.get("id") is not None
+            else None
+        ),
+        "occurredAt": occurred_at,
+    }
+
+
+def _utilization_segment(
+    shift: Dict[str, Any],
+    *,
+    category: str,
+    start_second: int,
+    end_second: int,
+    category_detail: Optional[str] = None,
+    location_id: Optional[int] = None,
+    location_label: str = "",
+    job_id: Optional[int] = None,
+    visit_id: Optional[int] = None,
+    departure_id: Optional[int] = None,
+    from_location_id: Optional[int] = None,
+    to_location_id: Optional[int] = None,
+    from_job_id: Optional[int] = None,
+    to_job_id: Optional[int] = None,
+    evidence: Optional[List[str]] = None,
+    review_codes: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    return {
+        "shift_id": int(shift["id"]),
+        "employee_id": int(shift["employee_id"]),
+        "employee_name": str(shift["employee_name"]),
+        "category": category,
+        "category_detail": category_detail,
+        "start_second": start_second,
+        "end_second": end_second,
+        "location_id": location_id,
+        "location_label": location_label,
+        "job_id": job_id,
+        "visit_id": visit_id,
+        "departure_id": departure_id,
+        "from_location_id": from_location_id,
+        "to_location_id": to_location_id,
+        "from_job_id": from_job_id,
+        "to_job_id": to_job_id,
+        "evidence": evidence or ["paid_shift"],
+        "review_codes": sorted(set(review_codes or ())),
+    }
+
+
+def _closed_shift_utilization(
+    shift: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    departures: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Partition one closed paid envelope without inferring missing events."""
+
+    clock_out = shift.get("clock_out")
+    if clock_out is None:
+        return [], [
+            _utilization_review_item(
+                shift,
+                code="open_shift",
+                message="This shift is still open and is excluded from finalized totals.",
+                occurred_at=shift["clock_in"],
+            )
+        ]
+
+    shift_start = _epoch_second(shift["clock_in"])
+    shift_end = _epoch_second(clock_out)
+    if shift_end <= shift_start:
+        return [], [
+            _utilization_review_item(
+                shift,
+                code="invalid_paid_interval",
+                message="Clock Out must be later than Clock In.",
+                occurred_at=shift["clock_in"],
+            )
+        ]
+
+    time_category = str(shift.get("time_category") or "productive")
+    if time_category == "non_productive":
+        subtype = str(shift.get("non_productive_type") or "").strip()
+        if subtype:
+            return [
+                _utilization_segment(
+                    shift,
+                    category="categorized",
+                    category_detail=subtype,
+                    start_second=shift_start,
+                    end_second=shift_end,
+                    location_id=shift.get("location_id"),
+                    location_label=str(shift.get("location_label") or ""),
+                    job_id=shift.get("job_id"),
+                    evidence=["paid_shift", "shift_category"],
+                )
+            ], []
+        issue = _utilization_review_item(
+            shift,
+            code="missing_non_productive_type",
+            message="This non-productive shift has no category subtype.",
+            occurred_at=shift["clock_in"],
+        )
+        return [
+            _utilization_segment(
+                shift,
+                category="unclassified",
+                start_second=shift_start,
+                end_second=shift_end,
+                evidence=["paid_shift", "shift_category"],
+                review_codes=[issue["code"]],
+            )
+        ], [issue]
+
+    review_items: List[Dict[str, Any]] = []
+    visit_by_id = {int(row["id"]): row for row in visits}
+    departures_by_visit: Dict[int, Dict[str, Any]] = {}
+    for departure in departures:
+        visit_id = departure.get("visit_id")
+        if visit_id is None:
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="legacy_unpaired_departure",
+                    message="A legacy departure is not paired to an explicit arrival.",
+                    departure=departure,
+                    occurred_at=departure["departure_time"],
+                )
+            )
+            continue
+        normalized_visit_id = int(visit_id)
+        if normalized_visit_id not in visit_by_id:
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="orphan_departure",
+                    message="A departure references an arrival outside this shift.",
+                    departure=departure,
+                    occurred_at=departure["departure_time"],
+                )
+            )
+            continue
+        departures_by_visit[normalized_visit_id] = departure
+
+    valid_arrivals: List[Dict[str, Any]] = []
+    pair_candidates: List[Dict[str, Any]] = []
+    for visit in visits:
+        sequence_version = int(visit.get("sequence_version") or 1)
+        arrival_second = _epoch_second(visit["arrival_time"])
+        if sequence_version < 2:
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="legacy_visit_evidence",
+                    message="A legacy arrival has no authoritative paired duration.",
+                    visit=visit,
+                    occurred_at=visit["arrival_time"],
+                )
+            )
+            continue
+        if visit.get("site_check_in_id") is not None and not (
+            (
+                visit.get("check_in_classification") in {"on_time", "late"}
+                and visit.get("check_in_review_status") == "not_required"
+            )
+            or (
+                visit.get("check_in_classification") == "needs_review"
+                and visit.get("check_in_review_status") == "approved"
+            )
+        ):
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="unaccepted_site_check_in",
+                    message=(
+                        "A linked QR check-in is pending review, rejected, or "
+                        "otherwise not accepted."
+                    ),
+                    visit=visit,
+                    occurred_at=visit["arrival_time"],
+                )
+            )
+            continue
+        if not (shift_start <= arrival_second < shift_end):
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="arrival_outside_paid_shift",
+                    message="An arrival falls outside the paid shift envelope.",
+                    visit=visit,
+                    occurred_at=visit["arrival_time"],
+                )
+            )
+            continue
+        if visit.get("location_id") is None:
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="arrival_missing_site",
+                    message="An arrival has no Site identity.",
+                    visit=visit,
+                    occurred_at=visit["arrival_time"],
+                )
+            )
+            continue
+        if visit.get("site_check_in_id") is not None and not (
+            visit.get("check_in_employee_id") is not None
+            and int(visit["check_in_employee_id"]) == int(shift["employee_id"])
+            and visit.get("check_in_location_id") is not None
+            and int(visit["check_in_location_id"]) == int(visit["location_id"])
+            and visit.get("check_in_at") is not None
+            and _epoch_second(visit["check_in_at"]) == arrival_second
+        ):
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="site_check_in_identity_mismatch",
+                    message=(
+                        "A linked QR check-in does not match this employee, Site, "
+                        "and arrival time."
+                    ),
+                    visit=visit,
+                    occurred_at=visit["arrival_time"],
+                )
+            )
+            continue
+
+        arrival = {
+            "visit": visit,
+            "start_second": arrival_second,
+            "location_id": int(visit["location_id"]),
+            "job_id": (
+                int(visit["job_id"]) if visit.get("job_id") is not None else None
+            ),
+        }
+        valid_arrivals.append(arrival)
+        departure = departures_by_visit.get(int(visit["id"]))
+        if departure is None:
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="missing_departure",
+                    message="An explicit arrival has no paired departure.",
+                    visit=visit,
+                    occurred_at=visit["arrival_time"],
+                )
+            )
+            continue
+
+        departure_second = _epoch_second(departure["departure_time"])
+        if not (arrival_second < departure_second <= shift_end):
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="invalid_departure_order",
+                    message="A paired departure is not after its arrival inside the shift.",
+                    visit=visit,
+                    departure=departure,
+                    occurred_at=departure["departure_time"],
+                )
+            )
+            continue
+        if (
+            departure.get("location_id") is None
+            or int(departure["location_id"]) != int(visit["location_id"])
+        ):
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="departure_site_mismatch",
+                    message="A paired departure does not match its arrival Site.",
+                    visit=visit,
+                    departure=departure,
+                    occurred_at=departure["departure_time"],
+                )
+            )
+            continue
+        pair_candidates.append(
+            {
+                **arrival,
+                "departure": departure,
+                "end_second": departure_second,
+            }
+        )
+
+    valid_arrivals.sort(
+        key=lambda row: (row["start_second"], int(row["visit"]["id"]))
+    )
+    pair_candidates.sort(
+        key=lambda row: (
+            row["start_second"],
+            row["end_second"],
+            int(row["visit"]["id"]),
+        )
+    )
+
+    arrival_evidence_by_second: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for visit in visits:
+        arrival_second = _epoch_second(visit["arrival_time"])
+        if (
+            shift_start <= arrival_second < shift_end
+            and visit.get("location_id") is not None
+        ):
+            arrival_evidence_by_second[arrival_second].append(visit)
+    simultaneous_conflict_ids: set[int] = set()
+    for simultaneous_arrivals in arrival_evidence_by_second.values():
+        evidence_targets = {
+            (int(visit["location_id"]), visit.get("job_id"))
+            for visit in simultaneous_arrivals
+        }
+        if len(evidence_targets) <= 1:
+            continue
+        simultaneous_conflict_ids.update(
+            int(visit["id"]) for visit in simultaneous_arrivals
+        )
+        for visit in simultaneous_arrivals:
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="simultaneous_arrival_conflict",
+                    message=(
+                        "Simultaneous arrivals point to different Sites or service "
+                        "occurrences."
+                    ),
+                    visit=visit,
+                    occurred_at=visit["arrival_time"],
+                )
+            )
+
+    conflicted_visit_ids: set[int] = set(simultaneous_conflict_ids)
+    for index, left in enumerate(pair_candidates):
+        for right in pair_candidates[index + 1 :]:
+            if right["start_second"] >= left["end_second"]:
+                break
+            if (
+                left["start_second"] < right["end_second"]
+                and right["start_second"] < left["end_second"]
+            ):
+                conflicted_visit_ids.update(
+                    (int(left["visit"]["id"]), int(right["visit"]["id"]))
+                )
+    all_arrivals = [
+        (int(visit["id"]), _epoch_second(visit["arrival_time"])) for visit in visits
+    ]
+    for candidate in pair_candidates:
+        candidate_visit_id = int(candidate["visit"]["id"])
+        contains_other_arrival = any(
+            visit_id != candidate_visit_id
+            and candidate["start_second"]
+            <= arrival_second
+            < candidate["end_second"]
+            for visit_id, arrival_second in all_arrivals
+        )
+        contains_other_departure = any(
+            int(departure["id"]) != int(candidate["departure"]["id"])
+            and candidate["start_second"]
+            < _epoch_second(departure["departure_time"])
+            <= candidate["end_second"]
+            for departure in departures
+        )
+        if contains_other_arrival or contains_other_departure:
+            conflicted_visit_ids.add(candidate_visit_id)
+
+    if conflicted_visit_ids:
+        for candidate in pair_candidates:
+            if int(candidate["visit"]["id"]) not in conflicted_visit_ids:
+                continue
+            review_items.append(
+                _utilization_review_item(
+                    shift,
+                    code="overlapping_site_evidence",
+                    message="Overlapping Site events cannot be classified safely.",
+                    visit=candidate["visit"],
+                    departure=candidate["departure"],
+                    occurred_at=candidate["visit"]["arrival_time"],
+                )
+            )
+
+    usable_pairs = [
+        candidate
+        for candidate in pair_candidates
+        if int(candidate["visit"]["id"]) not in conflicted_visit_ids
+    ]
+    usable_arrivals = [
+        arrival
+        for arrival in valid_arrivals
+        if int(arrival["visit"]["id"]) not in simultaneous_conflict_ids
+    ]
+    claims: List[Dict[str, Any]] = []
+    for candidate in usable_pairs:
+        claims.append(
+            _utilization_segment(
+                shift,
+                category="on_site",
+                start_second=candidate["start_second"],
+                end_second=candidate["end_second"],
+                location_id=candidate["location_id"],
+                location_label=str(candidate["visit"].get("location_label") or ""),
+                job_id=candidate["job_id"],
+                visit_id=int(candidate["visit"]["id"]),
+                departure_id=int(candidate["departure"]["id"]),
+                evidence=["visit_v2", "paired_departure"],
+            )
+        )
+
+    all_event_seconds = [
+        _epoch_second(visit["arrival_time"]) for visit in visits
+    ] + [_epoch_second(departure["departure_time"]) for departure in departures]
+    for candidate in usable_pairs:
+        departure_second = candidate["end_second"]
+        next_arrival = next(
+            (
+                arrival
+                for arrival in usable_arrivals
+                if int(arrival["visit"]["id"]) != int(candidate["visit"]["id"])
+                and arrival["start_second"] >= departure_second
+            ),
+            None,
+        )
+        if next_arrival is None or next_arrival["start_second"] <= departure_second:
+            continue
+        if next_arrival["location_id"] == candidate["location_id"]:
+            continue
+        if any(
+            departure_second < event_second < next_arrival["start_second"]
+            for event_second in all_event_seconds
+        ):
+            continue
+        if any(
+            _epoch_second(departure["departure_time"])
+            == next_arrival["start_second"]
+            for departure in departures
+        ):
+            continue
+        claims.append(
+            _utilization_segment(
+                shift,
+                category="travel",
+                start_second=departure_second,
+                end_second=next_arrival["start_second"],
+                from_location_id=candidate["location_id"],
+                to_location_id=next_arrival["location_id"],
+                from_job_id=candidate["job_id"],
+                to_job_id=next_arrival["job_id"],
+                visit_id=int(next_arrival["visit"]["id"]),
+                departure_id=int(candidate["departure"]["id"]),
+                evidence=["paired_departure", "next_visit_v2"],
+            )
+        )
+
+    claims.sort(
+        key=lambda row: (
+            row["start_second"],
+            row["end_second"],
+            row["category"],
+            row.get("visit_id") or 0,
+        )
+    )
+    overlapping_claim_indexes: set[int] = set()
+    for index, left in enumerate(claims):
+        for right_index in range(index + 1, len(claims)):
+            right = claims[right_index]
+            if right["start_second"] >= left["end_second"]:
+                break
+            overlapping_claim_indexes.update((index, right_index))
+    if overlapping_claim_indexes:
+        review_items.append(
+            _utilization_review_item(
+                shift,
+                code="classification_overlap",
+                message="Contradictory events produced overlapping measured intervals.",
+                occurred_at=shift["clock_in"],
+            )
+        )
+        claims = [
+            claim
+            for index, claim in enumerate(claims)
+            if index not in overlapping_claim_indexes
+        ]
+
+    issue_codes = {item["code"] for item in review_items}
+    output: List[Dict[str, Any]] = []
+    cursor = shift_start
+    for claim in claims:
+        if claim["start_second"] > cursor:
+            output.append(
+                _utilization_segment(
+                    shift,
+                    category="unclassified",
+                    start_second=cursor,
+                    end_second=claim["start_second"],
+                    evidence=["paid_shift"],
+                    review_codes=issue_codes,
+                )
+            )
+        output.append(claim)
+        cursor = max(cursor, claim["end_second"])
+    if cursor < shift_end:
+        output.append(
+            _utilization_segment(
+                shift,
+                category="unclassified",
+                start_second=cursor,
+                end_second=shift_end,
+                evidence=["paid_shift"],
+                review_codes=issue_codes,
+            )
+        )
+    return output, review_items
+
+
+def _split_utilization_segment(
+    segment: Dict[str, Any],
+    *,
+    range_start: datetime,
+    range_end: datetime,
+    app_timezone: ZoneInfo,
+) -> List[Dict[str, Any]]:
+    range_start_second = _epoch_second(range_start)
+    range_end_second = _epoch_second(range_end)
+    cursor = max(int(segment["start_second"]), range_start_second)
+    clipped_end = min(int(segment["end_second"]), range_end_second)
+    output: List[Dict[str, Any]] = []
+    while cursor < clipped_end:
+        local_day = _second_datetime(cursor).astimezone(app_timezone).date()
+        next_midnight = datetime.combine(
+            local_day + timedelta(days=1),
+            time.min,
+            tzinfo=app_timezone,
+        ).astimezone(timezone.utc)
+        piece_end = min(clipped_end, _epoch_second(next_midnight))
+        output.append(
+            {
+                **segment,
+                "date": local_day,
+                "start_second": cursor,
+                "end_second": piece_end,
+            }
+        )
+        cursor = piece_end
+    return output
+
+
+def _collapse_overlapping_paid_segments(
+    segments: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Count overlapping paid records once and keep the overlap unclassified."""
+
+    grouped: Dict[Tuple[int, date], List[Dict[str, Any]]] = defaultdict(list)
+    for segment in segments:
+        grouped[(int(segment["employee_id"]), segment["date"])].append(segment)
+
+    output: List[Dict[str, Any]] = []
+    for group in grouped.values():
+        boundaries = sorted(
+            {
+                int(segment[boundary])
+                for segment in group
+                for boundary in ("start_second", "end_second")
+            }
+        )
+        pieces: List[Dict[str, Any]] = []
+        for start_second, end_second in zip(boundaries, boundaries[1:]):
+            covering = [
+                segment
+                for segment in group
+                if int(segment["start_second"]) <= start_second
+                and int(segment["end_second"]) >= end_second
+            ]
+            if not covering:
+                continue
+            shift_ids = sorted({int(segment["shift_id"]) for segment in covering})
+            if len(covering) == 1:
+                piece = {
+                    **covering[0],
+                    "start_second": start_second,
+                    "end_second": end_second,
+                }
+            else:
+                review_codes = {
+                    code
+                    for segment in covering
+                    for code in segment.get("review_codes") or ()
+                }
+                review_codes.add("overlapping_paid_shifts")
+                piece = {
+                    **covering[0],
+                    "shift_id": shift_ids[0],
+                    "related_shift_ids": shift_ids,
+                    "category": "unclassified",
+                    "category_detail": None,
+                    "start_second": start_second,
+                    "end_second": end_second,
+                    "location_id": None,
+                    "location_label": "",
+                    "job_id": None,
+                    "visit_id": None,
+                    "departure_id": None,
+                    "from_location_id": None,
+                    "to_location_id": None,
+                    "from_job_id": None,
+                    "to_job_id": None,
+                    "evidence": ["overlapping_paid_shifts"],
+                    "review_codes": sorted(review_codes),
+                }
+            if (
+                pieces
+                and pieces[-1]["end_second"] == piece["start_second"]
+                and {
+                    key: value
+                    for key, value in pieces[-1].items()
+                    if key not in {"start_second", "end_second"}
+                }
+                == {
+                    key: value
+                    for key, value in piece.items()
+                    if key not in {"start_second", "end_second"}
+                }
+            ):
+                pieces[-1]["end_second"] = piece["end_second"]
+            else:
+                pieces.append(piece)
+        output.extend(pieces)
+
+    overlap_segments = [
+        segment
+        for segment in output
+        if "overlapping_paid_shifts" in segment.get("review_codes", [])
+    ]
+    review_items = [
+        {
+            "shiftId": int(segment["shift_id"]),
+            "relatedShiftIds": list(segment["related_shift_ids"]),
+            "employeeId": int(segment["employee_id"]),
+            "employeeName": str(segment["employee_name"]),
+            "code": "overlapping_paid_shifts",
+            "message": "Overlapping paid shifts were counted once and left unclassified.",
+            "visitId": None,
+            "departureId": None,
+            "occurredAt": _second_datetime(int(segment["start_second"])),
+        }
+        for segment in overlap_segments
+    ]
+    return output, review_items
+
+
+def _allocate_utilization_minutes(segments: List[Dict[str, Any]]) -> None:
+    """Allocate whole display minutes without breaking exact reconciliation."""
+
+    if not segments:
+        return
+    durations = [
+        int(segment["end_second"]) - int(segment["start_second"])
+        for segment in segments
+    ]
+    total_minutes = (sum(durations) + 30) // 60
+    allocated = [duration // 60 for duration in durations]
+    remainder_count = total_minutes - sum(allocated)
+    order = sorted(
+        range(len(segments)),
+        key=lambda index: (
+            -(durations[index] % 60),
+            int(segments[index]["start_second"]),
+            int(segments[index]["end_second"]),
+            int(segments[index]["shift_id"]),
+            str(segments[index]["category"]),
+        ),
+    )
+    for index in order[:remainder_count]:
+        allocated[index] += 1
+    for segment, duration, minutes in zip(segments, durations, allocated):
+        segment["duration_seconds"] = duration
+        segment["duration_minutes"] = minutes
+
+
+def _utilization_totals(segments: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = list(segments)
+    paid_seconds = sum(int(row["duration_seconds"]) for row in rows)
+    paid_minutes = sum(int(row["duration_minutes"]) for row in rows)
+    seconds_by_category = {
+        category: sum(
+            int(row["duration_seconds"])
+            for row in rows
+            if row["category"] == category
+        )
+        for category in UTILIZATION_CATEGORIES
+    }
+    minutes_by_category = {
+        category: sum(
+            int(row["duration_minutes"])
+            for row in rows
+            if row["category"] == category
+        )
+        for category in UTILIZATION_CATEGORIES
+    }
+    return {
+        "paidSeconds": paid_seconds,
+        "onSiteSeconds": seconds_by_category["on_site"],
+        "travelSeconds": seconds_by_category["travel"],
+        "categorizedSeconds": seconds_by_category["categorized"],
+        "unclassifiedSeconds": seconds_by_category["unclassified"],
+        "paidMinutes": paid_minutes,
+        "onSiteMinutes": minutes_by_category["on_site"],
+        "travelMinutes": minutes_by_category["travel"],
+        "categorizedMinutes": minutes_by_category["categorized"],
+        "unclassifiedMinutes": minutes_by_category["unclassified"],
+        "reconciles": (
+            paid_seconds == sum(seconds_by_category.values())
+            and paid_minutes == sum(minutes_by_category.values())
+        ),
+    }
+
+
+def _serialize_utilization_interval(segment: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "shiftId": int(segment["shift_id"]),
+        "relatedShiftIds": list(
+            segment.get("related_shift_ids") or [int(segment["shift_id"])]
+        ),
+        "category": segment["category"],
+        "categoryDetail": segment.get("category_detail"),
+        "intervalStart": _utc_iso(_second_datetime(segment["start_second"])),
+        "intervalEnd": _utc_iso(_second_datetime(segment["end_second"])),
+        "durationSeconds": int(segment["duration_seconds"]),
+        "durationMinutes": int(segment["duration_minutes"]),
+        "locationId": segment.get("location_id"),
+        "locationLabel": segment.get("location_label") or "",
+        "jobId": segment.get("job_id"),
+        "visitId": segment.get("visit_id"),
+        "departureId": segment.get("departure_id"),
+        "fromLocationId": segment.get("from_location_id"),
+        "toLocationId": segment.get("to_location_id"),
+        "fromJobId": segment.get("from_job_id"),
+        "toJobId": segment.get("to_job_id"),
+        "evidence": list(segment.get("evidence") or []),
+        "reviewCodes": list(segment.get("review_codes") or []),
+    }
+
+
+def _utilization_rows(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[int, date], List[Dict[str, Any]]] = defaultdict(list)
+    for segment in segments:
+        grouped[(int(segment["employee_id"]), segment["date"])].append(segment)
+
+    rows: List[Dict[str, Any]] = []
+    for (employee_id, local_day), group in grouped.items():
+        ordered = sorted(
+            group,
+            key=lambda row: (
+                int(row["start_second"]),
+                int(row["end_second"]),
+                int(row["shift_id"]),
+                str(row["category"]),
+            ),
+        )
+        _allocate_utilization_minutes(ordered)
+        rows.append(
+            {
+                "employeeId": employee_id,
+                "employeeName": str(ordered[0]["employee_name"]),
+                "date": str(local_day),
+                **_utilization_totals(ordered),
+                "intervals": [
+                    _serialize_utilization_interval(segment) for segment in ordered
+                ],
+            }
+        )
+    return sorted(
+        rows,
+        key=lambda row: (
+            row["date"],
+            row["employeeName"].casefold(),
+            row["employeeId"],
+        ),
+    )
+
+
+def _serialize_utilization_review_item(
+    item: Dict[str, Any],
+    app_timezone: ZoneInfo,
+) -> Dict[str, Any]:
+    occurred_at = item.get("occurredAt")
+    return {
+        **{key: value for key, value in item.items() if key != "occurredAt"},
+        "date": (
+            str(occurred_at.astimezone(app_timezone).date())
+            if occurred_at is not None
+            else None
+        ),
+        "occurredAt": _utc_iso(occurred_at),
+    }
 
 
 def _qr_only_presence_segments(
@@ -1705,6 +2636,98 @@ def build_operations_schedule_router(
             },
             "jobs": schedule_jobs,
             "unmatchedActualSegments": unmatched,
+        }
+
+    @router.get("/api/admin/operations/utilization")
+    def operations_utilization(
+        start_date: Optional[date] = Query(default=None),
+        end_date: Optional[date] = Query(default=None),
+        _: Dict[str, Any] = Depends(get_current_admin),
+    ) -> Dict[str, Any]:
+        observed_at = now_provider().astimezone(timezone.utc)
+        local_today = observed_at.astimezone(app_timezone).date()
+        resolved_start = start_date or _sunday_for(local_today)
+        resolved_end = end_date or (resolved_start + timedelta(days=6))
+        if resolved_end < resolved_start:
+            raise HTTPException(
+                status_code=400,
+                detail="end_date must be on or after start_date",
+            )
+
+        range_start, range_end = _local_bounds(
+            resolved_start,
+            resolved_end,
+            app_timezone,
+        )
+        shifts, visits, departures = _load_utilization_evidence(
+            range_start,
+            range_end,
+            observed_at,
+        )
+        segments: List[Dict[str, Any]] = []
+        review_items: List[Dict[str, Any]] = []
+        finalized_shift_ids: set[int] = set()
+        open_shift_ids: set[int] = set()
+        for shift in shifts:
+            shift_id = int(shift["id"])
+            if shift.get("clock_out") is None:
+                open_shift_ids.add(shift_id)
+            else:
+                finalized_shift_ids.add(shift_id)
+            shift_segments, shift_review_items = _closed_shift_utilization(
+                shift,
+                visits.get(shift_id, []),
+                departures.get(shift_id, []),
+            )
+            review_items.extend(shift_review_items)
+            for segment in shift_segments:
+                segments.extend(
+                    _split_utilization_segment(
+                        segment,
+                        range_start=range_start,
+                        range_end=range_end,
+                        app_timezone=app_timezone,
+                    )
+                )
+
+        segments, overlap_review_items = _collapse_overlapping_paid_segments(segments)
+        review_items.extend(overlap_review_items)
+        rows = _utilization_rows(segments)
+        summary = _utilization_totals(segments)
+        overlapping_shift_ids = {
+            shift_id
+            for item in overlap_review_items
+            for shift_id in item["relatedShiftIds"]
+        }
+        summary.update(
+            {
+                "finalizedShiftCount": len(finalized_shift_ids),
+                "openShiftCount": len(open_shift_ids),
+                "overlappingShiftCount": len(overlapping_shift_ids),
+                "reviewItemCount": len(review_items),
+            }
+        )
+        ordered_review_items = sorted(
+            review_items,
+            key=lambda item: (
+                item.get("occurredAt") or datetime.min.replace(tzinfo=timezone.utc),
+                int(item["employeeId"]),
+                int(item["shiftId"]),
+                str(item["code"]),
+            ),
+        )
+        return {
+            "success": True,
+            "timezone": timezone_name,
+            "observedAt": _utc_iso(observed_at),
+            "startDate": str(resolved_start),
+            "endDate": str(resolved_end),
+            "summary": summary,
+            "rows": rows,
+            "reviewItems": [
+                _serialize_utilization_review_item(item, app_timezone)
+                for item in ordered_review_items
+            ],
         }
 
     @router.get("/api/admin/operations/forecast")
