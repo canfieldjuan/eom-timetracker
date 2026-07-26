@@ -69,6 +69,7 @@ EMPLOYEE_ROLE = "employee"
 PAYROLL_ROLE = "payroll"
 EMPLOYEE_ROLES = (ADMIN_ROLE, EMPLOYEE_ROLE, PAYROLL_ROLE)
 PAYROLL_READ_ROLES = {ADMIN_ROLE, PAYROLL_ROLE}
+PAYROLL_VERIFICATION_LOCK_PREFIX = "eom_payroll_verification_week_v1"
 EMPLOYEE_WRITE_LOCK = threading.Lock()
 TIMESHEET_WRITE_LOCK = threading.Lock()
 TIMESHEET_PG_ADVISORY_LOCK_ID = 5_107_202_064
@@ -2386,6 +2387,34 @@ class TimeDataCorrectionApplyRequest(TimeDataCorrectionPlanRequest):
     confirmation: str = Field(min_length=1, max_length=100)
 
 
+class PayrollWeekRequest(BaseModel):
+    weekStart: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+    @field_validator("weekStart", mode="before")
+    @classmethod
+    def strip_week_start(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
+class PayrollVerificationRequest(PayrollWeekRequest):
+    sourceFingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    reason: str = Field(default="", max_length=500)
+
+    @field_validator("sourceFingerprint", "reason", mode="before")
+    @classmethod
+    def strip_verification_text(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
+class PayrollReopenRequest(PayrollWeekRequest):
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reopen_reason(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class JobCreateRequest(BaseModel):
     customerName: str = Field(min_length=1)
     scheduledDate: str  # YYYY-MM-DD
@@ -4033,6 +4062,61 @@ def _ensure_schema_migrations() -> None:
         "CREATE INDEX IF NOT EXISTS idx_time_data_correction_batches_created "
         "ON time_data_correction_batches(created_at)"
     )
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS payroll_verification_batches (
+            id                      BIGSERIAL PRIMARY KEY,
+            week_start              DATE NOT NULL UNIQUE,
+            week_end                DATE NOT NULL,
+            timezone                TEXT NOT NULL,
+            status                  VARCHAR(16) NOT NULL DEFAULT 'verified'
+                                        CHECK (status IN ('verified', 'reopened', 'finalized')),
+            source_fingerprint      VARCHAR(64) NOT NULL
+                                        CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+            snapshot                JSONB NOT NULL,
+            verified_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            verified_by_name        TEXT NOT NULL,
+            verified_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            reopened_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            reopened_by_name        TEXT,
+            reopened_reason         TEXT,
+            reopened_at             TIMESTAMPTZ,
+            finalized_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            finalized_by_name       TEXT,
+            finalized_at            TIMESTAMPTZ,
+            created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (week_end = week_start + 6)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS payroll_verification_events (
+            id                 BIGSERIAL PRIMARY KEY,
+            batch_id           BIGINT NOT NULL REFERENCES payroll_verification_batches(id) ON DELETE CASCADE,
+            week_start         DATE NOT NULL,
+            action             VARCHAR(16) NOT NULL
+                                   CHECK (action IN ('verify', 'reopen', 'finalize')),
+            actor_employee_id  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            actor_name         TEXT NOT NULL,
+            reason             TEXT NOT NULL DEFAULT '',
+            source_fingerprint VARCHAR(64) NOT NULL
+                                   CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+            before_state       JSONB,
+            after_state        JSONB NOT NULL,
+            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payroll_verification_batches_status_week
+        ON payroll_verification_batches(status, week_start)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payroll_verification_events_week
+        ON payroll_verification_events(week_start, created_at)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payroll_verification_events_batch
+        ON payroll_verification_events(batch_id, created_at)
+    """)
 
     # Seed threshold defaults if not already in settings
     for key, default_val in _SETTINGS_DEFAULTS.items():
@@ -10999,19 +11083,36 @@ def _payroll_source_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _compute_payroll_weekly_hours(week_start_text: Optional[str]) -> Dict[str, Any]:
+def _payroll_query_all(
+    sql: str,
+    params: tuple = (),
+    *,
+    cursor: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    if cursor is None:
+        return db.query_all(sql, params)
+    cursor.execute(sql, params)
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def _compute_payroll_weekly_hours(
+    week_start_text: Optional[str],
+    *,
+    cursor: Optional[Any] = None,
+) -> Dict[str, Any]:
     week_start = _parse_payroll_week_start(week_start_text)
     week_end, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
     now_utc = utc_now()
 
-    employee_rows = db.query_all(
+    employee_rows = _payroll_query_all(
         """
         SELECT id, name, active
         FROM employees
         ORDER BY LOWER(name), id
-        """
+        """,
+        cursor=cursor,
     )
-    shift_rows = db.query_all(
+    shift_rows = _payroll_query_all(
         """
         SELECT id, employee_id, clock_in, clock_out
         FROM shifts
@@ -11037,6 +11138,7 @@ def _compute_payroll_weekly_hours(week_start_text: Optional[str]) -> Dict[str, A
             week_start_utc,
             week_end_utc,
         ),
+        cursor=cursor,
     )
 
     employee_lookup = {int(row["id"]): row for row in employee_rows}
@@ -11151,6 +11253,227 @@ def _compute_payroll_weekly_hours(week_start_text: Optional[str]) -> Dict[str, A
     }
 
 
+def _lock_payroll_verification_week(cur: Any, week_start: date) -> None:
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (f"{PAYROLL_VERIFICATION_LOCK_PREFIX}:{week_start.isoformat()}",),
+    )
+
+
+def _lock_payroll_source_rows(cur: Any) -> None:
+    cur.execute("LOCK TABLE employees, shifts IN SHARE MODE")
+
+
+def _get_payroll_verification_batch(
+    cur: Any,
+    week_start: date,
+    *,
+    lock: bool = False,
+) -> Optional[Dict[str, Any]]:
+    lock_clause = " FOR UPDATE" if lock else ""
+    cur.execute(
+        f"""
+        SELECT *
+        FROM payroll_verification_batches
+        WHERE week_start = %s
+        {lock_clause}
+        """,
+        (week_start,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _payroll_verification_iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return to_utc_iso(value)
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
+
+def _payroll_verification_state(
+    row: Optional[Dict[str, Any]],
+    *,
+    current_source_fingerprint: Optional[str] = None,
+) -> Dict[str, Any]:
+    if row is None:
+        return {
+            "status": "unverified",
+            "batchId": None,
+            "sourceFingerprint": None,
+            "stale": False,
+            "verifiedAt": None,
+            "verifiedByName": None,
+            "reopenedAt": None,
+            "reopenedByName": None,
+            "reopenedReason": None,
+            "finalizedAt": None,
+            "finalizedByName": None,
+        }
+
+    source_fingerprint = str(row["source_fingerprint"])
+    stale = (
+        current_source_fingerprint is not None
+        and not hmac.compare_digest(source_fingerprint, current_source_fingerprint)
+    )
+    return {
+        "status": str(row["status"]),
+        "batchId": int(row["id"]),
+        "sourceFingerprint": source_fingerprint,
+        "stale": stale,
+        "verifiedAt": _payroll_verification_iso(row.get("verified_at")),
+        "verifiedByName": str(row["verified_by_name"]),
+        "reopenedAt": _payroll_verification_iso(row.get("reopened_at")),
+        "reopenedByName": (
+            str(row["reopened_by_name"])
+            if row.get("reopened_by_name") is not None
+            else None
+        ),
+        "reopenedReason": row.get("reopened_reason"),
+        "finalizedAt": _payroll_verification_iso(row.get("finalized_at")),
+        "finalizedByName": (
+            str(row["finalized_by_name"])
+            if row.get("finalized_by_name") is not None
+            else None
+        ),
+    }
+
+
+def _insert_payroll_verification_event(
+    cur: Any,
+    *,
+    batch_row: Dict[str, Any],
+    action: str,
+    actor: Dict[str, Any],
+    reason: str,
+    before_state: Optional[Dict[str, Any]],
+    after_state: Dict[str, Any],
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO payroll_verification_events (
+            batch_id,
+            week_start,
+            action,
+            actor_employee_id,
+            actor_name,
+            reason,
+            source_fingerprint,
+            before_state,
+            after_state
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+        """,
+        (
+            int(batch_row["id"]),
+            batch_row["week_start"],
+            action,
+            int(actor["id"]),
+            str(actor["name"]),
+            reason.strip(),
+            str(batch_row["source_fingerprint"]),
+            json.dumps(before_state, sort_keys=True) if before_state is not None else None,
+            json.dumps(after_state, sort_keys=True),
+        ),
+    )
+
+
+def _insert_payroll_verification_batch(
+    cur: Any,
+    *,
+    data: Dict[str, Any],
+    actor: Dict[str, Any],
+) -> Dict[str, Any]:
+    cur.execute(
+        """
+        INSERT INTO payroll_verification_batches (
+            week_start,
+            week_end,
+            timezone,
+            status,
+            source_fingerprint,
+            snapshot,
+            verified_by_employee_id,
+            verified_by_name
+        )
+        VALUES (%s, %s, %s, 'verified', %s, %s::jsonb, %s, %s)
+        RETURNING *
+        """,
+        (
+            data["weekStart"],
+            data["weekEnd"],
+            data["timezone"],
+            data["sourceFingerprint"],
+            json.dumps(data, sort_keys=True),
+            int(actor["id"]),
+            str(actor["name"]),
+        ),
+    )
+    return dict(cur.fetchone())
+
+
+def _update_payroll_verification_batch(
+    cur: Any,
+    *,
+    batch_id: int,
+    data: Dict[str, Any],
+    actor: Dict[str, Any],
+) -> Dict[str, Any]:
+    cur.execute(
+        """
+        UPDATE payroll_verification_batches
+        SET
+            week_end = %s,
+            timezone = %s,
+            status = 'verified',
+            source_fingerprint = %s,
+            snapshot = %s::jsonb,
+            verified_by_employee_id = %s,
+            verified_by_name = %s,
+            verified_at = NOW(),
+            finalized_by_employee_id = NULL,
+            finalized_by_name = NULL,
+            finalized_at = NULL,
+            updated_at = NOW()
+        WHERE id = %s
+        RETURNING *
+        """,
+        (
+            data["weekEnd"],
+            data["timezone"],
+            data["sourceFingerprint"],
+            json.dumps(data, sort_keys=True),
+            int(actor["id"]),
+            str(actor["name"]),
+            batch_id,
+        ),
+    )
+    return dict(cur.fetchone())
+
+
+def _ensure_payroll_snapshot_current(
+    payload_fingerprint: str,
+    data: Dict[str, Any],
+    action: str,
+) -> None:
+    if not hmac.compare_digest(payload_fingerprint, data["sourceFingerprint"]):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Payroll weekly hours changed; refresh before {action}",
+        )
+
+
+def _ensure_payroll_snapshot_has_no_blocking_issues(data: Dict[str, Any], action: str) -> None:
+    if data["summary"]["hasBlockingIssues"]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Resolve payroll hour issues before {action}",
+        )
+
+
 def _payroll_week_start_query(
     request: Request,
     week_start: Optional[str],
@@ -11172,6 +11495,288 @@ def admin_payroll_weekly_hours(
         f"week={data['weekStart']} employees={data['summary']['employeeCount']} issues={data['summary']['issueCount']}",
     )
     return data
+
+
+@app.get("/api/admin/payroll/weekly-hours/verification")
+def admin_payroll_weekly_hours_verification(
+    request: Request,
+    week_start: Optional[str] = Query(default=None, alias="weekStart"),
+    _: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    data = _compute_payroll_weekly_hours(_payroll_week_start_query(request, week_start))
+    row = db.query_one(
+        """
+        SELECT *
+        FROM payroll_verification_batches
+        WHERE week_start = %s
+        """,
+        (_parse_payroll_week_start(data["weekStart"]),),
+    )
+    append_access_log(
+        request,
+        "PAYROLL_WEEKLY_HOURS_VERIFICATION",
+        True,
+        f"week={data['weekStart']} status={row['status'] if row else 'unverified'}",
+    )
+    return {
+        "success": True,
+        "weekStart": data["weekStart"],
+        "weekEnd": data["weekEnd"],
+        "timezone": data["timezone"],
+        "currentSourceFingerprint": data["sourceFingerprint"],
+        "summary": data["summary"],
+        "verification": _payroll_verification_state(
+            row,
+            current_source_fingerprint=data["sourceFingerprint"],
+        ),
+    }
+
+
+@app.post("/api/admin/payroll/weekly-hours/verify")
+def admin_verify_payroll_weekly_hours(
+    payload: PayrollVerificationRequest,
+    request: Request,
+    current_payroll: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    week_start = _parse_payroll_week_start(payload.weekStart)
+    result: Dict[str, Any]
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_payroll_verification_week(cur, week_start)
+            _lock_payroll_source_rows(cur)
+            data = _compute_payroll_weekly_hours(week_start.isoformat(), cursor=cur)
+            _ensure_payroll_snapshot_current(payload.sourceFingerprint, data, "verifying")
+            _ensure_payroll_snapshot_has_no_blocking_issues(data, "verifying this week")
+            row = _get_payroll_verification_batch(cur, week_start, lock=True)
+            if row and row["status"] == "finalized":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Finalized payroll weeks must be reopened before verifying again",
+                )
+            if row and row["status"] == "verified":
+                if hmac.compare_digest(str(row["source_fingerprint"]), data["sourceFingerprint"]):
+                    result = {
+                        "success": True,
+                        "action": "verify",
+                        "idempotent": True,
+                        "weeklyHours": data,
+                        "verification": _payroll_verification_state(
+                            row,
+                            current_source_fingerprint=data["sourceFingerprint"],
+                        ),
+                    }
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Payroll week is already verified from a different source; reopen before verifying again",
+                    )
+            else:
+                before_state = _payroll_verification_state(row) if row else None
+                if row is None:
+                    saved = _insert_payroll_verification_batch(
+                        cur,
+                        data=data,
+                        actor=current_payroll,
+                    )
+                else:
+                    saved = _update_payroll_verification_batch(
+                        cur,
+                        batch_id=int(row["id"]),
+                        data=data,
+                        actor=current_payroll,
+                    )
+                after_state = _payroll_verification_state(
+                    saved,
+                    current_source_fingerprint=data["sourceFingerprint"],
+                )
+                _insert_payroll_verification_event(
+                    cur,
+                    batch_row=saved,
+                    action="verify",
+                    actor=current_payroll,
+                    reason=payload.reason,
+                    before_state=before_state,
+                    after_state=after_state,
+                )
+                result = {
+                    "success": True,
+                    "action": "verify",
+                    "idempotent": False,
+                    "weeklyHours": data,
+                    "verification": after_state,
+                }
+
+    append_access_log(
+        request,
+        "PAYROLL_WEEKLY_HOURS_VERIFY",
+        True,
+        f"week={week_start.isoformat()} batch={result['verification']['batchId']} idempotent={result['idempotent']}",
+    )
+    return result
+
+
+@app.post("/api/admin/payroll/weekly-hours/reopen")
+def admin_reopen_payroll_weekly_hours(
+    payload: PayrollReopenRequest,
+    request: Request,
+    current_payroll: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    week_start = _parse_payroll_week_start(payload.weekStart)
+    reason = payload.reason.strip()
+    result: Dict[str, Any]
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_payroll_verification_week(cur, week_start)
+            row = _get_payroll_verification_batch(cur, week_start, lock=True)
+            if row is None:
+                raise HTTPException(status_code=404, detail="Payroll week has not been verified")
+            if row["status"] == "reopened":
+                result = {
+                    "success": True,
+                    "action": "reopen",
+                    "idempotent": True,
+                    "verification": _payroll_verification_state(row),
+                }
+            else:
+                before_state = _payroll_verification_state(row)
+                cur.execute(
+                    """
+                    UPDATE payroll_verification_batches
+                    SET
+                        status = 'reopened',
+                        reopened_by_employee_id = %s,
+                        reopened_by_name = %s,
+                        reopened_reason = %s,
+                        reopened_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (
+                        int(current_payroll["id"]),
+                        str(current_payroll["name"]),
+                        reason,
+                        int(row["id"]),
+                    ),
+                )
+                saved = dict(cur.fetchone())
+                after_state = _payroll_verification_state(saved)
+                _insert_payroll_verification_event(
+                    cur,
+                    batch_row=saved,
+                    action="reopen",
+                    actor=current_payroll,
+                    reason=reason,
+                    before_state=before_state,
+                    after_state=after_state,
+                )
+                result = {
+                    "success": True,
+                    "action": "reopen",
+                    "idempotent": False,
+                    "verification": after_state,
+                }
+
+    append_access_log(
+        request,
+        "PAYROLL_WEEKLY_HOURS_REOPEN",
+        True,
+        f"week={week_start.isoformat()} batch={result['verification']['batchId']} idempotent={result['idempotent']}",
+    )
+    return result
+
+
+@app.post("/api/admin/payroll/weekly-hours/finalize")
+def admin_finalize_payroll_weekly_hours(
+    payload: PayrollVerificationRequest,
+    request: Request,
+    current_payroll: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    week_start = _parse_payroll_week_start(payload.weekStart)
+    result: Dict[str, Any]
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_payroll_verification_week(cur, week_start)
+            _lock_payroll_source_rows(cur)
+            data = _compute_payroll_weekly_hours(week_start.isoformat(), cursor=cur)
+            _ensure_payroll_snapshot_current(payload.sourceFingerprint, data, "finalizing")
+            _ensure_payroll_snapshot_has_no_blocking_issues(data, "finalizing this week")
+            row = _get_payroll_verification_batch(cur, week_start, lock=True)
+            if row is None:
+                raise HTTPException(status_code=409, detail="Verify the payroll week before finalizing")
+            if row["status"] == "finalized":
+                if hmac.compare_digest(str(row["source_fingerprint"]), data["sourceFingerprint"]):
+                    result = {
+                        "success": True,
+                        "action": "finalize",
+                        "idempotent": True,
+                        "weeklyHours": data,
+                        "verification": _payroll_verification_state(
+                            row,
+                            current_source_fingerprint=data["sourceFingerprint"],
+                        ),
+                    }
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Finalized payroll week is stale; reopen before finalizing again",
+                    )
+            elif row["status"] != "verified":
+                raise HTTPException(status_code=409, detail="Verify the payroll week before finalizing")
+            elif not hmac.compare_digest(str(row["source_fingerprint"]), data["sourceFingerprint"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Verified payroll week is stale; reopen and verify again before finalizing",
+                )
+            else:
+                before_state = _payroll_verification_state(row)
+                cur.execute(
+                    """
+                    UPDATE payroll_verification_batches
+                    SET
+                        status = 'finalized',
+                        finalized_by_employee_id = %s,
+                        finalized_by_name = %s,
+                        finalized_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (
+                        int(current_payroll["id"]),
+                        str(current_payroll["name"]),
+                        int(row["id"]),
+                    ),
+                )
+                saved = dict(cur.fetchone())
+                after_state = _payroll_verification_state(
+                    saved,
+                    current_source_fingerprint=data["sourceFingerprint"],
+                )
+                _insert_payroll_verification_event(
+                    cur,
+                    batch_row=saved,
+                    action="finalize",
+                    actor=current_payroll,
+                    reason=payload.reason,
+                    before_state=before_state,
+                    after_state=after_state,
+                )
+                result = {
+                    "success": True,
+                    "action": "finalize",
+                    "idempotent": False,
+                    "weeklyHours": data,
+                    "verification": after_state,
+                }
+
+    append_access_log(
+        request,
+        "PAYROLL_WEEKLY_HOURS_FINALIZE",
+        True,
+        f"week={week_start.isoformat()} batch={result['verification']['batchId']} idempotent={result['idempotent']}",
+    )
+    return result
 
 
 @app.get("/api/admin/payroll/weekly-hours/export")

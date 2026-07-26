@@ -641,6 +641,50 @@ CREATE TABLE time_data_correction_batches (
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Durable weekly payroll verification snapshots and audit trail. A payroll
+-- batch stores the source fingerprint Mayra verified; events preserve who moved
+-- the week through verify/reopen/finalize.
+CREATE TABLE payroll_verification_batches (
+    id                       BIGSERIAL PRIMARY KEY,
+    week_start               DATE NOT NULL UNIQUE,
+    week_end                 DATE NOT NULL,
+    timezone                 TEXT NOT NULL,
+    status                   VARCHAR(16) NOT NULL DEFAULT 'verified'
+                                 CHECK (status IN ('verified', 'reopened', 'finalized')),
+    source_fingerprint       VARCHAR(64) NOT NULL
+                                 CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+    snapshot                 JSONB NOT NULL,
+    verified_by_employee_id  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    verified_by_name         TEXT NOT NULL,
+    verified_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reopened_by_employee_id  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    reopened_by_name         TEXT,
+    reopened_reason          TEXT,
+    reopened_at              TIMESTAMPTZ,
+    finalized_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    finalized_by_name        TEXT,
+    finalized_at             TIMESTAMPTZ,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (week_end = week_start + 6)
+);
+
+CREATE TABLE payroll_verification_events (
+    id                 BIGSERIAL PRIMARY KEY,
+    batch_id           BIGINT NOT NULL REFERENCES payroll_verification_batches(id) ON DELETE CASCADE,
+    week_start         DATE NOT NULL,
+    action             VARCHAR(16) NOT NULL
+                           CHECK (action IN ('verify', 'reopen', 'finalize')),
+    actor_employee_id  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    actor_name         TEXT NOT NULL,
+    reason             TEXT NOT NULL DEFAULT '',
+    source_fingerprint VARCHAR(64) NOT NULL
+                           CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+    before_state       JSONB,
+    after_state        JSONB NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Durable business-scoped operation identity for Atlas money writes. The row
 -- survives browser/tab/admin changes and is resolved only after Atlas confirms
 -- the result, so an ambiguous retry cannot mint a second receipt. Payment
@@ -714,6 +758,12 @@ CREATE INDEX idx_site_check_in_reconciliation_reviews_lookup
     );
 CREATE INDEX idx_time_data_correction_batches_created
     ON time_data_correction_batches(created_at);
+CREATE INDEX idx_payroll_verification_batches_status_week
+    ON payroll_verification_batches(status, week_start);
+CREATE INDEX idx_payroll_verification_events_week
+    ON payroll_verification_events(week_start, created_at);
+CREATE INDEX idx_payroll_verification_events_batch
+    ON payroll_verification_events(batch_id, created_at);
 CREATE INDEX idx_receivables_operation_attempts_state
     ON receivables_operation_attempts(state, updated_at);
 CREATE UNIQUE INDEX uq_receivables_operation_attempts_active_identity
