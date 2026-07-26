@@ -7827,11 +7827,13 @@ def admin_employee_hours(
     )
     now = utc_now()
 
-    days_since_monday = now.weekday()
-    week_start = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
+    local_today = to_local(now).date()
+    days_since_sunday = (local_today.weekday() + 1) % 7
+    current_week_start_date = local_today - timedelta(days=days_since_sunday)
+    current_week_end_date = current_week_start_date + timedelta(days=7)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    today_str = local_date_string(now)
+    today_str = local_today.isoformat()
 
     emp_entries = [e for e in timesheet_data["entries"] if e.get("employeeId") == employee_id]
 
@@ -7852,14 +7854,15 @@ def admin_employee_hours(
             continue
 
         total = entry_hours(entry, now)
-        entry_date = local_date_string(clock_in_dt)
+        entry_local_date = to_local(clock_in_dt).date()
+        entry_date = entry_local_date.isoformat()
 
         all_time_hours += total
         if clock_in_dt >= year_start:
             yearly_hours += total
         if clock_in_dt >= month_start:
             monthly_hours += total
-        if clock_in_dt >= week_start:
+        if current_week_start_date <= entry_local_date < current_week_end_date:
             weekly_hours += total
         if entry_date == today_str:
             today_hours += total
@@ -7884,10 +7887,8 @@ def admin_employee_hours(
     shifts.sort(key=lambda x: (x["date"], x["clockIn"]), reverse=True)
 
     # Build weekly grid (Sun-Sat) for the requested week
-    days_since_sunday = (now.weekday() + 1) % 7
-    this_sunday_utc = (now - timedelta(days=days_since_sunday)).replace(hour=0, minute=0, second=0, microsecond=0)
-    grid_sunday_utc = this_sunday_utc + timedelta(weeks=week_offset)
-    grid_saturday_utc = grid_sunday_utc + timedelta(days=6, hours=23, minutes=59, seconds=59)
+    grid_sunday_date = current_week_start_date + timedelta(weeks=week_offset)
+    grid_end_date = grid_sunday_date + timedelta(days=7)
 
     shifts_by_date: Dict[str, list] = {}
     for entry in emp_entries:
@@ -7898,9 +7899,10 @@ def admin_employee_hours(
             ci_dt = parse_utc_iso(ci_str)
         except ValueError:
             continue
-        if not (grid_sunday_utc <= ci_dt <= grid_saturday_utc):
+        local_shift_date = to_local(ci_dt).date()
+        if not (grid_sunday_date <= local_shift_date < grid_end_date):
             continue
-        d_str = local_date_string(ci_dt)
+        d_str = local_shift_date.isoformat()
         co_disp = "Needs review" if is_stale_open_entry(entry, now) else "Active"
         if entry.get("clockOut"):
             try:
@@ -7944,14 +7946,14 @@ def admin_employee_hours(
     week_grid = []
     week_total = 0.0
     for i in range(7):
-        day_utc = grid_sunday_utc + timedelta(days=i)
-        d_str = local_date_string(day_utc)
+        local_day = grid_sunday_date + timedelta(days=i)
+        d_str = local_day.isoformat()
         day_shifts = shifts_by_date.get(d_str, [])
         day_hours = round(sum(s["hours"] for s in day_shifts), 2)
         week_total += day_hours
         week_grid.append({
             "date": d_str,
-            "dayLabel": to_local(day_utc).strftime("%a, %b %-d"),
+            "dayLabel": local_day.strftime("%a, %b %-d"),
             "shifts": day_shifts,
             "totalHours": day_hours,
         })
@@ -7968,7 +7970,7 @@ def admin_employee_hours(
         "weekGrid": week_grid,
         "weekTotal": round(week_total, 2),
         "weekOffset": week_offset,
-        "weekStartDate": local_date_string(grid_sunday_utc),
+        "weekStartDate": grid_sunday_date.isoformat(),
         "shifts": shifts[:50],
     }
 
