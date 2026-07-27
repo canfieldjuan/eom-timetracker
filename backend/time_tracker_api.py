@@ -14842,7 +14842,6 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     settings = load_settings()
 
     location_customers = _historical_location_metadata(timesheet_data, "location_customers")
-    location_rates = _historical_location_metadata(timesheet_data, "location_rates")
     location_rate_types = _historical_location_metadata(
         timesheet_data,
         "location_rate_types",
@@ -14892,8 +14891,6 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         if rate is not None:
             emp_rates[emp["id"]] = float(rate)
 
-    days_in_period = (end_date - start_date).days + 1 if (start_date and end_date) else 365
-    monthly_customers_credited: set = set()
     linked_jobs_credited: set[int] = set()
     visited_customer_dates: set = set()  # (customer, date_key) - dedup multi-employee same-day visits
 
@@ -14960,34 +14957,11 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             else:
                 revenue = 0.0
         else:
-            rate = location_rates.get(resolved_location)
             rate_type = location_rate_types.get(resolved_location, "per_visit")
-            if rate is not None:
-                if rate_type == "hourly":
-                    # Legacy fallback for unlinked rows.
-                    revenue = rate * hours
-                elif rate_type == "monthly":
-                    period_month = f"{entry_date.year}-{entry_date.month:02d}"
-                    site_month_key = (resolved_location, period_month)
-                    if site_month_key in canonical_monthly_site_months:
-                        revenue = 0.0
-                    else:
-                        # Legacy fallback for unlinked or multi-stop rows.
-                        month_key = (customer, period_month)
-                        if month_key not in monthly_customers_credited:
-                            days_in_month = calendar.monthrange(
-                                entry_date.year,
-                                entry_date.month,
-                            )[1]
-                            revenue = round(
-                                rate * min(days_in_period / days_in_month, 1.0),
-                                2,
-                            )
-                            monthly_customers_credited.add(month_key)
-                        else:
-                            revenue = 0.0
-                else:  # per_visit: credit once per customer per day
-                    revenue = rate if is_new_visit else 0.0
+            period_month = f"{entry_date.year}-{entry_date.month:02d}"
+            site_month_key = (resolved_location, period_month)
+            if rate_type == "monthly" and site_month_key in canonical_monthly_site_months:
+                revenue = 0.0
             else:
                 revenue = 0.0
                 revenue_complete = False
@@ -15447,7 +15421,6 @@ def admin_analytics_customer(
     settings = load_settings()
 
     location_customers = _historical_location_metadata(timesheet_data, "location_customers")
-    location_rates = _historical_location_metadata(timesheet_data, "location_rates")
     location_rate_types = _historical_location_metadata(
         timesheet_data,
         "location_rate_types",
@@ -15529,7 +15502,6 @@ def admin_analytics_customer(
         hours: float,
         entry_date: Any,
         is_visit: bool,
-        monthly_credited: set,
         date_key: str,
         job_id: Optional[int] = None,
     ) -> Tuple[float, bool, List[Dict[str, Any]]]:
@@ -15546,42 +15518,25 @@ def admin_analytics_customer(
                 issue = linked_job_revenue_issues.get(job_id)
                 return 0.0, False, [issue] if issue else []
             return 0.0, True, []
-        rate = location_rates.get(resolved_location)
         rate_type = location_rate_types.get(resolved_location, "per_visit")
-        if rate is None:
-            return (
-                0.0,
-                False,
-                [
-                    _analytics_missing_revenue_issue(
-                        location=resolved_location,
-                        customer=cust,
-                        date_key=date_key,
-                    )
-                ],
-            )
-        if rate_type == "hourly":
-            return float(rate) * hours, True, []
-        elif rate_type == "monthly":
-            period_month = f"{entry_date.year}-{entry_date.month:02d}"
-            site_month_key = (resolved_location, period_month)
-            if site_month_key in canonical_monthly_site_months:
-                return 0.0, True, []
-            month_key = (cust, period_month)
-            if month_key not in monthly_credited:
-                monthly_credited.add(month_key)
-                return float(rate), True, []
+        period_month = f"{entry_date.year}-{entry_date.month:02d}"
+        site_month_key = (resolved_location, period_month)
+        if rate_type == "monthly" and site_month_key in canonical_monthly_site_months:
             return 0.0, True, []
-        else:  # per_visit: credit once per location per day across all employees
-            visit_key = (resolved_location, date_key)
-            if is_visit and visit_key not in visited_for_revenue:
-                visited_for_revenue.add(visit_key)
-                return float(rate), True, []
-            return 0.0, True, []
+        return (
+            0.0,
+            False,
+            [
+                _analytics_missing_revenue_issue(
+                    location=resolved_location,
+                    customer=cust,
+                    date_key=date_key,
+                )
+            ],
+        )
 
     visits_list: List[Dict[str, Any]] = []
     week_agg: Dict[str, Dict[str, Any]] = {}
-    monthly_credited: set = set()
 
     def _record(
         resolved_location: str,
@@ -15603,7 +15558,6 @@ def admin_analytics_customer(
             hours,
             entry_date,
             is_visit,
-            monthly_credited,
             date_key,
             job_id=job_id,
         )
@@ -15651,7 +15605,6 @@ def admin_analytics_customer(
         week_agg[week_key]["revenue"] += revenue
         week_agg[week_key]["laborCost"] += labor_cost
 
-    visited_for_revenue: set = set()  # (resolved_location, date_key) - dedup per_visit in detail view
     for entry in timesheet_data["entries"]:
         if entry.get("clockOut") is None:
             continue

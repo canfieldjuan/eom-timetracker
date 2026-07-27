@@ -1233,8 +1233,8 @@ def _seed_historical_site_references(location_id: int, customer_name: str):
                 """
                 INSERT INTO visits (
                     shift_id, location_id, location_label, customer_name,
-                    arrival_time
-                ) VALUES (%s, %s, %s, %s, %s)
+                    arrival_time, job_id
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
@@ -1243,6 +1243,7 @@ def _seed_historical_site_references(location_id: int, customer_name: str):
                     f"{TEST_PREFIX} historical site",
                     customer_name,
                     past_start,
+                    job_id,
                 ),
             )
             visit_id = cur.fetchone()[0]
