@@ -6,6 +6,7 @@ Run:  cd backend && pytest -v
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Barrier, Event, Lock
 
@@ -1966,6 +1967,95 @@ class TestAnalyticsRegression:
             assert customer_row["revenue"] == 33.34
             day_row = next(row for row in body["byDay"] if row["date"] == "2047-02-01")
             assert day_row["revenue"] == 33.34
+        finally:
+            if shift_ids:
+                db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
+
+    def test_customer_detail_uses_canonical_monthly_allocation_for_linked_jobs(
+        self,
+        client,
+        auth,
+        employee_id,
+        monkeypatch,
+    ):
+        import time_tracker_api as api
+
+        customer_name = "Customer Detail Canonical Monthly"
+        site_ids: list[int] = []
+        job_ids: list[int] = []
+        shift_ids: list[int] = []
+        monkeypatch.setattr(
+            api,
+            "utc_now",
+            lambda: datetime(2047, 2, 16, 18, tzinfo=timezone.utc),
+        )
+        try:
+            site_id = _insert_profitability_site(
+                address="Customer Detail Canonical Monthly Site",
+                customer_name=customer_name,
+                rate=100.0,
+                rate_type="monthly",
+                expected_hours=2.0,
+            )
+            site_ids.append(site_id)
+            for index, scheduled_date in enumerate(
+                ("2047-02-01", "2047-02-08", "2047-02-15"),
+                start=1,
+            ):
+                job_ids.append(
+                    _insert_profitability_job(
+                        location_id=site_id,
+                        customer_name=customer_name,
+                        scheduled_date=scheduled_date,
+                        source_key=f"{9100 + index:064x}",
+                    )
+                )
+
+            for hour, linked_job_id in (
+                (9, job_ids[0]),
+                (13, job_ids[0]),
+                (15, None),
+            ):
+                shift_ids.append(
+                    int(
+                        db.execute_returning(
+                            """
+                            INSERT INTO shifts (
+                                employee_id, location_id, location_label,
+                                job_id, clock_in, clock_out, total_hours,
+                                notes, local_date
+                            )
+                            VALUES (
+                                %s, %s, 'Customer Detail Canonical Monthly Site',
+                                %s,
+                                DATE '2047-02-01' + (%s * INTERVAL '1 hour'),
+                                DATE '2047-02-01' + ((%s + 1) * INTERVAL '1 hour'),
+                                1.0, 'customer detail canonical monthly proof',
+                                '2047-02-01'
+                            )
+                            RETURNING id
+                            """,
+                            (employee_id, site_id, linked_job_id, hour, hour),
+                        )
+                    )
+                )
+
+            response = client.get(
+                f"/api/admin/analytics/customer/{customer_name.replace(' ', '%20')}",
+                headers=auth,
+                params={"weeks": 3},
+            )
+
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["summary"]["revenue"] == 33.34
+            assert body["summary"]["hours"] == 3.0
+            week = next(
+                row for row in body["byWeek"] if row["weekStart"] == "2047-01-27"
+            )
+            assert week["revenue"] == 33.34
+            assert sum(row["revenue"] for row in body["byVisit"]) == 33.34
         finally:
             if shift_ids:
                 db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))

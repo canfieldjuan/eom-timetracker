@@ -15117,7 +15117,46 @@ def admin_analytics_customer(
             customer = location if (location and not location.startswith("GPS ") and location not in ("Unknown", "")) else "Unmatched Location"
         return resolved, customer
 
-    def _calc_revenue(resolved_location: str, cust: str, hours: float, entry_date: Any, is_visit: bool, monthly_credited: set, date_key: str) -> float:
+    linked_period_job_ids: set[int] = set()
+    for entry in timesheet_data["entries"]:
+        if entry.get("clockOut") is None:
+            continue
+        if entry.get("timeCategory") == "non_productive":
+            continue
+        if entry.get("visits"):
+            continue
+        ci_str = str(entry.get("clockIn", "")).strip()
+        if not ci_str:
+            continue
+        try:
+            ci_dt = parse_utc_iso(ci_str)
+        except ValueError:
+            continue
+        entry_date = to_local(ci_dt).date()
+        if not (start_date <= entry_date <= end_date):
+            continue
+        resolved_location, cust = _resolve_loc(entry.get("location", ""))
+        if cust != customer_name:
+            continue
+        job_id = _analytics_entry_job_id(entry.get("jobId"))
+        if job_id is not None:
+            linked_period_job_ids.add(job_id)
+    (
+        monthly_job_revenue_cents,
+        canonical_monthly_site_months,
+    ) = _analytics_monthly_job_revenue_cents(linked_period_job_ids)
+    monthly_jobs_credited: set[int] = set()
+
+    def _calc_revenue(
+        resolved_location: str,
+        cust: str,
+        hours: float,
+        entry_date: Any,
+        is_visit: bool,
+        monthly_credited: set,
+        date_key: str,
+        job_id: Optional[int] = None,
+    ) -> float:
         rate = location_rates.get(resolved_location)
         rate_type = location_rate_types.get(resolved_location, "per_visit")
         if rate is None:
@@ -15125,7 +15164,21 @@ def admin_analytics_customer(
         if rate_type == "hourly":
             return float(rate) * hours
         elif rate_type == "monthly":
-            month_key = (cust, f"{entry_date.year}-{entry_date.month:02d}")
+            period_month = f"{entry_date.year}-{entry_date.month:02d}"
+            site_month_key = (resolved_location, period_month)
+            linked_cents = (
+                monthly_job_revenue_cents.get(job_id)
+                if job_id is not None
+                else None
+            )
+            if linked_cents is not None:
+                if job_id not in monthly_jobs_credited:
+                    monthly_jobs_credited.add(job_id)
+                    return float(Decimal(linked_cents) / Decimal(100))
+                return 0.0
+            if site_month_key in canonical_monthly_site_months:
+                return 0.0
+            month_key = (cust, period_month)
             if month_key not in monthly_credited:
                 monthly_credited.add(month_key)
                 return float(rate)
@@ -15151,10 +15204,20 @@ def admin_analytics_customer(
         emp_name: str,
         emp_rate: Any,
         date_key: str,
+        job_id: Optional[int] = None,
     ) -> None:
         if cust != customer_name:
             return
-        revenue = _calc_revenue(resolved_location, cust, hours, entry_date, is_visit, monthly_credited, date_key)
+        revenue = _calc_revenue(
+            resolved_location,
+            cust,
+            hours,
+            entry_date,
+            is_visit,
+            monthly_credited,
+            date_key,
+            job_id=job_id,
+        )
         labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
         lp = round(labor_cost / revenue * 100, 1) if revenue > 0 else None
         visits_list.append({
@@ -15225,7 +15288,18 @@ def admin_analytics_customer(
         else:
             e_hours = float(entry.get("totalHours", 0) or 0)
             resolved_location, cust = _resolve_loc(entry.get("location", ""))
-            _record(resolved_location, cust, e_hours, True, entry_date, week_key, emp_name, emp_rate, date_key)
+            _record(
+                resolved_location,
+                cust,
+                e_hours,
+                True,
+                entry_date,
+                week_key,
+                emp_name,
+                emp_rate,
+                date_key,
+                job_id=_analytics_entry_job_id(entry.get("jobId")),
+            )
 
     def _fin_week(w: Dict[str, Any]) -> Dict[str, Any]:
         rev = w["revenue"]
