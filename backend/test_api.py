@@ -2249,6 +2249,133 @@ class TestAnalyticsRegression:
                 db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
             _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
 
+    def test_analytics_credits_multi_stop_visits_by_visit_job_id(
+        self,
+        client,
+        auth,
+        employee_id,
+        monkeypatch,
+    ):
+        import time_tracker_api as api
+
+        customer_name = "Analytics Visit Job Revenue"
+        site_ids: list[int] = []
+        job_ids: list[int] = []
+        shift_ids: list[int] = []
+        monkeypatch.setattr(
+            api,
+            "utc_now",
+            lambda: datetime(2047, 3, 16, 18, tzinfo=timezone.utc),
+        )
+        try:
+            parent_site_id = _insert_profitability_site(
+                address="Analytics Visit Job Parent Site",
+                customer_name=customer_name,
+                rate=999.0,
+                rate_type="per_visit",
+                expected_hours=1.0,
+            )
+            site_ids.append(parent_site_id)
+            parent_job_id = _insert_profitability_job(
+                location_id=parent_site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-03-03",
+                source_key=f"{9599:064x}",
+            )
+            job_ids.append(parent_job_id)
+
+            visit_sites: list[tuple[int, str, int]] = []
+            for index, (address, rate) in enumerate(
+                (
+                    ("Analytics Visit Job A", 80.0),
+                    ("Analytics Visit Job B", 60.0),
+                ),
+                start=1,
+            ):
+                site_id = _insert_profitability_site(
+                    address=address,
+                    customer_name=customer_name,
+                    rate=rate,
+                    rate_type="per_visit",
+                    expected_hours=1.0,
+                )
+                site_ids.append(site_id)
+                job_id = _insert_profitability_job(
+                    location_id=site_id,
+                    customer_name=customer_name,
+                    scheduled_date="2047-03-03",
+                    source_key=f"{9500 + index:064x}",
+                )
+                job_ids.append(job_id)
+                visit_sites.append((site_id, address, job_id))
+
+            shift_id = int(
+                db.execute_returning(
+                    """
+                    INSERT INTO shifts (
+                        employee_id, location_id, location_label, job_id,
+                        clock_in, clock_out, total_hours, notes, local_date
+                    )
+                    VALUES (
+                        %s, %s, 'Analytics Visit Job Parent Site', %s,
+                        TIMESTAMPTZ '2047-03-03 08:00:00-06',
+                        TIMESTAMPTZ '2047-03-03 10:00:00-06',
+                        2.0, 'analytics visit job identity proof',
+                        DATE '2047-03-03'
+                    )
+                    RETURNING id
+                    """,
+                    (employee_id, parent_site_id, parent_job_id),
+                )
+            )
+            shift_ids.append(shift_id)
+
+            for hour_offset, (site_id, address, job_id) in zip((0, 1), visit_sites):
+                db.execute(
+                    """
+                    INSERT INTO visits (
+                        shift_id, location_id, location_label, customer_name,
+                        arrival_time, job_id, sequence_version
+                    )
+                    VALUES (
+                        %s, %s, %s, %s,
+                        TIMESTAMPTZ '2047-03-03 08:00:00-06'
+                            + (%s * INTERVAL '1 hour'),
+                        %s, 2
+                    )
+                    """,
+                    (shift_id, site_id, address, customer_name, hour_offset, job_id),
+                )
+
+            response = client.get(
+                "/api/admin/analytics",
+                headers=auth,
+                params={"period": "week", "date": "2047-03-03"},
+            )
+            assert response.status_code == 200, response.text
+            body = response.json()
+            customer_row = next(
+                row for row in body["byCustomer"] if row["customer"] == customer_name
+            )
+            assert customer_row["hours"] == 2.0
+            assert customer_row["revenue"] == 140.0
+            day_row = next(row for row in body["byDay"] if row["date"] == "2047-03-03")
+            assert day_row["revenue"] == 140.0
+
+            detail_response = client.get(
+                f"/api/admin/analytics/customer/{customer_name.replace(' ', '%20')}",
+                headers=auth,
+                params={"weeks": 3},
+            )
+            assert detail_response.status_code == 200, detail_response.text
+            detail = detail_response.json()
+            assert detail["summary"]["revenue"] == 140.0
+            assert sorted(row["revenue"] for row in detail["byVisit"]) == [60.0, 80.0]
+        finally:
+            if shift_ids:
+                db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
+
     def test_customer_detail_uses_canonical_monthly_allocation_for_linked_jobs(
         self,
         client,

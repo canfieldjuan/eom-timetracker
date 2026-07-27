@@ -15052,8 +15052,6 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             continue
         if entry.get("timeCategory") == "non_productive":
             continue
-        if entry.get("visits"):
-            continue
         ci_str = str(entry.get("clockIn", "")).strip()
         if not ci_str:
             continue
@@ -15063,6 +15061,15 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             continue
         entry_date = to_local(ci_dt).date()
         if start_date is not None and not (start_date <= entry_date <= end_date):
+            continue
+        visits = entry.get("visits") or []
+        if visits:
+            for visit in visits:
+                if not isinstance(visit, dict):
+                    continue
+                job_id = _analytics_entry_job_id(visit.get("jobId"))
+                if job_id is not None:
+                    linked_period_job_ids.add(job_id)
             continue
         job_id = _analytics_entry_job_id(entry.get("jobId"))
         if job_id is not None:
@@ -15241,7 +15248,16 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                 visit_hours = max((next_time - v_arrival).total_seconds() / 3600, 0.0)
                 v_loc = visit.get("location", "")
                 resolved_location, customer = _resolve_loc(v_loc)
-                _aggregate(customer, resolved_location, visit_hours, emp_id, entry_date, date_key, is_visit=True)
+                _aggregate(
+                    customer,
+                    resolved_location,
+                    visit_hours,
+                    emp_id,
+                    entry_date,
+                    date_key,
+                    is_visit=True,
+                    job_id=_analytics_entry_job_id(visit.get("jobId")),
+                )
         else:
             # Legacy / single-location shift
             hours = float(entry.get("totalHours", 0) or 0)
@@ -15580,8 +15596,6 @@ def admin_analytics_customer(
             continue
         if entry.get("timeCategory") == "non_productive":
             continue
-        if entry.get("visits"):
-            continue
         ci_str = str(entry.get("clockIn", "")).strip()
         if not ci_str:
             continue
@@ -15591,6 +15605,18 @@ def admin_analytics_customer(
             continue
         entry_date = to_local(ci_dt).date()
         if not (start_date <= entry_date <= end_date):
+            continue
+        visits = entry.get("visits") or []
+        if visits:
+            for visit in visits:
+                if not isinstance(visit, dict):
+                    continue
+                resolved_location, cust = _resolve_loc(visit.get("location", ""))
+                if cust != customer_name:
+                    continue
+                job_id = _analytics_entry_job_id(visit.get("jobId"))
+                if job_id is not None:
+                    linked_period_job_ids.add(job_id)
             continue
         resolved_location, cust = _resolve_loc(entry.get("location", ""))
         if cust != customer_name:
@@ -15745,7 +15771,18 @@ def admin_analytics_customer(
                         pass
                 v_hours = max((next_time - v_arrival).total_seconds() / 3600, 0.0)
                 resolved_location, cust = _resolve_loc(visit.get("location", ""))
-                _record(resolved_location, cust, v_hours, True, entry_date, week_key, emp_name, emp_rate, date_key)
+                _record(
+                    resolved_location,
+                    cust,
+                    v_hours,
+                    True,
+                    entry_date,
+                    week_key,
+                    emp_name,
+                    emp_rate,
+                    date_key,
+                    job_id=_analytics_entry_job_id(visit.get("jobId")),
+                )
         else:
             e_hours = float(entry.get("totalHours", 0) or 0)
             resolved_location, cust = _resolve_loc(entry.get("location", ""))
