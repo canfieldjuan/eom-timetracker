@@ -14478,7 +14478,16 @@ def admin_get_job(
     shift_rows = db.query_all(
         """
         SELECT s.id, s.employee_id, e.name AS employee_name,
-               s.clock_in, s.clock_out, s.total_hours, s.notes,
+               s.clock_in,
+               s.clock_out,
+               CASE
+                   WHEN s.clock_out IS NULL THEN NULL
+                   ELSE GREATEST(
+                       0.0,
+                       EXTRACT(EPOCH FROM (s.clock_out - s.clock_in)) / 3600.0
+                   )
+               END AS total_hours,
+               s.notes,
                e.hourly_rate
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
