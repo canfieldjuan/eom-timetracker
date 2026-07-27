@@ -13458,7 +13458,15 @@ def admin_schedule_vs_actual(
                s.location_id,
                COALESCE(c.name, l.customer_name, l.address,
                         s.location_label, '') AS customer_name,
-               COALESCE(SUM(s.total_hours), 0) AS actual_hours
+               COALESCE(
+                   SUM(
+                       GREATEST(
+                           0.0,
+                           EXTRACT(EPOCH FROM (s.clock_out - s.clock_in)) / 3600.0
+                       )
+                   ),
+                   0
+               ) AS actual_hours
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
         LEFT JOIN locations l ON s.location_id = l.id
