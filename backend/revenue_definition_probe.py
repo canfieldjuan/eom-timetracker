@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import calendar
 import json
+import os
+import sys
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -288,7 +290,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Reference date; previous complete Sunday-start weeks are measured.",
     )
     parser.add_argument("--weeks", type=int, default=2)
+    parser.add_argument(
+        "--db-url",
+        default=os.environ.get("DATABASE_URL", ""),
+        help="PostgreSQL URL (defaults to DATABASE_URL).",
+    )
     args = parser.parse_args(argv)
+    if not args.db_url:
+        print("DATABASE_URL or --db-url is required", file=sys.stderr)
+        return 2
+    db.init_pool(args.db_url)
     result = build_monthly_contract_revenue_divergence(
         reference_date=args.reference_date,
         week_count=args.weeks,
