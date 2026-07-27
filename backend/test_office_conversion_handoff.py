@@ -96,6 +96,33 @@ def test_estimate_approval_creates_one_customer_site_and_never_sends_rate_or_sch
     ]
 
 
+@pytest.mark.parametrize("site_field", ("rate", "rateType", "frequency"))
+def test_estimate_approval_requires_completed_estimate_site_fields(
+    client, auth, monkeypatch, configured_office_conversion, site_field
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+    body = _payload(contact_id, key)
+    assert isinstance(body["primarySite"], dict)
+    del body["primarySite"][site_field]
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Atlas must not be called for an incomplete estimate")
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", unexpected)
+    response = client.post(
+        "/api/admin/funnel/approve-estimate",
+        headers=auth,
+        json=body,
+    )
+
+    assert response.status_code == 422
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM customers WHERE atlas_contact_id = %s", (contact_id,)
+    )["count"] == 0
+
+
 def test_estimate_approval_retry_is_idempotent_and_changed_retry_fails_closed(
     client, auth, monkeypatch, configured_office_conversion
 ):
@@ -138,6 +165,49 @@ def test_estimate_approval_retry_is_idempotent_and_changed_retry_fails_closed(
     )["count"] == 1
 
 
+def test_estimate_approval_reused_key_for_different_contact_fails_closed(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    first_contact_id = str(uuid.uuid4())
+    second_contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+    calls: list[dict[str, object]] = []
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        calls.append(payload)
+        return _atlas_success(payload, idempotency_key)
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    first = client.post(
+        "/api/admin/funnel/approve-estimate",
+        headers=auth,
+        json=_payload(first_contact_id, key),
+    )
+    reused = client.post(
+        "/api/admin/funnel/approve-estimate",
+        headers=auth,
+        json=_payload(second_contact_id, key),
+    )
+
+    assert first.status_code == 201, first.text
+    assert reused.status_code == 409
+    assert reused.json()["code"] == "office_conversion_approval_key_already_reserved"
+    assert len(calls) == 1
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM customers WHERE atlas_contact_id = %s",
+        (second_contact_id,),
+    )["count"] == 0
+    assert db.query_one(
+        """
+        SELECT COUNT(*) AS count
+        FROM eom_office_conversion_handoffs
+        WHERE idempotency_key = %s
+        """,
+        (key,),
+    )["count"] == 1
+
+
 def test_estimate_approval_recovers_after_atlas_failure_without_duplicate_customer_or_site(
     client, auth, monkeypatch, configured_office_conversion
 ):
@@ -161,6 +231,7 @@ def test_estimate_approval_recovers_after_atlas_failure_without_duplicate_custom
     assert pending.status_code == 202, pending.text
     assert pending.json()["handoff"]["status"] == "atlas_pending"
     assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["idempotent"] is True
     assert recovered.json()["handoff"]["status"] == "finalized"
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM customers WHERE atlas_contact_id = %s", (contact_id,)

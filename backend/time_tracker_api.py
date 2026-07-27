@@ -2018,6 +2018,24 @@ class PrimarySiteCreateRequest(BaseModel):
         return self
 
 
+class OfficeEstimatePrimarySiteRequest(PrimarySiteCreateRequest):
+    """Completed estimate Site fields required before office approval."""
+
+    rate: float = Field(
+        ...,
+        ge=0,
+        le=SITE_RATE_MAX,
+        allow_inf_nan=False,
+    )
+    rateType: Literal["per_visit", "hourly", "monthly"] = Field(...)
+    frequency: str = Field(min_length=1, max_length=SITE_FREQUENCY_MAX_LENGTH)
+
+    @field_validator("frequency", mode="before")
+    @classmethod
+    def normalize_required_frequency(cls, value: Any) -> Any:
+        return _strip_required_text(value)
+
+
 class CustomerCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=CUSTOMER_NAME_MAX_LENGTH)
     primaryContactName: Optional[str] = Field(default=None, max_length=CUSTOMER_NAME_MAX_LENGTH)
@@ -2057,7 +2075,7 @@ class OfficeEstimateApprovalRequest(CustomerCreateRequest):
     """Completed-estimate facts needed for one office-created Customer/Site."""
 
     atlasContactId: UUID = Field(...)
-    primarySite: PrimarySiteCreateRequest = Field(...)
+    primarySite: OfficeEstimatePrimarySiteRequest = Field(...)
     idempotencyKey: UUID = Field(...)
 
 
@@ -9303,64 +9321,76 @@ def _reserve_office_conversion_handoff(
     fingerprint = _office_conversion_fingerprint(payload)
     contact_id = str(payload.atlasContactId)
     key = str(payload.idempotencyKey)
-    with db.get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            _lock_customer_site_mutations(cur)
-            cur.execute(
-                """
-                SELECT *
-                FROM eom_office_conversion_handoffs
-                WHERE atlas_contact_id = %s
-                FOR UPDATE
-                """,
-                (contact_id,),
-            )
-            existing = cur.fetchone()
-            if existing:
-                row = dict(existing)
-                if str(row["idempotency_key"]) != key:
-                    _raise_conflict(
-                        "office_conversion_contact_already_reserved",
-                        "This Atlas lead already has an office conversion approval",
-                        {"customerId": int(row["customer_id"]), "siteId": int(row["site_id"])},
-                    )
-                if not hmac.compare_digest(str(row["request_fingerprint"]), fingerprint):
-                    _raise_conflict(
-                        "office_conversion_retry_mismatch",
-                        "This approval key was already used with different estimate details",
-                        {"customerId": int(row["customer_id"]), "siteId": int(row["site_id"])},
-                    )
-                customer = _canonical_customer(cur, int(row["customer_id"]))
-                return {"handoff": row, "customer": customer}, False
-
-            cur.execute(
-                "SELECT id FROM customers WHERE atlas_contact_id = %s FOR UPDATE",
-                (contact_id,),
-            )
-            legacy_matches = cur.fetchall()
-            if legacy_matches:
-                _raise_conflict(
-                    "office_conversion_existing_atlas_customer",
-                    "An existing Atlas-linked Customer must be reconciled before approval",
-                    {"customerIds": [int(match["id"]) for match in legacy_matches]},
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                _lock_customer_site_mutations(cur)
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM eom_office_conversion_handoffs
+                    WHERE atlas_contact_id = %s
+                    FOR UPDATE
+                    """,
+                    (contact_id,),
                 )
+                existing = cur.fetchone()
+                if existing:
+                    row = dict(existing)
+                    if str(row["idempotency_key"]) != key:
+                        _raise_conflict(
+                            "office_conversion_contact_already_reserved",
+                            "This Atlas lead already has an office conversion approval",
+                            {"customerId": int(row["customer_id"]), "siteId": int(row["site_id"])},
+                        )
+                    if not hmac.compare_digest(str(row["request_fingerprint"]), fingerprint):
+                        _raise_conflict(
+                            "office_conversion_retry_mismatch",
+                            "This approval key was already used with different estimate details",
+                            {"customerId": int(row["customer_id"]), "siteId": int(row["site_id"])},
+                        )
+                    customer = _canonical_customer(cur, int(row["customer_id"]))
+                    return {"handoff": row, "customer": customer}, False
 
-            customer_id = _insert_customer(cur, payload)
-            site_id = _insert_site(cur, customer_id, payload.name, payload.primarySite)
-            cur.execute(
-                """
-                INSERT INTO eom_office_conversion_handoffs (
-                    atlas_contact_id, idempotency_key, request_fingerprint,
-                    customer_id, site_id, approved_by_employee_id
+                cur.execute(
+                    "SELECT id FROM customers WHERE atlas_contact_id = %s FOR UPDATE",
+                    (contact_id,),
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
-                RETURNING *
-                """,
-                (contact_id, key, fingerprint, customer_id, site_id, int(admin["id"])),
+                legacy_matches = cur.fetchall()
+                if legacy_matches:
+                    _raise_conflict(
+                        "office_conversion_existing_atlas_customer",
+                        "An existing Atlas-linked Customer must be reconciled before approval",
+                        {"customerIds": [int(match["id"]) for match in legacy_matches]},
+                    )
+
+                customer_id = _insert_customer(cur, payload)
+                site_id = _insert_site(cur, customer_id, payload.name, payload.primarySite)
+                cur.execute(
+                    """
+                    INSERT INTO eom_office_conversion_handoffs (
+                        atlas_contact_id, idempotency_key, request_fingerprint,
+                        customer_id, site_id, approved_by_employee_id
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (contact_id, key, fingerprint, customer_id, site_id, int(admin["id"])),
+                )
+                row = dict(cur.fetchone())
+                customer = _canonical_customer(cur, customer_id)
+                return {"handoff": row, "customer": customer}, True
+    except psycopg2.errors.UniqueViolation as exc:
+        if (
+            getattr(exc.diag, "constraint_name", "")
+            == "eom_office_conversion_handoffs_idempotency_key_key"
+        ):
+            _raise_conflict(
+                "office_conversion_approval_key_already_reserved",
+                "This approval key already belongs to a different office conversion",
+                {"idempotencyKey": key},
             )
-            row = dict(cur.fetchone())
-            customer = _canonical_customer(cur, customer_id)
-            return {"handoff": row, "customer": customer}, True
+        raise
 
 
 def _mark_office_conversion_finalized(
@@ -9554,7 +9584,7 @@ def admin_approve_estimate(
     return JSONResponse(
         status_code=201 if created else 200,
         content=jsonable_encoder(
-            {"success": True, "idempotent": False, "handoff": visible}
+            {"success": True, "idempotent": not created, "handoff": visible}
         ),
     )
 
