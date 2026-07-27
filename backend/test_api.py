@@ -1888,6 +1888,89 @@ class TestAnalyticsRegression:
             assert "customer" not in row
             assert "location" not in row
 
+    def test_analytics_week_uses_canonical_monthly_allocation_for_linked_jobs(
+        self,
+        client,
+        auth,
+        employee_id,
+    ):
+        customer_name = "Analytics Canonical Monthly"
+        site_ids: list[int] = []
+        job_ids: list[int] = []
+        shift_ids: list[int] = []
+        try:
+            site_id = _insert_profitability_site(
+                address="Analytics Canonical Monthly Site",
+                customer_name=customer_name,
+                rate=100.0,
+                rate_type="monthly",
+                expected_hours=2.0,
+            )
+            site_ids.append(site_id)
+            for index, scheduled_date in enumerate(
+                ("2047-02-01", "2047-02-08", "2047-02-15"),
+                start=1,
+            ):
+                job_ids.append(
+                    _insert_profitability_job(
+                        location_id=site_id,
+                        customer_name=customer_name,
+                        scheduled_date=scheduled_date,
+                        source_key=f"{9000 + index:064x}",
+                    )
+                )
+
+            for hour, linked_job_id in (
+                (9, job_ids[0]),
+                (13, job_ids[0]),
+                (15, None),
+            ):
+                shift_ids.append(
+                    int(
+                        db.execute_returning(
+                            """
+                            INSERT INTO shifts (
+                                employee_id, location_id, location_label,
+                                job_id, clock_in, clock_out, total_hours,
+                                notes, local_date
+                            )
+                            VALUES (
+                                %s, %s, 'Analytics Canonical Monthly Site',
+                                %s,
+                                DATE '2047-02-01' + (%s * INTERVAL '1 hour'),
+                                DATE '2047-02-01' + ((%s + 1) * INTERVAL '1 hour'),
+                                1.0, 'analytics canonical monthly proof',
+                                '2047-02-01'
+                            )
+                            RETURNING id
+                            """,
+                            (employee_id, site_id, linked_job_id, hour, hour),
+                        )
+                    )
+                )
+
+            response = client.get(
+                "/api/admin/analytics",
+                headers=auth,
+                params={"period": "week", "date": "2047-02-01"},
+            )
+
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["summary"]["revenue"] == 33.34
+            customer_row = next(
+                row for row in body["byCustomer"] if row["customer"] == customer_name
+            )
+            assert customer_row["hours"] == 3.0
+            assert customer_row["visits"] == 1
+            assert customer_row["revenue"] == 33.34
+            day_row = next(row for row in body["byDay"] if row["date"] == "2047-02-01")
+            assert day_row["revenue"] == 33.34
+        finally:
+            if shift_ids:
+                db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
+
 # ===============================================================================
 # Phase 3 - Jobs
 # ===============================================================================

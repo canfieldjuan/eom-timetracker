@@ -14458,6 +14458,96 @@ def admin_unlink_shift_from_job(
     return {"success": True}
 
 
+def _analytics_entry_job_id(value: Any) -> Optional[int]:
+    try:
+        job_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return job_id if job_id > 0 else None
+
+
+def _analytics_monthly_job_revenue_cents(
+    job_ids: set[int],
+) -> Tuple[Dict[int, int], set[Tuple[str, str]]]:
+    """Return canonical monthly allocations for linked monthly jobs."""
+    if not job_ids:
+        return {}, set()
+
+    selected_jobs = db.query_all(
+        """
+        SELECT j.id, j.location_id, j.scheduled_date, j.scheduled_start,
+               j.status, l.address, l.rate, l.rate_type
+        FROM jobs j
+        JOIN locations l ON l.id = j.location_id
+        WHERE j.id = ANY(%s)
+        """,
+        (sorted(job_ids),),
+    )
+    monthly_groups: Dict[Tuple[int, int, int], Any] = {}
+    revenue_by_job: Dict[int, int] = {}
+    canonical_site_months: set[Tuple[str, str]] = set()
+    for row in selected_jobs:
+        job_id = int(row["id"])
+        if str(row.get("rate_type") or "") != "monthly":
+            continue
+        if row.get("status") == "cancelled":
+            revenue_by_job[job_id] = 0
+            continue
+        if row.get("location_id") is None or row.get("rate") is None:
+            continue
+        scheduled_date = row["scheduled_date"]
+        monthly_groups[
+            (
+                int(row["location_id"]),
+                scheduled_date.year,
+                scheduled_date.month,
+            )
+        ] = row.get("rate")
+        canonical_site_months.add(
+            (
+                str(row["address"] or ""),
+                f"{scheduled_date.year}-{scheduled_date.month:02d}",
+            )
+        )
+
+    if not monthly_groups:
+        return revenue_by_job, canonical_site_months
+
+    month_starts = [
+        date(year, month, 1)
+        for _, year, month in monthly_groups
+    ]
+    month_ends = [
+        date(year, month, calendar.monthrange(year, month)[1])
+        for _, year, month in monthly_groups
+    ]
+    candidate_rows = db.query_all(
+        """
+        SELECT j.id, j.location_id, j.scheduled_date, j.scheduled_start,
+               j.status, l.rate, l.rate_type
+        FROM jobs j
+        JOIN locations l ON l.id = j.location_id
+        WHERE j.location_id = ANY(%s)
+          AND j.scheduled_date BETWEEN %s AND %s
+        ORDER BY j.scheduled_date, j.scheduled_start NULLS FIRST, j.id
+        """,
+        (
+            sorted({group[0] for group in monthly_groups}),
+            min(month_starts),
+            max(month_ends),
+        ),
+    )
+    app_timezone = ZoneInfo(TIMEZONE_NAME)
+    monthly_allocations = monthly_revenue_allocations(
+        [dict(row) for row in candidate_rows],
+        app_timezone,
+    )
+    for job_id in job_ids:
+        if job_id in monthly_allocations:
+            revenue_by_job[job_id] = monthly_allocations[job_id]
+    return revenue_by_job, canonical_site_months
+
+
 def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     now = utc_now()
     local_now = to_local(now)
@@ -14504,6 +14594,32 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         "location_expected_hours",
     )
 
+    linked_period_job_ids: set[int] = set()
+    for entry in timesheet_data["entries"]:
+        if entry.get("clockOut") is None:
+            continue
+        if entry.get("timeCategory") == "non_productive":
+            continue
+        if entry.get("visits"):
+            continue
+        ci_str = str(entry.get("clockIn", "")).strip()
+        if not ci_str:
+            continue
+        try:
+            ci_dt = parse_utc_iso(ci_str)
+        except ValueError:
+            continue
+        entry_date = to_local(ci_dt).date()
+        if start_date is not None and not (start_date <= entry_date <= end_date):
+            continue
+        job_id = _analytics_entry_job_id(entry.get("jobId"))
+        if job_id is not None:
+            linked_period_job_ids.add(job_id)
+    (
+        monthly_job_revenue_cents,
+        canonical_monthly_site_months,
+    ) = _analytics_monthly_job_revenue_cents(linked_period_job_ids)
+
     emp_rates: Dict[int, float] = {}
     for emp in employees_data["employees"]:
         rate = emp.get("hourlyRate")
@@ -14512,6 +14628,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
 
     days_in_period = (end_date - start_date).days + 1 if (start_date and end_date) else 365
     monthly_customers_credited: set = set()
+    monthly_jobs_credited: set[int] = set()
     visited_customer_dates: set = set()  # (customer, date_key) - dedup multi-employee same-day visits
 
     customer_agg: Dict[str, Dict[str, Any]] = {}
@@ -14540,8 +14657,16 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             customer = location if (location and not location.startswith("GPS ") and location not in ("Unknown", "")) else "Unmatched Location"
         return resolved, customer
 
-    def _aggregate(customer: str, resolved_location: str, hours: float, emp_id: int,
-                   entry_date: Any, date_key: str, is_visit: bool) -> None:
+    def _aggregate(
+        customer: str,
+        resolved_location: str,
+        hours: float,
+        emp_id: int,
+        entry_date: Any,
+        date_key: str,
+        is_visit: bool,
+        job_id: Optional[int] = None,
+    ) -> None:
         # Determine first-arrival: deduplicates multi-employee same-day visits
         visit_key = (customer, date_key)
         is_new_visit = is_visit and visit_key not in visited_customer_dates
@@ -14555,14 +14680,36 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                 # Per-employee, per-hour: scales correctly with number of workers sent
                 revenue = rate * hours
             elif rate_type == "monthly":
-                # Credit once per customer per calendar month (handles multi-month periods)
-                month_key = (customer, f"{entry_date.year}-{entry_date.month:02d}")
-                if month_key not in monthly_customers_credited:
-                    days_in_month = calendar.monthrange(entry_date.year, entry_date.month)[1]
-                    revenue = round(rate * min(days_in_period / days_in_month, 1.0), 2)
-                    monthly_customers_credited.add(month_key)
-                else:
+                period_month = f"{entry_date.year}-{entry_date.month:02d}"
+                site_month_key = (resolved_location, period_month)
+                linked_cents = (
+                    monthly_job_revenue_cents.get(job_id)
+                    if job_id is not None
+                    else None
+                )
+                if linked_cents is not None:
+                    if job_id not in monthly_jobs_credited:
+                        revenue = float(Decimal(linked_cents) / Decimal(100))
+                        monthly_jobs_credited.add(job_id)
+                    else:
+                        revenue = 0.0
+                elif site_month_key in canonical_monthly_site_months:
                     revenue = 0.0
+                else:
+                    # Legacy fallback for unlinked or multi-stop rows.
+                    month_key = (customer, period_month)
+                    if month_key not in monthly_customers_credited:
+                        days_in_month = calendar.monthrange(
+                            entry_date.year,
+                            entry_date.month,
+                        )[1]
+                        revenue = round(
+                            rate * min(days_in_period / days_in_month, 1.0),
+                            2,
+                        )
+                        monthly_customers_credited.add(month_key)
+                    else:
+                        revenue = 0.0
             else:  # per_visit: credit once per customer per day
                 revenue = rate if is_new_visit else 0.0
         else:
@@ -14643,7 +14790,16 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             hours = float(entry.get("totalHours", 0) or 0)
             location = entry.get("location", "")
             resolved_location, customer = _resolve_loc(location)
-            _aggregate(customer, resolved_location, hours, emp_id, entry_date, date_key, is_visit=True)
+            _aggregate(
+                customer,
+                resolved_location,
+                hours,
+                emp_id,
+                entry_date,
+                date_key,
+                is_visit=True,
+                job_id=_analytics_entry_job_id(entry.get("jobId")),
+            )
 
     def _classify(labor_pct, gross_margin, variance, rplh) -> Tuple[str, List[str]]:
         """Return (flag, reasons) - flag is Healthy/Watch/Fix/Raise Price/Drop."""
