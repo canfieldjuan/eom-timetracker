@@ -41,6 +41,7 @@ import qrcode.image.svg
 import arrival_policies
 import db
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -2052,6 +2053,14 @@ class CustomerCreateRequest(BaseModel):
         return _validate_optional_email(value)
 
 
+class OfficeEstimateApprovalRequest(CustomerCreateRequest):
+    """Completed-estimate facts needed for one office-created Customer/Site."""
+
+    atlasContactId: UUID = Field(...)
+    primarySite: PrimarySiteCreateRequest = Field(...)
+    idempotencyKey: UUID = Field(...)
+
+
 class CustomerUpdateRequest(BaseModel):
     expectedUpdateToken: Optional[str] = Field(
         default=None,
@@ -2637,6 +2646,14 @@ ATLAS_RECEIVABLES_SERVICE_TOKEN = os.getenv(
 ATLAS_RECEIVABLES_TIMEOUT_SECONDS = max(
     1.0, float(os.getenv("ATLAS_RECEIVABLES_TIMEOUT_SECONDS", "10"))
 )
+ATLAS_FUNNEL_BASE_URL = os.getenv("ATLAS_FUNNEL_BASE_URL", "").strip().rstrip("/")
+ATLAS_FUNNEL_SERVICE_TOKEN = os.getenv("ATLAS_FUNNEL_SERVICE_TOKEN", "").strip()
+ATLAS_FUNNEL_TIMEOUT_SECONDS = max(
+    1.0, float(os.getenv("ATLAS_FUNNEL_TIMEOUT_SECONDS", "10"))
+)
+EOM_FUNNEL_APPROVER_EMPLOYEE_ID = parse_int(
+    os.getenv("EOM_FUNNEL_APPROVER_EMPLOYEE_ID"), 0
+)
 GOOGLE_CALENDAR_CLIENT_ID = os.getenv("GOOGLE_CALENDAR_CLIENT_ID", "").strip()
 GOOGLE_CALENDAR_CLIENT_SECRET = os.getenv(
     "GOOGLE_CALENDAR_CLIENT_SECRET", ""
@@ -2803,6 +2820,78 @@ def _atlas_receivables_request(
             detail=detail,
             headers=headers,
         )
+    return content
+
+
+class AtlasFunnelRequestError(Exception):
+    """A tracker-to-Atlas response that leaves the local handoff retryable."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _require_atlas_funnel_configuration() -> None:
+    if not ATLAS_FUNNEL_BASE_URL or not ATLAS_FUNNEL_SERVICE_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="EOM customer handoff service is not configured",
+        )
+
+
+def _atlas_funnel_request(
+    path: str,
+    admin: Dict[str, Any],
+    *,
+    payload: Dict[str, Any],
+    idempotency_key: str,
+) -> Dict[str, Any]:
+    """Call Atlas from the server; its service credential never reaches a browser."""
+    _require_atlas_funnel_configuration()
+    if not path.startswith("/eom-funnel/"):
+        raise RuntimeError("Invalid EOM funnel proxy path")
+    headers = {
+        "Authorization": f"Bearer {ATLAS_FUNNEL_SERVICE_TOKEN}",
+        "X-EOM-Actor": str(admin["name"]),
+        "X-EOM-Actor-ID": str(admin["id"]),
+        "Idempotency-Key": idempotency_key,
+        "Accept": "application/json",
+    }
+    try:
+        response = requests.post(
+            f"{ATLAS_FUNNEL_BASE_URL}{path}",
+            headers=headers,
+            json=payload,
+            timeout=ATLAS_FUNNEL_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise AtlasFunnelRequestError(
+            503,
+            "EOM customer handoff service is temporarily unavailable; retry this approval",
+        ) from exc
+    try:
+        content = response.json()
+    except ValueError as exc:
+        if response.status_code >= 500:
+            raise AtlasFunnelRequestError(
+                response.status_code,
+                "EOM customer handoff service is temporarily unavailable; retry this approval",
+            ) from exc
+        raise AtlasFunnelRequestError(
+            502, "EOM customer handoff service returned an invalid response"
+        ) from exc
+    if response.status_code in (401, 403):
+        logger.error("Atlas EOM funnel service credential rejected status=%s", response.status_code)
+        raise AtlasFunnelRequestError(502, "EOM customer handoff service authentication failed")
+    if response.status_code >= 400:
+        detail: Any = content.get("detail", content) if isinstance(content, dict) else content
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("error") or "EOM customer handoff failed"
+        if not isinstance(detail, str) or not detail.strip():
+            detail = "EOM customer handoff failed"
+        raise AtlasFunnelRequestError(response.status_code, detail)
+    if not isinstance(content, dict):
+        raise AtlasFunnelRequestError(502, "EOM customer handoff service returned an invalid response")
     return content
 
 
@@ -3359,6 +3448,27 @@ def _ensure_customer_site_schema() -> None:
                 ALTER TABLE locations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
                 ALTER TABLE locations ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
                 ALTER TABLE locations ADD COLUMN IF NOT EXISTS archived_by INTEGER REFERENCES employees(id) ON DELETE SET NULL;
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eom_office_conversion_handoffs (
+                    atlas_contact_id UUID PRIMARY KEY,
+                    idempotency_key UUID NOT NULL UNIQUE,
+                    request_fingerprint VARCHAR(64) NOT NULL,
+                    customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+                    site_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE RESTRICT,
+                    approved_by_employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE RESTRICT,
+                    state VARCHAR(16) NOT NULL DEFAULT 'pending'
+                        CHECK (state IN ('pending', 'finalized')),
+                    atlas_handoff_id UUID,
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    finalized_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS idx_eom_office_conversion_handoffs_state
+                    ON eom_office_conversion_handoffs(state, updated_at);
                 """
             )
 
@@ -9145,6 +9255,157 @@ def _insert_site(
     return int(cur.fetchone()["id"])
 
 
+def _require_juan_funnel_approver(admin: Dict[str, Any]) -> None:
+    """Require the configured stable employee identity, not a display name."""
+    if EOM_FUNNEL_APPROVER_EMPLOYEE_ID <= 0:
+        raise HTTPException(
+            status_code=503,
+            detail="EOM funnel approval is not configured",
+        )
+    if int(admin["id"]) != EOM_FUNNEL_APPROVER_EMPLOYEE_ID:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the configured EOM funnel approver may approve estimates",
+        )
+
+
+def _office_conversion_fingerprint(payload: OfficeEstimateApprovalRequest) -> str:
+    """Fingerprint every customer/site field while excluding the retry key."""
+    source = payload.model_dump(mode="json", exclude={"idempotencyKey"})
+    canonical = json.dumps(source, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _serialize_office_conversion_handoff(
+    row: Dict[str, Any],
+    customer: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "contactId": str(row["atlas_contact_id"]),
+        "customerId": int(row["customer_id"]),
+        "siteId": int(row["site_id"]),
+        "status": str(row["state"]),
+        "atlasHandoffId": (
+            str(row["atlas_handoff_id"])
+            if row.get("atlas_handoff_id") is not None
+            else None
+        ),
+        "lastError": row.get("last_error"),
+        "customer": customer,
+    }
+
+
+def _reserve_office_conversion_handoff(
+    payload: OfficeEstimateApprovalRequest,
+    admin: Dict[str, Any],
+) -> tuple[Dict[str, Any], bool]:
+    """Create once or return the canonical local operation under one lock."""
+    fingerprint = _office_conversion_fingerprint(payload)
+    contact_id = str(payload.atlasContactId)
+    key = str(payload.idempotencyKey)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            cur.execute(
+                """
+                SELECT *
+                FROM eom_office_conversion_handoffs
+                WHERE atlas_contact_id = %s
+                FOR UPDATE
+                """,
+                (contact_id,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                row = dict(existing)
+                if str(row["idempotency_key"]) != key:
+                    _raise_conflict(
+                        "office_conversion_contact_already_reserved",
+                        "This Atlas lead already has an office conversion approval",
+                        {"customerId": int(row["customer_id"]), "siteId": int(row["site_id"])},
+                    )
+                if not hmac.compare_digest(str(row["request_fingerprint"]), fingerprint):
+                    _raise_conflict(
+                        "office_conversion_retry_mismatch",
+                        "This approval key was already used with different estimate details",
+                        {"customerId": int(row["customer_id"]), "siteId": int(row["site_id"])},
+                    )
+                customer = _canonical_customer(cur, int(row["customer_id"]))
+                return {"handoff": row, "customer": customer}, False
+
+            cur.execute(
+                "SELECT id FROM customers WHERE atlas_contact_id = %s FOR UPDATE",
+                (contact_id,),
+            )
+            legacy_matches = cur.fetchall()
+            if legacy_matches:
+                _raise_conflict(
+                    "office_conversion_existing_atlas_customer",
+                    "An existing Atlas-linked Customer must be reconciled before approval",
+                    {"customerIds": [int(match["id"]) for match in legacy_matches]},
+                )
+
+            customer_id = _insert_customer(cur, payload)
+            site_id = _insert_site(cur, customer_id, payload.name, payload.primarySite)
+            cur.execute(
+                """
+                INSERT INTO eom_office_conversion_handoffs (
+                    atlas_contact_id, idempotency_key, request_fingerprint,
+                    customer_id, site_id, approved_by_employee_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (contact_id, key, fingerprint, customer_id, site_id, int(admin["id"])),
+            )
+            row = dict(cur.fetchone())
+            customer = _canonical_customer(cur, customer_id)
+            return {"handoff": row, "customer": customer}, True
+
+
+def _mark_office_conversion_finalized(
+    contact_id: str,
+    idempotency_key: str,
+    atlas_handoff_id: str,
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            cur.execute(
+                """
+                UPDATE eom_office_conversion_handoffs
+                SET state = 'finalized', atlas_handoff_id = %s,
+                    last_error = NULL, finalized_at = COALESCE(finalized_at, NOW()),
+                    updated_at = NOW()
+                WHERE atlas_contact_id = %s AND idempotency_key = %s
+                RETURNING *
+                """,
+                (atlas_handoff_id, contact_id, idempotency_key),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Office conversion handoff disappeared before finalization")
+            return dict(row)
+
+
+def _note_office_conversion_error(
+    contact_id: str,
+    idempotency_key: str,
+    reason: str,
+) -> None:
+    try:
+        db.execute(
+            """
+            UPDATE eom_office_conversion_handoffs
+            SET last_error = %s, updated_at = NOW()
+            WHERE atlas_contact_id = %s AND idempotency_key = %s
+            """,
+            (reason[:1000], contact_id, idempotency_key),
+        )
+    except Exception:
+        logger.exception("Could not save office conversion handoff error")
+
+
 @app.get("/api/admin/customers")
 def admin_list_customers(
     request: Request,
@@ -9190,6 +9451,112 @@ def admin_create_customer(
         f"Customer {customer_id} by {admin['name']}",
     )
     return {"success": True, "customer": customer}
+
+
+@app.post("/api/admin/funnel/approve-estimate")
+def admin_approve_estimate(
+    payload: OfficeEstimateApprovalRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Create one operational Customer/Site and finalize its Atlas lead link.
+
+    This is intentionally an office command. It neither creates a job nor
+    projects a calendar event: those follow after the approved estimate through
+    their existing operational workflows.
+    """
+    _require_juan_funnel_approver(admin)
+    _require_atlas_funnel_configuration()
+    reserved, created = _reserve_office_conversion_handoff(payload, admin)
+    handoff = reserved["handoff"]
+    customer = reserved["customer"]
+    contact_id = str(payload.atlasContactId)
+    idempotency_key = str(payload.idempotencyKey)
+
+    if handoff["state"] == "finalized":
+        append_access_log(
+            request,
+            "EOM_ESTIMATE_APPROVAL_REPLAYED",
+            True,
+            f"contact={contact_id} customer={handoff['customer_id']}",
+        )
+        return JSONResponse(
+            status_code=200,
+            content=jsonable_encoder(
+                {
+                    "success": True,
+                    "idempotent": True,
+                    "handoff": _serialize_office_conversion_handoff(handoff, customer),
+                }
+            ),
+        )
+
+    atlas_payload = {
+        "contact_id": contact_id,
+        "tracker_customer_id": int(handoff["customer_id"]),
+        "tracker_site_id": int(handoff["site_id"]),
+    }
+    try:
+        atlas_result = _atlas_funnel_request(
+            "/eom-funnel/customer-handoffs",
+            admin,
+            payload=atlas_payload,
+            idempotency_key=idempotency_key,
+        )
+        try:
+            response_customer_id = int(atlas_result.get("tracker_customer_id", 0))
+            response_site_id = int(atlas_result.get("tracker_site_id", 0))
+        except (TypeError, ValueError):
+            response_customer_id = 0
+            response_site_id = 0
+        if (
+            not bool(atlas_result.get("success"))
+            or str(atlas_result.get("contact_id", "")) != contact_id
+            or response_customer_id != int(handoff["customer_id"])
+            or response_site_id != int(handoff["site_id"])
+            or str(atlas_result.get("approval_key", "")) != idempotency_key
+            or not str(atlas_result.get("handoff_id", "")).strip()
+        ):
+            raise AtlasFunnelRequestError(
+                502, "EOM customer handoff service returned a mismatched response"
+            )
+    except AtlasFunnelRequestError as exc:
+        _note_office_conversion_error(contact_id, idempotency_key, str(exc))
+        handoff = dict(handoff)
+        handoff["last_error"] = str(exc)
+        visible = _serialize_office_conversion_handoff(handoff, customer)
+        visible["status"] = "atlas_pending"
+        append_access_log(
+            request,
+            "EOM_ESTIMATE_APPROVAL_PENDING",
+            False,
+            f"contact={contact_id} customer={handoff['customer_id']} status={exc.status_code}",
+        )
+        return JSONResponse(
+            status_code=202,
+            content=jsonable_encoder(
+                {"success": False, "idempotent": not created, "handoff": visible}
+            ),
+        )
+
+    handoff = _mark_office_conversion_finalized(
+        contact_id,
+        idempotency_key,
+        str(atlas_result["handoff_id"]),
+    )
+    visible = _serialize_office_conversion_handoff(handoff, customer)
+    append_access_log(
+        request,
+        "EOM_ESTIMATE_APPROVED",
+        True,
+        f"contact={contact_id} customer={handoff['customer_id']} site={handoff['site_id']}",
+    )
+    return JSONResponse(
+        status_code=201 if created else 200,
+        content=jsonable_encoder(
+            {"success": True, "idempotent": False, "handoff": visible}
+        ),
+    )
 
 
 @app.get("/api/admin/customers/{customer_id}")
