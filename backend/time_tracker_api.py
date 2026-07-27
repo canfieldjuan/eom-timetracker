@@ -1954,6 +1954,17 @@ def _strip_optional_text(value: Any) -> Any:
     return stripped or None
 
 
+def _strip_optional_atlas_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=502, detail="EOM lead review service returned an invalid response"
+        )
+    stripped = value.strip()
+    return stripped or None
+
+
 def _validate_optional_email(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -3037,8 +3048,8 @@ def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]
     if not isinstance(leads, list):
         raise HTTPException(status_code=502, detail="EOM lead review service returned an invalid response")
     has_more = content.get("hasMore")
-    next_cursor = _strip_optional_text(content.get("nextCursor"))
-    cursor = _strip_optional_text(content.get("cursor"))
+    next_cursor = _strip_optional_atlas_text(content.get("nextCursor"))
+    cursor = _strip_optional_atlas_text(content.get("cursor"))
     if not isinstance(has_more, bool):
         raise HTTPException(status_code=502, detail="EOM lead review service returned an invalid response")
     if has_more and not next_cursor:
@@ -3065,10 +3076,10 @@ def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]
             {
                 "contactId": contact_id,
                 "fullName": full_name,
-                "email": _strip_optional_text(item.get("email")),
-                "phone": _strip_optional_text(item.get("phone")),
-                "address": _strip_optional_text(item.get("address")),
-                "source": _strip_optional_text(item.get("source")),
+                "email": _strip_optional_atlas_text(item.get("email")),
+                "phone": _strip_optional_atlas_text(item.get("phone")),
+                "address": _strip_optional_atlas_text(item.get("address")),
+                "source": _strip_optional_atlas_text(item.get("source")),
                 "createdAt": created_at,
             }
         )
@@ -3096,7 +3107,7 @@ def _validate_atlas_customer_handoff_result(
         response_site_id = 0
     atlas_handoff_id = str(atlas_result.get("handoff_id", "")).strip()
     if (
-        not bool(atlas_result.get("success"))
+        atlas_result.get("success") is not True
         or str(atlas_result.get("contact_id", "")) != contact_id
         or response_customer_id != customer_id
         or response_site_id != site_id
@@ -9894,7 +9905,7 @@ def admin_approve_estimate(
 def admin_list_funnel_review(
     request: Request,
     limit: int = Query(default=100, ge=1, le=200),
-    cursor: Optional[str] = Query(default=None, min_length=16, max_length=512),
+    cursor: Optional[str] = Query(default=None),
     admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     params: Dict[str, Any] = {"limit": limit}
