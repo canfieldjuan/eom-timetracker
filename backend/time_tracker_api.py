@@ -14079,8 +14079,16 @@ def admin_pricing_recommendations(
             required_revenue = required_rev_margin
 
         # Calculate suggested increase
-        revenue_gap = round(required_revenue - actual_revenue, 2) if required_revenue is not None else None
-        pct_increase = round(revenue_gap / actual_revenue * 100, 1) if revenue_gap is not None and actual_revenue > 0 else None
+        revenue_gap = (
+            round(required_revenue - actual_revenue, 2)
+            if required_revenue is not None and actual_revenue is not None
+            else None
+        )
+        pct_increase = (
+            round(revenue_gap / actual_revenue * 100, 1)
+            if revenue_gap is not None and actual_revenue is not None and actual_revenue > 0
+            else None
+        )
 
         # Suggested new per-visit price
         needs_increase = revenue_gap is not None and revenue_gap > 0
@@ -14103,6 +14111,8 @@ def admin_pricing_recommendations(
             "targetLaborPct": target_labor,
             "minMarginPct": min_margin,
             "actualRevenue": actual_revenue,
+            "knownRevenue": c.get("knownRevenue", actual_revenue),
+            "revenueComplete": c.get("revenueComplete", True),
             "actualLaborCost": actual_labor_cost,
             "actualLaborPct": c["laborPct"],
             "actualMarginPct": c["grossMarginPct"],
@@ -14114,6 +14124,7 @@ def admin_pricing_recommendations(
             "hours": actual_hours,
             "flag": c.get("flag", "Healthy"),
             "needsIncrease": needs_increase,
+            "issues": c.get("issues", []),
         }
         recommendations.append(rec)
 
@@ -14900,10 +14911,17 @@ def _analytics_entry_job_id(value: Any) -> Optional[int]:
 
 def _analytics_linked_job_revenue_cents(
     job_ids: set[int],
-) -> Tuple[Dict[int, Optional[int]], set[Tuple[str, str]]]:
+) -> Tuple[Dict[int, Optional[int]], set[Tuple[str, str]], Dict[int, Dict[str, Any]]]:
     """Return canonical rate-card revenue for linked single-location jobs."""
     if not job_ids:
-        return {}, set()
+        return {}, set(), {}
+
+    def _missing_revenue_issue(job_id: int) -> Dict[str, Any]:
+        return {
+            "code": "missing_revenue",
+            "message": "Revenue cannot be calculated from this linked job's Site rate card.",
+            "jobId": job_id,
+        }
 
     selected_jobs = db.query_all(
         """
@@ -14920,6 +14938,7 @@ def _analytics_linked_job_revenue_cents(
     monthly_linked_job_ids: set[int] = set()
     revenue_by_job: Dict[int, Optional[int]] = {}
     canonical_site_months: set[Tuple[str, str]] = set()
+    issues_by_job: Dict[int, Dict[str, Any]] = {}
     for row in selected_jobs:
         job_id = int(row["id"])
         rate_type = str(row.get("rate_type") or "")
@@ -14928,10 +14947,12 @@ def _analytics_linked_job_revenue_cents(
             continue
         if row.get("location_id") is None:
             revenue_by_job[job_id] = None
+            issues_by_job[job_id] = _missing_revenue_issue(job_id)
             continue
         rate_cents = _profitability_money_cents(row.get("rate"))
         if rate_cents is None:
             revenue_by_job[job_id] = None
+            issues_by_job[job_id] = _missing_revenue_issue(job_id)
             continue
         if rate_type == "per_visit":
             revenue_by_job[job_id] = rate_cents
@@ -14949,6 +14970,8 @@ def _analytics_linked_job_revenue_cents(
                 if expected is not None
                 else None
             )
+            if revenue_by_job[job_id] is None:
+                issues_by_job[job_id] = _missing_revenue_issue(job_id)
         elif rate_type == "monthly":
             scheduled_date = row["scheduled_date"]
             monthly_linked_job_ids.add(job_id)
@@ -14967,9 +14990,10 @@ def _analytics_linked_job_revenue_cents(
             )
         else:
             revenue_by_job[job_id] = None
+            issues_by_job[job_id] = _missing_revenue_issue(job_id)
 
     if not monthly_groups:
-        return revenue_by_job, canonical_site_months
+        return revenue_by_job, canonical_site_months, issues_by_job
 
     month_starts = [
         date(year, month, 1)
@@ -15005,7 +15029,8 @@ def _analytics_linked_job_revenue_cents(
             revenue_by_job[job_id] = monthly_allocations[job_id]
         elif job_id not in revenue_by_job:
             revenue_by_job[job_id] = None
-    return revenue_by_job, canonical_site_months
+            issues_by_job[job_id] = _missing_revenue_issue(job_id)
+    return revenue_by_job, canonical_site_months, issues_by_job
 
 
 def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
@@ -15085,6 +15110,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     (
         linked_job_revenue_cents,
         canonical_monthly_site_months,
+        linked_job_revenue_issues,
     ) = _analytics_linked_job_revenue_cents(linked_period_job_ids)
 
     emp_rates: Dict[int, float] = {}
@@ -15145,13 +15171,18 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             if job_id is not None
             else None
         )
+        revenue_issues: List[Dict[str, Any]] = []
+        revenue_complete = True
         if job_id is not None and job_id in linked_job_revenue_cents:
             if job_id not in linked_jobs_credited:
-                revenue = (
-                    float(Decimal(linked_cents) / Decimal(100))
-                    if linked_cents is not None
-                    else 0.0
-                )
+                if linked_cents is not None:
+                    revenue = float(Decimal(linked_cents) / Decimal(100))
+                else:
+                    revenue = 0.0
+                    revenue_complete = False
+                    issue = linked_job_revenue_issues.get(job_id)
+                    if issue:
+                        revenue_issues.append(issue)
                 linked_jobs_credited.add(job_id)
             else:
                 revenue = 0.0
@@ -15197,7 +15228,12 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                 "customer": customer, "location": resolved_location,
                 "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0,
                 "expectedHours": 0.0, "_hasExpected": False,
+                "_revenueComplete": True, "issues": [],
             }
+        customer_agg[customer]["_revenueComplete"] = (
+            bool(customer_agg[customer]["_revenueComplete"]) and revenue_complete
+        )
+        customer_agg[customer]["issues"].extend(revenue_issues)
         if is_new_visit:
             customer_agg[customer]["visits"] += 1
             if exp_h is not None:
@@ -15208,7 +15244,19 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         customer_agg[customer]["laborCost"] += labor_cost
 
         if date_key not in day_agg:
-            day_agg[date_key] = {"date": date_key, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
+            day_agg[date_key] = {
+                "date": date_key,
+                "visits": 0,
+                "hours": 0.0,
+                "revenue": 0.0,
+                "laborCost": 0.0,
+                "_revenueComplete": True,
+                "issues": [],
+            }
+        day_agg[date_key]["_revenueComplete"] = (
+            bool(day_agg[date_key]["_revenueComplete"]) and revenue_complete
+        )
+        day_agg[date_key]["issues"].extend(revenue_issues)
         if is_new_visit:
             day_agg[date_key]["visits"] += 1
         day_agg[date_key]["hours"] += hours
@@ -15350,23 +15398,27 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         return flag, reasons
 
     def _finalize(d: Dict[str, Any]) -> Dict[str, Any]:
-        rev = d["revenue"]
+        known_rev = round(d["revenue"], 2)
+        revenue_complete = bool(d.get("_revenueComplete", True))
+        rev = known_rev if revenue_complete else None
         lc = d["laborCost"]
         actual_h = round(d["hours"], 2)
-        lp = round(lc / rev * 100, 1) if rev > 0 else None
-        net = round(rev - lc, 2)
-        gross_margin = round(net / rev * 100, 1) if rev > 0 else None
+        lp = round(lc / rev * 100, 1) if rev is not None and rev > 0 else None
+        net = round(rev - lc, 2) if rev is not None else None
+        gross_margin = round(net / rev * 100, 1) if rev is not None and rev > 0 and net is not None else None
         has_exp = d.get("_hasExpected", False)
         exp_h = round(d.get("expectedHours", 0.0), 2) if has_exp else None
         variance = round(exp_h - actual_h, 2) if exp_h is not None else None
-        rplh = round(rev / actual_h, 2) if actual_h > 0 else None
+        rplh = round(rev / actual_h, 2) if rev is not None and actual_h > 0 else None
         flag, flag_reasons = _classify(lp, gross_margin, variance, rplh)
         return {
             "customer": d["customer"],
             "location": d["location"],
             "visits": d["visits"],
             "hours": actual_h,
-            "revenue": round(rev, 2),
+            "revenue": rev,
+            "knownRevenue": known_rev,
+            "revenueComplete": revenue_complete,
             "laborCost": round(lc, 2),
             "laborPct": lp,
             "netProfit": net,
@@ -15376,29 +15428,56 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             "rplh": rplh,
             "flag": flag,
             "flagReasons": flag_reasons,
+            "issues": list(d.get("issues") or []),
         }
 
-    by_customer = sorted([_finalize(c) for c in customer_agg.values()], key=lambda x: x["revenue"], reverse=True)
+    by_customer = sorted(
+        [_finalize(c) for c in customer_agg.values()],
+        key=lambda x: x["knownRevenue"],
+        reverse=True,
+    )
     by_day = sorted(
         [
             {
                 "date": d["date"],
                 "visits": d["visits"],
                 "hours": round(d["hours"], 2),
-                "revenue": round(d["revenue"], 2),
+                "revenue": (
+                    round(d["revenue"], 2)
+                    if bool(d.get("_revenueComplete", True))
+                    else None
+                ),
+                "knownRevenue": round(d["revenue"], 2),
+                "revenueComplete": bool(d.get("_revenueComplete", True)),
                 "laborCost": round(d["laborCost"], 2),
-                "laborPct": round(d["laborCost"] / d["revenue"] * 100, 1) if d["revenue"] > 0 else None,
-                "netProfit": round(d["revenue"] - d["laborCost"], 2),
+                "laborPct": (
+                    round(d["laborCost"] / d["revenue"] * 100, 1)
+                    if bool(d.get("_revenueComplete", True)) and d["revenue"] > 0
+                    else None
+                ),
+                "netProfit": (
+                    round(d["revenue"] - d["laborCost"], 2)
+                    if bool(d.get("_revenueComplete", True))
+                    else None
+                ),
+                "issues": list(d.get("issues") or []),
             }
             for d in day_agg.values()
         ],
         key=lambda x: x["date"],
     )
 
-    total_rev = sum(c["revenue"] for c in by_customer)
+    revenue_complete = all(c.get("revenueComplete", True) for c in by_customer)
+    known_total_rev = round(sum(c["knownRevenue"] for c in by_customer), 2)
+    total_rev = known_total_rev if revenue_complete else None
     total_lc = sum(c["laborCost"] for c in by_customer)
     total_hours = round(sum(c["hours"] for c in by_customer), 2)
     total_visits = sum(c["visits"] for c in by_customer)
+    issues = [
+        issue
+        for row in by_customer
+        for issue in row.get("issues", [])
+    ]
 
     return {
         "success": True,
@@ -15407,14 +15486,21 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         "endDate": end_date.strftime("%Y-%m-%d") if end_date else None,
         "laborPctTarget": settings["laborPctTarget"],
         "summary": {
-            "revenue": round(total_rev, 2),
+            "revenue": total_rev,
+            "knownRevenue": known_total_rev,
+            "revenueComplete": revenue_complete,
             "laborCost": round(total_lc, 2),
-            "laborPct": round(total_lc / total_rev * 100, 1) if total_rev > 0 else None,
-            "netProfit": round(total_rev - total_lc, 2),
-            "grossMarginPct": round((total_rev - total_lc) / total_rev * 100, 1) if total_rev > 0 else None,
+            "laborPct": round(total_lc / total_rev * 100, 1) if total_rev is not None and total_rev > 0 else None,
+            "netProfit": round(total_rev - total_lc, 2) if total_rev is not None else None,
+            "grossMarginPct": (
+                round((total_rev - total_lc) / total_rev * 100, 1)
+                if total_rev is not None and total_rev > 0
+                else None
+            ),
             "hours": total_hours,
             "visits": total_visits,
         },
+        "issues": issues,
         "byCustomer": by_customer,
         "byDay": by_day,
     }
@@ -15445,12 +15531,18 @@ def admin_dashboard(
 
     def _card(data: Dict[str, Any], label: str) -> Dict[str, Any]:
         s = data["summary"]
-        rplh = round(s["revenue"] / s["hours"], 2) if s["hours"] > 0 else None
+        rplh = (
+            round(s["revenue"] / s["hours"], 2)
+            if s["revenue"] is not None and s["hours"] > 0
+            else None
+        )
         return {
             "period": label,
             "startDate": data["startDate"],
             "endDate": data["endDate"],
             "revenue": s["revenue"],
+            "knownRevenue": s.get("knownRevenue", s["revenue"]),
+            "revenueComplete": s.get("revenueComplete", True),
             "laborCost": s["laborCost"],
             "laborPct": s["laborPct"],
             "netProfit": s["netProfit"],
@@ -15458,13 +15550,21 @@ def admin_dashboard(
             "hours": s["hours"],
             "visits": s["visits"],
             "rplh": rplh,
+            "issues": data.get("issues", []),
         }
 
     # Top/bottom 5 by net profit (from month data for meaningful ranking)
     customers = month_data["byCustomer"]
-    by_profit = sorted(customers, key=lambda c: c["netProfit"], reverse=True)
+    by_profit = sorted(
+        customers,
+        key=lambda c: c["netProfit"] if c["netProfit"] is not None else float("-inf"),
+        reverse=True,
+    )
     top5 = by_profit[:5]
-    bottom5 = sorted(customers, key=lambda c: c["netProfit"])[:5]
+    bottom5 = sorted(
+        customers,
+        key=lambda c: c["netProfit"] if c["netProfit"] is not None else float("inf"),
+    )[:5]
 
     # Biggest hour overruns
     overruns = [
@@ -15508,29 +15608,32 @@ def admin_analytics_export(
     w = csv.writer(buf)
     s = data["summary"]
 
+    def _csv_money(value: Any) -> str:
+        return "N/A" if value is None else f"${value:.2f}"
+
     w.writerow(["EOM Analytics Export"])
     w.writerow(["Period", data["period"], "From", data["startDate"], "To", data["endDate"]])
-    w.writerow(["Revenue", f'${s["revenue"]:.2f}', "Labor Cost", f'${s["laborCost"]:.2f}',
+    w.writerow(["Revenue", _csv_money(s["revenue"]), "Labor Cost", _csv_money(s["laborCost"]),
                 "Labor %", f'{s["laborPct"]}%' if s["laborPct"] is not None else "N/A",
-                "Net Profit", f'${s["netProfit"]:.2f}', "Target", f'{data["laborPctTarget"]}%'])
+                "Net Profit", _csv_money(s["netProfit"]), "Target", f'{data["laborPctTarget"]}%'])
     w.writerow([])
 
     w.writerow(["By Customer"])
     w.writerow(["Customer", "Location", "Visits", "Hours", "Revenue", "Labor Cost", "Labor %", "Net Profit"])
     for c in data["byCustomer"]:
         w.writerow([c["customer"], c["location"], c["visits"], f'{c["hours"]:.2f}',
-                    f'${c["revenue"]:.2f}', f'${c["laborCost"]:.2f}',
+                    _csv_money(c["revenue"]), _csv_money(c["laborCost"]),
                     f'{c["laborPct"]}%' if c["laborPct"] is not None else "N/A",
-                    f'${c["netProfit"]:.2f}'])
+                    _csv_money(c["netProfit"])])
     w.writerow([])
 
     w.writerow(["By Day"])
     w.writerow(["Date", "Visits", "Hours", "Revenue", "Labor Cost", "Labor %", "Net Profit"])
     for d in data["byDay"]:
         w.writerow([d["date"], d["visits"], f'{d["hours"]:.2f}',
-                    f'${d["revenue"]:.2f}', f'${d["laborCost"]:.2f}',
+                    _csv_money(d["revenue"]), _csv_money(d["laborCost"]),
                     f'{d["laborPct"]}%' if d["laborPct"] is not None else "N/A",
-                    f'${d["netProfit"]:.2f}'])
+                    _csv_money(d["netProfit"])])
 
     buf.seek(0)
     filename = f"eom_analytics_{period}_{data['startDate']}.csv"
@@ -15635,6 +15738,7 @@ def admin_analytics_customer(
     (
         linked_job_revenue_cents,
         canonical_monthly_site_months,
+        linked_job_revenue_issues,
     ) = _analytics_linked_job_revenue_cents(linked_period_job_ids)
     linked_jobs_credited: set[int] = set()
 
@@ -15647,7 +15751,7 @@ def admin_analytics_customer(
         monthly_credited: set,
         date_key: str,
         job_id: Optional[int] = None,
-    ) -> float:
+    ) -> Tuple[float, bool, List[Dict[str, Any]]]:
         linked_cents = (
             linked_job_revenue_cents.get(job_id)
             if job_id is not None
@@ -15656,34 +15760,33 @@ def admin_analytics_customer(
         if job_id is not None and job_id in linked_job_revenue_cents:
             if job_id not in linked_jobs_credited:
                 linked_jobs_credited.add(job_id)
-                return (
-                    float(Decimal(linked_cents) / Decimal(100))
-                    if linked_cents is not None
-                    else 0.0
-                )
-            return 0.0
+                if linked_cents is not None:
+                    return float(Decimal(linked_cents) / Decimal(100)), True, []
+                issue = linked_job_revenue_issues.get(job_id)
+                return 0.0, False, [issue] if issue else []
+            return 0.0, True, []
         rate = location_rates.get(resolved_location)
         rate_type = location_rate_types.get(resolved_location, "per_visit")
         if rate is None:
-            return 0.0
+            return 0.0, True, []
         if rate_type == "hourly":
-            return float(rate) * hours
+            return float(rate) * hours, True, []
         elif rate_type == "monthly":
             period_month = f"{entry_date.year}-{entry_date.month:02d}"
             site_month_key = (resolved_location, period_month)
             if site_month_key in canonical_monthly_site_months:
-                return 0.0
+                return 0.0, True, []
             month_key = (cust, period_month)
             if month_key not in monthly_credited:
                 monthly_credited.add(month_key)
-                return float(rate)
-            return 0.0
+                return float(rate), True, []
+            return 0.0, True, []
         else:  # per_visit: credit once per location per day across all employees
             visit_key = (resolved_location, date_key)
             if is_visit and visit_key not in visited_for_revenue:
                 visited_for_revenue.add(visit_key)
-                return float(rate)
-            return 0.0
+                return float(rate), True, []
+            return 0.0, True, []
 
     visits_list: List[Dict[str, Any]] = []
     week_agg: Dict[str, Dict[str, Any]] = {}
@@ -15703,7 +15806,7 @@ def admin_analytics_customer(
     ) -> None:
         if cust != customer_name:
             return
-        revenue = _calc_revenue(
+        revenue, revenue_complete, revenue_issues = _calc_revenue(
             resolved_location,
             cust,
             hours,
@@ -15714,19 +15817,43 @@ def admin_analytics_customer(
             job_id=job_id,
         )
         labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
-        lp = round(labor_cost / revenue * 100, 1) if revenue > 0 else None
+        public_revenue = revenue if revenue_complete else None
+        lp = (
+            round(labor_cost / public_revenue * 100, 1)
+            if public_revenue is not None and public_revenue > 0
+            else None
+        )
         visits_list.append({
             "date": entry_date.strftime("%Y-%m-%d"),
             "weekStart": week_key,
             "employee": emp_name,
             "hours": round(hours, 2),
-            "revenue": round(revenue, 2),
+            "revenue": round(public_revenue, 2) if public_revenue is not None else None,
+            "knownRevenue": round(revenue, 2),
+            "revenueComplete": revenue_complete,
             "laborCost": round(labor_cost, 2),
             "laborPct": lp,
-            "netProfit": round(revenue - labor_cost, 2),
+            "netProfit": (
+                round(public_revenue - labor_cost, 2)
+                if public_revenue is not None
+                else None
+            ),
+            "issues": revenue_issues,
         })
         if week_key not in week_agg:
-            week_agg[week_key] = {"weekStart": week_key, "visits": 0, "hours": 0.0, "revenue": 0.0, "laborCost": 0.0}
+            week_agg[week_key] = {
+                "weekStart": week_key,
+                "visits": 0,
+                "hours": 0.0,
+                "revenue": 0.0,
+                "laborCost": 0.0,
+                "_revenueComplete": True,
+                "issues": [],
+            }
+        week_agg[week_key]["_revenueComplete"] = (
+            bool(week_agg[week_key]["_revenueComplete"]) and revenue_complete
+        )
+        week_agg[week_key]["issues"].extend(revenue_issues)
         if is_visit:
             week_agg[week_key]["visits"] += 1
         week_agg[week_key]["hours"] += hours
@@ -15808,19 +15935,38 @@ def admin_analytics_customer(
             )
 
     def _fin_week(w: Dict[str, Any]) -> Dict[str, Any]:
-        rev = w["revenue"]
+        known_rev = round(w["revenue"], 2)
+        revenue_complete = bool(w.get("_revenueComplete", True))
+        rev = known_rev if revenue_complete else None
         lc = w["laborCost"]
-        lp = round(lc / rev * 100, 1) if rev > 0 else None
-        return {**w, "hours": round(w["hours"], 2), "revenue": round(rev, 2),
-                "laborCost": round(lc, 2), "laborPct": lp, "netProfit": round(rev - lc, 2)}
+        lp = round(lc / rev * 100, 1) if rev is not None and rev > 0 else None
+        return {
+            "weekStart": w["weekStart"],
+            "visits": w["visits"],
+            "hours": round(w["hours"], 2),
+            "revenue": rev,
+            "knownRevenue": known_rev,
+            "revenueComplete": revenue_complete,
+            "laborCost": round(lc, 2),
+            "laborPct": lp,
+            "netProfit": round(rev - lc, 2) if rev is not None else None,
+            "issues": list(w.get("issues") or []),
+        }
 
     visits_list_sorted = sorted(visits_list, key=lambda x: x["date"], reverse=True)
     by_week = sorted([_fin_week(w) for w in week_agg.values()], key=lambda x: x["weekStart"])
 
-    total_rev = sum(v["revenue"] for v in visits_list)
+    revenue_complete = all(v.get("revenueComplete", True) for v in visits_list)
+    known_total_rev = round(sum(v["knownRevenue"] for v in visits_list), 2)
+    total_rev = known_total_rev if revenue_complete else None
     total_lc = sum(v["laborCost"] for v in visits_list)
     total_hours = round(sum(v["hours"] for v in visits_list), 2)
     total_visits = len(visits_list)
+    issues = [
+        issue
+        for row in visits_list
+        for issue in row.get("issues", [])
+    ]
 
     return {
         "success": True,
@@ -15832,11 +15978,14 @@ def admin_analytics_customer(
         "summary": {
             "visits": total_visits,
             "hours": total_hours,
-            "revenue": round(total_rev, 2),
+            "revenue": total_rev,
+            "knownRevenue": known_total_rev,
+            "revenueComplete": revenue_complete,
             "laborCost": round(total_lc, 2),
-            "laborPct": round(total_lc / total_rev * 100, 1) if total_rev > 0 else None,
-            "netProfit": round(total_rev - total_lc, 2),
+            "laborPct": round(total_lc / total_rev * 100, 1) if total_rev is not None and total_rev > 0 else None,
+            "netProfit": round(total_rev - total_lc, 2) if total_rev is not None else None,
         },
+        "issues": issues,
         "byVisit": visits_list_sorted,
         "byWeek": by_week,
     }
