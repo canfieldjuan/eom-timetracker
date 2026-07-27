@@ -46,15 +46,29 @@ actually happens, then compare that to what the claim says.
 
 When a change adds or edits **a set whose membership a decision depends on** — a
 literal list used in a branch, a pattern family, a list duplicating one that
-exists elsewhere, or the set of behaviours/callers/fields the change must cover
-to be complete — the PR states which of three dispositions applies:
+exists elsewhere, or the set of behaviors/callers/fields the change must cover
+to be complete — the PR answers two independent questions.
 
-- **CLOSED** — genuinely finite and owned here. Cite where the canonical list lives.
+**1. Is the set closed or open?**
+
+- **CLOSED** — membership is finite and fully enumerable here. Cite where the
+  canonical list lives.
+- **OPEN** — membership is not fully enumerable, so any list is a heuristic.
+  State what happens to members not in the list, and make incompleteness err to
+  the cheap-error side.
+
+**2. Where does membership come from?**
+
+- **ENUMERATED** — written out in this change.
 - **DERIVED** — computed at runtime from a source of truth, so it cannot drift.
-  Prefer this whenever a source of truth exists; it is the only disposition that
+  Prefer this wherever a source of truth exists; it is the only sourcing that
   stays correct without maintenance.
-- **DEFAULTED** — open, so any list is a heuristic. State what happens to members
-  not in the list, and make incompleteness err to the cheap-error side.
+
+**The two questions are independent, and answering the second never discharges
+the first.** A DERIVED set can still be open: derivation says where membership
+comes from, not what happens to an input outside it — a set derived from a
+schema still needs a stated behavior for a key that schema does not carry.
+"DERIVED" alone is not a complete declaration.
 
 **Enumerating an open set with no declared default is the defect.** A list that
 looks complete today is indistinguishable, in review, from one deliberately
@@ -76,16 +90,16 @@ values was assumed rather than read, and `render.yaml` is not truth — it has
 drifted from the deployed values more than once. Config-shaped sets are almost
 never CLOSED here; read the deployed value, or default explicitly.
 
-Reviewers state each set-valued dependency and its disposition before approving.
-An enumerated open set with no declared default is "needs the closure
+Reviewers state each set-valued dependency and both of its answers before
+approving. An open set with no declared default is "needs the closure
 declaration," even when every listed member behaves correctly.
 
-The long-form version of this rule — including the choke-point, class-closure and
-generative-test requirements that apply to guards over an open input space — is
-`docs/GUARD_CLASS_CLOSURE.md` in the Atlas repo. The text above is a deliberate
-cross-repo copy: normative here, because a pointer into another repository is not
-usable from inside this one. Drift from the Atlas original is the accepted cost of
-that boundary; when the two disagree, Atlas is canonical.
+This rule is stated in full here and governs PRs in this repository. The Atlas
+repo carries a longer-form version covering guards over an open input space —
+fail-closed choke point, class-closure, and a generative property test — which is
+related reading, not an authority over this file. Each repo's protocol governs
+its own PRs and they are expected to diverge where the stacks differ. Provenance:
+adapted from Atlas `docs/GUARD_CLASS_CLOSURE.md`, 2026-07-26.
 
 ## Severity (blast radius, not taste)
 
