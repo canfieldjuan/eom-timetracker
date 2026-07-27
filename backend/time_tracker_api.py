@@ -14863,17 +14863,18 @@ def _analytics_entry_job_id(value: Any) -> Optional[int]:
     return job_id if job_id > 0 else None
 
 
-def _analytics_monthly_job_revenue_cents(
+def _analytics_linked_job_revenue_cents(
     job_ids: set[int],
-) -> Tuple[Dict[int, int], set[Tuple[str, str]]]:
-    """Return canonical monthly allocations for linked monthly jobs."""
+) -> Tuple[Dict[int, Optional[int]], set[Tuple[str, str]]]:
+    """Return canonical rate-card revenue for linked single-location jobs."""
     if not job_ids:
         return {}, set()
 
     selected_jobs = db.query_all(
         """
         SELECT j.id, j.location_id, j.scheduled_date, j.scheduled_start,
-               j.status, l.address, l.rate, l.rate_type
+               j.status, l.address, l.rate, l.rate_type,
+               l.expected_hours AS site_expected_hours
         FROM jobs j
         JOIN locations l ON l.id = j.location_id
         WHERE j.id = ANY(%s)
@@ -14881,31 +14882,56 @@ def _analytics_monthly_job_revenue_cents(
         (sorted(job_ids),),
     )
     monthly_groups: Dict[Tuple[int, int, int], Any] = {}
-    revenue_by_job: Dict[int, int] = {}
+    monthly_linked_job_ids: set[int] = set()
+    revenue_by_job: Dict[int, Optional[int]] = {}
     canonical_site_months: set[Tuple[str, str]] = set()
     for row in selected_jobs:
         job_id = int(row["id"])
-        if str(row.get("rate_type") or "") != "monthly":
-            continue
+        rate_type = str(row.get("rate_type") or "")
         if row.get("status") == "cancelled":
             revenue_by_job[job_id] = 0
             continue
-        if row.get("location_id") is None or row.get("rate") is None:
+        if row.get("location_id") is None:
+            revenue_by_job[job_id] = None
             continue
-        scheduled_date = row["scheduled_date"]
-        monthly_groups[
-            (
-                int(row["location_id"]),
-                scheduled_date.year,
-                scheduled_date.month,
+        rate_cents = _profitability_money_cents(row.get("rate"))
+        if rate_cents is None:
+            revenue_by_job[job_id] = None
+            continue
+        if rate_type == "per_visit":
+            revenue_by_job[job_id] = rate_cents
+        elif rate_type == "hourly":
+            expected = _profitability_nonnegative_decimal(
+                row.get("site_expected_hours")
             )
-        ] = row.get("rate")
-        canonical_site_months.add(
-            (
-                str(row["address"] or ""),
-                f"{scheduled_date.year}-{scheduled_date.month:02d}",
+            revenue_by_job[job_id] = (
+                int(
+                    (Decimal(rate_cents) * expected).quantize(
+                        Decimal("1"),
+                        rounding=ROUND_HALF_UP,
+                    )
+                )
+                if expected is not None
+                else None
             )
-        )
+        elif rate_type == "monthly":
+            scheduled_date = row["scheduled_date"]
+            monthly_linked_job_ids.add(job_id)
+            monthly_groups[
+                (
+                    int(row["location_id"]),
+                    scheduled_date.year,
+                    scheduled_date.month,
+                )
+            ] = row.get("rate")
+            canonical_site_months.add(
+                (
+                    str(row["address"] or ""),
+                    f"{scheduled_date.year}-{scheduled_date.month:02d}",
+                )
+            )
+        else:
+            revenue_by_job[job_id] = None
 
     if not monthly_groups:
         return revenue_by_job, canonical_site_months
@@ -14939,9 +14965,11 @@ def _analytics_monthly_job_revenue_cents(
         [dict(row) for row in candidate_rows],
         app_timezone,
     )
-    for job_id in job_ids:
+    for job_id in monthly_linked_job_ids:
         if job_id in monthly_allocations:
             revenue_by_job[job_id] = monthly_allocations[job_id]
+        elif job_id not in revenue_by_job:
+            revenue_by_job[job_id] = None
     return revenue_by_job, canonical_site_months
 
 
@@ -15013,9 +15041,9 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         if job_id is not None:
             linked_period_job_ids.add(job_id)
     (
-        monthly_job_revenue_cents,
+        linked_job_revenue_cents,
         canonical_monthly_site_months,
-    ) = _analytics_monthly_job_revenue_cents(linked_period_job_ids)
+    ) = _analytics_linked_job_revenue_cents(linked_period_job_ids)
 
     emp_rates: Dict[int, float] = {}
     for emp in employees_data["employees"]:
@@ -15025,7 +15053,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
 
     days_in_period = (end_date - start_date).days + 1 if (start_date and end_date) else 365
     monthly_customers_credited: set = set()
-    monthly_jobs_credited: set[int] = set()
+    linked_jobs_credited: set[int] = set()
     visited_customer_dates: set = set()  # (customer, date_key) - dedup multi-employee same-day visits
 
     customer_agg: Dict[str, Dict[str, Any]] = {}
@@ -15070,47 +15098,52 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         if is_new_visit:
             visited_customer_dates.add(visit_key)
 
-        rate = location_rates.get(resolved_location)
-        rate_type = location_rate_types.get(resolved_location, "per_visit")
-        if rate is not None:
-            if rate_type == "hourly":
-                # Per-employee, per-hour: scales correctly with number of workers sent
-                revenue = rate * hours
-            elif rate_type == "monthly":
-                period_month = f"{entry_date.year}-{entry_date.month:02d}"
-                site_month_key = (resolved_location, period_month)
-                linked_cents = (
-                    monthly_job_revenue_cents.get(job_id)
-                    if job_id is not None
-                    else None
+        linked_cents = (
+            linked_job_revenue_cents.get(job_id)
+            if job_id is not None
+            else None
+        )
+        if job_id is not None and job_id in linked_job_revenue_cents:
+            if job_id not in linked_jobs_credited:
+                revenue = (
+                    float(Decimal(linked_cents) / Decimal(100))
+                    if linked_cents is not None
+                    else 0.0
                 )
-                if linked_cents is not None:
-                    if job_id not in monthly_jobs_credited:
-                        revenue = float(Decimal(linked_cents) / Decimal(100))
-                        monthly_jobs_credited.add(job_id)
-                    else:
-                        revenue = 0.0
-                elif site_month_key in canonical_monthly_site_months:
-                    revenue = 0.0
-                else:
-                    # Legacy fallback for unlinked or multi-stop rows.
-                    month_key = (customer, period_month)
-                    if month_key not in monthly_customers_credited:
-                        days_in_month = calendar.monthrange(
-                            entry_date.year,
-                            entry_date.month,
-                        )[1]
-                        revenue = round(
-                            rate * min(days_in_period / days_in_month, 1.0),
-                            2,
-                        )
-                        monthly_customers_credited.add(month_key)
-                    else:
-                        revenue = 0.0
-            else:  # per_visit: credit once per customer per day
-                revenue = rate if is_new_visit else 0.0
+                linked_jobs_credited.add(job_id)
+            else:
+                revenue = 0.0
         else:
-            revenue = 0.0
+            rate = location_rates.get(resolved_location)
+            rate_type = location_rate_types.get(resolved_location, "per_visit")
+            if rate is not None:
+                if rate_type == "hourly":
+                    # Legacy fallback for unlinked rows.
+                    revenue = rate * hours
+                elif rate_type == "monthly":
+                    period_month = f"{entry_date.year}-{entry_date.month:02d}"
+                    site_month_key = (resolved_location, period_month)
+                    if site_month_key in canonical_monthly_site_months:
+                        revenue = 0.0
+                    else:
+                        # Legacy fallback for unlinked or multi-stop rows.
+                        month_key = (customer, period_month)
+                        if month_key not in monthly_customers_credited:
+                            days_in_month = calendar.monthrange(
+                                entry_date.year,
+                                entry_date.month,
+                            )[1]
+                            revenue = round(
+                                rate * min(days_in_period / days_in_month, 1.0),
+                                2,
+                            )
+                            monthly_customers_credited.add(month_key)
+                        else:
+                            revenue = 0.0
+                else:  # per_visit: credit once per customer per day
+                    revenue = rate if is_new_visit else 0.0
+            else:
+                revenue = 0.0
 
         emp_rate = emp_rates.get(emp_id)
         labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
@@ -15539,10 +15572,10 @@ def admin_analytics_customer(
         if job_id is not None:
             linked_period_job_ids.add(job_id)
     (
-        monthly_job_revenue_cents,
+        linked_job_revenue_cents,
         canonical_monthly_site_months,
-    ) = _analytics_monthly_job_revenue_cents(linked_period_job_ids)
-    monthly_jobs_credited: set[int] = set()
+    ) = _analytics_linked_job_revenue_cents(linked_period_job_ids)
+    linked_jobs_credited: set[int] = set()
 
     def _calc_revenue(
         resolved_location: str,
@@ -15554,6 +15587,20 @@ def admin_analytics_customer(
         date_key: str,
         job_id: Optional[int] = None,
     ) -> float:
+        linked_cents = (
+            linked_job_revenue_cents.get(job_id)
+            if job_id is not None
+            else None
+        )
+        if job_id is not None and job_id in linked_job_revenue_cents:
+            if job_id not in linked_jobs_credited:
+                linked_jobs_credited.add(job_id)
+                return (
+                    float(Decimal(linked_cents) / Decimal(100))
+                    if linked_cents is not None
+                    else 0.0
+                )
+            return 0.0
         rate = location_rates.get(resolved_location)
         rate_type = location_rate_types.get(resolved_location, "per_visit")
         if rate is None:
@@ -15563,16 +15610,6 @@ def admin_analytics_customer(
         elif rate_type == "monthly":
             period_month = f"{entry_date.year}-{entry_date.month:02d}"
             site_month_key = (resolved_location, period_month)
-            linked_cents = (
-                monthly_job_revenue_cents.get(job_id)
-                if job_id is not None
-                else None
-            )
-            if linked_cents is not None:
-                if job_id not in monthly_jobs_credited:
-                    monthly_jobs_credited.add(job_id)
-                    return float(Decimal(linked_cents) / Decimal(100))
-                return 0.0
             if site_month_key in canonical_monthly_site_months:
                 return 0.0
             month_key = (cust, period_month)
