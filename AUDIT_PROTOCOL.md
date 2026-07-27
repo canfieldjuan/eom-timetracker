@@ -42,6 +42,65 @@ actually happens, then compare that to what the claim says.
    Running it on file X does not license a claim about file Y. If you did not run
    it here, on this, you have not verified it — say "not verified."
 
+## Set-valued dependencies (declare the closure)
+
+When a change adds or edits **a set whose membership a decision depends on** — a
+literal list used in a branch, a pattern family, a list duplicating one that
+exists elsewhere, or the set of behaviors/callers/fields the change must cover
+to be complete — the PR answers two independent questions.
+
+**1. Is the set closed or open?**
+
+- **CLOSED** — membership is finite and fully enumerable here. Cite where the
+  canonical list lives.
+- **OPEN** — membership is not fully enumerable, so any list is a heuristic.
+  State what happens to members not in the list, and make incompleteness err to
+  the cheap-error side.
+
+**2. Where does membership come from?**
+
+- **ENUMERATED** — written out in this change.
+- **DERIVED** — computed at runtime from a source of truth, so it cannot drift.
+  Prefer this wherever a source of truth exists; it is the only sourcing that
+  stays correct without maintenance.
+
+**The two questions are independent, and answering the second never discharges
+the first.** A DERIVED set can still be open: derivation says where membership
+comes from, not what happens to an input outside it — a set derived from a
+schema still needs a stated behavior for a key that schema does not carry.
+"DERIVED" alone is not a complete declaration.
+
+**Enumerating an open set with no declared default is the defect.** A list that
+looks complete today is indistinguishable, in review, from one deliberately
+partial with a safe default — the declaration is what makes the difference
+visible. Every member found later is a real finding, so the loop cannot be
+shortened by relaxing review; it converges only when the PR says what *generates*
+membership instead of what is currently in the set.
+
+A list copied from elsewhere is CLOSED only if something enforces the copy.
+Otherwise it is a DERIVED candidate that was not derived, and it will drift
+silently. Prefer inverting ownership — have the consumer call the canonical
+definition — over maintaining two copies.
+
+Observed here: `ALLOWED_ORIGINS = _configured or DEFAULT` (#15) worked only when
+the env var was empty, and the deployed value was not — #16 replaced it with a
+union that cannot disable first-party origins. The same shape produced the
+`DATA_DIR` and `TIMEZONE` findings in #63: the set of deployed configuration
+values was assumed rather than read, and `render.yaml` is not truth — it has
+drifted from the deployed values more than once. Config-shaped sets are almost
+never CLOSED here; read the deployed value, or default explicitly.
+
+Reviewers state each set-valued dependency and both of its answers before
+approving. An open set with no declared default is "needs the closure
+declaration," even when every listed member behaves correctly.
+
+This rule is stated in full here and governs PRs in this repository. The Atlas
+repo carries a longer-form version covering guards over an open input space —
+fail-closed choke point, class-closure, and a generative property test — which is
+related reading, not an authority over this file. Each repo's protocol governs
+its own PRs and they are expected to diverge where the stacks differ. Provenance:
+adapted from Atlas `docs/GUARD_CLASS_CLOSURE.md`, 2026-07-26.
+
 ## Severity (blast radius, not taste)
 
 - **P1** — exploitable security or realistic data loss/corruption. State the
