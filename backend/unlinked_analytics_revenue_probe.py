@@ -1,9 +1,10 @@
-"""Read-only probe for remaining unlinked analytics revenue fallback rows.
+"""Read-only probe for pre-retirement unlinked analytics revenue fallback rows.
 
 The #62 convergence arc already routes rows with durable job identity through
-canonical Site rate-card allocation. This probe measures the remaining legacy
-fallback branch: productive analytics rows that still have no jobId but do have
-Site rate metadata.
+canonical Site rate-card allocation. This probe measures productive analytics
+rows that still have no jobId but do have Site rate metadata, so the historical
+legacy fallback blast radius can be audited after the runtime path fails those
+rows closed.
 """
 
 from __future__ import annotations
@@ -436,8 +437,8 @@ def _summary(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Measure unlinked/manual analytics revenue fallback rows before "
-            "changing #62 money behavior."
+            "Measure unlinked/manual analytics rows that used to take the "
+            "legacy revenue fallback before #62 retired that money behavior."
         ),
     )
     parser.add_argument(

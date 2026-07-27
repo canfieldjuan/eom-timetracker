@@ -2573,6 +2573,144 @@ class TestAnalyticsRegression:
             if site_ids:
                 db.execute("DELETE FROM locations WHERE id = ANY(%s)", (site_ids,))
 
+    def test_unlinked_valid_rate_fails_closed_in_analytics_views(
+        self,
+        client,
+        auth,
+        employee_id,
+        monkeypatch,
+    ):
+        import time_tracker_api as api
+
+        cases = [
+            (
+                "Analytics Unlinked Valid Hourly",
+                "Analytics Unlinked Valid Hourly Site",
+                40.0,
+                "hourly",
+            ),
+            (
+                "Analytics Unlinked Valid Per Visit",
+                "Analytics Unlinked Valid Per Visit Site",
+                75.0,
+                "per_visit",
+            ),
+            (
+                "Analytics Unlinked Valid Monthly",
+                "Analytics Unlinked Valid Monthly Site",
+                300.0,
+                "monthly",
+            ),
+        ]
+        site_ids: list[int] = []
+        shift_ids: list[int] = []
+        monkeypatch.setattr(
+            api,
+            "utc_now",
+            lambda: datetime(2047, 5, 10, 18, tzinfo=timezone.utc),
+        )
+        try:
+            expected_issues = []
+            for index, (customer_name, location_label, rate, rate_type) in enumerate(
+                cases
+            ):
+                site_id = _insert_profitability_site(
+                    address=location_label,
+                    customer_name=customer_name,
+                    rate=rate,
+                    rate_type=rate_type,
+                    expected_hours=2.0,
+                )
+                site_ids.append(site_id)
+                shift_ids.append(
+                    int(
+                        db.execute_returning(
+                            """
+                            INSERT INTO shifts (
+                                employee_id, location_id, location_label,
+                                job_id, clock_in, clock_out, total_hours,
+                                notes, local_date
+                            )
+                            VALUES (
+                                %s, %s, %s,
+                                NULL,
+                                TIMESTAMPTZ '2047-05-06 08:00:00-05'
+                                    + (%s * INTERVAL '2 hours'),
+                                TIMESTAMPTZ '2047-05-06 09:00:00-05'
+                                    + (%s * INTERVAL '2 hours'),
+                                1.0, 'analytics unlinked valid rate proof',
+                                DATE '2047-05-06'
+                            )
+                            RETURNING id
+                            """,
+                            (employee_id, site_id, location_label, index, index),
+                        )
+                    )
+                )
+                expected_issues.append(
+                    {
+                        "code": "missing_revenue",
+                        "message": (
+                            "Revenue cannot be calculated from this location's "
+                            "rate card."
+                        ),
+                        "location": location_label,
+                        "customer": customer_name,
+                        "date": "2047-05-06",
+                    }
+                )
+
+            analytics = client.get(
+                "/api/admin/analytics",
+                headers=auth,
+                params={"period": "week", "date": "2047-05-06"},
+            )
+            assert analytics.status_code == 200, analytics.text
+            body = analytics.json()
+            assert body["summary"]["revenue"] is None
+            assert body["summary"]["knownRevenue"] == 0.0
+            assert body["summary"]["revenueComplete"] is False
+            assert body["issues"] == expected_issues
+            by_customer = {row["customer"]: row for row in body["byCustomer"]}
+            for expected_issue in expected_issues:
+                row = by_customer[expected_issue["customer"]]
+                assert row["revenue"] is None
+                assert row["knownRevenue"] == 0.0
+                assert row["revenueComplete"] is False
+                assert row["issues"] == [expected_issue]
+            day_row = next(row for row in body["byDay"] if row["date"] == "2047-05-06")
+            assert day_row["revenue"] is None
+            assert day_row["knownRevenue"] == 0.0
+            assert day_row["revenueComplete"] is False
+            assert day_row["issues"] == expected_issues
+
+            for expected_issue in expected_issues:
+                detail = client.get(
+                    "/api/admin/analytics/customer/"
+                    f"{expected_issue['customer'].replace(' ', '%20')}",
+                    headers=auth,
+                    params={"weeks": 1},
+                )
+                assert detail.status_code == 200, detail.text
+                detail_body = detail.json()
+                assert detail_body["summary"]["revenue"] is None
+                assert detail_body["summary"]["knownRevenue"] == 0.0
+                assert detail_body["summary"]["revenueComplete"] is False
+                assert detail_body["issues"] == [expected_issue]
+                assert detail_body["byVisit"][0]["revenue"] is None
+                assert detail_body["byVisit"][0]["knownRevenue"] == 0.0
+                assert detail_body["byVisit"][0]["revenueComplete"] is False
+                assert detail_body["byVisit"][0]["issues"] == [expected_issue]
+                assert detail_body["byWeek"][0]["revenue"] is None
+                assert detail_body["byWeek"][0]["knownRevenue"] == 0.0
+                assert detail_body["byWeek"][0]["revenueComplete"] is False
+                assert detail_body["byWeek"][0]["issues"] == [expected_issue]
+        finally:
+            if shift_ids:
+                db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
+            if site_ids:
+                db.execute("DELETE FROM locations WHERE id = ANY(%s)", (site_ids,))
+
     def test_analytics_week_credits_linked_per_visit_jobs_per_job(
         self,
         client,
