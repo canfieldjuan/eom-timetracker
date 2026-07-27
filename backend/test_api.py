@@ -3603,6 +3603,71 @@ class TestScheduleVsActual:
         r = client.get("/api/admin/analytics/schedule-vs-actual?week_start=2026-03-29", headers=auth)
         assert r.status_code == 200, r.text
 
+    def test_schedule_vs_actual_uses_clock_span_when_stored_total_is_stale(
+        self,
+        client,
+        auth,
+        employee_id,
+        location_id,
+    ):
+        schedule_id = None
+        shift_id = None
+        try:
+            schedule_id = int(
+                db.execute_returning(
+                    """
+                    INSERT INTO schedules (
+                        employee_id, location_id, customer_name, week_start,
+                        scheduled_hours, notes
+                    )
+                    VALUES (%s, %s, 'Test Customer', DATE '2048-01-12', 2.0, '')
+                    RETURNING id
+                    """,
+                    (employee_id, location_id),
+                )
+            )
+            shift_id = int(
+                db.execute_returning(
+                    """
+                    INSERT INTO shifts (
+                        employee_id, location_id, location_label,
+                        clock_in, clock_out, total_hours, notes, local_date
+                    )
+                    VALUES (
+                        %s, %s, '123 Main St, Effingham',
+                        TIMESTAMPTZ '2048-01-13 08:00:00-06',
+                        TIMESTAMPTZ '2048-01-13 10:30:00-06',
+                        0.25, 'schedule actual canonical hours proof',
+                        DATE '2048-01-13'
+                    )
+                    RETURNING id
+                    """,
+                    (employee_id, location_id),
+                )
+            )
+
+            response = client.get(
+                "/api/admin/analytics/schedule-vs-actual",
+                headers=auth,
+                params={"week_start": "2048-01-12"},
+            )
+
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["summary"]["totalScheduled"] == 2.0
+            assert body["summary"]["totalActual"] == 2.5
+            row = next(
+                item for item in body["comparisons"] if item["customerName"] == "Test Customer"
+            )
+            assert row["scheduledHours"] == 2.0
+            assert row["actualHours"] == 2.5
+            assert row["driftHours"] == 0.5
+        finally:
+            if shift_id is not None:
+                db.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+            if schedule_id is not None:
+                db.execute("DELETE FROM schedules WHERE id = %s", (schedule_id,))
+
     def test_schedule_vs_actual_invalid_date(self, client, auth):
         r = client.get("/api/admin/analytics/schedule-vs-actual?week_start=not-a-date", headers=auth)
         assert r.status_code in (400, 422)
