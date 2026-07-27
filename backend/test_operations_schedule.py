@@ -25,6 +25,7 @@ from operations_schedule import (
     _schedule_execution_status,
     _utilization_rows,
     allocate_monthly_cents,
+    monthly_revenue_allocations,
 )
 
 
@@ -1181,6 +1182,53 @@ def test_monthly_allocation_is_exact_and_stable():
     }
     assert sum(allocate_monthly_cents(10_001, [1, 2, 3, 4]).values()) == 10_001
     assert allocate_monthly_cents(10_000, []) == {}
+
+
+def test_monthly_revenue_allocations_group_by_site_month_and_skip_cancelled():
+    chicago = ZoneInfo("America/Chicago")
+    rows = [
+        {
+            "id": 11,
+            "location_id": 9,
+            "scheduled_date": date(2026, 2, 1),
+            "scheduled_start": datetime(2026, 2, 1, 15, tzinfo=timezone.utc),
+            "status": "scheduled",
+            "rate": Decimal("100.01"),
+            "rate_type": "monthly",
+        },
+        {
+            "id": 12,
+            "location_id": 9,
+            "scheduled_date": date(2026, 2, 2),
+            "scheduled_start": datetime(2026, 2, 2, 15, tzinfo=timezone.utc),
+            "status": "cancelled",
+            "rate": Decimal("100.01"),
+            "rate_type": "monthly",
+        },
+        {
+            "id": 13,
+            "location_id": 9,
+            "scheduled_date": date(2026, 2, 8),
+            "scheduled_start": datetime(2026, 2, 8, 15, tzinfo=timezone.utc),
+            "status": "scheduled",
+            "rate": Decimal("100.01"),
+            "rate_type": "monthly",
+        },
+        {
+            "id": 14,
+            "location_id": 10,
+            "scheduled_date": date(2026, 2, 1),
+            "scheduled_start": datetime(2026, 2, 1, 15, tzinfo=timezone.utc),
+            "status": "scheduled",
+            "rate": Decimal("80.00"),
+            "rate_type": "per_visit",
+        },
+    ]
+
+    assert monthly_revenue_allocations(rows, chicago) == {
+        11: 5001,
+        13: 5000,
+    }
 
 
 def test_actual_matching_fails_closed_when_two_service_windows_overlap():
