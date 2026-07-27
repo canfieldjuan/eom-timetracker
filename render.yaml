@@ -48,8 +48,9 @@ services:
       - key: ALLOW_PUBLIC_REGISTRATION
         value: "false"
       # Receivables proxy config stays server-side. Base URL should be the Atlas
-      # EOM private service URL ending in /api/v1; token is the raw generated
-      # eomrx_v1_... value whose SHA-256 digest is stored on the Atlas service.
+      # EOM private service URL ending in /api/v1. Existing opaque tokens remain
+      # usable during rotation; the target token is the raw generated eomrx_v1_...
+      # value whose SHA-256 digest is stored on the Atlas service.
       - key: ATLAS_RECEIVABLES_BASE_URL
         sync: false
       - key: ATLAS_RECEIVABLES_SERVICE_TOKEN
