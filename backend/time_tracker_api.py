@@ -13798,7 +13798,11 @@ def admin_unmatched_shifts(
     """Return individual productive shifts with no location assigned, plus all registered locations for the assignment dropdown."""
     rows = db.query_all(
         """
-        SELECT s.id, s.clock_in, s.clock_out, s.total_hours,
+        SELECT s.id, s.clock_in, s.clock_out,
+               GREATEST(
+                   0.0,
+                   EXTRACT(EPOCH FROM (s.clock_out - s.clock_in)) / 3600.0
+               ) AS total_hours,
                s.local_date, s.notes,
                e.name AS employee_name
         FROM shifts s
