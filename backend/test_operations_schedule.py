@@ -4011,6 +4011,12 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
     assert response.status_code == 200, response.text
     body = response.json()
     jobs = {job["jobId"]: job for week in body["weeks"] for job in week["jobs"]}
+    canonical_monthly_rows = [
+        site
+        for week in body["weeks"]
+        for site in week["bySite"]
+        if site["locationId"] == monthly_site
+    ]
     allocations = [jobs[job_id]["estRevenue"] for job_id in monthly_job_ids]
     assert allocations == [33.34, 33.33, 33.33]
     assert sum(allocations) == pytest.approx(100)
@@ -4079,6 +4085,33 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
     assert schedule["summary"]["visibleJobCount"] == 8
     assert schedule["summary"]["excludedJobCount"] == 3
     assert schedule["summary"]["knownPlannedHours"] == pytest.approx(10)
+
+    legacy_response = client.get(
+        "/api/admin/analytics/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4},
+    )
+    assert legacy_response.status_code == 200, legacy_response.text
+    legacy_body = legacy_response.json()
+    legacy_monthly_rows = [
+        customer
+        for week in legacy_body["forecasts"]
+        for customer in week["byCustomer"]
+        if customer["locationId"] == monthly_site
+    ]
+    assert legacy_monthly_rows == [
+        {
+            "customerId": site["customerId"],
+            "locationId": site["locationId"],
+            "customer": site["customerName"],
+            "forecastHours": site["plannedHours"],
+            "source": "operations",
+            "estLaborCost": site["estLaborCost"],
+            "estRevenue": site["estRevenue"],
+            "issues": site.get("issues", []),
+        }
+        for site in canonical_monthly_rows
+    ]
 
 
 def test_utilization_reconciles_complete_route_split_crew_and_categorized_time(

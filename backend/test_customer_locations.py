@@ -1633,8 +1633,7 @@ def test_site_archive_restore_preserves_history_and_retires_future_qr_state(
         for row in week["byCustomer"]
         if row["customer"] == customer["name"]
     ]
-    assert forecast_customer_rows
-    assert {row["estRevenue"] for row in forecast_customer_rows} == {87.5}
+    assert forecast_customer_rows == []
 
     restored = client.post(
         f"/api/admin/locations/{site_id}/restore",

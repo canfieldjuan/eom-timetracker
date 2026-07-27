@@ -2658,6 +2658,81 @@ class TestForecast:
         r = client.get("/api/admin/analytics/forecast?weeks=-1", headers=auth)
         assert r.status_code in (400, 422, 200)  # implementation-defined
 
+    def test_forecast_adapts_canonical_operations_payload(self, client, auth, monkeypatch):
+        import time_tracker_api as api
+
+        def fake_canonical_forecast(weeks_ahead, *, timezone_name, now_provider):
+            assert weeks_ahead == 1
+            assert timezone_name == "America/Chicago"
+            assert now_provider().tzinfo is not None
+            return {
+                "success": True,
+                "weeksAhead": weeks_ahead,
+                "avgLaborRate": 22.5,
+                "issues": [],
+                "summary": {"estRevenue": 100.0},
+                "weeks": [
+                    {
+                        "weekStart": "2026-07-26",
+                        "weekEnd": "2026-08-01",
+                        "plannedHours": 2.0,
+                        "knownPlannedHours": 2.0,
+                        "plannedHoursComplete": True,
+                        "estRevenue": 33.34,
+                        "knownRevenue": 33.34,
+                        "revenueComplete": True,
+                        "estLaborCost": 45.0,
+                        "knownLaborCost": 45.0,
+                        "laborCostComplete": True,
+                        "bySite": [
+                            {
+                                "locationId": 99,
+                                "customerId": 12,
+                                "customerName": "Canonical Monthly",
+                                "siteAddress": "100 Canonical Way",
+                                "plannedHours": 2.0,
+                                "knownPlannedHours": 2.0,
+                                "plannedHoursComplete": True,
+                                "estRevenue": 33.34,
+                                "knownRevenue": 33.34,
+                                "revenueComplete": True,
+                                "estLaborCost": 45.0,
+                                "knownLaborCost": 45.0,
+                                "laborCostComplete": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        monkeypatch.setattr(api, "build_operations_forecast", fake_canonical_forecast)
+
+        response = client.get(
+            "/api/admin/analytics/forecast",
+            headers=auth,
+            params={"weeks_ahead": 1},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["weeksAhead"] == 1
+        assert body["avgLaborRate"] == 22.5
+        assert body["summary"] == {"estRevenue": 100.0}
+        assert body["weeks"] == body["forecasts"]
+        assert body["forecasts"][0]["estRevenue"] == 33.34
+        assert body["forecasts"][0]["byCustomer"] == [
+            {
+                "customerId": 12,
+                "locationId": 99,
+                "customer": "Canonical Monthly",
+                "forecastHours": 2.0,
+                "source": "operations",
+                "estLaborCost": 45.0,
+                "estRevenue": 33.34,
+                "issues": [],
+            }
+        ]
+
 
 # ===============================================================================
 # Locations - new fields (target_labor_pct, min_margin_pct)
