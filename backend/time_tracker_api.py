@@ -13916,7 +13916,11 @@ def admin_waste_analysis(
         f"""
         SELECT s.id, s.employee_id, e.name AS employee_name,
                COALESCE(l.customer_name, COALESCE(l.address, '')) AS customer,
-               s.total_hours, s.time_category, s.non_productive_type,
+               GREATEST(
+                   0.0,
+                   EXTRACT(EPOCH FROM (s.clock_out - s.clock_in)) / 3600.0
+               ) AS total_hours,
+               s.time_category, s.non_productive_type,
                s.notes, s.local_date, e.hourly_rate
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id

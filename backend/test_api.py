@@ -3508,6 +3508,64 @@ class TestTimeCategories:
         data = r.json()
         assert "waste" in data or "summary" in data or "success" in data
 
+    def test_waste_analysis_uses_clock_span_when_stored_total_is_stale(
+        self,
+        client,
+        auth,
+        employee_id,
+        location_id,
+    ):
+        shift_id = None
+        try:
+            shift_id = int(
+                db.execute_returning(
+                    """
+                    INSERT INTO shifts (
+                        employee_id, location_id, location_label,
+                        clock_in, clock_out, total_hours, notes, local_date,
+                        time_category, non_productive_type
+                    )
+                    VALUES (
+                        %s, %s, '123 Main St, Effingham',
+                        TIMESTAMPTZ '2048-02-03 08:00:00-06',
+                        TIMESTAMPTZ '2048-02-03 10:30:00-06',
+                        0.25, 'waste canonical hours proof',
+                        DATE '2048-02-03',
+                        'non_productive', 'waiting'
+                    )
+                    RETURNING id
+                    """,
+                    (employee_id, location_id),
+                )
+            )
+
+            response = client.get(
+                "/api/admin/analytics/waste",
+                headers=auth,
+                params={"period": "day", "date": "2048-02-03"},
+            )
+
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["summary"]["totalWasteHours"] == 2.5
+            assert body["summary"]["totalWasteCost"] == pytest.approx(41.88)
+            customer_row = next(
+                row for row in body["byCustomer"] if row["customer"] == "Test Customer"
+            )
+            assert customer_row["hours"] == 2.5
+            assert customer_row["cost"] == pytest.approx(41.88)
+            employee_row = next(
+                row for row in body["byEmployee"] if row["employee"] == "Catalina Gomez"
+            )
+            assert employee_row["hours"] == 2.5
+            assert employee_row["cost"] == pytest.approx(41.88)
+            cause_row = next(row for row in body["byCause"] if row["cause"] == "waiting")
+            assert cause_row["hours"] == 2.5
+            assert cause_row["cost"] == pytest.approx(41.88)
+        finally:
+            if shift_id is not None:
+                db.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+
     def test_waste_all_period(self, client, auth):
         r = client.get("/api/admin/analytics/waste?period=all", headers=auth)
         assert r.status_code == 200, r.text
