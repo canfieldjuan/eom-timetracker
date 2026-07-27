@@ -150,6 +150,10 @@ class _InvalidJsonAtlasResponse(_AtlasResponse):
         raise ValueError("not json")
 
 
+GENERATED_RECEIVABLES_TOKEN = "eomrx_v1_" + ("A" * 43)
+PRIVATE_ATLAS_RECEIVABLES_BASE_URL = "http://atlas-eom-api:10000/api/v1"
+
+
 class TestReceivablesProxy:
     def test_runtime_requirements_pin_pydantic_v2(self):
         requirements = (Path(__file__).parent / "requirements.txt").read_text(
@@ -224,6 +228,104 @@ class TestReceivablesProxy:
         assert "not configured" in response.json()["error"]
         assert client.get("/api/health").status_code == 200
 
+    def test_ready_uses_private_atlas_base_with_generated_token(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse({"status": "ready"})
+
+        monkeypatch.setattr(
+            api,
+            "ATLAS_RECEIVABLES_BASE_URL",
+            PRIVATE_ATLAS_RECEIVABLES_BASE_URL,
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+
+        response = client.get("/api/admin/receivables/ready", headers=auth)
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ready"}
+        assert GENERATED_RECEIVABLES_TOKEN not in response.text
+        method, url, kwargs = calls[0]
+        assert method == "GET"
+        assert url == f"{PRIVATE_ATLAS_RECEIVABLES_BASE_URL}/receivables/ready"
+        assert kwargs["headers"]["Authorization"] == (
+            f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
+        )
+        assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "atlas-eom-api:10000/api/v1",
+            "ftp://atlas-eom-api:10000/api/v1",
+            "http://atlas-eom-api:10000",
+            "http://atlas-eom-api:10000/api/v2",
+            "https://token:secret@atlas.test/api/v1",
+        ],
+    )
+    def test_invalid_atlas_base_url_fails_before_atlas_request(
+        self, client, auth, monkeypatch, base_url
+    ):
+        import time_tracker_api as api
+
+        calls = []
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", base_url)
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+
+        response = client.get("/api/admin/receivables/ready", headers=auth)
+
+        assert response.status_code == 503
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "service-token",
+            "opaque-pre-rotation-token",
+            "legacy.service_token-2026",
+        ],
+    )
+    def test_pre_rotation_opaque_service_token_remains_usable(
+        self, client, auth, monkeypatch, token
+    ):
+        import time_tracker_api as api
+
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse({"status": "ready"})
+
+        monkeypatch.setattr(
+            api,
+            "ATLAS_RECEIVABLES_BASE_URL",
+            PRIVATE_ATLAS_RECEIVABLES_BASE_URL,
+        )
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", token)
+        monkeypatch.setattr(api.requests, "request", fake_request)
+
+        response = client.get("/api/admin/receivables/ready", headers=auth)
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "ready"}
+        assert calls[0][2]["headers"]["Authorization"] == f"Bearer {token}"
+
     def test_forwards_service_token_and_server_derived_actor(
         self, client, auth, monkeypatch
     ):
@@ -241,7 +343,7 @@ class TestReceivablesProxy:
         monkeypatch.setattr(
             api,
             "ATLAS_RECEIVABLES_SERVICE_TOKEN",
-            "service-token-that-never-reaches-browser",
+            GENERATED_RECEIVABLES_TOKEN,
         )
         monkeypatch.setattr(api.requests, "request", fake_request)
 
@@ -255,7 +357,7 @@ class TestReceivablesProxy:
         assert method == "GET"
         assert url == "https://atlas.test/api/v1/receivables/open-invoices"
         assert kwargs["headers"]["Authorization"] == (
-            "Bearer service-token-that-never-reaches-browser"
+            f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
         )
         assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
         assert kwargs["params"]["search"] == "Acme"
@@ -274,7 +376,7 @@ class TestReceivablesProxy:
         monkeypatch.setattr(
             api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
         )
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(api.requests, "request", fake_request)
         headers = {**auth, "Idempotency-Key": "browser-payment-1"}
 
@@ -308,7 +410,7 @@ class TestReceivablesProxy:
         import time_tracker_api as api
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
 
         def fail(*_args, **_kwargs):
             raise api.requests.ConnectionError("offline")
@@ -328,7 +430,7 @@ class TestReceivablesProxy:
         import time_tracker_api as api
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(
             api.requests,
             "request",
@@ -350,7 +452,7 @@ class TestReceivablesProxy:
         import time_tracker_api as api
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "rejected-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(
             api.requests,
             "request",
@@ -379,7 +481,7 @@ class TestReceivablesProxy:
             return _AtlasResponse({"id": "payment-after-retry"}, status_code=201)
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(api.requests, "request", flaky_request)
         monkeypatch.setattr(api, "append_access_log", lambda *_args, **_kwargs: None)
         body = {
@@ -449,7 +551,7 @@ class TestReceivablesProxy:
             return _AtlasResponse({"id": "deposit-after-retry"}, status_code=201)
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(api.requests, "request", flaky_request)
         monkeypatch.setattr(api, "append_access_log", lambda *_args, **_kwargs: None)
         first_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -522,7 +624,7 @@ class TestReceivablesProxy:
             raise AssertionError(f"Unexpected Atlas request: {method} {url}")
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(api.requests, "request", atlas_request)
         monkeypatch.setattr(api, "append_access_log", lambda *_args, **_kwargs: None)
         body = {
@@ -637,7 +739,7 @@ class TestReceivablesProxy:
             raise AssertionError(f"Unexpected Atlas request: {method} {url}")
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(api.requests, "request", atlas_request)
         monkeypatch.setattr(api, "append_access_log", lambda *_args, **_kwargs: None)
         body = {
@@ -730,7 +832,7 @@ class TestReceivablesProxy:
         }
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(
             api.requests,
             "request",
@@ -777,7 +879,7 @@ class TestReceivablesProxy:
             return _AtlasResponse({"id": f"payment-{len(forwarded)}"}, status_code=201)
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(api.requests, "request", fake_request)
         body = {
             "contact_id": "11111111-1111-1111-1111-111111111111",
@@ -814,7 +916,7 @@ class TestReceivablesProxy:
 
         upstream_calls = []
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(
             api.db,
             "get_conn",
@@ -933,7 +1035,7 @@ class TestReceivablesProxy:
             )
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(api.requests, "request", fake_request)
         monkeypatch.setattr(
             api,
@@ -978,7 +1080,7 @@ class TestReceivablesProxy:
         import time_tracker_api as api
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(
             api.requests,
             "request",
@@ -1017,7 +1119,7 @@ class TestReceivablesProxy:
         import time_tracker_api as api
 
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
         monkeypatch.setattr(
             api.requests,
             "request",
@@ -1108,7 +1210,7 @@ class TestReceivablesProxy:
 
         audits = []
         monkeypatch.setattr(api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1")
-        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", "service-token")
+        monkeypatch.setattr(api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN)
 
         def successful_mutation(_method, url, **_kwargs):
             if url.endswith("/void"):
