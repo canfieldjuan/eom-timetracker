@@ -3032,9 +3032,16 @@ def _atlas_funnel_read(
     return content
 
 
-def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]:
     leads = content.get("leads")
     if not isinstance(leads, list):
+        raise HTTPException(status_code=502, detail="EOM lead review service returned an invalid response")
+    has_more = content.get("hasMore")
+    next_cursor = _strip_optional_text(content.get("nextCursor"))
+    cursor = _strip_optional_text(content.get("cursor"))
+    if not isinstance(has_more, bool):
+        raise HTTPException(status_code=502, detail="EOM lead review service returned an invalid response")
+    if has_more and not next_cursor:
         raise HTTPException(status_code=502, detail="EOM lead review service returned an invalid response")
     parsed: List[Dict[str, Any]] = []
     for item in leads:
@@ -3065,7 +3072,12 @@ def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> List[Dict[str,
                 "createdAt": created_at,
             }
         )
-    return parsed
+    return {
+        "leads": parsed,
+        "cursor": cursor,
+        "hasMore": has_more,
+        "nextCursor": next_cursor,
+    }
 
 
 def _validate_atlas_customer_handoff_result(
@@ -9843,10 +9855,15 @@ def admin_approve_estimate(
 def admin_list_funnel_review(
     request: Request,
     limit: int = Query(default=100, ge=1, le=200),
+    cursor: Optional[str] = Query(default=None, min_length=16, max_length=512),
     admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    content = _atlas_funnel_read("/eom-funnel/leads", admin, params={"limit": limit})
-    leads = _parse_atlas_lead_review_response(content)
+    params: Dict[str, Any] = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    content = _atlas_funnel_read("/eom-funnel/leads", admin, params=params)
+    lead_page = _parse_atlas_lead_review_response(content)
+    leads = lead_page["leads"]
     pending_handoffs = _list_pending_office_conversion_handoffs()
     append_access_log(
         request,
@@ -9858,6 +9875,9 @@ def admin_list_funnel_review(
         "success": True,
         "canApprove": _can_approve_eom_funnel(admin),
         "leads": leads,
+        "cursor": lead_page["cursor"],
+        "hasMore": lead_page["hasMore"],
+        "nextCursor": lead_page["nextCursor"],
         "pendingHandoffs": pending_handoffs,
     }
 

@@ -269,7 +269,10 @@ def test_funnel_review_lists_atlas_leads_and_pending_handoffs_without_writes(
                     "createdAt": "2026-07-27T12:00:00Z",
                     "internalField": "must not proxy",
                 }
-            ]
+            ],
+            "cursor": None,
+            "hasMore": True,
+            "nextCursor": "cursor-page-2-token",
         }
 
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
@@ -308,6 +311,9 @@ def test_funnel_review_lists_atlas_leads_and_pending_handoffs_without_writes(
             "createdAt": "2026-07-27T12:00:00Z",
         }
     ]
+    assert data["cursor"] is None
+    assert data["hasMore"] is True
+    assert data["nextCursor"] == "cursor-page-2-token"
     assert data["pendingHandoffs"][0]["contactId"] == contact_id
     assert data["pendingHandoffs"][0]["status"] == "pending"
     assert data["pendingHandoffs"][0]["lastError"] == "Atlas is temporarily unavailable"
@@ -322,7 +328,7 @@ def test_funnel_review_proxy_keeps_service_token_server_side(monkeypatch, config
         status_code = 200
 
         def json(self):
-            return {"leads": []}
+            return {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None}
 
     def get(url, *, headers, params, timeout):
         captured.update({"url": url, "headers": headers, "params": params, "timeout": timeout})
@@ -335,7 +341,7 @@ def test_funnel_review_proxy_keeps_service_token_server_side(monkeypatch, config
         params={"limit": 25},
     )
 
-    assert result == {"leads": []}
+    assert result == {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None}
     assert captured["url"] == "https://atlas.example.test/eom-funnel/leads"
     assert captured["headers"] == {
         "Authorization": "Bearer tracker-only-test-token",
@@ -344,6 +350,29 @@ def test_funnel_review_proxy_keeps_service_token_server_side(monkeypatch, config
         "Accept": "application/json",
     }
     assert captured["params"] == {"limit": 25}
+
+
+def test_funnel_review_proxy_forwards_cursor_without_exposing_service_token(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    captured: dict[str, object] = {}
+    cursor = "cursor-page-token-a"
+
+    def atlas_read(path, admin, *, params=None):
+        captured.update({"path": path, "admin": admin, "params": params})
+        return {"leads": [], "cursor": cursor, "hasMore": False, "nextCursor": None}
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
+    response = client.get(
+        f"/api/admin/funnel/review?limit=25&cursor={cursor}",
+        headers=auth,
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured["path"] == "/eom-funnel/leads"
+    assert captured["params"] == {"limit": 25, "cursor": cursor}
+    assert response.json()["cursor"] == cursor
 
 
 def test_pending_handoff_retry_finalizes_without_duplicate_customer_or_site(
