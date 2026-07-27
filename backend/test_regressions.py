@@ -131,6 +131,61 @@ class TestMyTimesheetHoursLiveCalc:
             _ensure_clocked_out(client, emp_auth)
 
 
+class TestHoursReportCanonicalHours:
+    def test_report_recomputes_closed_shift_duration_from_clock_span(
+        self,
+        client,
+        auth,
+        employee_id,
+        location_id,
+    ):
+        import db
+
+        shift_id = db.execute_returning(
+            """
+            INSERT INTO shifts (
+                employee_id, location_id, location_label,
+                clock_in, clock_out, total_hours, notes, local_date
+            )
+            VALUES (
+                %s, %s, '123 Main St, Effingham',
+                TIMESTAMPTZ '2048-01-13 08:00:00-06',
+                TIMESTAMPTZ '2048-01-13 10:30:00-06',
+                0.25, 'hours report canonical duration proof',
+                DATE '2048-01-13'
+            )
+            RETURNING id
+            """,
+            (employee_id, location_id),
+        )
+        try:
+            response = client.get(
+                "/api/admin/reports/hours",
+                headers=auth,
+                params={
+                    "period": "day",
+                    "date": "2048-01-13",
+                    "employee_id": employee_id,
+                },
+            )
+
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["totalHours"] == 2.5
+            assert body["totalShifts"] == 1
+            assert body["rows"][0]["hours"] == 2.5
+            assert body["summary"] == [
+                {
+                    "employeeId": employee_id,
+                    "employeeName": "Catalina Gomez",
+                    "totalHours": 2.5,
+                    "totalShifts": 1,
+                }
+            ]
+        finally:
+            db.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+
+
 # ===============================================================================
 # Pydantic max_length on free-text fields
 # ===============================================================================

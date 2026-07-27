@@ -12861,7 +12861,7 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
             continue
 
         emp_name = emp_names.get(emp_id, str(entry.get("employeeName", f"Employee {emp_id}")))
-        hours = float(entry.get("totalHours", 0) or 0)
+        hours = entry_hours(entry, now)
 
         try:
             co_dt = parse_utc_iso(str(entry["clockOut"]))
