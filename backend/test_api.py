@@ -1518,6 +1518,150 @@ class TestVisitJobIdentity:
                 db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
             _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
 
+    def test_startup_backfills_qr_visit_job_id_without_overwriting(self, client):
+        import time_tracker_api as api
+
+        site_ids: list[int] = []
+        job_ids: list[int] = []
+        shift_ids: list[int] = []
+        check_in_ids: list[int] = []
+        try:
+            site_id = _insert_profitability_site(
+                address="2049 Visit Backfill Proof",
+                customer_name="Visit Backfill Customer",
+                rate=175.0,
+                rate_type="per_visit",
+                expected_hours=1.5,
+            )
+            site_ids.append(site_id)
+            source_job_id = _insert_profitability_job(
+                location_id=site_id,
+                customer_name="Visit Backfill Customer",
+                scheduled_date="2049-06-02",
+                expected_hours=1.5,
+                revenue=175.0,
+                source_key="16" * 32,
+            )
+            existing_visit_job_id = _insert_profitability_job(
+                location_id=site_id,
+                customer_name="Visit Backfill Customer",
+                scheduled_date="2049-06-03",
+                expected_hours=1.5,
+                revenue=200.0,
+                source_key="17" * 32,
+            )
+            job_ids.extend([source_job_id, existing_visit_job_id])
+            employee_id = db.query_one(
+                "SELECT id FROM employees WHERE name = %s",
+                ("Catalina Gomez",),
+            )["id"]
+            shift_id = int(db.execute_returning(
+                """
+                INSERT INTO shifts (
+                    employee_id, location_id, location_label,
+                    clock_in, clock_out, total_hours, local_date
+                )
+                VALUES (
+                    %s, %s, 'Visit backfill shift',
+                    TIMESTAMPTZ '2049-06-02 08:00:00-05',
+                    TIMESTAMPTZ '2049-06-02 10:00:00-05',
+                    2.0, DATE '2049-06-02'
+                )
+                RETURNING id
+                """,
+                (employee_id, site_id),
+            ))
+            shift_ids.append(shift_id)
+
+            for minute_offset in (0, 30):
+                check_in_id = int(db.execute_returning(
+                    """
+                    INSERT INTO site_check_ins (
+                        employee_id, location_id, job_id,
+                        server_checked_in_at, device_scanned_at,
+                        latitude, longitude, accuracy_m, geofence_radius_m,
+                        distance_m, geofence_status, classification,
+                        classification_reason, device_clock_skew_seconds,
+                        review_status
+                    )
+                    VALUES (
+                        %s, %s, %s,
+                        TIMESTAMPTZ '2049-06-02 08:00:00-05'
+                            + (%s * INTERVAL '1 minute'),
+                        TIMESTAMPTZ '2049-06-02 08:00:00-05'
+                            + (%s * INTERVAL '1 minute'),
+                        39.1203000, -88.5433500, 5.00, 100,
+                        0.00, 'inside', 'on_time',
+                        'verified_scheduled_site', 0.00, 'not_required'
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        employee_id,
+                        site_id,
+                        source_job_id,
+                        minute_offset,
+                        minute_offset,
+                    ),
+                ))
+                check_in_ids.append(check_in_id)
+
+            backfill_visit_id = int(db.execute_returning(
+                """
+                INSERT INTO visits (
+                    shift_id, location_id, location_label, customer_name,
+                    arrival_time, site_check_in_id, sequence_version
+                )
+                VALUES (
+                    %s, %s, '2049 Visit Backfill Proof',
+                    'Visit Backfill Customer',
+                    TIMESTAMPTZ '2049-06-02 08:00:00-05',
+                    %s, 2
+                )
+                RETURNING id
+                """,
+                (shift_id, site_id, check_in_ids[0]),
+            ))
+            preserved_visit_id = int(db.execute_returning(
+                """
+                INSERT INTO visits (
+                    shift_id, location_id, location_label, customer_name,
+                    arrival_time, site_check_in_id, job_id, sequence_version
+                )
+                VALUES (
+                    %s, %s, '2049 Visit Backfill Proof',
+                    'Visit Backfill Customer',
+                    TIMESTAMPTZ '2049-06-02 08:30:00-05',
+                    %s, %s, 2
+                )
+                RETURNING id
+                """,
+                (shift_id, site_id, check_in_ids[1], existing_visit_job_id),
+            ))
+
+            api._ensure_schema_migrations()
+
+            rows = {
+                row["id"]: row["job_id"]
+                for row in db.query_all(
+                    "SELECT id, job_id FROM visits WHERE id = ANY(%s)",
+                    ([backfill_visit_id, preserved_visit_id],),
+                )
+            }
+            assert rows == {
+                backfill_visit_id: source_job_id,
+                preserved_visit_id: existing_visit_job_id,
+            }
+        finally:
+            if shift_ids:
+                db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
+            if check_in_ids:
+                db.execute(
+                    "DELETE FROM site_check_ins WHERE id = ANY(%s)",
+                    (check_in_ids,),
+                )
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
+
 
 class TestTimesheetGpsFlow:
     def test_timesheet_locations_exposes_match_radius(self, client, emp_auth):
