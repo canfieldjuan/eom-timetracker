@@ -34,6 +34,7 @@ UTILIZATION_CATEGORIES = (
     "categorized",
     "unclassified",
 )
+OPERATIONS_FORECAST_ALLOWED_WEEKS = {4, 8, 12}
 UTILIZATION_REVIEW_KEY_VERSION = "utilization-review.v1"
 UTILIZATION_EVIDENCE_VERSION = "utilization-classifier.v1"
 UTILIZATION_MISSING_DEPARTURE_CORRECTION = "utilization_missing_departure.v1"
@@ -3417,6 +3418,144 @@ def _normalize_reviewed_departure_input(
     return candidates.pop()
 
 
+def build_operations_forecast(
+    weeks_ahead: int,
+    *,
+    timezone_name: str = "America/Chicago",
+    now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> Dict[str, Any]:
+    if weeks_ahead < 1:
+        raise ValueError("weeks_ahead must be at least 1")
+
+    app_timezone = ZoneInfo(timezone_name)
+    observed_at = now_provider().astimezone(timezone.utc)
+    today = observed_at.astimezone(app_timezone).date()
+    first_week = _sunday_for(today)
+    forecast_end = first_week + timedelta(days=weeks_ahead * 7 - 1)
+    allocation_start = date(today.year, today.month, 1)
+    allocation_end = _month_end(forecast_end)
+    allocation_jobs = _load_jobs(allocation_start, allocation_end)
+
+    wage_rows = db.query_all(
+        """
+        SELECT id, hourly_rate
+        FROM employees
+        WHERE active = true AND role = 'employee'
+        ORDER BY id
+        """
+    )
+    configured_wages = [
+        Decimal(str(row["hourly_rate"]))
+        for row in wage_rows
+        if row.get("hourly_rate") is not None
+    ]
+    avg_hourly_rate: Optional[Decimal] = None
+    if configured_wages:
+        avg_hourly_rate = sum(configured_wages) / Decimal(len(configured_wages))
+
+    monthly_allocations = monthly_revenue_allocations(
+        allocation_jobs,
+        app_timezone,
+    )
+
+    forecast_jobs = []
+    for job in allocation_jobs:
+        if not today <= job["scheduled_date"] <= forecast_end or job.get(
+            "status"
+        ) not in {"scheduled", "in_progress"}:
+            continue
+        # The first forecast bucket is the current Sunday-Saturday week,
+        # but its totals represent only work that is still ahead.  A
+        # missing end time stays visible as an explicit setup issue.
+        if (
+            job.get("status") != "in_progress"
+            and job["scheduled_date"] == today
+            and job.get("scheduled_end") is not None
+            and job["scheduled_end"] <= observed_at
+        ):
+            continue
+        forecast_jobs.append(job)
+    calculated = [
+        _forecast_job_values(job, avg_hourly_rate, monthly_allocations)
+        for job in forecast_jobs
+    ]
+
+    weeks: List[Dict[str, Any]] = []
+    for offset in range(weeks_ahead):
+        week_start = first_week + timedelta(weeks=offset)
+        week_end = week_start + timedelta(days=6)
+        week_rows = [
+            row
+            for row in calculated
+            if week_start <= datetime.strptime(row["scheduledDate"], "%Y-%m-%d").date()
+            <= week_end
+        ]
+        by_site_rows: Dict[Optional[int], List[Dict[str, Any]]] = defaultdict(list)
+        for row in week_rows:
+            by_site_rows[row.get("locationId")].append(row)
+        by_site = []
+        for location_id, site_rows in by_site_rows.items():
+            site_summary = _aggregate_forecast_rows(site_rows)
+            first = site_rows[0]
+            by_site.append(
+                {
+                    "locationId": location_id,
+                    "customerId": first.get("customerId"),
+                    "customerName": first.get("customerName"),
+                    "siteAddress": first.get("siteAddress"),
+                    **site_summary,
+                }
+            )
+        summary = _aggregate_forecast_rows(week_rows)
+        weeks.append(
+            {
+                "weekStart": str(week_start),
+                "weekEnd": str(week_end),
+                **summary,
+                "bySite": sorted(
+                    by_site,
+                    key=lambda row: (
+                        str(row.get("customerName") or "").casefold(),
+                        str(row.get("siteAddress") or "").casefold(),
+                        int(row.get("locationId") or 0),
+                    ),
+                ),
+                "jobs": [_public_forecast_job(row) for row in week_rows],
+            }
+        )
+
+    global_issues: List[Dict[str, str]] = []
+    missing_wages = len(wage_rows) - len(configured_wages)
+    if not configured_wages:
+        global_issues.append(
+            _issue(
+                "missing_average_employee_rate",
+                "No active employee has a configured hourly rate.",
+            )
+        )
+    elif missing_wages:
+        global_issues.append(
+            _issue(
+                "employees_missing_rates",
+                f"{missing_wages} active employee account(s) have no hourly rate.",
+            )
+        )
+    return {
+        "success": True,
+        "timezone": timezone_name,
+        "observedAt": _utc_iso(observed_at),
+        "asOfDate": str(today),
+        "startDate": str(today),
+        "endDate": str(forecast_end),
+        "weeksAhead": weeks_ahead,
+        "avgLaborRate": _money(_money_cents(avg_hourly_rate)),
+        "issues": global_issues,
+        "summary": _aggregate_forecast_rows(calculated),
+        "weeks": weeks,
+        "forecasts": weeks,
+    }
+
+
 def build_operations_schedule_router(
     *,
     get_current_admin: Callable[..., Dict[str, Any]],
@@ -3888,138 +4027,15 @@ def build_operations_schedule_router(
         weeks_ahead: int = Query(default=4),
         _: Dict[str, Any] = Depends(get_current_admin),
     ) -> Dict[str, Any]:
-        if weeks_ahead not in {4, 8, 12}:
+        if weeks_ahead not in OPERATIONS_FORECAST_ALLOWED_WEEKS:
             raise HTTPException(
                 status_code=400,
                 detail="weeks_ahead must be one of: 4, 8, 12",
             )
-
-        observed_at = now_provider().astimezone(timezone.utc)
-        today = observed_at.astimezone(app_timezone).date()
-        first_week = _sunday_for(today)
-        forecast_end = first_week + timedelta(days=weeks_ahead * 7 - 1)
-        allocation_start = date(today.year, today.month, 1)
-        allocation_end = _month_end(forecast_end)
-        allocation_jobs = _load_jobs(allocation_start, allocation_end)
-
-        wage_rows = db.query_all(
-            """
-            SELECT id, hourly_rate
-            FROM employees
-            WHERE active = true AND role = 'employee'
-            ORDER BY id
-            """
+        return build_operations_forecast(
+            weeks_ahead,
+            timezone_name=timezone_name,
+            now_provider=now_provider,
         )
-        configured_wages = [
-            Decimal(str(row["hourly_rate"]))
-            for row in wage_rows
-            if row.get("hourly_rate") is not None
-        ]
-        avg_hourly_rate: Optional[Decimal] = None
-        if configured_wages:
-            avg_hourly_rate = sum(configured_wages) / Decimal(len(configured_wages))
-
-        monthly_allocations = monthly_revenue_allocations(
-            allocation_jobs,
-            app_timezone,
-        )
-
-        forecast_jobs = []
-        for job in allocation_jobs:
-            if not today <= job["scheduled_date"] <= forecast_end or job.get(
-                "status"
-            ) not in {"scheduled", "in_progress"}:
-                continue
-            # The first forecast bucket is the current Sunday-Saturday week,
-            # but its totals represent only work that is still ahead.  A
-            # missing end time stays visible as an explicit setup issue.
-            if (
-                job.get("status") != "in_progress"
-                and job["scheduled_date"] == today
-                and job.get("scheduled_end") is not None
-                and job["scheduled_end"] <= observed_at
-            ):
-                continue
-            forecast_jobs.append(job)
-        calculated = [
-            _forecast_job_values(job, avg_hourly_rate, monthly_allocations)
-            for job in forecast_jobs
-        ]
-
-        weeks: List[Dict[str, Any]] = []
-        for offset in range(weeks_ahead):
-            week_start = first_week + timedelta(weeks=offset)
-            week_end = week_start + timedelta(days=6)
-            week_rows = [
-                row
-                for row in calculated
-                if week_start
-                <= datetime.strptime(row["scheduledDate"], "%Y-%m-%d").date()
-                <= week_end
-            ]
-            by_site_rows: Dict[Optional[int], List[Dict[str, Any]]] = defaultdict(list)
-            for row in week_rows:
-                by_site_rows[row.get("locationId")].append(row)
-            by_site = []
-            for location_id, site_rows in by_site_rows.items():
-                site_summary = _aggregate_forecast_rows(site_rows)
-                first = site_rows[0]
-                by_site.append(
-                    {
-                        "locationId": location_id,
-                        "customerId": first.get("customerId"),
-                        "customerName": first.get("customerName"),
-                        "siteAddress": first.get("siteAddress"),
-                        **site_summary,
-                    }
-                )
-            summary = _aggregate_forecast_rows(week_rows)
-            weeks.append(
-                {
-                    "weekStart": str(week_start),
-                    "weekEnd": str(week_end),
-                    **summary,
-                    "bySite": sorted(
-                        by_site,
-                        key=lambda row: (
-                            str(row.get("customerName") or "").casefold(),
-                            str(row.get("siteAddress") or "").casefold(),
-                            int(row.get("locationId") or 0),
-                        ),
-                    ),
-                    "jobs": [_public_forecast_job(row) for row in week_rows],
-                }
-            )
-
-        global_issues: List[Dict[str, str]] = []
-        missing_wages = len(wage_rows) - len(configured_wages)
-        if not configured_wages:
-            global_issues.append(
-                _issue(
-                    "missing_average_employee_rate",
-                    "No active employee has a configured hourly rate.",
-                )
-            )
-        elif missing_wages:
-            global_issues.append(
-                _issue(
-                    "employees_missing_rates",
-                    f"{missing_wages} active employee account(s) have no hourly rate.",
-                )
-            )
-        return {
-            "success": True,
-            "timezone": timezone_name,
-            "observedAt": _utc_iso(observed_at),
-            "asOfDate": str(today),
-            "startDate": str(today),
-            "endDate": str(forecast_end),
-            "weeksAhead": weeks_ahead,
-            "avgLaborRate": _money(_money_cents(avg_hourly_rate)),
-            "issues": global_issues,
-            "summary": _aggregate_forecast_rows(calculated),
-            "weeks": weeks,
-            "forecasts": weeks,
-        }
 
     return router
