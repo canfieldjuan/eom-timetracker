@@ -63,6 +63,25 @@ CREATE TABLE locations (
     archived_by     INTEGER REFERENCES employees(id) ON DELETE SET NULL
 );
 
+-- One durable office approval links an Atlas lead to the operational Customer
+-- and first Site created from its completed estimate. Operational price and
+-- scheduling details remain on customers/locations, never in this record.
+CREATE TABLE eom_office_conversion_handoffs (
+    atlas_contact_id         UUID PRIMARY KEY,
+    idempotency_key          UUID NOT NULL UNIQUE,
+    request_fingerprint      VARCHAR(64) NOT NULL,
+    customer_id              INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    site_id                  INTEGER NOT NULL REFERENCES locations(id) ON DELETE RESTRICT,
+    approved_by_employee_id  INTEGER NOT NULL REFERENCES employees(id) ON DELETE RESTRICT,
+    state                    VARCHAR(16) NOT NULL DEFAULT 'pending'
+                               CHECK (state IN ('pending', 'finalized')),
+    atlas_handoff_id         UUID,
+    last_error               TEXT,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finalized_at             TIMESTAMPTZ
+);
+
 -- Jobs (service visits / scheduled work at a customer)
 CREATE TABLE jobs (
     id              SERIAL PRIMARY KEY,
