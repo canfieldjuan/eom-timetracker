@@ -13156,26 +13156,127 @@ def admin_schedule_vs_actual(
     }
 
 
-def _forecast_revenue_for_site(site: Optional[Dict[str, Any]], hours: float) -> float:
-    if not site or site.get("rate") is None:
-        return 0.0
-    rate = float(site["rate"])
-    rate_type = str(site.get("rate_type") or "per_visit")
-    if rate_type == "hourly":
-        return rate * hours
-    if rate_type == "monthly":
-        return rate / 4.33
-    expected_hours = (
-        float(site["expected_hours"])
-        if site.get("expected_hours") is not None
+def _legacy_forecast_value(
+    row: Dict[str, Any],
+    complete_key: str,
+    complete_value_key: str,
+    known_value_key: str,
+) -> Optional[float]:
+    value = row.get(complete_value_key)
+    if bool(row.get(complete_key)) or value is not None:
+        return value
+    return row.get(known_value_key)
+
+
+def _legacy_forecast_hours(row: Dict[str, Any]) -> Optional[float]:
+    return _legacy_forecast_value(
+        row,
+        "plannedHoursComplete",
+        "plannedHours",
+        "knownPlannedHours",
+    )
+
+
+def _legacy_forecast_money(
+    row: Dict[str, Any],
+    complete_key: str,
+    complete_value_key: str,
+    known_value_key: str,
+) -> Optional[float]:
+    value = _legacy_forecast_value(
+        row,
+        complete_key,
+        complete_value_key,
+        known_value_key,
+    )
+    return round(float(value), 2) if value is not None else None
+
+
+def _legacy_forecast_percent(
+    numerator: Optional[float],
+    denominator: Optional[float],
+) -> Optional[float]:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return round(numerator / denominator * 100, 1)
+
+
+def _legacy_forecast_by_customer(site_row: Dict[str, Any]) -> Dict[str, Any]:
+    forecast_hours = _legacy_forecast_hours(site_row)
+    est_labor = _legacy_forecast_money(
+        site_row,
+        "laborCostComplete",
+        "estLaborCost",
+        "knownLaborCost",
+    )
+    est_revenue = _legacy_forecast_money(
+        site_row,
+        "revenueComplete",
+        "estRevenue",
+        "knownRevenue",
+    )
+    customer_name = str(
+        site_row.get("customerName")
+        or site_row.get("siteAddress")
+        or "Unknown"
+    )
+    return {
+        "customerId": site_row.get("customerId"),
+        "locationId": site_row.get("locationId"),
+        "customer": customer_name,
+        "forecastHours": round(float(forecast_hours), 2)
+        if forecast_hours is not None
+        else None,
+        "source": "operations",
+        "estLaborCost": est_labor,
+        "estRevenue": est_revenue,
+        "issues": site_row.get("issues", []),
+    }
+
+
+def _legacy_forecast_week(week: Dict[str, Any]) -> Dict[str, Any]:
+    total_hours = _legacy_forecast_hours(week)
+    total_labor = _legacy_forecast_money(
+        week,
+        "laborCostComplete",
+        "estLaborCost",
+        "knownLaborCost",
+    )
+    total_revenue = _legacy_forecast_money(
+        week,
+        "revenueComplete",
+        "estRevenue",
+        "knownRevenue",
+    )
+    net = (
+        round(total_revenue - total_labor, 2)
+        if total_revenue is not None and total_labor is not None
         else None
     )
-    estimated_visits = (
-        hours / expected_hours
-        if expected_hours and expected_hours > 0
-        else 1
-    )
-    return rate * estimated_visits
+    by_customer = [
+        _legacy_forecast_by_customer(site_row)
+        for site_row in week.get("bySite", [])
+    ]
+    return {
+        "weekStart": week["weekStart"],
+        "weekEnd": week["weekEnd"],
+        "totalHours": round(float(total_hours), 2)
+        if total_hours is not None
+        else None,
+        "estLaborCost": total_labor,
+        "estRevenue": total_revenue,
+        "estNetProfit": net,
+        "estMarginPct": _legacy_forecast_percent(net, total_revenue),
+        "estLaborPct": _legacy_forecast_percent(total_labor, total_revenue),
+        "byCustomer": sorted(
+            by_customer,
+            key=lambda row: (
+                -(row["forecastHours"] or 0),
+                str(row.get("customer") or "").casefold(),
+                int(row.get("locationId") or 0),
+            ),
+        ),
+    }
 
 
 @app.get("/api/admin/analytics/forecast")
@@ -13184,265 +13285,25 @@ def admin_forecast(
     weeks_ahead: int = 4,
     _: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    """Simple weekly staffing forecast based on recent actual hours and scheduled data."""
-    now = utc_now()
-    local_now = to_local(now)
-    today = local_now.date()
-    days_since_sunday = (today.weekday() + 1) % 7
-    current_week_start = today - timedelta(days=days_since_sunday)
-
-    # Look back 8 weeks for historical averages
-    lookback_start = current_week_start - timedelta(weeks=8)
-    lookback_end = current_week_start - timedelta(days=1)
-
-    sites_by_id, alias_site_ids = _reporting_site_identity_catalog()
+    """Legacy forecast response backed by the canonical operations forecast."""
+    if weeks_ahead < 1:
+        raise HTTPException(status_code=400, detail="weeks_ahead must be at least 1")
     settings = load_settings()
-    active_site_ids_by_customer: Dict[int, set[int]] = {}
-    for site_id, site in sites_by_id.items():
-        if bool(site.get("active")) and site.get("customer_id") is not None:
-            active_site_ids_by_customer.setdefault(
-                int(site["customer_id"]),
-                set(),
-            ).add(site_id)
-
-    # Historical actuals by customer per week
-    hist_rows = db.query_all(
-        """
-        SELECT s.location_id,
-               COALESCE(c.name, l.customer_name, l.address,
-                        s.location_label, 'Unknown') AS customer,
-               s.local_date, SUM(s.total_hours) AS hours
-        FROM shifts s
-        LEFT JOIN locations l ON s.location_id = l.id
-        LEFT JOIN customers c ON c.id = l.customer_id
-        WHERE s.clock_out IS NOT NULL AND s.local_date >= %s AND s.local_date <= %s
-        GROUP BY s.location_id, customer, s.local_date
-        """,
-        (lookback_start, lookback_end),
+    canonical = build_operations_forecast(
+        weeks_ahead,
+        timezone_name=TIMEZONE_NAME,
+        now_provider=utc_now,
     )
-
-    # Aggregate output by stable Customer identity while retaining Site-level
-    # hour buckets for pricing. Equal display names remain separate identities.
-    customer_weekly: Dict[Tuple[str, Any], Dict[str, float]] = {}
-    identity_names: Dict[Tuple[str, Any], str] = {}
-    historical_site_ids: Dict[Tuple[str, Any], set[int]] = {}
-    historical_hours_by_site: Dict[Tuple[str, Any], Dict[int, float]] = {}
-    historical_unassigned_hours: Dict[Tuple[str, Any], float] = {}
-    for r in hist_rows:
-        customer_name = str(r["customer"] or "Unknown")
-        row_hours = float(r["hours"] or 0)
-        identity = _reporting_site_identity(
-            r.get("location_id"),
-            customer_name,
-            alias_site_ids,
-            sites_by_id,
-        )
-        identity_names.setdefault(identity, customer_name)
-        if r.get("location_id") is not None:
-            site_id = int(r["location_id"])
-            historical_site_ids.setdefault(identity, set()).add(site_id)
-            site_hours = historical_hours_by_site.setdefault(identity, {})
-            site_hours[site_id] = site_hours.get(site_id, 0.0) + row_hours
-        else:
-            historical_unassigned_hours[identity] = (
-                historical_unassigned_hours.get(identity, 0.0) + row_hours
-            )
-        d = r["local_date"]
-        ds = (d.weekday() + 1) % 7
-        wk = str(d - timedelta(days=ds))
-        if identity not in customer_weekly:
-            customer_weekly[identity] = {}
-        customer_weekly[identity][wk] = (
-            customer_weekly[identity].get(wk, 0) + row_hours
-        )
-
-    # Average hours per week per customer
-    customer_avg: Dict[Tuple[str, Any], float] = {}
-    for identity, weeks in customer_weekly.items():
-        if weeks:
-            customer_avg[identity] = round(sum(weeks.values()) / len(weeks), 2)
-
-    # Get avg labor rate
-    avg_rate_row = db.query_one("SELECT AVG(hourly_rate) AS avg_rate FROM employees WHERE hourly_rate IS NOT NULL AND active = true")
-    avg_labor_rate = float(avg_rate_row["avg_rate"]) if avg_rate_row and avg_rate_row["avg_rate"] else _SETTINGS_DEFAULTS["laborRateFallback"]
-
-    # Build forecast for each future week
-    forecasts = []
-    for i in range(weeks_ahead):
-        forecast_week_start = current_week_start + timedelta(weeks=i)
-        forecast_week_end = forecast_week_start + timedelta(days=6)
-
-        # Check if we have schedules for this week
-        scheduled = db.query_all(
-            """
-            SELECT sc.location_id, COALESCE(c.name, sc.customer_name) AS customer_name,
-                   SUM(sc.scheduled_hours) AS hours
-            FROM schedules sc
-            LEFT JOIN locations l ON l.id = sc.location_id
-            LEFT JOIN customers c ON c.id = l.customer_id
-            WHERE sc.week_start = %s
-            GROUP BY sc.location_id, c.name, sc.customer_name
-            """,
-            (forecast_week_start,),
-        )
-        scheduled_map: Dict[Tuple[str, Any], Dict[str, Any]] = {}
-        for schedule in scheduled:
-            customer_name = str(schedule.get("customer_name") or "")
-            identity = _reporting_site_identity(
-                schedule.get("location_id"),
-                customer_name,
-                alias_site_ids,
-                sites_by_id,
-            )
-            identity_names.setdefault(identity, customer_name)
-            scheduled_entry = scheduled_map.setdefault(
-                identity,
-                {
-                    "hours": 0.0,
-                    "siteHours": {},
-                    "unassignedHours": 0.0,
-                },
-            )
-            scheduled_hours = float(schedule["hours"] or 0)
-            scheduled_entry["hours"] += scheduled_hours
-            if schedule.get("location_id") is not None:
-                scheduled_site_id = int(schedule["location_id"])
-                scheduled_entry["siteHours"][scheduled_site_id] = (
-                    scheduled_entry["siteHours"].get(scheduled_site_id, 0.0)
-                    + scheduled_hours
-                )
-            else:
-                scheduled_entry["unassignedHours"] += scheduled_hours
-
-        total_hours = 0.0
-        total_labor = 0.0
-        total_revenue = 0.0
-        by_customer = []
-
-        all_customers = set(customer_avg) | set(scheduled_map)
-        for identity in all_customers:
-            # Use schedule if available, otherwise historical average
-            scheduled_entry = scheduled_map.get(identity)
-            hours = (
-                float(scheduled_entry["hours"])
-                if scheduled_entry
-                else customer_avg.get(identity, 0)
-            )
-            labor = hours * avg_labor_rate
-
-            historical_ids = historical_site_ids.get(identity, set())
-            active_customer_site_ids = (
-                active_site_ids_by_customer.get(int(identity[1]), set())
-                if identity[0] == "customer"
-                else set()
-            )
-            economics_hours_by_site: Dict[int, float]
-            unassigned_hours = 0.0
-            if scheduled_entry:
-                economics_hours_by_site = {
-                    int(site_id): float(site_hours)
-                    for site_id, site_hours in scheduled_entry.get(
-                        "siteHours",
-                        {},
-                    ).items()
-                }
-                unassigned_hours = float(
-                    scheduled_entry.get("unassignedHours", 0.0)
-                )
-            elif identity[0] == "customer" and len(active_customer_site_ids) == 1:
-                # Historical hours at a retired Site use the sole active
-                # replacement Site's current economics.
-                economics_hours_by_site = {
-                    next(iter(active_customer_site_ids)): float(hours)
-                }
-            else:
-                observed_weeks = max(len(customer_weekly.get(identity, {})), 1)
-                economics_hours_by_site = {
-                    int(site_id): float(site_hours) / observed_weeks
-                    for site_id, site_hours in historical_hours_by_site.get(
-                        identity,
-                        {},
-                    ).items()
-                }
-                unassigned_hours = (
-                    historical_unassigned_hours.get(identity, 0.0)
-                    / observed_weeks
-                )
-
-            if unassigned_hours:
-                fallback_site_id: Optional[int] = None
-                if len(economics_hours_by_site) == 1:
-                    fallback_site_id = next(iter(economics_hours_by_site))
-                elif identity[0] == "site":
-                    fallback_site_id = int(identity[1])
-                elif len(active_customer_site_ids) == 1:
-                    fallback_site_id = next(iter(active_customer_site_ids))
-                elif len(historical_ids) == 1:
-                    fallback_site_id = next(iter(historical_ids))
-                if fallback_site_id is not None:
-                    economics_hours_by_site[fallback_site_id] = (
-                        economics_hours_by_site.get(fallback_site_id, 0.0)
-                        + unassigned_hours
-                    )
-
-            economics_site_ids = set(economics_hours_by_site)
-            location_id_value = (
-                next(iter(economics_site_ids))
-                if len(economics_site_ids) == 1
-                else None
-            )
-            site = sites_by_id.get(location_id_value) if location_id_value else None
-            rev = sum(
-                _forecast_revenue_for_site(
-                    sites_by_id.get(site_id),
-                    site_hours,
-                )
-                for site_id, site_hours in economics_hours_by_site.items()
-            )
-
-            total_hours += hours
-            total_labor += labor
-            total_revenue += rev
-            by_customer.append({
-                "customerId": (
-                    int(identity[1])
-                    if identity[0] == "customer"
-                    else (
-                        int(site["customer_id"])
-                        if site and site.get("customer_id") is not None
-                        else None
-                    )
-                ),
-                "locationId": location_id_value,
-                "customer": str(
-                    (site or {}).get("customer_name")
-                    or identity_names.get(identity)
-                    or identity[1]
-                ),
-                "forecastHours": round(hours, 2),
-                "source": "schedule" if identity in scheduled_map else "historical",
-                "estLaborCost": round(labor, 2),
-                "estRevenue": round(rev, 2),
-            })
-
-        net = round(total_revenue - total_labor, 2)
-        forecasts.append({
-            "weekStart": str(forecast_week_start),
-            "weekEnd": str(forecast_week_end),
-            "totalHours": round(total_hours, 2),
-            "estLaborCost": round(total_labor, 2),
-            "estRevenue": round(total_revenue, 2),
-            "estNetProfit": net,
-            "estMarginPct": round(net / total_revenue * 100, 1) if total_revenue > 0 else None,
-            "estLaborPct": round(total_labor / total_revenue * 100, 1) if total_revenue > 0 else None,
-            "byCustomer": sorted(by_customer, key=lambda c: c["forecastHours"], reverse=True),
-        })
+    forecasts = [_legacy_forecast_week(week) for week in canonical["weeks"]]
 
     return {
         "success": True,
         "weeksAhead": weeks_ahead,
-        "avgLaborRate": round(avg_labor_rate, 2),
+        "avgLaborRate": canonical.get("avgLaborRate"),
         "laborPctTarget": settings.get("laborPctTarget", _SETTINGS_DEFAULTS["laborPctTarget"]),
+        "issues": canonical.get("issues", []),
+        "summary": canonical.get("summary"),
+        "weeks": forecasts,
         "forecasts": forecasts,
     }
 
@@ -15250,6 +15111,7 @@ def admin_analytics_customer(
 # correction ledger; the router receives only the cross-process lock identity
 # and never receives a raw timekeeping mutation helper.
 from operations_schedule import (
+    build_operations_forecast,
     build_operations_schedule_router,
     build_weekly_labor_profitability,
     monthly_revenue_allocations,

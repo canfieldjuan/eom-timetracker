@@ -972,44 +972,6 @@ def test_weekly_schedules_keep_equal_named_customers_distinct_by_site(
     } == {first_site["id"]: 1.0, second_site["id"]: 2.0}
     assert sum(row["actualHours"] for row in shared_comparisons) == 3.0
 
-    import time_tracker_api as api
-
-    today = api.to_local(api.utc_now()).date()
-    current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
-    for site, hours in ((first_site, 3.0), (second_site, 4.0)):
-        response = client.post(
-            "/api/admin/schedules",
-            headers=auth,
-            json={
-                "employeeId": employee_id,
-                "locationId": site["id"],
-                "customerName": shared_name,
-                "weekStart": current_sunday.isoformat(),
-                "scheduledHours": hours,
-                "notes": "Forecast identity proof",
-            },
-        )
-        assert response.status_code == 200, response.text
-
-    forecast = client.get(
-        "/api/admin/analytics/forecast",
-        headers=auth,
-        params={"weeks_ahead": 1},
-    )
-    assert forecast.status_code == 200, forecast.text
-    shared_forecast = [
-        row
-        for row in forecast.json()["forecasts"][0]["byCustomer"]
-        if row["customer"] == shared_name
-    ]
-    assert {
-        row["locationId"]: (row["forecastHours"], row["estRevenue"])
-        for row in shared_forecast
-    } == {
-        first_site["id"]: (3.0, 300.0),
-        second_site["id"]: (4.0, 800.0),
-    }
-
 
 def test_weekly_schedule_rejects_zero_or_multi_site_customer(
     client,
@@ -1122,7 +1084,7 @@ def test_weekly_schedule_rejects_zero_or_multi_site_customer(
     assert legacy_schedule_id is not None
 
 
-def test_forecast_uses_the_active_replacement_site_for_customer_economics(
+def test_forecast_no_longer_projects_retired_history_without_source_jobs(
     client,
     auth,
     employee_id,
@@ -1165,7 +1127,7 @@ def test_forecast_uses_the_active_replacement_site_for_customer_economics(
         headers=auth,
     )
     assert archived.status_code == 200, archived.text
-    replacement_site = _create_site(
+    _replacement_site = _create_site(
         client,
         auth,
         customer["id"],
@@ -1186,13 +1148,10 @@ def test_forecast_uses_the_active_replacement_site_for_customer_economics(
         for row in forecast.json()["forecasts"][0]["byCustomer"]
         if row["customerId"] == customer["id"]
     ]
-    assert len(customer_rows) == 1
-    assert customer_rows[0]["locationId"] == replacement_site["id"]
-    assert customer_rows[0]["forecastHours"] == 2.0
-    assert customer_rows[0]["estRevenue"] == 440.0
+    assert customer_rows == []
 
 
-def test_forecast_sums_site_economics_for_one_customer_with_multiple_sites(
+def test_forecast_no_longer_projects_history_or_schedules_without_source_jobs(
     client,
     auth,
     employee_id,
@@ -1261,11 +1220,7 @@ def test_forecast_sums_site_economics_for_one_customer_with_multiple_sites(
         for row in historical.json()["forecasts"][0]["byCustomer"]
         if row["customerId"] == customer["id"]
     ]
-    assert len(historical_rows) == 1
-    assert historical_rows[0]["locationId"] is None
-    assert historical_rows[0]["source"] == "historical"
-    assert historical_rows[0]["forecastHours"] == 5.0
-    assert historical_rows[0]["estRevenue"] == 350.0
+    assert historical_rows == []
 
     today = api.to_local(api.utc_now()).date()
     current_sunday = today - timedelta(days=(today.weekday() + 1) % 7)
@@ -1290,8 +1245,4 @@ def test_forecast_sums_site_economics_for_one_customer_with_multiple_sites(
         for row in scheduled.json()["forecasts"][0]["byCustomer"]
         if row["customerId"] == customer["id"]
     ]
-    assert len(scheduled_rows) == 1
-    assert scheduled_rows[0]["locationId"] == visit_site["id"]
-    assert scheduled_rows[0]["source"] == "schedule"
-    assert scheduled_rows[0]["forecastHours"] == 6.0
-    assert scheduled_rows[0]["estRevenue"] == 300.0
+    assert scheduled_rows == []
