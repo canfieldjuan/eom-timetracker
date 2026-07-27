@@ -14154,7 +14154,7 @@ def _source_job_profitability_economics(
 ) -> Dict[int, Dict[str, Any]]:
     economics: Dict[int, Dict[str, Any]] = {}
     monthly_group_for_job: Dict[int, Tuple[int, int, int]] = {}
-    monthly_rates: Dict[Tuple[int, int, int], int] = {}
+    monthly_rates: Dict[Tuple[int, int, int], Any] = {}
 
     for row in rows:
         if row.get("source_key") is None:
@@ -14188,24 +14188,25 @@ def _source_job_profitability_economics(
                     scheduled_date.month,
                 )
                 monthly_group_for_job[job_id] = group
-                monthly_rates[group] = rate_cents
+                monthly_rates[group] = row.get("site_rate")
 
         economics[job_id] = {
             "expected_hours": float(expected) if expected is not None else None,
             "revenue_cents": revenue_cents,
         }
 
-    if not monthly_rates:
+    if not monthly_group_for_job:
         return economics
 
-    month_starts = [date(year, month, 1) for _, year, month in monthly_rates]
+    monthly_groups = set(monthly_rates)
+    month_starts = [date(year, month, 1) for _, year, month in monthly_groups]
     month_ends = [
         date(year, month, calendar.monthrange(year, month)[1])
-        for _, year, month in monthly_rates
+        for _, year, month in monthly_groups
     ]
     candidate_rows = db.query_all(
         """
-        SELECT id, location_id, scheduled_date, scheduled_start
+        SELECT id, location_id, scheduled_date, scheduled_start, status
         FROM jobs
         WHERE status <> 'cancelled'
           AND location_id = ANY(%s)
@@ -14213,12 +14214,12 @@ def _source_job_profitability_economics(
         ORDER BY scheduled_date, scheduled_start NULLS FIRST, id
         """,
         (
-            sorted({group[0] for group in monthly_rates}),
+            sorted({group[0] for group in monthly_groups}),
             min(month_starts),
             max(month_ends),
         ),
     )
-    candidates_by_group: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = {}
+    allocation_candidates: List[Dict[str, Any]] = []
     for candidate in candidate_rows:
         scheduled_date = candidate["scheduled_date"]
         group = (
@@ -14226,33 +14227,23 @@ def _source_job_profitability_economics(
             scheduled_date.year,
             scheduled_date.month,
         )
-        if group in monthly_rates:
-            candidates_by_group.setdefault(group, []).append(candidate)
+        if group in monthly_groups:
+            allocation_candidates.append(
+                {
+                    **candidate,
+                    "rate": monthly_rates[group],
+                    "rate_type": "monthly",
+                }
+            )
 
     app_timezone = ZoneInfo(TIMEZONE_NAME)
-    allocations_by_group: Dict[Tuple[int, int, int], Dict[int, int]] = {}
-    for group, candidates in candidates_by_group.items():
-        ordered = sorted(
-            candidates,
-            key=lambda row: (
-                row.get("scheduled_start")
-                or datetime.combine(
-                    row["scheduled_date"],
-                    clock_time.min,
-                    tzinfo=app_timezone,
-                ).astimezone(timezone.utc),
-                int(row["id"]),
-            ),
-        )
-        allocations_by_group[group] = allocate_monthly_cents(
-            monthly_rates[group],
-            (int(row["id"]) for row in ordered),
-        )
+    monthly_allocations = monthly_revenue_allocations(
+        allocation_candidates,
+        app_timezone,
+    )
 
-    for job_id, group in monthly_group_for_job.items():
-        economics[job_id]["revenue_cents"] = allocations_by_group.get(
-            group, {}
-        ).get(job_id)
+    for job_id in monthly_group_for_job:
+        economics[job_id]["revenue_cents"] = monthly_allocations.get(job_id)
     return economics
 
 
@@ -15259,9 +15250,9 @@ def admin_analytics_customer(
 # correction ledger; the router receives only the cross-process lock identity
 # and never receives a raw timekeeping mutation helper.
 from operations_schedule import (
-    allocate_monthly_cents,
     build_operations_schedule_router,
     build_weekly_labor_profitability,
+    monthly_revenue_allocations,
 )
 
 app.include_router(

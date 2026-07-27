@@ -2850,7 +2850,7 @@ def _aggregate_forecast_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _monthly_revenue_allocations(
+def monthly_revenue_allocations(
     jobs: List[Dict[str, Any]],
     app_timezone: ZoneInfo,
 ) -> Dict[int, int]:
@@ -3101,7 +3101,7 @@ def build_weekly_labor_profitability(
         window_end=range_end,
     )
     allocation_jobs = _load_jobs(allocation_start, allocation_end)
-    monthly_allocations = _monthly_revenue_allocations(
+    monthly_allocations = monthly_revenue_allocations(
         allocation_jobs,
         app_timezone,
     )
@@ -3919,46 +3919,10 @@ def build_operations_schedule_router(
         if configured_wages:
             avg_hourly_rate = sum(configured_wages) / Decimal(len(configured_wages))
 
-        monthly_groups: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = defaultdict(
-            list
+        monthly_allocations = monthly_revenue_allocations(
+            allocation_jobs,
+            app_timezone,
         )
-        for job in allocation_jobs:
-            if (
-                job.get("status") != "cancelled"
-                and job.get("location_id") is not None
-                and str(job.get("rate_type") or "") == "monthly"
-            ):
-                scheduled_date = job["scheduled_date"]
-                monthly_groups[
-                    (
-                        int(job["location_id"]),
-                        scheduled_date.year,
-                        scheduled_date.month,
-                    )
-                ].append(job)
-
-        monthly_allocations: Dict[int, int] = {}
-        for jobs_in_month in monthly_groups.values():
-            ordered = sorted(
-                jobs_in_month,
-                key=lambda row: (
-                    row.get("scheduled_start")
-                    or datetime.combine(
-                        row["scheduled_date"],
-                        time.min,
-                        tzinfo=app_timezone,
-                    ).astimezone(timezone.utc),
-                    int(row["id"]),
-                ),
-            )
-            monthly_cents = _money_cents(ordered[0].get("rate"))
-            if monthly_cents is not None:
-                monthly_allocations.update(
-                    allocate_monthly_cents(
-                        monthly_cents,
-                        (int(job["id"]) for job in ordered),
-                    )
-                )
 
         forecast_jobs = []
         for job in allocation_jobs:

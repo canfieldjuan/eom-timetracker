@@ -2315,6 +2315,69 @@ class TestJobs:
         finally:
             _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
 
+    def test_jobs_profitability_uses_shared_monthly_allocation_helper(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        customer_name = "Profitability Shared Helper"
+        job_ids: list[int] = []
+        site_ids: list[int] = []
+        captured_job_ids: list[list[int]] = []
+        try:
+            site_id = _insert_profitability_site(
+                address="Profitability Shared Helper Site",
+                customer_name=customer_name,
+                rate=100.00,
+                rate_type="monthly",
+                expected_hours=4.0,
+            )
+            site_ids.append(site_id)
+            first_job = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-03-01",
+                source_key="40" * 32,
+            )
+            second_job = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2047-03-08",
+                source_key="41" * 32,
+            )
+            job_ids.extend([first_job, second_job])
+
+            def fake_monthly_allocations(jobs, _app_timezone):
+                captured_job_ids.append([int(row["id"]) for row in jobs])
+                return {
+                    first_job: 4321,
+                    second_job: 5679,
+                }
+
+            monkeypatch.setattr(
+                api,
+                "monthly_revenue_allocations",
+                fake_monthly_allocations,
+            )
+
+            response = client.get(
+                "/api/admin/jobs/profitability",
+                headers=auth,
+                params={
+                    "customer": customer_name,
+                    "start_date": "2047-03-01",
+                    "end_date": "2047-03-31",
+                },
+            )
+
+            assert response.status_code == 200, response.text
+            by_id = {row["jobId"]: row for row in response.json()["jobs"]}
+            assert by_id[first_job]["revenue"] == 43.21
+            assert by_id[second_job]["revenue"] == 56.79
+            assert captured_job_ids == [[first_job, second_job]]
+        finally:
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
+
     @pytest.mark.parametrize(
         ("rate_type", "source_key_prefix"),
         [
