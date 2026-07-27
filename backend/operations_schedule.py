@@ -96,6 +96,82 @@ def _local_bounds(
     )
 
 
+def _local_interval_day_slices(
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    range_start: datetime,
+    range_end: datetime,
+    app_timezone: ZoneInfo,
+) -> List[Tuple[date, float]]:
+    slices: List[Tuple[date, float]] = []
+    cursor = max(start_utc.astimezone(timezone.utc), range_start)
+    clipped_end = min(end_utc.astimezone(timezone.utc), range_end)
+    while cursor < clipped_end:
+        local_cursor = cursor.astimezone(app_timezone)
+        local_day = local_cursor.date()
+        next_local_midnight = datetime.combine(
+            local_day + timedelta(days=1),
+            time.min,
+            tzinfo=app_timezone,
+        ).astimezone(timezone.utc)
+        next_cursor = min(clipped_end, next_local_midnight)
+        hours = _hours(cursor, next_cursor)
+        if hours > 0:
+            slices.append((local_day, hours))
+        cursor = next_cursor
+    return slices
+
+
+def _local_interval_grid_day_slices(
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    range_start: datetime,
+    range_end: datetime,
+    app_timezone: ZoneInfo,
+) -> List[Tuple[date, float]]:
+    """Split visible time by local day and fold retained boundary time into the grid."""
+
+    normalized_start = start_utc.astimezone(timezone.utc)
+    normalized_end = end_utc.astimezone(timezone.utc)
+    if normalized_end <= normalized_start:
+        return []
+
+    first_grid_day = range_start.astimezone(app_timezone).date()
+    last_grid_day = (range_end - timedelta(microseconds=1)).astimezone(
+        app_timezone
+    ).date()
+    slices: List[Tuple[date, float]] = []
+
+    if normalized_start < range_start:
+        boundary_end = min(normalized_end, range_start)
+        boundary_hours = _hours(normalized_start, boundary_end)
+        if boundary_hours > 0:
+            slices.append((first_grid_day, boundary_hours))
+
+    overlap_start = max(normalized_start, range_start)
+    overlap_end = min(normalized_end, range_end)
+    if overlap_start < overlap_end:
+        slices.extend(
+            _local_interval_day_slices(
+                overlap_start,
+                overlap_end,
+                range_start=range_start,
+                range_end=range_end,
+                app_timezone=app_timezone,
+            )
+        )
+
+    if normalized_end > range_end:
+        boundary_start = max(normalized_start, range_end)
+        boundary_hours = _hours(boundary_start, normalized_end)
+        if boundary_hours > 0:
+            slices.append((last_grid_day, boundary_hours))
+
+    return slices
+
+
 def _sunday_for(day: date) -> date:
     return day - timedelta(days=(day.weekday() + 1) % 7)
 
@@ -2934,6 +3010,11 @@ def _actual_profitability_row(
     source_job: Dict[str, Any],
     monthly_allocations: Dict[int, int],
     *,
+    week_start: date,
+    week_end: date,
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
     default_target_labor_pct: Optional[float],
     default_min_margin_pct: Optional[float],
 ) -> Dict[str, Any]:
@@ -2978,6 +3059,14 @@ def _actual_profitability_row(
         "siteAddress": row.get("siteAddress"),
         "siteType": row.get("siteType"),
         "scheduledDate": row.get("scheduledDate"),
+        "profitabilityDate": _job_profitability_date(
+            source_job,
+            week_start=week_start,
+            week_end=week_end,
+            app_timezone=app_timezone,
+            range_start=range_start,
+            range_end=range_end,
+        ),
         "scheduledStart": row.get("scheduledStart"),
         "scheduledEnd": row.get("scheduledEnd"),
         "status": row.get("status"),
@@ -3013,6 +3102,269 @@ def _actual_profitability_row(
         ],
         "issues": issues,
     }
+
+
+def _job_profitability_date(
+    source_job: Dict[str, Any],
+    *,
+    week_start: date,
+    week_end: date,
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> str:
+    scheduled_start = source_job.get("scheduled_start")
+    scheduled_end = source_job.get("scheduled_end")
+    if (
+        isinstance(scheduled_start, datetime)
+        and isinstance(scheduled_end, datetime)
+        and scheduled_end > scheduled_start
+    ):
+        overlap_start = max(scheduled_start.astimezone(timezone.utc), range_start)
+        overlap_end = min(scheduled_end.astimezone(timezone.utc), range_end)
+        if overlap_start < overlap_end:
+            return overlap_start.astimezone(app_timezone).date().isoformat()
+
+    scheduled_date = source_job.get("scheduled_date")
+    if isinstance(scheduled_date, datetime):
+        scheduled_day = scheduled_date.date()
+    elif isinstance(scheduled_date, date):
+        scheduled_day = scheduled_date
+    else:
+        scheduled_day = week_start
+    if scheduled_day < week_start:
+        return week_start.isoformat()
+    if scheduled_day > week_end:
+        return week_end.isoformat()
+    return scheduled_day.isoformat()
+
+
+def _allocate_cents_by_weight(
+    total_cents: int,
+    weights: Dict[str, float],
+) -> Dict[str, int]:
+    positive_weights = {
+        key: weight
+        for key, weight in weights.items()
+        if weight > 0
+    }
+    total_weight = sum(positive_weights.values())
+    if total_weight <= 0:
+        return {key: 0 for key in weights}
+
+    allocations = []
+    allocated = 0
+    for key, weight in sorted(positive_weights.items()):
+        exact = (
+            Decimal(total_cents)
+            * Decimal(str(weight))
+            / Decimal(str(total_weight))
+        )
+        floor_cents = int(exact)
+        allocated += floor_cents
+        allocations.append(
+            {
+                "key": key,
+                "cents": floor_cents,
+                "remainder": exact - Decimal(floor_cents),
+            }
+        )
+
+    remaining = total_cents - allocated
+    for item in sorted(
+        allocations,
+        key=lambda row: (-row["remainder"], row["key"]),
+    )[:remaining]:
+        item["cents"] = int(item["cents"]) + 1
+
+    result = {key: 0 for key in weights}
+    result.update({str(item["key"]): int(item["cents"]) for item in allocations})
+    return result
+
+
+def _daily_worker_rows(
+    worker: Dict[str, Any],
+    *,
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> Dict[str, Dict[str, Any]]:
+    hours_by_day: Dict[str, float] = defaultdict(float)
+    for interval in worker.get("intervals") or []:
+        if not interval.get("finalized") or not interval.get("intervalEnd"):
+            continue
+        interval_start = _parse_utc_iso(str(interval["intervalStart"]))
+        interval_end = _parse_utc_iso(str(interval["intervalEnd"]))
+        for local_day, hours in _local_interval_grid_day_slices(
+            interval_start,
+            interval_end,
+            range_start=range_start,
+            range_end=range_end,
+            app_timezone=app_timezone,
+        ):
+            hours_by_day[local_day.isoformat()] += hours
+
+    labor_cents = _money_cents(worker.get("laborCost"))
+    labor_by_day = (
+        _allocate_cents_by_weight(labor_cents, dict(hours_by_day))
+        if labor_cents is not None
+        else {}
+    )
+    return {
+        day: {
+            "employeeId": int(worker["employeeId"]),
+            "employeeName": worker["employeeName"],
+            "_hours": hours,
+            "laborCost": (
+                _money(labor_by_day[day])
+                if labor_cents is not None
+                else None
+            ),
+            "status": worker["status"],
+        }
+        for day, hours in hours_by_day.items()
+    }
+
+
+def _daily_profitability_worker_response(
+    worker: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "employeeId": int(worker["employeeId"]),
+        "employeeName": worker["employeeName"],
+        "hours": round(float(worker.get("_hours") or 0), 2),
+        "laborCost": worker["laborCost"],
+        "status": worker["status"],
+    }
+
+
+def _daily_profitability_issues(
+    profit_row: Dict[str, Any],
+    workers: List[Dict[str, Any]],
+    *,
+    day: str,
+    revenue_date: str,
+    revenue_cents: MoneyCents,
+) -> List[Dict[str, str]]:
+    dynamic_codes = {"missing_worker_rate", "missing_revenue"}
+    issues = [
+        issue
+        for issue in profit_row.get("issues") or []
+        if str(issue.get("code") or "") not in dynamic_codes
+    ]
+    if day == revenue_date and revenue_cents is None:
+        issues.append(
+            _issue(
+                "missing_revenue",
+                "Revenue cannot be calculated from this Site's rate card.",
+            )
+        )
+    for worker in workers:
+        if worker.get("laborCost") is not None:
+            continue
+        if float(worker.get("_hours") or 0) <= 0:
+            continue
+        issues.append(
+            _issue(
+                "missing_worker_rate",
+                f"{worker['employeeName']} has no configured hourly rate.",
+            )
+        )
+    return issues
+
+
+def _daily_profitability_job_rows(
+    profit_row: Dict[str, Any],
+    decorated_row: Dict[str, Any],
+    *,
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> List[Dict[str, Any]]:
+    revenue_date = str(profit_row.get("profitabilityDate") or profit_row.get("scheduledDate") or "")
+    worker_rows_by_day: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for worker in decorated_row.get("workers") or []:
+        for day, daily_worker in _daily_worker_rows(
+            worker,
+            app_timezone=app_timezone,
+            range_start=range_start,
+            range_end=range_end,
+        ).items():
+            worker_rows_by_day[day].append(daily_worker)
+
+    daily_rows: List[Dict[str, Any]] = []
+    for day in sorted(set(worker_rows_by_day) | ({revenue_date} if revenue_date else set())):
+        workers = sorted(
+            worker_rows_by_day.get(day, []),
+            key=lambda worker: (
+                worker["employeeName"].casefold(),
+                worker["employeeId"],
+            ),
+        )
+        actual_hours = round(
+            sum(float(worker.get("_hours") or 0) for worker in workers),
+            2,
+        )
+        labor_incomplete = any(
+            worker.get("laborCost") is None and float(worker.get("_hours") or 0) > 0
+            for worker in workers
+        )
+        known_labor_cents = sum(
+            _money_cents(worker.get("laborCost")) or 0
+            for worker in workers
+        )
+        actual_labor_cents: MoneyCents = None if labor_incomplete else known_labor_cents
+        revenue_cents = (
+            _money_cents(profit_row.get("revenue"))
+            if day == revenue_date
+            else 0
+        )
+        issues = _daily_profitability_issues(
+            profit_row,
+            workers,
+            day=day,
+            revenue_date=revenue_date,
+            revenue_cents=revenue_cents,
+        )
+        planned_hours = profit_row.get("plannedHours") if day == revenue_date else 0.0
+        net_cents = (
+            revenue_cents - actual_labor_cents
+            if revenue_cents is not None and actual_labor_cents is not None
+            else None
+        )
+        actual_labor_pct = _percent(actual_labor_cents, revenue_cents)
+        target_labor_pct = profit_row.get("targetLaborPct")
+        daily_row = {
+            **profit_row,
+            "profitabilityDate": day,
+            "revenueRecognitionDate": revenue_date,
+            "plannedHours": planned_hours,
+            "actualHours": actual_hours,
+            "varianceHours": (
+                round(actual_hours - float(planned_hours), 2)
+                if planned_hours is not None
+                else None
+            ),
+            "revenue": _money(revenue_cents),
+            "revenueComplete": revenue_cents is not None,
+            "actualLaborCost": _money(actual_labor_cents),
+            "knownActualLaborCost": _money(known_labor_cents),
+            "laborCostComplete": actual_labor_cents is not None,
+            "netProfit": _money(net_cents),
+            "grossMarginPct": _percent(net_cents, revenue_cents),
+            "actualLaborPct": actual_labor_pct,
+            "laborTargetVariancePct": (
+                round(actual_labor_pct - float(target_labor_pct), 1)
+                if actual_labor_pct is not None and target_labor_pct is not None
+                else None
+            ),
+            "workers": [
+                _daily_profitability_worker_response(worker) for worker in workers
+            ],
+            "issues": issues,
+        }
+        daily_rows.append(daily_row)
+    return daily_rows
 
 
 def _aggregate_actual_profitability_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3081,6 +3433,175 @@ def _aggregate_actual_profitability_rows(rows: List[Dict[str, Any]]) -> Dict[str
     }
 
 
+def _profitability_issue_details(rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    issues: List[Dict[str, str]] = []
+    seen: set[Tuple[str, str]] = set()
+    for row in rows:
+        for issue in row.get("issues") or []:
+            code = str(issue.get("code") or "")
+            message = str(issue.get("message") or "")
+            key = (code, message)
+            if key in seen:
+                continue
+            seen.add(key)
+            issues.append({"code": code, "message": message})
+    return issues
+
+
+def _profitability_issue_count(rows: List[Dict[str, Any]]) -> int:
+    return sum(len(row.get("issues") or []) for row in rows)
+
+
+def _profitability_job_sort_key(row: Dict[str, Any]) -> Tuple[str, str, int]:
+    return (
+        str(row.get("scheduledDate") or ""),
+        str(row.get("scheduledStart") or ""),
+        int(row.get("jobId") or 0),
+    )
+
+
+def _profitability_site_sort_key(row: Dict[str, Any]) -> Tuple[str, str, int]:
+    return (
+        str(row.get("customerName") or "").casefold(),
+        str(row.get("siteAddress") or "").casefold(),
+        int(row.get("locationId") or 0),
+    )
+
+
+def _group_profitability_by_site(
+    rows: List[Dict[str, Any]],
+    *,
+    include_jobs: bool = False,
+) -> List[Dict[str, Any]]:
+    by_site_rows: Dict[Optional[int], List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_site_rows[row.get("locationId")].append(row)
+
+    sites = []
+    for location_id, site_rows in by_site_rows.items():
+        first = site_rows[0]
+        site = {
+            "locationId": location_id,
+            "customerId": first.get("customerId"),
+            "customerName": first.get("customerName"),
+            "siteAddress": first.get("siteAddress"),
+            "siteType": first.get("siteType"),
+            **_aggregate_actual_profitability_rows(site_rows),
+            "issueCount": _profitability_issue_count(site_rows),
+            "issues": _profitability_issue_details(site_rows),
+        }
+        if include_jobs:
+            site["jobs"] = sorted(site_rows, key=_profitability_job_sort_key)
+        sites.append(site)
+
+    return sorted(sites, key=_profitability_site_sort_key)
+
+
+def _daily_profitability_rows(
+    week_start: date,
+    week_end: date,
+    profit_jobs: List[Dict[str, Any]],
+    unmatched: List[Dict[str, Any]],
+    *,
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> List[Dict[str, Any]]:
+    rows_by_day: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in profit_jobs:
+        profitability_date = str(row.get("profitabilityDate") or row.get("scheduledDate") or "")
+        if profitability_date:
+            rows_by_day[profitability_date].append(row)
+
+    unmatched_by_day = _daily_unmatched_profitability_rows(
+        week_start,
+        week_end,
+        unmatched,
+        app_timezone=app_timezone,
+        range_start=range_start,
+        range_end=range_end,
+    )
+
+    by_day = []
+    for offset in range(7):
+        day = week_start + timedelta(days=offset)
+        day_text = day.isoformat()
+        day_rows = rows_by_day.get(day_text, [])
+        unmatched_rows = unmatched_by_day.get(day_text, [])
+        unmatched_actual_hours = round(
+            sum(
+                float(row["dailyHours"])
+                for row in unmatched_rows
+                if row.get("finalized") and row.get("dailyHours") is not None
+            ),
+            2,
+        )
+        issues = _profitability_issue_details(day_rows)
+        if unmatched_rows:
+            issues.append(
+                _issue(
+                    "unmatched_actual_labor",
+                    "Labor was clocked on this day but could not be matched to a scheduled job.",
+                )
+            )
+        by_day.append(
+            {
+                "date": day_text,
+                **_aggregate_actual_profitability_rows(day_rows),
+                "unmatchedActualHours": unmatched_actual_hours,
+                "unmatchedActualSegmentCount": len(unmatched_rows),
+                "unmatchedActualSegments": unmatched_rows,
+                "issueCount": _profitability_issue_count(day_rows)
+                + (1 if unmatched_rows else 0),
+                "issues": issues,
+                "sites": _group_profitability_by_site(
+                    day_rows,
+                    include_jobs=True,
+                ),
+            }
+        )
+    return by_day
+
+
+def _parse_utc_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
+        timezone.utc
+    )
+
+
+def _daily_unmatched_profitability_rows(
+    week_start: date,
+    week_end: date,
+    unmatched: List[Dict[str, Any]],
+    *,
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> Dict[str, List[Dict[str, Any]]]:
+    by_day: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for segment in unmatched:
+        interval_start = _parse_utc_iso(str(segment["intervalStart"]))
+        interval_end_text = segment.get("intervalEnd")
+        if bool(segment.get("finalized")) and interval_end_text:
+            interval_end = _parse_utc_iso(str(interval_end_text))
+            for local_day, hours in _local_interval_day_slices(
+                interval_start,
+                interval_end,
+                range_start=range_start,
+                range_end=range_end,
+                app_timezone=app_timezone,
+            ):
+                by_day[local_day.isoformat()].append(
+                    {**segment, "dailyHours": round(hours, 2)}
+                )
+            continue
+
+        local_day = interval_start.astimezone(app_timezone).date()
+        if week_start <= local_day <= week_end:
+            by_day[local_day.isoformat()].append({**segment, "dailyHours": None})
+    return by_day
+
+
 def build_weekly_labor_profitability(
     week_start: date,
     *,
@@ -3121,28 +3642,28 @@ def build_weekly_labor_profitability(
             row,
             source_jobs[int(row["id"])],
             monthly_allocations,
+            week_start=week_start,
+            week_end=week_end,
+            app_timezone=app_timezone,
+            range_start=range_start,
+            range_end=range_end,
             default_target_labor_pct=default_target_labor_pct,
             default_min_margin_pct=default_min_margin_pct,
         )
         for row in schedule_jobs
     ]
-
-    by_site_rows: Dict[Optional[int], List[Dict[str, Any]]] = defaultdict(list)
-    for row in profit_jobs:
-        by_site_rows[row.get("locationId")].append(row)
-    by_site = []
-    for location_id, site_rows in by_site_rows.items():
-        first = site_rows[0]
-        by_site.append(
-            {
-                "locationId": location_id,
-                "customerId": first.get("customerId"),
-                "customerName": first.get("customerName"),
-                "siteAddress": first.get("siteAddress"),
-                "siteType": first.get("siteType"),
-                **_aggregate_actual_profitability_rows(site_rows),
-            }
+    decorated_jobs = {int(row["id"]): row for row in schedule_jobs}
+    daily_profit_jobs = [
+        daily_row
+        for row in profit_jobs
+        for daily_row in _daily_profitability_job_rows(
+            row,
+            decorated_jobs[int(row["jobId"])],
+            app_timezone=app_timezone,
+            range_start=range_start,
+            range_end=range_end,
         )
+    ]
 
     unmatched_actual_hours = sum(
         float(segment["hours"])
@@ -3161,13 +3682,15 @@ def build_weekly_labor_profitability(
             "unmatchedActualHours": round(unmatched_actual_hours, 2),
             "unmatchedActualSegmentCount": len(unmatched),
         },
-        "bySite": sorted(
-            by_site,
-            key=lambda row: (
-                str(row.get("customerName") or "").casefold(),
-                str(row.get("siteAddress") or "").casefold(),
-                int(row.get("locationId") or 0),
-            ),
+        "bySite": _group_profitability_by_site(profit_jobs),
+        "byDay": _daily_profitability_rows(
+            week_start,
+            week_end,
+            daily_profit_jobs,
+            unmatched,
+            app_timezone=app_timezone,
+            range_start=range_start,
+            range_end=range_end,
         ),
         "jobs": profit_jobs,
         "unmatchedActualSegments": unmatched,
