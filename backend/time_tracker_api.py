@@ -15071,7 +15071,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                 )
         else:
             # Legacy / single-location shift
-            hours = float(entry.get("totalHours", 0) or 0)
+            hours = entry_hours(entry, now)
             location = entry.get("location", "")
             resolved_location, customer = _resolve_loc(location)
             _aggregate(
@@ -15663,7 +15663,7 @@ def admin_analytics_customer(
                     job_id=_analytics_entry_job_id(visit.get("jobId")),
                 )
         else:
-            e_hours = float(entry.get("totalHours", 0) or 0)
+            e_hours = entry_hours(entry, now)
             resolved_location, cust = _resolve_loc(entry.get("location", ""))
             _record(
                 resolved_location,

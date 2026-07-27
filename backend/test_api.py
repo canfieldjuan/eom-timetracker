@@ -2310,6 +2310,102 @@ class TestAnalyticsRegression:
                 db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
             _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
 
+    def test_analytics_single_location_hours_use_clock_span_when_stored_total_is_stale(
+        self,
+        client,
+        auth,
+        employee_id,
+        monkeypatch,
+    ):
+        import time_tracker_api as api
+
+        customer_name = "Analytics Canonical Hours"
+        location_label = "Analytics Canonical Hours Site"
+        site_ids: list[int] = []
+        job_ids: list[int] = []
+        shift_ids: list[int] = []
+        monkeypatch.setattr(
+            api,
+            "utc_now",
+            lambda: datetime(2048, 1, 15, 18, tzinfo=timezone.utc),
+        )
+        try:
+            site_id = _insert_profitability_site(
+                address=location_label,
+                customer_name=customer_name,
+                rate=40.0,
+                rate_type="hourly",
+                expected_hours=2.5,
+            )
+            site_ids.append(site_id)
+            job_id = _insert_profitability_job(
+                location_id=site_id,
+                customer_name=customer_name,
+                scheduled_date="2048-01-13",
+                source_key=f"{9250:064x}",
+            )
+            job_ids.append(job_id)
+            shift_ids.append(
+                int(
+                    db.execute_returning(
+                        """
+                        INSERT INTO shifts (
+                            employee_id, location_id, location_label,
+                            job_id, clock_in, clock_out, total_hours,
+                            notes, local_date
+                        )
+                        VALUES (
+                            %s, %s, %s,
+                            %s,
+                            TIMESTAMPTZ '2048-01-13 08:00:00-06',
+                            TIMESTAMPTZ '2048-01-13 10:30:00-06',
+                            0.25, 'analytics canonical hours proof',
+                            DATE '2048-01-13'
+                        )
+                        RETURNING id
+                        """,
+                        (employee_id, site_id, location_label, job_id),
+                    )
+                )
+            )
+
+            response = client.get(
+                "/api/admin/analytics",
+                headers=auth,
+                params={"period": "week", "date": "2048-01-13"},
+            )
+
+            assert response.status_code == 200, response.text
+            body = response.json()
+            assert body["summary"]["hours"] == 2.5
+            assert body["summary"]["laborCost"] == pytest.approx(41.88)
+            customer_row = next(
+                row for row in body["byCustomer"] if row["customer"] == customer_name
+            )
+            assert customer_row["hours"] == 2.5
+            assert customer_row["laborCost"] == pytest.approx(41.88)
+            day_row = next(row for row in body["byDay"] if row["date"] == "2048-01-13")
+            assert day_row["hours"] == 2.5
+            assert day_row["laborCost"] == pytest.approx(41.88)
+
+            detail = client.get(
+                f"/api/admin/analytics/customer/{customer_name.replace(' ', '%20')}",
+                headers=auth,
+                params={"weeks": 1},
+            )
+            assert detail.status_code == 200, detail.text
+            detail_body = detail.json()
+            assert detail_body["summary"]["hours"] == 2.5
+            assert detail_body["summary"]["laborCost"] == pytest.approx(41.88)
+            assert detail_body["byVisit"][0]["hours"] == 2.5
+            assert detail_body["byVisit"][0]["laborCost"] == pytest.approx(41.88)
+            assert detail_body["byWeek"][0]["hours"] == 2.5
+            assert detail_body["byWeek"][0]["laborCost"] == pytest.approx(41.88)
+        finally:
+            if shift_ids:
+                db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
+
     def test_linked_job_missing_rate_fails_closed_across_analytics_callers(
         self,
         client,
