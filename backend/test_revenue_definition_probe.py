@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import json
 
+import revenue_definition_probe as probe
 from revenue_definition_probe import (
     build_monthly_contract_revenue_divergence,
     completed_week_starts,
+    main,
 )
 
 
@@ -96,3 +99,50 @@ def test_monthly_probe_shows_proration_delta_and_skips_cancelled_jobs():
     assert first_row["legacyAnalyticsProratedRevenue"] == 225.81
     assert first_row["forecastDelta"] == 102.39
     assert first_row["analyticsDelta"] == 107.53
+
+
+def test_cli_requires_database_url(monkeypatch, capsys):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(
+        probe.db,
+        "init_pool",
+        lambda _database_url: (_ for _ in ()).throw(
+            AssertionError("init_pool should not run without a database URL")
+        ),
+    )
+
+    exit_code = main(["--reference-date", "2026-07-27"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "DATABASE_URL or --db-url is required" in captured.err
+
+
+def test_cli_initializes_pool_from_database_url(monkeypatch, capsys):
+    initialized = []
+
+    def fake_build(*, reference_date, week_count):
+        assert reference_date == date(2026, 7, 27)
+        assert week_count == 3
+        return {
+            "success": True,
+            "summary": {"rowCount": 0},
+            "rows": [],
+        }
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://example.test/eom")
+    monkeypatch.setattr(probe.db, "init_pool", initialized.append)
+    monkeypatch.setattr(probe, "build_monthly_contract_revenue_divergence", fake_build)
+
+    exit_code = main(["--reference-date", "2026-07-27", "--weeks", "3"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert initialized == ["postgresql://example.test/eom"]
+    assert json.loads(captured.out) == {
+        "rows": [],
+        "success": True,
+        "summary": {"rowCount": 0},
+    }
+    assert captured.err == ""
