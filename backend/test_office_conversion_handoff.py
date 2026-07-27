@@ -426,6 +426,63 @@ def test_pending_handoff_retry_finalizes_without_duplicate_customer_or_site(
     )["count"] == 1
 
 
+def test_pending_handoff_retry_returns_finalized_when_error_update_loses_race(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+    atlas_handoff_id = str(uuid.uuid4())
+
+    def failing_atlas_request(path, admin, *, payload, idempotency_key):
+        raise api.AtlasFunnelRequestError(503, "Atlas is temporarily unavailable")
+
+    def stale_timeout_after_remote_success(path, admin, *, payload, idempotency_key):
+        db.execute(
+            """
+            UPDATE eom_office_conversion_handoffs
+            SET state = 'finalized',
+                atlas_handoff_id = %s,
+                last_error = NULL,
+                finalized_at = COALESCE(finalized_at, NOW()),
+                updated_at = NOW()
+            WHERE atlas_contact_id = %s AND idempotency_key = %s
+            """,
+            (atlas_handoff_id, contact_id, key),
+        )
+        raise api.AtlasFunnelRequestError(503, "stale timeout after finalize")
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", failing_atlas_request)
+    pending = client.post(
+        "/api/admin/funnel/approve-estimate",
+        headers=auth,
+        json=_payload(contact_id, key),
+    )
+    monkeypatch.setattr(api, "_atlas_funnel_request", stale_timeout_after_remote_success)
+    retried = client.post(
+        f"/api/admin/funnel/handoffs/{contact_id}/retry",
+        headers=auth,
+    )
+    row = db.query_one(
+        """
+        SELECT state, atlas_handoff_id, last_error
+        FROM eom_office_conversion_handoffs
+        WHERE atlas_contact_id = %s
+        """,
+        (contact_id,),
+    )
+
+    assert pending.status_code == 202, pending.text
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["handoff"]["status"] == "finalized"
+    assert retried.json()["handoff"]["lastError"] is None
+    assert row == {
+        "state": "finalized",
+        "atlas_handoff_id": atlas_handoff_id,
+        "last_error": None,
+    }
+
+
 def test_estimate_approval_requires_configured_employee_before_local_or_remote_side_effect(
     client, auth, monkeypatch, configured_office_conversion
 ):

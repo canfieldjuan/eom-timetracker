@@ -9694,18 +9694,36 @@ def _note_office_conversion_error(
     contact_id: str,
     idempotency_key: str,
     reason: str,
-) -> None:
+) -> bool:
     try:
-        db.execute(
-            """
-            UPDATE eom_office_conversion_handoffs
-            SET last_error = %s, updated_at = NOW()
-            WHERE atlas_contact_id = %s AND idempotency_key = %s
-            """,
-            (reason[:1000], contact_id, idempotency_key),
-        )
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE eom_office_conversion_handoffs
+                    SET last_error = %s, updated_at = NOW()
+                    WHERE atlas_contact_id = %s
+                      AND idempotency_key = %s
+                      AND state = 'pending'
+                    """,
+                    (reason[:1000], contact_id, idempotency_key),
+                )
+                return cur.rowcount == 1
     except Exception:
         logger.exception("Could not save office conversion handoff error")
+        return False
+
+
+def _finalized_office_conversion_after_lost_error_race(
+    contact_id: str,
+) -> Optional[Dict[str, Any]]:
+    refreshed = _office_conversion_handoff_for_contact(contact_id)
+    if not refreshed:
+        return None
+    handoff = refreshed["handoff"]
+    if handoff.get("state") != "finalized":
+        return None
+    return refreshed
 
 
 @app.get("/api/admin/customers")
@@ -9813,7 +9831,28 @@ def admin_approve_estimate(
             idempotency_key=idempotency_key,
         )
     except AtlasFunnelRequestError as exc:
-        _note_office_conversion_error(contact_id, idempotency_key, str(exc))
+        if not _note_office_conversion_error(contact_id, idempotency_key, str(exc)):
+            finalized = _finalized_office_conversion_after_lost_error_race(contact_id)
+            if finalized:
+                append_access_log(
+                    request,
+                    "EOM_ESTIMATE_APPROVAL_REPLAYED",
+                    True,
+                    f"contact={contact_id} customer={finalized['handoff']['customer_id']}",
+                )
+                return JSONResponse(
+                    status_code=200,
+                    content=jsonable_encoder(
+                        {
+                            "success": True,
+                            "idempotent": True,
+                            "handoff": _serialize_office_conversion_handoff(
+                                finalized["handoff"],
+                                finalized["customer"],
+                            ),
+                        }
+                    ),
+                )
         handoff = dict(handoff)
         handoff["last_error"] = str(exc)
         visible = _serialize_office_conversion_handoff(handoff, customer)
@@ -9935,7 +9974,28 @@ def admin_retry_funnel_handoff(
             idempotency_key=idempotency_key,
         )
     except AtlasFunnelRequestError as exc:
-        _note_office_conversion_error(contact_id_text, idempotency_key, str(exc))
+        if not _note_office_conversion_error(contact_id_text, idempotency_key, str(exc)):
+            finalized = _finalized_office_conversion_after_lost_error_race(contact_id_text)
+            if finalized:
+                append_access_log(
+                    request,
+                    "EOM_ESTIMATE_APPROVAL_RETRY_REPLAYED",
+                    True,
+                    f"contact={contact_id_text} customer={finalized['handoff']['customer_id']}",
+                )
+                return JSONResponse(
+                    status_code=200,
+                    content=jsonable_encoder(
+                        {
+                            "success": True,
+                            "idempotent": True,
+                            "handoff": _serialize_office_conversion_handoff(
+                                finalized["handoff"],
+                                finalized["customer"],
+                            ),
+                        }
+                    ),
+                )
         handoff = dict(handoff)
         handoff["last_error"] = str(exc)
         visible = _serialize_office_conversion_handoff(handoff, customer)
