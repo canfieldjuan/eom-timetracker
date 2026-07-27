@@ -12245,19 +12245,131 @@ def _compute_payroll_weekly_hours(
     }
 
 
-def _payroll_unallocated_correction_counts(
+def _payroll_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _payroll_optional_money_total(values: List[Any]) -> Optional[float]:
+    cents_values: List[int] = []
+    for value in values:
+        cents = _profitability_money_cents(value)
+        if cents is None:
+            return None
+        cents_values.append(cents)
+    return round(sum(cents_values) / 100, 2)
+
+
+def _payroll_correction_candidate_sites(
+    day_row: Dict[str, Any],
+    employee_id: int,
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for site in day_row.get("sites") or []:
+        candidate_jobs: List[Dict[str, Any]] = []
+        for job in site.get("jobs") or []:
+            worker_rows = [
+                worker
+                for worker in job.get("workers") or []
+                if int(worker.get("employeeId") or 0) == employee_id
+            ]
+            if not worker_rows:
+                continue
+            actual_hours = round(
+                sum(_payroll_float(worker.get("hours")) for worker in worker_rows),
+                2,
+            )
+            candidate_jobs.append(
+                {
+                    "jobId": job.get("jobId"),
+                    "scheduledDate": job.get("scheduledDate"),
+                    "profitabilityDate": job.get("profitabilityDate"),
+                    "revenueRecognitionDate": job.get("revenueRecognitionDate"),
+                    "actualHours": actual_hours,
+                    "actualLaborCost": _payroll_optional_money_total(
+                        [worker.get("laborCost") for worker in worker_rows]
+                    ),
+                    "laborCostComplete": all(
+                        worker.get("laborCost") is not None for worker in worker_rows
+                    ),
+                }
+            )
+        if not candidate_jobs:
+            continue
+        candidates.append(
+            {
+                "locationId": site.get("locationId"),
+                "customerId": site.get("customerId"),
+                "customerName": site.get("customerName"),
+                "siteAddress": site.get("siteAddress"),
+                "actualHours": round(
+                    sum(_payroll_float(job.get("actualHours")) for job in candidate_jobs),
+                    2,
+                ),
+                "actualLaborCost": _payroll_optional_money_total(
+                    [job.get("actualLaborCost") for job in candidate_jobs]
+                ),
+                "laborCostComplete": all(
+                    bool(job.get("laborCostComplete")) for job in candidate_jobs
+                ),
+                "jobCount": len(candidate_jobs),
+                "jobs": candidate_jobs,
+            }
+        )
+    return candidates
+
+
+def _payroll_unallocated_correction_details_by_date(
     weekly_hours: Dict[str, Any],
-) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
+    result: Dict[str, Any],
+) -> Dict[str, List[Dict[str, Any]]]:
+    profitability_days = {
+        str(day.get("date") or ""): day
+        for day in result.get("byDay") or []
+        if isinstance(day, dict)
+    }
+    details_by_date: Dict[str, List[Dict[str, Any]]] = {}
     for employee in weekly_hours.get("employees") or []:
+        employee_id = int(employee.get("employeeId") or 0)
+        employee_name = str(employee.get("employeeName") or "")
         for day in employee.get("days") or []:
-            if not day.get("correction"):
+            correction = day.get("correction")
+            if not correction:
                 continue
             day_key = str(day.get("date") or "")
             if not day_key:
                 continue
-            counts[day_key] = counts.get(day_key, 0) + 1
-    return counts
+            candidate_sites = _payroll_correction_candidate_sites(
+                profitability_days.get(day_key, {}),
+                employee_id,
+            )
+            details_by_date.setdefault(day_key, []).append(
+                {
+                    "correctionId": int(correction["correctionId"]),
+                    "employeeId": employee_id,
+                    "employeeName": employee_name,
+                    "date": day_key,
+                    "allocationStatus": "unallocated",
+                    "sourceTotalMinutes": int(correction["sourceTotalMinutes"]),
+                    "sourceTotalHours": round(
+                        int(correction["sourceTotalMinutes"]) / 60,
+                        2,
+                    ),
+                    "correctedTotalMinutes": int(correction["correctedTotalMinutes"]),
+                    "correctedTotalHours": round(
+                        int(correction["correctedTotalMinutes"]) / 60,
+                        2,
+                    ),
+                    "deltaMinutes": int(correction["deltaMinutes"]),
+                    "deltaHours": round(int(correction["deltaMinutes"]) / 60, 2),
+                    "reason": str(correction["reason"]),
+                    "candidateSiteCount": len(candidate_sites),
+                    "candidateSites": candidate_sites,
+                }
+            )
+    return details_by_date
 
 
 def _payroll_issue_rows_by_date(
@@ -12295,18 +12407,25 @@ def _append_daily_profitability_issue(
 def _annotate_labor_profitability_daily_payroll_proof(
     result: Dict[str, Any],
     weekly_hours: Dict[str, Any],
-) -> None:
-    correction_counts = _payroll_unallocated_correction_counts(weekly_hours)
+) -> List[Dict[str, Any]]:
+    corrections_by_date = _payroll_unallocated_correction_details_by_date(
+        weekly_hours,
+        result,
+    )
     payroll_issues_by_date = _payroll_issue_rows_by_date(weekly_hours)
-    total_count = sum(correction_counts.values())
+    total_count = sum(len(rows) for rows in corrections_by_date.values())
     result.setdefault("summary", {})["unallocatedCorrectionCount"] = total_count
+    unallocated_corrections: List[Dict[str, Any]] = []
     for day in result.get("byDay") or []:
         if not isinstance(day, dict):
             continue
         day_key = str(day.get("date") or "")
-        correction_count = correction_counts.get(day_key, 0)
+        correction_rows = corrections_by_date.get(day_key, [])
+        correction_count = len(correction_rows)
+        unallocated_corrections.extend(correction_rows)
         payroll_issues = payroll_issues_by_date.get(day_key, [])
         day["unallocatedCorrectionCount"] = correction_count
+        day["unallocatedCorrections"] = correction_rows
         day["payrollIssueCount"] = len(payroll_issues)
         for payroll_issue in payroll_issues:
             _append_daily_profitability_issue(day, payroll_issue)
@@ -12325,6 +12444,7 @@ def _annotate_labor_profitability_daily_payroll_proof(
                     ),
                 },
             )
+    return unallocated_corrections
 
 
 def _lock_payroll_verification_week(cur: Any, week_start: date) -> None:
@@ -13159,7 +13279,10 @@ def admin_payroll_labor_profitability(
             _SETTINGS_DEFAULTS["grossMarginMin"],
         ),
     )
-    _annotate_labor_profitability_daily_payroll_proof(result, weekly_hours)
+    unallocated_corrections = _annotate_labor_profitability_daily_payroll_proof(
+        result,
+        weekly_hours,
+    )
     payroll_summary = weekly_hours["summary"]
     issues: List[Dict[str, str]] = []
     if payroll_summary["hasBlockingIssues"]:
@@ -13190,6 +13313,11 @@ def admin_payroll_labor_profitability(
         "totalHours": payroll_summary["totalHours"],
         "correctionCount": payroll_summary["correctionCount"],
         "unallocatedCorrectionCount": result["summary"]["unallocatedCorrectionCount"],
+        "unallocatedCorrectionCandidateCount": sum(
+            int(row.get("candidateSiteCount") or 0)
+            for row in unallocated_corrections
+        ),
+        "unallocatedCorrections": unallocated_corrections,
         "issueCount": payroll_summary["issueCount"],
         "hasBlockingIssues": payroll_summary["hasBlockingIssues"],
     }

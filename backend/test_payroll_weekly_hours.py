@@ -2001,8 +2001,8 @@ def test_payroll_labor_profitability_discloses_unallocated_hour_corrections(
         )
         payroll_auth = _login(client, "Payroll Labor Profitability Mayra")
         source_id = _create_payroll_profitability_source()
-        _, site_id = _create_payroll_profitability_site()
-        _create_payroll_profitability_job_and_shift(
+        customer_id, site_id = _create_payroll_profitability_site()
+        job_id = _create_payroll_profitability_job_and_shift(
             employee_id=employee_id,
             site_id=site_id,
             source_id=source_id,
@@ -2031,6 +2031,46 @@ def test_payroll_labor_profitability_discloses_unallocated_hour_corrections(
         assert body["payrollHours"]["totalHours"] == 3.0
         assert body["payrollHours"]["correctionCount"] == 1
         assert body["payrollHours"]["unallocatedCorrectionCount"] == 1
+        assert body["payrollHours"]["unallocatedCorrectionCandidateCount"] == 1
+        correction = body["payrollHours"]["unallocatedCorrections"][0]
+        assert correction == {
+            "correctionId": corrected.json()["correction"]["correctionId"],
+            "employeeId": employee_id,
+            "employeeName": "Payroll Labor Profitability Worker",
+            "date": "2026-07-20",
+            "allocationStatus": "unallocated",
+            "sourceTotalMinutes": 120,
+            "sourceTotalHours": 2.0,
+            "correctedTotalMinutes": 180,
+            "correctedTotalHours": 3.0,
+            "deltaMinutes": 60,
+            "deltaHours": 1.0,
+            "reason": "Mayra corrected total hours.",
+            "candidateSiteCount": 1,
+            "candidateSites": [
+                {
+                    "locationId": site_id,
+                    "customerId": customer_id,
+                    "customerName": "Payroll Labor Profitability Customer",
+                    "siteAddress": "Payroll Labor Profitability Site",
+                    "actualHours": 2.0,
+                    "actualLaborCost": 40.0,
+                    "laborCostComplete": True,
+                    "jobCount": 1,
+                    "jobs": [
+                        {
+                            "jobId": job_id,
+                            "scheduledDate": "2026-07-20",
+                            "profitabilityDate": "2026-07-20",
+                            "revenueRecognitionDate": "2026-07-20",
+                            "actualHours": 2.0,
+                            "actualLaborCost": 40.0,
+                            "laborCostComplete": True,
+                        }
+                    ],
+                }
+            ],
+        }
         assert body["summary"]["unallocatedCorrectionCount"] == 1
         assert body["summary"]["actualHours"] == 2.0
         assert [issue["code"] for issue in body["issues"]] == [
@@ -2039,6 +2079,7 @@ def test_payroll_labor_profitability_discloses_unallocated_hour_corrections(
         monday = next(row for row in body["byDay"] if row["date"] == "2026-07-20")
         assert monday["actualHours"] == 2.0
         assert monday["unallocatedCorrectionCount"] == 1
+        assert monday["unallocatedCorrections"] == [correction]
         assert [issue["code"] for issue in monday["issues"]] == [
             "payroll_hour_corrections_not_allocated_to_sites"
         ]
