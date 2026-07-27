@@ -2466,6 +2466,113 @@ class TestAnalyticsRegression:
                 db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
             _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
 
+    def test_unlinked_missing_rate_fails_closed_in_analytics_views(
+        self,
+        client,
+        auth,
+        employee_id,
+        monkeypatch,
+    ):
+        import time_tracker_api as api
+
+        customer_name = "Analytics Missing Unlinked Rate"
+        location_label = "Analytics Missing Unlinked Rate Site"
+        site_ids: list[int] = []
+        shift_ids: list[int] = []
+        monkeypatch.setattr(
+            api,
+            "utc_now",
+            lambda: datetime(2047, 4, 12, 18, tzinfo=timezone.utc),
+        )
+        try:
+            site_id = _insert_profitability_site(
+                address=location_label,
+                customer_name=customer_name,
+                rate=None,
+                rate_type="per_visit",
+                expected_hours=2.0,
+            )
+            site_ids.append(site_id)
+            shift_ids.append(
+                int(
+                    db.execute_returning(
+                        """
+                        INSERT INTO shifts (
+                            employee_id, location_id, location_label,
+                            job_id, clock_in, clock_out, total_hours,
+                            notes, local_date
+                        )
+                        VALUES (
+                            %s, %s, %s,
+                            NULL,
+                            TIMESTAMPTZ '2047-04-09 08:00:00-05',
+                            TIMESTAMPTZ '2047-04-09 10:00:00-05',
+                            2.0, 'analytics missing unlinked rate proof',
+                            DATE '2047-04-09'
+                        )
+                        RETURNING id
+                        """,
+                        (employee_id, site_id, location_label),
+                    )
+                )
+            )
+            expected_issue = {
+                "code": "missing_revenue",
+                "message": "Revenue cannot be calculated from this location's rate card.",
+                "location": location_label,
+                "customer": customer_name,
+                "date": "2047-04-09",
+            }
+
+            analytics = client.get(
+                "/api/admin/analytics",
+                headers=auth,
+                params={"period": "week", "date": "2047-04-09"},
+            )
+            assert analytics.status_code == 200, analytics.text
+            body = analytics.json()
+            assert body["summary"]["revenue"] is None
+            assert body["summary"]["knownRevenue"] == 0.0
+            assert body["summary"]["revenueComplete"] is False
+            assert body["issues"] == [expected_issue]
+            customer_row = next(
+                row for row in body["byCustomer"] if row["customer"] == customer_name
+            )
+            assert customer_row["revenue"] is None
+            assert customer_row["knownRevenue"] == 0.0
+            assert customer_row["revenueComplete"] is False
+            assert customer_row["issues"] == [expected_issue]
+            day_row = next(row for row in body["byDay"] if row["date"] == "2047-04-09")
+            assert day_row["revenue"] is None
+            assert day_row["knownRevenue"] == 0.0
+            assert day_row["revenueComplete"] is False
+            assert day_row["issues"] == [expected_issue]
+
+            detail = client.get(
+                f"/api/admin/analytics/customer/{customer_name.replace(' ', '%20')}",
+                headers=auth,
+                params={"weeks": 1},
+            )
+            assert detail.status_code == 200, detail.text
+            detail_body = detail.json()
+            assert detail_body["summary"]["revenue"] is None
+            assert detail_body["summary"]["knownRevenue"] == 0.0
+            assert detail_body["summary"]["revenueComplete"] is False
+            assert detail_body["issues"] == [expected_issue]
+            assert detail_body["byVisit"][0]["revenue"] is None
+            assert detail_body["byVisit"][0]["knownRevenue"] == 0.0
+            assert detail_body["byVisit"][0]["revenueComplete"] is False
+            assert detail_body["byVisit"][0]["issues"] == [expected_issue]
+            assert detail_body["byWeek"][0]["revenue"] is None
+            assert detail_body["byWeek"][0]["knownRevenue"] == 0.0
+            assert detail_body["byWeek"][0]["revenueComplete"] is False
+            assert detail_body["byWeek"][0]["issues"] == [expected_issue]
+        finally:
+            if shift_ids:
+                db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
+            if site_ids:
+                db.execute("DELETE FROM locations WHERE id = ANY(%s)", (site_ids,))
+
     def test_analytics_week_credits_linked_per_visit_jobs_per_job(
         self,
         client,

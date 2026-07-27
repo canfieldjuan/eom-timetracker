@@ -14909,19 +14909,45 @@ def _analytics_entry_job_id(value: Any) -> Optional[int]:
     return job_id if job_id > 0 else None
 
 
+def _analytics_missing_revenue_issue(
+    *,
+    job_id: Optional[int] = None,
+    location: Optional[str] = None,
+    customer: Optional[str] = None,
+    date_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    issue: Dict[str, Any] = {
+        "code": "missing_revenue",
+        "message": "Revenue cannot be calculated from this linked job's Site rate card."
+        if job_id is not None
+        else "Revenue cannot be calculated from this location's rate card.",
+    }
+    if job_id is not None:
+        issue["jobId"] = job_id
+    if location:
+        issue["location"] = location
+    if customer:
+        issue["customer"] = customer
+    if date_key:
+        issue["date"] = date_key
+    return issue
+
+
+def _analytics_extend_unique_issues(
+    target: List[Dict[str, Any]],
+    issues: List[Dict[str, Any]],
+) -> None:
+    for issue in issues:
+        if issue not in target:
+            target.append(issue)
+
+
 def _analytics_linked_job_revenue_cents(
     job_ids: set[int],
 ) -> Tuple[Dict[int, Optional[int]], set[Tuple[str, str]], Dict[int, Dict[str, Any]]]:
     """Return canonical rate-card revenue for linked single-location jobs."""
     if not job_ids:
         return {}, set(), {}
-
-    def _missing_revenue_issue(job_id: int) -> Dict[str, Any]:
-        return {
-            "code": "missing_revenue",
-            "message": "Revenue cannot be calculated from this linked job's Site rate card.",
-            "jobId": job_id,
-        }
 
     selected_jobs = db.query_all(
         """
@@ -14947,12 +14973,12 @@ def _analytics_linked_job_revenue_cents(
             continue
         if row.get("location_id") is None:
             revenue_by_job[job_id] = None
-            issues_by_job[job_id] = _missing_revenue_issue(job_id)
+            issues_by_job[job_id] = _analytics_missing_revenue_issue(job_id=job_id)
             continue
         rate_cents = _profitability_money_cents(row.get("rate"))
         if rate_cents is None:
             revenue_by_job[job_id] = None
-            issues_by_job[job_id] = _missing_revenue_issue(job_id)
+            issues_by_job[job_id] = _analytics_missing_revenue_issue(job_id=job_id)
             continue
         if rate_type == "per_visit":
             revenue_by_job[job_id] = rate_cents
@@ -14971,7 +14997,7 @@ def _analytics_linked_job_revenue_cents(
                 else None
             )
             if revenue_by_job[job_id] is None:
-                issues_by_job[job_id] = _missing_revenue_issue(job_id)
+                issues_by_job[job_id] = _analytics_missing_revenue_issue(job_id=job_id)
         elif rate_type == "monthly":
             scheduled_date = row["scheduled_date"]
             monthly_linked_job_ids.add(job_id)
@@ -14990,7 +15016,7 @@ def _analytics_linked_job_revenue_cents(
             )
         else:
             revenue_by_job[job_id] = None
-            issues_by_job[job_id] = _missing_revenue_issue(job_id)
+            issues_by_job[job_id] = _analytics_missing_revenue_issue(job_id=job_id)
 
     if not monthly_groups:
         return revenue_by_job, canonical_site_months, issues_by_job
@@ -15029,7 +15055,7 @@ def _analytics_linked_job_revenue_cents(
             revenue_by_job[job_id] = monthly_allocations[job_id]
         elif job_id not in revenue_by_job:
             revenue_by_job[job_id] = None
-            issues_by_job[job_id] = _missing_revenue_issue(job_id)
+            issues_by_job[job_id] = _analytics_missing_revenue_issue(job_id=job_id)
     return revenue_by_job, canonical_site_months, issues_by_job
 
 
@@ -15217,6 +15243,14 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                     revenue = rate if is_new_visit else 0.0
             else:
                 revenue = 0.0
+                revenue_complete = False
+                revenue_issues.append(
+                    _analytics_missing_revenue_issue(
+                        location=resolved_location,
+                        customer=customer,
+                        date_key=date_key,
+                    )
+                )
 
         emp_rate = emp_rates.get(emp_id)
         labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
@@ -15233,7 +15267,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         customer_agg[customer]["_revenueComplete"] = (
             bool(customer_agg[customer]["_revenueComplete"]) and revenue_complete
         )
-        customer_agg[customer]["issues"].extend(revenue_issues)
+        _analytics_extend_unique_issues(customer_agg[customer]["issues"], revenue_issues)
         if is_new_visit:
             customer_agg[customer]["visits"] += 1
             if exp_h is not None:
@@ -15256,7 +15290,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         day_agg[date_key]["_revenueComplete"] = (
             bool(day_agg[date_key]["_revenueComplete"]) and revenue_complete
         )
-        day_agg[date_key]["issues"].extend(revenue_issues)
+        _analytics_extend_unique_issues(day_agg[date_key]["issues"], revenue_issues)
         if is_new_visit:
             day_agg[date_key]["visits"] += 1
         day_agg[date_key]["hours"] += hours
@@ -15768,7 +15802,17 @@ def admin_analytics_customer(
         rate = location_rates.get(resolved_location)
         rate_type = location_rate_types.get(resolved_location, "per_visit")
         if rate is None:
-            return 0.0, True, []
+            return (
+                0.0,
+                False,
+                [
+                    _analytics_missing_revenue_issue(
+                        location=resolved_location,
+                        customer=cust,
+                        date_key=date_key,
+                    )
+                ],
+            )
         if rate_type == "hourly":
             return float(rate) * hours, True, []
         elif rate_type == "monthly":
@@ -15853,7 +15897,7 @@ def admin_analytics_customer(
         week_agg[week_key]["_revenueComplete"] = (
             bool(week_agg[week_key]["_revenueComplete"]) and revenue_complete
         )
-        week_agg[week_key]["issues"].extend(revenue_issues)
+        _analytics_extend_unique_issues(week_agg[week_key]["issues"], revenue_issues)
         if is_visit:
             week_agg[week_key]["visits"] += 1
         week_agg[week_key]["hours"] += hours
