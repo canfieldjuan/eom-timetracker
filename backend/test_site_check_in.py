@@ -427,7 +427,14 @@ class TestExplicitSiteQrActions:
         location_id,
         explicit_action_employee,
     ):
+        import time_tracker_api as api
+
         employee_id, employee_auth = explicit_action_employee
+        matched_job_id = create_canonical_job(
+            location_id,
+            datetime.now(timezone.utc) - timedelta(minutes=15),
+            suffix="explicit-action-visit-job",
+        )
         shift_id = clock_in_action_employee(client, employee_auth)
         token = create_site_qr(client, auth, location_id)["token"]
         resolved = client.post(
@@ -453,6 +460,8 @@ class TestExplicitSiteQrActions:
         assert arrival_body["outcome"] == "recorded"
         assert arrival_body["replayed"] is False
         assert arrival_body["shiftId"] == shift_id
+        assert arrival_body["checkIn"]["jobId"] == matched_job_id
+        assert arrival_body["visit"]["jobId"] == matched_job_id
         assert arrival_body["visit"]["sequenceVersion"] == 2
         assert arrival_body["visit"]["siteCheckInId"] == arrival_body["checkIn"]["id"]
         assert arrival_body["actionState"]["recommendedAction"] == "depart"
@@ -488,9 +497,10 @@ class TestExplicitSiteQrActions:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT v.sequence_version, v.site_check_in_id,
-                       d.visit_id, receipt.outcome
+                SELECT v.sequence_version, v.site_check_in_id, v.job_id AS visit_job_id,
+                       ci.job_id AS check_in_job_id, d.visit_id, receipt.outcome
                 FROM visits v
+                JOIN site_check_ins ci ON ci.id = v.site_check_in_id
                 JOIN departures d ON d.visit_id = v.id
                 JOIN site_qr_action_receipts receipt
                   ON receipt.departure_id = d.id
@@ -507,8 +517,21 @@ class TestExplicitSiteQrActions:
         conn.close()
         assert int(stored["sequence_version"]) == 2
         assert int(stored["site_check_in_id"]) == arrival_body["checkIn"]["id"]
+        assert int(stored["visit_job_id"]) == matched_job_id
+        assert int(stored["check_in_job_id"]) == matched_job_id
         assert int(stored["visit_id"]) == arrival_body["visit"]["id"]
         assert stored["outcome"] == "recorded"
+        loaded_entry = next(
+            entry
+            for entry in api.load_timesheets()["entries"]
+            if entry["id"] == shift_id
+        )
+        loaded_visit = next(
+            visit
+            for visit in loaded_entry["visits"]
+            if visit["id"] == arrival_body["visit"]["id"]
+        )
+        assert loaded_visit["jobId"] == matched_job_id
 
     @pytest.mark.parametrize(
         "geofence_status",
