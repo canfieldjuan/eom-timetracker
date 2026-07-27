@@ -246,6 +246,346 @@ def test_estimate_approval_recovers_after_atlas_failure_without_duplicate_custom
     )["count"] == 1
 
 
+def test_funnel_review_lists_atlas_leads_and_pending_handoffs_without_writes(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        raise api.AtlasFunnelRequestError(503, "Atlas is temporarily unavailable")
+
+    def atlas_read(path, admin, *, params=None):
+        return {
+            "leads": [
+                {
+                    "contactId": contact_id,
+                    "fullName": "New Estimate Lead",
+                    "email": "lead@example.test",
+                    "phone": "217-555-0144",
+                    "address": "900 Lead Lane, Effingham, IL",
+                    "source": "website",
+                    "createdAt": "2026-07-27T12:00:00Z",
+                    "internalField": "must not proxy",
+                }
+            ],
+            "cursor": None,
+            "hasMore": True,
+            "nextCursor": "cursor-page-2-token",
+        }
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    pending = client.post(
+        "/api/admin/funnel/approve-estimate",
+        headers=auth,
+        json=_payload(contact_id, key),
+    )
+    before_counts = {
+        "customers": db.query_one("SELECT COUNT(*) AS n FROM customers")["n"],
+        "sites": db.query_one("SELECT COUNT(*) AS n FROM locations")["n"],
+        "handoffs": db.query_one("SELECT COUNT(*) AS n FROM eom_office_conversion_handoffs")["n"],
+    }
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
+    response = client.get("/api/admin/funnel/review", headers=auth)
+    after_counts = {
+        "customers": db.query_one("SELECT COUNT(*) AS n FROM customers")["n"],
+        "sites": db.query_one("SELECT COUNT(*) AS n FROM locations")["n"],
+        "handoffs": db.query_one("SELECT COUNT(*) AS n FROM eom_office_conversion_handoffs")["n"],
+    }
+
+    assert pending.status_code == 202, pending.text
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["success"] is True
+    assert data["canApprove"] is True
+    assert data["leads"] == [
+        {
+            "contactId": contact_id,
+            "fullName": "New Estimate Lead",
+            "email": "lead@example.test",
+            "phone": "217-555-0144",
+            "address": "900 Lead Lane, Effingham, IL",
+            "source": "website",
+            "createdAt": "2026-07-27T12:00:00Z",
+        }
+    ]
+    assert data["cursor"] is None
+    assert data["hasMore"] is True
+    assert data["nextCursor"] == "cursor-page-2-token"
+    assert data["pendingHandoffs"][0]["contactId"] == contact_id
+    assert data["pendingHandoffs"][0]["status"] == "pending"
+    assert data["pendingHandoffs"][0]["lastError"] == "Atlas is temporarily unavailable"
+    assert before_counts == after_counts
+
+
+def test_funnel_review_proxy_keeps_service_token_server_side(monkeypatch, configured_office_conversion):
+    api = configured_office_conversion
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None}
+
+    def get(url, *, headers, params, timeout):
+        captured.update({"url": url, "headers": headers, "params": params, "timeout": timeout})
+        return _Response()
+
+    monkeypatch.setattr(api.requests, "get", get)
+    result = api._atlas_funnel_read(
+        "/eom-funnel/leads",
+        {"id": 1, "name": "Juan Canfield"},
+        params={"limit": 25},
+    )
+
+    assert result == {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None}
+    assert captured["url"] == "https://atlas.example.test/eom-funnel/leads"
+    assert captured["headers"] == {
+        "Authorization": "Bearer tracker-only-test-token",
+        "X-EOM-Actor": "Juan Canfield",
+        "X-EOM-Actor-ID": "1",
+        "Accept": "application/json",
+    }
+    assert captured["params"] == {"limit": 25}
+
+
+def test_funnel_review_proxy_forwards_cursor_without_exposing_service_token(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    captured: dict[str, object] = {}
+    cursor = "cursor-page-token-a"
+
+    def atlas_read(path, admin, *, params=None):
+        captured.update({"path": path, "admin": admin, "params": params})
+        return {"leads": [], "cursor": cursor, "hasMore": False, "nextCursor": None}
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
+    response = client.get(
+        f"/api/admin/funnel/review?limit=25&cursor={cursor}",
+        headers=auth,
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured["path"] == "/eom-funnel/leads"
+    assert captured["params"] == {"limit": 25, "cursor": cursor}
+    assert response.json()["cursor"] == cursor
+
+
+def test_funnel_review_proxy_accepts_any_returned_cursor_value(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    captured: list[dict[str, object]] = []
+    short_cursor = "x"
+    long_cursor = "c" * 600
+
+    def atlas_read(path, admin, *, params=None):
+        captured.append({"path": path, "params": params})
+        return {"leads": [], "cursor": params.get("cursor"), "hasMore": False, "nextCursor": None}
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
+    short_response = client.get(
+        f"/api/admin/funnel/review?limit=25&cursor={short_cursor}",
+        headers=auth,
+    )
+    long_response = client.get(
+        f"/api/admin/funnel/review?limit=25&cursor={long_cursor}",
+        headers=auth,
+    )
+
+    assert short_response.status_code == 200, short_response.text
+    assert long_response.status_code == 200, long_response.text
+    assert captured[0]["params"] == {"limit": 25, "cursor": short_cursor}
+    assert captured[1]["params"] == {"limit": 25, "cursor": long_cursor}
+    assert short_response.json()["cursor"] == short_cursor
+    assert long_response.json()["cursor"] == long_cursor
+
+
+def test_funnel_review_rejects_non_string_optional_lead_fields(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+
+    def atlas_read(path, admin, *, params=None):
+        return {
+            "leads": [
+                {
+                    "contactId": str(uuid.uuid4()),
+                    "fullName": "Nested Lead",
+                    "email": {"hidden": "nested@example.test"},
+                    "phone": None,
+                    "address": None,
+                    "source": None,
+                    "createdAt": "2026-07-27T12:00:00Z",
+                }
+            ],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+        }
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
+    response = client.get("/api/admin/funnel/review", headers=auth)
+
+    assert response.status_code == 502, response.text
+    assert response.json()["error"] == "EOM lead review service returned an invalid response"
+
+
+def test_pending_handoff_retry_finalizes_without_duplicate_customer_or_site(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+    calls: list[dict[str, object]] = []
+
+    def failing_atlas_request(path, admin, *, payload, idempotency_key):
+        raise api.AtlasFunnelRequestError(503, "Atlas is temporarily unavailable")
+
+    def successful_atlas_request(path, admin, *, payload, idempotency_key):
+        calls.append({"path": path, "payload": payload, "key": idempotency_key})
+        return _atlas_success(payload, idempotency_key)
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", failing_atlas_request)
+    pending = client.post(
+        "/api/admin/funnel/approve-estimate",
+        headers=auth,
+        json=_payload(contact_id, key),
+    )
+    monkeypatch.setattr(api, "_atlas_funnel_request", successful_atlas_request)
+    retried = client.post(
+        f"/api/admin/funnel/handoffs/{contact_id}/retry",
+        headers=auth,
+    )
+    replayed = client.post(
+        f"/api/admin/funnel/handoffs/{contact_id}/retry",
+        headers=auth,
+    )
+
+    assert pending.status_code == 202, pending.text
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["handoff"]["status"] == "finalized"
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["idempotent"] is True
+    assert len(calls) == 1
+    assert calls[0]["key"] == key
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM customers WHERE atlas_contact_id = %s", (contact_id,)
+    )["count"] == 1
+    assert db.query_one(
+        """
+        SELECT COUNT(*) AS count
+        FROM locations l JOIN customers c ON c.id = l.customer_id
+        WHERE c.atlas_contact_id = %s
+        """,
+        (contact_id,),
+    )["count"] == 1
+
+
+def test_pending_handoff_retry_returns_finalized_when_error_update_loses_race(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+    atlas_handoff_id = str(uuid.uuid4())
+
+    def failing_atlas_request(path, admin, *, payload, idempotency_key):
+        raise api.AtlasFunnelRequestError(503, "Atlas is temporarily unavailable")
+
+    def stale_timeout_after_remote_success(path, admin, *, payload, idempotency_key):
+        db.execute(
+            """
+            UPDATE eom_office_conversion_handoffs
+            SET state = 'finalized',
+                atlas_handoff_id = %s,
+                last_error = NULL,
+                finalized_at = COALESCE(finalized_at, NOW()),
+                updated_at = NOW()
+            WHERE atlas_contact_id = %s AND idempotency_key = %s
+            """,
+            (atlas_handoff_id, contact_id, key),
+        )
+        raise api.AtlasFunnelRequestError(503, "stale timeout after finalize")
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", failing_atlas_request)
+    pending = client.post(
+        "/api/admin/funnel/approve-estimate",
+        headers=auth,
+        json=_payload(contact_id, key),
+    )
+    monkeypatch.setattr(api, "_atlas_funnel_request", stale_timeout_after_remote_success)
+    retried = client.post(
+        f"/api/admin/funnel/handoffs/{contact_id}/retry",
+        headers=auth,
+    )
+    row = db.query_one(
+        """
+        SELECT state, atlas_handoff_id, last_error
+        FROM eom_office_conversion_handoffs
+        WHERE atlas_contact_id = %s
+        """,
+        (contact_id,),
+    )
+
+    assert pending.status_code == 202, pending.text
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["handoff"]["status"] == "finalized"
+    assert retried.json()["handoff"]["lastError"] is None
+    assert row == {
+        "state": "finalized",
+        "atlas_handoff_id": atlas_handoff_id,
+        "last_error": None,
+    }
+
+
+def test_pending_handoff_retry_requires_boolean_success_before_finalizing(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+
+    def failing_atlas_request(path, admin, *, payload, idempotency_key):
+        raise api.AtlasFunnelRequestError(503, "Atlas is temporarily unavailable")
+
+    def malformed_success(path, admin, *, payload, idempotency_key):
+        result = _atlas_success(payload, idempotency_key)
+        result["success"] = "false"
+        return result
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", failing_atlas_request)
+    pending = client.post(
+        "/api/admin/funnel/approve-estimate",
+        headers=auth,
+        json=_payload(contact_id, key),
+    )
+    monkeypatch.setattr(api, "_atlas_funnel_request", malformed_success)
+    retried = client.post(
+        f"/api/admin/funnel/handoffs/{contact_id}/retry",
+        headers=auth,
+    )
+    row = db.query_one(
+        """
+        SELECT state, atlas_handoff_id, last_error
+        FROM eom_office_conversion_handoffs
+        WHERE atlas_contact_id = %s
+        """,
+        (contact_id,),
+    )
+
+    assert pending.status_code == 202, pending.text
+    assert retried.status_code == 202, retried.text
+    assert retried.json()["handoff"]["status"] == "atlas_pending"
+    assert row["state"] == "pending"
+    assert row["atlas_handoff_id"] is None
+    assert row["last_error"] == "EOM customer handoff service returned a mismatched response"
+
+
 def test_estimate_approval_requires_configured_employee_before_local_or_remote_side_effect(
     client, auth, monkeypatch, configured_office_conversion
 ):
