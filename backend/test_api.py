@@ -3302,6 +3302,61 @@ class TestJobs:
         assert r.status_code == 200, r.text
         assert r.json()["job"]["id"] == job_id
 
+    def test_get_job_uses_clock_span_when_stored_total_is_stale(
+        self,
+        client,
+        auth,
+        employee_id,
+        location_id,
+    ):
+        job_id = None
+        shift_id = None
+        try:
+            job_id = _insert_profitability_job(
+                location_id=location_id,
+                customer_name="Job Detail Canonical Hours",
+                scheduled_date="2048-03-04",
+                expected_hours=2.5,
+                revenue=100.0,
+                source_key=f"{9300:064x}",
+            )
+            shift_id = int(
+                db.execute_returning(
+                    """
+                    INSERT INTO shifts (
+                        employee_id, location_id, location_label,
+                        job_id, clock_in, clock_out, total_hours,
+                        notes, local_date
+                    )
+                    VALUES (
+                        %s, %s, '123 Main St, Effingham',
+                        %s,
+                        TIMESTAMPTZ '2048-03-04 08:00:00-06',
+                        TIMESTAMPTZ '2048-03-04 10:30:00-06',
+                        0.25, 'job detail canonical hours proof',
+                        DATE '2048-03-04'
+                    )
+                    RETURNING id
+                    """,
+                    (employee_id, location_id, job_id),
+                )
+            )
+
+            response = client.get(f"/api/admin/jobs/{job_id}", headers=auth)
+
+            assert response.status_code == 200, response.text
+            job = response.json()["job"]
+            assert job["totalHours"] == 2.5
+            assert job["totalLaborCost"] == pytest.approx(41.88)
+            assert job["netProfit"] == pytest.approx(58.12)
+            assert job["shifts"][0]["hours"] == 2.5
+            assert job["shifts"][0]["laborCost"] == pytest.approx(41.88)
+        finally:
+            if shift_id is not None:
+                db.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+            if job_id is not None:
+                db.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
+
     def test_get_job_not_found(self, client, auth):
         r = client.get("/api/admin/jobs/999999", headers=auth)
         assert r.status_code == 404
