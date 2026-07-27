@@ -4166,6 +4166,14 @@ def _ensure_schema_migrations() -> None:
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_visits_job_id ON visits(job_id)")
     db.execute("""
+        UPDATE visits AS v
+        SET job_id = ci.job_id
+        FROM site_check_ins AS ci
+        WHERE v.site_check_in_id = ci.id
+          AND v.job_id IS NULL
+          AND ci.job_id IS NOT NULL
+    """)
+    db.execute("""
         CREATE TABLE IF NOT EXISTS site_qr_action_receipts (
             id                    BIGSERIAL PRIMARY KEY,
             employee_id           INTEGER REFERENCES employees(id) ON DELETE SET NULL,
