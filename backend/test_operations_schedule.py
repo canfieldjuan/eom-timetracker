@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 
 import db
+import operations_schedule as ops
 from operations_schedule import (
     _allocate_utilization_minutes,
     _collapse_overlapping_paid_segments,
@@ -5382,6 +5383,70 @@ def test_operations_routes_require_admin(client, emp_auth):
     forecast = client.get("/api/admin/operations/forecast", headers=emp_auth)
     assert schedule.status_code == 403
     assert forecast.status_code == 403
+
+
+def test_operations_forecast_builder_allows_future_legacy_one_week_seam(
+    monkeypatch,
+):
+    fixed_now = datetime(2026, 7, 27, 15, tzinfo=timezone.utc)
+    monkeypatch.setattr(ops, "_load_jobs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(ops.db, "query_all", lambda *_args, **_kwargs: [])
+
+    body = ops.build_operations_forecast(
+        1,
+        timezone_name="America/Chicago",
+        now_provider=lambda: fixed_now,
+    )
+
+    assert body["success"] is True
+    assert body["weeksAhead"] == 1
+    assert body["asOfDate"] == "2026-07-27"
+    assert body["startDate"] == "2026-07-27"
+    assert body["endDate"] == "2026-08-01"
+    assert [week["weekStart"] for week in body["weeks"]] == ["2026-07-26"]
+    assert body["forecasts"] == body["weeks"]
+    assert {issue["code"] for issue in body["issues"]} == {
+        "missing_average_employee_rate"
+    }
+
+
+def test_operations_forecast_route_keeps_allowed_horizon_gate(
+    client,
+    auth,
+    monkeypatch,
+):
+    calls: list[int] = []
+
+    def fake_builder(weeks_ahead, *, timezone_name, now_provider):
+        calls.append(weeks_ahead)
+        assert timezone_name == "America/Chicago"
+        assert now_provider().tzinfo is not None
+        return {
+            "success": True,
+            "weeksAhead": weeks_ahead,
+            "weeks": [],
+            "forecasts": [],
+        }
+
+    monkeypatch.setattr(ops, "build_operations_forecast", fake_builder)
+
+    allowed = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 8},
+    )
+    rejected = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 1},
+    )
+
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["weeksAhead"] == 8
+    assert calls == [8]
+    assert rejected.status_code == 400
+    assert rejected.json()["error"] == "weeks_ahead must be one of: 4, 8, 12"
+    assert calls == [8]
 
 
 def test_forecast_rejects_unsupported_horizon(client, auth):
