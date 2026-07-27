@@ -831,6 +831,11 @@ def _row_to_visit(row: Dict[str, Any]) -> Dict[str, Any]:
         "customer":    row["customer_name"] or "",
         "gps":         row["gps"],
         "gpsMeta":     row.get("gps_meta"),
+        "jobId":       (
+            int(row["job_id"])
+            if row.get("job_id") is not None
+            else None
+        ),
         "sequenceVersion": int(row.get("sequence_version") or 1),
         "siteCheckInId": (
             int(row["site_check_in_id"])
@@ -951,7 +956,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
         """
         SELECT v.id, v.shift_id, COALESCE(l.address, '') AS location,
                v.location_label, v.customer_name, v.arrival_time, v.gps, v.gps_meta,
-               v.sequence_version, v.site_check_in_id
+               v.job_id, v.sequence_version, v.site_check_in_id
         FROM visits v
         LEFT JOIN locations l ON v.location_id = l.id
         ORDER BY v.shift_id, v.arrival_time
@@ -1124,9 +1129,9 @@ def _save_timesheets_to_db(
                     INSERT INTO visits (
                         shift_id, location_id, location_label, customer_name,
                         arrival_time, gps, gps_meta, sequence_version,
-                        site_check_in_id
+                        site_check_in_id, job_id
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -1139,6 +1144,7 @@ def _save_timesheets_to_db(
                         json.dumps(visit["gpsMeta"]) if visit.get("gpsMeta") else None,
                         int(visit.get("sequenceVersion") or 2),
                         visit.get("siteCheckInId"),
+                        visit.get("jobId"),
                     ),
                 )
                 visit["id"] = int(cur.fetchone()[0])
@@ -4101,6 +4107,10 @@ def _ensure_schema_migrations() -> None:
     )
     db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS "
+        "job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL"
+    )
+    db.execute(
+        "ALTER TABLE visits ADD COLUMN IF NOT EXISTS "
         "sequence_version SMALLINT NOT NULL DEFAULT 1"
     )
     db.execute("""
@@ -4154,6 +4164,7 @@ def _ensure_schema_migrations() -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS uq_visits_site_check_in_id
         ON visits(site_check_in_id) WHERE site_check_in_id IS NOT NULL
     """)
+    db.execute("CREATE INDEX IF NOT EXISTS idx_visits_job_id ON visits(job_id)")
     db.execute("""
         CREATE TABLE IF NOT EXISTS site_qr_action_receipts (
             id                    BIGSERIAL PRIMARY KEY,
@@ -4477,6 +4488,7 @@ def _site_action_visit_summary(row: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "siteName": str(row.get("site_name") or row.get("location_label") or ""),
         "customerName": str(row.get("customer_name") or ""),
+        "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
         "arrivalTime": to_utc_iso(row["arrival_time"]),
         "sequenceVersion": int(row.get("sequence_version") or 1),
     }
@@ -4552,7 +4564,7 @@ def _build_site_action_state(
     cur.execute(
         """
         SELECT v.id, v.location_id, v.location_label, v.customer_name,
-               v.arrival_time, v.sequence_version, l.address AS site_name,
+               v.arrival_time, v.job_id, v.sequence_version, l.address AS site_name,
                paired.id AS paired_departure_id
         FROM visits v
         LEFT JOIN locations l ON l.id = v.location_id
@@ -4597,7 +4609,7 @@ def _build_site_action_state(
     cur.execute(
         """
         SELECT v.id, v.location_id, v.location_label, v.customer_name,
-               v.arrival_time, v.sequence_version, l.address AS site_name
+               v.arrival_time, v.job_id, v.sequence_version, l.address AS site_name
         FROM visits v
         LEFT JOIN locations l ON l.id = v.location_id
         LEFT JOIN departures paired ON paired.visit_id = v.id
@@ -4638,6 +4650,11 @@ def _build_site_action_state(
             if latest_visit
             else None
         ),
+        "latestVisitJobId": (
+            int(latest_visit["job_id"])
+            if latest_visit and latest_visit.get("job_id") is not None
+            else None
+        ),
         "latestVisitPairedDepartureId": (
             int(latest_visit["paired_departure_id"])
             if latest_visit and latest_visit.get("paired_departure_id") is not None
@@ -4645,6 +4662,10 @@ def _build_site_action_state(
         ),
         "latestDepartureId": latest_departure_id,
         "missingDepartureVisitIds": [int(row["id"]) for row in missing_rows],
+        "missingDepartureJobIds": [
+            int(row["job_id"]) if row.get("job_id") is not None else None
+            for row in missing_rows
+        ],
         "recommendedAction": recommended_action,
     }
     fingerprint = hashlib.sha256(
@@ -4798,6 +4819,7 @@ def _serialize_site_check_in(row: Dict[str, Any]) -> Dict[str, Any]:
         "employeeName": str(row.get("employee_name") or ""),
         "siteId": int(row["location_id"]),
         "siteName": str(row.get("site_name") or ""),
+        "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
         "serverCheckedInAt": to_utc_iso(row["server_checked_in_at"]),
         "deviceScannedAt": to_utc_iso(row["device_scanned_at"]),
         "latitude": float(row["latitude"]),
@@ -6402,6 +6424,7 @@ def _record_explicit_site_action(
                     geofence=geofence,
                 )
                 if records_time_event:
+                    visit_job_id = check_in.get("jobId") if check_in else None
                     gps = build_gps_point(
                         payload.latitude,
                         payload.longitude,
@@ -6413,9 +6436,9 @@ def _record_explicit_site_action(
                         INSERT INTO visits (
                             shift_id, location_id, location_label, customer_name,
                             arrival_time, gps, gps_meta, sequence_version,
-                            site_check_in_id
+                            site_check_in_id, job_id
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, 2, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, 2, %s, %s)
                         RETURNING id
                         """,
                         (
@@ -6427,6 +6450,7 @@ def _record_explicit_site_action(
                             psycopg2.extras.Json(gps),
                             psycopg2.extras.Json(gps_meta),
                             check_in_id,
+                            visit_job_id,
                         ),
                     )
                     visit_id = int(cur.fetchone()["id"])
@@ -6445,6 +6469,7 @@ def _record_explicit_site_action(
                         "customer": str(site.get("customer_name") or ""),
                         "gps": gps,
                         "gpsMeta": gps_meta,
+                        "jobId": visit_job_id,
                         "sequenceVersion": 2,
                         "siteCheckInId": check_in_id,
                     }
@@ -10652,6 +10677,7 @@ def _correction_shift_snapshots(
             v.arrival_time,
             v.gps,
             v.gps_meta,
+            v.job_id,
             v.sequence_version,
             v.site_check_in_id,
             v.created_at
@@ -10730,6 +10756,7 @@ def _correction_shift_snapshots(
             "arrivalTime": to_utc_iso(row["arrival_time"]),
             "gps": row.get("gps"),
             "gpsMeta": row.get("gps_meta"),
+            "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
             "sequenceVersion": int(row.get("sequence_version") or 1),
             "siteCheckInId": (
                 int(row["site_check_in_id"])

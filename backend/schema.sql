@@ -161,6 +161,7 @@ CREATE TABLE visits (
     arrival_time   TIMESTAMPTZ NOT NULL,
     gps            JSONB,
     gps_meta       JSONB,
+    job_id         INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
     sequence_version SMALLINT NOT NULL DEFAULT 1
                          CHECK (sequence_version IN (1, 2)),
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -759,6 +760,7 @@ CREATE INDEX idx_shifts_location_id ON shifts(location_id);
 CREATE INDEX idx_visits_shift_id    ON visits(shift_id);
 CREATE INDEX idx_visits_arrival     ON visits(arrival_time);
 CREATE INDEX idx_visits_location_id ON visits(location_id);
+CREATE INDEX idx_visits_job_id      ON visits(job_id);
 CREATE INDEX idx_departures_shift_id ON departures(shift_id);
 CREATE INDEX idx_departures_time     ON departures(departure_time);
 CREATE INDEX idx_departures_location_id ON departures(location_id);

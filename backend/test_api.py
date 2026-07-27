@@ -1154,8 +1154,10 @@ class TestQrEventSchemaMigration:
             DROP TABLE IF EXISTS site_qr_action_receipts;
             DROP INDEX IF EXISTS uq_departures_visit_id;
             DROP INDEX IF EXISTS uq_visits_site_check_in_id;
+            DROP INDEX IF EXISTS idx_visits_job_id;
             ALTER TABLE departures DROP COLUMN IF EXISTS visit_id;
             ALTER TABLE visits DROP COLUMN IF EXISTS site_check_in_id;
+            ALTER TABLE visits DROP COLUMN IF EXISTS job_id;
             ALTER TABLE visits DROP COLUMN IF EXISTS sequence_version;
         """)
         shift_id = api.db.execute_returning("""
@@ -1203,7 +1205,9 @@ class TestQrEventSchemaMigration:
                 WHERE table_schema = current_schema()
                   AND (
                     (table_name = 'visits'
-                     AND column_name IN ('sequence_version', 'site_check_in_id'))
+                     AND column_name IN (
+                       'sequence_version', 'site_check_in_id', 'job_id'
+                     ))
                     OR
                     (table_name = 'departures' AND column_name = 'visit_id')
                   )
@@ -1225,7 +1229,7 @@ class TestQrEventSchemaMigration:
                       AND (
                         (table_name = 'visits'
                          AND column_name IN (
-                           'sequence_version', 'site_check_in_id'
+                           'sequence_version', 'site_check_in_id', 'job_id'
                          ))
                         OR
                         (table_name = 'departures' AND column_name = 'visit_id')
@@ -1235,6 +1239,7 @@ class TestQrEventSchemaMigration:
             assert set(pairing_columns) == {
                 ("visits", "sequence_version"),
                 ("visits", "site_check_in_id"),
+                ("visits", "job_id"),
                 ("departures", "visit_id"),
             }
             assert pairing_columns[("visits", "sequence_version")] == {
@@ -1246,17 +1251,23 @@ class TestQrEventSchemaMigration:
             }
             assert pairing_columns[("visits", "site_check_in_id")]["udt_name"] == "int8"
             assert pairing_columns[("visits", "site_check_in_id")]["is_nullable"] == "YES"
+            assert pairing_columns[("visits", "job_id")]["udt_name"] == "int4"
+            assert pairing_columns[("visits", "job_id")]["is_nullable"] == "YES"
             assert pairing_columns[("departures", "visit_id")]["udt_name"] == "int4"
             assert pairing_columns[("departures", "visit_id")]["is_nullable"] == "YES"
 
             assert api.db.query_one(
                 """
-                SELECT sequence_version, site_check_in_id
+                SELECT sequence_version, site_check_in_id, job_id
                 FROM visits
                 WHERE id = %s
                 """,
                 (visit_id,),
-            ) == {"sequence_version": 1, "site_check_in_id": None}
+            ) == {
+                "sequence_version": 1,
+                "site_check_in_id": None,
+                "job_id": None,
+            }
             assert api.db.query_one(
                 "SELECT visit_id FROM departures WHERE id = %s",
                 (departure_id,),
@@ -1290,6 +1301,10 @@ class TestQrEventSchemaMigration:
                 "REFERENCES site_check_ins(id) ON DELETE SET NULL"
             ) in visit_foreign_keys
             assert (
+                "FOREIGN KEY (job_id) "
+                "REFERENCES jobs(id) ON DELETE SET NULL"
+            ) in visit_foreign_keys
+            assert (
                 "FOREIGN KEY (visit_id) "
                 "REFERENCES visits(id) ON DELETE SET NULL"
             ) in visit_foreign_keys
@@ -1302,13 +1317,15 @@ class TestQrEventSchemaMigration:
                     WHERE schemaname = current_schema()
                       AND indexname IN (
                         'uq_departures_visit_id',
-                        'uq_visits_site_check_in_id'
+                        'uq_visits_site_check_in_id',
+                        'idx_visits_job_id'
                       )
                 """)
             }
             assert set(pairing_indexes) == {
                 "uq_departures_visit_id",
                 "uq_visits_site_check_in_id",
+                "idx_visits_job_id",
             }
             assert "UNIQUE INDEX" in pairing_indexes["uq_departures_visit_id"]
             assert "(visit_id)" in pairing_indexes["uq_departures_visit_id"]
@@ -1324,6 +1341,7 @@ class TestQrEventSchemaMigration:
                 "WHERE (site_check_in_id IS NOT NULL)"
                 in pairing_indexes["uq_visits_site_check_in_id"]
             )
+            assert "(job_id)" in pairing_indexes["idx_visits_job_id"]
 
             receipt_columns = {
                 row["column_name"]: row
@@ -1404,6 +1422,101 @@ class TestQrEventSchemaMigration:
             assert "(shift_id, server_recorded_at DESC)" in receipt_index["indexdef"]
         finally:
             api.db.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+
+
+class TestVisitJobIdentity:
+    def test_save_and_load_preserve_visit_job_id_without_shift_link(self, client):
+        import time_tracker_api as api
+
+        site_ids: list[int] = []
+        job_ids: list[int] = []
+        shift_ids: list[int] = []
+        try:
+            site_id = _insert_profitability_site(
+                address="2049 Visit Identity Proof",
+                customer_name="Visit Identity Customer",
+                rate=250.0,
+                rate_type="per_visit",
+                expected_hours=2.0,
+            )
+            site_ids.append(site_id)
+            job_id = _insert_profitability_job(
+                location_id=site_id,
+                customer_name="Visit Identity Customer",
+                scheduled_date="2049-06-01",
+                expected_hours=2.0,
+                revenue=250.0,
+                source_key="15" * 32,
+            )
+            job_ids.append(job_id)
+            employee_id = db.query_one(
+                "SELECT id FROM employees WHERE name = %s",
+                ("Catalina Gomez",),
+            )["id"]
+            shift_id = int(db.execute_returning(
+                """
+                INSERT INTO shifts (
+                    employee_id, location_label, clock_in, local_date
+                )
+                VALUES (
+                    %s, 'Visit identity shift',
+                    TIMESTAMPTZ '2049-06-01 08:00:00-05',
+                    DATE '2049-06-01'
+                )
+                RETURNING id
+                """,
+                (employee_id,),
+            ))
+            shift_ids.append(shift_id)
+
+            timesheet_data = api._load_timesheets_from_db()
+            pre_shift_ids = {entry["id"] for entry in timesheet_data["entries"]}
+            pre_visit_counts = {
+                entry["id"]: len(entry.get("visits", []))
+                for entry in timesheet_data["entries"]
+            }
+            pre_departure_counts = {
+                entry["id"]: len(entry.get("departures", []))
+                for entry in timesheet_data["entries"]
+            }
+            entry = next(
+                row for row in timesheet_data["entries"] if row["id"] == shift_id
+            )
+            assert entry["jobId"] is None
+            entry["visits"].append({
+                "arrivalTime": "2049-06-01T13:30:00Z",
+                "location": "2049 Visit Identity Proof",
+                "customer": "Visit Identity Customer",
+                "gps": None,
+                "gpsMeta": None,
+                "sequenceVersion": 2,
+                "siteCheckInId": None,
+                "jobId": job_id,
+            })
+
+            api._save_timesheets_to_db(
+                timesheet_data,
+                pre_shift_ids,
+                pre_visit_counts,
+                pre_departure_counts,
+            )
+
+            stored = db.query_one(
+                "SELECT job_id FROM visits WHERE shift_id = %s",
+                (shift_id,),
+            )
+            assert stored == {"job_id": job_id}
+            loaded_entry = next(
+                row
+                for row in api._load_timesheets_from_db()["entries"]
+                if row["id"] == shift_id
+            )
+            assert loaded_entry["jobId"] is None
+            assert loaded_entry["visits"][0]["jobId"] == job_id
+        finally:
+            if shift_ids:
+                db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
+            _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
 
 
 class TestTimesheetGpsFlow:
