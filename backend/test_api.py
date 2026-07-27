@@ -3629,6 +3629,50 @@ class TestTimeCategories:
         r = client.get("/api/admin/analytics/waste?period=bogus", headers=auth)
         assert r.status_code in (400, 422)
 
+    def test_unmatched_shifts_use_clock_span_when_stored_total_is_stale(
+        self,
+        client,
+        auth,
+        employee_id,
+    ):
+        shift_id = None
+        try:
+            shift_id = int(
+                db.execute_returning(
+                    """
+                    INSERT INTO shifts (
+                        employee_id, location_id, location_label,
+                        clock_in, clock_out, total_hours, notes, local_date,
+                        time_category
+                    )
+                    VALUES (
+                        %s, NULL, 'Unmatched canonical hours',
+                        TIMESTAMPTZ '2048-04-07 08:00:00-05',
+                        TIMESTAMPTZ '2048-04-07 10:30:00-05',
+                        0.25, 'unmatched canonical hours proof',
+                        DATE '2048-04-07',
+                        'productive'
+                    )
+                    RETURNING id
+                    """,
+                    (employee_id,),
+                )
+            )
+
+            response = client.get("/api/admin/analytics/unmatched-shifts", headers=auth)
+
+            assert response.status_code == 200, response.text
+            body = response.json()
+            shift = next(row for row in body["shifts"] if row["id"] == shift_id)
+            assert shift["hours"] == 2.5
+            assert body["totalHours"] == round(
+                sum(row["hours"] for row in body["shifts"]),
+                2,
+            )
+        finally:
+            if shift_id is not None:
+                db.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
+
     def test_categorize_shift_not_found(self, client, auth):
         r = client.patch("/api/admin/shifts/999999/categorize", headers=auth,
                          json={"timeCategory": "productive"})
