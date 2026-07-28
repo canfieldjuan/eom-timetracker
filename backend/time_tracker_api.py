@@ -12263,73 +12263,104 @@ def _payroll_optional_money_total(values: List[Any]) -> Optional[float]:
 
 
 def _payroll_correction_candidate_sites(
-    day_row: Dict[str, Any],
+    candidate_segments: List[Dict[str, Any]],
+    correction_date: str,
     employee_id: int,
 ) -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-    for site in day_row.get("sites") or []:
-        candidate_jobs: List[Dict[str, Any]] = []
-        for job in site.get("jobs") or []:
-            worker_rows = [
-                worker
-                for worker in job.get("workers") or []
-                if int(worker.get("employeeId") or 0) == employee_id
-            ]
-            if not worker_rows:
-                continue
-            actual_hours = round(
-                sum(_payroll_float(worker.get("hours")) for worker in worker_rows),
-                2,
-            )
-            candidate_jobs.append(
-                {
-                    "jobId": job.get("jobId"),
-                    "scheduledDate": job.get("scheduledDate"),
-                    "profitabilityDate": job.get("profitabilityDate"),
-                    "revenueRecognitionDate": job.get("revenueRecognitionDate"),
-                    "actualHours": actual_hours,
-                    "actualLaborCost": _payroll_optional_money_total(
-                        [worker.get("laborCost") for worker in worker_rows]
-                    ),
-                    "laborCostComplete": all(
-                        worker.get("laborCost") is not None for worker in worker_rows
-                    ),
-                }
-            )
-        if not candidate_jobs:
+    sites_by_key: Dict[Tuple[Any, Any, str, str], Dict[str, Any]] = {}
+    for segment in candidate_segments:
+        if str(segment.get("date") or "") != correction_date:
             continue
-        candidates.append(
-            {
-                "locationId": site.get("locationId"),
-                "customerId": site.get("customerId"),
-                "customerName": site.get("customerName"),
-                "siteAddress": site.get("siteAddress"),
-                "actualHours": round(
-                    sum(_payroll_float(job.get("actualHours")) for job in candidate_jobs),
-                    2,
-                ),
-                "actualLaborCost": _payroll_optional_money_total(
-                    [job.get("actualLaborCost") for job in candidate_jobs]
-                ),
-                "laborCostComplete": all(
-                    bool(job.get("laborCostComplete")) for job in candidate_jobs
-                ),
-                "jobCount": len(candidate_jobs),
-                "jobs": candidate_jobs,
-            }
+        if int(segment.get("employeeId") or 0) != employee_id:
+            continue
+        location_id = segment.get("locationId")
+        if location_id is None:
+            continue
+
+        key = (
+            location_id,
+            segment.get("customerId"),
+            str(segment.get("customerName") or ""),
+            str(segment.get("siteAddress") or ""),
         )
+        site_row = sites_by_key.setdefault(
+            key,
+            {
+                "locationId": location_id,
+                "customerId": segment.get("customerId"),
+                "customerName": segment.get("customerName"),
+                "siteAddress": segment.get("siteAddress"),
+                "actualHours": 0.0,
+                "_laborValues": [],
+                "_siteSegmentKeys": set(),
+                "_jobsById": {},
+            },
+        )
+        site_segment_key = str(
+            segment.get("siteSegmentKey")
+            or segment.get("segmentKey")
+            or json.dumps(segment, sort_keys=True, default=str)
+        )
+        if site_segment_key not in site_row["_siteSegmentKeys"]:
+            site_row["_siteSegmentKeys"].add(site_segment_key)
+            site_row["actualHours"] += _payroll_float(segment.get("actualHours"))
+            site_row["_laborValues"].append(segment.get("actualLaborCost"))
+
+        job_id = segment.get("jobId")
+        if job_id is None:
+            continue
+        job_row = site_row["_jobsById"].setdefault(
+            int(job_id),
+            {
+                "jobId": int(job_id),
+                "scheduledDate": segment.get("scheduledDate"),
+                "profitabilityDate": segment.get("profitabilityDate"),
+                "revenueRecognitionDate": segment.get("revenueRecognitionDate"),
+                "actualHours": 0.0,
+                "_laborValues": [],
+            },
+        )
+        job_row["actualHours"] += _payroll_float(segment.get("actualHours"))
+        job_row["_laborValues"].append(segment.get("actualLaborCost"))
+
+    candidates: List[Dict[str, Any]] = []
+    for site_row in sites_by_key.values():
+        jobs = []
+        for job_row in site_row["_jobsById"].values():
+            labor_values = list(job_row.pop("_laborValues"))
+            job_row["actualHours"] = round(_payroll_float(job_row["actualHours"]), 2)
+            job_row["actualLaborCost"] = _payroll_optional_money_total(labor_values)
+            job_row["laborCostComplete"] = all(value is not None for value in labor_values)
+            jobs.append(job_row)
+        labor_values = list(site_row.pop("_laborValues"))
+        site_row.pop("_siteSegmentKeys")
+        site_row.pop("_jobsById")
+        site_row["actualHours"] = round(_payroll_float(site_row["actualHours"]), 2)
+        site_row["actualLaborCost"] = _payroll_optional_money_total(labor_values)
+        site_row["laborCostComplete"] = all(value is not None for value in labor_values)
+        site_row["jobCount"] = len(jobs)
+        site_row["jobs"] = sorted(
+            jobs,
+            key=lambda job: (
+                str(job.get("scheduledDate") or ""),
+                int(job.get("jobId") or 0),
+            ),
+        )
+        candidates.append(site_row)
+    candidates.sort(
+        key=lambda site: (
+            str(site.get("customerName") or "").casefold(),
+            str(site.get("siteAddress") or "").casefold(),
+            int(site.get("locationId") or 0),
+        )
+    )
     return candidates
 
 
 def _payroll_unallocated_correction_details_by_date(
     weekly_hours: Dict[str, Any],
-    result: Dict[str, Any],
+    candidate_segments: List[Dict[str, Any]],
 ) -> Dict[str, List[Dict[str, Any]]]:
-    profitability_days = {
-        str(day.get("date") or ""): day
-        for day in result.get("byDay") or []
-        if isinstance(day, dict)
-    }
     details_by_date: Dict[str, List[Dict[str, Any]]] = {}
     for employee in weekly_hours.get("employees") or []:
         employee_id = int(employee.get("employeeId") or 0)
@@ -12342,7 +12373,8 @@ def _payroll_unallocated_correction_details_by_date(
             if not day_key:
                 continue
             candidate_sites = _payroll_correction_candidate_sites(
-                profitability_days.get(day_key, {}),
+                candidate_segments,
+                day_key,
                 employee_id,
             )
             details_by_date.setdefault(day_key, []).append(
@@ -12407,10 +12439,11 @@ def _append_daily_profitability_issue(
 def _annotate_labor_profitability_daily_payroll_proof(
     result: Dict[str, Any],
     weekly_hours: Dict[str, Any],
+    candidate_segments: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     corrections_by_date = _payroll_unallocated_correction_details_by_date(
         weekly_hours,
-        result,
+        candidate_segments,
     )
     payroll_issues_by_date = _payroll_issue_rows_by_date(weekly_hours)
     total_count = sum(len(rows) for rows in corrections_by_date.values())
@@ -13256,32 +13289,42 @@ def admin_payroll_labor_profitability(
     parsed_week_start = _parse_payroll_week_start(
         _payroll_week_start_query(request, week_start)
     )
-    weekly_hours = _compute_payroll_weekly_hours(parsed_week_start.isoformat())
-    verification_row = db.query_one(
-        """
-        SELECT *
-        FROM payroll_verification_batches
-        WHERE week_start = %s
-        """,
-        (parsed_week_start,),
-    )
-    settings = load_settings()
-    result = build_weekly_labor_profitability(
-        parsed_week_start,
-        timezone_name=TIMEZONE_NAME,
-        now_provider=utc_now,
-        default_target_labor_pct=settings.get(
-            "laborPctTarget",
-            _SETTINGS_DEFAULTS["laborPctTarget"],
-        ),
-        default_min_margin_pct=settings.get(
-            "grossMarginMin",
-            _SETTINGS_DEFAULTS["grossMarginMin"],
-        ),
-    )
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            weekly_hours = _compute_payroll_weekly_hours(
+                parsed_week_start.isoformat(),
+                cursor=cur,
+            )
+            cur.execute(
+                """
+                SELECT *
+                FROM payroll_verification_batches
+                WHERE week_start = %s
+                """,
+                (parsed_week_start,),
+            )
+            verification_row = cur.fetchone()
+            settings = load_settings(cursor=cur)
+            result = build_weekly_labor_profitability(
+                parsed_week_start,
+                timezone_name=TIMEZONE_NAME,
+                now_provider=utc_now,
+                default_target_labor_pct=settings.get(
+                    "laborPctTarget",
+                    _SETTINGS_DEFAULTS["laborPctTarget"],
+                ),
+                default_min_margin_pct=settings.get(
+                    "grossMarginMin",
+                    _SETTINGS_DEFAULTS["grossMarginMin"],
+                ),
+                cursor=cur,
+            )
+    candidate_segments = result.pop("_payrollCorrectionCandidateSegments", [])
     unallocated_corrections = _annotate_labor_profitability_daily_payroll_proof(
         result,
         weekly_hours,
+        candidate_segments,
     )
     payroll_summary = weekly_hours["summary"]
     issues: List[Dict[str, str]] = []
@@ -13621,9 +13664,9 @@ def admin_reports_hours_pdf(
     )
 
 
-def load_settings() -> Dict[str, Any]:
+def load_settings(*, cursor: Optional[Any] = None) -> Dict[str, Any]:
     defaults: Dict[str, Any] = _SETTINGS_DEFAULTS.copy()
-    rows = db.query_all("SELECT key, value FROM settings")
+    rows = _payroll_query_all("SELECT key, value FROM settings", cursor=cursor)
     data: Dict[str, Any] = {r["key"]: r["value"] for r in rows}
     for k, v in defaults.items():
         if k not in data:

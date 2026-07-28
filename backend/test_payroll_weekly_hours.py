@@ -2090,6 +2090,303 @@ def test_payroll_labor_profitability_discloses_unallocated_hour_corrections(
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
+def test_payroll_labor_profitability_reads_candidate_inputs_from_one_snapshot(
+    client,
+    monkeypatch,
+):
+    week_start = date(2026, 7, 19)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    payroll_id = None
+    observed: dict[str, str] = {}
+
+    def fake_profitability_builder(*_args, **kwargs):
+        cursor = kwargs.get("cursor")
+        assert cursor is not None
+        cursor.execute("SHOW transaction_isolation")
+        observed["isolation"] = cursor.fetchone()["transaction_isolation"]
+        cursor.execute("SHOW transaction_read_only")
+        observed["read_only"] = cursor.fetchone()["transaction_read_only"]
+        return {
+            "success": True,
+            "period": "week",
+            "timezone": "America/Chicago",
+            "observedAt": "2026-07-20T00:00:00Z",
+            "weekStart": week_start.isoformat(),
+            "weekEnd": (week_start + timedelta(days=6)).isoformat(),
+            "summary": {
+                "jobCount": 0,
+                "unmatchedActualSegmentCount": 0,
+            },
+            "bySite": [],
+            "byDay": [],
+            "jobs": [],
+            "unmatchedActualSegments": [],
+            "_payrollCorrectionCandidateSegments": [],
+        }
+
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Snapshot Mayra",
+            role="payroll",
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Snapshot Mayra")
+        monkeypatch.setattr(
+            time_tracker_api,
+            "build_weekly_labor_profitability",
+            fake_profitability_builder,
+        )
+
+        response = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+
+        assert response.status_code == 200, response.text
+        assert observed == {"isolation": "repeatable read", "read_only": "on"}
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([value for value in (payroll_id,) if value])
+
+
+def test_payroll_labor_profitability_includes_ambiguous_unmatched_candidates(
+    client,
+):
+    week_start = date(2026, 7, 19)
+    service_day = date(2026, 7, 20)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    employee_id = None
+    payroll_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Mayra",
+            role="payroll",
+        )
+        employee_id = _create_employee(
+            "Payroll Labor Profitability Ambiguous Worker",
+            hourly_rate=20,
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Mayra")
+        source_id = _create_payroll_profitability_source()
+        customer_id, site_id = _create_payroll_profitability_site()
+        first_job_id = _create_payroll_profitability_job_only(
+            site_id=site_id,
+            source_id=source_id,
+            scheduled_date=service_day,
+            scheduled_start=_local_dt(service_day, 9),
+            scheduled_end=_local_dt(service_day, 11),
+            source_key="6" * 64,
+        )
+        second_job_id = _create_payroll_profitability_job_only(
+            site_id=site_id,
+            source_id=source_id,
+            scheduled_date=service_day,
+            scheduled_start=_local_dt(service_day, 9),
+            scheduled_end=_local_dt(service_day, 11),
+            source_key="7" * 64,
+        )
+        _create_payroll_profitability_shift_evidence(
+            employee_id=employee_id,
+            site_id=site_id,
+            local_start=_local_dt(service_day, 9),
+            local_end=_local_dt(service_day, 11),
+        )
+
+        corrected = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": service_day.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Mayra corrected ambiguous site time.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+
+        response = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        correction = body["payrollHours"]["unallocatedCorrections"][0]
+        assert correction["candidateSiteCount"] == 1
+        assert correction["candidateSites"] == [
+            {
+                "locationId": site_id,
+                "customerId": customer_id,
+                "customerName": "Payroll Labor Profitability Customer",
+                "siteAddress": "Payroll Labor Profitability Site",
+                "actualHours": 2.0,
+                "actualLaborCost": None,
+                "laborCostComplete": False,
+                "jobCount": 2,
+                "jobs": [
+                    {
+                        "jobId": first_job_id,
+                        "scheduledDate": "2026-07-20",
+                        "profitabilityDate": "2026-07-20",
+                        "revenueRecognitionDate": "2026-07-20",
+                        "actualHours": 2.0,
+                        "actualLaborCost": None,
+                        "laborCostComplete": False,
+                    },
+                    {
+                        "jobId": second_job_id,
+                        "scheduledDate": "2026-07-20",
+                        "profitabilityDate": "2026-07-20",
+                        "revenueRecognitionDate": "2026-07-20",
+                        "actualHours": 2.0,
+                        "actualLaborCost": None,
+                        "laborCostComplete": False,
+                    },
+                ],
+            }
+        ]
+        assert body["summary"]["actualHours"] == 0.0
+        assert body["summary"]["unmatchedActualHours"] == 2.0
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_correction_candidate_sites_exclude_locationless_segments():
+    candidates = time_tracker_api._payroll_correction_candidate_sites(
+        [
+            {
+                "segmentKey": "locationless",
+                "siteSegmentKey": "locationless",
+                "date": "2026-07-20",
+                "employeeId": 10,
+                "locationId": None,
+                "jobId": 100,
+                "actualHours": 2.0,
+                "actualLaborCost": 40.0,
+            },
+            {
+                "segmentKey": "site",
+                "siteSegmentKey": "site",
+                "date": "2026-07-20",
+                "employeeId": 10,
+                "locationId": 50,
+                "customerId": 60,
+                "customerName": "Candidate Customer",
+                "siteAddress": "Candidate Site",
+                "jobId": 101,
+                "scheduledDate": "2026-07-20",
+                "profitabilityDate": "2026-07-20",
+                "revenueRecognitionDate": "2026-07-20",
+                "actualHours": 1.5,
+                "actualLaborCost": 30.0,
+            },
+        ],
+        "2026-07-20",
+        10,
+    )
+
+    assert candidates == [
+        {
+            "locationId": 50,
+            "customerId": 60,
+            "customerName": "Candidate Customer",
+            "siteAddress": "Candidate Site",
+            "actualHours": 1.5,
+            "actualLaborCost": 30.0,
+            "laborCostComplete": True,
+            "jobCount": 1,
+            "jobs": [
+                {
+                    "jobId": 101,
+                    "scheduledDate": "2026-07-20",
+                    "profitabilityDate": "2026-07-20",
+                    "revenueRecognitionDate": "2026-07-20",
+                    "actualHours": 1.5,
+                    "actualLaborCost": 30.0,
+                    "laborCostComplete": True,
+                }
+            ],
+        }
+    ]
+
+
+def test_payroll_labor_profitability_does_not_offer_folded_boundary_labor_candidate(
+    client,
+):
+    week_start = date(2026, 7, 19)
+    prior_day = week_start - timedelta(days=1)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    employee_id = None
+    payroll_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Mayra",
+            role="payroll",
+        )
+        employee_id = _create_employee(
+            "Payroll Labor Profitability Boundary Candidate Worker",
+            hourly_rate=20,
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Mayra")
+        source_id = _create_payroll_profitability_source()
+        _, site_id = _create_payroll_profitability_site()
+        job_id = _create_payroll_profitability_job_only(
+            site_id=site_id,
+            source_id=source_id,
+            scheduled_date=week_start,
+            scheduled_start=_local_dt(week_start, 0, 30),
+            scheduled_end=_local_dt(week_start, 1, 30),
+            source_key="8" * 64,
+        )
+        _create_payroll_profitability_shift_evidence(
+            employee_id=employee_id,
+            local_start=_local_dt(prior_day, 22),
+            local_end=_local_dt(prior_day, 23),
+            qr_site_id=site_id,
+            qr_job_id=job_id,
+            qr_local_time=_local_dt(prior_day, 22, 30),
+        )
+
+        corrected = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": week_start.isoformat(),
+                "correctedTotalMinutes": 60,
+                "reason": "Mayra corrected Sunday total hours.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+
+        response = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        correction = body["payrollHours"]["unallocatedCorrections"][0]
+        assert correction["sourceTotalMinutes"] == 0
+        assert correction["candidateSiteCount"] == 0
+        assert correction["candidateSites"] == []
+        sunday = body["byDay"][0]
+        assert sunday["date"] == "2026-07-19"
+        assert sunday["actualHours"] == 1.0
+        assert sunday["unallocatedCorrections"] == [correction]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
 def test_employee_role_migration_allows_payroll_on_existing_constraints():
     db.execute(
         """

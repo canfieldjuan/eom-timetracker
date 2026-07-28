@@ -79,6 +79,18 @@ def _issue(code: str, message: str) -> Dict[str, str]:
     return {"code": code, "message": message}
 
 
+def _query_all(
+    sql: str,
+    params: tuple = (),
+    *,
+    cursor: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    if cursor is None:
+        return db.query_all(sql, params)
+    cursor.execute(sql, params)
+    return [dict(row) for row in cursor.fetchall()]
+
+
 def _local_bounds(
     start_date: date,
     end_date: date,
@@ -206,6 +218,7 @@ def _load_jobs(
     *,
     window_start: Optional[datetime] = None,
     window_end: Optional[datetime] = None,
+    cursor: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     if (window_start is None) != (window_end is None):
         raise ValueError("Both job window bounds are required")
@@ -230,7 +243,7 @@ def _load_jobs(
                 )
         """
         params = (window_end, window_start, start_date, end_date)
-    return db.query_all(
+    return _query_all(
         f"""
         SELECT j.id, j.location_id, j.customer_name, j.scheduled_date,
                j.expected_hours AS legacy_expected_hours,
@@ -258,10 +271,15 @@ def _load_jobs(
                  j.id
         """,
         params,
+        cursor=cursor,
     )
 
 
-def _load_linked_job_metadata(job_ids: Iterable[int]) -> Dict[int, Dict[str, Any]]:
+def _load_linked_job_metadata(
+    job_ids: Iterable[int],
+    *,
+    cursor: Optional[Any] = None,
+) -> Dict[int, Dict[str, Any]]:
     """Load explicit-link identity independently of the visible job window."""
 
     ids = sorted(set(int(job_id) for job_id in job_ids))
@@ -269,7 +287,7 @@ def _load_linked_job_metadata(job_ids: Iterable[int]) -> Dict[int, Dict[str, Any
         return {}
     return {
         int(row["id"]): row
-        for row in db.query_all(
+        for row in _query_all(
             """
             SELECT id, location_id, status
             FROM jobs
@@ -277,6 +295,7 @@ def _load_linked_job_metadata(job_ids: Iterable[int]) -> Dict[int, Dict[str, Any
             ORDER BY id
             """,
             (ids,),
+            cursor=cursor,
         )
     }
 
@@ -431,6 +450,8 @@ def _load_time_evidence(
     range_end: datetime,
     observed_at: datetime,
     visible_job_ids: Iterable[int],
+    *,
+    cursor: Optional[Any] = None,
 ) -> Tuple[
     List[Dict[str, Any]],
     Dict[int, List[Dict[str, Any]]],
@@ -439,7 +460,7 @@ def _load_time_evidence(
     List[Dict[str, Any]],
 ]:
     linked_job_ids = [int(job_id) for job_id in visible_job_ids]
-    shifts = db.query_all(
+    shifts = _query_all(
         """
         SELECT s.id, s.employee_id, e.name AS employee_name, e.hourly_rate,
                s.location_id, s.location_label, s.clock_in, s.clock_out,
@@ -483,12 +504,13 @@ def _load_time_evidence(
             observed_at,
             observed_at,
         ),
+        cursor=cursor,
     )
 
     shift_ids = [int(row["id"]) for row in shifts]
     visits: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     if shift_ids:
-        for row in db.query_all(
+        for row in _query_all(
             """
             SELECT id, shift_id, location_id, location_label, customer_name,
                    arrival_time, sequence_version, site_check_in_id
@@ -497,12 +519,13 @@ def _load_time_evidence(
             ORDER BY shift_id, arrival_time, id
             """,
             (shift_ids,),
+            cursor=cursor,
         ):
             visits[int(row["shift_id"])].append(row)
 
     departures: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     if shift_ids:
-        for row in db.query_all(
+        for row in _query_all(
             """
             SELECT id, shift_id, location_id, location_label, customer_name,
                    departure_time, visit_id
@@ -511,11 +534,12 @@ def _load_time_evidence(
             ORDER BY shift_id, departure_time, id
             """,
             (shift_ids,),
+            cursor=cursor,
         ):
             departures[int(row["shift_id"])].append(row)
 
     qr_by_employee_site: Dict[Tuple[int, int], List[datetime]] = defaultdict(list)
-    qr_rows = db.query_all(
+    qr_rows = _query_all(
         """
         SELECT sci.id, sci.employee_id, e.name AS employee_name, e.hourly_rate,
                sci.location_id, sci.job_id, l.address AS location_label,
@@ -561,6 +585,7 @@ def _load_time_evidence(
             shift_ids,
             observed_at,
         ),
+        cursor=cursor,
     )
     for row in qr_rows:
         qr_by_employee_site[(int(row["employee_id"]), int(row["location_id"]))].append(
@@ -2472,6 +2497,7 @@ def _decorate_schedule_jobs(
     *,
     visible_range_start: Optional[datetime] = None,
     visible_range_end: Optional[datetime] = None,
+    cursor: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = defaultdict(list)
     jobs_by_id = {int(job["id"]): job for job in jobs}
@@ -2491,10 +2517,10 @@ def _decorate_schedule_jobs(
                     .astimezone(app_timezone)
                     .date()
                 )
-                cursor = first_service_date
-                while cursor <= last_service_date:
-                    service_dates.add(cursor)
-                    cursor += timedelta(days=1)
+                service_date_cursor = first_service_date
+                while service_date_cursor <= last_service_date:
+                    service_dates.add(service_date_cursor)
+                    service_date_cursor += timedelta(days=1)
             for service_date in service_dates:
                 jobs_by_site_date[(int(job["location_id"]), service_date)].append(job)
 
@@ -2503,6 +2529,7 @@ def _decorate_schedule_jobs(
         range_end,
         observed_at,
         jobs_by_id,
+        cursor=cursor,
     )
     linked_jobs_by_id = dict(jobs_by_id)
     linked_jobs_by_id.update(
@@ -2518,7 +2545,8 @@ def _decorate_schedule_jobs(
                 for row in qr_rows
                 if row.get("job_id") is not None
                 and int(row["job_id"]) not in jobs_by_id
-            ]
+            ],
+            cursor=cursor,
         )
     )
     cross_boundary_shift_ids = _unique_visible_qr_shift_ids(
@@ -3367,6 +3395,147 @@ def _daily_profitability_job_rows(
     return daily_rows
 
 
+def _payroll_local_hours_by_day(
+    intervals: List[Dict[str, Any]],
+    *,
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> Dict[str, float]:
+    hours_by_day: Dict[str, float] = defaultdict(float)
+    for interval in intervals:
+        if not interval.get("finalized") or not interval.get("intervalEnd"):
+            continue
+        interval_start = _parse_utc_iso(str(interval["intervalStart"]))
+        interval_end = _parse_utc_iso(str(interval["intervalEnd"]))
+        for local_day, hours in _local_interval_day_slices(
+            interval_start,
+            interval_end,
+            range_start=range_start,
+            range_end=range_end,
+            app_timezone=app_timezone,
+        ):
+            hours_by_day[local_day.isoformat()] += hours
+    return hours_by_day
+
+
+def _payroll_correction_candidate_segments(
+    profit_jobs: List[Dict[str, Any]],
+    decorated_jobs: Dict[int, Dict[str, Any]],
+    unmatched: List[Dict[str, Any]],
+    *,
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    profit_jobs_by_id = {int(row["jobId"]): row for row in profit_jobs}
+    for job_id, profit_row in profit_jobs_by_id.items():
+        if profit_row.get("locationId") is None:
+            continue
+        decorated = decorated_jobs.get(job_id)
+        if not decorated:
+            continue
+        for worker in decorated.get("workers") or []:
+            hours_by_day = _payroll_local_hours_by_day(
+                worker.get("intervals") or [],
+                app_timezone=app_timezone,
+                range_start=range_start,
+                range_end=range_end,
+            )
+            if not hours_by_day:
+                continue
+            worker_labor_cents = _money_cents(worker.get("laborCost"))
+            labor_by_day = (
+                _allocate_cents_by_weight(worker_labor_cents, dict(hours_by_day))
+                if worker_labor_cents is not None
+                else {}
+            )
+            for day_key, hours in hours_by_day.items():
+                segments.append(
+                    {
+                        "segmentKey": (
+                            f"matched:{job_id}:{worker['employeeId']}:{day_key}"
+                        ),
+                        "siteSegmentKey": (
+                            f"matched:{job_id}:{worker['employeeId']}:{day_key}"
+                        ),
+                        "source": "matched_job",
+                        "date": day_key,
+                        "employeeId": int(worker["employeeId"]),
+                        "employeeName": worker["employeeName"],
+                        "locationId": profit_row.get("locationId"),
+                        "customerId": profit_row.get("customerId"),
+                        "customerName": profit_row.get("customerName"),
+                        "siteAddress": profit_row.get("siteAddress"),
+                        "jobId": job_id,
+                        "scheduledDate": profit_row.get("scheduledDate"),
+                        "profitabilityDate": profit_row.get("profitabilityDate"),
+                        "revenueRecognitionDate": profit_row.get("profitabilityDate"),
+                        "actualHours": round(hours, 2),
+                        "actualLaborCost": (
+                            _money(labor_by_day[day_key])
+                            if worker_labor_cents is not None
+                            else None
+                        ),
+                        "laborCostComplete": worker_labor_cents is not None,
+                    }
+                )
+
+    for segment in unmatched:
+        if not segment.get("finalized") or not segment.get("intervalEnd"):
+            continue
+        hours_by_day = _payroll_local_hours_by_day(
+            [
+                {
+                    "intervalStart": segment["intervalStart"],
+                    "intervalEnd": segment["intervalEnd"],
+                    "finalized": True,
+                }
+            ],
+            app_timezone=app_timezone,
+            range_start=range_start,
+            range_end=range_end,
+        )
+        if not hours_by_day:
+            continue
+        candidate_job_ids = [int(job_id) for job_id in segment.get("candidateJobIds") or []]
+        for job_id in candidate_job_ids:
+            profit_row = profit_jobs_by_id.get(job_id)
+            if not profit_row or profit_row.get("locationId") is None:
+                continue
+            for day_key, hours in hours_by_day.items():
+                segments.append(
+                    {
+                        "segmentKey": (
+                            f"unmatched:{segment.get('shiftId')}:{job_id}:"
+                            f"{segment['intervalStart']}:{segment['intervalEnd']}:{day_key}"
+                        ),
+                        "siteSegmentKey": (
+                            f"unmatched:{segment.get('shiftId')}:"
+                            f"{segment['intervalStart']}:{segment['intervalEnd']}:{day_key}"
+                        ),
+                        "source": "unmatched_actual_labor",
+                        "reason": segment.get("reason"),
+                        "date": day_key,
+                        "employeeId": int(segment["employeeId"]),
+                        "employeeName": segment["employeeName"],
+                        "locationId": profit_row.get("locationId"),
+                        "customerId": profit_row.get("customerId"),
+                        "customerName": profit_row.get("customerName"),
+                        "siteAddress": profit_row.get("siteAddress"),
+                        "jobId": job_id,
+                        "scheduledDate": profit_row.get("scheduledDate"),
+                        "profitabilityDate": profit_row.get("profitabilityDate"),
+                        "revenueRecognitionDate": profit_row.get("profitabilityDate"),
+                        "actualHours": round(hours, 2),
+                        "actualLaborCost": None,
+                        "laborCostComplete": False,
+                    }
+                )
+    return segments
+
+
 def _aggregate_actual_profitability_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     included_rows = [row for row in rows if bool(row.get("includedInProfitability"))]
     known_planned_hours = sum(
@@ -3609,6 +3778,7 @@ def build_weekly_labor_profitability(
     now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     default_target_labor_pct: Optional[float] = None,
     default_min_margin_pct: Optional[float] = None,
+    cursor: Optional[Any] = None,
 ) -> Dict[str, Any]:
     app_timezone = ZoneInfo(timezone_name)
     observed_at = now_provider().astimezone(timezone.utc)
@@ -3621,8 +3791,9 @@ def build_weekly_labor_profitability(
         week_end,
         window_start=range_start,
         window_end=range_end,
+        cursor=cursor,
     )
-    allocation_jobs = _load_jobs(allocation_start, allocation_end)
+    allocation_jobs = _load_jobs(allocation_start, allocation_end, cursor=cursor)
     monthly_allocations = monthly_revenue_allocations(
         allocation_jobs,
         app_timezone,
@@ -3635,6 +3806,7 @@ def build_weekly_labor_profitability(
         app_timezone,
         visible_range_start=range_start,
         visible_range_end=range_end,
+        cursor=cursor,
     )
     source_jobs = {int(job["id"]): job for job in jobs}
     profit_jobs = [
@@ -3670,6 +3842,14 @@ def build_weekly_labor_profitability(
         for segment in unmatched
         if segment.get("finalized") and segment.get("hours") is not None
     )
+    correction_candidate_segments = _payroll_correction_candidate_segments(
+        profit_jobs,
+        decorated_jobs,
+        unmatched,
+        app_timezone=app_timezone,
+        range_start=range_start,
+        range_end=range_end,
+    )
     return {
         "success": True,
         "period": "week",
@@ -3694,6 +3874,7 @@ def build_weekly_labor_profitability(
         ),
         "jobs": profit_jobs,
         "unmatchedActualSegments": unmatched,
+        "_payrollCorrectionCandidateSegments": correction_candidate_segments,
     }
 
 
