@@ -67,6 +67,7 @@ def _apply_schema(conn):
                 google_calendar_sources, google_calendar_connections,
                 eom_office_conversion_handoffs,
                 receivables_operation_attempts,
+                payroll_hour_correction_allocations,
                 payroll_hour_corrections,
                 payroll_verification_events, payroll_verification_batches,
                 time_data_correction_batches,

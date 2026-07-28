@@ -2487,6 +2487,17 @@ class PayrollCorrectionVoidRequest(BaseModel):
         return value.strip() if isinstance(value, str) else value
 
 
+class PayrollCorrectionAllocationRequest(BaseModel):
+    locationId: int = Field(gt=0)
+    jobId: Optional[int] = Field(default=None, gt=0)
+    reason: str = Field(min_length=3, max_length=500)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_allocation_reason(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class JobCreateRequest(BaseModel):
     customerName: str = Field(min_length=1)
     scheduledDate: str  # YYYY-MM-DD
@@ -4504,6 +4515,37 @@ def _ensure_schema_migrations() -> None:
         )
     """)
     db.execute("""
+        CREATE TABLE IF NOT EXISTS payroll_hour_correction_allocations (
+            id                         BIGSERIAL PRIMARY KEY,
+            correction_id              BIGINT NOT NULL REFERENCES payroll_hour_corrections(id) ON DELETE CASCADE,
+            week_start                 DATE NOT NULL,
+            correction_date            DATE NOT NULL,
+            employee_id                INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            location_id                INTEGER NOT NULL REFERENCES locations(id) ON DELETE RESTRICT,
+            job_id                     INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+            allocated_delta_minutes    INTEGER NOT NULL
+                                           CHECK (
+                                               allocated_delta_minutes BETWEEN -1440 AND 1440
+                                               AND allocated_delta_minutes <> 0
+                                           ),
+            allocated_labor_cost_cents INTEGER,
+            reason                     TEXT NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 500),
+            status                     VARCHAR(16) NOT NULL DEFAULT 'active'
+                                           CHECK (status IN ('active', 'superseded', 'voided')),
+            created_by_employee_id     INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_by_name            TEXT NOT NULL,
+            voided_by_employee_id      INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            voided_by_name             TEXT,
+            voided_reason              TEXT,
+            voided_at                  TIMESTAMPTZ,
+            superseded_by              BIGINT REFERENCES payroll_hour_correction_allocations(id)
+                                           ON DELETE SET NULL,
+            created_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (correction_date >= week_start AND correction_date < week_start + 7)
+        )
+    """)
+    db.execute("""
         CREATE INDEX IF NOT EXISTS idx_payroll_verification_batches_status_week
         ON payroll_verification_batches(status, week_start)
     """)
@@ -4523,6 +4565,15 @@ def _ensure_schema_migrations() -> None:
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_payroll_hour_corrections_week
         ON payroll_hour_corrections(week_start, status, correction_date)
+    """)
+    db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_payroll_hour_correction_allocations_active
+        ON payroll_hour_correction_allocations(correction_id)
+        WHERE status = 'active'
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payroll_hour_correction_allocations_week
+        ON payroll_hour_correction_allocations(week_start, status, correction_date)
     """)
 
     # Seed threshold defaults if not already in settings
@@ -12262,6 +12313,49 @@ def _payroll_optional_money_total(values: List[Any]) -> Optional[float]:
     return round(sum(cents_values) / 100, 2)
 
 
+def _payroll_signed_money(cents: Optional[int]) -> Optional[float]:
+    if cents is None:
+        return None
+    return round(int(cents) / 100, 2)
+
+
+def _payroll_signed_money_cents(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite():
+        return None
+    return int(
+        (amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) * 100)
+        .to_integral_value()
+    )
+
+
+def _payroll_delta_labor_cost_cents(
+    delta_minutes: int,
+    hourly_rate: Any,
+) -> Optional[int]:
+    if hourly_rate is None:
+        return None
+    try:
+        rate = Decimal(str(hourly_rate))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not rate.is_finite() or rate < 0:
+        return None
+    return int(
+        (
+            rate
+            * Decimal(int(delta_minutes))
+            * Decimal(100)
+            / Decimal(60)
+        ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+
+
 def _payroll_correction_candidate_sites(
     candidate_segments: List[Dict[str, Any]],
     correction_date: str,
@@ -12357,11 +12451,15 @@ def _payroll_correction_candidate_sites(
     return candidates
 
 
-def _payroll_unallocated_correction_details_by_date(
+def _payroll_correction_details_by_date(
     weekly_hours: Dict[str, Any],
     candidate_segments: List[Dict[str, Any]],
+    allocation_rows: List[Dict[str, Any]],
 ) -> Dict[str, List[Dict[str, Any]]]:
     details_by_date: Dict[str, List[Dict[str, Any]]] = {}
+    allocations_by_correction_id = _payroll_correction_allocations_by_correction_id(
+        allocation_rows
+    )
     for employee in weekly_hours.get("employees") or []:
         employee_id = int(employee.get("employeeId") or 0)
         employee_name = str(employee.get("employeeName") or "")
@@ -12377,31 +12475,118 @@ def _payroll_unallocated_correction_details_by_date(
                 day_key,
                 employee_id,
             )
+            correction_id = int(correction["correctionId"])
+            allocation_row = allocations_by_correction_id.get(correction_id)
+            allocation = (
+                _serialize_payroll_correction_allocation(allocation_row)
+                if allocation_row
+                else None
+            )
+            detail = {
+                "correctionId": correction_id,
+                "employeeId": employee_id,
+                "employeeName": employee_name,
+                "date": day_key,
+                "allocationStatus": "allocated" if allocation else "unallocated",
+                "sourceTotalMinutes": int(correction["sourceTotalMinutes"]),
+                "sourceTotalHours": round(
+                    int(correction["sourceTotalMinutes"]) / 60,
+                    2,
+                ),
+                "correctedTotalMinutes": int(correction["correctedTotalMinutes"]),
+                "correctedTotalHours": round(
+                    int(correction["correctedTotalMinutes"]) / 60,
+                    2,
+                ),
+                "deltaMinutes": int(correction["deltaMinutes"]),
+                "deltaHours": round(int(correction["deltaMinutes"]) / 60, 2),
+                "reason": str(correction["reason"]),
+                "candidateSiteCount": len(candidate_sites),
+                "candidateSites": candidate_sites,
+            }
+            if allocation:
+                detail["allocation"] = allocation
             details_by_date.setdefault(day_key, []).append(
-                {
-                    "correctionId": int(correction["correctionId"]),
-                    "employeeId": employee_id,
-                    "employeeName": employee_name,
-                    "date": day_key,
-                    "allocationStatus": "unallocated",
-                    "sourceTotalMinutes": int(correction["sourceTotalMinutes"]),
-                    "sourceTotalHours": round(
-                        int(correction["sourceTotalMinutes"]) / 60,
-                        2,
-                    ),
-                    "correctedTotalMinutes": int(correction["correctedTotalMinutes"]),
-                    "correctedTotalHours": round(
-                        int(correction["correctedTotalMinutes"]) / 60,
-                        2,
-                    ),
-                    "deltaMinutes": int(correction["deltaMinutes"]),
-                    "deltaHours": round(int(correction["deltaMinutes"]) / 60, 2),
-                    "reason": str(correction["reason"]),
-                    "candidateSiteCount": len(candidate_sites),
-                    "candidateSites": candidate_sites,
-                }
+                detail
             )
     return details_by_date
+
+
+def _append_allocated_correction_to_profitability_site(
+    site: Dict[str, Any],
+    correction: Dict[str, Any],
+) -> None:
+    site.setdefault("allocatedCorrections", []).append(correction)
+    site["allocatedCorrectionCount"] = len(site["allocatedCorrections"])
+    allocation = correction.get("allocation") or {}
+    job_id = allocation.get("jobId")
+    if job_id is None:
+        return
+    for job in site.get("jobs") or []:
+        if int(job.get("jobId") or 0) != int(job_id):
+            continue
+        job.setdefault("allocatedCorrections", []).append(correction)
+        job["allocatedCorrectionCount"] = len(job["allocatedCorrections"])
+        return
+
+
+def _attach_allocated_corrections_to_profitability_targets(
+    result: Dict[str, Any],
+    allocated_corrections: List[Dict[str, Any]],
+) -> None:
+    weekly_sites = {
+        int(site.get("locationId") or 0): site
+        for site in result.get("bySite") or []
+        if site.get("locationId") is not None
+    }
+    days = {
+        str(day.get("date") or ""): day
+        for day in result.get("byDay") or []
+        if isinstance(day, dict)
+    }
+    for correction in allocated_corrections:
+        allocation = correction.get("allocation") or {}
+        location_id = int(allocation.get("locationId") or 0)
+        if location_id <= 0:
+            continue
+        weekly_site = weekly_sites.get(location_id)
+        if weekly_site:
+            _append_allocated_correction_to_profitability_site(weekly_site, correction)
+        day = days.get(str(correction.get("date") or ""))
+        if not day:
+            continue
+        for site in day.get("sites") or []:
+            if int(site.get("locationId") or 0) != location_id:
+                continue
+            _append_allocated_correction_to_profitability_site(site, correction)
+            break
+
+
+def _payroll_correction_labor_summary(
+    corrections: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    total_delta_minutes = sum(
+        int((correction.get("allocation") or {}).get("allocatedDeltaMinutes") or 0)
+        for correction in corrections
+    )
+    known_labor_cents = 0
+    labor_incomplete = False
+    for correction in corrections:
+        allocation = correction.get("allocation") or {}
+        cost_cents = _payroll_signed_money_cents(allocation.get("allocatedLaborCost"))
+        if cost_cents is None:
+            labor_incomplete = True
+            continue
+        known_labor_cents += cost_cents
+    return {
+        "allocatedCorrectionDeltaMinutes": total_delta_minutes,
+        "allocatedCorrectionDeltaHours": round(total_delta_minutes / 60, 2),
+        "knownAllocatedCorrectionLaborCost": _payroll_signed_money(known_labor_cents),
+        "allocatedCorrectionLaborCost": (
+            None if labor_incomplete else _payroll_signed_money(known_labor_cents)
+        ),
+        "allocatedCorrectionLaborCostComplete": not labor_incomplete,
+    }
 
 
 def _payroll_issue_rows_by_date(
@@ -12440,29 +12625,58 @@ def _annotate_labor_profitability_daily_payroll_proof(
     result: Dict[str, Any],
     weekly_hours: Dict[str, Any],
     candidate_segments: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    corrections_by_date = _payroll_unallocated_correction_details_by_date(
+    allocation_rows: List[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    corrections_by_date = _payroll_correction_details_by_date(
         weekly_hours,
         candidate_segments,
+        allocation_rows,
     )
     payroll_issues_by_date = _payroll_issue_rows_by_date(weekly_hours)
-    total_count = sum(len(rows) for rows in corrections_by_date.values())
-    result.setdefault("summary", {})["unallocatedCorrectionCount"] = total_count
-    unallocated_corrections: List[Dict[str, Any]] = []
+    all_corrections = [
+        correction
+        for rows in corrections_by_date.values()
+        for correction in rows
+    ]
+    unallocated_corrections: List[Dict[str, Any]] = [
+        correction
+        for correction in all_corrections
+        if correction.get("allocationStatus") == "unallocated"
+    ]
+    allocated_corrections: List[Dict[str, Any]] = [
+        correction
+        for correction in all_corrections
+        if correction.get("allocationStatus") == "allocated"
+    ]
+    summary = result.setdefault("summary", {})
+    summary["unallocatedCorrectionCount"] = len(unallocated_corrections)
+    summary["allocatedCorrectionCount"] = len(allocated_corrections)
+    summary.update(_payroll_correction_labor_summary(allocated_corrections))
     for day in result.get("byDay") or []:
         if not isinstance(day, dict):
             continue
         day_key = str(day.get("date") or "")
         correction_rows = corrections_by_date.get(day_key, [])
-        correction_count = len(correction_rows)
-        unallocated_corrections.extend(correction_rows)
+        day_unallocated_corrections = [
+            correction
+            for correction in correction_rows
+            if correction.get("allocationStatus") == "unallocated"
+        ]
+        day_allocated_corrections = [
+            correction
+            for correction in correction_rows
+            if correction.get("allocationStatus") == "allocated"
+        ]
         payroll_issues = payroll_issues_by_date.get(day_key, [])
-        day["unallocatedCorrectionCount"] = correction_count
-        day["unallocatedCorrections"] = correction_rows
+        day["unallocatedCorrectionCount"] = len(day_unallocated_corrections)
+        day["unallocatedCorrections"] = day_unallocated_corrections
+        day["allocatedCorrectionCount"] = len(day_allocated_corrections)
+        day["allocatedCorrections"] = day_allocated_corrections
+        day.update(_payroll_correction_labor_summary(day_allocated_corrections))
         day["payrollIssueCount"] = len(payroll_issues)
         for payroll_issue in payroll_issues:
             _append_daily_profitability_issue(day, payroll_issue)
-        if correction_count <= 0:
+        if len(day_unallocated_corrections) <= 0:
             continue
         issue_code = "payroll_hour_corrections_not_allocated_to_sites"
         if not any(issue.get("code") == issue_code for issue in day.get("issues") or []):
@@ -12477,7 +12691,14 @@ def _annotate_labor_profitability_daily_payroll_proof(
                     ),
                 },
             )
-    return unallocated_corrections
+    _attach_allocated_corrections_to_profitability_targets(
+        result,
+        allocated_corrections,
+    )
+    return {
+        "allocated": allocated_corrections,
+        "unallocated": unallocated_corrections,
+    }
 
 
 def _lock_payroll_verification_week(cur: Any, week_start: date) -> None:
@@ -12488,7 +12709,16 @@ def _lock_payroll_verification_week(cur: Any, week_start: date) -> None:
 
 
 def _lock_payroll_source_rows(cur: Any) -> None:
-    cur.execute("LOCK TABLE employees, shifts, payroll_hour_corrections IN SHARE MODE")
+    cur.execute(
+        """
+        LOCK TABLE
+            employees,
+            shifts,
+            payroll_hour_corrections,
+            payroll_hour_correction_allocations
+        IN SHARE MODE
+        """
+    )
 
 
 def _get_payroll_verification_batch(
@@ -12763,6 +12993,131 @@ def _payroll_correction_rows(
     )
 
 
+def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, Any]:
+    delta_minutes = int(row["allocated_delta_minutes"])
+    return {
+        "allocationId": int(row["id"]),
+        "correctionId": int(row["correction_id"]),
+        "weekStart": row["week_start"].isoformat(),
+        "date": row["correction_date"].isoformat(),
+        "employeeId": int(row["employee_id"]),
+        "locationId": int(row["location_id"]),
+        "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
+        "allocatedDeltaMinutes": delta_minutes,
+        "allocatedDeltaHours": round(delta_minutes / 60, 2),
+        "allocatedLaborCost": _payroll_signed_money(row.get("allocated_labor_cost_cents")),
+        "laborCostComplete": row.get("allocated_labor_cost_cents") is not None,
+        "reason": str(row["reason"]),
+        "status": str(row["status"]),
+        "createdByName": str(row["created_by_name"]),
+        "createdAt": _payroll_verification_iso(row.get("created_at")),
+        "voidedByName": (
+            str(row["voided_by_name"])
+            if row.get("voided_by_name") is not None
+            else None
+        ),
+        "voidedReason": row.get("voided_reason"),
+        "voidedAt": _payroll_verification_iso(row.get("voided_at")),
+        "supersededBy": (
+            int(row["superseded_by"])
+            if row.get("superseded_by") is not None
+            else None
+        ),
+    }
+
+
+def _payroll_correction_allocation_rows(
+    week_start: date,
+    *,
+    cursor: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    return _payroll_query_all(
+        """
+        SELECT allocation.*
+        FROM payroll_hour_correction_allocations allocation
+        JOIN payroll_hour_corrections correction
+          ON correction.id = allocation.correction_id
+        WHERE allocation.week_start = %s
+          AND allocation.status = 'active'
+          AND correction.status = 'active'
+        ORDER BY allocation.correction_date, allocation.correction_id, allocation.id
+        """,
+        (week_start,),
+        cursor=cursor,
+    )
+
+
+def _payroll_correction_allocations_by_correction_id(
+    rows: List[Dict[str, Any]],
+) -> Dict[int, Dict[str, Any]]:
+    return {
+        int(row["correction_id"]): row
+        for row in rows
+        if row.get("correction_id") is not None
+    }
+
+
+def _payroll_correction_candidate_detail_for_row(
+    cur: Any,
+    correction_row: Dict[str, Any],
+) -> Dict[str, Any]:
+    week_start = correction_row["week_start"]
+    weekly_hours = _compute_payroll_weekly_hours(week_start.isoformat(), cursor=cur)
+    settings = load_settings(cursor=cur)
+    result = build_weekly_labor_profitability(
+        week_start,
+        timezone_name=TIMEZONE_NAME,
+        now_provider=utc_now,
+        default_target_labor_pct=settings.get(
+            "laborPctTarget",
+            _SETTINGS_DEFAULTS["laborPctTarget"],
+        ),
+        default_min_margin_pct=settings.get(
+            "grossMarginMin",
+            _SETTINGS_DEFAULTS["grossMarginMin"],
+        ),
+        cursor=cur,
+    )
+    candidate_segments = result.pop("_payrollCorrectionCandidateSegments", [])
+    details_by_date = _payroll_correction_details_by_date(
+        weekly_hours,
+        candidate_segments,
+        [],
+    )
+    correction_id = int(correction_row["id"])
+    correction_date = correction_row["correction_date"].isoformat()
+    for detail in details_by_date.get(correction_date, []):
+        if int(detail.get("correctionId") or 0) == correction_id:
+            return detail
+    raise HTTPException(
+        status_code=409,
+        detail="Payroll correction is not present in the current weekly-hours proof",
+    )
+
+
+def _payroll_correction_candidate_target(
+    correction_detail: Dict[str, Any],
+    *,
+    location_id: int,
+    job_id: Optional[int],
+) -> Dict[str, Any]:
+    for site in correction_detail.get("candidateSites") or []:
+        if int(site.get("locationId") or 0) != int(location_id):
+            continue
+        if job_id is None:
+            return site
+        if any(int(job.get("jobId") or 0) == int(job_id) for job in site.get("jobs") or []):
+            return site
+        raise HTTPException(
+            status_code=409,
+            detail="Payroll correction allocation job is not a current candidate",
+        )
+    raise HTTPException(
+        status_code=409,
+        detail="Payroll correction allocation Site is not a current candidate",
+    )
+
+
 def _ensure_payroll_week_corrections_editable(cur: Any, week_start: date) -> None:
     batch = _get_payroll_verification_batch(cur, week_start, lock=True)
     if batch and batch["status"] in {"verified", "finalized"}:
@@ -12865,7 +13220,14 @@ def admin_create_payroll_hour_correction(
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_payroll_verification_week(cur, week_start)
             _ensure_payroll_week_corrections_editable(cur, week_start)
-            cur.execute("LOCK TABLE payroll_hour_corrections IN SHARE ROW EXCLUSIVE MODE")
+            cur.execute(
+                """
+                LOCK TABLE
+                    payroll_hour_corrections,
+                    payroll_hour_correction_allocations
+                IN SHARE ROW EXCLUSIVE MODE
+                """
+            )
             cur.execute(
                 "SELECT id, name FROM employees WHERE id = %s FOR SHARE",
                 (payload.employeeId,),
@@ -12901,6 +13263,15 @@ def admin_create_payroll_hour_correction(
                         UPDATE payroll_hour_corrections
                         SET status = 'superseded', updated_at = NOW()
                         WHERE id = %s
+                        """,
+                        (int(existing["id"]),),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE payroll_hour_correction_allocations
+                        SET status = 'superseded', updated_at = NOW()
+                        WHERE correction_id = %s
+                          AND status = 'active'
                         """,
                         (int(existing["id"]),),
                     )
@@ -12978,7 +13349,14 @@ def admin_void_payroll_hour_correction(
             week_start = identity["week_start"]
             _lock_payroll_verification_week(cur, week_start)
             _ensure_payroll_week_corrections_editable(cur, week_start)
-            cur.execute("LOCK TABLE payroll_hour_corrections IN SHARE ROW EXCLUSIVE MODE")
+            cur.execute(
+                """
+                LOCK TABLE
+                    payroll_hour_corrections,
+                    payroll_hour_correction_allocations
+                IN SHARE ROW EXCLUSIVE MODE
+                """
+            )
             cur.execute(
                 """
                 SELECT correction.*, employee.name AS employee_name
@@ -13015,6 +13393,26 @@ def admin_void_payroll_hour_correction(
             )
             saved = dict(cur.fetchone())
             saved["employee_name"] = str(row["employee_name"])
+            cur.execute(
+                """
+                UPDATE payroll_hour_correction_allocations
+                SET
+                    status = 'voided',
+                    voided_by_employee_id = %s,
+                    voided_by_name = %s,
+                    voided_reason = %s,
+                    voided_at = NOW(),
+                    updated_at = NOW()
+                WHERE correction_id = %s
+                  AND status = 'active'
+                """,
+                (
+                    int(current_payroll["id"]),
+                    str(current_payroll["name"]),
+                    payload.reason,
+                    correction_id,
+                ),
+            )
             _lock_payroll_source_rows(cur)
             weekly_hours = _compute_payroll_weekly_hours(week_start.isoformat(), cursor=cur)
             result = {
@@ -13029,6 +13427,255 @@ def admin_void_payroll_hour_correction(
         "PAYROLL_HOUR_CORRECTION_VOID",
         True,
         f"week={week_start.isoformat()} correction={correction_id}",
+    )
+    return result
+
+
+@app.post("/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation")
+def admin_allocate_payroll_hour_correction(
+    correction_id: int,
+    payload: PayrollCorrectionAllocationRequest,
+    request: Request,
+    current_payroll: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    result: Dict[str, Any]
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT week_start
+                FROM payroll_hour_corrections
+                WHERE id = %s
+                  AND status = 'active'
+                """,
+                (correction_id,),
+            )
+            correction_identity = cur.fetchone()
+            if correction_identity is None:
+                raise HTTPException(status_code=404, detail="Active payroll correction not found")
+            week_start = correction_identity["week_start"]
+            _lock_payroll_verification_week(cur, week_start)
+            _ensure_payroll_week_corrections_editable(cur, week_start)
+            cur.execute(
+                """
+                LOCK TABLE
+                    payroll_hour_corrections,
+                    payroll_hour_correction_allocations
+                IN SHARE ROW EXCLUSIVE MODE
+                """
+            )
+            cur.execute(
+                """
+                SELECT correction.*, employee.name AS employee_name, employee.hourly_rate
+                FROM payroll_hour_corrections correction
+                JOIN employees employee ON employee.id = correction.employee_id
+                WHERE correction.id = %s
+                  AND correction.status = 'active'
+                FOR UPDATE
+                """,
+                (correction_id,),
+            )
+            correction_row = cur.fetchone()
+            if correction_row is None:
+                raise HTTPException(status_code=404, detail="Active payroll correction not found")
+            correction_detail = _payroll_correction_candidate_detail_for_row(
+                cur,
+                dict(correction_row),
+            )
+            delta_minutes = int(correction_detail["deltaMinutes"])
+            if delta_minutes == 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Payroll correction has no hour delta to allocate",
+                )
+            _payroll_correction_candidate_target(
+                correction_detail,
+                location_id=int(payload.locationId),
+                job_id=payload.jobId,
+            )
+            labor_cost_cents = _payroll_delta_labor_cost_cents(
+                delta_minutes,
+                correction_row.get("hourly_rate"),
+            )
+            cur.execute(
+                """
+                SELECT *
+                FROM payroll_hour_correction_allocations
+                WHERE correction_id = %s
+                  AND status = 'active'
+                FOR UPDATE
+                """,
+                (correction_id,),
+            )
+            existing = cur.fetchone()
+            if (
+                existing
+                and int(existing["location_id"]) == int(payload.locationId)
+                and (
+                    (existing.get("job_id") is None and payload.jobId is None)
+                    or int(existing.get("job_id") or 0) == int(payload.jobId or 0)
+                )
+                and int(existing["allocated_delta_minutes"]) == delta_minutes
+                and existing.get("allocated_labor_cost_cents") == labor_cost_cents
+                and str(existing["reason"]) == payload.reason
+            ):
+                saved = dict(existing)
+                idempotent = True
+            else:
+                if existing:
+                    cur.execute(
+                        """
+                        UPDATE payroll_hour_correction_allocations
+                        SET status = 'superseded', updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (int(existing["id"]),),
+                    )
+                cur.execute(
+                    """
+                    INSERT INTO payroll_hour_correction_allocations (
+                        correction_id,
+                        week_start,
+                        correction_date,
+                        employee_id,
+                        location_id,
+                        job_id,
+                        allocated_delta_minutes,
+                        allocated_labor_cost_cents,
+                        reason,
+                        created_by_employee_id,
+                        created_by_name
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        correction_id,
+                        correction_row["week_start"],
+                        correction_row["correction_date"],
+                        int(correction_row["employee_id"]),
+                        int(payload.locationId),
+                        int(payload.jobId) if payload.jobId is not None else None,
+                        delta_minutes,
+                        labor_cost_cents,
+                        payload.reason,
+                        int(current_payroll["id"]),
+                        str(current_payroll["name"]),
+                    ),
+                )
+                saved = dict(cur.fetchone())
+                if existing:
+                    cur.execute(
+                        """
+                        UPDATE payroll_hour_correction_allocations
+                        SET superseded_by = %s, updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (int(saved["id"]), int(existing["id"])),
+                    )
+                idempotent = False
+            allocation = _serialize_payroll_correction_allocation(saved)
+            correction_detail["allocationStatus"] = "allocated"
+            correction_detail["allocation"] = allocation
+            result = {
+                "success": True,
+                "action": "allocate",
+                "idempotent": idempotent,
+                "allocation": allocation,
+                "correction": correction_detail,
+            }
+
+    append_access_log(
+        request,
+        "PAYROLL_HOUR_CORRECTION_ALLOCATION",
+        True,
+        (
+            f"week={result['allocation']['weekStart']} correction={correction_id} "
+            f"location={payload.locationId} job={payload.jobId or 'none'} "
+            f"idempotent={result['idempotent']}"
+        ),
+    )
+    return result
+
+
+@app.post("/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation/void")
+def admin_void_payroll_hour_correction_allocation(
+    correction_id: int,
+    payload: PayrollCorrectionVoidRequest,
+    request: Request,
+    current_payroll: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    result: Dict[str, Any]
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT week_start
+                FROM payroll_hour_corrections
+                WHERE id = %s
+                  AND status = 'active'
+                """,
+                (correction_id,),
+            )
+            correction_identity = cur.fetchone()
+            if correction_identity is None:
+                raise HTTPException(status_code=404, detail="Active payroll correction not found")
+            week_start = correction_identity["week_start"]
+            _lock_payroll_verification_week(cur, week_start)
+            _ensure_payroll_week_corrections_editable(cur, week_start)
+            cur.execute(
+                """
+                LOCK TABLE
+                    payroll_hour_corrections,
+                    payroll_hour_correction_allocations
+                IN SHARE ROW EXCLUSIVE MODE
+                """
+            )
+            cur.execute(
+                """
+                SELECT *
+                FROM payroll_hour_correction_allocations
+                WHERE correction_id = %s
+                  AND status = 'active'
+                FOR UPDATE
+                """,
+                (correction_id,),
+            )
+            allocation_row = cur.fetchone()
+            if allocation_row is None:
+                raise HTTPException(status_code=404, detail="Active payroll correction allocation not found")
+            cur.execute(
+                """
+                UPDATE payroll_hour_correction_allocations
+                SET
+                    status = 'voided',
+                    voided_by_employee_id = %s,
+                    voided_by_name = %s,
+                    voided_reason = %s,
+                    voided_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    int(current_payroll["id"]),
+                    str(current_payroll["name"]),
+                    payload.reason,
+                    int(allocation_row["id"]),
+                ),
+            )
+            saved = dict(cur.fetchone())
+            result = {
+                "success": True,
+                "action": "void_allocation",
+                "allocation": _serialize_payroll_correction_allocation(saved),
+            }
+
+    append_access_log(
+        request,
+        "PAYROLL_HOUR_CORRECTION_ALLOCATION_VOID",
+        True,
+        f"week={result['allocation']['weekStart']} correction={correction_id}",
     )
     return result
 
@@ -13306,6 +13953,10 @@ def admin_payroll_labor_profitability(
             )
             verification_row = cur.fetchone()
             settings = load_settings(cursor=cur)
+            allocation_rows = _payroll_correction_allocation_rows(
+                parsed_week_start,
+                cursor=cur,
+            )
             result = build_weekly_labor_profitability(
                 parsed_week_start,
                 timezone_name=TIMEZONE_NAME,
@@ -13325,6 +13976,7 @@ def admin_payroll_labor_profitability(
         result,
         weekly_hours,
         candidate_segments,
+        allocation_rows,
     )
     payroll_summary = weekly_hours["summary"]
     issues: List[Dict[str, str]] = []
@@ -13338,7 +13990,7 @@ def admin_payroll_labor_profitability(
                 ),
             }
         )
-    if payroll_summary["correctionCount"] > 0:
+    if unallocated_corrections["unallocated"]:
         issues.append(
             {
                 "code": "payroll_hour_corrections_not_allocated_to_sites",
@@ -13356,11 +14008,18 @@ def admin_payroll_labor_profitability(
         "totalHours": payroll_summary["totalHours"],
         "correctionCount": payroll_summary["correctionCount"],
         "unallocatedCorrectionCount": result["summary"]["unallocatedCorrectionCount"],
+        "allocatedCorrectionCount": result["summary"]["allocatedCorrectionCount"],
+        "allocatedCorrectionDeltaMinutes": result["summary"]["allocatedCorrectionDeltaMinutes"],
+        "allocatedCorrectionDeltaHours": result["summary"]["allocatedCorrectionDeltaHours"],
+        "allocatedCorrectionLaborCost": result["summary"]["allocatedCorrectionLaborCost"],
+        "knownAllocatedCorrectionLaborCost": result["summary"]["knownAllocatedCorrectionLaborCost"],
+        "allocatedCorrectionLaborCostComplete": result["summary"]["allocatedCorrectionLaborCostComplete"],
         "unallocatedCorrectionCandidateCount": sum(
             int(row.get("candidateSiteCount") or 0)
-            for row in unallocated_corrections
+            for row in unallocated_corrections["unallocated"]
         ),
-        "unallocatedCorrections": unallocated_corrections,
+        "unallocatedCorrections": unallocated_corrections["unallocated"],
+        "allocatedCorrections": unallocated_corrections["allocated"],
         "issueCount": payroll_summary["issueCount"],
         "hasBlockingIssues": payroll_summary["hasBlockingIssues"],
     }
