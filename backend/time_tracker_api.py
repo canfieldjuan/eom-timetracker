@@ -12303,6 +12303,18 @@ def _payroll_float(value: Any) -> float:
         return 0.0
 
 
+def _payroll_hours_to_minutes(value: Any) -> int:
+    try:
+        hours = Decimal(str(value or 0))
+    except (InvalidOperation, TypeError, ValueError):
+        return 0
+    if not hours.is_finite():
+        return 0
+    return int(
+        (hours * Decimal(60)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+
+
 def _payroll_optional_money_total(values: List[Any]) -> Optional[float]:
     cents_values: List[int] = []
     for value in values:
@@ -12363,6 +12375,8 @@ def _payroll_correction_candidate_sites(
 ) -> List[Dict[str, Any]]:
     sites_by_key: Dict[Tuple[Any, Any, str, str], Dict[str, Any]] = {}
     for segment in candidate_segments:
+        if segment.get("includedInProfitability") is False:
+            continue
         if str(segment.get("date") or "") != correction_date:
             continue
         if int(segment.get("employeeId") or 0) != employee_id:
@@ -12506,6 +12520,11 @@ def _payroll_correction_details_by_date(
             }
             if allocation:
                 detail["allocation"] = allocation
+                allocation_issue = _payroll_correction_allocation_issue(detail)
+                detail["allocationValid"] = allocation_issue is None
+                if allocation_issue:
+                    detail["allocationStatus"] = "invalid"
+                    detail["allocationIssue"] = allocation_issue
             details_by_date.setdefault(day_key, []).append(
                 detail
             )
@@ -12516,8 +12535,7 @@ def _append_allocated_correction_to_profitability_site(
     site: Dict[str, Any],
     correction: Dict[str, Any],
 ) -> None:
-    site.setdefault("allocatedCorrections", []).append(correction)
-    site["allocatedCorrectionCount"] = len(site["allocatedCorrections"])
+    _append_allocated_correction_to_profitability_target(site, correction)
     allocation = correction.get("allocation") or {}
     job_id = allocation.get("jobId")
     if job_id is None:
@@ -12525,9 +12543,105 @@ def _append_allocated_correction_to_profitability_site(
     for job in site.get("jobs") or []:
         if int(job.get("jobId") or 0) != int(job_id):
             continue
-        job.setdefault("allocatedCorrections", []).append(correction)
-        job["allocatedCorrectionCount"] = len(job["allocatedCorrections"])
+        _append_allocated_correction_to_profitability_target(job, correction)
         return
+
+
+def _append_allocated_correction_to_profitability_target(
+    target: Dict[str, Any],
+    correction: Dict[str, Any],
+) -> None:
+    target.setdefault("allocatedCorrections", []).append(correction)
+    target["allocatedCorrectionCount"] = len(target["allocatedCorrections"])
+    _annotate_allocated_correction_adjusted_profitability(
+        target,
+        target["allocatedCorrections"],
+    )
+
+
+def _payroll_allocation_matches_candidate_target(
+    correction: Dict[str, Any],
+) -> bool:
+    return _payroll_correction_allocation_issue(correction) is None
+
+
+def _payroll_correction_allocation_issue(
+    correction: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    allocation = correction.get("allocation") or {}
+    location_id = allocation.get("locationId")
+    if location_id is None:
+        return {
+            "code": "payroll_correction_allocation_target_missing",
+            "message": "Payroll correction allocation is missing a selected Site.",
+        }
+    current_delta_minutes = int(correction.get("deltaMinutes") or 0)
+    allocated_delta_minutes = int(allocation.get("allocatedDeltaMinutes") or 0)
+    if allocated_delta_minutes != current_delta_minutes:
+        return {
+            "code": "payroll_correction_allocation_stale_delta",
+            "message": (
+                "Payroll correction allocation was saved for a different hour "
+                "delta than the current clock evidence shows."
+            ),
+        }
+    job_id = allocation.get("jobId")
+    for site in correction.get("candidateSites") or []:
+        if int(site.get("locationId") or 0) != int(location_id):
+            continue
+        if job_id is None:
+            if _payroll_target_can_absorb_delta(
+                target=site,
+                delta_minutes=allocated_delta_minutes,
+            ):
+                return None
+            return {
+                "code": "payroll_correction_allocation_negative_target",
+                "message": (
+                    "Payroll correction allocation would make the selected Site "
+                    "negative."
+                ),
+            }
+        for job in site.get("jobs") or []:
+            if int(job.get("jobId") or 0) != int(job_id):
+                continue
+            if _payroll_target_can_absorb_delta(
+                target=job,
+                delta_minutes=allocated_delta_minutes,
+            ):
+                return None
+            return {
+                "code": "payroll_correction_allocation_negative_target",
+                "message": (
+                    "Payroll correction allocation would make the selected job "
+                    "negative."
+                ),
+            }
+        return {
+            "code": "payroll_correction_allocation_target_not_current_candidate",
+            "message": (
+                "Payroll correction allocation job is no longer a current "
+                "profitability candidate."
+            ),
+        }
+    return {
+        "code": "payroll_correction_allocation_target_not_current_candidate",
+        "message": (
+            "Payroll correction allocation Site is no longer a current "
+            "profitability candidate."
+        ),
+    }
+
+
+def _payroll_target_can_absorb_delta(
+    *,
+    target: Dict[str, Any],
+    delta_minutes: int,
+) -> bool:
+    return (
+        delta_minutes >= 0
+        or _payroll_hours_to_minutes(target.get("actualHours")) + delta_minutes >= 0
+    )
 
 
 def _attach_allocated_corrections_to_profitability_targets(
@@ -12544,11 +12658,24 @@ def _attach_allocated_corrections_to_profitability_targets(
         for day in result.get("byDay") or []
         if isinstance(day, dict)
     }
+    top_level_jobs = {
+        int(job.get("jobId") or 0): job
+        for job in result.get("jobs") or []
+        if job.get("jobId") is not None
+    }
     for correction in allocated_corrections:
         allocation = correction.get("allocation") or {}
         location_id = int(allocation.get("locationId") or 0)
         if location_id <= 0:
             continue
+        job_id = allocation.get("jobId")
+        if job_id is not None:
+            top_level_job = top_level_jobs.get(int(job_id))
+            if top_level_job:
+                _append_allocated_correction_to_profitability_target(
+                    top_level_job,
+                    correction,
+                )
         weekly_site = weekly_sites.get(location_id)
         if weekly_site:
             _append_allocated_correction_to_profitability_site(weekly_site, correction)
@@ -12573,7 +12700,12 @@ def _payroll_correction_labor_summary(
     labor_incomplete = False
     for correction in corrections:
         allocation = correction.get("allocation") or {}
-        cost_cents = _payroll_signed_money_cents(allocation.get("allocatedLaborCost"))
+        cost_source = (
+            allocation.get("currentAllocatedLaborCost")
+            if "currentAllocatedLaborCost" in allocation
+            else allocation.get("allocatedLaborCost")
+        )
+        cost_cents = _payroll_signed_money_cents(cost_source)
         if cost_cents is None:
             labor_incomplete = True
             continue
@@ -12587,6 +12719,107 @@ def _payroll_correction_labor_summary(
         ),
         "allocatedCorrectionLaborCostComplete": not labor_incomplete,
     }
+
+
+def _payroll_signed_percent(
+    numerator: Optional[int],
+    denominator: Optional[int],
+) -> Optional[float]:
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return round(numerator / denominator * 100, 1)
+
+
+def _annotate_allocated_correction_adjusted_profitability(
+    target: Dict[str, Any],
+    allocated_corrections: List[Dict[str, Any]],
+    *,
+    include_correction_summary: bool = True,
+) -> None:
+    if not allocated_corrections:
+        return
+
+    correction_summary = _payroll_correction_labor_summary(allocated_corrections)
+    if include_correction_summary:
+        target.update(correction_summary)
+
+    adjusted_actual_hours = round(
+        _payroll_float(target.get("actualHours"))
+        + int(correction_summary["allocatedCorrectionDeltaMinutes"]) / 60,
+        2,
+    )
+    target["adjustedActualHours"] = adjusted_actual_hours
+
+    planned_hours = target.get("plannedHours")
+    if planned_hours is not None and bool(target.get("plannedHoursComplete", True)):
+        target["adjustedVarianceHours"] = round(
+            adjusted_actual_hours - _payroll_float(planned_hours),
+            2,
+        )
+    else:
+        target["adjustedVarianceHours"] = None
+
+    known_base_labor_cents = _payroll_signed_money_cents(
+        target.get("knownActualLaborCost")
+    )
+    if known_base_labor_cents is None:
+        known_base_labor_cents = (
+            _payroll_signed_money_cents(target.get("actualLaborCost")) or 0
+        )
+    known_correction_labor_cents = (
+        _payroll_signed_money_cents(
+            correction_summary["knownAllocatedCorrectionLaborCost"]
+        )
+        or 0
+    )
+    target["knownAdjustedActualLaborCost"] = _payroll_signed_money(
+        known_base_labor_cents + known_correction_labor_cents
+    )
+
+    base_labor_cents = _payroll_signed_money_cents(target.get("actualLaborCost"))
+    base_labor_complete = (
+        base_labor_cents is not None and bool(target.get("laborCostComplete", True))
+    )
+    correction_labor_cents = _payroll_signed_money_cents(
+        correction_summary["allocatedCorrectionLaborCost"]
+    )
+    adjusted_labor_complete = (
+        base_labor_complete
+        and correction_labor_cents is not None
+        and bool(correction_summary["allocatedCorrectionLaborCostComplete"])
+    )
+    adjusted_labor_cents: Optional[int] = (
+        base_labor_cents + correction_labor_cents
+        if adjusted_labor_complete and base_labor_cents is not None
+        else None
+    )
+    target["adjustedActualLaborCost"] = _payroll_signed_money(adjusted_labor_cents)
+    target["adjustedLaborCostComplete"] = adjusted_labor_complete
+
+    revenue_cents = _profitability_money_cents(target.get("revenue"))
+    adjusted_net_cents = (
+        revenue_cents - adjusted_labor_cents
+        if revenue_cents is not None and adjusted_labor_cents is not None
+        else None
+    )
+    target["adjustedNetProfit"] = _payroll_signed_money(adjusted_net_cents)
+    target["adjustedGrossMarginPct"] = _payroll_signed_percent(
+        adjusted_net_cents,
+        revenue_cents,
+    )
+    adjusted_labor_pct = _payroll_signed_percent(
+        adjusted_labor_cents,
+        revenue_cents,
+    )
+    target["adjustedActualLaborPct"] = adjusted_labor_pct
+    target_labor_pct = target.get("targetLaborPct")
+    if adjusted_labor_pct is not None and target_labor_pct is not None:
+        target["adjustedLaborTargetVariancePct"] = round(
+            adjusted_labor_pct - _payroll_float(target_labor_pct),
+            1,
+        )
+    else:
+        target["adjustedLaborTargetVariancePct"] = None
 
 
 def _payroll_issue_rows_by_date(
@@ -12643,6 +12876,11 @@ def _annotate_labor_profitability_daily_payroll_proof(
         for correction in all_corrections
         if correction.get("allocationStatus") == "unallocated"
     ]
+    invalid_allocated_corrections: List[Dict[str, Any]] = [
+        correction
+        for correction in all_corrections
+        if correction.get("allocationStatus") == "invalid"
+    ]
     allocated_corrections: List[Dict[str, Any]] = [
         correction
         for correction in all_corrections
@@ -12650,8 +12888,19 @@ def _annotate_labor_profitability_daily_payroll_proof(
     ]
     summary = result.setdefault("summary", {})
     summary["unallocatedCorrectionCount"] = len(unallocated_corrections)
+    summary["invalidAllocationCount"] = len(invalid_allocated_corrections)
     summary["allocatedCorrectionCount"] = len(allocated_corrections)
     summary.update(_payroll_correction_labor_summary(allocated_corrections))
+    profitability_allocated_corrections = [
+        correction
+        for correction in allocated_corrections
+        if _payroll_allocation_matches_candidate_target(correction)
+    ]
+    _annotate_allocated_correction_adjusted_profitability(
+        summary,
+        profitability_allocated_corrections,
+        include_correction_summary=False,
+    )
     for day in result.get("byDay") or []:
         if not isinstance(day, dict):
             continue
@@ -12662,6 +12911,11 @@ def _annotate_labor_profitability_daily_payroll_proof(
             for correction in correction_rows
             if correction.get("allocationStatus") == "unallocated"
         ]
+        day_invalid_allocated_corrections = [
+            correction
+            for correction in correction_rows
+            if correction.get("allocationStatus") == "invalid"
+        ]
         day_allocated_corrections = [
             correction
             for correction in correction_rows
@@ -12670,12 +12924,37 @@ def _annotate_labor_profitability_daily_payroll_proof(
         payroll_issues = payroll_issues_by_date.get(day_key, [])
         day["unallocatedCorrectionCount"] = len(day_unallocated_corrections)
         day["unallocatedCorrections"] = day_unallocated_corrections
+        day["invalidAllocationCount"] = len(day_invalid_allocated_corrections)
+        day["invalidAllocatedCorrections"] = day_invalid_allocated_corrections
         day["allocatedCorrectionCount"] = len(day_allocated_corrections)
         day["allocatedCorrections"] = day_allocated_corrections
         day.update(_payroll_correction_labor_summary(day_allocated_corrections))
+        day_profitability_allocated_corrections = [
+            correction
+            for correction in day_allocated_corrections
+            if _payroll_allocation_matches_candidate_target(correction)
+        ]
+        _annotate_allocated_correction_adjusted_profitability(
+            day,
+            day_profitability_allocated_corrections,
+            include_correction_summary=False,
+        )
         day["payrollIssueCount"] = len(payroll_issues)
         for payroll_issue in payroll_issues:
             _append_daily_profitability_issue(day, payroll_issue)
+        if day_invalid_allocated_corrections:
+            issue_code = "payroll_hour_corrections_invalid_allocations"
+            if not any(issue.get("code") == issue_code for issue in day.get("issues") or []):
+                _append_daily_profitability_issue(
+                    day,
+                    {
+                        "code": issue_code,
+                        "message": (
+                            "One or more payroll hour correction allocations no "
+                            "longer match the current profitability proof."
+                        ),
+                    },
+                )
         if len(day_unallocated_corrections) <= 0:
             continue
         issue_code = "payroll_hour_corrections_not_allocated_to_sites"
@@ -12693,10 +12972,11 @@ def _annotate_labor_profitability_daily_payroll_proof(
             )
     _attach_allocated_corrections_to_profitability_targets(
         result,
-        allocated_corrections,
+        profitability_allocated_corrections,
     )
     return {
         "allocated": allocated_corrections,
+        "invalid": invalid_allocated_corrections,
         "unallocated": unallocated_corrections,
     }
 
@@ -12995,6 +13275,13 @@ def _payroll_correction_rows(
 
 def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, Any]:
     delta_minutes = int(row["allocated_delta_minutes"])
+    stored_labor_cost_cents = row.get("allocated_labor_cost_cents")
+    current_labor_cost_cents = stored_labor_cost_cents
+    if "employee_hourly_rate" in row:
+        current_labor_cost_cents = _payroll_delta_labor_cost_cents(
+            delta_minutes,
+            row.get("employee_hourly_rate"),
+        )
     return {
         "allocationId": int(row["id"]),
         "correctionId": int(row["correction_id"]),
@@ -13005,8 +13292,10 @@ def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, A
         "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
         "allocatedDeltaMinutes": delta_minutes,
         "allocatedDeltaHours": round(delta_minutes / 60, 2),
-        "allocatedLaborCost": _payroll_signed_money(row.get("allocated_labor_cost_cents")),
-        "laborCostComplete": row.get("allocated_labor_cost_cents") is not None,
+        "allocatedLaborCost": _payroll_signed_money(stored_labor_cost_cents),
+        "laborCostComplete": stored_labor_cost_cents is not None,
+        "currentAllocatedLaborCost": _payroll_signed_money(current_labor_cost_cents),
+        "currentLaborCostComplete": current_labor_cost_cents is not None,
         "reason": str(row["reason"]),
         "status": str(row["status"]),
         "createdByName": str(row["created_by_name"]),
@@ -13034,9 +13323,12 @@ def _payroll_correction_allocation_rows(
     return _payroll_query_all(
         """
         SELECT allocation.*
+             , employee.hourly_rate AS employee_hourly_rate
         FROM payroll_hour_correction_allocations allocation
         JOIN payroll_hour_corrections correction
           ON correction.id = allocation.correction_id
+        JOIN employees employee
+          ON employee.id = allocation.employee_id
         WHERE allocation.week_start = %s
           AND allocation.status = 'active'
           AND correction.status = 'active'
@@ -13106,8 +13398,9 @@ def _payroll_correction_candidate_target(
             continue
         if job_id is None:
             return site
-        if any(int(job.get("jobId") or 0) == int(job_id) for job in site.get("jobs") or []):
-            return site
+        for job in site.get("jobs") or []:
+            if int(job.get("jobId") or 0) == int(job_id):
+                return job
         raise HTTPException(
             status_code=409,
             detail="Payroll correction allocation job is not a current candidate",
@@ -13115,6 +13408,22 @@ def _payroll_correction_candidate_target(
     raise HTTPException(
         status_code=409,
         detail="Payroll correction allocation Site is not a current candidate",
+    )
+
+
+def _ensure_payroll_correction_allocation_capacity(
+    *,
+    target: Dict[str, Any],
+    delta_minutes: int,
+) -> None:
+    if _payroll_target_can_absorb_delta(
+        target=target,
+        delta_minutes=delta_minutes,
+    ):
+        return
+    raise HTTPException(
+        status_code=409,
+        detail="Payroll correction allocation would make selected profitability target negative",
     )
 
 
@@ -13488,10 +13797,14 @@ def admin_allocate_payroll_hour_correction(
                     status_code=409,
                     detail="Payroll correction has no hour delta to allocate",
                 )
-            _payroll_correction_candidate_target(
+            allocation_target = _payroll_correction_candidate_target(
                 correction_detail,
                 location_id=int(payload.locationId),
                 job_id=payload.jobId,
+            )
+            _ensure_payroll_correction_allocation_capacity(
+                target=allocation_target,
+                delta_minutes=delta_minutes,
             )
             labor_cost_cents = _payroll_delta_labor_cost_cents(
                 delta_minutes,
@@ -13574,6 +13887,7 @@ def admin_allocate_payroll_hour_correction(
                         (int(saved["id"]), int(existing["id"])),
                     )
                 idempotent = False
+            saved["employee_hourly_rate"] = correction_row.get("hourly_rate")
             allocation = _serialize_payroll_correction_allocation(saved)
             correction_detail["allocationStatus"] = "allocated"
             correction_detail["allocation"] = allocation
@@ -14001,6 +14315,16 @@ def admin_payroll_labor_profitability(
                 ),
             }
         )
+    if unallocated_corrections["invalid"]:
+        issues.append(
+            {
+                "code": "payroll_hour_corrections_invalid_allocations",
+                "message": (
+                    "One or more payroll hour correction allocations no longer "
+                    "match the current profitability proof."
+                ),
+            }
+        )
 
     result["payrollHours"] = {
         "sourceFingerprint": weekly_hours["sourceFingerprint"],
@@ -14008,6 +14332,7 @@ def admin_payroll_labor_profitability(
         "totalHours": payroll_summary["totalHours"],
         "correctionCount": payroll_summary["correctionCount"],
         "unallocatedCorrectionCount": result["summary"]["unallocatedCorrectionCount"],
+        "invalidAllocationCount": result["summary"]["invalidAllocationCount"],
         "allocatedCorrectionCount": result["summary"]["allocatedCorrectionCount"],
         "allocatedCorrectionDeltaMinutes": result["summary"]["allocatedCorrectionDeltaMinutes"],
         "allocatedCorrectionDeltaHours": result["summary"]["allocatedCorrectionDeltaHours"],
@@ -14019,6 +14344,7 @@ def admin_payroll_labor_profitability(
             for row in unallocated_corrections["unallocated"]
         ),
         "unallocatedCorrections": unallocated_corrections["unallocated"],
+        "invalidAllocatedCorrections": unallocated_corrections["invalid"],
         "allocatedCorrections": unallocated_corrections["allocated"],
         "issueCount": payroll_summary["issueCount"],
         "hasBlockingIssues": payroll_summary["hasBlockingIssues"],

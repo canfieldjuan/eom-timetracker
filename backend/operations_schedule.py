@@ -3469,6 +3469,9 @@ def _payroll_correction_candidate_segments(
                         "customerName": profit_row.get("customerName"),
                         "siteAddress": profit_row.get("siteAddress"),
                         "jobId": job_id,
+                        "includedInProfitability": bool(
+                            profit_row.get("includedInProfitability")
+                        ),
                         "scheduledDate": profit_row.get("scheduledDate"),
                         "profitabilityDate": profit_row.get("profitabilityDate"),
                         "revenueRecognitionDate": profit_row.get("profitabilityDate"),
@@ -3525,6 +3528,9 @@ def _payroll_correction_candidate_segments(
                         "customerName": profit_row.get("customerName"),
                         "siteAddress": profit_row.get("siteAddress"),
                         "jobId": job_id,
+                        "includedInProfitability": bool(
+                            profit_row.get("includedInProfitability")
+                        ),
                         "scheduledDate": profit_row.get("scheduledDate"),
                         "profitabilityDate": profit_row.get("profitabilityDate"),
                         "revenueRecognitionDate": profit_row.get("profitabilityDate"),
