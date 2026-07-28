@@ -1307,7 +1307,8 @@ def test_void_payroll_correction_restores_shift_total_and_employee_role_is_denie
 
 def test_payroll_verification_schema_migration_installs_existing_deployments():
     db.execute(
-        "DROP TABLE IF EXISTS payroll_hour_corrections, "
+        "DROP TABLE IF EXISTS payroll_hour_correction_allocations, "
+        "payroll_hour_corrections, "
         "payroll_verification_events, payroll_verification_batches"
     )
     time_tracker_api._ensure_schema_migrations()
@@ -1320,6 +1321,9 @@ def test_payroll_verification_schema_migration_installs_existing_deployments():
     )
     correction_table = db.query_one(
         "SELECT to_regclass('payroll_hour_corrections') AS table_name"
+    )
+    allocation_table = db.query_one(
+        "SELECT to_regclass('payroll_hour_correction_allocations') AS table_name"
     )
     status_check = db.query_one(
         """
@@ -1338,6 +1342,8 @@ def test_payroll_verification_schema_migration_installs_existing_deployments():
     assert event_table["table_name"] == "payroll_verification_events"
     assert correction_table is not None
     assert correction_table["table_name"] == "payroll_hour_corrections"
+    assert allocation_table is not None
+    assert allocation_table["table_name"] == "payroll_hour_correction_allocations"
     assert status_check == {"found": 1}
 
 
@@ -2084,6 +2090,225 @@ def test_payroll_labor_profitability_discloses_unallocated_hour_corrections(
             "payroll_hour_corrections_not_allocated_to_sites"
         ]
         assert monday["sites"][0]["actualHours"] == 2.0
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_correction_allocation_attaches_site_proof_without_blending_actuals(
+    client,
+):
+    week_start = date(2026, 7, 19)
+    service_day = date(2026, 7, 20)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    employee_id = None
+    payroll_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Mayra",
+            role="payroll",
+        )
+        employee_id = _create_employee(
+            "Payroll Labor Profitability Allocated Worker",
+            hourly_rate=20,
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Mayra")
+        source_id = _create_payroll_profitability_source()
+        customer_id, site_id = _create_payroll_profitability_site()
+        job_id = _create_payroll_profitability_job_and_shift(
+            employee_id=employee_id,
+            site_id=site_id,
+            source_id=source_id,
+            service_day=service_day,
+        )
+        corrected = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": service_day.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Mayra corrected total hours.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+        correction_id = corrected.json()["correction"]["correctionId"]
+
+        allocation_response = client.post(
+            f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation",
+            headers=payroll_auth,
+            json={
+                "locationId": site_id,
+                "jobId": job_id,
+                "reason": "Juan assigned Mayra's correction to this Site.",
+            },
+        )
+
+        assert allocation_response.status_code == 200, allocation_response.text
+        allocation = allocation_response.json()["allocation"]
+        assert allocation["correctionId"] == correction_id
+        assert allocation["locationId"] == site_id
+        assert allocation["jobId"] == job_id
+        assert allocation["allocatedDeltaMinutes"] == 60
+        assert allocation["allocatedDeltaHours"] == 1.0
+        assert allocation["allocatedLaborCost"] == 20.0
+        assert allocation["laborCostComplete"] is True
+
+        response = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["payrollHours"]["correctionCount"] == 1
+        assert body["payrollHours"]["unallocatedCorrectionCount"] == 0
+        assert body["payrollHours"]["allocatedCorrectionCount"] == 1
+        assert body["payrollHours"]["allocatedCorrectionDeltaHours"] == 1.0
+        assert body["payrollHours"]["allocatedCorrectionLaborCost"] == 20.0
+        assert body["payrollHours"]["unallocatedCorrections"] == []
+        correction = body["payrollHours"]["allocatedCorrections"][0]
+        assert correction["allocationStatus"] == "allocated"
+        assert correction["allocation"] == allocation
+        assert correction["candidateSites"][0]["locationId"] == site_id
+        assert body["issues"] == []
+        assert body["summary"]["unallocatedCorrectionCount"] == 0
+        assert body["summary"]["allocatedCorrectionCount"] == 1
+        assert body["summary"]["actualHours"] == 2.0
+        assert body["summary"]["actualLaborCost"] == 40.0
+        monday = next(row for row in body["byDay"] if row["date"] == "2026-07-20")
+        assert monday["unallocatedCorrectionCount"] == 0
+        assert monday["unallocatedCorrections"] == []
+        assert monday["allocatedCorrectionCount"] == 1
+        assert monday["allocatedCorrections"] == [correction]
+        site = monday["sites"][0]
+        assert site["locationId"] == site_id
+        assert site["allocatedCorrections"] == [correction]
+        assert site["actualHours"] == 2.0
+        assert site["actualLaborCost"] == 40.0
+        assert site["jobs"][0]["jobId"] == job_id
+        assert site["jobs"][0]["allocatedCorrections"] == [correction]
+        weekly_site = next(row for row in body["bySite"] if row["locationId"] == site_id)
+        assert weekly_site["allocatedCorrections"] == [correction]
+        assert weekly_site["customerId"] == customer_id
+
+        voided = client.post(
+            f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation/void",
+            headers=payroll_auth,
+            json={"reason": "Juan needs to choose a different Site."},
+        )
+        assert voided.status_code == 200, voided.text
+        assert voided.json()["allocation"]["status"] == "voided"
+        after_void = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+        assert after_void.status_code == 200, after_void.text
+        assert after_void.json()["payrollHours"]["allocatedCorrectionCount"] == 0
+        assert after_void.json()["payrollHours"]["unallocatedCorrectionCount"] == 1
+
+        reallocated = client.post(
+            f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation",
+            headers=payroll_auth,
+            json={
+                "locationId": site_id,
+                "jobId": job_id,
+                "reason": "Juan reassigned the correction before voiding it.",
+            },
+        )
+        assert reallocated.status_code == 200, reallocated.text
+        voided_correction = client.post(
+            f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/void",
+            headers=payroll_auth,
+            json={"reason": "Correction no longer belongs in this week."},
+        )
+        assert voided_correction.status_code == 200, voided_correction.text
+        after_correction_void = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+        assert after_correction_void.status_code == 200, after_correction_void.text
+        assert after_correction_void.json()["payrollHours"]["correctionCount"] == 0
+        assert after_correction_void.json()["payrollHours"]["allocatedCorrectionCount"] == 0
+        assert after_correction_void.json()["payrollHours"]["unallocatedCorrectionCount"] == 0
+        allocation_status = db.query_one(
+            """
+            SELECT status
+            FROM payroll_hour_correction_allocations
+            WHERE correction_id = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (correction_id,),
+        )
+        assert allocation_status == {"status": "voided"}
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_correction_allocation_rejects_non_candidate_site(client):
+    week_start = date(2026, 7, 19)
+    service_day = date(2026, 7, 20)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    employee_id = None
+    payroll_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Mayra",
+            role="payroll",
+        )
+        employee_id = _create_employee(
+            "Payroll Labor Profitability Reject Worker",
+            hourly_rate=20,
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Mayra")
+        source_id = _create_payroll_profitability_source()
+        _, site_id = _create_payroll_profitability_site()
+        _create_payroll_profitability_job_and_shift(
+            employee_id=employee_id,
+            site_id=site_id,
+            source_id=source_id,
+            service_day=service_day,
+        )
+        corrected = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": service_day.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Mayra corrected total hours.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+        correction_id = corrected.json()["correction"]["correctionId"]
+
+        rejected = client.post(
+            f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation",
+            headers=payroll_auth,
+            json={
+                "locationId": site_id + 9999,
+                "reason": "This Site is not supported by clocked proof.",
+            },
+        )
+
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["error"] == (
+            "Payroll correction allocation Site is not a current candidate"
+        )
+        response = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["payrollHours"]["unallocatedCorrectionCount"] == 1
+        assert response.json()["payrollHours"]["allocatedCorrectionCount"] == 0
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_payroll_labor_profitability_rows()
