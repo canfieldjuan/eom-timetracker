@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO, StringIO
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import bcrypt
@@ -54,6 +55,11 @@ def _create_shift(
     employee_id: int,
     local_start: datetime,
     local_end: datetime | None,
+    *,
+    location_id: int | None = None,
+    location_label: str = "",
+    job_id: int | None = None,
+    time_category: str = "productive",
 ) -> int:
     clock_in = local_start.astimezone(timezone.utc)
     clock_out = local_end.astimezone(timezone.utc) if local_end else None
@@ -64,13 +70,27 @@ def _create_shift(
         db.execute_returning(
             """
             INSERT INTO shifts (
-                employee_id, clock_in, clock_out, total_hours,
-                local_date, timezone, notes
+                employee_id, location_id, location_label, job_id,
+                clock_in, clock_out, total_hours, local_date, timezone,
+                time_category, notes
             )
-            VALUES (%s, %s, %s, %s, %s, 'America/Chicago', 'payroll-weekly-hours-test')
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, 'America/Chicago', %s,
+                'payroll-weekly-hours-test'
+            )
             RETURNING id
             """,
-            (employee_id, clock_in, clock_out, total_hours, local_start.date()),
+            (
+                employee_id,
+                location_id,
+                location_label,
+                job_id,
+                clock_in,
+                clock_out,
+                total_hours,
+                local_start.date(),
+                time_category,
+            ),
         )
     )
 
@@ -111,6 +131,52 @@ def _weekly_hours(client, auth: dict[str, str], week_start: date) -> dict:
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _payroll_timesheet(
+    client,
+    auth: dict[str, str],
+    week_start: date,
+    *,
+    employee_id: int | None = None,
+) -> dict:
+    url = f"/api/admin/payroll/timesheet?weekStart={week_start.isoformat()}"
+    if employee_id is not None:
+        url += f"&employeeId={employee_id}"
+    response = client.get(url, headers=auth)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _create_timesheet_site(
+    *,
+    address: str = "Payroll Timesheet Contract Site",
+    customer_name: str = "Payroll Timesheet Contract Customer",
+) -> tuple[int, int]:
+    customer_id = int(
+        db.execute_returning(
+            "INSERT INTO customers (name) VALUES (%s) RETURNING id",
+            (customer_name,),
+        )
+    )
+    location_id = int(
+        db.execute_returning(
+            """
+            INSERT INTO locations (customer_id, address, customer_name, location_type)
+            VALUES (%s, %s, %s, 'Commercial')
+            RETURNING id
+            """,
+            (customer_id, address, customer_name),
+        )
+    )
+    return customer_id, location_id
+
+
+def _delete_timesheet_site(customer_id: int | None, location_id: int | None) -> None:
+    if location_id is not None:
+        db.execute("DELETE FROM locations WHERE id = %s", (location_id,))
+    if customer_id is not None:
+        db.execute("DELETE FROM customers WHERE id = %s", (customer_id,))
 
 
 def _delete_payroll_labor_profitability_rows() -> None:
@@ -616,6 +682,13 @@ def test_payroll_role_can_read_weekly_hours_but_not_admin_surfaces(client, auth,
         assert allowed.status_code == 200, allowed.text
         assert allowed.json()["weekStart"] == "2026-07-19"
 
+        timesheet_allowed = client.get(
+            "/api/admin/payroll/timesheet?weekStart=2026-07-19",
+            headers=payroll_auth,
+        )
+        assert timesheet_allowed.status_code == 200, timesheet_allowed.text
+        assert timesheet_allowed.json()["capabilities"]["rawShiftRows"] is True
+
         admin_allowed = client.get(
             "/api/admin/payroll/weekly-hours?weekStart=2026-07-19",
             headers=auth,
@@ -627,6 +700,12 @@ def test_payroll_role_can_read_weekly_hours_but_not_admin_surfaces(client, auth,
             headers=emp_auth,
         )
         assert employee_denied.status_code == 403, employee_denied.text
+
+        timesheet_denied = client.get(
+            "/api/admin/payroll/timesheet?weekStart=2026-07-19",
+            headers=emp_auth,
+        )
+        assert timesheet_denied.status_code == 403, timesheet_denied.text
 
         payroll_admin_list = client.get("/api/admin/employees", headers=payroll_auth)
         assert payroll_admin_list.status_code == 403, payroll_admin_list.text
@@ -643,6 +722,62 @@ def test_payroll_role_can_read_weekly_hours_but_not_admin_surfaces(client, auth,
         assert payroll_admin_create.status_code == 403, payroll_admin_create.text
     finally:
         _delete_employees([payroll_id])
+
+
+def test_payroll_timesheet_route_reads_under_repeatable_read_snapshot(monkeypatch):
+    statements: list[str] = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, sql, _params=()):
+            statements.append(" ".join(sql.split()))
+
+    fake_cursor = FakeCursor()
+
+    class FakeConnection:
+        def cursor(self, cursor_factory=None):
+            assert cursor_factory is not None
+            return fake_cursor
+
+    class FakeConnectionContext:
+        def __enter__(self):
+            return FakeConnection()
+
+        def __exit__(self, *_args):
+            return None
+
+    def fake_get_conn():
+        return FakeConnectionContext()
+
+    def fake_compute(week_start, *, employee_id=None, cursor=None):
+        assert week_start == "2026-07-19"
+        assert employee_id == 123
+        assert cursor is fake_cursor
+        return {
+            "weekStart": "2026-07-19",
+            "summary": {"employeeCount": 1, "issueCount": 0},
+        }
+
+    monkeypatch.setattr(time_tracker_api.db, "get_conn", fake_get_conn)
+    monkeypatch.setattr(time_tracker_api, "_compute_payroll_timesheet", fake_compute)
+    monkeypatch.setattr(time_tracker_api, "append_access_log", lambda *_args: None)
+
+    body = time_tracker_api.admin_payroll_timesheet(
+        SimpleNamespace(query_params={}),
+        week_start="2026-07-19",
+        employee_id=123,
+        _={"id": 1, "name": "Payroll"},
+    )
+
+    assert body["weekStart"] == "2026-07-19"
+    assert statements == [
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+    ]
 
 
 def test_weekly_hours_include_zero_active_and_inactive_with_week_shift(client, auth):
@@ -716,6 +851,466 @@ def test_weekly_hours_include_zero_active_and_inactive_with_week_shift(client, a
         assert employees["Payroll Saturday Boundary Worker"]["days"][6]["totalMinutes"] == 60
     finally:
         _delete_employees(employee_ids)
+
+
+def test_payroll_timesheet_exposes_shift_rows_for_employee_week(client):
+    week_start = date(2026, 7, 12)
+    service_day = week_start + timedelta(days=2)
+    payroll_id = None
+    employee_id = None
+    customer_id = None
+    location_id = None
+    try:
+        payroll_id = _create_employee("Payroll Timesheet Contract Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Timesheet Contract Alma")
+        customer_id, location_id = _create_timesheet_site()
+        payroll_auth = _login(client, "Payroll Timesheet Contract Mayra")
+
+        first_shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 7),
+            _local_dt(service_day, 11),
+            location_id=location_id,
+            location_label="Supervisor",
+        )
+        second_shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 16, 30),
+            _local_dt(service_day, 20, 35),
+            location_id=location_id,
+            location_label="Supervisor",
+        )
+
+        body = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+
+        assert body["success"] is True
+        assert body["selectedEmployeeId"] == employee_id
+        assert body["capabilities"] == {
+            "rawShiftRows": True,
+            "dayTotalCorrections": True,
+            "shiftClockCorrections": False,
+            "breakMinutesTracked": False,
+            "locationAllocatedCorrections": True,
+        }
+        assert body["breakPolicy"]["tracked"] is False
+        assert body["summary"]["employeeCount"] == 1
+        assert body["summary"]["totalMinutes"] == 485
+        assert body["summary"]["totalHours"] == 8.08
+        assert body["sourceFingerprint"]
+        assert body["timesheetSourceFingerprint"]
+
+        employee = body["employees"][0]
+        assert employee["employeeId"] == employee_id
+        assert employee["employeeName"] == "Payroll Timesheet Contract Alma"
+        tuesday = employee["days"][2]
+        assert tuesday["date"] == service_day.isoformat()
+        assert tuesday["status"] == "registered"
+        assert tuesday["totalMinutes"] == 485
+        assert tuesday["totalHours"] == 8.08
+        assert [shift["shiftId"] for shift in tuesday["shifts"]] == [
+            first_shift_id,
+            second_shift_id,
+        ]
+        assert [shift["clockIn"]["display"] for shift in tuesday["shifts"]] == [
+            "07:00 AM",
+            "04:30 PM",
+        ]
+        assert [shift["clockOut"]["display"] for shift in tuesday["shifts"]] == [
+            "11:00 AM",
+            "08:35 PM",
+        ]
+        assert [shift["totalMinutes"] for shift in tuesday["shifts"]] == [240, 245]
+        assert all(shift["breakMinutes"] is None for shift in tuesday["shifts"])
+        assert all(shift["locationId"] == location_id for shift in tuesday["shifts"])
+        assert all(shift["locationLabel"] == "Supervisor" for shift in tuesday["shifts"])
+        assert all(
+            shift["customerName"] == "Payroll Timesheet Contract Customer"
+            for shift in tuesday["shifts"]
+        )
+        assert all(shift["status"] == "registered" for shift in tuesday["shifts"])
+        assert all(
+            shift["fieldSupport"] == {
+                "clockIn": {"display": True, "correction": False},
+                "clockOut": {"display": True, "correction": False},
+                "breakMinutes": {"display": False, "correction": False},
+                "totalHours": {"display": True, "correction": False},
+            }
+            for shift in tuesday["shifts"]
+        )
+
+        weekly = _weekly_hours(client, payroll_auth, week_start)
+        weekly_employee = _employees_by_name(weekly)["Payroll Timesheet Contract Alma"]
+        assert "shifts" not in weekly_employee["days"][2]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+        _delete_timesheet_site(customer_id, location_id)
+
+
+def test_payroll_timesheet_reuses_one_shift_snapshot_for_rows_and_totals(
+    client,
+    monkeypatch,
+):
+    week_start = date(2026, 7, 12)
+    service_day = week_start + timedelta(days=3)
+    payroll_id = None
+    employee_id = None
+    calls = 0
+    original = time_tracker_api._payroll_overlapping_shift_rows
+
+    def counting_shift_rows(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_payroll_overlapping_shift_rows",
+        counting_shift_rows,
+    )
+
+    try:
+        payroll_id = _create_employee("Payroll Timesheet Snapshot Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Timesheet Snapshot Worker")
+        payroll_auth = _login(client, "Payroll Timesheet Snapshot Mayra")
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 10),
+        )
+
+        body = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+
+        assert calls == 1
+        wednesday = body["employees"][0]["days"][3]
+        assert wednesday["totalMinutes"] == 120
+        assert [shift["totalMinutes"] for shift in wednesday["shifts"]] == [120]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_timesheet_keeps_day_total_corrections_out_of_shift_rows(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=1)
+    payroll_id = None
+    employee_id = None
+    customer_id = None
+    location_id = None
+    try:
+        payroll_id = _create_employee("Payroll Timesheet Correction Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Timesheet Correction Worker")
+        customer_id, location_id = _create_timesheet_site(
+            address="Payroll Timesheet Correction Site",
+            customer_name="Payroll Timesheet Correction Customer",
+        )
+        payroll_auth = _login(client, "Payroll Timesheet Correction Mayra")
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 10),
+            location_id=location_id,
+            location_label="Correction Site",
+        )
+
+        corrected = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": service_day.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Mayra confirmed the day total but not the location split.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+
+        body = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        monday = body["employees"][0]["days"][1]
+        assert monday["status"] == "corrected"
+        assert monday["totalMinutes"] == 180
+        assert sum(shift["totalMinutes"] for shift in monday["shifts"]) == 120
+        assert monday["correction"]["sourceTotalMinutes"] == 120
+        assert monday["correction"]["correctedTotalMinutes"] == 180
+        assert monday["correction"]["deltaMinutes"] == 60
+        assert monday["correction"]["allocationStatus"] == "unallocated"
+        assert monday["correction"]["allocation"] is None
+        assert monday["correction"]["unallocatedLocationLabel"] == (
+            "Horas corregidas sin ubicación confirmada"
+        )
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+        _delete_timesheet_site(customer_id, location_id)
+
+
+def test_payroll_timesheet_allocation_labels_and_rate_fingerprint(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=1)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Mayra",
+            role="payroll",
+        )
+        employee_id = _create_employee(
+            "Payroll Labor Profitability Timesheet Allocation Worker",
+            hourly_rate=20,
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Mayra")
+        source_id = _create_payroll_profitability_source()
+        customer_id, site_id = _create_payroll_profitability_site()
+        job_id = _create_payroll_profitability_job_and_shift(
+            employee_id=employee_id,
+            site_id=site_id,
+            source_id=source_id,
+            service_day=service_day,
+        )
+        corrected = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": service_day.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Mayra corrected total hours for allocation labels.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+        correction_id = corrected.json()["correction"]["correctionId"]
+        allocated = client.post(
+            f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation",
+            headers=payroll_auth,
+            json={
+                "locationId": site_id,
+                "jobId": job_id,
+                "reason": "Juan assigned Mayra's correction to this Site.",
+            },
+        )
+        assert allocated.status_code == 200, allocated.text
+
+        first = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        first_fingerprint = first["timesheetSourceFingerprint"]
+        monday = first["employees"][0]["days"][1]
+        allocation = monday["correction"]["allocation"]
+        assert allocation["customerId"] == customer_id
+        assert allocation["customerName"] == "Payroll Labor Profitability Customer"
+        assert allocation["siteAddress"] == "Payroll Labor Profitability Site"
+        assert allocation["currentAllocatedLaborCost"] == 20.0
+
+        db.execute(
+            """
+            UPDATE locations
+            SET
+                customer_name = 'Payroll Labor Profitability Renamed Customer',
+                address = 'Payroll Labor Profitability Renamed Site'
+            WHERE id = %s
+            """,
+            (site_id,),
+        )
+
+        second = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        second_allocation = second["employees"][0]["days"][1]["correction"]["allocation"]
+        assert second_allocation["customerName"] == (
+            "Payroll Labor Profitability Renamed Customer"
+        )
+        assert second_allocation["siteAddress"] == (
+            "Payroll Labor Profitability Renamed Site"
+        )
+        assert second["timesheetSourceFingerprint"] != first_fingerprint
+
+        db.execute(
+            "UPDATE employees SET hourly_rate = 25 WHERE id = %s",
+            (employee_id,),
+        )
+
+        third = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        third_allocation = third["employees"][0]["days"][1]["correction"]["allocation"]
+        assert third_allocation["currentAllocatedLaborCost"] == 25.0
+        assert third["timesheetSourceFingerprint"] != second["timesheetSourceFingerprint"]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_timesheet_marks_stale_correction_allocation_invalid(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=1)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Mayra",
+            role="payroll",
+        )
+        employee_id = _create_employee(
+            "Payroll Labor Profitability Timesheet Stale Allocation Worker",
+            hourly_rate=20,
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Mayra")
+        source_id = _create_payroll_profitability_source()
+        _, site_id = _create_payroll_profitability_site()
+        job_id = _create_payroll_profitability_job_and_shift(
+            employee_id=employee_id,
+            site_id=site_id,
+            source_id=source_id,
+            service_day=service_day,
+        )
+        shift = db.query_one(
+            "SELECT id FROM shifts WHERE employee_id = %s AND job_id = %s",
+            (employee_id, job_id),
+        )
+        assert shift is not None
+
+        corrected = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": service_day.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Mayra corrected total hours before stale allocation.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+        correction_id = corrected.json()["correction"]["correctionId"]
+        allocated = client.post(
+            f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation",
+            headers=payroll_auth,
+            json={
+                "locationId": site_id,
+                "jobId": job_id,
+                "reason": "Juan assigned Mayra's correction before shift evidence changed.",
+            },
+        )
+        assert allocated.status_code == 200, allocated.text
+        assert allocated.json()["allocation"]["allocatedDeltaMinutes"] == 60
+
+        before = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        before_correction = before["employees"][0]["days"][1]["correction"]
+        before_fingerprint = before["timesheetSourceFingerprint"]
+        assert before_correction["deltaMinutes"] == 60
+        assert before_correction["allocationStatus"] == "allocated"
+        assert before_correction["allocationValid"] is True
+
+        changed_clock_out = _local_dt(service_day, 11, 30).astimezone(timezone.utc)
+        db.execute(
+            """
+            UPDATE shifts
+            SET
+                clock_out = %s,
+                total_hours = 2.50
+            WHERE id = %s
+            """,
+            (changed_clock_out, int(shift["id"])),
+        )
+
+        body = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        monday = body["employees"][0]["days"][1]
+        correction = monday["correction"]
+        assert correction["deltaMinutes"] == 30
+        assert correction["allocationStatus"] == "invalid"
+        assert correction["allocationValid"] is False
+        assert correction["allocation"]["allocatedDeltaMinutes"] == 60
+        assert correction["allocationIssue"]["code"] == (
+            "payroll_correction_allocation_stale_delta"
+        )
+        assert body["timesheetSourceFingerprint"] != before_fingerprint
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_timesheet_clips_open_shift_segment_to_week_start(
+    client,
+    monkeypatch,
+):
+    week_start = date(2026, 7, 19)
+    prior_day = week_start - timedelta(days=1)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Timesheet Open Shift Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Timesheet Open Shift Worker")
+        payroll_auth = _login(client, "Payroll Timesheet Open Shift Mayra")
+        monkeypatch.setattr(
+            time_tracker_api,
+            "utc_now",
+            lambda: _local_dt(week_start + timedelta(days=1), 12).astimezone(timezone.utc),
+        )
+        _create_shift(
+            employee_id,
+            _local_dt(prior_day, 20),
+            None,
+        )
+
+        body = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        sunday = body["employees"][0]["days"][0]
+        assert sunday["status"] == "needs_review"
+        assert sunday["issueCodes"] == ["missing_clock_out"]
+        shift = sunday["shifts"][0]
+        assert shift["clockIn"]["localIso"].startswith("2026-07-18T20:00:00")
+        assert shift["segmentClockIn"]["localIso"].startswith("2026-07-19T00:00:00")
+        assert shift["segmentClockOut"] is None
+        assert shift["totalMinutes"] == 0
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
 def test_weekly_hours_flags_open_and_invalid_without_counting_minutes(client, auth):

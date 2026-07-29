@@ -12075,39 +12075,47 @@ def _payroll_query_all(
     return [dict(row) for row in cursor.fetchall()]
 
 
-def _compute_payroll_weekly_hours(
-    week_start_text: Optional[str],
+def _payroll_overlapping_shift_rows(
+    week_start_utc: datetime,
+    week_end_utc: datetime,
+    now_utc: datetime,
     *,
     cursor: Optional[Any] = None,
-) -> Dict[str, Any]:
-    week_start = _parse_payroll_week_start(week_start_text)
-    week_end, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
-    now_utc = utc_now()
-
-    employee_rows = _payroll_query_all(
+) -> List[Dict[str, Any]]:
+    return _payroll_query_all(
         """
-        SELECT id, name, active
-        FROM employees
-        ORDER BY LOWER(name), id
-        """,
-        cursor=cursor,
-    )
-    shift_rows = _payroll_query_all(
-        """
-        SELECT id, employee_id, clock_in, clock_out
-        FROM shifts
-        WHERE clock_in < %s
+        SELECT
+            shift_row.id,
+            shift_row.employee_id,
+            shift_row.clock_in,
+            shift_row.clock_out,
+            shift_row.total_hours,
+            shift_row.local_date,
+            shift_row.timezone,
+            shift_row.location_id,
+            shift_row.location_label,
+            shift_row.job_id,
+            shift_row.time_category,
+            shift_row.non_productive_type,
+            shift_row.notes,
+            location.address AS location_address,
+            location.customer_name AS location_customer_name,
+            customer.name AS customer_name
+        FROM shifts shift_row
+        LEFT JOIN locations location ON location.id = shift_row.location_id
+        LEFT JOIN customers customer ON customer.id = location.customer_id
+        WHERE shift_row.clock_in < %s
           AND (
-              (clock_out IS NULL AND clock_in < %s AND %s > %s)
+              (shift_row.clock_out IS NULL AND shift_row.clock_in < %s AND %s > %s)
               OR (
-                  clock_out IS NOT NULL
+                  shift_row.clock_out IS NOT NULL
                   AND (
-                      clock_out > %s
-                      OR (clock_in >= %s AND clock_in < %s)
+                      shift_row.clock_out > %s
+                      OR (shift_row.clock_in >= %s AND shift_row.clock_in < %s)
                   )
               )
           )
-        ORDER BY employee_id, clock_in, id
+        ORDER BY shift_row.employee_id, shift_row.clock_in, shift_row.id
         """,
         (
             week_end_utc,
@@ -12120,26 +12128,58 @@ def _compute_payroll_weekly_hours(
         ),
         cursor=cursor,
     )
-    correction_rows = _payroll_query_all(
-        """
-        SELECT
-            correction.id,
-            correction.week_start,
-            correction.correction_date,
-            correction.employee_id,
-            employee.name AS employee_name,
-            correction.corrected_total_minutes,
-            correction.reason,
-            correction.created_at
-        FROM payroll_hour_corrections correction
-        JOIN employees employee ON employee.id = correction.employee_id
-        WHERE correction.week_start = %s
-          AND correction.status = 'active'
-        ORDER BY correction.employee_id, correction.correction_date, correction.id
-        """,
-        (week_start,),
-        cursor=cursor,
-    )
+
+
+def _compute_payroll_weekly_hours(
+    week_start_text: Optional[str],
+    *,
+    cursor: Optional[Any] = None,
+    employee_rows: Optional[List[Dict[str, Any]]] = None,
+    shift_rows: Optional[List[Dict[str, Any]]] = None,
+    correction_rows: Optional[List[Dict[str, Any]]] = None,
+    now_utc: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    week_start = _parse_payroll_week_start(week_start_text)
+    week_end, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
+    now_utc = now_utc or utc_now()
+
+    if employee_rows is None:
+        employee_rows = _payroll_query_all(
+            """
+            SELECT id, name, active
+            FROM employees
+            ORDER BY LOWER(name), id
+            """,
+            cursor=cursor,
+        )
+    if shift_rows is None:
+        shift_rows = _payroll_overlapping_shift_rows(
+            week_start_utc,
+            week_end_utc,
+            now_utc,
+            cursor=cursor,
+        )
+    if correction_rows is None:
+        correction_rows = _payroll_query_all(
+            """
+            SELECT
+                correction.id,
+                correction.week_start,
+                correction.correction_date,
+                correction.employee_id,
+                employee.name AS employee_name,
+                correction.corrected_total_minutes,
+                correction.reason,
+                correction.created_at
+            FROM payroll_hour_corrections correction
+            JOIN employees employee ON employee.id = correction.employee_id
+            WHERE correction.week_start = %s
+              AND correction.status = 'active'
+            ORDER BY correction.employee_id, correction.correction_date, correction.id
+            """,
+            (week_start,),
+            cursor=cursor,
+        )
 
     employee_lookup = {int(row["id"]): row for row in employee_rows}
     included: Dict[int, Dict[str, Any]] = {
@@ -12293,6 +12333,501 @@ def _compute_payroll_weekly_hours(
             "issueCount": issue_count,
             "hasBlockingIssues": issue_count > 0,
         },
+    }
+
+
+def _payroll_timesheet_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _payroll_timesheet_location_label(shift_row: Dict[str, Any]) -> str:
+    return (
+        _payroll_timesheet_text(shift_row.get("location_label"))
+        or _payroll_timesheet_text(shift_row.get("location_address"))
+    )
+
+
+def _payroll_timesheet_customer_name(shift_row: Dict[str, Any]) -> str:
+    return (
+        _payroll_timesheet_text(shift_row.get("location_customer_name"))
+        or _payroll_timesheet_text(shift_row.get("customer_name"))
+    )
+
+
+def _payroll_timesheet_datetime(value: Optional[datetime]) -> Optional[Dict[str, str]]:
+    if value is None:
+        return None
+    local_value = to_local(value)
+    return {
+        "iso": to_utc_iso(value),
+        "localIso": local_value.replace(microsecond=0).isoformat(),
+        "display": local_clock_string(value),
+    }
+
+
+def _payroll_timesheet_segment_bounds(
+    start_utc: datetime,
+    end_utc: datetime,
+) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    cursor = start_utc
+    while cursor < end_utc:
+        local_cursor = to_local(cursor)
+        local_day = local_cursor.date()
+        next_local_midnight = datetime.combine(
+            local_day + timedelta(days=1),
+            clock_time.min,
+            tzinfo=APP_TIMEZONE,
+        )
+        next_cursor = min(end_utc, next_local_midnight.astimezone(timezone.utc))
+        if next_cursor <= cursor:
+            break
+        seconds = max(0.0, (next_cursor - cursor).total_seconds())
+        if seconds > 0:
+            segments.append(
+                {
+                    "date": local_day,
+                    "startUtc": cursor,
+                    "endUtc": next_cursor,
+                    "seconds": seconds,
+                }
+            )
+        cursor = next_cursor
+    allocations = _allocate_payroll_shift_minutes(
+        [(segment["date"], float(segment["seconds"])) for segment in segments]
+    )
+    for segment, (_, minutes) in zip(segments, allocations):
+        segment["minutes"] = int(minutes)
+    return segments
+
+
+def _payroll_timesheet_allocation_validity_payload(
+    correction_details: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    payload: List[Dict[str, Any]] = []
+    for detail in sorted(
+        correction_details,
+        key=lambda row: int(row.get("correctionId") or 0),
+    ):
+        allocation_issue = detail.get("allocationIssue") or {}
+        payload.append(
+            {
+                "correction_id": int(detail.get("correctionId") or 0),
+                "allocation_status": str(detail.get("allocationStatus") or ""),
+                "allocation_valid": detail.get("allocationValid"),
+                "allocation_issue_code": str(allocation_issue.get("code") or ""),
+                "allocation_issue_message": str(allocation_issue.get("message") or ""),
+            }
+        )
+    return payload
+
+
+def _payroll_timesheet_source_fingerprint(
+    *,
+    week_start: date,
+    week_end: date,
+    employees: List[Dict[str, Any]],
+    shifts: List[Dict[str, Any]],
+    corrections: List[Dict[str, Any]],
+    allocations: List[Dict[str, Any]],
+    correction_details: List[Dict[str, Any]],
+) -> str:
+    payload = {
+        "timezone": TIMEZONE_NAME,
+        "weekStart": week_start.isoformat(),
+        "weekEnd": week_end.isoformat(),
+        "employees": [
+            {
+                "id": int(row["id"]),
+                "name": str(row["name"]),
+                "active": bool(row["active"]),
+            }
+            for row in employees
+        ],
+        "shifts": [
+            {
+                "id": int(row["id"]),
+                "employee_id": int(row["employee_id"]),
+                "clock_in": to_utc_iso(row["clock_in"]),
+                "clock_out": (
+                    to_utc_iso(row["clock_out"]) if row.get("clock_out") else None
+                ),
+                "total_hours": (
+                    str(row["total_hours"]) if row.get("total_hours") is not None else None
+                ),
+                "local_date": (
+                    row["local_date"].isoformat()
+                    if row.get("local_date") is not None
+                    else None
+                ),
+                "location_id": (
+                    int(row["location_id"])
+                    if row.get("location_id") is not None
+                    else None
+                ),
+                "location_label": _payroll_timesheet_location_label(row),
+                "customer_name": _payroll_timesheet_customer_name(row),
+                "job_id": int(row["job_id"]) if row.get("job_id") is not None else None,
+                "time_category": str(row.get("time_category") or ""),
+                "non_productive_type": row.get("non_productive_type"),
+            }
+            for row in shifts
+        ],
+        "corrections": [
+            {
+                "id": int(row["id"]),
+                "employee_id": int(row["employee_id"]),
+                "correction_date": row["correction_date"].isoformat(),
+                "corrected_total_minutes": int(row["corrected_total_minutes"]),
+                "reason": str(row["reason"]),
+                "created_at": to_utc_iso(row["created_at"]),
+            }
+            for row in corrections
+        ],
+        "allocations": [
+            {
+                "id": int(row["id"]),
+                "correction_id": int(row["correction_id"]),
+                "location_id": int(row["location_id"]),
+                "location_customer_id": (
+                    int(row["location_customer_id"])
+                    if row.get("location_customer_id") is not None
+                    else None
+                ),
+                "location_customer_name": str(row.get("location_customer_name") or ""),
+                "location_address": str(row.get("location_address") or ""),
+                "job_id": int(row["job_id"]) if row.get("job_id") is not None else None,
+                "allocated_delta_minutes": int(row["allocated_delta_minutes"]),
+                "allocated_labor_cost_cents": row.get("allocated_labor_cost_cents"),
+                "employee_hourly_rate": (
+                    str(row["employee_hourly_rate"])
+                    if row.get("employee_hourly_rate") is not None
+                    else None
+                ),
+                "status": str(row["status"]),
+            }
+            for row in allocations
+        ],
+        "allocationValidity": _payroll_timesheet_allocation_validity_payload(
+            correction_details
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _serialize_payroll_timesheet_shift(
+    shift_row: Dict[str, Any],
+    *,
+    segment: Dict[str, Any],
+    segment_index: int,
+    segment_count: int,
+    issue_codes: List[str],
+) -> Dict[str, Any]:
+    clock_in = shift_row["clock_in"].astimezone(timezone.utc)
+    clock_out_value = shift_row.get("clock_out")
+    clock_out = (
+        clock_out_value.astimezone(timezone.utc)
+        if clock_out_value is not None
+        else None
+    )
+    minutes = int(segment.get("minutes") or 0)
+    status = "needs_review" if issue_codes else "registered"
+    location_id = shift_row.get("location_id")
+    job_id = shift_row.get("job_id")
+    location_label = _payroll_timesheet_location_label(shift_row)
+    customer_name = _payroll_timesheet_customer_name(shift_row)
+    return {
+        "rowId": f"shift:{int(shift_row['id'])}:{segment['date'].isoformat()}:{segment_index}",
+        "kind": "shift",
+        "shiftId": int(shift_row["id"]),
+        "employeeId": int(shift_row["employee_id"]),
+        "date": segment["date"].isoformat(),
+        "segmentIndex": segment_index,
+        "segmentCount": segment_count,
+        "spansMultipleDays": segment_count > 1,
+        "clockIn": _payroll_timesheet_datetime(clock_in),
+        "clockOut": _payroll_timesheet_datetime(clock_out),
+        "segmentClockIn": _payroll_timesheet_datetime(segment.get("startUtc")),
+        "segmentClockOut": _payroll_timesheet_datetime(segment.get("endUtc")),
+        "totalMinutes": minutes,
+        "totalHours": round(minutes / 60, 2),
+        "breakMinutes": None,
+        "locationId": int(location_id) if location_id is not None else None,
+        "locationLabel": location_label,
+        "customerName": customer_name,
+        "jobId": int(job_id) if job_id is not None else None,
+        "timeCategory": str(shift_row.get("time_category") or "productive"),
+        "nonProductiveType": shift_row.get("non_productive_type"),
+        "status": status,
+        "issueCodes": list(issue_codes),
+        "fieldSupport": {
+            "clockIn": {"display": True, "correction": False},
+            "clockOut": {"display": True, "correction": False},
+            "breakMinutes": {"display": False, "correction": False},
+            "totalHours": {"display": True, "correction": False},
+        },
+        "original": {
+            "clockIn": _payroll_timesheet_datetime(clock_in),
+            "clockOut": _payroll_timesheet_datetime(clock_out),
+            "totalMinutes": minutes,
+            "totalHours": round(minutes / 60, 2),
+            "breakMinutes": None,
+            "locationId": int(location_id) if location_id is not None else None,
+            "locationLabel": location_label,
+            "customerName": customer_name,
+            "jobId": int(job_id) if job_id is not None else None,
+        },
+    }
+
+
+def _compute_payroll_timesheet(
+    week_start_text: Optional[str],
+    *,
+    employee_id: Optional[int] = None,
+    cursor: Optional[Any] = None,
+) -> Dict[str, Any]:
+    week_start = _parse_payroll_week_start(week_start_text)
+    week_end, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
+    now_utc = utc_now()
+    employee_rows = _payroll_query_all(
+        """
+        SELECT id, name, active
+        FROM employees
+        ORDER BY LOWER(name), id
+        """,
+        cursor=cursor,
+    )
+    shift_rows = _payroll_overlapping_shift_rows(
+        week_start_utc,
+        week_end_utc,
+        now_utc,
+        cursor=cursor,
+    )
+    correction_rows = _payroll_correction_rows(week_start, cursor=cursor)
+    allocation_rows = _payroll_correction_allocation_rows(week_start, cursor=cursor)
+    allocations_by_correction_id = _payroll_correction_allocations_by_correction_id(
+        allocation_rows
+    )
+    weekly_hours = _compute_payroll_weekly_hours(
+        week_start.isoformat(),
+        cursor=cursor,
+        employee_rows=employee_rows,
+        shift_rows=shift_rows,
+        correction_rows=correction_rows,
+        now_utc=now_utc,
+    )
+    settings = load_settings(cursor=cursor)
+    profitability = build_weekly_labor_profitability(
+        week_start,
+        timezone_name=TIMEZONE_NAME,
+        now_provider=utc_now,
+        default_target_labor_pct=settings.get(
+            "laborPctTarget",
+            _SETTINGS_DEFAULTS["laborPctTarget"],
+        ),
+        default_min_margin_pct=settings.get(
+            "grossMarginMin",
+            _SETTINGS_DEFAULTS["grossMarginMin"],
+        ),
+        cursor=cursor,
+    )
+    correction_details_by_id = {
+        int(detail["correctionId"]): detail
+        for rows in _payroll_correction_details_by_date(
+            weekly_hours,
+            profitability.pop("_payrollCorrectionCandidateSegments", []),
+            allocation_rows,
+        ).values()
+        for detail in rows
+    }
+
+    for employee in weekly_hours["employees"]:
+        for day in employee["days"]:
+            day["shifts"] = []
+            day["status"] = "no_hours"
+            correction = day.get("correction")
+            if correction:
+                correction_id = int(correction["correctionId"])
+                allocation_row = allocations_by_correction_id.get(correction_id)
+                correction_detail = correction_details_by_id.get(correction_id)
+                if correction_detail:
+                    correction["allocationStatus"] = str(
+                        correction_detail.get("allocationStatus") or "unallocated"
+                    )
+                    correction["allocation"] = correction_detail.get("allocation")
+                    if "allocationValid" in correction_detail:
+                        correction["allocationValid"] = bool(
+                            correction_detail["allocationValid"]
+                        )
+                    if correction_detail.get("allocationIssue"):
+                        correction["allocationIssue"] = correction_detail[
+                            "allocationIssue"
+                        ]
+                else:
+                    correction["allocationStatus"] = (
+                        "allocated" if allocation_row else "unallocated"
+                    )
+                    correction["allocation"] = (
+                        _serialize_payroll_correction_allocation(allocation_row)
+                        if allocation_row
+                        else None
+                    )
+                if correction["allocationStatus"] == "unallocated":
+                    correction["unallocatedLocationLabel"] = (
+                        "Horas corregidas sin ubicación confirmada"
+                    )
+
+    employees_by_id = {
+        int(employee["employeeId"]): employee
+        for employee in weekly_hours["employees"]
+    }
+
+    for shift_row in shift_rows:
+        row_employee_id = int(shift_row["employee_id"])
+        employee = employees_by_id.get(row_employee_id)
+        if employee is None:
+            continue
+
+        clock_in = shift_row["clock_in"].astimezone(timezone.utc)
+        clock_out_value = shift_row.get("clock_out")
+        issue_at_utc = max(clock_in, week_start_utc)
+        if issue_at_utc >= week_end_utc:
+            issue_at_utc = week_start_utc
+
+        issue_codes: List[str] = []
+        if clock_out_value is None:
+            issue_codes.append("missing_clock_out")
+            segments = [
+                {
+                    "date": to_local(issue_at_utc).date(),
+                    "startUtc": issue_at_utc,
+                    "endUtc": None,
+                    "minutes": 0,
+                }
+            ]
+        else:
+            clock_out = clock_out_value.astimezone(timezone.utc)
+            if clock_out <= clock_in:
+                issue_codes.append("invalid_shift_duration")
+                segments = [
+                    {
+                        "date": to_local(issue_at_utc).date(),
+                        "startUtc": issue_at_utc,
+                        "endUtc": clock_out,
+                        "minutes": 0,
+                    }
+                ]
+            else:
+                overlap_start = max(clock_in, week_start_utc)
+                overlap_end = min(clock_out, week_end_utc)
+                if overlap_end <= overlap_start:
+                    continue
+                segments = _payroll_timesheet_segment_bounds(
+                    overlap_start,
+                    overlap_end,
+                )
+
+        segment_count = len(segments)
+        for index, segment in enumerate(segments, start=1):
+            day = _payroll_day_map(employee).get(segment["date"].isoformat())
+            if day is None:
+                continue
+            day["shifts"].append(
+                _serialize_payroll_timesheet_shift(
+                    shift_row,
+                    segment=segment,
+                    segment_index=index,
+                    segment_count=segment_count,
+                    issue_codes=issue_codes,
+                )
+            )
+
+    filtered_employees = weekly_hours["employees"]
+    if employee_id is not None:
+        filtered_employees = [
+            employee
+            for employee in weekly_hours["employees"]
+            if int(employee["employeeId"]) == int(employee_id)
+        ]
+
+    for employee in filtered_employees:
+        for day in employee["days"]:
+            day["shifts"].sort(
+                key=lambda shift: (
+                    str((shift.get("segmentClockIn") or {}).get("iso") or ""),
+                    int(shift.get("shiftId") or 0),
+                    int(shift.get("segmentIndex") or 0),
+                )
+            )
+            if day.get("issueCodes"):
+                day["status"] = "needs_review"
+            elif day.get("correction"):
+                day["status"] = "corrected"
+            elif day["shifts"] or int(day.get("totalMinutes") or 0) > 0:
+                day["status"] = "registered"
+
+    total_minutes = sum(int(employee["totalMinutes"]) for employee in filtered_employees)
+    return {
+        "success": True,
+        "period": "week",
+        "timezone": TIMEZONE_NAME,
+        "weekStart": week_start.isoformat(),
+        "weekEnd": week_end.isoformat(),
+        "weekEndExclusive": (week_end + timedelta(days=1)).isoformat(),
+        "generatedAt": to_utc_iso(utc_now()),
+        "sourceFingerprint": weekly_hours["sourceFingerprint"],
+        "timesheetSourceFingerprint": _payroll_timesheet_source_fingerprint(
+            week_start=week_start,
+            week_end=week_end,
+            employees=employee_rows,
+            shifts=shift_rows,
+            corrections=correction_rows,
+            allocations=allocation_rows,
+            correction_details=list(correction_details_by_id.values()),
+        ),
+        "selectedEmployeeId": int(employee_id) if employee_id is not None else None,
+        "capabilities": {
+            "rawShiftRows": True,
+            "dayTotalCorrections": True,
+            "shiftClockCorrections": False,
+            "breakMinutesTracked": False,
+            "locationAllocatedCorrections": True,
+        },
+        "breakPolicy": {
+            "tracked": False,
+            "label": "Descanso no registrado",
+            "message": "El reloj actual no guarda minutos de descanso.",
+        },
+        "employees": filtered_employees,
+        "summary": {
+            "employeeCount": len(filtered_employees),
+            "activeEmployeeCount": sum(
+                1 for employee in filtered_employees if employee["active"]
+            ),
+            "employeesWithHours": sum(
+                1 for employee in filtered_employees if employee["totalMinutes"] > 0
+            ),
+            "totalMinutes": total_minutes,
+            "totalHours": round(total_minutes / 60, 2),
+            "completedShiftCount": sum(
+                int(employee["completedShiftCount"])
+                for employee in filtered_employees
+            ),
+            "overlappingShiftCount": sum(
+                int(employee["overlappingShiftCount"])
+                for employee in filtered_employees
+            ),
+            "correctionCount": sum(
+                int(employee["correctionCount"])
+                for employee in filtered_employees
+            ),
+            "issueCount": sum(len(employee["issues"]) for employee in filtered_employees),
+            "hasBlockingIssues": any(
+                bool(employee["issues"]) for employee in filtered_employees
+            ),
+        },
+        "weeklyHoursSummary": weekly_hours["summary"],
     }
 
 
@@ -13289,6 +13824,13 @@ def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, A
         "date": row["correction_date"].isoformat(),
         "employeeId": int(row["employee_id"]),
         "locationId": int(row["location_id"]),
+        "customerId": (
+            int(row["location_customer_id"])
+            if row.get("location_customer_id") is not None
+            else None
+        ),
+        "customerName": str(row.get("location_customer_name") or ""),
+        "siteAddress": str(row.get("location_address") or ""),
         "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
         "allocatedDeltaMinutes": delta_minutes,
         "allocatedDeltaHours": round(delta_minutes / 60, 2),
@@ -13315,6 +13857,38 @@ def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, A
     }
 
 
+def _enrich_payroll_correction_allocation_target_labels(
+    row: Dict[str, Any],
+    *,
+    cursor: Optional[Any] = None,
+) -> Dict[str, Any]:
+    if (
+        row.get("location_customer_id") is not None
+        or row.get("location_customer_name") is not None
+        or row.get("location_address") is not None
+    ):
+        return row
+    location_id = row.get("location_id")
+    if location_id is None:
+        return row
+    labels = _payroll_query_all(
+        """
+        SELECT location.customer_id AS location_customer_id
+             , COALESCE(location.customer_name, customer.name, '') AS location_customer_name
+             , location.address AS location_address
+        FROM locations location
+        LEFT JOIN customers customer
+          ON customer.id = location.customer_id
+        WHERE location.id = %s
+        """,
+        (int(location_id),),
+        cursor=cursor,
+    )
+    if labels:
+        row.update(labels[0])
+    return row
+
+
 def _payroll_correction_allocation_rows(
     week_start: date,
     *,
@@ -13324,11 +13898,18 @@ def _payroll_correction_allocation_rows(
         """
         SELECT allocation.*
              , employee.hourly_rate AS employee_hourly_rate
+             , location.customer_id AS location_customer_id
+             , COALESCE(location.customer_name, customer.name, '') AS location_customer_name
+             , location.address AS location_address
         FROM payroll_hour_correction_allocations allocation
         JOIN payroll_hour_corrections correction
           ON correction.id = allocation.correction_id
         JOIN employees employee
           ON employee.id = allocation.employee_id
+        JOIN locations location
+          ON location.id = allocation.location_id
+        LEFT JOIN customers customer
+          ON customer.id = location.customer_id
         WHERE allocation.week_start = %s
           AND allocation.status = 'active'
           AND correction.status = 'active'
@@ -13455,6 +14036,30 @@ def admin_payroll_weekly_hours(
         "PAYROLL_WEEKLY_HOURS",
         True,
         f"week={data['weekStart']} employees={data['summary']['employeeCount']} issues={data['summary']['issueCount']}",
+    )
+    return data
+
+
+@app.get("/api/admin/payroll/timesheet")
+def admin_payroll_timesheet(
+    request: Request,
+    week_start: Optional[str] = Query(default=None, alias="weekStart"),
+    employee_id: Optional[int] = Query(default=None, alias="employeeId", gt=0),
+    _: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            data = _compute_payroll_timesheet(
+                _payroll_week_start_query(request, week_start),
+                employee_id=employee_id,
+                cursor=cur,
+            )
+    append_access_log(
+        request,
+        "PAYROLL_TIMESHEET",
+        True,
+        f"week={data['weekStart']} selectedEmployee={employee_id or 'all'} employees={data['summary']['employeeCount']} issues={data['summary']['issueCount']}",
     )
     return data
 
@@ -13888,6 +14493,7 @@ def admin_allocate_payroll_hour_correction(
                     )
                 idempotent = False
             saved["employee_hourly_rate"] = correction_row.get("hourly_rate")
+            _enrich_payroll_correction_allocation_target_labels(saved, cursor=cur)
             allocation = _serialize_payroll_correction_allocation(saved)
             correction_detail["allocationStatus"] = "allocated"
             correction_detail["allocation"] = allocation
@@ -13979,6 +14585,7 @@ def admin_void_payroll_hour_correction_allocation(
                 ),
             )
             saved = dict(cur.fetchone())
+            _enrich_payroll_correction_allocation_target_labels(saved, cursor=cur)
             result = {
                 "success": True,
                 "action": "void_allocation",
