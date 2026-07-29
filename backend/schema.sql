@@ -756,6 +756,40 @@ CREATE TABLE payroll_hour_correction_allocations (
     CHECK (correction_date >= week_start AND correction_date < week_start + 7)
 );
 
+CREATE TABLE payroll_shift_corrections (
+    id                        BIGSERIAL PRIMARY KEY,
+    week_start                DATE NOT NULL,
+    correction_date           DATE NOT NULL,
+    employee_id               INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    shift_id                  INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+    source_clock_in           TIMESTAMPTZ NOT NULL,
+    source_clock_out          TIMESTAMPTZ,
+    source_break_minutes      INTEGER CHECK (
+                                  source_break_minutes IS NULL
+                                  OR source_break_minutes BETWEEN 0 AND 1440
+                              ),
+    source_total_minutes      INTEGER NOT NULL CHECK (source_total_minutes BETWEEN 0 AND 1440),
+    corrected_clock_in        TIMESTAMPTZ NOT NULL,
+    corrected_clock_out       TIMESTAMPTZ NOT NULL,
+    corrected_break_minutes   INTEGER NOT NULL DEFAULT 0
+                                  CHECK (corrected_break_minutes BETWEEN 0 AND 1440),
+    corrected_total_minutes   INTEGER NOT NULL CHECK (corrected_total_minutes BETWEEN 0 AND 1440),
+    reason                    TEXT NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 500),
+    status                    VARCHAR(16) NOT NULL DEFAULT 'active'
+                                  CHECK (status IN ('active', 'superseded', 'voided')),
+    created_by_employee_id    INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_by_name           TEXT NOT NULL,
+    voided_by_employee_id     INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    voided_by_name            TEXT,
+    voided_reason             TEXT,
+    voided_at                 TIMESTAMPTZ,
+    superseded_by             BIGINT REFERENCES payroll_shift_corrections(id) ON DELETE SET NULL,
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (correction_date >= week_start AND correction_date < week_start + 7),
+    CHECK (corrected_clock_out > corrected_clock_in)
+);
+
 -- Durable business-scoped operation identity for Atlas money writes. The row
 -- survives browser/tab/admin changes and is resolved only after Atlas confirms
 -- the result, so an ambiguous retry cannot mint a second receipt. Payment
@@ -846,6 +880,11 @@ CREATE UNIQUE INDEX uq_payroll_hour_correction_allocations_active
     WHERE status = 'active';
 CREATE INDEX idx_payroll_hour_correction_allocations_week
     ON payroll_hour_correction_allocations(week_start, status, correction_date);
+CREATE UNIQUE INDEX uq_payroll_shift_corrections_active_shift
+    ON payroll_shift_corrections(week_start, shift_id)
+    WHERE status = 'active';
+CREATE INDEX idx_payroll_shift_corrections_week
+    ON payroll_shift_corrections(week_start, status, correction_date);
 CREATE INDEX idx_receivables_operation_attempts_state
     ON receivables_operation_attempts(state, updated_at);
 CREATE UNIQUE INDEX uq_receivables_operation_attempts_active_identity

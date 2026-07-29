@@ -105,6 +105,10 @@ def _delete_employees(employee_ids: list[int]) -> None:
 def _delete_payroll_verification_weeks(week_starts: list[date]) -> None:
     for week_start in week_starts:
         db.execute(
+            "DELETE FROM payroll_shift_corrections WHERE week_start = %s",
+            (week_start,),
+        )
+        db.execute(
             "DELETE FROM payroll_hour_corrections WHERE week_start = %s",
             (week_start,),
         )
@@ -893,11 +897,13 @@ def test_payroll_timesheet_exposes_shift_rows_for_employee_week(client):
         assert body["capabilities"] == {
             "rawShiftRows": True,
             "dayTotalCorrections": True,
-            "shiftClockCorrections": False,
+            "shiftClockCorrections": True,
             "breakMinutesTracked": False,
+            "shiftBreakCorrections": True,
             "locationAllocatedCorrections": True,
         }
         assert body["breakPolicy"]["tracked"] is False
+        assert body["breakPolicy"]["correctionSupported"] is True
         assert body["summary"]["employeeCount"] == 1
         assert body["summary"]["totalMinutes"] == 485
         assert body["summary"]["totalHours"] == 8.08
@@ -935,9 +941,9 @@ def test_payroll_timesheet_exposes_shift_rows_for_employee_week(client):
         assert all(shift["status"] == "registered" for shift in tuesday["shifts"])
         assert all(
             shift["fieldSupport"] == {
-                "clockIn": {"display": True, "correction": False},
-                "clockOut": {"display": True, "correction": False},
-                "breakMinutes": {"display": False, "correction": False},
+                "clockIn": {"display": True, "correction": True},
+                "clockOut": {"display": True, "correction": True},
+                "breakMinutes": {"display": True, "correction": True},
                 "totalHours": {"display": True, "correction": False},
             }
             for shift in tuesday["shifts"]
@@ -1058,6 +1064,180 @@ def test_payroll_timesheet_keeps_day_total_corrections_out_of_shift_rows(client)
         _delete_payroll_verification_weeks([week_start])
         _delete_employees([value for value in (employee_id, payroll_id) if value])
         _delete_timesheet_site(customer_id, location_id)
+
+
+def test_payroll_shift_correction_overlays_clock_break_without_mutating_shift(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=2)
+    payroll_id = None
+    employee_id = None
+    customer_id = None
+    location_id = None
+    try:
+        payroll_id = _create_employee("Payroll Shift Correction Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Shift Correction Alma")
+        customer_id, location_id = _create_timesheet_site(
+            address="Payroll Shift Correction Site",
+            customer_name="Payroll Shift Correction Customer",
+        )
+        payroll_auth = _login(client, "Payroll Shift Correction Mayra")
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 12),
+            location_id=location_id,
+            location_label="Shift Correction Site",
+        )
+        before = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+
+        corrected = client.post(
+            "/api/admin/payroll/timesheet/shift-corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "shiftId": shift_id,
+                "date": service_day.isoformat(),
+                "correctedClockIn": _local_dt(service_day, 8, 15).isoformat(),
+                "correctedClockOut": _local_dt(service_day, 13, 15).isoformat(),
+                "correctedBreakMinutes": 30,
+                "reason": "Mayra confirmed the row clock times and lunch break.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+        body = corrected.json()
+        correction = body["correction"]
+        assert correction["shiftId"] == shift_id
+        assert correction["sourceClockIn"]["display"] == "08:00 AM"
+        assert correction["sourceClockOut"]["display"] == "12:00 PM"
+        assert correction["sourceBreakMinutes"] is None
+        assert correction["sourceTotalMinutes"] == 240
+        assert correction["correctedClockIn"]["display"] == "08:15 AM"
+        assert correction["correctedClockOut"]["display"] == "01:15 PM"
+        assert correction["correctedBreakMinutes"] == 30
+        assert correction["correctedTotalMinutes"] == 270
+        assert correction["deltaMinutes"] == 30
+
+        timesheet = body["timesheet"]
+        assert timesheet["timesheetSourceFingerprint"] != before["timesheetSourceFingerprint"]
+        assert timesheet["sourceFingerprint"] != before["sourceFingerprint"]
+        tuesday = timesheet["employees"][0]["days"][2]
+        assert tuesday["status"] == "corrected"
+        assert tuesday["totalMinutes"] == 270
+        shift = tuesday["shifts"][0]
+        assert shift["status"] == "corrected"
+        assert shift["clockIn"]["display"] == "08:15 AM"
+        assert shift["clockOut"]["display"] == "01:15 PM"
+        assert shift["breakMinutes"] == 30
+        assert shift["totalMinutes"] == 270
+        assert shift["original"]["clockIn"]["display"] == "08:00 AM"
+        assert shift["original"]["clockOut"]["display"] == "12:00 PM"
+        assert shift["original"]["breakMinutes"] is None
+        assert shift["original"]["totalMinutes"] == 240
+        assert shift["correction"]["correctionId"] == correction["correctionId"]
+
+        weekly = _weekly_hours(client, payroll_auth, week_start)
+        weekly_employee = _employees_by_name(weekly)["Payroll Shift Correction Alma"]
+        assert weekly_employee["days"][2]["totalMinutes"] == 270
+        assert weekly_employee["totalMinutes"] == 270
+        assert weekly["summary"]["totalMinutes"] == 270
+
+        raw_shift = db.query_one(
+            "SELECT clock_in, clock_out, total_hours FROM shifts WHERE id = %s",
+            (shift_id,),
+        )
+        assert raw_shift["clock_in"].astimezone(CHICAGO).strftime("%H:%M") == "08:00"
+        assert raw_shift["clock_out"].astimezone(CHICAGO).strftime("%H:%M") == "12:00"
+        assert float(raw_shift["total_hours"]) == 4.0
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+        _delete_timesheet_site(customer_id, location_id)
+
+
+def test_payroll_shift_correction_supersedes_and_voids(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=3)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Shift Void Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Shift Void Alma")
+        payroll_auth = _login(client, "Payroll Shift Void Mayra")
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 10),
+        )
+        first = client.post(
+            "/api/admin/payroll/timesheet/shift-corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "shiftId": shift_id,
+                "date": service_day.isoformat(),
+                "correctedClockIn": _local_dt(service_day, 8).isoformat(),
+                "correctedClockOut": _local_dt(service_day, 11).isoformat(),
+                "correctedBreakMinutes": 0,
+                "reason": "Initial shift correction from Mayra.",
+            },
+        )
+        assert first.status_code == 200, first.text
+        first_id = first.json()["correction"]["correctionId"]
+
+        second = client.post(
+            "/api/admin/payroll/timesheet/shift-corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "shiftId": shift_id,
+                "date": service_day.isoformat(),
+                "correctedClockIn": _local_dt(service_day, 8).isoformat(),
+                "correctedClockOut": _local_dt(service_day, 10, 30).isoformat(),
+                "correctedBreakMinutes": 15,
+                "reason": "Updated shift correction from Mayra.",
+            },
+        )
+        assert second.status_code == 200, second.text
+        second_id = second.json()["correction"]["correctionId"]
+        assert second_id != first_id
+        assert second.json()["timesheet"]["employees"][0]["days"][3]["totalMinutes"] == 135
+
+        rows = db.query_all(
+            """
+            SELECT id, status, superseded_by
+            FROM payroll_shift_corrections
+            WHERE week_start = %s AND shift_id = %s
+            ORDER BY id
+            """,
+            (week_start, shift_id),
+        )
+        assert rows[0]["status"] == "superseded"
+        assert rows[0]["superseded_by"] == second_id
+        assert rows[1]["status"] == "active"
+        assert rows[1]["superseded_by"] is None
+
+        voided = client.post(
+            f"/api/admin/payroll/timesheet/shift-corrections/{second_id}/void",
+            headers=payroll_auth,
+            json={"reason": "Mayra reversed the row correction."},
+        )
+        assert voided.status_code == 200, voided.text
+        assert voided.json()["correction"]["status"] == "voided"
+        wednesday = voided.json()["timesheet"]["employees"][0]["days"][3]
+        assert wednesday["status"] == "registered"
+        assert wednesday["totalMinutes"] == 120
+        assert "correction" not in wednesday["shifts"][0]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
 def test_payroll_timesheet_allocation_labels_and_rate_fingerprint(client):
@@ -1904,7 +2084,8 @@ def test_void_payroll_correction_restores_shift_total_and_employee_role_is_denie
 
 def test_payroll_verification_schema_migration_installs_existing_deployments():
     db.execute(
-        "DROP TABLE IF EXISTS payroll_hour_correction_allocations, "
+        "DROP TABLE IF EXISTS payroll_shift_corrections, "
+        "payroll_hour_correction_allocations, "
         "payroll_hour_corrections, "
         "payroll_verification_events, payroll_verification_batches"
     )
@@ -1921,6 +2102,9 @@ def test_payroll_verification_schema_migration_installs_existing_deployments():
     )
     allocation_table = db.query_one(
         "SELECT to_regclass('payroll_hour_correction_allocations') AS table_name"
+    )
+    shift_correction_table = db.query_one(
+        "SELECT to_regclass('payroll_shift_corrections') AS table_name"
     )
     status_check = db.query_one(
         """
@@ -1941,6 +2125,8 @@ def test_payroll_verification_schema_migration_installs_existing_deployments():
     assert correction_table["table_name"] == "payroll_hour_corrections"
     assert allocation_table is not None
     assert allocation_table["table_name"] == "payroll_hour_correction_allocations"
+    assert shift_correction_table is not None
+    assert shift_correction_table["table_name"] == "payroll_shift_corrections"
     assert status_check == {"found": 1}
 
 
