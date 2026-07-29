@@ -451,6 +451,7 @@ def _load_time_evidence(
     observed_at: datetime,
     visible_job_ids: Iterable[int],
     *,
+    payroll_week_start: Optional[date] = None,
     cursor: Optional[Any] = None,
 ) -> Tuple[
     List[Dict[str, Any]],
@@ -470,9 +471,21 @@ def _load_time_evidence(
                s.job_id
         FROM shifts s
         JOIN employees e ON e.id = s.employee_id
-        LEFT JOIN payroll_shift_corrections correction
-          ON correction.shift_id = s.id
-         AND correction.status = 'active'
+        LEFT JOIN LATERAL (
+            SELECT
+                shift_correction.corrected_clock_in,
+                shift_correction.corrected_clock_out,
+                shift_correction.corrected_break_minutes
+            FROM payroll_shift_corrections shift_correction
+            WHERE shift_correction.shift_id = s.id
+              AND shift_correction.status = 'active'
+              AND (
+                  %s::date IS NULL
+                  OR shift_correction.week_start = %s::date
+              )
+            ORDER BY shift_correction.week_start DESC, shift_correction.id DESC
+            LIMIT 1
+        ) correction ON TRUE
         WHERE s.time_category = 'productive'
           AND (
               (
@@ -504,6 +517,8 @@ def _load_time_evidence(
         ORDER BY s.clock_in, s.id
         """,
         (
+            payroll_week_start,
+            payroll_week_start,
             range_end,
             observed_at,
             range_start,
@@ -564,9 +579,22 @@ def _load_time_evidence(
               OR EXISTS (
                   SELECT 1
                   FROM shifts evidence_shift
-                  LEFT JOIN payroll_shift_corrections evidence_correction
-                    ON evidence_correction.shift_id = evidence_shift.id
-                   AND evidence_correction.status = 'active'
+                  LEFT JOIN LATERAL (
+                      SELECT
+                          shift_correction.corrected_clock_in,
+                          shift_correction.corrected_clock_out
+                      FROM payroll_shift_corrections shift_correction
+                      WHERE shift_correction.shift_id = evidence_shift.id
+                        AND shift_correction.status = 'active'
+                        AND (
+                            %s::date IS NULL
+                            OR shift_correction.week_start = %s::date
+                        )
+                      ORDER BY
+                          shift_correction.week_start DESC,
+                          shift_correction.id DESC
+                      LIMIT 1
+                  ) evidence_correction ON TRUE
                   WHERE evidence_shift.id = ANY(%s)
                     AND evidence_shift.employee_id = sci.employee_id
                     AND COALESCE(evidence_correction.corrected_clock_in, evidence_shift.clock_in)
@@ -597,6 +625,8 @@ def _load_time_evidence(
             range_start,
             range_end,
             linked_job_ids,
+            payroll_week_start,
+            payroll_week_start,
             shift_ids,
             observed_at,
         ),
@@ -2546,6 +2576,7 @@ def _decorate_schedule_jobs(
     *,
     visible_range_start: Optional[datetime] = None,
     visible_range_end: Optional[datetime] = None,
+    payroll_week_start: Optional[date] = None,
     cursor: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = defaultdict(list)
@@ -2578,6 +2609,7 @@ def _decorate_schedule_jobs(
         range_end,
         observed_at,
         jobs_by_id,
+        payroll_week_start=payroll_week_start,
         cursor=cursor,
     )
     linked_jobs_by_id = dict(jobs_by_id)
@@ -3861,6 +3893,7 @@ def build_weekly_labor_profitability(
         app_timezone,
         visible_range_start=range_start,
         visible_range_end=range_end,
+        payroll_week_start=week_start,
         cursor=cursor,
     )
     source_jobs = {int(job["id"]): job for job in jobs}

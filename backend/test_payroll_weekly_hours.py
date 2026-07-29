@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 from datetime import date, datetime, timedelta, timezone
+import inspect
 from io import BytesIO, StringIO
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -617,6 +618,23 @@ def _normalized_text(value: str) -> str:
 
 def _different_fingerprint(fingerprint: str) -> str:
     return ("0" * 64) if fingerprint != ("0" * 64) else ("1" * 64)
+
+
+def test_payroll_lock_helpers_acquire_shared_table_family_in_one_order():
+    expected_order = [
+        "shifts",
+        "payroll_shift_corrections",
+        "payroll_hour_corrections",
+        "payroll_hour_correction_allocations",
+    ]
+    for helper in (
+        time_tracker_api._lock_payroll_source_rows,
+        time_tracker_api._lock_payroll_correction_write_tables,
+    ):
+        source = inspect.getsource(helper)
+        lock_clause = source[source.index("LOCK TABLE") :]
+        positions = [lock_clause.index(table_name) for table_name in expected_order]
+        assert positions == sorted(positions)
 
 
 def test_admin_can_create_update_and_log_in_payroll_role(client, auth):
@@ -2476,9 +2494,10 @@ def test_payroll_labor_profitability_reports_actual_site_margin_without_rates(
 
 def test_payroll_labor_profitability_uses_shift_correction_overlay(client):
     week_start = date(2026, 7, 19)
+    next_week_start = week_start + timedelta(days=7)
     service_day = date(2026, 7, 20)
     _delete_payroll_labor_profitability_rows()
-    _delete_payroll_verification_weeks([week_start])
+    _delete_payroll_verification_weeks([week_start, next_week_start])
     employee_id = None
     payroll_id = None
     try:
@@ -2524,6 +2543,44 @@ def test_payroll_labor_profitability_uses_shift_correction_overlay(client):
             },
         )
         assert corrected.status_code == 200, corrected.text
+        db.execute(
+            """
+            INSERT INTO payroll_shift_corrections (
+                week_start,
+                correction_date,
+                employee_id,
+                shift_id,
+                source_clock_in,
+                source_clock_out,
+                source_break_minutes,
+                source_total_minutes,
+                corrected_clock_in,
+                corrected_clock_out,
+                corrected_break_minutes,
+                corrected_total_minutes,
+                reason,
+                created_by_employee_id,
+                created_by_name
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, NULL, 120,
+                %s, %s, 0, 60,
+                'A different payroll week correction must not fan out labor.',
+                %s, 'Payroll Labor Profitability Mayra'
+            )
+            """,
+            (
+                next_week_start,
+                next_week_start,
+                employee_id,
+                shift_id,
+                _local_dt(service_day, 9).astimezone(timezone.utc),
+                _local_dt(service_day, 11).astimezone(timezone.utc),
+                _local_dt(service_day, 9).astimezone(timezone.utc),
+                _local_dt(service_day, 10).astimezone(timezone.utc),
+                payroll_id,
+            ),
+        )
 
         response = client.get(
             f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
@@ -2558,7 +2615,7 @@ def test_payroll_labor_profitability_uses_shift_correction_overlay(client):
             }
         ]
     finally:
-        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_verification_weeks([week_start, next_week_start])
         _delete_payroll_labor_profitability_rows()
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 

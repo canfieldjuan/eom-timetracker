@@ -13997,23 +13997,29 @@ def _lock_payroll_verification_week(cur: Any, week_start: date) -> None:
 
 
 def _lock_payroll_source_rows(cur: Any) -> None:
+    # Keep this table order aligned with _lock_payroll_correction_write_tables.
+    # PostgreSQL table locks are cheap here compared with a cross-path deadlock
+    # between verification reads and correction/cleanup writes.
     cur.execute(
         """
         LOCK TABLE
-            employees,
             shifts,
             payroll_shift_corrections,
             payroll_hour_corrections,
-            payroll_hour_correction_allocations
+            payroll_hour_correction_allocations,
+            employees
         IN SHARE MODE
         """
     )
 
 
 def _lock_payroll_correction_write_tables(cur: Any) -> None:
+    # Acquire shifts first because time-data cleanup mutates shifts and payroll
+    # verification reads lock shifts before correction tables.
     cur.execute(
         """
         LOCK TABLE
+            shifts,
             payroll_shift_corrections,
             payroll_hour_corrections,
             payroll_hour_correction_allocations
