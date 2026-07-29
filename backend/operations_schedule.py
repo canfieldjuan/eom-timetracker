@@ -463,15 +463,21 @@ def _load_time_evidence(
     shifts = _query_all(
         """
         SELECT s.id, s.employee_id, e.name AS employee_name, e.hourly_rate,
-               s.location_id, s.location_label, s.clock_in, s.clock_out,
+               s.location_id, s.location_label,
+               COALESCE(correction.corrected_clock_in, s.clock_in) AS clock_in,
+               COALESCE(correction.corrected_clock_out, s.clock_out) AS clock_out,
+               COALESCE(correction.corrected_break_minutes, 0) AS payroll_break_minutes,
                s.job_id
         FROM shifts s
         JOIN employees e ON e.id = s.employee_id
+        LEFT JOIN payroll_shift_corrections correction
+          ON correction.shift_id = s.id
+         AND correction.status = 'active'
         WHERE s.time_category = 'productive'
           AND (
               (
-                  s.clock_in < %s
-                  AND COALESCE(s.clock_out, %s) > %s
+                  COALESCE(correction.corrected_clock_in, s.clock_in) < %s
+                  AND COALESCE(correction.corrected_clock_out, s.clock_out, %s) > %s
               )
               OR EXISTS (
                   SELECT 1
@@ -479,8 +485,9 @@ def _load_time_evidence(
                   WHERE linked_sci.employee_id = s.employee_id
                     AND linked_sci.job_id = ANY(%s)
                     AND linked_sci.server_checked_in_at < %s
-                    AND s.clock_in <= linked_sci.server_checked_in_at
-                    AND COALESCE(s.clock_out, %s)
+                    AND COALESCE(correction.corrected_clock_in, s.clock_in)
+                        <= linked_sci.server_checked_in_at
+                    AND COALESCE(correction.corrected_clock_out, s.clock_out, %s)
                         > linked_sci.server_checked_in_at
                     AND (
                         (
@@ -557,10 +564,18 @@ def _load_time_evidence(
               OR EXISTS (
                   SELECT 1
                   FROM shifts evidence_shift
+                  LEFT JOIN payroll_shift_corrections evidence_correction
+                    ON evidence_correction.shift_id = evidence_shift.id
+                   AND evidence_correction.status = 'active'
                   WHERE evidence_shift.id = ANY(%s)
                     AND evidence_shift.employee_id = sci.employee_id
-                    AND evidence_shift.clock_in <= sci.server_checked_in_at
-                    AND COALESCE(evidence_shift.clock_out, %s)
+                    AND COALESCE(evidence_correction.corrected_clock_in, evidence_shift.clock_in)
+                        <= sci.server_checked_in_at
+                    AND COALESCE(
+                            evidence_correction.corrected_clock_out,
+                            evidence_shift.clock_out,
+                            %s
+                        )
                         > sci.server_checked_in_at
               )
           )
@@ -2068,6 +2083,34 @@ def _apply_qr_job_links(
     return represented_qr_ids
 
 
+def _apply_shift_break_minutes_to_segments(
+    segments: List[Dict[str, Any]],
+    break_minutes: int,
+) -> List[Dict[str, Any]]:
+    remaining_seconds = max(0, int(break_minutes)) * 60
+    if remaining_seconds <= 0:
+        return segments
+
+    adjusted: List[Dict[str, Any]] = []
+    for segment in reversed(segments):
+        segment_copy = dict(segment)
+        duration_seconds = max(
+            int((segment_copy["end"] - segment_copy["start"]).total_seconds()),
+            0,
+        )
+        deducted_seconds = min(duration_seconds, remaining_seconds)
+        remaining_seconds -= deducted_seconds
+        if deducted_seconds >= duration_seconds:
+            continue
+        if deducted_seconds > 0:
+            segment_copy["end"] = segment_copy["end"] - timedelta(
+                seconds=deducted_seconds,
+            )
+        adjusted.append(segment_copy)
+    adjusted.reverse()
+    return adjusted
+
+
 def _closed_shift_segments(
     shift: Dict[str, Any],
     visits: List[Dict[str, Any]],
@@ -2179,7 +2222,10 @@ def _closed_shift_segments(
                 end=upper,
                 base_evidence="unassigned_gap",
             )
-        return output
+        return _apply_shift_break_minutes_to_segments(
+            output,
+            int(shift.get("payroll_break_minutes") or 0),
+        )
 
     cursor = lower
     used_departures: set[int] = set()
@@ -2275,7 +2321,10 @@ def _closed_shift_segments(
             end=upper,
             base_evidence="unassigned_gap",
         )
-    return [segment for segment in output if segment["end"] > segment["start"]]
+    return _apply_shift_break_minutes_to_segments(
+        [segment for segment in output if segment["end"] > segment["start"]],
+        int(shift.get("payroll_break_minutes") or 0),
+    )
 
 
 def _open_shift_presence(

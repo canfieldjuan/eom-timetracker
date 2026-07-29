@@ -768,7 +768,7 @@ CREATE TABLE payroll_shift_corrections (
                                   source_break_minutes IS NULL
                                   OR source_break_minutes BETWEEN 0 AND 1440
                               ),
-    source_total_minutes      INTEGER NOT NULL CHECK (source_total_minutes BETWEEN 0 AND 1440),
+    source_total_minutes      INTEGER NOT NULL CHECK (source_total_minutes >= 0),
     corrected_clock_in        TIMESTAMPTZ NOT NULL,
     corrected_clock_out       TIMESTAMPTZ NOT NULL,
     corrected_break_minutes   INTEGER NOT NULL DEFAULT 0

@@ -4573,7 +4573,7 @@ def _ensure_schema_migrations() -> None:
                                       source_break_minutes IS NULL
                                       OR source_break_minutes BETWEEN 0 AND 1440
                                   ),
-            source_total_minutes      INTEGER NOT NULL CHECK (source_total_minutes BETWEEN 0 AND 1440),
+            source_total_minutes      INTEGER NOT NULL CHECK (source_total_minutes >= 0),
             corrected_clock_in        TIMESTAMPTZ NOT NULL,
             corrected_clock_out       TIMESTAMPTZ NOT NULL,
             corrected_break_minutes   INTEGER NOT NULL DEFAULT 0
@@ -4594,6 +4594,41 @@ def _ensure_schema_migrations() -> None:
             CHECK (correction_date >= week_start AND correction_date < week_start + 7),
             CHECK (corrected_clock_out > corrected_clock_in)
         )
+    """)
+    db.execute("""
+        DO $$
+        DECLARE
+            source_total_constraint RECORD;
+            has_current_constraint BOOLEAN := FALSE;
+        BEGIN
+            FOR source_total_constraint IN
+                SELECT
+                    constraint_row.conname,
+                    pg_get_constraintdef(constraint_row.oid) AS definition
+                FROM pg_constraint constraint_row
+                WHERE constraint_row.conrelid = 'payroll_shift_corrections'::regclass
+                  AND constraint_row.contype = 'c'
+                  AND pg_get_constraintdef(constraint_row.oid)
+                      LIKE '%%source_total_minutes%%'
+            LOOP
+                IF replace(source_total_constraint.definition, ' ', '')
+                       LIKE '%%source_total_minutes>=0%%'
+                   AND source_total_constraint.definition NOT LIKE '%%1440%%' THEN
+                    has_current_constraint := TRUE;
+                ELSE
+                    EXECUTE format(
+                        'ALTER TABLE payroll_shift_corrections DROP CONSTRAINT %%I',
+                        source_total_constraint.conname
+                    );
+                END IF;
+            END LOOP;
+
+            IF NOT has_current_constraint THEN
+                ALTER TABLE payroll_shift_corrections
+                    ADD CONSTRAINT payroll_shift_corrections_source_total_minutes_check
+                    CHECK (source_total_minutes >= 0);
+            END IF;
+        END $$;
     """)
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_payroll_verification_batches_status_week
@@ -11283,6 +11318,44 @@ def _correction_shift_snapshots(
         (ids,),
         cursor,
     )
+    payroll_shift_correction_rows = _correction_query_all(
+        """
+        SELECT
+            correction.id,
+            correction.week_start,
+            correction.correction_date,
+            correction.employee_id,
+            correction.shift_id,
+            correction.source_clock_in,
+            correction.source_clock_out,
+            correction.source_break_minutes,
+            correction.source_total_minutes,
+            correction.corrected_clock_in,
+            correction.corrected_clock_out,
+            correction.corrected_break_minutes,
+            correction.corrected_total_minutes,
+            correction.reason,
+            correction.status,
+            correction.created_by_employee_id,
+            correction.created_by_name,
+            correction.voided_by_employee_id,
+            correction.voided_by_name,
+            correction.voided_reason,
+            correction.voided_at,
+            correction.superseded_by,
+            correction.created_at,
+            correction.updated_at
+        FROM payroll_shift_corrections correction
+        WHERE correction.shift_id = ANY(%s)
+        ORDER BY
+            correction.shift_id,
+            correction.week_start,
+            correction.status,
+            correction.id
+        """,
+        (ids,),
+        cursor,
+    )
 
     visits_by_shift: Dict[int, List[Dict[str, Any]]] = {}
     for row in visit_rows:
@@ -11380,6 +11453,57 @@ def _correction_shift_snapshots(
             "createdAt": to_utc_iso(row["created_at"]),
         })
 
+    payroll_corrections_by_shift: Dict[int, List[Dict[str, Any]]] = {}
+    for row in payroll_shift_correction_rows:
+        payroll_corrections_by_shift.setdefault(int(row["shift_id"]), []).append(
+            {
+                "correctionId": int(row["id"]),
+                "weekStart": str(row["week_start"]),
+                "date": str(row["correction_date"]),
+                "employeeId": int(row["employee_id"]),
+                "shiftId": int(row["shift_id"]),
+                "sourceClockIn": to_utc_iso(row["source_clock_in"]),
+                "sourceClockOut": (
+                    to_utc_iso(row["source_clock_out"])
+                    if row.get("source_clock_out")
+                    else None
+                ),
+                "sourceBreakMinutes": row.get("source_break_minutes"),
+                "sourceTotalMinutes": int(row["source_total_minutes"]),
+                "correctedClockIn": to_utc_iso(row["corrected_clock_in"]),
+                "correctedClockOut": to_utc_iso(row["corrected_clock_out"]),
+                "correctedBreakMinutes": int(row["corrected_break_minutes"]),
+                "correctedTotalMinutes": int(row["corrected_total_minutes"]),
+                "reason": row["reason"],
+                "status": row["status"],
+                "createdByEmployeeId": (
+                    int(row["created_by_employee_id"])
+                    if row.get("created_by_employee_id") is not None
+                    else None
+                ),
+                "createdByName": row["created_by_name"],
+                "voidedByEmployeeId": (
+                    int(row["voided_by_employee_id"])
+                    if row.get("voided_by_employee_id") is not None
+                    else None
+                ),
+                "voidedByName": row.get("voided_by_name"),
+                "voidedReason": row.get("voided_reason"),
+                "voidedAt": (
+                    to_utc_iso(row["voided_at"])
+                    if row.get("voided_at")
+                    else None
+                ),
+                "supersededBy": (
+                    int(row["superseded_by"])
+                    if row.get("superseded_by") is not None
+                    else None
+                ),
+                "createdAt": to_utc_iso(row["created_at"]),
+                "updatedAt": to_utc_iso(row["updated_at"]),
+            }
+        )
+
     snapshots = []
     for row in shift_rows:
         shift_id = int(row["id"])
@@ -11407,6 +11531,10 @@ def _correction_shift_snapshots(
             "visits": visits_by_shift.get(shift_id, []),
             "departures": departures_by_shift.get(shift_id, []),
             "siteQrActionReceipts": receipts_by_shift.get(shift_id, []),
+            "payrollShiftCorrections": payroll_corrections_by_shift.get(
+                shift_id,
+                [],
+            ),
         })
     return snapshots
 
@@ -11790,6 +11918,67 @@ def admin_time_data_correction_preview(
     return result
 
 
+def _migrate_duplicate_payroll_shift_corrections(
+    cur: Any,
+    duplicate_resolutions: List[Dict[str, Any]],
+) -> List[int]:
+    migrated_ids: List[int] = []
+    for resolution in duplicate_resolutions:
+        canonical_shift_id = int(resolution["canonicalShiftId"])
+        duplicate_shift_ids = [
+            int(value)
+            for value in resolution.get("duplicateShiftIds", [])
+        ]
+        if not duplicate_shift_ids:
+            continue
+
+        cur.execute(
+            """
+            WITH duplicate_active AS (
+                SELECT week_start, COUNT(*) AS active_count
+                FROM payroll_shift_corrections
+                WHERE shift_id = ANY(%s)
+                  AND status = 'active'
+                GROUP BY week_start
+            )
+            SELECT week_start
+            FROM duplicate_active
+            WHERE active_count > 1
+            UNION
+            SELECT duplicate_correction.week_start
+            FROM payroll_shift_corrections duplicate_correction
+            JOIN payroll_shift_corrections canonical_correction
+              ON canonical_correction.week_start = duplicate_correction.week_start
+             AND canonical_correction.shift_id = %s
+             AND canonical_correction.status = 'active'
+            WHERE duplicate_correction.shift_id = ANY(%s)
+              AND duplicate_correction.status = 'active'
+            LIMIT 1
+            """,
+            (duplicate_shift_ids, canonical_shift_id, duplicate_shift_ids),
+        )
+        if cur.fetchone():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Duplicate shift payroll correction conflicts with the "
+                    "canonical shift; resolve the payroll correction first"
+                ),
+            )
+
+        cur.execute(
+            """
+            UPDATE payroll_shift_corrections
+            SET shift_id = %s, updated_at = NOW()
+            WHERE shift_id = ANY(%s)
+            RETURNING id
+            """,
+            (canonical_shift_id, duplicate_shift_ids),
+        )
+        migrated_ids.extend(int(row["id"]) for row in cur.fetchall())
+    return sorted(migrated_ids)
+
+
 @app.post("/api/admin/corrections/time-data/apply")
 def admin_apply_time_data_correction(
     payload: TimeDataCorrectionApplyRequest,
@@ -11809,6 +11998,7 @@ def admin_apply_time_data_correction(
                 "SELECT pg_advisory_xact_lock(%s)",
                 (TIMESHEET_PG_ADVISORY_LOCK_ID,),
             )
+            _lock_payroll_correction_write_tables(cur)
             if requested_ids:
                 cur.execute(
                     "SELECT id FROM shifts WHERE id = ANY(%s) ORDER BY id FOR UPDATE",
@@ -11876,6 +12066,12 @@ def admin_apply_time_data_correction(
                     )
                 closed_shift_ids.append(int(updated["id"]))
 
+            migrated_payroll_shift_correction_ids = (
+                _migrate_duplicate_payroll_shift_corrections(
+                    cur,
+                    plan["duplicateResolutions"],
+                )
+            )
             deleted_shift_ids = sorted(
                 int(value)
                 for row in plan["duplicateResolutions"]
@@ -11896,6 +12092,9 @@ def admin_apply_time_data_correction(
             result = {
                 "deletedShiftIds": deleted_shift_ids,
                 "closedShiftIds": sorted(closed_shift_ids),
+                "migratedPayrollShiftCorrectionIds": (
+                    migrated_payroll_shift_correction_ids
+                ),
             }
             cur.execute(
                 "UPDATE time_data_correction_batches SET result = %s::jsonb WHERE id = %s",
@@ -12782,7 +12981,12 @@ def _serialize_payroll_timesheet_shift(
         )
         source_total_minutes = int(correction_row["source_total_minutes"])
         source_break_minutes = correction_row.get("source_break_minutes")
-    can_correct_shift = segment_count == 1
+    can_correct_shift = (
+        segment_count == 1
+        and source_clock_out is not None
+        and to_local(source_clock_in).date() == segment["date"]
+        and to_local(source_clock_out).date() == segment["date"]
+    )
     result = {
         "rowId": f"shift:{int(shift_row['id'])}:{segment['date'].isoformat()}:{segment_index}",
         "kind": "shift",
@@ -13806,6 +14010,18 @@ def _lock_payroll_source_rows(cur: Any) -> None:
     )
 
 
+def _lock_payroll_correction_write_tables(cur: Any) -> None:
+    cur.execute(
+        """
+        LOCK TABLE
+            payroll_shift_corrections,
+            payroll_hour_corrections,
+            payroll_hour_correction_allocations
+        IN SHARE ROW EXCLUSIVE MODE
+        """
+    )
+
+
 def _get_payroll_verification_batch(
     cur: Any,
     week_start: date,
@@ -14440,15 +14656,7 @@ def admin_create_payroll_shift_correction(
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_payroll_verification_week(cur, week_start)
             _ensure_payroll_week_corrections_editable(cur, week_start)
-            cur.execute(
-                """
-                LOCK TABLE
-                    payroll_shift_corrections,
-                    payroll_hour_corrections,
-                    payroll_hour_correction_allocations
-                IN SHARE ROW EXCLUSIVE MODE
-                """
-            )
+            _lock_payroll_correction_write_tables(cur)
             cur.execute(
                 """
                 SELECT shift_row.*, employee.name AS employee_name
@@ -14603,15 +14811,7 @@ def admin_void_payroll_shift_correction(
             week_start = identity["week_start"]
             _lock_payroll_verification_week(cur, week_start)
             _ensure_payroll_week_corrections_editable(cur, week_start)
-            cur.execute(
-                """
-                LOCK TABLE
-                    payroll_shift_corrections,
-                    payroll_hour_corrections,
-                    payroll_hour_correction_allocations
-                IN SHARE ROW EXCLUSIVE MODE
-                """
-            )
+            _lock_payroll_correction_write_tables(cur)
             cur.execute(
                 """
                 SELECT correction.*, employee.name AS employee_name
@@ -14740,14 +14940,7 @@ def admin_create_payroll_hour_correction(
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_payroll_verification_week(cur, week_start)
             _ensure_payroll_week_corrections_editable(cur, week_start)
-            cur.execute(
-                """
-                LOCK TABLE
-                    payroll_hour_corrections,
-                    payroll_hour_correction_allocations
-                IN SHARE ROW EXCLUSIVE MODE
-                """
-            )
+            _lock_payroll_correction_write_tables(cur)
             cur.execute(
                 "SELECT id, name FROM employees WHERE id = %s FOR SHARE",
                 (payload.employeeId,),
@@ -14869,14 +15062,7 @@ def admin_void_payroll_hour_correction(
             week_start = identity["week_start"]
             _lock_payroll_verification_week(cur, week_start)
             _ensure_payroll_week_corrections_editable(cur, week_start)
-            cur.execute(
-                """
-                LOCK TABLE
-                    payroll_hour_corrections,
-                    payroll_hour_correction_allocations
-                IN SHARE ROW EXCLUSIVE MODE
-                """
-            )
+            _lock_payroll_correction_write_tables(cur)
             cur.execute(
                 """
                 SELECT correction.*, employee.name AS employee_name
@@ -14976,14 +15162,7 @@ def admin_allocate_payroll_hour_correction(
             week_start = correction_identity["week_start"]
             _lock_payroll_verification_week(cur, week_start)
             _ensure_payroll_week_corrections_editable(cur, week_start)
-            cur.execute(
-                """
-                LOCK TABLE
-                    payroll_hour_corrections,
-                    payroll_hour_correction_allocations
-                IN SHARE ROW EXCLUSIVE MODE
-                """
-            )
+            _lock_payroll_correction_write_tables(cur)
             cur.execute(
                 """
                 SELECT correction.*, employee.name AS employee_name, employee.hourly_rate
@@ -15149,14 +15328,7 @@ def admin_void_payroll_hour_correction_allocation(
             week_start = correction_identity["week_start"]
             _lock_payroll_verification_week(cur, week_start)
             _ensure_payroll_week_corrections_editable(cur, week_start)
-            cur.execute(
-                """
-                LOCK TABLE
-                    payroll_hour_corrections,
-                    payroll_hour_correction_allocations
-                IN SHARE ROW EXCLUSIVE MODE
-                """
-            )
+            _lock_payroll_correction_write_tables(cur)
             cur.execute(
                 """
                 SELECT *

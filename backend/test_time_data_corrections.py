@@ -298,6 +298,51 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
         duplicate_start,
         duplicate_start + timedelta(hours=2),
     )
+    correction_week_start = duplicate_start.date() - timedelta(
+        days=(duplicate_start.date().weekday() + 1) % 7,
+    )
+    correction_id = db.execute_returning(
+        """
+        INSERT INTO payroll_shift_corrections (
+            week_start,
+            correction_date,
+            employee_id,
+            shift_id,
+            source_clock_in,
+            source_clock_out,
+            source_break_minutes,
+            source_total_minutes,
+            corrected_clock_in,
+            corrected_clock_out,
+            corrected_break_minutes,
+            corrected_total_minutes,
+            reason,
+            status,
+            created_by_employee_id,
+            created_by_name
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, NULL, 120,
+            %s, %s, 15, 105,
+            'Mayra correction attached to duplicate shift.',
+            'active',
+            %s,
+            'Payroll Mayra'
+        )
+        RETURNING id
+        """,
+        (
+            correction_week_start,
+            duplicate_start.date(),
+            employee_id,
+            candidates["duplicates"][0],
+            duplicate_start,
+            duplicate_start + timedelta(hours=2),
+            duplicate_start,
+            duplicate_start + timedelta(hours=2),
+            employee_id,
+        ),
+    )
     selection = _selection(candidates, reason)
     try:
         preview = client.post(
@@ -360,6 +405,7 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
         assert result["archiveStored"] is True
         assert result["deletedShiftIds"] == sorted(candidates["duplicates"])
         assert result["closedShiftIds"] == [candidates["stale"]]
+        assert result["migratedPayrollShiftCorrectionIds"] == [correction_id]
 
         remaining = db.query_all(
             "SELECT id, clock_out FROM shifts WHERE id = ANY(%s) ORDER BY id",
@@ -385,6 +431,15 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
         }
         assert set(archived_by_id) == set(candidate_ids)
         assert archived_by_id[candidates["duplicates"][0]]["departures"]
+        archived_payroll_corrections = archived_by_id[
+            candidates["duplicates"][0]
+        ]["payrollShiftCorrections"]
+        assert len(archived_payroll_corrections) == 1
+        assert archived_payroll_corrections[0]["correctionId"] == correction_id
+        assert (
+            archived_payroll_corrections[0]["reason"]
+            == "Mayra correction attached to duplicate shift."
+        )
         archived_qr_shift = archived_by_id[candidates["duplicates"][0]]
         archived_receipts = {
             row["action"]: row for row in archived_qr_shift["siteQrActionReceipts"]
@@ -410,6 +465,21 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
         assert all(row["visit_id"] is None for row in preserved_receipts)
         assert all(row["departure_id"] is None for row in preserved_receipts)
         assert batch["result"]["deletedShiftIds"] == sorted(candidates["duplicates"])
+        assert batch["result"]["migratedPayrollShiftCorrectionIds"] == [correction_id]
+        migrated_correction = db.query_one(
+            """
+            SELECT shift_id, status, reason
+            FROM payroll_shift_corrections
+            WHERE id = %s
+            """,
+            (correction_id,),
+        )
+        assert migrated_correction["shift_id"] == candidates["canonical"]
+        assert migrated_correction["status"] == "active"
+        assert (
+            migrated_correction["reason"]
+            == "Mayra correction attached to duplicate shift."
+        )
 
         repeat = client.post(
             "/api/admin/corrections/time-data/apply",
