@@ -596,11 +596,17 @@ def _paired_version_two_visit(
     return visit_id, departure_id
 
 
-def _schedule_body(client, auth, service_day: date) -> dict:
+def _schedule_body(
+    client,
+    auth,
+    service_day: date,
+    *,
+    end_day: date | None = None,
+) -> dict:
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={"start_date": str(service_day), "end_date": str(end_day or service_day)},
     )
     assert response.status_code == 200, response.text
     return response.json()
@@ -1183,10 +1189,14 @@ def test_operations_schedule_scopes_shift_correction_overlay_to_visible_week(
     week_start = date(2026, 7, 19)
     next_week_start = week_start + timedelta(days=7)
     service_day = week_start + timedelta(days=1)
+    next_service_day = next_week_start + timedelta(days=1)
     shift_start = datetime(2026, 7, 20, 9, tzinfo=chicago)
     source_shift_end = datetime(2026, 7, 20, 11, tzinfo=chicago)
     current_week_corrected_end = datetime(2026, 7, 20, 12, tzinfo=chicago)
     later_week_corrected_end = datetime(2026, 7, 20, 10, tzinfo=chicago)
+    next_shift_start = datetime(2026, 7, 27, 9, tzinfo=chicago)
+    next_source_shift_end = datetime(2026, 7, 27, 11, tzinfo=chicago)
+    next_corrected_shift_end = datetime(2026, 7, 27, 12, tzinfo=chicago)
 
     with db.get_conn() as conn:
         with conn.cursor() as cur:
@@ -1206,6 +1216,22 @@ def test_operations_schedule_scopes_shift_correction_overlay_to_visible_week(
                 location_id=site_id,
                 location_label=f"{TEST_PREFIX} Site Correction Scope",
                 job_id=job_id,
+            )
+            next_site_id, next_job_id = _canonical_job(
+                cur,
+                suffix="Correction Scope Next Week",
+                start=next_shift_start,
+                end=next_corrected_shift_end,
+            )
+            next_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=next_shift_start,
+                end=next_source_shift_end,
+                service_day=next_service_day,
+                location_id=next_site_id,
+                location_label=f"{TEST_PREFIX} Site Correction Scope Next Week",
+                job_id=next_job_id,
             )
             cur.execute(
                 """
@@ -1243,6 +1269,14 @@ def test_operations_schedule_scopes_shift_correction_overlay_to_visible_week(
                         'active',
                         %s,
                         'Mayra'
+                    ),
+                    (
+                        %s, %s, %s, %s, %s, %s, NULL, 120,
+                        %s, %s, 0, 180,
+                        'Next payroll week correction.',
+                        'active',
+                        %s,
+                        'Mayra'
                     )
                 """,
                 (
@@ -1264,15 +1298,28 @@ def test_operations_schedule_scopes_shift_correction_overlay_to_visible_week(
                     shift_start,
                     later_week_corrected_end,
                     employee_id,
+                    next_week_start,
+                    next_service_day,
+                    employee_id,
+                    next_shift_id,
+                    next_shift_start,
+                    next_source_shift_end,
+                    next_shift_start,
+                    next_corrected_shift_end,
+                    employee_id,
                 ),
             )
 
-    body = _schedule_body(client, auth, service_day)
+    body = _schedule_body(client, auth, service_day, end_day=next_service_day)
     job = _schedule_job(body, job_id)
+    next_job = _schedule_job(body, next_job_id)
 
     assert job["actualHours"] == pytest.approx(3.0)
     assert job["actualLaborCost"] == pytest.approx(60.0)
     assert job["workers"][0]["hours"] == pytest.approx(3.0)
+    assert next_job["actualHours"] == pytest.approx(3.0)
+    assert next_job["actualLaborCost"] == pytest.approx(60.0)
+    assert next_job["workers"][0]["hours"] == pytest.approx(3.0)
 
 
 def test_monthly_allocation_is_exact_and_stable():

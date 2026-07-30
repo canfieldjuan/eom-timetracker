@@ -1708,6 +1708,69 @@ def test_payroll_timesheet_offers_row_edit_for_same_day_open_shift(
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
+def test_payroll_shift_correction_closes_open_source_shift_for_later_weeks(
+    client,
+    monkeypatch,
+):
+    week_start = date(2026, 7, 19)
+    next_week_start = week_start + timedelta(days=7)
+    service_day = week_start + timedelta(days=3)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Open Closed Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Open Closed Alma")
+        payroll_auth = _login(client, "Payroll Open Closed Mayra")
+        monkeypatch.setattr(
+            time_tracker_api,
+            "utc_now",
+            lambda: _local_dt(service_day, 12).astimezone(timezone.utc),
+        )
+        shift_id = _create_shift(employee_id, _local_dt(service_day, 8), None)
+
+        corrected = client.post(
+            "/api/admin/payroll/timesheet/shift-corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "shiftId": shift_id,
+                "date": service_day.isoformat(),
+                "correctedClockIn": _local_dt(service_day, 8).isoformat(),
+                "correctedClockOut": _local_dt(service_day, 12).isoformat(),
+                "correctedBreakMinutes": 0,
+                "reason": "Mayra closed the missing clock-out from the source week.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+
+        monkeypatch.setattr(
+            time_tracker_api,
+            "utc_now",
+            lambda: _local_dt(next_week_start + timedelta(days=2), 12).astimezone(
+                timezone.utc
+            ),
+        )
+        weekly = _weekly_hours(client, payroll_auth, next_week_start)
+        employee = _employees_by_name(weekly)["Payroll Open Closed Alma"]
+        assert employee["issueCodes"] == []
+        assert employee["totalMinutes"] == 0
+        assert employee["completedShiftCount"] == 0
+        assert employee["overlappingShiftCount"] == 0
+
+        timesheet = _payroll_timesheet(
+            client,
+            payroll_auth,
+            next_week_start,
+            employee_id=employee_id,
+        )
+        assert timesheet["summary"]["issueCount"] == 0
+        assert all(day["shifts"] == [] for day in timesheet["employees"][0]["days"])
+    finally:
+        _delete_payroll_verification_weeks([week_start, next_week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
 def test_weekly_hours_flags_open_and_invalid_without_counting_minutes(client, auth):
     employee_id = _create_employee("Payroll Issue Worker")
     week_start = date(2026, 7, 19)

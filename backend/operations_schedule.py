@@ -451,7 +451,7 @@ def _load_time_evidence(
     observed_at: datetime,
     visible_job_ids: Iterable[int],
     *,
-    payroll_week_start: Optional[date] = None,
+    timezone_name: str = "America/Chicago",
     cursor: Optional[Any] = None,
 ) -> Tuple[
     List[Dict[str, Any]],
@@ -479,9 +479,17 @@ def _load_time_evidence(
             FROM payroll_shift_corrections shift_correction
             WHERE shift_correction.shift_id = s.id
               AND shift_correction.status = 'active'
-              AND (
-                  %s::date IS NULL
-                  OR shift_correction.week_start = %s::date
+              AND shift_correction.week_start = (
+                  COALESCE(
+                      s.local_date,
+                      (s.clock_in AT TIME ZONE %s)::date
+                  )
+                  - EXTRACT(
+                      DOW FROM COALESCE(
+                          s.local_date,
+                          (s.clock_in AT TIME ZONE %s)::date
+                      )
+                  )::integer
               )
             ORDER BY shift_correction.week_start DESC, shift_correction.id DESC
             LIMIT 1
@@ -517,8 +525,8 @@ def _load_time_evidence(
         ORDER BY s.clock_in, s.id
         """,
         (
-            payroll_week_start,
-            payroll_week_start,
+            timezone_name,
+            timezone_name,
             range_end,
             observed_at,
             range_start,
@@ -586,9 +594,23 @@ def _load_time_evidence(
                       FROM payroll_shift_corrections shift_correction
                       WHERE shift_correction.shift_id = evidence_shift.id
                         AND shift_correction.status = 'active'
-                        AND (
-                            %s::date IS NULL
-                            OR shift_correction.week_start = %s::date
+                        AND shift_correction.week_start = (
+                            COALESCE(
+                                evidence_shift.local_date,
+                                (
+                                    evidence_shift.clock_in
+                                    AT TIME ZONE %s
+                                )::date
+                            )
+                            - EXTRACT(
+                                DOW FROM COALESCE(
+                                    evidence_shift.local_date,
+                                    (
+                                        evidence_shift.clock_in
+                                        AT TIME ZONE %s
+                                    )::date
+                                )
+                            )::integer
                         )
                       ORDER BY
                           shift_correction.week_start DESC,
@@ -625,8 +647,8 @@ def _load_time_evidence(
             range_start,
             range_end,
             linked_job_ids,
-            payroll_week_start,
-            payroll_week_start,
+            timezone_name,
+            timezone_name,
             shift_ids,
             observed_at,
         ),
@@ -2576,7 +2598,6 @@ def _decorate_schedule_jobs(
     *,
     visible_range_start: Optional[datetime] = None,
     visible_range_end: Optional[datetime] = None,
-    payroll_week_start: Optional[date] = None,
     cursor: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = defaultdict(list)
@@ -2609,7 +2630,7 @@ def _decorate_schedule_jobs(
         range_end,
         observed_at,
         jobs_by_id,
-        payroll_week_start=payroll_week_start,
+        timezone_name=getattr(app_timezone, "key", str(app_timezone)),
         cursor=cursor,
     )
     linked_jobs_by_id = dict(jobs_by_id)
@@ -3893,7 +3914,6 @@ def build_weekly_labor_profitability(
         app_timezone,
         visible_range_start=range_start,
         visible_range_end=range_end,
-        payroll_week_start=week_start,
         cursor=cursor,
     )
     source_jobs = {int(job["id"]): job for job in jobs}
@@ -4403,7 +4423,6 @@ def build_operations_schedule_router(
             app_timezone,
             visible_range_start=range_start,
             visible_range_end=range_end,
-            payroll_week_start=_sunday_for(resolved_start),
         )
         active_jobs = [job for job in schedule_jobs if job["includedInPlan"]]
         known_planned_hours = sum(

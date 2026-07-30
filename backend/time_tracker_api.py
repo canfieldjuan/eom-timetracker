@@ -26,7 +26,7 @@ from datetime import date, datetime, time as clock_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from ipaddress import ip_address, ip_network
 from pathlib import Path
-from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Annotated, Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple
 from urllib.parse import quote, urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -12429,6 +12429,41 @@ def _payroll_shift_correction_rows(
     )
 
 
+def _payroll_active_shift_correction_rows_for_shift_ids(
+    shift_ids: Iterable[int],
+    *,
+    cursor: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    normalized_shift_ids = sorted({int(shift_id) for shift_id in shift_ids})
+    if not normalized_shift_ids:
+        return []
+    return _payroll_query_all(
+        """
+        SELECT DISTINCT ON (correction.shift_id)
+            correction.*,
+            employee.name AS employee_name
+        FROM payroll_shift_corrections correction
+        JOIN employees employee ON employee.id = correction.employee_id
+        JOIN shifts shift_row ON shift_row.id = correction.shift_id
+        JOIN LATERAL (
+            SELECT COALESCE(
+                shift_row.local_date,
+                (shift_row.clock_in AT TIME ZONE %s)::date
+            ) AS source_work_date
+        ) source ON TRUE
+        WHERE correction.shift_id = ANY(%s)
+          AND correction.status = 'active'
+          AND correction.week_start = (
+              source.source_work_date
+              - EXTRACT(DOW FROM source.source_work_date)::integer
+          )
+        ORDER BY correction.shift_id, correction.id DESC
+        """,
+        (TIMEZONE_NAME, normalized_shift_ids),
+        cursor=cursor,
+    )
+
+
 def _payroll_shift_corrections_by_shift_id(
     rows: List[Dict[str, Any]],
 ) -> Dict[int, Dict[str, Any]]:
@@ -12568,8 +12603,8 @@ def _compute_payroll_weekly_hours(
             cursor=cursor,
         )
     if shift_correction_rows is None:
-        shift_correction_rows = _payroll_shift_correction_rows(
-            week_start,
+        shift_correction_rows = _payroll_active_shift_correction_rows_for_shift_ids(
+            [int(row["id"]) for row in shift_rows],
             cursor=cursor,
         )
     shift_corrections_by_shift_id = _payroll_shift_corrections_by_shift_id(
@@ -12590,6 +12625,13 @@ def _compute_payroll_weekly_hours(
             raw_shift_row,
             shift_corrections_by_shift_id.get(int(raw_shift_row["id"])),
         )
+        if not _payroll_shift_overlaps_week(
+            shift_row,
+            week_start_utc=week_start_utc,
+            week_end_utc=week_end_utc,
+            now_utc=now_utc,
+        ):
+            continue
         employee_id = int(shift_row["employee_id"])
         employee_source = employee_lookup.get(employee_id)
         if employee_source is None:
@@ -13075,7 +13117,10 @@ def _compute_payroll_timesheet(
         cursor=cursor,
     )
     correction_rows = _payroll_correction_rows(week_start, cursor=cursor)
-    shift_correction_rows = _payroll_shift_correction_rows(week_start, cursor=cursor)
+    shift_correction_rows = _payroll_active_shift_correction_rows_for_shift_ids(
+        [int(row["id"]) for row in shift_rows],
+        cursor=cursor,
+    )
     shift_corrections_by_shift_id = _payroll_shift_corrections_by_shift_id(
         shift_correction_rows
     )
