@@ -2142,6 +2142,22 @@ def _apply_shift_break_minutes_to_segments(
     remaining_seconds = max(0, int(break_minutes)) * 60
     if remaining_seconds <= 0:
         return segments
+    duration_segments = [
+        segment
+        for segment in segments
+        if segment["end"] > segment["start"]
+    ]
+    located_site_ids = {
+        int(segment["location_id"])
+        for segment in duration_segments
+        if segment.get("location_id") is not None
+    }
+    has_unallocated_time = any(
+        segment.get("location_id") is None
+        for segment in duration_segments
+    )
+    if has_unallocated_time or len(located_site_ids) != 1:
+        return segments
 
     adjusted: List[Dict[str, Any]] = []
     for segment in reversed(segments):

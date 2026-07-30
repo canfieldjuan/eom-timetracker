@@ -1282,6 +1282,20 @@ def raise_timesheet_mutation_failure(result: Any) -> None:
     raise HTTPException(status_code=400, detail=str(result))
 
 
+def _shift_has_active_payroll_correction(shift_id: int) -> bool:
+    row = db.query_one(
+        """
+        SELECT 1
+        FROM payroll_shift_corrections
+        WHERE shift_id = %s
+          AND status = 'active'
+        LIMIT 1
+        """,
+        (int(shift_id),),
+    )
+    return row is not None
+
+
 @contextmanager
 def timesheet_postgres_advisory_lock():
     """Serialize timesheet event writers across backend worker processes."""
@@ -9059,6 +9073,17 @@ def admin_adjust_entry(
         entry = next((e for e in timesheet_data["entries"] if e["id"] == entry_id), None)
         if not entry:
             return False, "Entry not found"
+        if (
+            (payload.clockIn is not None or payload.clockOut is not None)
+            and _shift_has_active_payroll_correction(entry_id)
+        ):
+            return (
+                False,
+                (
+                    "Entry has an active payroll correction; void or supersede "
+                    "the correction before editing raw clock times"
+                ),
+            )
 
         new_ci_utc: Optional[datetime] = None
         new_co_utc: Optional[datetime] = None

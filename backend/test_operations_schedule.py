@@ -14,6 +14,7 @@ import db
 import operations_schedule as ops
 from operations_schedule import (
     _allocate_utilization_minutes,
+    _apply_shift_break_minutes_to_segments,
     _collapse_overlapping_paid_segments,
     _closed_shift_utilization,
     _closed_shift_segments,
@@ -79,6 +80,43 @@ def test_correction_evidence_locks_shift_before_joined_mutable_inputs():
     assert cursor.queries[1] == "LOCK TABLE site_check_ins, jobs IN SHARE MODE"
     assert "FROM visits v" in cursor.queries[2]
     assert "FROM departures" in cursor.queries[3]
+
+
+def test_aggregate_break_minutes_do_not_shorten_multi_site_segments():
+    start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    segments = [
+        {
+            "start": start,
+            "end": start + timedelta(hours=1),
+            "location_id": 10,
+        },
+        {
+            "start": start + timedelta(hours=1),
+            "end": start + timedelta(hours=3),
+            "location_id": 20,
+        },
+    ]
+
+    adjusted = _apply_shift_break_minutes_to_segments(segments, 30)
+
+    assert adjusted == segments
+
+
+def test_aggregate_break_minutes_still_shorten_single_site_segments():
+    start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    segments = [
+        {
+            "start": start,
+            "end": start + timedelta(hours=3),
+            "location_id": 10,
+        },
+    ]
+
+    adjusted = _apply_shift_break_minutes_to_segments(segments, 30)
+
+    assert len(adjusted) == 1
+    assert adjusted[0]["start"] == start
+    assert adjusted[0]["end"] == start + timedelta(hours=2, minutes=30)
 
 
 @pytest.mark.parametrize(

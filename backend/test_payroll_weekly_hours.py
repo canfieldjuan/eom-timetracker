@@ -1194,6 +1194,62 @@ def test_payroll_shift_correction_overlays_clock_break_without_mutating_shift(cl
         _delete_timesheet_site(customer_id, location_id)
 
 
+def test_admin_entry_adjust_rejects_active_payroll_shift_correction(client, auth):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=2)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Raw Edit Guard Mayra",
+            role="payroll",
+        )
+        employee_id = _create_employee("Payroll Raw Edit Guard Alma")
+        payroll_auth = _login(client, "Payroll Raw Edit Guard Mayra")
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 12),
+        )
+
+        corrected = client.post(
+            "/api/admin/payroll/timesheet/shift-corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "shiftId": shift_id,
+                "date": service_day.isoformat(),
+                "correctedClockIn": _local_dt(service_day, 8, 15).isoformat(),
+                "correctedClockOut": _local_dt(service_day, 12, 15).isoformat(),
+                "correctedBreakMinutes": 0,
+                "reason": "Mayra corrected this shift before a legacy raw edit.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+
+        adjusted = client.patch(
+            f"/api/admin/entries/{shift_id}",
+            headers=auth,
+            json={"clockOut": _local_dt(service_day, 13).strftime("%Y-%m-%dT%H:%M")},
+        )
+
+        assert adjusted.status_code == 400
+        assert adjusted.json()["error"] == (
+            "Entry has an active payroll correction; void or supersede "
+            "the correction before editing raw clock times"
+        )
+        raw_shift = db.query_one(
+            "SELECT clock_out, total_hours FROM shifts WHERE id = %s",
+            (shift_id,),
+        )
+        assert raw_shift["clock_out"].astimezone(CHICAGO).strftime("%H:%M") == "12:00"
+        assert float(raw_shift["total_hours"]) == 4.0
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
 def test_payroll_shift_correction_rejects_moving_source_shift_to_another_date(
     client,
 ):
