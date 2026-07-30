@@ -620,21 +620,37 @@ def _different_fingerprint(fingerprint: str) -> str:
     return ("0" * 64) if fingerprint != ("0" * 64) else ("1" * 64)
 
 
-def test_payroll_lock_helpers_acquire_shared_table_family_in_one_order():
-    expected_order = [
+def test_payroll_lock_helpers_avoid_shift_table_lock_for_payroll_edits():
+    source_order = [
         "shifts",
         "payroll_shift_corrections",
         "payroll_hour_corrections",
         "payroll_hour_correction_allocations",
     ]
-    for helper in (
-        time_tracker_api._lock_payroll_source_rows,
-        time_tracker_api._lock_payroll_correction_write_tables,
-    ):
-        source = inspect.getsource(helper)
-        lock_clause = source[source.index("LOCK TABLE") :]
-        positions = [lock_clause.index(table_name) for table_name in expected_order]
-        assert positions == sorted(positions)
+    source_lock = inspect.getsource(time_tracker_api._lock_payroll_source_rows)
+    source_lock_clause = source_lock[source_lock.index("LOCK TABLE") :]
+    source_positions = [
+        source_lock_clause.index(table_name)
+        for table_name in source_order
+    ]
+    assert source_positions == sorted(source_positions)
+
+    write_lock = inspect.getsource(
+        time_tracker_api._lock_payroll_correction_write_tables
+    )
+    write_lock_clause = write_lock[write_lock.index("LOCK TABLE") :]
+    assert "shifts" not in write_lock_clause
+    write_order = source_order[1:]
+    write_positions = [
+        write_lock_clause.index(table_name)
+        for table_name in write_order
+    ]
+    assert write_positions == sorted(write_positions)
+
+    cleanup_source = inspect.getsource(time_tracker_api.admin_apply_time_data_correction)
+    assert cleanup_source.index("_lock_payroll_source_rows") < cleanup_source.index(
+        "_lock_payroll_correction_write_tables"
+    )
 
 
 def test_admin_can_create_update_and_log_in_payroll_role(client, auth):
@@ -1178,6 +1194,61 @@ def test_payroll_shift_correction_overlays_clock_break_without_mutating_shift(cl
         _delete_timesheet_site(customer_id, location_id)
 
 
+def test_payroll_shift_correction_rejects_moving_source_shift_to_another_date(
+    client,
+):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=1)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Shift Date Guard Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Shift Date Guard Alma")
+        payroll_auth = _login(client, "Payroll Shift Date Guard Mayra")
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 12),
+        )
+
+        moved = client.post(
+            "/api/admin/payroll/timesheet/shift-corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "shiftId": shift_id,
+                "date": (service_day + timedelta(days=1)).isoformat(),
+                "correctedClockIn": _local_dt(
+                    service_day + timedelta(days=1),
+                    8,
+                ).isoformat(),
+                "correctedClockOut": _local_dt(
+                    service_day + timedelta(days=1),
+                    12,
+                ).isoformat(),
+                "correctedBreakMinutes": 0,
+                "reason": "This stale request tries to move the work date.",
+            },
+        )
+
+        assert moved.status_code == 400
+        assert moved.json()["error"] == (
+            "Correction date must match the source shift work date"
+        )
+        assert db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM payroll_shift_corrections
+            WHERE shift_id = %s
+            """,
+            (shift_id,),
+        )["count"] == 0
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
 def test_payroll_shift_correction_allows_anomalous_long_source_shift(client):
     week_start = date(2026, 7, 19)
     service_day = week_start + timedelta(days=1)
@@ -1585,6 +1656,53 @@ def test_payroll_timesheet_clips_open_shift_segment_to_week_start(
         assert shift["segmentClockIn"]["localIso"].startswith("2026-07-19T00:00:00")
         assert shift["segmentClockOut"] is None
         assert shift["totalMinutes"] == 0
+        assert shift["fieldSupport"] == {
+            "clockIn": {"display": True, "correction": False},
+            "clockOut": {"display": True, "correction": False},
+            "breakMinutes": {"display": True, "correction": False},
+            "totalHours": {"display": True, "correction": False},
+        }
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_timesheet_offers_row_edit_for_same_day_open_shift(
+    client,
+    monkeypatch,
+):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=3)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Same Day Open Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Same Day Open Alma")
+        payroll_auth = _login(client, "Payroll Same Day Open Mayra")
+        monkeypatch.setattr(
+            time_tracker_api,
+            "utc_now",
+            lambda: _local_dt(service_day, 12).astimezone(timezone.utc),
+        )
+        shift_id = _create_shift(employee_id, _local_dt(service_day, 8), None)
+
+        body = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+
+        wednesday = body["employees"][0]["days"][3]
+        shift = wednesday["shifts"][0]
+        assert shift["shiftId"] == shift_id
+        assert wednesday["issueCodes"] == ["missing_clock_out"]
+        assert shift["fieldSupport"] == {
+            "clockIn": {"display": True, "correction": True},
+            "clockOut": {"display": True, "correction": True},
+            "breakMinutes": {"display": True, "correction": True},
+            "totalHours": {"display": True, "correction": False},
+        }
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_employees([value for value in (employee_id, payroll_id) if value])

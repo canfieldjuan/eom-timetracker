@@ -11998,6 +11998,7 @@ def admin_apply_time_data_correction(
                 "SELECT pg_advisory_xact_lock(%s)",
                 (TIMESHEET_PG_ADVISORY_LOCK_ID,),
             )
+            _lock_payroll_source_rows(cur)
             _lock_payroll_correction_write_tables(cur)
             if requested_ids:
                 cur.execute(
@@ -12981,11 +12982,25 @@ def _serialize_payroll_timesheet_shift(
         )
         source_total_minutes = int(correction_row["source_total_minutes"])
         source_break_minutes = correction_row.get("source_break_minutes")
-    can_correct_shift = (
-        segment_count == 1
-        and source_clock_out is not None
-        and to_local(source_clock_in).date() == segment["date"]
+    source_starts_on_segment_date = to_local(source_clock_in).date() == segment["date"]
+    source_ends_on_segment_date = (
+        source_clock_out is not None
         and to_local(source_clock_out).date() == segment["date"]
+    )
+    can_correct_closed_shift = (
+        segment_count == 1
+        and source_starts_on_segment_date
+        and source_ends_on_segment_date
+    )
+    can_correct_open_shift = (
+        segment_count == 1
+        and source_clock_out is None
+        and source_starts_on_segment_date
+        and "missing_clock_out" in issue_codes
+    )
+    can_correct_shift = (
+        can_correct_closed_shift
+        or can_correct_open_shift
     )
     result = {
         "rowId": f"shift:{int(shift_row['id'])}:{segment['date'].isoformat()}:{segment_index}",
@@ -13997,9 +14012,6 @@ def _lock_payroll_verification_week(cur: Any, week_start: date) -> None:
 
 
 def _lock_payroll_source_rows(cur: Any) -> None:
-    # Keep this table order aligned with _lock_payroll_correction_write_tables.
-    # PostgreSQL table locks are cheap here compared with a cross-path deadlock
-    # between verification reads and correction/cleanup writes.
     cur.execute(
         """
         LOCK TABLE
@@ -14014,12 +14026,9 @@ def _lock_payroll_source_rows(cur: Any) -> None:
 
 
 def _lock_payroll_correction_write_tables(cur: Any) -> None:
-    # Acquire shifts first because time-data cleanup mutates shifts and payroll
-    # verification reads lock shifts before correction tables.
     cur.execute(
         """
         LOCK TABLE
-            shifts,
             payroll_shift_corrections,
             payroll_hour_corrections,
             payroll_hour_correction_allocations
@@ -14278,6 +14287,30 @@ def _ensure_payroll_shift_correction_dates(
         raise HTTPException(
             status_code=400,
             detail="Corrected shift times must stay on the correction date",
+        )
+
+
+def _payroll_shift_source_work_date(shift_row: Dict[str, Any]) -> date:
+    local_date = shift_row.get("local_date")
+    if isinstance(local_date, date):
+        return local_date
+    if local_date:
+        try:
+            return datetime.strptime(str(local_date), "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    return to_local(shift_row["clock_in"]).date()
+
+
+def _ensure_payroll_shift_correction_source_date(
+    shift_row: Dict[str, Any],
+    correction_date: date,
+) -> None:
+    source_date = _payroll_shift_source_work_date(shift_row)
+    if correction_date != source_date:
+        raise HTTPException(
+            status_code=400,
+            detail="Correction date must match the source shift work date",
         )
 
 
@@ -14688,6 +14721,10 @@ def admin_create_payroll_shift_correction(
                     status_code=400,
                     detail="Shift does not overlap the selected payroll week",
                 )
+            _ensure_payroll_shift_correction_source_date(
+                dict(shift_row),
+                correction_date,
+            )
             source_total_minutes = _payroll_raw_shift_total_minutes(dict(shift_row))
             cur.execute(
                 """
@@ -14775,7 +14812,6 @@ def admin_create_payroll_shift_correction(
                         (int(saved["id"]), int(existing["id"])),
                     )
                 idempotent = False
-            _lock_payroll_source_rows(cur)
             timesheet = _compute_payroll_timesheet(
                 week_start.isoformat(),
                 employee_id=int(payload.employeeId),
@@ -14854,7 +14890,6 @@ def admin_void_payroll_shift_correction(
             )
             saved = dict(cur.fetchone())
             saved["employee_name"] = str(row["employee_name"])
-            _lock_payroll_source_rows(cur)
             timesheet = _compute_payroll_timesheet(
                 week_start.isoformat(),
                 employee_id=int(row["employee_id"]),
@@ -15030,7 +15065,6 @@ def admin_create_payroll_hour_correction(
                         (int(saved["id"]), int(existing["id"])),
                     )
                 idempotent = False
-            _lock_payroll_source_rows(cur)
             weekly_hours = _compute_payroll_weekly_hours(week_start.isoformat(), cursor=cur)
             result = {
                 "success": True,
@@ -15125,7 +15159,6 @@ def admin_void_payroll_hour_correction(
                     correction_id,
                 ),
             )
-            _lock_payroll_source_rows(cur)
             weekly_hours = _compute_payroll_weekly_hours(week_start.isoformat(), cursor=cur)
             result = {
                 "success": True,

@@ -4403,6 +4403,7 @@ def build_operations_schedule_router(
             app_timezone,
             visible_range_start=range_start,
             visible_range_end=range_end,
+            payroll_week_start=_sunday_for(resolved_start),
         )
         active_jobs = [job for job in schedule_jobs if job["includedInPlan"]]
         known_planned_hours = sum(

@@ -1175,6 +1175,106 @@ def _unmatched_for_shift(body: dict, shift_id: int) -> list[dict]:
     ]
 
 
+def test_operations_schedule_scopes_shift_correction_overlay_to_visible_week(
+    client,
+    auth,
+):
+    chicago = ZoneInfo("America/Chicago")
+    week_start = date(2026, 7, 19)
+    next_week_start = week_start + timedelta(days=7)
+    service_day = week_start + timedelta(days=1)
+    shift_start = datetime(2026, 7, 20, 9, tzinfo=chicago)
+    source_shift_end = datetime(2026, 7, 20, 11, tzinfo=chicago)
+    current_week_corrected_end = datetime(2026, 7, 20, 12, tzinfo=chicago)
+    later_week_corrected_end = datetime(2026, 7, 20, 10, tzinfo=chicago)
+
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            site_id, job_id = _canonical_job(
+                cur,
+                suffix="Correction Scope",
+                start=shift_start,
+                end=current_week_corrected_end,
+            )
+            employee_id = _employee(cur, "Correction Scope", 20)
+            shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=shift_start,
+                end=source_shift_end,
+                service_day=service_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Correction Scope",
+                job_id=job_id,
+            )
+            cur.execute(
+                """
+                INSERT INTO payroll_shift_corrections (
+                    week_start,
+                    correction_date,
+                    employee_id,
+                    shift_id,
+                    source_clock_in,
+                    source_clock_out,
+                    source_break_minutes,
+                    source_total_minutes,
+                    corrected_clock_in,
+                    corrected_clock_out,
+                    corrected_break_minutes,
+                    corrected_total_minutes,
+                    reason,
+                    status,
+                    created_by_employee_id,
+                    created_by_name
+                )
+                VALUES
+                    (
+                        %s, %s, %s, %s, %s, %s, NULL, 120,
+                        %s, %s, 0, 180,
+                        'Current payroll week correction.',
+                        'active',
+                        %s,
+                        'Mayra'
+                    ),
+                    (
+                        %s, %s, %s, %s, %s, %s, NULL, 120,
+                        %s, %s, 0, 60,
+                        'Later payroll week correction must not leak backward.',
+                        'active',
+                        %s,
+                        'Mayra'
+                    )
+                """,
+                (
+                    week_start,
+                    service_day,
+                    employee_id,
+                    shift_id,
+                    shift_start,
+                    source_shift_end,
+                    shift_start,
+                    current_week_corrected_end,
+                    employee_id,
+                    next_week_start,
+                    next_week_start + timedelta(days=1),
+                    employee_id,
+                    shift_id,
+                    shift_start,
+                    source_shift_end,
+                    shift_start,
+                    later_week_corrected_end,
+                    employee_id,
+                ),
+            )
+
+    body = _schedule_body(client, auth, service_day)
+    job = _schedule_job(body, job_id)
+
+    assert job["actualHours"] == pytest.approx(3.0)
+    assert job["actualLaborCost"] == pytest.approx(60.0)
+    assert job["workers"][0]["hours"] == pytest.approx(3.0)
+
+
 def test_monthly_allocation_is_exact_and_stable():
     assert allocate_monthly_cents(10_000, [7, 9, 11]) == {
         7: 3334,
