@@ -2217,6 +2217,7 @@ def _closed_shift_segments(
         "employee_id": int(shift["employee_id"]),
         "employee_name": str(shift["employee_name"]),
         "hourly_rate": shift.get("hourly_rate"),
+        "payroll_break_minutes": int(shift.get("payroll_break_minutes") or 0),
         "finalized": True,
     }
 
@@ -2304,10 +2305,7 @@ def _closed_shift_segments(
                 end=upper,
                 base_evidence="unassigned_gap",
             )
-        return _apply_shift_break_minutes_to_segments(
-            output,
-            int(shift.get("payroll_break_minutes") or 0),
-        )
+        return output
 
     cursor = lower
     used_departures: set[int] = set()
@@ -2403,10 +2401,7 @@ def _closed_shift_segments(
             end=upper,
             base_evidence="unassigned_gap",
         )
-    return _apply_shift_break_minutes_to_segments(
-        [segment for segment in output if segment["end"] > segment["start"]],
-        int(shift.get("payroll_break_minutes") or 0),
-    )
+    return [segment for segment in output if segment["end"] > segment["start"]]
 
 
 def _open_shift_presence(
@@ -2619,6 +2614,61 @@ def _serialize_unmatched(
     }
 
 
+def _apply_resolved_shift_break_minutes(
+    resolved_segments: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Deduct corrected breaks only after every shift segment has a job verdict."""
+
+    if not resolved_segments:
+        return resolved_segments
+
+    indexed_segments: List[Dict[str, Any]] = []
+    segments_by_shift_id: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for index, resolved in enumerate(resolved_segments):
+        segment = dict(resolved["segment"])
+        segment["_break_allocation_index"] = index
+        indexed = {**resolved, "segment": segment}
+        indexed_segments.append(indexed)
+
+        shift_id = segment.get("shift_id")
+        if shift_id is None:
+            continue
+        segments_by_shift_id[int(shift_id)].append(indexed)
+
+    active_indices = set(range(len(indexed_segments)))
+    adjusted_by_index: Dict[int, Dict[str, Any]] = {}
+    for shift_segments in segments_by_shift_id.values():
+        break_minutes = max(
+            int(resolved["segment"].get("payroll_break_minutes") or 0)
+            for resolved in shift_segments
+        )
+        if break_minutes <= 0:
+            continue
+
+        adjusted = _apply_shift_break_minutes_to_segments(
+            [resolved["segment"] for resolved in shift_segments],
+            break_minutes,
+        )
+        adjusted_indices = {
+            int(segment["_break_allocation_index"]) for segment in adjusted
+        }
+        for segment in adjusted:
+            adjusted_by_index[int(segment["_break_allocation_index"])] = segment
+        for resolved in shift_segments:
+            index = int(resolved["segment"]["_break_allocation_index"])
+            if index not in adjusted_indices:
+                active_indices.discard(index)
+
+    output: List[Dict[str, Any]] = []
+    for index, resolved in enumerate(indexed_segments):
+        if index not in active_indices:
+            continue
+        segment = dict(adjusted_by_index.get(index, resolved["segment"]))
+        segment.pop("_break_allocation_index", None)
+        output.append({**resolved, "segment": segment})
+    return output
+
+
 def _decorate_schedule_jobs(
     jobs: List[Dict[str, Any]],
     range_start: datetime,
@@ -2738,6 +2788,7 @@ def _decorate_schedule_jobs(
 
     workers_by_job: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
     unmatched: List[Dict[str, Any]] = []
+    resolved_segments: List[Dict[str, Any]] = []
     for segment in segments:
         job, reason, candidate_job_ids = _match_segment_to_job(
             segment,
@@ -2747,6 +2798,13 @@ def _decorate_schedule_jobs(
             linked_jobs_by_id=linked_jobs_by_id,
         )
         if job is None:
+            resolved_segments.append(
+                {
+                    "segment": dict(segment),
+                    "job": None,
+                    "reason": reason,
+                }
+            )
             shift_id = segment.get("shift_id")
             is_cross_boundary_shift = (
                 shift_id is not None and int(shift_id) in cross_boundary_shift_ids
@@ -2764,6 +2822,22 @@ def _decorate_schedule_jobs(
             unmatched.append(_serialize_unmatched(segment, reason, candidate_job_ids))
             continue
 
+        matched_segment = dict(segment)
+        matched_segment["job_id"] = int(job["id"])
+        resolved_segments.append(
+            {
+                "segment": matched_segment,
+                "job": job,
+                "reason": reason,
+            }
+        )
+
+    for resolved in _apply_resolved_shift_break_minutes(resolved_segments):
+        segment = resolved["segment"]
+        job = resolved["job"]
+        if job is None:
+            continue
+        reason = resolved["reason"]
         job_id = int(job["id"])
         employee_id = int(segment["employee_id"])
         worker = workers_by_job[job_id].setdefault(

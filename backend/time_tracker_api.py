@@ -14408,6 +14408,57 @@ def _ensure_payroll_shift_correction_source_date(
         )
 
 
+def _ensure_shift_correction_void_keeps_single_open_shift(
+    cur: Any,
+    correction_row: Dict[str, Any],
+) -> None:
+    if correction_row.get("source_clock_out") is not None:
+        return
+
+    cur.execute(
+        """
+        SELECT id
+        FROM shifts
+        WHERE id = %s
+          AND clock_out IS NULL
+        FOR UPDATE
+        """,
+        (int(correction_row["shift_id"]),),
+    )
+    if cur.fetchone() is None:
+        return
+
+    cur.execute(
+        """
+        SELECT shift_row.id
+        FROM shifts shift_row
+        WHERE shift_row.employee_id = %s
+          AND shift_row.id <> %s
+          AND shift_row.clock_out IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM payroll_shift_corrections active_correction
+              WHERE active_correction.shift_id = shift_row.id
+                AND active_correction.status = 'active'
+          )
+        ORDER BY shift_row.clock_in DESC, shift_row.id DESC
+        LIMIT 1
+        FOR UPDATE OF shift_row
+        """,
+        (int(correction_row["employee_id"]), int(correction_row["shift_id"])),
+    )
+    if cur.fetchone() is None:
+        return
+
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Cannot void this correction while the employee has another open shift; "
+            "clock out the current shift or correct it before voiding the older one"
+        ),
+    )
+
+
 def _serialize_payroll_correction(row: Dict[str, Any]) -> Dict[str, Any]:
     corrected_minutes = int(row["corrected_total_minutes"])
     return {
@@ -14938,66 +14989,68 @@ def admin_void_payroll_shift_correction(
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
-    with db.get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT week_start FROM payroll_shift_corrections WHERE id = %s",
-                (correction_id,),
-            )
-            identity = cur.fetchone()
-            if identity is None:
-                raise HTTPException(status_code=404, detail="Active payroll shift correction not found")
-            week_start = identity["week_start"]
-            _lock_payroll_verification_week(cur, week_start)
-            _ensure_payroll_week_corrections_editable(cur, week_start)
-            _lock_payroll_correction_write_tables(cur)
-            cur.execute(
-                """
-                SELECT correction.*, employee.name AS employee_name
-                FROM payroll_shift_corrections correction
-                JOIN employees employee ON employee.id = correction.employee_id
-                WHERE correction.id = %s
-                  AND correction.status = 'active'
-                FOR UPDATE
-                """,
-                (correction_id,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                raise HTTPException(status_code=404, detail="Active payroll shift correction not found")
-            cur.execute(
-                """
-                UPDATE payroll_shift_corrections
-                SET
-                    status = 'voided',
-                    voided_by_employee_id = %s,
-                    voided_by_name = %s,
-                    voided_reason = %s,
-                    voided_at = NOW(),
-                    updated_at = NOW()
-                WHERE id = %s
-                RETURNING *
-                """,
-                (
-                    int(current_payroll["id"]),
-                    str(current_payroll["name"]),
-                    payload.reason,
-                    correction_id,
-                ),
-            )
-            saved = dict(cur.fetchone())
-            saved["employee_name"] = str(row["employee_name"])
-            timesheet = _compute_payroll_timesheet(
-                week_start.isoformat(),
-                employee_id=int(row["employee_id"]),
-                cursor=cur,
-            )
-            result = {
-                "success": True,
-                "action": "void_shift_correction",
-                "correction": _serialize_payroll_shift_correction(saved),
-                "timesheet": timesheet,
-            }
+    with timesheet_postgres_advisory_lock():
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT week_start FROM payroll_shift_corrections WHERE id = %s",
+                    (correction_id,),
+                )
+                identity = cur.fetchone()
+                if identity is None:
+                    raise HTTPException(status_code=404, detail="Active payroll shift correction not found")
+                week_start = identity["week_start"]
+                _lock_payroll_verification_week(cur, week_start)
+                _ensure_payroll_week_corrections_editable(cur, week_start)
+                _lock_payroll_correction_write_tables(cur)
+                cur.execute(
+                    """
+                    SELECT correction.*, employee.name AS employee_name
+                    FROM payroll_shift_corrections correction
+                    JOIN employees employee ON employee.id = correction.employee_id
+                    WHERE correction.id = %s
+                      AND correction.status = 'active'
+                    FOR UPDATE
+                    """,
+                    (correction_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Active payroll shift correction not found")
+                _ensure_shift_correction_void_keeps_single_open_shift(cur, dict(row))
+                cur.execute(
+                    """
+                    UPDATE payroll_shift_corrections
+                    SET
+                        status = 'voided',
+                        voided_by_employee_id = %s,
+                        voided_by_name = %s,
+                        voided_reason = %s,
+                        voided_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (
+                        int(current_payroll["id"]),
+                        str(current_payroll["name"]),
+                        payload.reason,
+                        correction_id,
+                    ),
+                )
+                saved = dict(cur.fetchone())
+                saved["employee_name"] = str(row["employee_name"])
+                timesheet = _compute_payroll_timesheet(
+                    week_start.isoformat(),
+                    employee_id=int(row["employee_id"]),
+                    cursor=cur,
+                )
+                result = {
+                    "success": True,
+                    "action": "void_shift_correction",
+                    "correction": _serialize_payroll_shift_correction(saved),
+                    "timesheet": timesheet,
+                }
 
     append_access_log(
         request,
