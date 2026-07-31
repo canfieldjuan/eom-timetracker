@@ -1764,6 +1764,55 @@ def test_payroll_timesheet_offers_row_edit_for_same_day_open_shift(
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
+def test_payroll_shift_correction_rejects_future_clock_out(
+    client,
+    monkeypatch,
+):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=3)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Future Clockout Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Future Clockout Alma")
+        payroll_auth = _login(client, "Payroll Future Clockout Mayra")
+        monkeypatch.setattr(
+            time_tracker_api,
+            "utc_now",
+            lambda: _local_dt(service_day, 10).astimezone(timezone.utc),
+        )
+        shift_id = _create_shift(employee_id, _local_dt(service_day, 8), None)
+
+        corrected = client.post(
+            "/api/admin/payroll/timesheet/shift-corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "shiftId": shift_id,
+                "date": service_day.isoformat(),
+                "correctedClockIn": _local_dt(service_day, 8).isoformat(),
+                "correctedClockOut": _local_dt(service_day, 12).isoformat(),
+                "correctedBreakMinutes": 0,
+                "reason": "This correction should not count future hours.",
+            },
+        )
+
+        assert corrected.status_code == 400
+        assert corrected.json()["error"] == "Corrected clock-out cannot be in the future"
+        assert db.query_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM payroll_shift_corrections
+            WHERE shift_id = %s
+            """,
+            (shift_id,),
+        )["count"] == 0
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
 def test_payroll_shift_correction_closes_open_source_shift_for_later_weeks(
     client,
     monkeypatch,

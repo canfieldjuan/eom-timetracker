@@ -2152,11 +2152,25 @@ def _apply_shift_break_minutes_to_segments(
         for segment in duration_segments
         if segment.get("location_id") is not None
     }
+    job_ids = {
+        int(segment["job_id"])
+        for segment in duration_segments
+        if segment.get("job_id") is not None
+    }
     has_unallocated_time = any(
         segment.get("location_id") is None
         for segment in duration_segments
     )
-    if has_unallocated_time or len(located_site_ids) != 1:
+    has_unallocated_job = any(
+        segment.get("job_id") is None
+        for segment in duration_segments
+    )
+    if (
+        has_unallocated_time
+        or len(located_site_ids) != 1
+        or has_unallocated_job
+        or len(job_ids) != 1
+    ):
         return segments
 
     adjusted: List[Dict[str, Any]] = []

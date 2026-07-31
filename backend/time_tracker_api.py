@@ -14345,11 +14345,17 @@ def _ensure_payroll_shift_correction_dates(
     correction_date: date,
     corrected_clock_in: datetime,
     corrected_clock_out: datetime,
+    observed_at: datetime,
 ) -> None:
     if corrected_clock_out <= corrected_clock_in:
         raise HTTPException(
             status_code=400,
             detail="Corrected clock-out must be after corrected clock-in",
+        )
+    if corrected_clock_out > observed_at + timedelta(minutes=5):
+        raise HTTPException(
+            status_code=400,
+            detail="Corrected clock-out cannot be in the future",
         )
     local_clock_in_date = to_local(corrected_clock_in).date()
     local_clock_out_date = to_local(corrected_clock_out).date()
@@ -14750,10 +14756,12 @@ def admin_create_payroll_shift_correction(
         payload.correctedClockOut,
         "correctedClockOut",
     )
+    observed_at = utc_now()
     _ensure_payroll_shift_correction_dates(
         correction_date=correction_date,
         corrected_clock_in=corrected_clock_in,
         corrected_clock_out=corrected_clock_out,
+        observed_at=observed_at,
     )
     corrected_total_minutes = _payroll_corrected_shift_total_minutes(
         corrected_clock_in,
@@ -14785,7 +14793,7 @@ def admin_create_payroll_shift_correction(
                 dict(shift_row),
                 week_start_utc=week_start_utc,
                 week_end_utc=week_end_utc,
-                now_utc=utc_now(),
+                now_utc=observed_at,
             ):
                 raise HTTPException(
                     status_code=400,
