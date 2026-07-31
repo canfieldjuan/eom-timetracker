@@ -1959,6 +1959,115 @@ def test_payroll_shift_correction_resolves_open_shift_for_next_clock_in(
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
+def test_payroll_shift_correction_excludes_resolved_open_shift_from_status_views(
+    client,
+    monkeypatch,
+):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=3)
+    admin_id = None
+    employee_id = None
+    try:
+        admin_id = _create_employee("Payroll Open Status Admin", role="admin")
+        employee_id = _create_employee("Payroll Open Status Alma")
+        admin_auth = _login(client, "Payroll Open Status Admin")
+        employee_auth = _login(client, "Payroll Open Status Alma")
+        monkeypatch.setattr(time_tracker_api, "ENFORCE_CLOCK_HOURS", False)
+        monkeypatch.setattr(
+            time_tracker_api,
+            "utc_now",
+            lambda: _local_dt(service_day, 12).astimezone(timezone.utc),
+        )
+        source_shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            None,
+        )
+
+        corrected = client.post(
+            "/api/admin/payroll/timesheet/shift-corrections",
+            headers=admin_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "shiftId": source_shift_id,
+                "date": service_day.isoformat(),
+                "correctedClockIn": _local_dt(service_day, 8).isoformat(),
+                "correctedClockOut": _local_dt(service_day, 11).isoformat(),
+                "correctedBreakMinutes": 0,
+                "reason": "Mayra closed this raw open shift before status checks.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+
+        employee_status = client.get(
+            "/api/timesheet/current-status",
+            headers=employee_auth,
+        )
+        assert employee_status.status_code == 200, employee_status.text
+        assert employee_status.json()["currentlyWorking"] == []
+
+        dashboard = time_tracker_api.build_dashboard_hours_data()
+        employee_row = next(
+            row
+            for row in dashboard["employees"]
+            if row["name"] == "Payroll Open Status Alma"
+        )
+        assert employee_row["currentlyWorking"] is False
+        assert employee_row["totalHours"] == 0.0
+        assert employee_row["shifts"] == []
+
+        monkeypatch.setattr(
+            time_tracker_api,
+            "utc_now",
+            lambda: _local_dt(service_day, 12, 30).astimezone(timezone.utc),
+        )
+        next_clock_in = client.post(
+            "/api/timesheet/clock-in",
+            headers=employee_auth,
+            json={
+                "location": "Payroll Open Status Current Site",
+                "gpsOverrideReason": "payroll correction closed prior shift",
+            },
+        )
+        assert next_clock_in.status_code == 200, next_clock_in.text
+
+        monkeypatch.setattr(
+            time_tracker_api,
+            "utc_now",
+            lambda: _local_dt(service_day, 13).astimezone(timezone.utc),
+        )
+        current_status = client.get(
+            "/api/timesheet/current-status",
+            headers=employee_auth,
+        )
+        assert current_status.status_code == 200, current_status.text
+        current_rows = current_status.json()["currentlyWorking"]
+        assert [row["location"] for row in current_rows] == [
+            "Payroll Open Status Current Site"
+        ]
+
+        refreshed_dashboard = time_tracker_api.build_dashboard_hours_data()
+        refreshed_row = next(
+            row
+            for row in refreshed_dashboard["employees"]
+            if row["name"] == "Payroll Open Status Alma"
+        )
+        assert refreshed_row["currentlyWorking"] is True
+        assert refreshed_row["totalHours"] == 0.5
+        assert refreshed_row["shifts"] == [
+            {
+                "date": service_day.isoformat(),
+                "startTime": "12:30",
+                "endTime": "--:--",
+                "hours": 0.5,
+            }
+        ]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, admin_id) if value])
+
+
 def test_payroll_shift_correction_void_rejects_second_open_shift(
     client,
     monkeypatch,

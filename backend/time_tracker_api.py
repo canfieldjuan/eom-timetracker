@@ -1201,13 +1201,37 @@ def _entry_resolved_by_payroll_correction(entry: Dict[str, Any]) -> bool:
     return _shift_has_active_payroll_correction(shift_id)
 
 
+def _raw_open_entry_is_stale(
+    entry: Dict[str, Any],
+    reference_time: datetime,
+) -> bool:
+    try:
+        started_at = parse_utc_iso(str(entry.get("clockIn", "")))
+    except ValueError:
+        return False
+
+    elapsed_hours = (reference_time - started_at).total_seconds() / 3600
+    return elapsed_hours > MAX_ACTIVE_SHIFT_HOURS
+
+
+def is_current_open_entry(
+    entry: Dict[str, Any],
+    reference_time: datetime,
+) -> bool:
+    if entry.get("clockOut") is not None:
+        return False
+    if _entry_resolved_by_payroll_correction(entry):
+        return False
+    return not _raw_open_entry_is_stale(entry, reference_time)
+
+
 def get_open_entry(entries: List[Dict[str, Any]], employee_id: int) -> Optional[Dict[str, Any]]:
+    now = utc_now()
     open_entries = [
         entry
         for entry in entries
         if entry.get("employeeId") == employee_id
-        and entry.get("clockOut") is None
-        and not _entry_resolved_by_payroll_correction(entry)
+        and is_current_open_entry(entry, now)
     ]
     if not open_entries:
         return None
@@ -1221,14 +1245,7 @@ def is_stale_open_entry(entry: Dict[str, Any], reference_time: datetime) -> bool
         return False
     if _entry_resolved_by_payroll_correction(entry):
         return False
-
-    try:
-        started_at = parse_utc_iso(str(entry.get("clockIn", "")))
-    except ValueError:
-        return False
-
-    elapsed_hours = (reference_time - started_at).total_seconds() / 3600
-    return elapsed_hours > MAX_ACTIVE_SHIFT_HOURS
+    return _raw_open_entry_is_stale(entry, reference_time)
 
 
 def get_stale_open_entry(
@@ -1483,7 +1500,10 @@ def entry_hours(entry: Dict[str, Any], reference_time: datetime) -> float:
 
     clock_out_value = entry.get("clockOut")
     if clock_out_value is None:
-        if is_stale_open_entry(entry, reference_time):
+        if (
+            _entry_resolved_by_payroll_correction(entry)
+            or _raw_open_entry_is_stale(entry, reference_time)
+        ):
             return 0.0
         duration = reference_time - clock_in_time
         duration_hours = duration.total_seconds() / 3600
@@ -1508,8 +1528,7 @@ def latest_open_entry(entries: List[Dict[str, Any]], employee_id: int) -> Option
         entry
         for entry in entries
         if entry.get("employeeId") == employee_id
-        and entry.get("clockOut") is None
-        and not is_stale_open_entry(entry, now)
+        and is_current_open_entry(entry, now)
     ]
     if not open_entries:
         return None
@@ -1533,6 +1552,14 @@ def build_dashboard_hours_data() -> Dict[str, Any]:
         employee_id = int(employee["id"])
         relevant_entries = [
             entry for entry in timesheet_data["entries"] if int(entry.get("employeeId", 0)) == employee_id
+        ]
+        relevant_entries = [
+            entry
+            for entry in relevant_entries
+            if not (
+                entry.get("clockOut") is None
+                and _entry_resolved_by_payroll_correction(entry)
+            )
         ]
         open_entry = latest_open_entry(relevant_entries, employee_id)
         currently_working = open_entry is not None
@@ -1627,9 +1654,7 @@ def build_public_current_status(
 
     rows: List[Dict[str, Any]] = []
     for entry in timesheet_data["entries"]:
-        if entry.get("clockOut") is not None:
-            continue
-        if is_stale_open_entry(entry, now):
+        if not is_current_open_entry(entry, now):
             continue
 
         try:
