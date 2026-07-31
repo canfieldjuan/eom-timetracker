@@ -2017,6 +2017,20 @@ def test_payroll_shift_correction_excludes_resolved_open_shift_from_status_views
         assert employee_row["totalHours"] == 0.0
         assert employee_row["shifts"] == []
 
+        my_hours = client.get("/api/timesheet/my-hours", headers=employee_auth)
+        assert my_hours.status_code == 200, my_hours.text
+        assert my_hours.json()["weeklyHours"] == 0.0
+        assert my_hours.json()["recentShifts"] == []
+
+        admin_hours = client.get(
+            f"/api/admin/employees/{employee_id}/hours",
+            headers=admin_auth,
+        )
+        assert admin_hours.status_code == 200, admin_hours.text
+        assert admin_hours.json()["weeklyHours"] == 0.0
+        assert admin_hours.json()["shifts"] == []
+        assert all(day["shifts"] == [] for day in admin_hours.json()["weekGrid"])
+
         monkeypatch.setattr(
             time_tracker_api,
             "utc_now",
@@ -2046,6 +2060,32 @@ def test_payroll_shift_correction_excludes_resolved_open_shift_from_status_views
         assert [row["location"] for row in current_rows] == [
             "Payroll Open Status Current Site"
         ]
+
+        current_my_hours = client.get("/api/timesheet/my-hours", headers=employee_auth)
+        assert current_my_hours.status_code == 200, current_my_hours.text
+        assert current_my_hours.json()["weeklyHours"] == 0.5
+        assert current_my_hours.json()["recentShifts"] == [
+            {
+                "date": service_day.isoformat(),
+                "clockIn": "12:30 PM",
+                "clockOut": "Active",
+                "hours": 0.5,
+                "location": "Payroll Open Status Current Site",
+                "customer": "",
+            }
+        ]
+
+        current_admin_hours = client.get(
+            f"/api/admin/employees/{employee_id}/hours",
+            headers=admin_auth,
+        )
+        assert current_admin_hours.status_code == 200, current_admin_hours.text
+        assert current_admin_hours.json()["weeklyHours"] == 0.5
+        assert [
+            shift["location"]
+            for day in current_admin_hours.json()["weekGrid"]
+            for shift in day["shifts"]
+        ] == ["Payroll Open Status Current Site"]
 
         refreshed_dashboard = time_tracker_api.build_dashboard_hours_data()
         refreshed_row = next(

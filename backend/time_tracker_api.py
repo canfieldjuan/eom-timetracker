@@ -1218,11 +1218,28 @@ def is_current_open_entry(
     entry: Dict[str, Any],
     reference_time: datetime,
 ) -> bool:
+    if is_payroll_resolved_open_entry(entry):
+        return False
     if entry.get("clockOut") is not None:
         return False
-    if _entry_resolved_by_payroll_correction(entry):
-        return False
     return not _raw_open_entry_is_stale(entry, reference_time)
+
+
+def is_payroll_resolved_open_entry(entry: Dict[str, Any]) -> bool:
+    return (
+        entry.get("clockOut") is None
+        and _entry_resolved_by_payroll_correction(entry)
+    )
+
+
+def _exclude_payroll_resolved_open_entries(
+    entries: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    return [
+        entry
+        for entry in entries
+        if not is_payroll_resolved_open_entry(entry)
+    ]
 
 
 def get_open_entry(entries: List[Dict[str, Any]], employee_id: int) -> Optional[Dict[str, Any]]:
@@ -1553,14 +1570,7 @@ def build_dashboard_hours_data() -> Dict[str, Any]:
         relevant_entries = [
             entry for entry in timesheet_data["entries"] if int(entry.get("employeeId", 0)) == employee_id
         ]
-        relevant_entries = [
-            entry
-            for entry in relevant_entries
-            if not (
-                entry.get("clockOut") is None
-                and _entry_resolved_by_payroll_correction(entry)
-            )
-        ]
+        relevant_entries = _exclude_payroll_resolved_open_entries(relevant_entries)
         open_entry = latest_open_entry(relevant_entries, employee_id)
         currently_working = open_entry is not None
 
@@ -8611,7 +8621,13 @@ def admin_employee_hours(
     year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     today_str = local_today.isoformat()
 
-    emp_entries = [e for e in timesheet_data["entries"] if e.get("employeeId") == employee_id]
+    emp_entries = _exclude_payroll_resolved_open_entries(
+        [
+            e
+            for e in timesheet_data["entries"]
+            if e.get("employeeId") == employee_id
+        ]
+    )
 
     today_hours = 0.0
     monthly_hours = 0.0
@@ -9215,6 +9231,7 @@ def my_timesheet_hours(
         e for e in timesheet_data.get("entries", [])
         if e.get("employeeId") == employee_id
     ]
+    my_entries = _exclude_payroll_resolved_open_entries(my_entries)
 
     weekly_hours = 0.0
     today_hours = 0.0
