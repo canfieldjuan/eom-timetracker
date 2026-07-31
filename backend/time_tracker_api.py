@@ -1189,9 +1189,25 @@ def load_timesheets() -> Dict[str, Any]:
     return _load_timesheets_from_db()
 
 
+def _entry_resolved_by_payroll_correction(entry: Dict[str, Any]) -> bool:
+    if entry.get("clockOut") is not None:
+        return False
+    try:
+        shift_id = int(entry.get("id") or 0)
+    except (TypeError, ValueError):
+        return False
+    if shift_id <= 0:
+        return False
+    return _shift_has_active_payroll_correction(shift_id)
+
+
 def get_open_entry(entries: List[Dict[str, Any]], employee_id: int) -> Optional[Dict[str, Any]]:
     open_entries = [
-        entry for entry in entries if entry.get("employeeId") == employee_id and entry.get("clockOut") is None
+        entry
+        for entry in entries
+        if entry.get("employeeId") == employee_id
+        and entry.get("clockOut") is None
+        and not _entry_resolved_by_payroll_correction(entry)
     ]
     if not open_entries:
         return None
@@ -1202,6 +1218,8 @@ def get_open_entry(entries: List[Dict[str, Any]], employee_id: int) -> Optional[
 
 def is_stale_open_entry(entry: Dict[str, Any], reference_time: datetime) -> bool:
     if entry.get("clockOut") is not None:
+        return False
+    if _entry_resolved_by_payroll_correction(entry):
         return False
 
     try:
@@ -14769,139 +14787,140 @@ def admin_create_payroll_shift_correction(
         int(payload.correctedBreakMinutes),
     )
     result: Dict[str, Any]
-    with db.get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            _lock_payroll_verification_week(cur, week_start)
-            _ensure_payroll_week_corrections_editable(cur, week_start)
-            _lock_payroll_correction_write_tables(cur)
-            cur.execute(
-                """
-                SELECT shift_row.*, employee.name AS employee_name
-                FROM shifts shift_row
-                JOIN employees employee ON employee.id = shift_row.employee_id
-                WHERE shift_row.id = %s
-                  AND shift_row.employee_id = %s
-                FOR SHARE
-                """,
-                (int(payload.shiftId), int(payload.employeeId)),
-            )
-            shift_row = cur.fetchone()
-            if shift_row is None:
-                raise HTTPException(status_code=404, detail="Shift not found")
-            _, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
-            if not _payroll_shift_overlaps_week(
-                dict(shift_row),
-                week_start_utc=week_start_utc,
-                week_end_utc=week_end_utc,
-                now_utc=observed_at,
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Shift does not overlap the selected payroll week",
-                )
-            _ensure_payroll_shift_correction_source_date(
-                dict(shift_row),
-                correction_date,
-            )
-            source_total_minutes = _payroll_raw_shift_total_minutes(dict(shift_row))
-            cur.execute(
-                """
-                SELECT *
-                FROM payroll_shift_corrections
-                WHERE week_start = %s
-                  AND shift_id = %s
-                  AND status = 'active'
-                FOR UPDATE
-                """,
-                (week_start, int(payload.shiftId)),
-            )
-            existing = cur.fetchone()
-            if (
-                existing
-                and existing["corrected_clock_in"].astimezone(timezone.utc)
-                == corrected_clock_in
-                and existing["corrected_clock_out"].astimezone(timezone.utc)
-                == corrected_clock_out
-                and int(existing["corrected_break_minutes"])
-                == int(payload.correctedBreakMinutes)
-                and str(existing["reason"]) == payload.reason
-            ):
-                saved = dict(existing)
-                saved["employee_name"] = str(shift_row["employee_name"])
-                idempotent = True
-            else:
-                if existing:
-                    cur.execute(
-                        """
-                        UPDATE payroll_shift_corrections
-                        SET status = 'superseded', updated_at = NOW()
-                        WHERE id = %s
-                        """,
-                        (int(existing["id"]),),
-                    )
+    with timesheet_postgres_advisory_lock():
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                _lock_payroll_verification_week(cur, week_start)
+                _ensure_payroll_week_corrections_editable(cur, week_start)
+                _lock_payroll_correction_write_tables(cur)
                 cur.execute(
                     """
-                    INSERT INTO payroll_shift_corrections (
-                        week_start,
-                        correction_date,
-                        employee_id,
-                        shift_id,
-                        source_clock_in,
-                        source_clock_out,
-                        source_break_minutes,
-                        source_total_minutes,
-                        corrected_clock_in,
-                        corrected_clock_out,
-                        corrected_break_minutes,
-                        corrected_total_minutes,
-                        reason,
-                        created_by_employee_id,
-                        created_by_name
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING *
+                    SELECT shift_row.*, employee.name AS employee_name
+                    FROM shifts shift_row
+                    JOIN employees employee ON employee.id = shift_row.employee_id
+                    WHERE shift_row.id = %s
+                      AND shift_row.employee_id = %s
+                    FOR SHARE
                     """,
-                    (
-                        week_start,
-                        correction_date,
-                        int(payload.employeeId),
-                        int(payload.shiftId),
-                        shift_row["clock_in"],
-                        shift_row.get("clock_out"),
-                        source_total_minutes,
-                        corrected_clock_in,
-                        corrected_clock_out,
-                        int(payload.correctedBreakMinutes),
-                        corrected_total_minutes,
-                        payload.reason,
-                        int(current_payroll["id"]),
-                        str(current_payroll["name"]),
-                    ),
+                    (int(payload.shiftId), int(payload.employeeId)),
                 )
-                saved = dict(cur.fetchone())
-                saved["employee_name"] = str(shift_row["employee_name"])
-                if existing:
+                shift_row = cur.fetchone()
+                if shift_row is None:
+                    raise HTTPException(status_code=404, detail="Shift not found")
+                _, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
+                if not _payroll_shift_overlaps_week(
+                    dict(shift_row),
+                    week_start_utc=week_start_utc,
+                    week_end_utc=week_end_utc,
+                    now_utc=observed_at,
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Shift does not overlap the selected payroll week",
+                    )
+                _ensure_payroll_shift_correction_source_date(
+                    dict(shift_row),
+                    correction_date,
+                )
+                source_total_minutes = _payroll_raw_shift_total_minutes(dict(shift_row))
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM payroll_shift_corrections
+                    WHERE week_start = %s
+                      AND shift_id = %s
+                      AND status = 'active'
+                    FOR UPDATE
+                    """,
+                    (week_start, int(payload.shiftId)),
+                )
+                existing = cur.fetchone()
+                if (
+                    existing
+                    and existing["corrected_clock_in"].astimezone(timezone.utc)
+                    == corrected_clock_in
+                    and existing["corrected_clock_out"].astimezone(timezone.utc)
+                    == corrected_clock_out
+                    and int(existing["corrected_break_minutes"])
+                    == int(payload.correctedBreakMinutes)
+                    and str(existing["reason"]) == payload.reason
+                ):
+                    saved = dict(existing)
+                    saved["employee_name"] = str(shift_row["employee_name"])
+                    idempotent = True
+                else:
+                    if existing:
+                        cur.execute(
+                            """
+                            UPDATE payroll_shift_corrections
+                            SET status = 'superseded', updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (int(existing["id"]),),
+                        )
                     cur.execute(
                         """
-                        UPDATE payroll_shift_corrections
-                        SET superseded_by = %s, updated_at = NOW()
-                        WHERE id = %s
+                        INSERT INTO payroll_shift_corrections (
+                            week_start,
+                            correction_date,
+                            employee_id,
+                            shift_id,
+                            source_clock_in,
+                            source_clock_out,
+                            source_break_minutes,
+                            source_total_minutes,
+                            corrected_clock_in,
+                            corrected_clock_out,
+                            corrected_break_minutes,
+                            corrected_total_minutes,
+                            reason,
+                            created_by_employee_id,
+                            created_by_name
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING *
                         """,
-                        (int(saved["id"]), int(existing["id"])),
+                        (
+                            week_start,
+                            correction_date,
+                            int(payload.employeeId),
+                            int(payload.shiftId),
+                            shift_row["clock_in"],
+                            shift_row.get("clock_out"),
+                            source_total_minutes,
+                            corrected_clock_in,
+                            corrected_clock_out,
+                            int(payload.correctedBreakMinutes),
+                            corrected_total_minutes,
+                            payload.reason,
+                            int(current_payroll["id"]),
+                            str(current_payroll["name"]),
+                        ),
                     )
-                idempotent = False
-            timesheet = _compute_payroll_timesheet(
-                week_start.isoformat(),
-                employee_id=int(payload.employeeId),
-                cursor=cur,
-            )
-            result = {
-                "success": True,
-                "action": "correct_shift",
-                "idempotent": idempotent,
-                "correction": _serialize_payroll_shift_correction(saved),
-                "timesheet": timesheet,
-            }
+                    saved = dict(cur.fetchone())
+                    saved["employee_name"] = str(shift_row["employee_name"])
+                    if existing:
+                        cur.execute(
+                            """
+                            UPDATE payroll_shift_corrections
+                            SET superseded_by = %s, updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (int(saved["id"]), int(existing["id"])),
+                        )
+                    idempotent = False
+                timesheet = _compute_payroll_timesheet(
+                    week_start.isoformat(),
+                    employee_id=int(payload.employeeId),
+                    cursor=cur,
+                )
+                result = {
+                    "success": True,
+                    "action": "correct_shift",
+                    "idempotent": idempotent,
+                    "correction": _serialize_payroll_shift_correction(saved),
+                    "timesheet": timesheet,
+                }
 
     append_access_log(
         request,
