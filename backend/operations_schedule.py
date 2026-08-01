@@ -451,6 +451,7 @@ def _load_time_evidence(
     observed_at: datetime,
     visible_job_ids: Iterable[int],
     *,
+    timezone_name: str = "America/Chicago",
     cursor: Optional[Any] = None,
 ) -> Tuple[
     List[Dict[str, Any]],
@@ -463,15 +464,41 @@ def _load_time_evidence(
     shifts = _query_all(
         """
         SELECT s.id, s.employee_id, e.name AS employee_name, e.hourly_rate,
-               s.location_id, s.location_label, s.clock_in, s.clock_out,
+               s.location_id, s.location_label,
+               COALESCE(correction.corrected_clock_in, s.clock_in) AS clock_in,
+               COALESCE(correction.corrected_clock_out, s.clock_out) AS clock_out,
+               COALESCE(correction.corrected_break_minutes, 0) AS payroll_break_minutes,
                s.job_id
         FROM shifts s
         JOIN employees e ON e.id = s.employee_id
+        LEFT JOIN LATERAL (
+            SELECT
+                shift_correction.corrected_clock_in,
+                shift_correction.corrected_clock_out,
+                shift_correction.corrected_break_minutes
+            FROM payroll_shift_corrections shift_correction
+            WHERE shift_correction.shift_id = s.id
+              AND shift_correction.status = 'active'
+              AND shift_correction.week_start = (
+                  COALESCE(
+                      s.local_date,
+                      (s.clock_in AT TIME ZONE %s)::date
+                  )
+                  - EXTRACT(
+                      DOW FROM COALESCE(
+                          s.local_date,
+                          (s.clock_in AT TIME ZONE %s)::date
+                      )
+                  )::integer
+              )
+            ORDER BY shift_correction.week_start DESC, shift_correction.id DESC
+            LIMIT 1
+        ) correction ON TRUE
         WHERE s.time_category = 'productive'
           AND (
               (
-                  s.clock_in < %s
-                  AND COALESCE(s.clock_out, %s) > %s
+                  COALESCE(correction.corrected_clock_in, s.clock_in) < %s
+                  AND COALESCE(correction.corrected_clock_out, s.clock_out, %s) > %s
               )
               OR EXISTS (
                   SELECT 1
@@ -479,8 +506,9 @@ def _load_time_evidence(
                   WHERE linked_sci.employee_id = s.employee_id
                     AND linked_sci.job_id = ANY(%s)
                     AND linked_sci.server_checked_in_at < %s
-                    AND s.clock_in <= linked_sci.server_checked_in_at
-                    AND COALESCE(s.clock_out, %s)
+                    AND COALESCE(correction.corrected_clock_in, s.clock_in)
+                        <= linked_sci.server_checked_in_at
+                    AND COALESCE(correction.corrected_clock_out, s.clock_out, %s)
                         > linked_sci.server_checked_in_at
                     AND (
                         (
@@ -497,6 +525,8 @@ def _load_time_evidence(
         ORDER BY s.clock_in, s.id
         """,
         (
+            timezone_name,
+            timezone_name,
             range_end,
             observed_at,
             range_start,
@@ -557,10 +587,45 @@ def _load_time_evidence(
               OR EXISTS (
                   SELECT 1
                   FROM shifts evidence_shift
+                  LEFT JOIN LATERAL (
+                      SELECT
+                          shift_correction.corrected_clock_in,
+                          shift_correction.corrected_clock_out
+                      FROM payroll_shift_corrections shift_correction
+                      WHERE shift_correction.shift_id = evidence_shift.id
+                        AND shift_correction.status = 'active'
+                        AND shift_correction.week_start = (
+                            COALESCE(
+                                evidence_shift.local_date,
+                                (
+                                    evidence_shift.clock_in
+                                    AT TIME ZONE %s
+                                )::date
+                            )
+                            - EXTRACT(
+                                DOW FROM COALESCE(
+                                    evidence_shift.local_date,
+                                    (
+                                        evidence_shift.clock_in
+                                        AT TIME ZONE %s
+                                    )::date
+                                )
+                            )::integer
+                        )
+                      ORDER BY
+                          shift_correction.week_start DESC,
+                          shift_correction.id DESC
+                      LIMIT 1
+                  ) evidence_correction ON TRUE
                   WHERE evidence_shift.id = ANY(%s)
                     AND evidence_shift.employee_id = sci.employee_id
-                    AND evidence_shift.clock_in <= sci.server_checked_in_at
-                    AND COALESCE(evidence_shift.clock_out, %s)
+                    AND COALESCE(evidence_correction.corrected_clock_in, evidence_shift.clock_in)
+                        <= sci.server_checked_in_at
+                    AND COALESCE(
+                            evidence_correction.corrected_clock_out,
+                            evidence_shift.clock_out,
+                            %s
+                        )
                         > sci.server_checked_in_at
               )
           )
@@ -582,6 +647,8 @@ def _load_time_evidence(
             range_start,
             range_end,
             linked_job_ids,
+            timezone_name,
+            timezone_name,
             shift_ids,
             observed_at,
         ),
@@ -2068,6 +2135,64 @@ def _apply_qr_job_links(
     return represented_qr_ids
 
 
+def _apply_shift_break_minutes_to_segments(
+    segments: List[Dict[str, Any]],
+    break_minutes: int,
+) -> List[Dict[str, Any]]:
+    remaining_seconds = max(0, int(break_minutes)) * 60
+    if remaining_seconds <= 0:
+        return segments
+    duration_segments = [
+        segment
+        for segment in segments
+        if segment["end"] > segment["start"]
+    ]
+    located_site_ids = {
+        int(segment["location_id"])
+        for segment in duration_segments
+        if segment.get("location_id") is not None
+    }
+    job_ids = {
+        int(segment["job_id"])
+        for segment in duration_segments
+        if segment.get("job_id") is not None
+    }
+    has_unallocated_time = any(
+        segment.get("location_id") is None
+        for segment in duration_segments
+    )
+    has_unallocated_job = any(
+        segment.get("job_id") is None
+        for segment in duration_segments
+    )
+    if (
+        has_unallocated_time
+        or len(located_site_ids) != 1
+        or has_unallocated_job
+        or len(job_ids) != 1
+    ):
+        return segments
+
+    adjusted: List[Dict[str, Any]] = []
+    for segment in reversed(segments):
+        segment_copy = dict(segment)
+        duration_seconds = max(
+            int((segment_copy["end"] - segment_copy["start"]).total_seconds()),
+            0,
+        )
+        deducted_seconds = min(duration_seconds, remaining_seconds)
+        remaining_seconds -= deducted_seconds
+        if deducted_seconds >= duration_seconds:
+            continue
+        if deducted_seconds > 0:
+            segment_copy["end"] = segment_copy["end"] - timedelta(
+                seconds=deducted_seconds,
+            )
+        adjusted.append(segment_copy)
+    adjusted.reverse()
+    return adjusted
+
+
 def _closed_shift_segments(
     shift: Dict[str, Any],
     visits: List[Dict[str, Any]],
@@ -2092,6 +2217,7 @@ def _closed_shift_segments(
         "employee_id": int(shift["employee_id"]),
         "employee_name": str(shift["employee_name"]),
         "hourly_rate": shift.get("hourly_rate"),
+        "payroll_break_minutes": int(shift.get("payroll_break_minutes") or 0),
         "finalized": True,
     }
 
@@ -2488,6 +2614,61 @@ def _serialize_unmatched(
     }
 
 
+def _apply_resolved_shift_break_minutes(
+    resolved_segments: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Deduct corrected breaks only after every shift segment has a job verdict."""
+
+    if not resolved_segments:
+        return resolved_segments
+
+    indexed_segments: List[Dict[str, Any]] = []
+    segments_by_shift_id: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for index, resolved in enumerate(resolved_segments):
+        segment = dict(resolved["segment"])
+        segment["_break_allocation_index"] = index
+        indexed = {**resolved, "segment": segment}
+        indexed_segments.append(indexed)
+
+        shift_id = segment.get("shift_id")
+        if shift_id is None:
+            continue
+        segments_by_shift_id[int(shift_id)].append(indexed)
+
+    active_indices = set(range(len(indexed_segments)))
+    adjusted_by_index: Dict[int, Dict[str, Any]] = {}
+    for shift_segments in segments_by_shift_id.values():
+        break_minutes = max(
+            int(resolved["segment"].get("payroll_break_minutes") or 0)
+            for resolved in shift_segments
+        )
+        if break_minutes <= 0:
+            continue
+
+        adjusted = _apply_shift_break_minutes_to_segments(
+            [resolved["segment"] for resolved in shift_segments],
+            break_minutes,
+        )
+        adjusted_indices = {
+            int(segment["_break_allocation_index"]) for segment in adjusted
+        }
+        for segment in adjusted:
+            adjusted_by_index[int(segment["_break_allocation_index"])] = segment
+        for resolved in shift_segments:
+            index = int(resolved["segment"]["_break_allocation_index"])
+            if index not in adjusted_indices:
+                active_indices.discard(index)
+
+    output: List[Dict[str, Any]] = []
+    for index, resolved in enumerate(indexed_segments):
+        if index not in active_indices:
+            continue
+        segment = dict(adjusted_by_index.get(index, resolved["segment"]))
+        segment.pop("_break_allocation_index", None)
+        output.append({**resolved, "segment": segment})
+    return output
+
+
 def _decorate_schedule_jobs(
     jobs: List[Dict[str, Any]],
     range_start: datetime,
@@ -2529,6 +2710,7 @@ def _decorate_schedule_jobs(
         range_end,
         observed_at,
         jobs_by_id,
+        timezone_name=getattr(app_timezone, "key", str(app_timezone)),
         cursor=cursor,
     )
     linked_jobs_by_id = dict(jobs_by_id)
@@ -2606,6 +2788,7 @@ def _decorate_schedule_jobs(
 
     workers_by_job: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
     unmatched: List[Dict[str, Any]] = []
+    resolved_segments: List[Dict[str, Any]] = []
     for segment in segments:
         job, reason, candidate_job_ids = _match_segment_to_job(
             segment,
@@ -2615,6 +2798,13 @@ def _decorate_schedule_jobs(
             linked_jobs_by_id=linked_jobs_by_id,
         )
         if job is None:
+            resolved_segments.append(
+                {
+                    "segment": dict(segment),
+                    "job": None,
+                    "reason": reason,
+                }
+            )
             shift_id = segment.get("shift_id")
             is_cross_boundary_shift = (
                 shift_id is not None and int(shift_id) in cross_boundary_shift_ids
@@ -2632,6 +2822,22 @@ def _decorate_schedule_jobs(
             unmatched.append(_serialize_unmatched(segment, reason, candidate_job_ids))
             continue
 
+        matched_segment = dict(segment)
+        matched_segment["job_id"] = int(job["id"])
+        resolved_segments.append(
+            {
+                "segment": matched_segment,
+                "job": job,
+                "reason": reason,
+            }
+        )
+
+    for resolved in _apply_resolved_shift_break_minutes(resolved_segments):
+        segment = resolved["segment"]
+        job = resolved["job"]
+        if job is None:
+            continue
+        reason = resolved["reason"]
         job_id = int(job["id"])
         employee_id = int(segment["employee_id"])
         worker = workers_by_job[job_id].setdefault(

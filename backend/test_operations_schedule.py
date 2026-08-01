@@ -14,6 +14,7 @@ import db
 import operations_schedule as ops
 from operations_schedule import (
     _allocate_utilization_minutes,
+    _apply_shift_break_minutes_to_segments,
     _collapse_overlapping_paid_segments,
     _closed_shift_utilization,
     _closed_shift_segments,
@@ -79,6 +80,68 @@ def test_correction_evidence_locks_shift_before_joined_mutable_inputs():
     assert cursor.queries[1] == "LOCK TABLE site_check_ins, jobs IN SHARE MODE"
     assert "FROM visits v" in cursor.queries[2]
     assert "FROM departures" in cursor.queries[3]
+
+
+def test_aggregate_break_minutes_do_not_shorten_multi_site_segments():
+    start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    segments = [
+        {
+            "start": start,
+            "end": start + timedelta(hours=1),
+            "location_id": 10,
+            "job_id": 100,
+        },
+        {
+            "start": start + timedelta(hours=1),
+            "end": start + timedelta(hours=3),
+            "location_id": 20,
+            "job_id": 200,
+        },
+    ]
+
+    adjusted = _apply_shift_break_minutes_to_segments(segments, 30)
+
+    assert adjusted == segments
+
+
+def test_aggregate_break_minutes_do_not_shorten_same_site_multi_job_segments():
+    start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    segments = [
+        {
+            "start": start,
+            "end": start + timedelta(hours=1),
+            "location_id": 10,
+            "job_id": 100,
+        },
+        {
+            "start": start + timedelta(hours=1),
+            "end": start + timedelta(hours=3),
+            "location_id": 10,
+            "job_id": 200,
+        },
+    ]
+
+    adjusted = _apply_shift_break_minutes_to_segments(segments, 30)
+
+    assert adjusted == segments
+
+
+def test_aggregate_break_minutes_still_shorten_single_site_segments():
+    start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    segments = [
+        {
+            "start": start,
+            "end": start + timedelta(hours=3),
+            "location_id": 10,
+            "job_id": 100,
+        },
+    ]
+
+    adjusted = _apply_shift_break_minutes_to_segments(segments, 30)
+
+    assert len(adjusted) == 1
+    assert adjusted[0]["start"] == start
+    assert adjusted[0]["end"] == start + timedelta(hours=2, minutes=30)
 
 
 @pytest.mark.parametrize(
@@ -596,11 +659,17 @@ def _paired_version_two_visit(
     return visit_id, departure_id
 
 
-def _schedule_body(client, auth, service_day: date) -> dict:
+def _schedule_body(
+    client,
+    auth,
+    service_day: date,
+    *,
+    end_day: date | None = None,
+) -> dict:
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={"start_date": str(service_day), "end_date": str(end_day or service_day)},
     )
     assert response.status_code == 200, response.text
     return response.json()
@@ -1173,6 +1242,147 @@ def _unmatched_for_shift(body: dict, shift_id: int) -> list[dict]:
         for segment in body["unmatchedActualSegments"]
         if segment["shiftId"] == shift_id
     ]
+
+
+def test_operations_schedule_scopes_shift_correction_overlay_to_visible_week(
+    client,
+    auth,
+):
+    chicago = ZoneInfo("America/Chicago")
+    week_start = date(2026, 7, 19)
+    next_week_start = week_start + timedelta(days=7)
+    service_day = week_start + timedelta(days=1)
+    next_service_day = next_week_start + timedelta(days=1)
+    shift_start = datetime(2026, 7, 20, 9, tzinfo=chicago)
+    source_shift_end = datetime(2026, 7, 20, 11, tzinfo=chicago)
+    current_week_corrected_end = datetime(2026, 7, 20, 12, tzinfo=chicago)
+    later_week_corrected_end = datetime(2026, 7, 20, 10, tzinfo=chicago)
+    next_shift_start = datetime(2026, 7, 27, 9, tzinfo=chicago)
+    next_source_shift_end = datetime(2026, 7, 27, 11, tzinfo=chicago)
+    next_corrected_shift_end = datetime(2026, 7, 27, 12, tzinfo=chicago)
+
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            site_id, job_id = _canonical_job(
+                cur,
+                suffix="Correction Scope",
+                start=shift_start,
+                end=current_week_corrected_end,
+            )
+            employee_id = _employee(cur, "Correction Scope", 20)
+            shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=shift_start,
+                end=source_shift_end,
+                service_day=service_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Correction Scope",
+                job_id=job_id,
+            )
+            next_site_id, next_job_id = _canonical_job(
+                cur,
+                suffix="Correction Scope Next Week",
+                start=next_shift_start,
+                end=next_corrected_shift_end,
+            )
+            next_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=next_shift_start,
+                end=next_source_shift_end,
+                service_day=next_service_day,
+                location_id=next_site_id,
+                location_label=f"{TEST_PREFIX} Site Correction Scope Next Week",
+                job_id=next_job_id,
+            )
+            cur.execute(
+                """
+                INSERT INTO payroll_shift_corrections (
+                    week_start,
+                    correction_date,
+                    employee_id,
+                    shift_id,
+                    source_clock_in,
+                    source_clock_out,
+                    source_break_minutes,
+                    source_total_minutes,
+                    corrected_clock_in,
+                    corrected_clock_out,
+                    corrected_break_minutes,
+                    corrected_total_minutes,
+                    reason,
+                    status,
+                    created_by_employee_id,
+                    created_by_name
+                )
+                VALUES
+                    (
+                        %s, %s, %s, %s, %s, %s, NULL, 120,
+                        %s, %s, 0, 180,
+                        'Current payroll week correction.',
+                        'active',
+                        %s,
+                        'Mayra'
+                    ),
+                    (
+                        %s, %s, %s, %s, %s, %s, NULL, 120,
+                        %s, %s, 0, 60,
+                        'Later payroll week correction must not leak backward.',
+                        'active',
+                        %s,
+                        'Mayra'
+                    ),
+                    (
+                        %s, %s, %s, %s, %s, %s, NULL, 120,
+                        %s, %s, 0, 180,
+                        'Next payroll week correction.',
+                        'active',
+                        %s,
+                        'Mayra'
+                    )
+                """,
+                (
+                    week_start,
+                    service_day,
+                    employee_id,
+                    shift_id,
+                    shift_start,
+                    source_shift_end,
+                    shift_start,
+                    current_week_corrected_end,
+                    employee_id,
+                    next_week_start,
+                    next_week_start + timedelta(days=1),
+                    employee_id,
+                    shift_id,
+                    shift_start,
+                    source_shift_end,
+                    shift_start,
+                    later_week_corrected_end,
+                    employee_id,
+                    next_week_start,
+                    next_service_day,
+                    employee_id,
+                    next_shift_id,
+                    next_shift_start,
+                    next_source_shift_end,
+                    next_shift_start,
+                    next_corrected_shift_end,
+                    employee_id,
+                ),
+            )
+
+    body = _schedule_body(client, auth, service_day, end_day=next_service_day)
+    job = _schedule_job(body, job_id)
+    next_job = _schedule_job(body, next_job_id)
+
+    assert job["actualHours"] == pytest.approx(3.0)
+    assert job["actualLaborCost"] == pytest.approx(60.0)
+    assert job["workers"][0]["hours"] == pytest.approx(3.0)
+    assert next_job["actualHours"] == pytest.approx(3.0)
+    assert next_job["actualLaborCost"] == pytest.approx(60.0)
+    assert next_job["workers"][0]["hours"] == pytest.approx(3.0)
 
 
 def test_monthly_allocation_is_exact_and_stable():
