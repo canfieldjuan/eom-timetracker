@@ -69,6 +69,30 @@ def test_render_proxy_hop_configuration_matches_live_topology():
     assert int(configured_hops.group(1)) == tta.DEFAULT_TRUSTED_PROXY_HOPS
 
 
+def test_render_blueprint_declares_atlas_funnel_proxy_environment():
+    render_config = (Path(__file__).resolve().parents[1] / "render.yaml").read_text()
+
+    for key in (
+        "ATLAS_FUNNEL_BASE_URL",
+        "ATLAS_FUNNEL_SERVICE_TOKEN",
+        "ATLAS_FUNNEL_TIMEOUT_SECONDS",
+    ):
+        assert re.search(rf"(?m)^\s*-\s+key:\s+{key}\s*$", render_config)
+
+    assert re.search(
+        r"(?m)^\s*-\s+key:\s+ATLAS_FUNNEL_BASE_URL\s*\n\s+sync:\s+false\s*$",
+        render_config,
+    )
+    assert re.search(
+        r"(?m)^\s*-\s+key:\s+ATLAS_FUNNEL_SERVICE_TOKEN\s*\n\s+sync:\s+false\s*$",
+        render_config,
+    )
+    assert re.search(
+        r"(?m)^\s*-\s+key:\s+ATLAS_FUNNEL_TIMEOUT_SECONDS\s*\n\s+value:\s+[\"']?10[\"']?\s*$",
+        render_config,
+    )
+
+
 def test_no_xff_uses_direct_peer(monkeypatch):
     monkeypatch.setattr(tta, "TRUST_PROXY", True)
     monkeypatch.setattr(tta, "TRUSTED_PROXY_HOPS", 1)

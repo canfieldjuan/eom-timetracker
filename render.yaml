@@ -57,6 +57,15 @@ services:
         sync: false
       - key: ATLAS_RECEIVABLES_TIMEOUT_SECONDS
         value: "10"
+      # Funnel proxy config stays server-side. Base URL should be the Atlas EOM
+      # private service URL ending in /api/v1. The token is the raw generated
+      # eomf_v1_... bearer whose SHA-256 digest is stored on Atlas.
+      - key: ATLAS_FUNNEL_BASE_URL
+        sync: false
+      - key: ATLAS_FUNNEL_SERVICE_TOKEN
+        sync: false
+      - key: ATLAS_FUNNEL_TIMEOUT_SECONDS
+        value: "10"
       # Google Calendar is a one-way, read-only planning source. OAuth client
       # material and the independent Fernet key remain server-side secrets.
       - key: GOOGLE_CALENDAR_CLIENT_ID
