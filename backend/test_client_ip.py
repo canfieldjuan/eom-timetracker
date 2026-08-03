@@ -76,6 +76,7 @@ def test_render_blueprint_declares_atlas_funnel_proxy_environment():
         "ATLAS_FUNNEL_BASE_URL",
         "ATLAS_FUNNEL_SERVICE_TOKEN",
         "ATLAS_FUNNEL_TIMEOUT_SECONDS",
+        "EOM_FUNNEL_APPROVER_EMPLOYEE_ID",
     ):
         assert re.search(rf"(?m)^\s*-\s+key:\s+{key}\s*$", render_config)
 
@@ -89,6 +90,10 @@ def test_render_blueprint_declares_atlas_funnel_proxy_environment():
     )
     assert re.search(
         r"(?m)^\s*-\s+key:\s+ATLAS_FUNNEL_TIMEOUT_SECONDS\s*\n\s+value:\s+[\"']?10[\"']?\s*$",
+        render_config,
+    )
+    assert re.search(
+        r"(?m)^\s*-\s+key:\s+EOM_FUNNEL_APPROVER_EMPLOYEE_ID\s*\n\s+sync:\s+false\s*$",
         render_config,
     )
 

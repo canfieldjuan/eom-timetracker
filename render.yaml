@@ -66,6 +66,10 @@ services:
         sync: false
       - key: ATLAS_FUNNEL_TIMEOUT_SECONDS
         value: "10"
+      # Estimate approval is intentionally limited to Juan's configured
+      # employee row; set this to that employee ID in the target environment.
+      - key: EOM_FUNNEL_APPROVER_EMPLOYEE_ID
+        sync: false
       # Google Calendar is a one-way, read-only planning source. OAuth client
       # material and the independent Fernet key remain server-side secrets.
       - key: GOOGLE_CALENDAR_CLIENT_ID
