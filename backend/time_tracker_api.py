@@ -76,6 +76,8 @@ EMPLOYEE_WRITE_LOCK = threading.Lock()
 TIMESHEET_WRITE_LOCK = threading.Lock()
 TIMESHEET_PG_ADVISORY_LOCK_ID = 5_107_202_064
 ACCESS_LOG_WRITE_LOCK = threading.Lock()
+ACCESS_LOG_RETENTION_LOCK = threading.Lock()
+_ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON: Optional[date] = None
 logger = logging.getLogger("eom.time_tracker")
 
 try:
@@ -260,6 +262,7 @@ SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS = 12
 SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS = 600
 SITE_CHECK_IN_RECONCILIATION_GAP_DEFAULT_MINUTES = 15
 SITE_CHECK_IN_RECONCILIATION_MAX_DAYS = 31
+ACCESS_LOG_RETENTION_DEFAULT_DAYS = 400
 SITE_CHECK_IN_QR_VERSION = "eom1"
 SITE_CHECK_IN_RADIUS_M = SITE_CHECK_IN_RADIUS_DEFAULT_M
 SITE_CHECK_IN_MAX_ACCURACY_M = SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M
@@ -1767,6 +1770,7 @@ def build_public_current_status(
 def append_access_log(request: Request, action: str, allowed: bool, reason: str = "") -> None:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = to_utc_iso(utc_now())
+    local_date_text = local_date_for_logs()
     client_ip = get_client_ip(request)
     user_agent = request.headers.get("user-agent", "")
 
@@ -1781,7 +1785,7 @@ def append_access_log(request: Request, action: str, allowed: bool, reason: str 
         "method": request.method,
     }
 
-    log_file = LOGS_DIR / f"access_{local_date_for_logs()}.json"
+    log_file = LOGS_DIR / f"access_{local_date_text}.json"
 
     with ACCESS_LOG_WRITE_LOCK:
         with process_file_lock(log_file):
@@ -1790,6 +1794,63 @@ def append_access_log(request: Request, action: str, allowed: bool, reason: str 
                 payload = []
             payload.append(entry)
             write_json_atomic(log_file, payload)
+
+    try:
+        _append_access_log_to_postgres(entry, local_date_text)
+    except Exception:
+        logger.warning("access_log_postgres_write_failed", exc_info=True)
+        return
+
+    try:
+        _maybe_prune_access_log_entries()
+    except Exception:
+        logger.warning("access_log_postgres_prune_failed", exc_info=True)
+
+
+def _append_access_log_to_postgres(entry: Dict[str, Any], local_date_text: str) -> None:
+    logged_at = parse_utc_iso(str(entry["timestamp"]))
+    log_date = date.fromisoformat(local_date_text)
+    db.execute(
+        """
+        INSERT INTO access_log_entries (
+            logged_at, local_date, action, allowed, reason,
+            client_ip, user_agent, endpoint, method, entry
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            logged_at,
+            log_date,
+            str(entry.get("action", "")),
+            bool(entry.get("allowed")),
+            str(entry.get("reason", "")),
+            str(entry.get("clientIP", "")),
+            str(entry.get("userAgent", "")),
+            str(entry.get("endpoint", "")),
+            str(entry.get("method", "")),
+            psycopg2.extras.Json(entry),
+        ),
+    )
+
+
+def _prune_access_log_entries(now: Optional[datetime] = None) -> None:
+    cutoff = (now or utc_now()) - timedelta(days=ACCESS_LOG_RETENTION_DAYS)
+    db.execute(
+        "DELETE FROM access_log_entries WHERE logged_at < %s",
+        (cutoff,),
+    )
+
+
+def _maybe_prune_access_log_entries() -> None:
+    global _ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON
+
+    today = utc_now().date()
+    with ACCESS_LOG_RETENTION_LOCK:
+        if _ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON == today:
+            return
+        _ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON = today
+
+    _prune_access_log_entries()
 
 
 def current_schedule_context() -> Dict[str, Any]:
@@ -2732,6 +2793,10 @@ DEFAULT_TRUSTED_PROXY_HOPS = 2
 TRUSTED_PROXY_HOPS = max(
     1,
     parse_int(os.getenv("TRUSTED_PROXY_HOPS"), DEFAULT_TRUSTED_PROXY_HOPS),
+)
+ACCESS_LOG_RETENTION_DAYS = max(
+    1,
+    parse_int(os.getenv("ACCESS_LOG_RETENTION_DAYS"), ACCESS_LOG_RETENTION_DEFAULT_DAYS),
 )
 # Gate employee clock actions (clock-in/out, arrive, depart, QR check-in) to the
 # ACCESS_START_HOUR..ACCESS_END_HOUR window on ALLOWED_DAYS. Deliberately does NOT
@@ -4105,6 +4170,27 @@ def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
     _ensure_employee_role_schema()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS access_log_entries (
+            id          BIGSERIAL PRIMARY KEY,
+            logged_at   TIMESTAMPTZ NOT NULL,
+            local_date  DATE NOT NULL,
+            action      TEXT NOT NULL,
+            allowed     BOOLEAN NOT NULL,
+            reason      TEXT NOT NULL DEFAULT '',
+            client_ip   TEXT NOT NULL DEFAULT '',
+            user_agent  TEXT NOT NULL DEFAULT '',
+            endpoint    TEXT NOT NULL DEFAULT '',
+            method      TEXT NOT NULL DEFAULT '',
+            entry       JSONB NOT NULL,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_access_log_entries_local_date
+        ON access_log_entries(local_date, logged_at, id)
+    """)
+    _prune_access_log_entries()
     db.execute("""
         CREATE TABLE IF NOT EXISTS receivables_operation_attempts (
             attempt_id          BIGSERIAL PRIMARY KEY,
@@ -12201,15 +12287,68 @@ def admin_apply_time_data_correction(
     }
 
 
-def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
-        return []
-
+def _read_access_logs_file_for_date(date_text: str) -> List[Dict[str, Any]]:
     log_file = LOGS_DIR / f"access_{date_text}.json"
     payload = read_json_file(log_file, [])
     if not isinstance(payload, list):
         return []
     return payload
+
+
+def _read_access_logs_postgres_for_date(log_date: date) -> List[Dict[str, Any]]:
+    rows = db.query_all(
+        """
+        SELECT entry
+        FROM access_log_entries
+        WHERE local_date = %s
+        ORDER BY logged_at ASC, id ASC
+        """,
+        (log_date,),
+    )
+    logs: List[Dict[str, Any]] = []
+    for row in rows:
+        entry = row.get("entry")
+        if isinstance(entry, dict):
+            logs.append(entry)
+    return logs
+
+
+def _dedupe_access_logs(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        key = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+
+    return sorted(deduped, key=lambda item: str(item.get("timestamp", "")))
+
+
+def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
+        return []
+
+    try:
+        log_date = date.fromisoformat(date_text)
+    except ValueError:
+        return []
+
+    postgres_logs: Optional[List[Dict[str, Any]]] = None
+    try:
+        postgres_logs = _read_access_logs_postgres_for_date(log_date)
+    except Exception:
+        logger.warning("access_log_postgres_read_failed", exc_info=True)
+
+    file_logs = _read_access_logs_file_for_date(date_text)
+    if postgres_logs is None:
+        return file_logs
+    if not postgres_logs:
+        return file_logs
+    if not file_logs:
+        return postgres_logs
+    return _dedupe_access_logs([*file_logs, *postgres_logs])
 
 
 @app.get("/api/admin/logs/{date_text}")

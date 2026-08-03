@@ -7,13 +7,55 @@ Run:  cd backend && pytest -v test_regressions.py
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
 
 SITE_GPS = {"latitude": 39.1203, "longitude": -88.54335}
+
+
+def _access_log_entry(
+    timestamp: str,
+    action: str,
+    *,
+    endpoint: str = "/api/admin/example",
+) -> dict:
+    return {
+        "timestamp": timestamp,
+        "action": action,
+        "allowed": True,
+        "reason": "pytest",
+        "clientIP": "203.0.113.10",
+        "userAgent": "pytest",
+        "endpoint": endpoint,
+        "method": "GET",
+    }
+
+
+def _insert_access_log_entry(api, date_text: str, entry: dict) -> None:
+    api.db.execute(
+        """
+        INSERT INTO access_log_entries (
+            logged_at, local_date, action, allowed, reason,
+            client_ip, user_agent, endpoint, method, entry
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            api.parse_utc_iso(entry["timestamp"]),
+            date.fromisoformat(date_text),
+            entry["action"],
+            entry["allowed"],
+            entry["reason"],
+            entry["clientIP"],
+            entry["userAgent"],
+            entry["endpoint"],
+            entry["method"],
+            api.psycopg2.extras.Json(entry),
+        ),
+    )
 
 
 def _ensure_clocked_out(client, headers) -> None:
@@ -689,3 +731,111 @@ class TestRemovedOrphanEndpoints:
         # Main analytics endpoint (used by portal.html) still serves.
         r = client.get("/api/admin/analytics?period=day", headers=auth)
         assert r.status_code == 200, r.text
+
+
+class TestAccessLogDurability:
+    def test_access_log_entry_dual_writes_file_and_postgres(
+        self, client, monkeypatch, tmp_path
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "LOGS_DIR", tmp_path / "logs")
+        before = api.utc_now() - timedelta(seconds=1)
+
+        response = client.get(
+            "/api/health",
+            headers={"user-agent": "access-log-durability-test"},
+        )
+        assert response.status_code == 200, response.text
+
+        rows = api.db.query_all(
+            """
+            SELECT local_date, entry
+            FROM access_log_entries
+            WHERE action = %s
+              AND endpoint = %s
+              AND logged_at >= %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("HEALTH_CHECK", "/api/health", before),
+        )
+        assert rows, "health check did not write a durable access-log row"
+
+        entry = rows[0]["entry"]
+        assert entry["action"] == "HEALTH_CHECK"
+        assert entry["allowed"] is True
+        assert entry["endpoint"] == "/api/health"
+        assert entry["method"] == "GET"
+        assert entry["userAgent"] == "access-log-durability-test"
+
+        file_payload = api.read_json_file(
+            api.LOGS_DIR / f"access_{rows[0]['local_date']}.json",
+            [],
+        )
+        assert entry in file_payload
+
+    def test_admin_logs_reads_postgres_and_legacy_file_without_duplicates(
+        self, client, auth, monkeypatch, tmp_path
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "LOGS_DIR", tmp_path / "logs")
+        date_text = "2026-02-04"
+        legacy_only = _access_log_entry(
+            "2026-02-04T14:00:00Z",
+            "LEGACY_FILE_ONLY",
+        )
+        duplicated = _access_log_entry(
+            "2026-02-04T15:00:00Z",
+            "CUTOVER_DUPLICATE",
+        )
+        postgres_only = _access_log_entry(
+            "2026-02-04T16:00:00Z",
+            "POSTGRES_ONLY",
+        )
+        api.write_json_atomic(
+            api.LOGS_DIR / f"access_{date_text}.json",
+            [legacy_only, duplicated],
+        )
+        _insert_access_log_entry(api, date_text, duplicated)
+        _insert_access_log_entry(api, date_text, postgres_only)
+
+        response = client.get(f"/api/admin/logs/{date_text}", headers=auth)
+
+        assert response.status_code == 200, response.text
+        logs = response.json()["logs"]
+        assert legacy_only in logs
+        assert postgres_only in logs
+        assert logs.count(duplicated) == 1
+
+    def test_access_log_retention_prunes_only_expired_postgres_rows(
+        self, client, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "ACCESS_LOG_RETENTION_DAYS", 30)
+        now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+        expired = _access_log_entry(
+            "2026-06-14T12:00:00Z",
+            "RETENTION_EXPIRED",
+        )
+        retained = _access_log_entry(
+            "2026-06-16T12:00:00Z",
+            "RETENTION_KEPT",
+        )
+        _insert_access_log_entry(api, "2026-06-14", expired)
+        _insert_access_log_entry(api, "2026-06-16", retained)
+
+        api._prune_access_log_entries(now)
+
+        rows = api.db.query_all(
+            """
+            SELECT action
+            FROM access_log_entries
+            WHERE action LIKE %s
+            ORDER BY action
+            """,
+            ("RETENTION_%",),
+        )
+        assert rows == [{"action": "RETENTION_KEPT"}]
