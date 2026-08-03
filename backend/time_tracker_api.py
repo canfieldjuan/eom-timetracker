@@ -6438,8 +6438,7 @@ def time_tracker_page(
 
 
 @app.get("/api/health")
-def health_check(request: Request) -> Dict[str, Any]:
-    append_access_log(request, "HEALTH_CHECK", True, "Public endpoint")
+def health_check() -> Dict[str, Any]:
     return {
         "status": "ok",
         "serverTime": to_utc_iso(utc_now()),
@@ -12384,10 +12383,19 @@ def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:
     except Exception:
         logger.warning("access_log_postgres_read_failed", exc_info=True)
 
-    file_logs = _read_access_logs_file_for_date(date_text)
+    file_logs: Optional[List[Dict[str, Any]]] = None
+    try:
+        file_logs = _read_access_logs_file_for_date(date_text)
+    except Exception:
+        logger.warning("access_log_file_read_failed", exc_info=True)
+
     if postgres_logs is None:
+        if file_logs is None:
+            return []
         return [_public_access_log_entry(entry) for entry in file_logs]
     if not postgres_logs:
+        if file_logs is None:
+            return []
         return [_public_access_log_entry(entry) for entry in file_logs]
     if not file_logs:
         return [_public_access_log_entry(entry) for entry in postgres_logs]

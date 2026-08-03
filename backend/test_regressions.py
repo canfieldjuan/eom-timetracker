@@ -752,11 +752,12 @@ class TestAccessLogDurability:
         monkeypatch.setattr(api, "LOGS_DIR", tmp_path / "logs")
         before = api.utc_now() - timedelta(seconds=1)
 
-        response = client.get(
-            "/api/health",
+        response = client.post(
+            "/api/auth/login",
             headers={"user-agent": "access-log-durability-test"},
+            json={"name": "Definitely Not A User", "password": "x"},
         )
-        assert response.status_code == 200, response.text
+        assert response.status_code == 401, response.text
 
         rows = api.db.query_all(
             """
@@ -768,16 +769,16 @@ class TestAccessLogDurability:
             ORDER BY id DESC
             LIMIT 1
             """,
-            ("HEALTH_CHECK", "/api/health", before),
+            ("LOGIN_FAILED", "/api/auth/login", before),
         )
-        assert rows, "health check did not write a durable access-log row"
+        assert rows, "login failure did not write a durable access-log row"
 
         entry = rows[0]["entry"]
         assert entry["eventId"] == rows[0]["event_id"]
-        assert entry["action"] == "HEALTH_CHECK"
-        assert entry["allowed"] is True
-        assert entry["endpoint"] == "/api/health"
-        assert entry["method"] == "GET"
+        assert entry["action"] == "LOGIN_FAILED"
+        assert entry["allowed"] is False
+        assert entry["endpoint"] == "/api/auth/login"
+        assert entry["method"] == "POST"
         assert entry["userAgent"] == "access-log-durability-test"
 
         file_payload = api.read_json_file(
@@ -858,12 +859,13 @@ class TestAccessLogDurability:
         monkeypatch.setattr(api, "write_json_atomic", fail_file_write)
         before = api.utc_now() - timedelta(seconds=1)
 
-        response = client.get(
-            "/api/health",
+        response = client.post(
+            "/api/auth/login",
             headers={"user-agent": "access-log-file-failure-test"},
+            json={"name": "Definitely Not A User", "password": "x"},
         )
 
-        assert response.status_code == 200, response.text
+        assert response.status_code == 401, response.text
         rows = api.db.query_all(
             """
             SELECT entry
@@ -874,10 +876,49 @@ class TestAccessLogDurability:
             ORDER BY id DESC
             LIMIT 1
             """,
-            ("HEALTH_CHECK", "/api/health", before),
+            ("LOGIN_FAILED", "/api/auth/login", before),
         )
         assert rows
         assert rows[0]["entry"]["userAgent"] == "access-log-file-failure-test"
+
+    def test_health_endpoint_does_not_wait_on_access_log_write(self, client, monkeypatch):
+        import time_tracker_api as api
+
+        def fail_access_log(*_args, **_kwargs):
+            raise RuntimeError("health should not synchronously audit")
+
+        monkeypatch.setattr(api, "append_access_log", fail_access_log)
+
+        response = client.get("/api/health")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "ok"
+
+    def test_admin_logs_fall_back_to_postgres_when_legacy_file_is_malformed(
+        self, client, auth, monkeypatch, tmp_path
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "LOGS_DIR", tmp_path / "logs")
+        date_text = "2026-02-05"
+        postgres_only = _access_log_entry(
+            "2026-02-05T16:00:00Z",
+            "POSTGRES_SURVIVES_BAD_FILE",
+            event_id="test-postgres-bad-file-fallback",
+        )
+        api.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        (api.LOGS_DIR / f"access_{date_text}.json").write_text(
+            "{not valid json",
+            encoding="utf-8",
+        )
+        _insert_access_log_entry(api, date_text, postgres_only)
+
+        response = client.get(f"/api/admin/logs/{date_text}", headers=auth)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["logs"] == [
+            api._public_access_log_entry(postgres_only)
+        ]
 
     def test_access_log_retention_prunes_only_expired_postgres_rows(
         self, client, monkeypatch
