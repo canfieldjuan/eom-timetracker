@@ -920,6 +920,36 @@ class TestAccessLogDurability:
             api._public_access_log_entry(postgres_only)
         ]
 
+    def test_admin_logs_skip_non_object_legacy_entries_when_merging_postgres(
+        self, client, auth, monkeypatch, tmp_path
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "LOGS_DIR", tmp_path / "logs")
+        date_text = "2026-02-06"
+        legacy_only = _access_log_entry(
+            "2026-02-06T14:00:00Z",
+            "LEGACY_VALID_OBJECT",
+        )
+        postgres_only = _access_log_entry(
+            "2026-02-06T16:00:00Z",
+            "POSTGRES_SURVIVES_LEGACY_NON_OBJECT",
+            event_id="test-postgres-legacy-non-object",
+        )
+        api.write_json_atomic(
+            api.LOGS_DIR / f"access_{date_text}.json",
+            [None, legacy_only, "not an object"],
+        )
+        _insert_access_log_entry(api, date_text, postgres_only)
+
+        response = client.get(f"/api/admin/logs/{date_text}", headers=auth)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["logs"] == [
+            legacy_only,
+            api._public_access_log_entry(postgres_only),
+        ]
+
     def test_access_log_retention_prunes_only_expired_postgres_rows(
         self, client, monkeypatch
     ):

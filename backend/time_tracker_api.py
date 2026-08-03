@@ -12326,7 +12326,7 @@ def _read_access_logs_file_for_date(date_text: str) -> List[Dict[str, Any]]:
     payload = read_json_file(log_file, [])
     if not isinstance(payload, list):
         return []
-    return payload
+    return [entry for entry in payload if isinstance(entry, dict)]
 
 
 def _read_access_logs_postgres_for_date(log_date: date) -> List[Dict[str, Any]]:
