@@ -909,3 +909,48 @@ class TestAccessLogDurability:
             ("RETENTION_%",),
         )
         assert rows == [{"action": "RETENTION_KEPT"}]
+
+    def test_access_log_retention_retry_is_not_suppressed_after_prune_failure(
+        self, client, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        attempts = 0
+        today = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+
+        def fixed_now():
+            return today
+
+        def flaky_prune():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("simulated transient prune failure")
+
+        monkeypatch.setattr(api, "_ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON", None)
+        monkeypatch.setattr(api, "utc_now", fixed_now)
+        monkeypatch.setattr(api, "_prune_access_log_entries", flaky_prune)
+
+        with pytest.raises(RuntimeError, match="simulated transient prune failure"):
+            api._maybe_prune_access_log_entries()
+
+        assert api._ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON is None
+
+        api._maybe_prune_access_log_entries()
+
+        assert attempts == 2
+        assert api._ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON == today.date()
+
+    def test_access_log_schema_migration_installs_logged_at_retention_index(self, client):
+        import time_tracker_api as api
+
+        api.db.execute("DROP INDEX IF EXISTS idx_access_log_entries_logged_at")
+
+        api._ensure_schema_migrations()
+
+        row = api.db.query_one(
+            """
+            SELECT to_regclass('idx_access_log_entries_logged_at') AS index_name
+            """
+        )
+        assert row == {"index_name": "idx_access_log_entries_logged_at"}

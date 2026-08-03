@@ -867,6 +867,8 @@ CREATE UNIQUE INDEX uq_access_log_entries_event_id
     ON access_log_entries(event_id);
 CREATE INDEX idx_access_log_entries_local_date
     ON access_log_entries(local_date, logged_at, id);
+CREATE INDEX idx_access_log_entries_logged_at
+    ON access_log_entries(logged_at);
 CREATE INDEX idx_site_check_in_schedules_lookup
     ON site_check_in_schedules(employee_id, location_id, scheduled_start);
 CREATE INDEX idx_site_check_in_schedule_rules_lookup

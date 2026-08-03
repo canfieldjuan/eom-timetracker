@@ -1863,9 +1863,9 @@ def _maybe_prune_access_log_entries() -> None:
     with ACCESS_LOG_RETENTION_LOCK:
         if _ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON == today:
             return
-        _ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON = today
 
-    _prune_access_log_entries()
+        _prune_access_log_entries()
+        _ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON = today
 
 
 def current_schedule_context() -> Dict[str, Any]:
@@ -4220,6 +4220,10 @@ def _ensure_schema_migrations() -> None:
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_access_log_entries_local_date
         ON access_log_entries(local_date, logged_at, id)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_access_log_entries_logged_at
+        ON access_log_entries(logged_at)
     """)
     _prune_access_log_entries()
     db.execute("""
