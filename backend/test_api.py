@@ -2233,6 +2233,18 @@ class TestTimesheetGpsFlow:
         assert entry["clockInGpsMeta"]["matchedLocation"] == "123 Main St, Effingham"
         assert entry["clockInGpsMeta"]["distanceM"] > 0
 
+        def reloaded_active_entry():
+            status = client.get("/api/timesheet/current-status", headers=emp_auth)
+            assert status.status_code == 200, status.text
+            rows = [
+                row
+                for row in status.json()["currentlyWorking"]
+                if row["employeeName"] == "Catalina Gomez"
+                and row["notes"] == "start with override"
+            ]
+            assert rows, status.json()["currentlyWorking"]
+            return rows[0]
+
         visit = client.post("/api/timesheet/visit", headers=emp_auth, json={
             "latitude": 38.0,
             "longitude": -89.0,
@@ -2240,7 +2252,13 @@ class TestTimesheetGpsFlow:
             "gpsOverrideDetail": "customer asked for curbside handoff",
         })
         assert visit.status_code == 200, visit.text
-        assert visit.json()["visit"]["gpsMeta"]["overrideReason"] == "customer_request"
+        visit_rows = reloaded_active_entry()["visits"]
+        assert [
+            row
+            for row in visit_rows
+            if (row.get("gpsMeta") or {}).get("overrideReason") == "customer_request"
+            and (row.get("gpsMeta") or {}).get("overrideDetail") == "customer asked for curbside handoff"
+        ], visit_rows
 
         depart = client.post("/api/timesheet/depart", headers=emp_auth, json={
             "latitude": 38.0,
@@ -2249,7 +2267,13 @@ class TestTimesheetGpsFlow:
             "gpsOverrideDetail": "manual departure verification",
         })
         assert depart.status_code == 200, depart.text
-        assert depart.json()["departure"]["gpsMeta"]["overrideReason"] == "other"
+        departure_rows = reloaded_active_entry()["departures"]
+        assert [
+            row
+            for row in departure_rows
+            if (row.get("gpsMeta") or {}).get("overrideReason") == "other"
+            and (row.get("gpsMeta") or {}).get("overrideDetail") == "manual departure verification"
+        ], departure_rows
 
         co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
             "notes": "cleanup with override meta",
