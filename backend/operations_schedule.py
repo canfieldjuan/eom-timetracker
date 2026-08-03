@@ -359,18 +359,43 @@ def _load_expected_hours_learning_by_site(
     if not resolved_site_ids:
         return learning
 
+    timezone_name = getattr(app_timezone, "key", str(app_timezone))
     rows = _query_all(
         """
-        WITH visit_evidence AS (
+        WITH target_shifts AS (
+            SELECT DISTINCT v.shift_id
+            FROM visits v
+            WHERE v.location_id = ANY(%s)
+              AND v.sequence_version >= 2
+        ),
+        visit_evidence AS (
             SELECT
                 v.id AS visit_id,
+                evidence_shift.id AS shift_id,
                 v.location_id,
                 v.arrival_time,
                 v.sequence_version,
                 d.id AS departure_id,
                 d.departure_time,
                 d.location_id AS departure_location_id,
+                evidence_shift.time_category,
                 COALESCE(
+                    correction.corrected_clock_in,
+                    evidence_shift.clock_in
+                ) AS paid_clock_in,
+                COALESCE(
+                    correction.corrected_clock_out,
+                    evidence_shift.clock_out
+                ) AS paid_clock_out,
+                COALESCE(
+                    correction.corrected_break_minutes,
+                    0
+                ) AS payroll_break_minutes,
+                COALESCE(
+                    CASE
+                        WHEN visit_job.location_id = v.location_id
+                        THEN v.job_id
+                    END,
                     CASE
                         WHEN check_in_job.location_id = v.location_id
                         THEN sci.job_id
@@ -400,55 +425,175 @@ def _load_expected_hours_learning_by_site(
                     )
                 ) AS accepted_check_in
             FROM visits v
+            JOIN target_shifts target ON target.shift_id = v.shift_id
             JOIN shifts evidence_shift ON evidence_shift.id = v.shift_id
+            LEFT JOIN LATERAL (
+                SELECT
+                    shift_correction.corrected_clock_in,
+                    shift_correction.corrected_clock_out,
+                    shift_correction.corrected_break_minutes
+                FROM payroll_shift_corrections shift_correction
+                WHERE shift_correction.shift_id = evidence_shift.id
+                  AND shift_correction.status = 'active'
+                  AND shift_correction.week_start = (
+                      COALESCE(
+                          evidence_shift.local_date,
+                          (evidence_shift.clock_in AT TIME ZONE %s)::date
+                      )
+                      - EXTRACT(
+                          DOW FROM COALESCE(
+                              evidence_shift.local_date,
+                              (evidence_shift.clock_in AT TIME ZONE %s)::date
+                          )
+                      )::integer
+                  )
+                ORDER BY shift_correction.week_start DESC, shift_correction.id DESC
+                LIMIT 1
+            ) correction ON TRUE
+            LEFT JOIN jobs visit_job ON visit_job.id = v.job_id
             LEFT JOIN jobs shift_job ON shift_job.id = evidence_shift.job_id
             LEFT JOIN site_check_ins sci ON sci.id = v.site_check_in_id
             LEFT JOIN jobs check_in_job ON check_in_job.id = sci.job_id
             LEFT JOIN departures d ON d.visit_id = v.id
-            WHERE v.location_id = ANY(%s)
-              AND v.sequence_version >= 2
+            WHERE v.sequence_version >= 2
         ),
-        problem_jobs AS (
-            SELECT DISTINCT resolved_job_id
+        paired_visit_evidence AS (
+            SELECT *,
+                   EXTRACT(EPOCH FROM (departure_time - arrival_time)) AS raw_seconds
+            FROM visit_evidence
+            WHERE time_category = 'productive'
+              AND location_id IS NOT NULL
+              AND departure_id IS NOT NULL
+              AND departure_time > arrival_time
+              AND departure_location_id IS NOT DISTINCT FROM location_id
+              AND accepted_check_in IS TRUE
+              AND paid_clock_in IS NOT NULL
+              AND paid_clock_out IS NOT NULL
+              AND paid_clock_out > paid_clock_in
+              AND arrival_time >= paid_clock_in
+              AND departure_time <= paid_clock_out
+        ),
+        invalid_jobs AS (
+            SELECT DISTINCT resolved_job_id AS job_id
             FROM visit_evidence
             WHERE resolved_job_id IS NOT NULL
               AND (
-                    departure_id IS NULL
+                    time_category IS DISTINCT FROM 'productive'
+                    OR location_id IS NULL
+                    OR departure_id IS NULL
                     OR departure_time <= arrival_time
                     OR departure_location_id IS DISTINCT FROM location_id
-                    OR NOT accepted_check_in
+                    OR accepted_check_in IS NOT TRUE
+                    OR paid_clock_in IS NULL
+                    OR paid_clock_out IS NULL
+                    OR paid_clock_out <= paid_clock_in
+                    OR arrival_time < paid_clock_in
+                    OR departure_time > paid_clock_out
               )
+        ),
+        candidate_pairs AS (
+            SELECT pairs.*,
+                   j.id AS job_id,
+                   j.scheduled_date
+            FROM paired_visit_evidence pairs
+            JOIN jobs j ON j.id = pairs.resolved_job_id
+                       AND j.location_id = pairs.location_id
+            WHERE j.status = 'completed'
+              AND j.scheduled_date BETWEEN %s AND %s
+        ),
+        overlap_visits AS (
+            SELECT DISTINCT left_pair.visit_id
+            FROM paired_visit_evidence left_pair
+            JOIN paired_visit_evidence right_pair
+              ON right_pair.shift_id = left_pair.shift_id
+             AND right_pair.visit_id <> left_pair.visit_id
+             AND left_pair.arrival_time < right_pair.departure_time
+             AND right_pair.arrival_time < left_pair.departure_time
+        ),
+        overlap_jobs AS (
+            SELECT DISTINCT candidate.job_id
+            FROM candidate_pairs candidate
+            WHERE EXISTS (
+                SELECT 1
+                FROM overlap_visits overlap
+                WHERE overlap.visit_id = candidate.visit_id
+            )
+        ),
+        clean_pairs AS (
+            SELECT candidate.*
+            FROM candidate_pairs candidate
+            WHERE candidate.location_id = ANY(%s)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM invalid_jobs invalid
+                  WHERE invalid.job_id = candidate.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM overlap_jobs overlap
+                  WHERE overlap.job_id = candidate.job_id
+              )
+        ),
+        scope_pairs AS (
+            SELECT pairs.*
+            FROM paired_visit_evidence pairs
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM overlap_visits overlap
+                WHERE overlap.visit_id = pairs.visit_id
+            )
+        ),
+        shift_scopes AS (
+            SELECT shift_id,
+                   COUNT(DISTINCT location_id) AS location_count,
+                   COUNT(DISTINCT resolved_job_id)
+                       FILTER (WHERE resolved_job_id IS NOT NULL) AS job_count,
+                   COUNT(*) FILTER (WHERE resolved_job_id IS NULL)
+                       AS unassigned_job_count
+            FROM scope_pairs
+            GROUP BY shift_id
+        ),
+        shift_job_seconds AS (
+            SELECT clean.job_id,
+                   clean.location_id,
+                   clean.scheduled_date,
+                   clean.shift_id,
+                   GREATEST(
+                       SUM(clean.raw_seconds)
+                       - CASE
+                           WHEN MAX(scope.location_count) = 1
+                            AND MAX(scope.job_count) = 1
+                            AND MAX(scope.unassigned_job_count) = 0
+                           THEN LEAST(
+                               MAX(clean.payroll_break_minutes) * 60,
+                               SUM(clean.raw_seconds)
+                           )
+                           ELSE 0
+                         END,
+                       0
+                   ) AS person_seconds,
+                   COUNT(*) AS interval_count
+            FROM clean_pairs clean
+            JOIN shift_scopes scope ON scope.shift_id = clean.shift_id
+            GROUP BY clean.job_id, clean.location_id, clean.scheduled_date, clean.shift_id
         )
-        SELECT j.id AS job_id,
-               j.location_id,
-               j.scheduled_date,
-               SUM(EXTRACT(EPOCH FROM (ve.departure_time - ve.arrival_time))) / 3600.0
-                   AS person_hours,
-               COUNT(*) AS interval_count
-        FROM visit_evidence ve
-        JOIN jobs j ON j.id = ve.resolved_job_id
-                   AND j.location_id = ve.location_id
-        WHERE j.location_id = ANY(%s)
-          AND j.status = 'completed'
-          AND j.scheduled_date BETWEEN %s AND %s
-          AND ve.departure_id IS NOT NULL
-          AND ve.departure_time > ve.arrival_time
-          AND ve.departure_location_id IS NOT DISTINCT FROM ve.location_id
-          AND ve.accepted_check_in
-          AND NOT EXISTS (
-              SELECT 1
-              FROM problem_jobs problem
-              WHERE problem.resolved_job_id = j.id
-          )
-        GROUP BY j.id, j.location_id, j.scheduled_date
-        HAVING SUM(EXTRACT(EPOCH FROM (ve.departure_time - ve.arrival_time))) > 0
-        ORDER BY j.location_id, j.scheduled_date, j.id
+        SELECT job_id,
+               location_id,
+               scheduled_date,
+               SUM(person_seconds) / 3600.0 AS person_hours,
+               SUM(interval_count) AS interval_count
+        FROM shift_job_seconds
+        GROUP BY job_id, location_id, scheduled_date
+        HAVING SUM(person_seconds) > 0
+        ORDER BY location_id, scheduled_date, job_id
         """,
         (
             resolved_site_ids,
-            resolved_site_ids,
+            timezone_name,
+            timezone_name,
             observation_start,
             observation_end,
+            resolved_site_ids,
         ),
         cursor=cursor,
     )

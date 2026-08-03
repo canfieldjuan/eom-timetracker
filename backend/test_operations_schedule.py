@@ -568,14 +568,15 @@ def _visit(
     suffix: str,
     sequence_version: int = 1,
     site_check_in_id: int | None = None,
+    job_id: int | None = None,
 ) -> int:
     cur.execute(
         """
         INSERT INTO visits (
             shift_id, location_id, location_label, customer_name,
-            arrival_time, sequence_version, site_check_in_id
+            arrival_time, sequence_version, site_check_in_id, job_id
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -586,6 +587,7 @@ def _visit(
             at,
             sequence_version,
             site_check_in_id,
+            job_id,
         ),
     )
     return int(cur.fetchone()[0])
@@ -647,6 +649,7 @@ def _paired_version_two_visit(
         suffix=suffix,
         sequence_version=2,
         site_check_in_id=check_in_id,
+        job_id=job_id,
     )
     departure_id = _departure(
         cur,
@@ -4353,11 +4356,12 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
     today = datetime.now(app_timezone).date()
     future_day = today + timedelta(days=1)
     completed_days = [
+        today - timedelta(days=28),
         today - timedelta(days=21),
         today - timedelta(days=14),
         today - timedelta(days=7),
     ]
-    durations = [2, 3, 7]
+    durations = [2, 3, 4, 7]
     with db.get_conn() as conn:
         with conn.cursor() as cur:
             source_id = _source(
@@ -4401,28 +4405,95 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
                 shift_start = local_start.astimezone(timezone.utc) - timedelta(
                     minutes=15
                 )
+                shift_end = shift_start + timedelta(hours=hours, minutes=30)
                 shift_id = _shift(
                     cur,
                     employee_id=employee_id,
                     start=shift_start,
-                    end=shift_start + timedelta(hours=hours, minutes=30),
+                    end=shift_end,
                     service_day=service_day,
                     location_id=site_id,
                     location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
-                    job_id=job_id,
+                    job_id=None if index == 0 else job_id,
                 )
-                _paired_version_two_visit(
-                    cur,
-                    employee_id=employee_id,
-                    shift_id=shift_id,
-                    location_id=site_id,
-                    job_id=job_id,
-                    arrival=local_start.astimezone(timezone.utc),
-                    departure=(
-                        local_start + timedelta(hours=hours)
-                    ).astimezone(timezone.utc),
-                    suffix=f"Expected Hours Learning {index}",
+                arrival = local_start.astimezone(timezone.utc)
+                departure = (local_start + timedelta(hours=hours)).astimezone(
+                    timezone.utc
                 )
+                if index == 0:
+                    manual_visit_id = _visit(
+                        cur,
+                        shift_id=shift_id,
+                        location_id=site_id,
+                        at=arrival,
+                        suffix=f"Expected Hours Learning {index}",
+                        sequence_version=2,
+                        job_id=job_id,
+                    )
+                    _departure(
+                        cur,
+                        shift_id=shift_id,
+                        location_id=site_id,
+                        at=departure,
+                        suffix=f"Expected Hours Learning {index}",
+                        visit_id=manual_visit_id,
+                    )
+                else:
+                    _paired_version_two_visit(
+                        cur,
+                        employee_id=employee_id,
+                        shift_id=shift_id,
+                        location_id=site_id,
+                        job_id=job_id,
+                        arrival=arrival,
+                        departure=departure,
+                        suffix=f"Expected Hours Learning {index}",
+                    )
+                if index == 2:
+                    service_week_start = service_day - timedelta(
+                        days=(service_day.weekday() + 1) % 7
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO payroll_shift_corrections (
+                            week_start,
+                            correction_date,
+                            employee_id,
+                            shift_id,
+                            source_clock_in,
+                            source_clock_out,
+                            source_break_minutes,
+                            source_total_minutes,
+                            corrected_clock_in,
+                            corrected_clock_out,
+                            corrected_break_minutes,
+                            corrected_total_minutes,
+                            reason,
+                            status,
+                            created_by_employee_id,
+                            created_by_name
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, NULL, 270,
+                            %s, %s, 60, 210,
+                            'Deduct scheduled meal break from learned hours.',
+                            'active',
+                            %s,
+                            'Mayra'
+                        )
+                        """,
+                        (
+                            service_week_start,
+                            service_day,
+                            employee_id,
+                            shift_id,
+                            shift_start,
+                            shift_end,
+                            shift_start,
+                            shift_end,
+                            employee_id,
+                        ),
+                    )
 
             invalid_day = today - timedelta(days=3)
             invalid_local_start = datetime.combine(
@@ -4485,6 +4556,183 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
                 visit_id=invalid_visit_id,
             )
 
+            outside_day = today - timedelta(days=4)
+            outside_local_start = datetime.combine(
+                outside_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            outside_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=outside_local_start.astimezone(timezone.utc),
+                end=(outside_local_start + timedelta(hours=9)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-outside-paid-shift",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (outside_job_id,),
+            )
+            outside_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=outside_local_start.astimezone(timezone.utc),
+                end=(outside_local_start + timedelta(hours=2)).astimezone(
+                    timezone.utc
+                ),
+                service_day=outside_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=outside_job_id,
+            )
+            outside_visit_id = _visit(
+                cur,
+                shift_id=outside_shift_id,
+                location_id=site_id,
+                at=(outside_local_start - timedelta(minutes=30)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Outside Paid Shift",
+                sequence_version=2,
+                job_id=outside_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=outside_shift_id,
+                location_id=site_id,
+                at=(outside_local_start + timedelta(hours=1)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Outside Paid Shift",
+                visit_id=outside_visit_id,
+            )
+
+            overlap_day = today - timedelta(days=5)
+            overlap_local_start = datetime.combine(
+                overlap_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            overlap_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=overlap_local_start.astimezone(timezone.utc),
+                end=(overlap_local_start + timedelta(hours=10)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-overlap",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (overlap_job_id,),
+            )
+            overlap_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=overlap_local_start.astimezone(timezone.utc),
+                end=(overlap_local_start + timedelta(hours=4)).astimezone(
+                    timezone.utc
+                ),
+                service_day=overlap_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=overlap_job_id,
+            )
+            first_overlap_visit = _visit(
+                cur,
+                shift_id=overlap_shift_id,
+                location_id=site_id,
+                at=overlap_local_start.astimezone(timezone.utc),
+                suffix="Expected Hours Learning Overlap A",
+                sequence_version=2,
+                job_id=overlap_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=overlap_shift_id,
+                location_id=site_id,
+                at=(overlap_local_start + timedelta(hours=2)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Overlap A",
+                visit_id=first_overlap_visit,
+            )
+            second_overlap_visit = _visit(
+                cur,
+                shift_id=overlap_shift_id,
+                location_id=site_id,
+                at=(overlap_local_start + timedelta(hours=1)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Overlap B",
+                sequence_version=2,
+                job_id=overlap_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=overlap_shift_id,
+                location_id=site_id,
+                at=(overlap_local_start + timedelta(hours=3)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Overlap B",
+                visit_id=second_overlap_visit,
+            )
+
+            non_productive_day = today - timedelta(days=6)
+            non_productive_local_start = datetime.combine(
+                non_productive_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            non_productive_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=non_productive_local_start.astimezone(timezone.utc),
+                end=(non_productive_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-non-productive",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (non_productive_job_id,),
+            )
+            non_productive_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=non_productive_local_start.astimezone(timezone.utc),
+                end=(non_productive_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                service_day=non_productive_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=non_productive_job_id,
+                time_category="non_productive",
+                non_productive_type="drive_time",
+            )
+            _paired_version_two_visit(
+                cur,
+                employee_id=employee_id,
+                shift_id=non_productive_shift_id,
+                location_id=site_id,
+                job_id=non_productive_job_id,
+                arrival=non_productive_local_start.astimezone(timezone.utc),
+                departure=(non_productive_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Non Productive",
+            )
+
             future_start = datetime.combine(
                 future_day,
                 time(hour=18),
@@ -4523,7 +4771,7 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
     assert baseline["suggestedHours"] == 3
     assert baseline["plannedHours"] is None
     assert baseline["manualHours"] is None
-    assert baseline["sampleSize"] == 3
+    assert baseline["sampleSize"] == 4
     assert baseline["minimumSampleSize"] == 3
     assert baseline["observationPeriod"] == {
         "startDate": str(completed_days[0]),
