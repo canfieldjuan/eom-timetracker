@@ -4374,6 +4374,7 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
                 expected_hours=None,
             )
             employee_id = _employee(cur, "Expected Hours Learning", 22)
+            other_employee_id = _employee(cur, "Expected Hours Learning Other", 22)
             for index, (service_day, hours) in enumerate(
                 zip(completed_days, durations)
             ):
@@ -4422,6 +4423,67 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
                     ).astimezone(timezone.utc),
                     suffix=f"Expected Hours Learning {index}",
                 )
+
+            invalid_day = today - timedelta(days=3)
+            invalid_local_start = datetime.combine(
+                invalid_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            invalid_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=invalid_local_start.astimezone(timezone.utc),
+                end=(invalid_local_start + timedelta(hours=11)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-invalid-qr-identity",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (invalid_job_id,),
+            )
+            invalid_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=invalid_local_start.astimezone(timezone.utc)
+                - timedelta(minutes=15),
+                end=(invalid_local_start + timedelta(hours=11, minutes=15)).astimezone(
+                    timezone.utc
+                ),
+                service_day=invalid_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=invalid_job_id,
+            )
+            invalid_check_in_id = _check_in(
+                cur,
+                employee_id=other_employee_id,
+                location_id=site_id,
+                checked_in_at=invalid_local_start.astimezone(timezone.utc),
+                job_id=invalid_job_id,
+            )
+            invalid_visit_id = _visit(
+                cur,
+                shift_id=invalid_shift_id,
+                location_id=site_id,
+                at=invalid_local_start.astimezone(timezone.utc),
+                suffix="Expected Hours Learning Invalid",
+                sequence_version=2,
+                site_check_in_id=invalid_check_in_id,
+            )
+            _departure(
+                cur,
+                shift_id=invalid_shift_id,
+                location_id=site_id,
+                at=(invalid_local_start + timedelta(hours=11)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Invalid",
+                visit_id=invalid_visit_id,
+            )
 
             future_start = datetime.combine(
                 future_day,

@@ -383,13 +383,19 @@ def _load_expected_hours_learning_by_site(
                 (
                     v.site_check_in_id IS NULL
                     OR (
-                        (
-                            sci.classification IN ('on_time', 'late')
-                            AND sci.review_status = 'not_required'
-                        )
-                        OR (
-                            sci.classification = 'needs_review'
-                            AND sci.review_status = 'approved'
+                        sci.employee_id = evidence_shift.employee_id
+                        AND sci.location_id = v.location_id
+                        AND DATE_TRUNC('second', sci.server_checked_in_at)
+                            = DATE_TRUNC('second', v.arrival_time)
+                        AND (
+                            (
+                                sci.classification IN ('on_time', 'late')
+                                AND sci.review_status = 'not_required'
+                            )
+                            OR (
+                                sci.classification = 'needs_review'
+                                AND sci.review_status = 'approved'
+                            )
                         )
                     )
                 ) AS accepted_check_in
