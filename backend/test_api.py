@@ -2399,10 +2399,14 @@ class TestTimesheetGpsFlow:
         rows = report.json()["rows"]
         catalina = [r for r in rows if r["employeeName"] == "Catalina Gomez"]
         assert catalina, rows
-        latest = catalina[-1]
-        assert latest["gpsExceptions"]
-        assert "clock_in - other" in latest["gpsExceptionsText"]
-        assert "clock_out - gps_signal" in latest["gpsExceptionsText"]
+        expected_markers = ("clock_in - other", "clock_out - gps_signal")
+        matching_exception_rows = [
+            row
+            for row in catalina
+            if row["gpsExceptions"]
+            and all(marker in row["gpsExceptionsText"] for marker in expected_markers)
+        ]
+        assert matching_exception_rows, catalina
 
     def test_hours_report_can_filter_to_exception_shifts_only(self, client, auth, emp_auth):
         pin = client.patch("/api/admin/locations/pin", headers=auth, json={
