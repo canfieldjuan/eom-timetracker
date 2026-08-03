@@ -82,6 +82,24 @@ CREATE TABLE eom_office_conversion_handoffs (
     finalized_at             TIMESTAMPTZ
 );
 
+-- Request access diagnostics. During the file-to-Postgres cutover the API keeps
+-- writing the legacy JSON files and reads both sources for the admin log view.
+CREATE TABLE access_log_entries (
+    id          BIGSERIAL PRIMARY KEY,
+    event_id    TEXT NOT NULL,
+    logged_at   TIMESTAMPTZ NOT NULL,
+    local_date  DATE NOT NULL,
+    action      TEXT NOT NULL,
+    allowed     BOOLEAN NOT NULL,
+    reason      TEXT NOT NULL DEFAULT '',
+    client_ip   TEXT NOT NULL DEFAULT '',
+    user_agent  TEXT NOT NULL DEFAULT '',
+    endpoint    TEXT NOT NULL DEFAULT '',
+    method      TEXT NOT NULL DEFAULT '',
+    entry       JSONB NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Jobs (service visits / scheduled work at a customer)
 CREATE TABLE jobs (
     id              SERIAL PRIMARY KEY,
@@ -845,6 +863,12 @@ CREATE INDEX idx_locations_customer_id ON locations(customer_id);
 CREATE UNIQUE INDEX uq_locations_address_key
     ON locations(address_key) WHERE address_key IS NOT NULL;
 CREATE INDEX idx_employees_active    ON employees(active);
+CREATE UNIQUE INDEX uq_access_log_entries_event_id
+    ON access_log_entries(event_id);
+CREATE INDEX idx_access_log_entries_local_date
+    ON access_log_entries(local_date, logged_at, id);
+CREATE INDEX idx_access_log_entries_logged_at
+    ON access_log_entries(logged_at);
 CREATE INDEX idx_site_check_in_schedules_lookup
     ON site_check_in_schedules(employee_id, location_id, scheduled_start);
 CREATE INDEX idx_site_check_in_schedule_rules_lookup

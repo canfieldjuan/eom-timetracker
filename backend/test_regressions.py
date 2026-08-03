@@ -7,13 +7,65 @@ Run:  cd backend && pytest -v test_regressions.py
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
 
 SITE_GPS = {"latitude": 39.1203, "longitude": -88.54335}
+
+
+def _access_log_entry(
+    timestamp: str,
+    action: str,
+    *,
+    endpoint: str = "/api/admin/example",
+    event_id: str | None = None,
+) -> dict:
+    entry = {
+        "timestamp": timestamp,
+        "action": action,
+        "allowed": True,
+        "reason": "pytest",
+        "clientIP": "203.0.113.10",
+        "userAgent": "pytest",
+        "endpoint": endpoint,
+        "method": "GET",
+    }
+    if event_id is not None:
+        entry["eventId"] = event_id
+    return entry
+
+
+def _insert_access_log_entry(api, date_text: str, entry: dict) -> None:
+    event_id = str(
+        entry.get("eventId")
+        or f"test-{date_text}-{entry['action']}-{entry['timestamp']}"
+    )
+    stored_entry = {**entry, "eventId": event_id}
+    api.db.execute(
+        """
+        INSERT INTO access_log_entries (
+            event_id, logged_at, local_date, action, allowed, reason,
+            client_ip, user_agent, endpoint, method, entry
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            event_id,
+            api.parse_utc_iso(stored_entry["timestamp"]),
+            date.fromisoformat(date_text),
+            stored_entry["action"],
+            stored_entry["allowed"],
+            stored_entry["reason"],
+            stored_entry["clientIP"],
+            stored_entry["userAgent"],
+            stored_entry["endpoint"],
+            stored_entry["method"],
+            api.psycopg2.extras.Json(stored_entry),
+        ),
+    )
 
 
 def _ensure_clocked_out(client, headers) -> None:
@@ -689,3 +741,287 @@ class TestRemovedOrphanEndpoints:
         # Main analytics endpoint (used by portal.html) still serves.
         r = client.get("/api/admin/analytics?period=day", headers=auth)
         assert r.status_code == 200, r.text
+
+
+class TestAccessLogDurability:
+    def test_access_log_entry_dual_writes_file_and_postgres(
+        self, client, monkeypatch, tmp_path
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "LOGS_DIR", tmp_path / "logs")
+        before = api.utc_now() - timedelta(seconds=1)
+
+        response = client.post(
+            "/api/auth/login",
+            headers={"user-agent": "access-log-durability-test"},
+            json={"name": "Definitely Not A User", "password": "x"},
+        )
+        assert response.status_code == 401, response.text
+
+        rows = api.db.query_all(
+            """
+            SELECT event_id, local_date, entry
+            FROM access_log_entries
+            WHERE action = %s
+              AND endpoint = %s
+              AND logged_at >= %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("LOGIN_FAILED", "/api/auth/login", before),
+        )
+        assert rows, "login failure did not write a durable access-log row"
+
+        entry = rows[0]["entry"]
+        assert entry["eventId"] == rows[0]["event_id"]
+        assert entry["action"] == "LOGIN_FAILED"
+        assert entry["allowed"] is False
+        assert entry["endpoint"] == "/api/auth/login"
+        assert entry["method"] == "POST"
+        assert entry["userAgent"] == "access-log-durability-test"
+
+        file_payload = api.read_json_file(
+            api.LOGS_DIR / f"access_{rows[0]['local_date']}.json",
+            [],
+        )
+        assert entry in file_payload
+
+    def test_admin_logs_reads_postgres_and_legacy_file_without_duplicates(
+        self, client, auth, monkeypatch, tmp_path
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "LOGS_DIR", tmp_path / "logs")
+        date_text = "2026-02-04"
+        legacy_only = _access_log_entry(
+            "2026-02-04T14:00:00Z",
+            "LEGACY_FILE_ONLY",
+        )
+        duplicate_event_id = "test-cutover-duplicate-event"
+        duplicated = _access_log_entry(
+            "2026-02-04T15:00:00Z",
+            "CUTOVER_DUPLICATE",
+            event_id=duplicate_event_id,
+        )
+        postgres_only = _access_log_entry(
+            "2026-02-04T16:00:00Z",
+            "POSTGRES_ONLY",
+            event_id="test-postgres-only-event",
+        )
+        api.write_json_atomic(
+            api.LOGS_DIR / f"access_{date_text}.json",
+            [legacy_only, duplicated],
+        )
+        _insert_access_log_entry(api, date_text, duplicated)
+        _insert_access_log_entry(api, date_text, postgres_only)
+
+        response = client.get(f"/api/admin/logs/{date_text}", headers=auth)
+
+        assert response.status_code == 200, response.text
+        logs = response.json()["logs"]
+        assert all("eventId" not in entry for entry in logs)
+        assert legacy_only in logs
+        assert api._public_access_log_entry(postgres_only) in logs
+        assert logs.count(api._public_access_log_entry(duplicated)) == 1
+
+    def test_access_log_dedupe_preserves_identical_legacy_events_without_event_ids(
+        self, client
+    ):
+        import time_tracker_api as api
+
+        first = _access_log_entry(
+            "2026-02-04T15:00:00Z",
+            "IDENTICAL_LEGACY_LOGIN_FAILURE",
+        )
+        second = dict(first)
+        assert api._dedupe_access_logs([first, second]) == [first, second]
+
+        with_event_id = _access_log_entry(
+            "2026-02-04T15:00:00Z",
+            "DUPLICATED_CUTOVER_EVENT",
+            event_id="shared-cutover-id",
+        )
+        assert api._dedupe_access_logs([with_event_id, dict(with_event_id)]) == [
+            with_event_id
+        ]
+
+    def test_legacy_file_failure_does_not_block_postgres_access_log_write(
+        self, client, monkeypatch, tmp_path
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "LOGS_DIR", tmp_path / "logs")
+
+        def fail_file_write(*_args, **_kwargs):
+            raise OSError("simulated legacy log disk failure")
+
+        monkeypatch.setattr(api, "write_json_atomic", fail_file_write)
+        before = api.utc_now() - timedelta(seconds=1)
+
+        response = client.post(
+            "/api/auth/login",
+            headers={"user-agent": "access-log-file-failure-test"},
+            json={"name": "Definitely Not A User", "password": "x"},
+        )
+
+        assert response.status_code == 401, response.text
+        rows = api.db.query_all(
+            """
+            SELECT entry
+            FROM access_log_entries
+            WHERE action = %s
+              AND endpoint = %s
+              AND logged_at >= %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            ("LOGIN_FAILED", "/api/auth/login", before),
+        )
+        assert rows
+        assert rows[0]["entry"]["userAgent"] == "access-log-file-failure-test"
+
+    def test_health_endpoint_does_not_wait_on_access_log_write(self, client, monkeypatch):
+        import time_tracker_api as api
+
+        def fail_access_log(*_args, **_kwargs):
+            raise RuntimeError("health should not synchronously audit")
+
+        monkeypatch.setattr(api, "append_access_log", fail_access_log)
+
+        response = client.get("/api/health")
+
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "ok"
+
+    def test_admin_logs_fall_back_to_postgres_when_legacy_file_is_malformed(
+        self, client, auth, monkeypatch, tmp_path
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "LOGS_DIR", tmp_path / "logs")
+        date_text = "2026-02-05"
+        postgres_only = _access_log_entry(
+            "2026-02-05T16:00:00Z",
+            "POSTGRES_SURVIVES_BAD_FILE",
+            event_id="test-postgres-bad-file-fallback",
+        )
+        api.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        (api.LOGS_DIR / f"access_{date_text}.json").write_text(
+            "{not valid json",
+            encoding="utf-8",
+        )
+        _insert_access_log_entry(api, date_text, postgres_only)
+
+        response = client.get(f"/api/admin/logs/{date_text}", headers=auth)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["logs"] == [
+            api._public_access_log_entry(postgres_only)
+        ]
+
+    def test_admin_logs_skip_non_object_legacy_entries_when_merging_postgres(
+        self, client, auth, monkeypatch, tmp_path
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "LOGS_DIR", tmp_path / "logs")
+        date_text = "2026-02-06"
+        legacy_only = _access_log_entry(
+            "2026-02-06T14:00:00Z",
+            "LEGACY_VALID_OBJECT",
+        )
+        postgres_only = _access_log_entry(
+            "2026-02-06T16:00:00Z",
+            "POSTGRES_SURVIVES_LEGACY_NON_OBJECT",
+            event_id="test-postgres-legacy-non-object",
+        )
+        api.write_json_atomic(
+            api.LOGS_DIR / f"access_{date_text}.json",
+            [None, legacy_only, "not an object"],
+        )
+        _insert_access_log_entry(api, date_text, postgres_only)
+
+        response = client.get(f"/api/admin/logs/{date_text}", headers=auth)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["logs"] == [
+            legacy_only,
+            api._public_access_log_entry(postgres_only),
+        ]
+
+    def test_access_log_retention_prunes_only_expired_postgres_rows(
+        self, client, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "ACCESS_LOG_RETENTION_DAYS", 30)
+        now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+        expired = _access_log_entry(
+            "2026-06-14T12:00:00Z",
+            "RETENTION_EXPIRED",
+        )
+        retained = _access_log_entry(
+            "2026-06-16T12:00:00Z",
+            "RETENTION_KEPT",
+        )
+        _insert_access_log_entry(api, "2026-06-14", expired)
+        _insert_access_log_entry(api, "2026-06-16", retained)
+
+        api._prune_access_log_entries(now)
+
+        rows = api.db.query_all(
+            """
+            SELECT action
+            FROM access_log_entries
+            WHERE action LIKE %s
+            ORDER BY action
+            """,
+            ("RETENTION_%",),
+        )
+        assert rows == [{"action": "RETENTION_KEPT"}]
+
+    def test_access_log_retention_retry_is_not_suppressed_after_prune_failure(
+        self, client, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        attempts = 0
+        today = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+
+        def fixed_now():
+            return today
+
+        def flaky_prune():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("simulated transient prune failure")
+
+        monkeypatch.setattr(api, "_ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON", None)
+        monkeypatch.setattr(api, "utc_now", fixed_now)
+        monkeypatch.setattr(api, "_prune_access_log_entries", flaky_prune)
+
+        with pytest.raises(RuntimeError, match="simulated transient prune failure"):
+            api._maybe_prune_access_log_entries()
+
+        assert api._ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON is None
+
+        api._maybe_prune_access_log_entries()
+
+        assert attempts == 2
+        assert api._ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON == today.date()
+
+    def test_access_log_schema_migration_installs_logged_at_retention_index(self, client):
+        import time_tracker_api as api
+
+        api.db.execute("DROP INDEX IF EXISTS idx_access_log_entries_logged_at")
+
+        api._ensure_schema_migrations()
+
+        row = api.db.query_one(
+            """
+            SELECT to_regclass('idx_access_log_entries_logged_at') AS index_name
+            """
+        )
+        assert row == {"index_name": "idx_access_log_entries_logged_at"}

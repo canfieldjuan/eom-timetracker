@@ -60,7 +60,8 @@ def _apply_schema(conn):
     """Drop and recreate all tables from schema.sql."""
     with conn.cursor() as cur:
         cur.execute("""
-            DROP TABLE IF EXISTS planned_visit_audit_events,
+            DROP TABLE IF EXISTS access_log_entries,
+                planned_visit_audit_events,
                 planned_visit_assignments, planned_service_visits,
                 google_calendar_event_mappings, calendar_import_previews,
                 crew_memberships, crews, google_calendar_oauth_states,
@@ -122,6 +123,16 @@ def clear_receivables_operation_attempts(setup_db):
     conn = _raw_conn()
     with conn.cursor() as cur:
         cur.execute("DELETE FROM receivables_operation_attempts")
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture(autouse=True)
+def clear_access_log_entries(setup_db):
+    """Keep request-log rows isolated between API test cases."""
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM access_log_entries")
     conn.commit()
     conn.close()
 

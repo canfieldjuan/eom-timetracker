@@ -28,7 +28,7 @@ from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple
 from urllib.parse import quote, urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import bcrypt
@@ -76,6 +76,8 @@ EMPLOYEE_WRITE_LOCK = threading.Lock()
 TIMESHEET_WRITE_LOCK = threading.Lock()
 TIMESHEET_PG_ADVISORY_LOCK_ID = 5_107_202_064
 ACCESS_LOG_WRITE_LOCK = threading.Lock()
+ACCESS_LOG_RETENTION_LOCK = threading.Lock()
+_ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON: Optional[date] = None
 logger = logging.getLogger("eom.time_tracker")
 
 try:
@@ -260,6 +262,7 @@ SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS = 12
 SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS = 600
 SITE_CHECK_IN_RECONCILIATION_GAP_DEFAULT_MINUTES = 15
 SITE_CHECK_IN_RECONCILIATION_MAX_DAYS = 31
+ACCESS_LOG_RETENTION_DEFAULT_DAYS = 400
 SITE_CHECK_IN_QR_VERSION = "eom1"
 SITE_CHECK_IN_RADIUS_M = SITE_CHECK_IN_RADIUS_DEFAULT_M
 SITE_CHECK_IN_MAX_ACCURACY_M = SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M
@@ -1765,12 +1768,13 @@ def build_public_current_status(
 
 
 def append_access_log(request: Request, action: str, allowed: bool, reason: str = "") -> None:
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = to_utc_iso(utc_now())
+    local_date_text = local_date_for_logs()
     client_ip = get_client_ip(request)
     user_agent = request.headers.get("user-agent", "")
 
     entry = {
+        "eventId": str(uuid4()),
         "timestamp": timestamp,
         "action": action,
         "allowed": allowed,
@@ -1781,7 +1785,30 @@ def append_access_log(request: Request, action: str, allowed: bool, reason: str 
         "method": request.method,
     }
 
-    log_file = LOGS_DIR / f"access_{local_date_for_logs()}.json"
+    postgres_written = False
+    try:
+        _append_access_log_to_postgres(entry, local_date_text)
+        postgres_written = True
+    except Exception:
+        logger.warning("access_log_postgres_write_failed", exc_info=True)
+
+    try:
+        _append_access_log_to_file(entry, local_date_text)
+    except Exception:
+        logger.warning("access_log_file_write_failed", exc_info=True)
+
+    if not postgres_written:
+        return
+
+    try:
+        _maybe_prune_access_log_entries()
+    except Exception:
+        logger.warning("access_log_postgres_prune_failed", exc_info=True)
+
+
+def _append_access_log_to_file(entry: Dict[str, Any], local_date_text: str) -> None:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOGS_DIR / f"access_{local_date_text}.json"
 
     with ACCESS_LOG_WRITE_LOCK:
         with process_file_lock(log_file):
@@ -1790,6 +1817,55 @@ def append_access_log(request: Request, action: str, allowed: bool, reason: str 
                 payload = []
             payload.append(entry)
             write_json_atomic(log_file, payload)
+
+
+def _append_access_log_to_postgres(entry: Dict[str, Any], local_date_text: str) -> None:
+    event_id = str(entry.get("eventId") or uuid4())
+    entry = {**entry, "eventId": event_id}
+    logged_at = parse_utc_iso(str(entry["timestamp"]))
+    log_date = date.fromisoformat(local_date_text)
+    db.execute(
+        """
+        INSERT INTO access_log_entries (
+            event_id, logged_at, local_date, action, allowed, reason,
+            client_ip, user_agent, endpoint, method, entry
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            event_id,
+            logged_at,
+            log_date,
+            str(entry.get("action", "")),
+            bool(entry.get("allowed")),
+            str(entry.get("reason", "")),
+            str(entry.get("clientIP", "")),
+            str(entry.get("userAgent", "")),
+            str(entry.get("endpoint", "")),
+            str(entry.get("method", "")),
+            psycopg2.extras.Json(entry),
+        ),
+    )
+
+
+def _prune_access_log_entries(now: Optional[datetime] = None) -> None:
+    cutoff = (now or utc_now()) - timedelta(days=ACCESS_LOG_RETENTION_DAYS)
+    db.execute(
+        "DELETE FROM access_log_entries WHERE logged_at < %s",
+        (cutoff,),
+    )
+
+
+def _maybe_prune_access_log_entries() -> None:
+    global _ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON
+
+    today = utc_now().date()
+    with ACCESS_LOG_RETENTION_LOCK:
+        if _ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON == today:
+            return
+
+        _prune_access_log_entries()
+        _ACCESS_LOG_RETENTION_LAST_ATTEMPTED_ON = today
 
 
 def current_schedule_context() -> Dict[str, Any]:
@@ -2732,6 +2808,10 @@ DEFAULT_TRUSTED_PROXY_HOPS = 2
 TRUSTED_PROXY_HOPS = max(
     1,
     parse_int(os.getenv("TRUSTED_PROXY_HOPS"), DEFAULT_TRUSTED_PROXY_HOPS),
+)
+ACCESS_LOG_RETENTION_DAYS = max(
+    1,
+    parse_int(os.getenv("ACCESS_LOG_RETENTION_DAYS"), ACCESS_LOG_RETENTION_DEFAULT_DAYS),
 )
 # Gate employee clock actions (clock-in/out, arrive, depart, QR check-in) to the
 # ACCESS_START_HOUR..ACCESS_END_HOUR window on ALLOWED_DAYS. Deliberately does NOT
@@ -4105,6 +4185,47 @@ def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
     _ensure_employee_role_schema()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS access_log_entries (
+            id          BIGSERIAL PRIMARY KEY,
+            event_id    TEXT NOT NULL,
+            logged_at   TIMESTAMPTZ NOT NULL,
+            local_date  DATE NOT NULL,
+            action      TEXT NOT NULL,
+            allowed     BOOLEAN NOT NULL,
+            reason      TEXT NOT NULL DEFAULT '',
+            client_ip   TEXT NOT NULL DEFAULT '',
+            user_agent  TEXT NOT NULL DEFAULT '',
+            endpoint    TEXT NOT NULL DEFAULT '',
+            method      TEXT NOT NULL DEFAULT '',
+            entry       JSONB NOT NULL,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute("""
+        ALTER TABLE access_log_entries
+            ADD COLUMN IF NOT EXISTS event_id TEXT;
+
+        UPDATE access_log_entries
+        SET event_id = COALESCE(NULLIF(entry->>'eventId', ''), 'legacy-' || id::text)
+        WHERE event_id IS NULL OR event_id = '';
+
+        ALTER TABLE access_log_entries
+            ALTER COLUMN event_id SET NOT NULL;
+    """)
+    db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_access_log_entries_event_id
+        ON access_log_entries(event_id)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_access_log_entries_local_date
+        ON access_log_entries(local_date, logged_at, id)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_access_log_entries_logged_at
+        ON access_log_entries(logged_at)
+    """)
+    _prune_access_log_entries()
     db.execute("""
         CREATE TABLE IF NOT EXISTS receivables_operation_attempts (
             attempt_id          BIGSERIAL PRIMARY KEY,
@@ -6317,8 +6438,7 @@ def time_tracker_page(
 
 
 @app.get("/api/health")
-def health_check(request: Request) -> Dict[str, Any]:
-    append_access_log(request, "HEALTH_CHECK", True, "Public endpoint")
+def health_check() -> Dict[str, Any]:
     return {
         "status": "ok",
         "serverTime": to_utc_iso(utc_now()),
@@ -12201,15 +12321,88 @@ def admin_apply_time_data_correction(
     }
 
 
-def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
-        return []
-
+def _read_access_logs_file_for_date(date_text: str) -> List[Dict[str, Any]]:
     log_file = LOGS_DIR / f"access_{date_text}.json"
     payload = read_json_file(log_file, [])
     if not isinstance(payload, list):
         return []
-    return payload
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+def _read_access_logs_postgres_for_date(log_date: date) -> List[Dict[str, Any]]:
+    rows = db.query_all(
+        """
+        SELECT entry
+        FROM access_log_entries
+        WHERE local_date = %s
+        ORDER BY logged_at ASC, id ASC
+        """,
+        (log_date,),
+    )
+    logs: List[Dict[str, Any]] = []
+    for row in rows:
+        entry = row.get("entry")
+        if isinstance(entry, dict):
+            logs.append(entry)
+    return logs
+
+
+def _dedupe_access_logs(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        event_id = str(entry.get("eventId") or "").strip()
+        if event_id:
+            key = f"event:{event_id}"
+            if key in seen:
+                continue
+            seen.add(key)
+        deduped.append(entry)
+
+    return sorted(deduped, key=lambda item: str(item.get("timestamp", "")))
+
+
+def _public_access_log_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    public_entry = dict(entry)
+    public_entry.pop("eventId", None)
+    return public_entry
+
+
+def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_text):
+        return []
+
+    try:
+        log_date = date.fromisoformat(date_text)
+    except ValueError:
+        return []
+
+    postgres_logs: Optional[List[Dict[str, Any]]] = None
+    try:
+        postgres_logs = _read_access_logs_postgres_for_date(log_date)
+    except Exception:
+        logger.warning("access_log_postgres_read_failed", exc_info=True)
+
+    file_logs: Optional[List[Dict[str, Any]]] = None
+    try:
+        file_logs = _read_access_logs_file_for_date(date_text)
+    except Exception:
+        logger.warning("access_log_file_read_failed", exc_info=True)
+
+    if postgres_logs is None:
+        if file_logs is None:
+            return []
+        return [_public_access_log_entry(entry) for entry in file_logs]
+    if not postgres_logs:
+        if file_logs is None:
+            return []
+        return [_public_access_log_entry(entry) for entry in file_logs]
+    if not file_logs:
+        return [_public_access_log_entry(entry) for entry in postgres_logs]
+    return [
+        _public_access_log_entry(entry)
+        for entry in _dedupe_access_logs([*file_logs, *postgres_logs])
+    ]
 
 
 @app.get("/api/admin/logs/{date_text}")
