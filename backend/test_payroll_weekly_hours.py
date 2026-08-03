@@ -2312,7 +2312,7 @@ def test_week_start_must_be_a_sunday(client, auth):
 
 
 def test_payroll_week_verification_requires_current_fingerprint_and_records_audit(client, auth):
-    week_start = date(2026, 8, 2)
+    week_start = date(2026, 8, 30)
     employee_id = _create_employee("Payroll Verification Worker")
     _delete_payroll_verification_weeks([week_start])
     try:
