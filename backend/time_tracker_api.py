@@ -30,201 +30,51 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-_data_dir_env = os.environ.get("DATA_DIR", "")
-DATA_DIR = Path(_data_dir_env) if _data_dir_env else BASE_DIR / "data"
-LOGS_DIR = DATA_DIR / "logs"
-REPORTS_DIR = DATA_DIR / "reports"
-BACKEND_DIR = BASE_DIR / "backend"
+# Internal module imports
+from config import (
+    BASE_DIR, DATA_DIR, LOGS_DIR, REPORTS_DIR, BACKEND_DIR,
+    EMPLOYEES_FILE, TIMESHEETS_FILE, SETTINGS_FILE,
+    DEFAULT_LOCATIONS, JWT_ALGORITHM, ACCESS_LOG_WRITE_LOCK,
+    JWT_SECRET, TIMEZONE_NAME, APP_TIMEZONE, TOKEN_TTL_HOURS,
+    MAX_ACTIVE_SHIFT_HOURS, AUTO_CLOSE_STALE_SHIFTS,
+    LOCATION_MATCH_RADIUS_M, LOCATION_MATCH_RADIUS_DEFAULT_M,
+    ACCESS_START_HOUR, ACCESS_END_HOUR, ALLOWED_DAYS,
+    ALLOWED_IPS, TRUST_PROXY, BOOTSTRAP_ADMIN_IDS,
+    _SETTINGS_DEFAULTS
+)
+from utils import (
+    json_copy, read_json_file, write_json_atomic,
+    process_file_lock, utc_now, to_utc_iso, parse_utc_iso,
+    to_local, local_clock_string, local_date_string, local_date_for_logs,
+    get_client_ip,
+    haversine_m,
+    find_nearest_location_match as _db_find_nearest_location_match,
+    find_nearest_location as _db_find_nearest_location,
+    build_gps_meta, require_gps_override
+)
+from security import (
+    verify_password, create_auth_token, decode_auth_token,
+    get_current_employee, get_current_admin
+)
+from models import (
+    LoginRequest, RegisterRequest, ClockInRequest, ClockOutRequest,
+    DepartRequest, EntryAdjustRequest, ReportGenerateRequest,
+    JobCreateRequest, JobUpdateRequest, JobLinkShiftsRequest,
+    ShiftCategorizeRequest, ScheduleEntryRequest
+)
 
-EMPLOYEES_FILE = DATA_DIR / "employees.json"
-TIMESHEETS_FILE = DATA_DIR / "timesheets.json"
-SETTINGS_FILE = DATA_DIR / "settings.json"
-
-DEFAULT_LOCATIONS = [
-    "Office Maids 101, Effingham",
-    "Office Maids 102, Effingham",
-    "Office Maids 103, Effingham",
-]
-
-JWT_ALGORITHM = "HS256"
 EMPLOYEE_WRITE_LOCK = threading.Lock()
 TIMESHEET_WRITE_LOCK = threading.Lock()
-ACCESS_LOG_WRITE_LOCK = threading.Lock()
-
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
 
 
-def load_env_file(path: Path) -> None:
-    """Load KEY=VALUE entries without extra dependencies."""
-    if not path.exists():
-        return
+def find_nearest_location_match(
+    lat: float,
+    lng: float,
+    timesheet_data: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if timesheet_data is None:
+        return _db_find_nearest_location_match(lat, lng)
 
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key:
-            continue
-
-        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
-            value = value[1:-1]
-        elif value.startswith("'") and value.endswith("'") and len(value) >= 2:
-            value = value[1:-1]
-
-        os.environ.setdefault(key, value)
-
-
-def load_local_env() -> None:
-    load_env_file(BASE_DIR / ".env")
-    load_env_file(BACKEND_DIR / ".env")
-
-
-def json_copy(value: Any) -> Any:
-    return json.loads(json.dumps(value))
-
-
-def read_json_file(path: Path, default_value: Any) -> Any:
-    if not path.exists():
-        return json_copy(default_value)
-
-    with path.open("r", encoding="utf-8") as file:
-        return json.load(file)
-
-
-def write_json_atomic(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f"{path.name}.{os.getpid()}.{int(time.time() * 1000)}.tmp")
-    try:
-        with temp_path.open("w", encoding="utf-8") as file:
-            json.dump(payload, file, indent=2)
-            file.write("\n")
-        os.replace(temp_path, path)
-    finally:
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def lock_file_path(target_path: Path) -> Path:
-    return target_path.with_name(f"{target_path.name}.lock")
-
-
-@contextmanager
-def process_file_lock(target_path: Path):
-    lock_path = lock_file_path(target_path)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        if fcntl is not None:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-
-        try:
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def to_utc_iso(value: datetime) -> str:
-    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def parse_utc_iso(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
-
-
-def to_local(dt: datetime) -> datetime:
-    return dt.astimezone(APP_TIMEZONE)
-
-
-def local_clock_string(dt: datetime) -> str:
-    return to_local(dt).strftime("%I:%M %p")
-
-
-def local_date_string(dt: datetime) -> str:
-    return to_local(dt).strftime("%Y-%m-%d")
-
-
-def local_date_for_logs() -> str:
-    return datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
-
-
-def normalize_ip(raw_ip: str) -> str:
-    ip = raw_ip.strip()
-    if ip.startswith("::ffff:"):
-        return ip[7:]
-    return ip
-
-
-def get_client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "")
-    forwarded_ip = forwarded.split(",")[0].strip() if forwarded else ""
-
-    direct_ip = request.client.host if request.client and request.client.host else ""
-    selected = forwarded_ip if TRUST_PROXY and forwarded_ip else direct_ip
-    return normalize_ip(selected) if selected else "unknown"
-
-
-def parse_int(value: Optional[str], default: int) -> int:
-    try:
-        return int(str(value))
-    except (TypeError, ValueError):
-        return default
-
-
-def parse_bool(value: Optional[str], default: bool) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def parse_allowed_days(value: Optional[str]) -> List[str]:
-    if not value:
-        return ["1", "2", "3", "4", "5"]
-
-    days = [part.strip() for part in value.split(",") if part.strip()]
-    if not days:
-        return ["1", "2", "3", "4", "5"]
-
-    for day in days:
-        if not re.fullmatch(r"[0-6]", day):
-            raise RuntimeError(f"Invalid ALLOWED_DAYS value: {day}")
-
-    return days
-
-
-def parse_allowed_ips(value: Optional[str]) -> List[str]:
-    if not value:
-        return []
-    return [part.strip() for part in value.split(",") if part.strip()]
-
-
-LOCATION_MATCH_RADIUS_DEFAULT_M = 50
-LOCATION_MATCH_RADIUS_M = LOCATION_MATCH_RADIUS_DEFAULT_M
-
-
-def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    R = 6_371_000
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    a = (math.sin(math.radians(lat2 - lat1) / 2) ** 2
-         + math.cos(phi1) * math.cos(phi2) * math.sin(math.radians(lng2 - lng1) / 2) ** 2)
-    return 2 * R * math.asin(math.sqrt(a))
-
-
-def find_nearest_location_match(lat: float, lng: float, timesheet_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     coords = timesheet_data.get("location_coords", {})
     best_name, best_dist = None, float("inf")
     for name, c in coords.items():
@@ -240,59 +90,17 @@ def find_nearest_location_match(lat: float, lng: float, timesheet_data: Dict[str
     }
 
 
-def find_nearest_location(lat: float, lng: float, timesheet_data: Dict[str, Any]) -> Optional[str]:
+def find_nearest_location(
+    lat: float,
+    lng: float,
+    timesheet_data: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    if timesheet_data is None:
+        return _db_find_nearest_location(lat, lng)
+
     nearest = find_nearest_location_match(lat, lng, timesheet_data)
     if nearest and nearest["withinRadius"]:
         return str(nearest["location"])
-    return None
-
-
-def build_gps_meta(
-    timesheet_data: Dict[str, Any],
-    latitude: Optional[float],
-    longitude: Optional[float],
-    override_reason: str = "",
-    override_detail: str = "",
-) -> Optional[Dict[str, Any]]:
-    reason = str(override_reason or "").strip()
-    detail = str(override_detail or "").strip()
-    nearest = None
-    if latitude is not None and longitude is not None:
-        nearest = find_nearest_location_match(latitude, longitude, timesheet_data)
-
-    if not nearest and not reason and not detail:
-        return None
-
-    return {
-        "override": bool(reason),
-        "overrideReason": reason,
-        "overrideDetail": detail,
-        "matchedLocation": str(nearest["location"]) if nearest else "",
-        "distanceM": round(float(nearest["distanceM"]), 2) if nearest else None,
-        "withinRadius": bool(nearest["withinRadius"]) if nearest else None,
-    }
-
-
-def require_gps_override(
-    timesheet_data: Dict[str, Any],
-    latitude: Optional[float],
-    longitude: Optional[float],
-    override_reason: str = "",
-) -> Optional[str]:
-    if str(override_reason or "").strip():
-        return None
-
-    if latitude is None or longitude is None:
-        return None
-
-    nearest = find_nearest_location_match(latitude, longitude, timesheet_data)
-    if nearest and not nearest["withinRadius"]:
-        distance_m = round(float(nearest["distanceM"]))
-        return (
-            f"GPS is {distance_m}m from the nearest saved site "
-            f"({nearest['location']}). Add an override reason to continue."
-        )
-
     return None
 
 
@@ -339,193 +147,6 @@ def collect_entry_gps_exceptions(entry: Dict[str, Any]) -> List[str]:
     return exceptions
 
 
-def validate_schedule(start_hour: int, end_hour: int) -> None:
-    if start_hour < 0 or start_hour > 23:
-        raise RuntimeError("ACCESS_START_HOUR must be between 0 and 23")
-    if end_hour < 1 or end_hour > 24:
-        raise RuntimeError("ACCESS_END_HOUR must be between 1 and 24")
-    if start_hour >= end_hour:
-        raise RuntimeError("ACCESS_START_HOUR must be less than ACCESS_END_HOUR")
-
-
-def normalize_employees(raw_data: Any) -> Dict[str, Any]:
-    if not isinstance(raw_data, dict):
-        raw_data = {}
-
-    raw_employees = raw_data.get("employees")
-    employees: List[Dict[str, Any]] = []
-    max_id = 0
-
-    if isinstance(raw_employees, list):
-        for item in raw_employees:
-            if not isinstance(item, dict):
-                continue
-
-            try:
-                employee_id = int(item.get("id", 0))
-            except (TypeError, ValueError):
-                continue
-
-            if employee_id <= 0:
-                continue
-
-            name = str(item.get("name", "")).strip()
-            password_hash = str(item.get("password", "")).strip()
-            if not name or not password_hash:
-                continue
-
-            try:
-                raw_rate = item.get("hourlyRate")
-                hourly_rate = float(raw_rate) if raw_rate is not None else None
-            except (TypeError, ValueError):
-                hourly_rate = None
-
-            employee = {
-                "id": employee_id,
-                "name": name,
-                "password": password_hash,
-                "active": bool(item.get("active", True)),
-                "role": str(item.get("role", "employee")),
-                "created": item.get("created"),
-                "lastLogin": item.get("lastLogin"),
-                "hourlyRate": hourly_rate,
-            }
-            employees.append(employee)
-            max_id = max(max_id, employee_id)
-
-    raw_next_id = raw_data.get("nextId")
-    try:
-        next_id = int(raw_next_id)
-    except (TypeError, ValueError):
-        next_id = max_id + 1
-
-    if next_id <= max_id:
-        next_id = max_id + 1
-
-    return {"employees": employees, "nextId": next_id}
-
-
-def normalize_timesheets(raw_data: Any) -> Dict[str, Any]:
-    if not isinstance(raw_data, dict):
-        raw_data = {}
-
-    raw_entries = raw_data.get("entries")
-    entries: List[Dict[str, Any]] = []
-    max_id = 0
-
-    if isinstance(raw_entries, list):
-        for item in raw_entries:
-            if not isinstance(item, dict):
-                continue
-
-            try:
-                entry_id = int(item.get("id", 0))
-                employee_id = int(item.get("employeeId", 0))
-            except (TypeError, ValueError):
-                continue
-
-            if entry_id <= 0 or employee_id <= 0:
-                continue
-
-            raw_visits = item.get("visits")
-            visits: List[Dict[str, Any]] = []
-            if isinstance(raw_visits, list):
-                for v in raw_visits:
-                    if isinstance(v, dict) and v.get("arrivalTime"):
-                        visits.append({
-                            "arrivalTime": str(v["arrivalTime"]),
-                            "location": str(v.get("location", "")),
-                            "customer": str(v.get("customer", "")),
-                            "gps": v.get("gps") if isinstance(v.get("gps"), dict) else None,
-                        })
-
-            entry = {
-                "id": entry_id,
-                "employeeId": employee_id,
-                "employeeName": str(item.get("employeeName", "")).strip(),
-                "location": str(item.get("location", "")).strip(),
-                "clockIn": str(item.get("clockIn", "")).strip(),
-                "clockOut": item.get("clockOut"),
-                "totalHours": float(item.get("totalHours", 0) or 0),
-                "notes": str(item.get("notes", "")),
-                "date": str(item.get("date", "")).strip(),
-                "timezone": str(item.get("timezone", "")).strip(),
-                "clockInGps": item.get("clockInGps") if isinstance(item.get("clockInGps"), dict) else None,
-                "clockOutGps": item.get("clockOutGps") if isinstance(item.get("clockOutGps"), dict) else None,
-                "visits": visits,
-            }
-            entries.append(entry)
-            max_id = max(max_id, entry_id)
-
-    raw_locations = raw_data.get("locations")
-    if isinstance(raw_locations, list) and raw_locations:
-        locations = [str(value).strip() for value in raw_locations if str(value).strip()]
-    else:
-        locations = DEFAULT_LOCATIONS[:]
-
-    raw_coords = raw_data.get("location_coords")
-    location_coords: Dict[str, Dict[str, float]] = {}
-    if isinstance(raw_coords, dict):
-        for name, coords in raw_coords.items():
-            if isinstance(coords, dict):
-                try:
-                    location_coords[str(name)] = {
-                        "lat": float(coords["lat"]),
-                        "lng": float(coords["lng"]),
-                    }
-                except (KeyError, TypeError, ValueError):
-                    pass
-
-    raw_customers = raw_data.get("location_customers")
-    location_customers: Dict[str, str] = {}
-    if isinstance(raw_customers, dict):
-        for name, customer in raw_customers.items():
-            if isinstance(name, str) and isinstance(customer, str) and customer.strip():
-                location_customers[name] = customer.strip()
-
-    raw_rates = raw_data.get("location_rates")
-    location_rates: Dict[str, float] = {}
-    if isinstance(raw_rates, dict):
-        for name, rate in raw_rates.items():
-            if isinstance(name, str):
-                try:
-                    location_rates[name] = float(rate)
-                except (TypeError, ValueError):
-                    pass
-
-    raw_rate_types = raw_data.get("location_rate_types")
-    location_rate_types: Dict[str, str] = {}
-    if isinstance(raw_rate_types, dict):
-        for name, rtype in raw_rate_types.items():
-            if isinstance(name, str) and rtype in ("per_visit", "hourly", "monthly"):
-                location_rate_types[name] = rtype
-
-    raw_types = raw_data.get("location_types")
-    location_types: Dict[str, str] = {}
-    if isinstance(raw_types, dict):
-        for name, ltype in raw_types.items():
-            if isinstance(name, str) and ltype in ("Residential", "Commercial"):
-                location_types[name] = ltype
-
-    raw_frequencies = raw_data.get("location_frequencies")
-    location_frequencies: Dict[str, str] = {}
-    if isinstance(raw_frequencies, dict):
-        for name, freq in raw_frequencies.items():
-            if isinstance(name, str) and isinstance(freq, str) and freq.strip():
-                location_frequencies[name] = freq.strip()
-
-    raw_next_id = raw_data.get("nextId")
-    try:
-        next_id = int(raw_next_id)
-    except (TypeError, ValueError):
-        next_id = max_id + 1
-
-    if next_id <= max_id:
-        next_id = max_id + 1
-
-    return {"entries": entries, "nextId": next_id, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies}
-
-
 # --- PostgreSQL-backed data layer --------------------------------------------
 
 def _row_to_employee(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -544,88 +165,12 @@ def _row_to_employee(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _load_employees_from_db() -> Dict[str, Any]:
+def load_employees() -> Dict[str, Any]:
     rows = db.query_all(
-        "SELECT id, name, password_hash, active, role, hourly_rate, created_at, last_login_at "
-        "FROM employees ORDER BY id"
+        "SELECT id, name, password_hash, active, role, hourly_rate, created_at, last_login_at FROM employees ORDER BY id"
     )
     employees = [_row_to_employee(r) for r in rows]
-    max_id = max((e["id"] for e in employees), default=0)
-    return {"employees": employees, "nextId": max_id + 1}
-
-
-def _save_employees_to_db(employees_data: Dict[str, Any], pre_ids: set) -> None:
-    """Upsert employees. Updates in-memory dicts with DB-assigned IDs for new employees."""
-    with db.get_conn() as conn:
-        cur = conn.cursor()
-        for emp in employees_data.get("employees", []):
-            if emp["id"] not in pre_ids:
-                cur.execute(
-                    """
-                    INSERT INTO employees
-                      (name, password_hash, active, role, hourly_rate, last_login_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (name) DO UPDATE SET
-                        password_hash = EXCLUDED.password_hash,
-                        active        = EXCLUDED.active,
-                        role          = EXCLUDED.role,
-                        hourly_rate   = EXCLUDED.hourly_rate,
-                        last_login_at = EXCLUDED.last_login_at
-                    RETURNING id
-                    """,
-                    (
-                        emp["name"],
-                        emp["password"],
-                        emp.get("active", True),
-                        emp.get("role", "employee"),
-                        emp.get("hourlyRate"),
-                        emp.get("lastLogin"),
-                    ),
-                )
-                emp["id"] = cur.fetchone()[0]
-            else:
-                cur.execute(
-                    """
-                    UPDATE employees SET
-                        password_hash = %s,
-                        active        = %s,
-                        role          = %s,
-                        hourly_rate   = %s,
-                        last_login_at = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        emp["password"],
-                        emp.get("active", True),
-                        emp.get("role", "employee"),
-                        emp.get("hourlyRate"),
-                        emp.get("lastLogin"),
-                        emp["id"],
-                    ),
-                )
-        cur.execute(
-            "SELECT setval('employees_id_seq', COALESCE(MAX(id), 1)) FROM employees"
-        )
-
-
-def load_employees() -> Dict[str, Any]:
-    return _load_employees_from_db()
-
-
-def save_employees(employees_data: Dict[str, Any]) -> None:
-    with EMPLOYEE_WRITE_LOCK:
-        pre_ids: set = set()  # treat all as inserts (name conflict -> update)
-        _save_employees_to_db(employees_data, pre_ids)
-
-
-def update_employees(mutator) -> Tuple[bool, Any]:
-    with EMPLOYEE_WRITE_LOCK:
-        employees_data = _load_employees_from_db()
-        pre_ids = {emp["id"] for emp in employees_data["employees"]}
-        ok, payload = mutator(employees_data)
-        if ok:
-            _save_employees_to_db(employees_data, pre_ids)
-        return ok, payload
+    return {"employees": employees, "nextId": max((e["id"] for e in employees), default=0) + 1}
 
 
 def _row_to_visit(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -677,7 +222,7 @@ def _row_to_entry(
     }
 
 
-def _load_timesheets_from_db() -> Dict[str, Any]:
+def load_timesheets() -> Dict[str, Any]:
     loc_rows = db.query_all(
         "SELECT address, customer_name, location_type, rate, rate_type, "
         "frequency, lat, lng, expected_hours, target_labor_pct, min_margin_pct "
@@ -783,182 +328,6 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
     }
 
 
-def _save_timesheets_to_db(
-    timesheet_data: Dict[str, Any],
-    pre_shift_ids: set,
-    pre_visit_counts: Dict[int, int],
-    pre_departure_counts: Dict[int, int],
-) -> None:
-    """Upsert locations, shifts, and new child events. Updates in-memory entry IDs for new shifts."""
-    with db.get_conn() as conn:
-        cur = conn.cursor()
-
-        addr_to_id: Dict[str, int] = {}
-        for addr in timesheet_data.get("locations", []):
-            c = timesheet_data.get("location_coords", {}).get(addr, {})
-            cur.execute(
-                """
-                INSERT INTO locations
-                  (address, customer_name, location_type, rate, rate_type, frequency, lat, lng,
-                   expected_hours, target_labor_pct, min_margin_pct)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (address) DO UPDATE SET
-                    customer_name    = EXCLUDED.customer_name,
-                    location_type    = EXCLUDED.location_type,
-                    rate             = EXCLUDED.rate,
-                    rate_type        = EXCLUDED.rate_type,
-                    frequency        = EXCLUDED.frequency,
-                    lat              = EXCLUDED.lat,
-                    lng              = EXCLUDED.lng,
-                    expected_hours   = EXCLUDED.expected_hours,
-                    target_labor_pct = COALESCE(EXCLUDED.target_labor_pct, locations.target_labor_pct),
-                    min_margin_pct   = COALESCE(EXCLUDED.min_margin_pct, locations.min_margin_pct)
-                RETURNING id
-                """,
-                (
-                    addr,
-                    timesheet_data.get("location_customers", {}).get(addr),
-                    timesheet_data.get("location_types", {}).get(addr),
-                    timesheet_data.get("location_rates", {}).get(addr),
-                    timesheet_data.get("location_rate_types", {}).get(addr, "per_visit"),
-                    timesheet_data.get("location_frequencies", {}).get(addr),
-                    c.get("lat"),
-                    c.get("lng"),
-                    timesheet_data.get("location_expected_hours", {}).get(addr),
-                    timesheet_data.get("location_target_labor", {}).get(addr),
-                    timesheet_data.get("location_min_margin", {}).get(addr),
-                ),
-            )
-            addr_to_id[addr] = cur.fetchone()[0]
-
-        for entry in timesheet_data.get("entries", []):
-            loc_id = addr_to_id.get(entry.get("location", ""))
-            is_new = entry["id"] not in pre_shift_ids
-
-            if is_new:
-                cur.execute(
-                    """
-                    INSERT INTO shifts
-                      (employee_id, location_id, location_label, clock_in, clock_out, total_hours,
-                       notes, local_date, timezone, clock_in_gps, clock_in_gps_meta,
-                       clock_out_gps, clock_out_gps_meta,
-                       job_id, time_category, non_productive_type)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        entry["employeeId"],
-                        loc_id,
-                        entry.get("location", ""),
-                        entry.get("clockIn"),
-                        entry.get("clockOut"),
-                        entry.get("totalHours"),
-                        entry.get("notes", ""),
-                        entry.get("date") or None,
-                        entry.get("timezone", "America/Chicago"),
-                        json.dumps(entry["clockInGps"]) if entry.get("clockInGps") else None,
-                        json.dumps(entry["clockInGpsMeta"]) if entry.get("clockInGpsMeta") else None,
-                        json.dumps(entry["clockOutGps"]) if entry.get("clockOutGps") else None,
-                        json.dumps(entry["clockOutGpsMeta"]) if entry.get("clockOutGpsMeta") else None,
-                        entry.get("jobId"),
-                        entry.get("timeCategory", "productive"),
-                        entry.get("nonProductiveType"),
-                    ),
-                )
-                entry["id"] = cur.fetchone()[0]
-            else:
-                cur.execute(
-                    """
-                    UPDATE shifts SET
-                        location_id         = %s,
-                        location_label      = %s,
-                        clock_out           = %s,
-                        total_hours         = %s,
-                        notes               = %s,
-                        local_date          = %s,
-                        timezone            = %s,
-                        clock_in_gps        = %s,
-                        clock_in_gps_meta   = %s,
-                        clock_out_gps       = %s,
-                        clock_out_gps_meta  = %s,
-                        job_id              = %s,
-                        time_category       = %s,
-                        non_productive_type = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        loc_id,
-                        entry.get("location", ""),
-                        entry.get("clockOut"),
-                        entry.get("totalHours"),
-                        entry.get("notes", ""),
-                        entry.get("date") or None,
-                        entry.get("timezone", "America/Chicago"),
-                        json.dumps(entry["clockInGps"]) if entry.get("clockInGps") else None,
-                        json.dumps(entry["clockInGpsMeta"]) if entry.get("clockInGpsMeta") else None,
-                        json.dumps(entry["clockOutGps"]) if entry.get("clockOutGps") else None,
-                        json.dumps(entry["clockOutGpsMeta"]) if entry.get("clockOutGpsMeta") else None,
-                        entry.get("jobId"),
-                        entry.get("timeCategory", "productive"),
-                        entry.get("nonProductiveType"),
-                        entry["id"],
-                    ),
-                )
-
-            # Insert only visits appended since last load
-            existing_count = pre_visit_counts.get(entry["id"], 0)
-            for visit in entry.get("visits", [])[existing_count:]:
-                v_loc_id = addr_to_id.get(visit.get("location", ""))
-                cur.execute(
-                    """
-                    INSERT INTO visits (shift_id, location_id, location_label, customer_name, arrival_time, gps, gps_meta)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        entry["id"],
-                        v_loc_id,
-                        visit.get("location", ""),
-                        visit.get("customer") or None,
-                        visit.get("arrivalTime"),
-                        json.dumps(visit["gps"]) if visit.get("gps") else None,
-                        json.dumps(visit["gpsMeta"]) if visit.get("gpsMeta") else None,
-                    ),
-                )
-                # Auto-link shift to the first registered location visited
-                if v_loc_id:
-                    cur.execute(
-                        "UPDATE shifts SET location_id = %s WHERE id = %s AND location_id IS NULL",
-                        (v_loc_id, entry["id"]),
-                    )
-
-            existing_departure_count = pre_departure_counts.get(entry["id"], 0)
-            for departure in entry.get("departures", [])[existing_departure_count:]:
-                d_loc_id = addr_to_id.get(departure.get("location", ""))
-                cur.execute(
-                    """
-                    INSERT INTO departures (shift_id, location_id, location_label, customer_name, departure_time, gps, gps_meta)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        entry["id"],
-                        d_loc_id,
-                        departure.get("location", ""),
-                        departure.get("customer") or None,
-                        departure.get("departureTime"),
-                        json.dumps(departure["gps"]) if departure.get("gps") else None,
-                        json.dumps(departure["gpsMeta"]) if departure.get("gpsMeta") else None,
-                    ),
-                )
-
-        cur.execute(
-            "SELECT setval('shifts_id_seq', COALESCE(MAX(id), 1)) FROM shifts"
-        )
-
-
-def load_timesheets() -> Dict[str, Any]:
-    return _load_timesheets_from_db()
-
-
 def get_open_entry(entries: List[Dict[str, Any]], employee_id: int) -> Optional[Dict[str, Any]]:
     open_entries = [
         entry for entry in entries if entry.get("employeeId") == employee_id and entry.get("clockOut") is None
@@ -1003,23 +372,6 @@ def close_stale_open_entries(timesheet_data: Dict[str, Any], reference_time: dat
         changed = True
 
     return changed
-
-
-def update_timesheets(mutator) -> Tuple[bool, Any]:
-    with TIMESHEET_WRITE_LOCK:
-        timesheet_data = _load_timesheets_from_db()
-        pre_shift_ids = {e["id"] for e in timesheet_data["entries"]}
-        pre_visit_counts = {e["id"]: len(e.get("visits", [])) for e in timesheet_data["entries"]}
-        pre_departure_counts = {e["id"]: len(e.get("departures", [])) for e in timesheet_data["entries"]}
-
-        changed = False
-        if AUTO_CLOSE_STALE_SHIFTS:
-            changed = close_stale_open_entries(timesheet_data, utc_now())
-
-        ok, payload = mutator(timesheet_data)
-        if ok or changed:
-            _save_timesheets_to_db(timesheet_data, pre_shift_ids, pre_visit_counts, pre_departure_counts)
-        return ok, payload
 
 
 def find_employee_by_name(employees: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
@@ -1459,184 +811,6 @@ def get_current_employee(
     return {"id": employee["id"], "name": employee["name"], "role": employee.get("role", "employee")}
 
 
-class LoginRequest(BaseModel):
-    name: str = Field(min_length=1)
-    password: str = Field(min_length=1)
-
-
-class RegisterRequest(BaseModel):
-    name: str = Field(min_length=2)
-    password: str = Field(min_length=4)
-
-
-class ClockInRequest(BaseModel):
-    location: str = ""
-    notes: str = ""
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    gpsOverrideReason: str = ""
-    gpsOverrideDetail: str = ""
-
-
-class ClockOutRequest(BaseModel):
-    notes: str = ""
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    gpsOverrideReason: str = ""
-    gpsOverrideDetail: str = ""
-
-
-class DepartRequest(BaseModel):
-    notes: str = ""
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    gpsOverrideReason: str = ""
-    gpsOverrideDetail: str = ""
-
-
-class EntryAdjustRequest(BaseModel):
-    clockIn: Optional[str] = None   # "YYYY-MM-DDTHH:MM" local time
-    clockOut: Optional[str] = None  # "YYYY-MM-DDTHH:MM" local time, or "" to clear
-
-
-class ReportGenerateRequest(BaseModel):
-    month: int = Field(ge=1, le=12)
-    year: int = Field(ge=2000, le=2100)
-    emails: List[str] = []
-    company_name: str = "Effingham Office Maids"
-    send_email: bool = False
-    use_mock_data: bool = False
-
-
-class JobCreateRequest(BaseModel):
-    customerName: str = Field(min_length=1)
-    scheduledDate: str  # YYYY-MM-DD
-    expectedHours: Optional[float] = None
-    revenue: Optional[float] = None
-    notes: str = ""
-    status: str = "scheduled"
-    locationId: Optional[int] = None
-
-
-class JobUpdateRequest(BaseModel):
-    customerName: Optional[str] = None
-    scheduledDate: Optional[str] = None  # YYYY-MM-DD
-    expectedHours: Optional[float] = None
-    revenue: Optional[float] = None
-    notes: Optional[str] = None
-    status: Optional[str] = None
-    locationId: Optional[int] = None
-
-
-class JobLinkShiftsRequest(BaseModel):
-    shiftIds: List[int]
-
-
-VALID_NON_PRODUCTIVE_TYPES = ("drive_time", "waiting", "supply_run", "rework", "lockout", "other")
-
-
-class ShiftCategorizeRequest(BaseModel):
-    timeCategory: str  # "productive" or "non_productive"
-    nonProductiveType: Optional[str] = None
-    notes: Optional[str] = None
-
-
-class ScheduleEntryRequest(BaseModel):
-    employeeId: int
-    customerName: str = Field(min_length=1)
-    weekStart: str  # YYYY-MM-DD (must be a Sunday)
-    scheduledHours: float
-    notes: str = ""
-    locationId: Optional[int] = None
-
-
-load_local_env()
-
-JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
-if len(JWT_SECRET) < 32:
-    raise RuntimeError("JWT_SECRET must be configured with at least 32 characters")
-
-TIMEZONE_NAME = os.getenv("TIMEZONE", "America/New_York")
-APP_TIMEZONE = ZoneInfo(TIMEZONE_NAME)
-
-TOKEN_TTL_HOURS = parse_int(os.getenv("TOKEN_TTL_HOURS"), 12)
-MAX_ACTIVE_SHIFT_HOURS = float(os.getenv("MAX_ACTIVE_SHIFT_HOURS", "24"))
-AUTO_CLOSE_STALE_SHIFTS = parse_bool(os.getenv("AUTO_CLOSE_STALE_SHIFTS"), True)
-LOCATION_MATCH_RADIUS_M = parse_int(os.getenv("LOCATION_MATCH_RADIUS_M"), LOCATION_MATCH_RADIUS_DEFAULT_M)
-
-ACCESS_START_HOUR = parse_int(os.getenv("ACCESS_START_HOUR"), 8)
-ACCESS_END_HOUR = parse_int(os.getenv("ACCESS_END_HOUR"), 18)
-validate_schedule(ACCESS_START_HOUR, ACCESS_END_HOUR)
-ALLOWED_DAYS = parse_allowed_days(os.getenv("ALLOWED_DAYS"))
-ALLOWED_IPS = parse_allowed_ips(os.getenv("ALLOWED_IPS"))
-TRUST_PROXY = parse_bool(os.getenv("TRUST_PROXY"), False)
-BOOTSTRAP_ADMIN_IDS = [
-    int(x) for x in os.getenv("BOOTSTRAP_ADMIN_IDS", "").split(",") if x.strip().isdigit()
-]
-
-# ---------------------------------------------------------------------------
-# Business-rule defaults - single source of truth for all threshold settings.
-# These seed the `settings` DB table on first boot and serve as in-code
-# fallbacks if a key is somehow absent from the DB.
-# ---------------------------------------------------------------------------
-_SETTINGS_DEFAULTS: Dict[str, Any] = {
-    "laborPctTarget":    35.0,   # target labor % of revenue
-    "laborPctWatch":     40.0,   # labor % above this = Watch flag
-    "laborPctFix":       55.0,   # labor % above this = Fix flag
-    "laborPctDrop":      70.0,   # labor % above this = Drop flag
-    "grossMarginMin":    30.0,   # gross margin % below this = Watch
-    "grossMarginFix":    15.0,   # gross margin % below this = Fix
-    "grossMarginDrop":    0.0,   # gross margin % at/below this = Drop
-    "hourOverrunWatch":   0.5,   # hours over expected = Watch
-    "hourOverrunFix":     2.0,   # hours over expected = Fix
-    "rplhMin":           25.0,   # revenue per labor hour below this = flagged
-    "laborRateFallback": 15.0,   # avg labor rate used when no employee rates are set
-}
-
-
-def apply_bootstrap_admins() -> None:
-    if not BOOTSTRAP_ADMIN_IDS:
-        return
-    def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        changed = False
-        for emp in employees_data["employees"]:
-            if emp["id"] in BOOTSTRAP_ADMIN_IDS and emp.get("role") != "admin":
-                emp["role"] = "admin"
-                changed = True
-        return changed, None
-    update_employees(mutator)
-
-
-app = FastAPI(title="EOM Time Tracker API", version="2.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.middleware("http")
-async def private_network_access_middleware(request: Request, call_next):
-    response = await call_next(request)
-    if request.headers.get("access-control-request-private-network") == "true":
-        response.headers["Access-Control-Allow-Private-Network"] = "true"
-    return response
-
-
-@app.exception_handler(HTTPException)
-async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
-    detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
-    return JSONResponse(status_code=exc.status_code, content={"success": False, "error": detail})
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
-    first_error = exc.errors()[0] if exc.errors() else {}
-    message = first_error.get("msg", "Invalid request payload")
-    return JSONResponse(status_code=422, content={"success": False, "error": message})
-
-
 def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     db.execute(
@@ -1764,6 +938,24 @@ def _auto_migrate_if_empty() -> None:
         print(f"[auto-migrate] Done:\n{completed.stdout}", flush=True)
 
 
+def apply_bootstrap_admins() -> None:
+    if not BOOTSTRAP_ADMIN_IDS:
+        return
+    db.execute(
+        "UPDATE employees SET role = 'admin' WHERE id = ANY(%s) AND role <> 'admin'",
+        (BOOTSTRAP_ADMIN_IDS,),
+    )
+
+
+app = FastAPI(title="EOM Time Tracker API", version="2.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 @app.on_event("startup")
 def startup_event() -> None:
     database_url = os.getenv("DATABASE_URL", "")
@@ -1773,6 +965,30 @@ def startup_event() -> None:
     _ensure_schema_migrations()
     _auto_migrate_if_empty()
     apply_bootstrap_admins()
+
+
+VALID_NON_PRODUCTIVE_TYPES = ("drive_time", "waiting", "supply_run", "rework", "lockout", "other")
+
+
+@app.middleware("http")
+async def private_network_access_middleware(request: Request, call_next):
+    response = await call_next(request)
+    if request.headers.get("access-control-request-private-network") == "true":
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
+    detail = exc.detail if isinstance(exc.detail, str) else "Request failed"
+    return JSONResponse(status_code=exc.status_code, content={"success": False, "error": detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    first_error = exc.errors()[0] if exc.errors() else {}
+    message = first_error.get("msg", "Invalid request payload")
+    return JSONResponse(status_code=422, content={"success": False, "error": message})
 
 
 @app.get("/api/health")
@@ -1797,25 +1013,27 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
         append_access_log(request, "LOGIN_FAILED", False, "Missing credentials")
         raise HTTPException(status_code=400, detail="Name and password are required")
 
-    def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        employee = find_employee_by_name(employees_data["employees"], employee_name)
-        if not employee or not verify_password(password, employee["password"]):
-            return False, None
+    row = db.query_one(
+        "SELECT id, name, password_hash, role FROM employees WHERE name = %s AND active = true",
+        (employee_name,)
+    )
 
-        employee["lastLogin"] = to_utc_iso(utc_now())
-        return True, {"id": employee["id"], "name": employee["name"], "role": employee.get("role", "employee")}
-
-    ok, employee = update_employees(mutator)
-    if not ok or not employee:
+    if not row or not verify_password(password, row["password_hash"]):
         append_access_log(request, "LOGIN_FAILED", False, "Invalid credentials")
         raise HTTPException(status_code=401, detail="Invalid name or password")
 
-    token = create_auth_token(employee["id"], employee["name"], employee.get("role", "employee"))
-    append_access_log(request, "LOGIN_SUCCESS", True, f"Employee: {employee['name']}")
+    # Update last login
+    db.execute(
+        "UPDATE employees SET last_login_at = NOW() WHERE id = %s",
+        (row["id"],)
+    )
+
+    token = create_auth_token(row["id"], row["name"], row.get("role", "employee"))
+    append_access_log(request, "LOGIN_SUCCESS", True, f"Employee: {row['name']}")
     return {
         "success": True,
         "token": token,
-        "employee": {"id": employee["id"], "name": employee["name"], "role": employee.get("role", "employee")},
+        "employee": {"id": row["id"], "name": row["name"], "role": row.get("role", "employee")},
     }
 
 
@@ -1828,32 +1046,24 @@ def register(payload: RegisterRequest, request: Request) -> Dict[str, Any]:
 
     hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(10)).decode("utf-8")
 
-    def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        existing = find_employee_by_name(employees_data["employees"], employee_name)
-        if existing:
-            return False, "An account with that name already exists"
-
-        employee_id = int(employees_data["nextId"])
-        employee = {
-            "id": employee_id,
-            "name": employee_name,
-            "password": hashed,
-            "active": True,
-            "role": "employee",
-            "created": to_utc_iso(utc_now()),
-            "lastLogin": None,
-        }
-        employees_data["employees"].append(employee)
-        employees_data["nextId"] = employee_id + 1
-        return True, {"id": employee_id, "name": employee_name}
-
-    ok, result = update_employees(mutator)
-    if not ok:
-        append_access_log(request, "REGISTER_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
+    try:
+        new_id = db.execute_returning(
+            """
+            INSERT INTO employees (name, password_hash, active, role, created_at)
+            VALUES (%s, %s, true, 'employee', NOW())
+            RETURNING id
+            """,
+            (employee_name, hashed)
+        )
+    except Exception as e:
+        # Check if it's a unique constraint violation
+        if "already exists" in str(e).lower() or "unique constraint" in str(e).lower():
+            append_access_log(request, "REGISTER_FAILED", False, "An account with that name already exists")
+            raise HTTPException(status_code=400, detail="An account with that name already exists")
+        raise e
 
     append_access_log(request, "REGISTER_SUCCESS", True, f"New employee: {employee_name}")
-    return {"success": True, "employee": result}
+    return {"success": True, "employee": {"id": new_id, "name": employee_name}}
 
 
 @app.patch("/api/admin/employees/{employee_id}")
@@ -1886,25 +1096,52 @@ def admin_update_employee(
         else:
             new_hourly_rate = None
 
-    def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        emp = find_employee_by_id(employees_data["employees"], employee_id)
-        if not emp:
-            return False, "Employee not found"
-        if new_role:
-            emp["role"] = new_role
-        if "active" in payload:
-            emp["active"] = bool(payload["active"])
-        if hashed_password:
-            emp["password"] = hashed_password
-        if "hourlyRate" in payload:
-            emp["hourlyRate"] = new_hourly_rate
-        return True, {"id": emp["id"], "name": emp["name"], "role": emp["role"], "active": emp["active"], "hourlyRate": emp.get("hourlyRate")}
+    # Dynamic SQL update
+    fields = []
+    params = []
 
-    ok, result = update_employees(mutator)
-    if not ok:
-        raise HTTPException(status_code=404, detail=str(result))
+    if new_role:
+        fields.append("role = %s")
+        params.append(new_role)
+    if "active" in payload:
+        fields.append("active = %s")
+        params.append(bool(payload["active"]))
+    if hashed_password:
+        fields.append("password_hash = %s")
+        params.append(hashed_password)
+    if "hourlyRate" in payload:
+        fields.append("hourly_rate = %s")
+        params.append(new_hourly_rate)
+
+    if not fields:
+        # Just return current state
+        row = db.query_one("SELECT id, name, role, active, hourly_rate FROM employees WHERE id = %s", (employee_id,))
+        if not row:
+            raise HTTPException(status_code=404, detail="Employee not found")
+        return {"success": True, "employee": {"id": row["id"], "name": row["name"], "role": row["role"], "active": row["active"], "hourlyRate": float(row["hourly_rate"]) if row["hourly_rate"] is not None else None}}
+
+    params.append(employee_id)
+    try:
+        updated_row = db.query_one(
+            f"UPDATE employees SET {', '.join(fields)} WHERE id = %s RETURNING id, name, role, active, hourly_rate",
+            tuple(params)
+        )
+        if not updated_row:
+            raise HTTPException(status_code=404, detail="Employee not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     append_access_log(request, "EMPLOYEE_UPDATED", True, f"id={employee_id} {payload}")
-    return {"success": True, "employee": result}
+    return {
+        "success": True,
+        "employee": {
+            "id": updated_row["id"],
+            "name": updated_row["name"],
+            "role": updated_row["role"],
+            "active": updated_row["active"],
+            "hourlyRate": float(updated_row["hourly_rate"]) if updated_row["hourly_rate"] is not None else None
+        }
+    }
 
 
 @app.get("/api/admin/employees")
@@ -1915,34 +1152,49 @@ def admin_list_employees(
     if employee.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    employees_data = load_employees()
-    timesheet_data = load_timesheets()
+    # Fetch employees with total hours and last shift info directly from DB
     now = utc_now()
-    rows = []
+    rows = db.query_all(
+        """
+        SELECT
+            e.id, e.name, e.role, e.active, e.created_at, e.last_login_at, e.hourly_rate,
+            COALESCE(SUM(s.total_hours), 0) AS total_hours,
+            COUNT(s.id) AS total_shifts
+        FROM employees e
+        LEFT JOIN shifts s ON e.id = s.employee_id
+        GROUP BY e.id
+        ORDER BY e.name
+        """
+    )
 
-    for emp in employees_data["employees"]:
-        emp_entries = [e for e in timesheet_data["entries"] if e.get("employeeId") == emp["id"]]
-        total_hours = sum(entry_hours(e, now) for e in emp_entries)
-        last_entry = max(emp_entries, key=lambda e: e.get("clockIn", ""), default=None)
-        last_gps = None
-        if last_entry:
-            last_gps = last_entry.get("clockInGps") or last_entry.get("clockOutGps")
+    # Fetch last GPS for each employee separately to keep it simple or use a complex window function
+    last_gps_rows = db.query_all(
+        """
+        SELECT DISTINCT ON (employee_id)
+            employee_id, clock_in_gps, clock_out_gps
+        FROM shifts
+        ORDER BY employee_id, clock_in DESC
+        """
+    )
+    last_gps_map = {r["employee_id"]: (r["clock_out_gps"] or r["clock_in_gps"]) for r in last_gps_rows}
 
-        rows.append({
-            "id": emp["id"],
-            "name": emp["name"],
-            "role": emp.get("role", "employee"),
-            "active": emp.get("active", True),
-            "created": emp.get("created"),
-            "lastLogin": emp.get("lastLogin"),
-            "totalHours": round(total_hours, 2),
-            "totalShifts": len(emp_entries),
-            "lastGps": last_gps,
-            "hourlyRate": emp.get("hourlyRate"),
+    formatted_rows = []
+    for r in rows:
+        formatted_rows.append({
+            "id": r["id"],
+            "name": r["name"],
+            "role": r["role"],
+            "active": r["active"],
+            "created": to_utc_iso(r["created_at"]),
+            "lastLogin": to_utc_iso(r["last_login_at"]) if r["last_login_at"] else None,
+            "totalHours": round(float(r["total_hours"]), 2),
+            "totalShifts": r["total_shifts"],
+            "lastGps": last_gps_map.get(r["id"]),
+            "hourlyRate": float(r["hourly_rate"]) if r["hourly_rate"] is not None else None,
         })
 
-    append_access_log(request, "ADMIN_EMPLOYEES", True, f"{len(rows)} employees")
-    return {"success": True, "employees": rows}
+    append_access_log(request, "ADMIN_EMPLOYEES", True, f"{len(formatted_rows)} employees")
+    return {"success": True, "employees": formatted_rows}
 
 
 @app.get("/api/admin/employees/{employee_id}/hours")
@@ -2118,71 +1370,89 @@ def clock_in(
     now_utc = utc_now()
     work_date = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
 
-    def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        existing_open = get_open_entry(timesheet_data["entries"], employee["id"])
-        if existing_open and not is_stale_open_entry(existing_open, now_utc):
-            return False, "Already clocked in"
+    # 1. Check for existing open shift
+    existing_open = db.query_one(
+        "SELECT id, clock_in FROM shifts WHERE employee_id = %s AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1",
+        (employee["id"],)
+    )
+    if existing_open:
+        # Check if it's stale
+        if not is_stale_open_entry({"clockIn": to_utc_iso(existing_open["clock_in"]), "clockOut": None}, now_utc):
+            raise HTTPException(status_code=400, detail="Already clocked in")
 
-        override_error = require_gps_override(
-            timesheet_data,
-            payload.latitude,
-            payload.longitude,
-            payload.gpsOverrideReason,
+    # 2. GPS Validation
+    override_error = require_gps_override(
+        payload.latitude,
+        payload.longitude,
+        payload.gpsOverrideReason,
+    )
+    if override_error:
+        raise HTTPException(status_code=400, detail=override_error)
+
+    # 3. Location Matching
+    if has_gps:
+        matched = find_nearest_location(payload.latitude, payload.longitude)
+        location = matched or payload.location.strip() or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+    else:
+        location = payload.location.strip() or "Unknown"
+
+    # 4. GPS Meta
+    gps_meta = build_gps_meta(
+        payload.latitude,
+        payload.longitude,
+        payload.gpsOverrideReason,
+        payload.gpsOverrideDetail,
+    )
+
+    # 5. Get location_id if possible
+    loc_row = db.query_one("SELECT id, customer_name FROM locations WHERE address = %s", (location,))
+    location_id = loc_row["id"] if loc_row else None
+    customer_name = loc_row["customer_name"] if loc_row else ""
+
+    # 6. Insert Shift
+    try:
+        clock_in_gps_value = {"lat": payload.latitude, "lng": payload.longitude} if has_gps else None
+        clock_in_gps = json.dumps(clock_in_gps_value) if clock_in_gps_value else None
+        clock_in_gps_meta = json.dumps(gps_meta) if gps_meta else None
+
+        new_id = db.execute_returning(
+            """
+            INSERT INTO shifts (
+                employee_id, location_id, location_label, clock_in,
+                notes, local_date, timezone, clock_in_gps, clock_in_gps_meta,
+                time_category
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'productive')
+            RETURNING id
+            """,
+            (
+                employee["id"], location_id, location, now_utc,
+                notes, work_date, TIMEZONE_NAME, clock_in_gps, clock_in_gps_meta
+            )
         )
-        if override_error:
-            return False, override_error
+    except Exception as e:
+        append_access_log(request, "CLOCK_IN_FAILED", False, str(e))
+        raise HTTPException(status_code=500, detail="Failed to record clock-in")
 
-        # Auto-match location from GPS; fall back to provided string or GPS coords
-        if has_gps:
-            matched = find_nearest_location(payload.latitude, payload.longitude, timesheet_data)
-            location = matched or payload.location.strip() or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
-        else:
-            location = payload.location.strip() or "Unknown"
+    append_access_log(request, "CLOCK_IN_SUCCESS", True, f"Employee: {employee['name']} at {location}")
 
-        entry_id = int(timesheet_data["nextId"])
-        entry = {
-            "id": entry_id,
+    return {
+        "success": True,
+        "entry": {
+            "id": new_id,
             "employeeId": employee["id"],
             "employeeName": employee["name"],
             "location": location,
+            "customer": customer_name,
             "clockIn": to_utc_iso(now_utc),
             "clockOut": None,
             "totalHours": 0,
             "notes": notes,
             "date": work_date,
             "timezone": TIMEZONE_NAME,
-            "clockInGps": None,
-            "clockInGpsMeta": None,
-            "clockOutGps": None,
-            "clockOutGpsMeta": None,
-            "jobId": None,
-            "timeCategory": "productive",
-            "nonProductiveType": None,
-            "visits": [],
+            "clockInGps": clock_in_gps_value,
+            "clockInGpsMeta": gps_meta,
         }
-        if has_gps:
-            entry["clockInGps"] = {"lat": payload.latitude, "lng": payload.longitude}
-        entry["clockInGpsMeta"] = build_gps_meta(
-            timesheet_data,
-            payload.latitude,
-            payload.longitude,
-            payload.gpsOverrideReason,
-            payload.gpsOverrideDetail,
-        )
-        timesheet_data["entries"].append(entry)
-        timesheet_data["nextId"] = entry_id + 1
-        return True, entry
-
-    ok, result = update_timesheets(mutator)
-    if not ok:
-        append_access_log(request, "CLOCK_IN_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
-
-    loc = result.get("location", "")
-    location_customers: Dict[str, str] = load_timesheets().get("location_customers", {})
-    result["customer"] = _resolve_customer(loc, location_customers)
-    append_access_log(request, "CLOCK_IN_SUCCESS", True, f"Employee: {employee['name']} at {loc}")
-    return {"success": True, "entry": result}
+    }
 
 
 @app.post("/api/timesheet/clock-out")
@@ -2194,60 +1464,76 @@ def clock_out(
     notes = payload.notes.strip() if payload else ""
     now_utc = utc_now()
 
-    def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
-            return False, "Not currently clocked in"
+    # 1. Find open shift
+    open_shift = db.query_one(
+        "SELECT id, clock_in, notes FROM shifts WHERE employee_id = %s AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1",
+        (employee["id"],)
+    )
+    if not open_shift or is_stale_open_entry({"clockIn": to_utc_iso(open_shift["clock_in"]), "clockOut": None}, now_utc):
+        raise HTTPException(status_code=400, detail="Not currently clocked in")
 
-        override_error = require_gps_override(
-            timesheet_data,
-            payload.latitude if payload else None,
-            payload.longitude if payload else None,
-            payload.gpsOverrideReason if payload else "",
-        )
-        if override_error:
-            return False, override_error
+    # 2. GPS Validation
+    latitude = payload.latitude if payload else None
+    longitude = payload.longitude if payload else None
+    override_reason = payload.gpsOverrideReason if payload else ""
+    override_detail = payload.gpsOverrideDetail if payload else ""
 
-        try:
-            clock_in_time = parse_utc_iso(str(open_entry.get("clockIn", "")))
-        except ValueError:
-            return False, "Invalid clock-in timestamp"
+    override_error = require_gps_override(latitude, longitude, override_reason)
+    if override_error:
+        raise HTTPException(status_code=400, detail=override_error)
 
-        total_hours = (now_utc - clock_in_time).total_seconds() / 3600
-        if total_hours < 0:
-            return False, "Invalid clock-in timestamp"
+    # 3. Calculate Hours
+    clock_in_time = open_shift["clock_in"].replace(tzinfo=timezone.utc)
+    total_hours = (now_utc - clock_in_time).total_seconds() / 3600
+    if total_hours < 0:
+        total_hours = 0.0
 
-        open_entry["clockOut"] = to_utc_iso(now_utc)
-        open_entry["totalHours"] = round(total_hours, 2)
+    # 4. GPS Meta
+    gps_meta = build_gps_meta(latitude, longitude, override_reason, override_detail)
+
+    # 5. Update Shift
+    try:
+        clock_out_gps_value = {"lat": latitude, "lng": longitude} if latitude is not None else None
+        clock_out_gps = json.dumps(clock_out_gps_value) if clock_out_gps_value else None
+        clock_out_gps_meta = json.dumps(gps_meta) if gps_meta else None
+
+        # Merge notes if provided
+        final_notes = open_shift["notes"]
         if notes:
-            open_entry["notes"] = notes
-        if payload and payload.latitude is not None and payload.longitude is not None:
-            open_entry["clockOutGps"] = {
-                "lat": payload.latitude,
-                "lng": payload.longitude,
-            }
-        open_entry["clockOutGpsMeta"] = build_gps_meta(
-            timesheet_data,
-            payload.latitude if payload else None,
-            payload.longitude if payload else None,
-            payload.gpsOverrideReason if payload else "",
-            payload.gpsOverrideDetail if payload else "",
+            final_notes = f"{final_notes}\n{notes}".strip()
+
+        db.execute(
+            """
+            UPDATE shifts SET
+                clock_out = %s,
+                total_hours = %s,
+                notes = %s,
+                clock_out_gps = %s,
+                clock_out_gps_meta = %s
+            WHERE id = %s
+            """,
+            (now_utc, round(total_hours, 2), final_notes, clock_out_gps, clock_out_gps_meta, open_shift["id"])
         )
-
-        return True, open_entry
-
-    ok, result = update_timesheets(mutator)
-    if not ok:
-        append_access_log(request, "CLOCK_OUT_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
+    except Exception as e:
+        append_access_log(request, "CLOCK_OUT_FAILED", False, str(e))
+        raise HTTPException(status_code=500, detail="Failed to record clock-out")
 
     append_access_log(
         request,
         "CLOCK_OUT_SUCCESS",
         True,
-        f"Employee: {employee['name']}, Hours: {result.get('totalHours', 0)}",
+        f"Employee: {employee['name']}, Hours: {round(total_hours, 2)}",
     )
-    return {"success": True, "entry": result}
+    return {
+        "success": True,
+            "entry": {
+                "id": open_shift["id"],
+                "clockOut": to_utc_iso(now_utc),
+                "totalHours": round(total_hours, 2),
+                "clockOutGps": clock_out_gps_value,
+                "clockOutGpsMeta": gps_meta,
+            }
+        }
 
 
 @app.post("/api/timesheet/visit")
@@ -2260,63 +1546,87 @@ def log_visit(
     has_gps = payload.latitude is not None and payload.longitude is not None
     now_utc = utc_now()
 
-    def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
-            return False, "Not currently clocked in"
+    # 1. Find open shift
+    open_shift = db.query_one(
+        "SELECT id, clock_in FROM shifts WHERE employee_id = %s AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1",
+        (employee["id"],)
+    )
+    if not open_shift or is_stale_open_entry({"clockIn": to_utc_iso(open_shift["clock_in"]), "clockOut": None}, now_utc):
+        raise HTTPException(status_code=400, detail="Not currently clocked in")
 
-        override_error = require_gps_override(
-            timesheet_data,
-            payload.latitude,
-            payload.longitude,
-            payload.gpsOverrideReason,
+    # 2. GPS Validation
+    override_error = require_gps_override(
+        payload.latitude,
+        payload.longitude,
+        payload.gpsOverrideReason,
+    )
+    if override_error:
+        raise HTTPException(status_code=400, detail=override_error)
+
+    # 3. Location Matching
+    if has_gps:
+        matched = find_nearest_location(payload.latitude, payload.longitude)
+        location = matched or str(payload.location or "").strip() or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+    else:
+        location = str(payload.location or "").strip() or "Unknown"
+
+    # 4. Get location_id and customer
+    loc_row = db.query_one("SELECT id, customer_name FROM locations WHERE address = %s", (location,))
+    location_id = loc_row["id"] if loc_row else None
+    customer_name = loc_row["customer_name"] if loc_row else ""
+
+    # 5. Check for duplicate visit
+    active_visit = get_active_visit_for_shift(open_shift["id"])
+    if active_visit and active_visit.get("location_label") == location:
+        return {"success": True, "alreadyHere": True}
+
+    # 6. GPS Meta
+    gps_meta = build_gps_meta(
+        payload.latitude,
+        payload.longitude,
+        payload.gpsOverrideReason,
+        payload.gpsOverrideDetail,
+    )
+
+    # 7. Insert Visit
+    try:
+        gps_value = {"lat": payload.latitude, "lng": payload.longitude} if has_gps else None
+        gps_json = json.dumps(gps_value) if gps_value else None
+        gps_meta_json = json.dumps(gps_meta) if gps_meta else None
+
+        db.execute(
+            """
+            INSERT INTO visits (shift_id, location_id, location_label, customer_name, arrival_time, gps, gps_meta)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (open_shift["id"], location_id, location, customer_name, now_utc, gps_json, gps_meta_json)
         )
-        if override_error:
-            return False, override_error
 
-        if has_gps:
-            matched = find_nearest_location(payload.latitude, payload.longitude, timesheet_data)
-            location = matched or str(payload.location or "").strip() or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
-        else:
-            location = str(payload.location or "").strip() or "Unknown"
-
-        customer = timesheet_data.get("location_customers", {}).get(location, "")
-
-        # Avoid duplicate: skip if location matches the most recent visit
-        existing_visits = open_entry.get("visits") or []
-        active_visit = get_active_visit(open_entry)
-        if active_visit and active_visit.get("location") == location:
-            return False, "already_at_location"
-
-        visit = {
-            "arrivalTime": to_utc_iso(now_utc),
-            "location": location,
-            "customer": customer,
-            "gps": {"lat": payload.latitude, "lng": payload.longitude} if has_gps else None,
-            "gpsMeta": build_gps_meta(
-                timesheet_data,
-                payload.latitude,
-                payload.longitude,
-                payload.gpsOverrideReason,
-                payload.gpsOverrideDetail,
-            ),
-        }
-
-        if not isinstance(open_entry.get("visits"), list):
-            open_entry["visits"] = []
-        open_entry["visits"].append(visit)
-
-        return True, {"visit": visit, "entryId": open_entry["id"]}
-
-    ok, result = update_timesheets(mutator)
-    if not ok:
-        if result == "already_at_location":
-            return {"success": True, "alreadyHere": True}
-        raise HTTPException(status_code=400, detail=str(result))
+        # Auto-link shift to the first registered location visited
+        if location_id:
+            db.execute(
+                "UPDATE shifts SET location_id = %s WHERE id = %s AND location_id IS NULL",
+                (location_id, open_shift["id"]),
+            )
+    except Exception as e:
+        append_access_log(request, "VISIT_FAILED", False, str(e))
+        raise HTTPException(status_code=500, detail="Failed to record visit")
 
     append_access_log(request, "VISIT_LOGGED", True,
-                      f"Employee: {employee['name']} arrived at {result['visit']['location']}")
-    return {"success": True, "alreadyHere": False, **result}
+                      f"Employee: {employee['name']} arrived at {location}")
+
+    return {
+        "success": True,
+        "alreadyHere": False,
+        "visit": {
+            "arrivalTime": to_utc_iso(now_utc),
+            "location": location,
+            "customer": customer_name,
+            "gps": gps_value,
+            "gpsMeta": gps_meta,
+        },
+        "entryId": open_shift["id"]
+    }
 
 
 def get_active_visit(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2333,6 +1643,28 @@ def get_active_visit(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return last_visit if arrival_time else None
 
 
+def get_active_visit_for_shift(shift_id: int) -> Optional[Dict[str, Any]]:
+    """Return the most recent visit for a shift if it hasn't been departed from."""
+    # Find latest visit
+    last_visit = db.query_one(
+        "SELECT id, location_id, location_label, customer_name, arrival_time FROM visits WHERE shift_id = %s ORDER BY arrival_time DESC LIMIT 1",
+        (shift_id,)
+    )
+    if not last_visit:
+        return None
+
+    # Find latest departure
+    last_departure = db.query_one(
+        "SELECT departure_time FROM departures WHERE shift_id = %s ORDER BY departure_time DESC LIMIT 1",
+        (shift_id,)
+    )
+
+    if last_departure and last_departure["departure_time"] >= last_visit["arrival_time"]:
+        return None
+
+    return last_visit
+
+
 @app.post("/api/timesheet/depart")
 def depart_location(
     payload: Optional[DepartRequest],
@@ -2341,64 +1673,79 @@ def depart_location(
 ) -> Dict[str, Any]:
     now_utc = utc_now()
 
-    def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
-        if not open_entry or is_stale_open_entry(open_entry, now_utc):
-            return False, "Not currently clocked in"
+    # 1. Find open shift
+    open_shift = db.query_one(
+        "SELECT id, clock_in, notes FROM shifts WHERE employee_id = %s AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1",
+        (employee["id"],)
+    )
+    if not open_shift or is_stale_open_entry({"clockIn": to_utc_iso(open_shift["clock_in"]), "clockOut": None}, now_utc):
+        raise HTTPException(status_code=400, detail="Not currently clocked in")
 
-        override_error = require_gps_override(
-            timesheet_data,
-            payload.latitude if payload else None,
-            payload.longitude if payload else None,
-            payload.gpsOverrideReason if payload else "",
+    # 2. GPS Validation
+    latitude = payload.latitude if payload else None
+    longitude = payload.longitude if payload else None
+    override_reason = payload.gpsOverrideReason if payload else ""
+    override_detail = payload.gpsOverrideDetail if payload else ""
+
+    override_error = require_gps_override(latitude, longitude, override_reason)
+    if override_error:
+        raise HTTPException(status_code=400, detail=override_error)
+
+    # 3. Find active visit to depart from
+    active_visit = get_active_visit_for_shift(open_shift["id"])
+    if not active_visit:
+        raise HTTPException(status_code=400, detail="No active arrival to depart from")
+
+    # 4. GPS Meta
+    gps_meta = build_gps_meta(latitude, longitude, override_reason, override_detail)
+
+    # 5. Insert Departure
+    try:
+        gps_value = {"lat": latitude, "lng": longitude} if latitude is not None else None
+        gps_json = json.dumps(gps_value) if gps_value else None
+        gps_meta_json = json.dumps(gps_meta) if gps_meta else None
+
+        db.execute(
+            """
+            INSERT INTO departures (shift_id, location_id, location_label, customer_name, departure_time, gps, gps_meta)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                open_shift["id"],
+                active_visit["location_id"],
+                active_visit["location_label"],
+                active_visit["customer_name"],
+                now_utc,
+                gps_json,
+                gps_meta_json
+            )
         )
-        if override_error:
-            return False, override_error
 
-        active_visit = get_active_visit(open_entry)
-        if not active_visit:
-            return False, "No active arrival to depart from"
+        # Update notes if provided and currently empty
+        if payload and payload.notes and not str(open_shift.get("notes", "")).strip():
+            db.execute("UPDATE shifts SET notes = %s WHERE id = %s", (payload.notes.strip(), open_shift["id"]))
 
-        departure = {
-            "departureTime": to_utc_iso(now_utc),
-            "location": active_visit.get("location", ""),
-            "customer": active_visit.get("customer", ""),
-            "gps": None,
-            "gpsMeta": build_gps_meta(
-                timesheet_data,
-                payload.latitude if payload else None,
-                payload.longitude if payload else None,
-                payload.gpsOverrideReason if payload else "",
-                payload.gpsOverrideDetail if payload else "",
-            ),
-        }
-        if payload and payload.latitude is not None and payload.longitude is not None:
-            departure["gps"] = {
-                "lat": payload.latitude,
-                "lng": payload.longitude,
-            }
-
-        if not isinstance(open_entry.get("departures"), list):
-            open_entry["departures"] = []
-        open_entry["departures"].append(departure)
-
-        if payload and payload.notes and not str(open_entry.get("notes", "")).strip():
-            open_entry["notes"] = payload.notes.strip()
-
-        return True, {"departure": departure, "entryId": open_entry["id"]}
-
-    ok, result = update_timesheets(mutator)
-    if not ok:
-        append_access_log(request, "DEPARTURE_FAILED", False, str(result))
-        raise HTTPException(status_code=400, detail=str(result))
+    except Exception as e:
+        append_access_log(request, "DEPARTURE_FAILED", False, str(e))
+        raise HTTPException(status_code=500, detail="Failed to record departure")
 
     append_access_log(
         request,
         "DEPARTURE_LOGGED",
         True,
-        f"Employee: {employee['name']} departed {result['departure']['location']}",
+        f"Employee: {employee['name']} departed {active_visit['location_label']}",
     )
-    return {"success": True, **result}
+    return {
+        "success": True,
+            "departure": {
+                "departureTime": to_utc_iso(now_utc),
+                "location": active_visit["location_label"],
+                "customer": active_visit["customer_name"],
+                "gps": gps_value,
+                "gpsMeta": gps_meta,
+            },
+            "entryId": open_shift["id"]
+        }
 
 
 @app.patch("/api/admin/entries/{entry_id}")
@@ -2411,61 +1758,81 @@ def admin_adjust_entry(
     def parse_local_dt(s: str) -> datetime:
         return datetime.strptime(s.strip()[:16], "%Y-%m-%dT%H:%M").replace(tzinfo=APP_TIMEZONE)
 
-    def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        entry = next((e for e in timesheet_data["entries"] if e["id"] == entry_id), None)
-        if not entry:
-            return False, "Entry not found"
+    # 1. Fetch current entry
+    entry = db.query_one("SELECT * FROM shifts WHERE id = %s", (entry_id,))
+    if not entry:
+        raise HTTPException(status_code=404, detail="Entry not found")
 
-        new_ci_utc: Optional[datetime] = None
-        new_co_utc: Optional[datetime] = None
+    new_ci_utc: Optional[datetime] = None
+    new_co_utc: Optional[datetime] = None
 
-        if payload.clockIn:
+    if payload.clockIn:
+        try:
+            new_ci_utc = parse_local_dt(payload.clockIn).astimezone(timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid clockIn - use YYYY-MM-DDTHH:MM")
+
+    if payload.clockOut is not None:
+        if payload.clockOut.strip() != "":
             try:
-                new_ci_utc = parse_local_dt(payload.clockIn).astimezone(timezone.utc)
+                new_co_utc = parse_local_dt(payload.clockOut).astimezone(timezone.utc)
             except ValueError:
-                return False, "Invalid clockIn - use YYYY-MM-DDTHH:MM"
+                raise HTTPException(status_code=400, detail="Invalid clockOut - use YYYY-MM-DDTHH:MM")
 
-        if payload.clockOut is not None:
-            if payload.clockOut.strip() == "":
-                # Clear clock-out -> make shift active again
-                entry["clockOut"] = None
-                entry["totalHours"] = 0.0
-            else:
-                try:
-                    new_co_utc = parse_local_dt(payload.clockOut).astimezone(timezone.utc)
-                except ValueError:
-                    return False, "Invalid clockOut - use YYYY-MM-DDTHH:MM"
+    # 2. Prepare Updates
+    fields = []
+    params = []
 
-        # Apply clock-in change
-        if new_ci_utc is not None:
-            entry["clockIn"] = to_utc_iso(new_ci_utc)
-            entry["date"] = new_ci_utc.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d")
+    final_ci_utc = new_ci_utc or entry["clock_in"].replace(tzinfo=timezone.utc)
+    if new_ci_utc:
+        fields.append("clock_in = %s")
+        params.append(new_ci_utc)
+        fields.append("local_date = %s")
+        params.append(new_ci_utc.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d"))
 
-        # Apply clock-out change
-        if new_co_utc is not None:
-            ci_utc = parse_utc_iso(str(entry["clockIn"]))
-            if new_co_utc <= ci_utc:
-                return False, "Clock-out must be after clock-in"
-            entry["clockOut"] = to_utc_iso(new_co_utc)
-            entry["totalHours"] = round((new_co_utc - ci_utc).total_seconds() / 3600, 2)
-        elif new_ci_utc is not None and entry.get("clockOut"):
-            # Recalculate hours after clock-in shift
-            try:
-                co_utc = parse_utc_iso(str(entry["clockOut"]))
-                if co_utc <= new_ci_utc:
-                    return False, "Clock-out must be after clock-in"
-                entry["totalHours"] = round((co_utc - new_ci_utc).total_seconds() / 3600, 2)
-            except ValueError:
-                pass
+    final_co_utc = entry["clock_out"]
+    if payload.clockOut is not None:
+        if payload.clockOut.strip() == "":
+            fields.append("clock_out = NULL")
+            fields.append("total_hours = 0.0")
+            final_co_utc = None
+        else:
+            if new_co_utc <= final_ci_utc:
+                raise HTTPException(status_code=400, detail="Clock-out must be after clock-in")
+            fields.append("clock_out = %s")
+            params.append(new_co_utc)
+            final_co_utc = new_co_utc
 
-        return True, entry
+    # Re-calculate hours if either clock-in or clock-out changed (and both exist)
+    if (new_ci_utc or payload.clockOut is not None) and final_co_utc:
+        total_hours = (final_co_utc.replace(tzinfo=timezone.utc) - final_ci_utc.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+        fields.append("total_hours = %s")
+        params.append(round(max(0, total_hours), 2))
 
-    ok, result = update_timesheets(mutator)
-    if not ok:
-        raise HTTPException(status_code=400, detail=str(result))
+    if payload.notes is not None:
+        fields.append("notes = %s")
+        params.append(payload.notes.strip())
+
+    if payload.location is not None:
+        loc = payload.location.strip()
+        fields.append("location_label = %s")
+        params.append(loc)
+        # Try to update location_id
+        loc_row = db.query_one("SELECT id FROM locations WHERE address = %s", (loc,))
+        fields.append("location_id = %s")
+        params.append(loc_row["id"] if loc_row else None)
+
+    if not fields:
+        return {"success": True, "entry": {"id": entry_id}}
+
+    params.append(entry_id)
+    try:
+        db.execute(f"UPDATE shifts SET {', '.join(fields)} WHERE id = %s", tuple(params))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     append_access_log(request, "ENTRY_ADJUSTED", True, f"Entry {entry_id} adjusted by admin")
-    return {"success": True, "entry": result}
+    return {"success": True, "entry": {"id": entry_id}}
 
 
 @app.get("/api/timesheet/my-hours")
@@ -2577,62 +1944,109 @@ def admin_update_locations(
     location_expected_hours: Dict[str, float] = {}
     location_target_labor: Dict[str, float] = {}
     location_min_margin: Dict[str, float] = {}
-    for item in raw:
-        if isinstance(item, dict) and item.get("name", "").strip():
-            name = str(item["name"]).strip()
-            locations.append(name)
-            if item.get("lat") is not None and item.get("lng") is not None:
-                try:
-                    location_coords[name] = {"lat": float(item["lat"]), "lng": float(item["lng"])}
-                except (TypeError, ValueError):
-                    pass
-            if item.get("customer", "").strip():
-                location_customers[name] = str(item["customer"]).strip()
-            if item.get("rate") is not None:
-                try:
-                    location_rates[name] = float(item["rate"])
-                except (TypeError, ValueError):
-                    pass
-            if item.get("rateType") in ("per_visit", "hourly", "monthly"):
-                location_rate_types[name] = item["rateType"]
-            if item.get("type") in ("Residential", "Commercial"):
-                location_types[name] = item["type"]
-            if isinstance(item.get("frequency"), str) and item["frequency"].strip():
-                location_frequencies[name] = item["frequency"].strip()
-            if item.get("expectedHours") is not None:
-                try:
-                    location_expected_hours[name] = float(item["expectedHours"])
-                except (TypeError, ValueError):
-                    pass
-            if item.get("targetLaborPct") is not None:
-                try:
-                    location_target_labor[name] = float(item["targetLaborPct"])
-                except (TypeError, ValueError):
-                    pass
-            if item.get("minMarginPct") is not None:
-                try:
-                    location_min_margin[name] = float(item["minMarginPct"])
-                except (TypeError, ValueError):
-                    pass
-        elif isinstance(item, str) and item.strip():
-            locations.append(item.strip())
 
-    def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
-        data["locations"] = locations
-        data["location_coords"] = location_coords
-        data["location_customers"] = location_customers
-        data["location_rates"] = location_rates
-        data["location_rate_types"] = location_rate_types
-        data["location_types"] = location_types
-        data["location_frequencies"] = location_frequencies
-        data["location_expected_hours"] = location_expected_hours
-        data["location_target_labor"] = location_target_labor
-        data["location_min_margin"] = location_min_margin
-        return True, locations
+    with db.get_conn() as conn:
+        cur = conn.cursor()
 
-    update_timesheets(mutator)
-    append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations, {len(location_coords)} with coords")
-    return {"success": True, "locations": locations, "location_coords": location_coords, "location_customers": location_customers, "location_rates": location_rates, "location_rate_types": location_rate_types, "location_types": location_types, "location_frequencies": location_frequencies, "location_expected_hours": location_expected_hours, "location_target_labor": location_target_labor, "location_min_margin": location_min_margin}
+        # Deactivate all locations first to handle deletions
+        cur.execute("UPDATE locations SET active = false")
+
+        for item in raw:
+            name = ""
+            if isinstance(item, dict) and item.get("name", "").strip():
+                name = str(item["name"]).strip()
+                locations.append(name)
+
+                if item.get("lat") is not None and item.get("lng") is not None:
+                    try:
+                        location_coords[name] = {"lat": float(item["lat"]), "lng": float(item["lng"])}
+                    except (TypeError, ValueError):
+                        pass
+
+                if item.get("customer", "").strip():
+                    location_customers[name] = str(item["customer"]).strip()
+                if item.get("rate") is not None:
+                    try:
+                        location_rates[name] = float(item["rate"])
+                    except (TypeError, ValueError):
+                        pass
+                if item.get("rateType") in ("per_visit", "hourly", "monthly"):
+                    location_rate_types[name] = item["rateType"]
+                if item.get("type") in ("Residential", "Commercial"):
+                    location_types[name] = item["type"]
+                if isinstance(item.get("frequency"), str) and item["frequency"].strip():
+                    location_frequencies[name] = item["frequency"].strip()
+                if item.get("expectedHours") is not None:
+                    try:
+                        location_expected_hours[name] = float(item["expectedHours"])
+                    except (TypeError, ValueError):
+                        pass
+                if item.get("targetLaborPct") is not None:
+                    try:
+                        location_target_labor[name] = float(item["targetLaborPct"])
+                    except (TypeError, ValueError):
+                        pass
+                if item.get("minMarginPct") is not None:
+                    try:
+                        location_min_margin[name] = float(item["minMarginPct"])
+                    except (TypeError, ValueError):
+                        pass
+
+                cur.execute(
+                    """
+                    INSERT INTO locations
+                      (address, customer_name, location_type, rate, rate_type, frequency, lat, lng,
+                       expected_hours, target_labor_pct, min_margin_pct, active)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true)
+                    ON CONFLICT (address) DO UPDATE SET
+                        customer_name    = EXCLUDED.customer_name,
+                        location_type    = EXCLUDED.location_type,
+                        rate             = EXCLUDED.rate,
+                        rate_type        = EXCLUDED.rate_type,
+                        frequency        = EXCLUDED.frequency,
+                        lat              = EXCLUDED.lat,
+                        lng              = EXCLUDED.lng,
+                        expected_hours   = EXCLUDED.expected_hours,
+                        target_labor_pct = COALESCE(EXCLUDED.target_labor_pct, locations.target_labor_pct),
+                        min_margin_pct   = COALESCE(EXCLUDED.min_margin_pct, locations.min_margin_pct),
+                        active           = true
+                    """,
+                    (
+                        name,
+                        location_customers.get(name),
+                        location_types.get(name),
+                        location_rates.get(name),
+                        location_rate_types.get(name, "per_visit"),
+                        location_frequencies.get(name),
+                        location_coords.get(name, {}).get("lat"),
+                        location_coords.get(name, {}).get("lng"),
+                        location_expected_hours.get(name),
+                        location_target_labor.get(name),
+                        location_min_margin.get(name),
+                    ),
+                )
+            elif isinstance(item, str) and item.strip():
+                name = item.strip()
+                locations.append(name)
+                cur.execute(
+                    "INSERT INTO locations (address, active) VALUES (%s, true) ON CONFLICT (address) DO UPDATE SET active = true",
+                    (name,)
+                )
+
+    append_access_log(request, "LOCATIONS_UPDATED", True, f"{len(locations)} locations updated")
+    return {
+        "success": True,
+        "locations": locations,
+        "location_coords": location_coords,
+        "location_customers": location_customers,
+        "location_rates": location_rates,
+        "location_rate_types": location_rate_types,
+        "location_types": location_types,
+        "location_frequencies": location_frequencies,
+        "location_expected_hours": location_expected_hours,
+        "location_target_labor": location_target_labor,
+        "location_min_margin": location_min_margin
+    }
 
 
 @app.patch("/api/admin/locations/pin")
@@ -2653,15 +2067,20 @@ def admin_patch_location_pin(
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="lat and lng must be numbers")
 
-    def mutator(data: Dict[str, Any]) -> Tuple[bool, Any]:
-        if location not in data.get("locations", []):
-            return False, "Location not found"
-        data.setdefault("location_coords", {})[location] = {"lat": lat, "lng": lng}
-        return True, None
+    try:
+        # Check if location exists
+        exists = db.query_one("SELECT 1 FROM locations WHERE address = %s", (location,))
+        if not exists:
+            raise HTTPException(status_code=404, detail="Location not found")
 
-    ok, err = update_timesheets(mutator)
-    if not ok:
-        raise HTTPException(status_code=400, detail=str(err))
+        db.execute(
+            "UPDATE locations SET lat = %s, lng = %s WHERE address = %s",
+            (lat, lng, location)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     append_access_log(request, "LOCATION_PIN_SET", True, f"Pin set for: {location}")
     return {"success": True}
@@ -3583,6 +3002,9 @@ def admin_waste_analysis(
         tuple(params),
     )
 
+    settings = load_settings()
+    burden_mult = settings.get("laborBurdenMultiplier", _SETTINGS_DEFAULTS["laborBurdenMultiplier"])
+
     by_customer: Dict[str, Dict[str, Any]] = {}
     by_employee: Dict[str, Dict[str, Any]] = {}
     by_cause: Dict[str, Dict[str, Any]] = {}
@@ -3594,7 +3016,7 @@ def admin_waste_analysis(
         hours = float(r["total_hours"] or 0)
         has_rate = r.get("hourly_rate") is not None
         rate = float(r["hourly_rate"]) if has_rate else 0.0
-        cost = rate * hours
+        cost = rate * hours * burden_mult
         npt = r["non_productive_type"] or "other"
         cust = r["customer"] or "Unknown"
         emp = r["employee_name"]
@@ -3979,6 +3401,9 @@ def admin_jobs_profitability(
         for r in db.query_all("SELECT id, hourly_rate FROM employees WHERE hourly_rate IS NOT NULL")
     }
 
+    settings = load_settings()
+    burden_mult = settings.get("laborBurdenMultiplier", _SETTINGS_DEFAULTS["laborBurdenMultiplier"])
+
     # Batch-load all shift details for matched jobs in one query (avoids N+1)
     job_ids = [r["id"] for r in rows]
     labor_by_job: Dict[int, float] = {jid: 0.0 for jid in job_ids}
@@ -3992,9 +3417,8 @@ def admin_jobs_profitability(
             (job_ids,),
         )
         for sd in all_shifts:
-            labor_by_job[sd["job_id"]] += (
-                emp_rates.get(sd["employee_id"], 0.0) * float(sd["total_hours"] or 0)
-            )
+            base_labor = emp_rates.get(sd["employee_id"], 0.0) * float(sd["total_hours"] or 0)
+            labor_by_job[sd["job_id"]] += (base_labor * burden_mult)
 
     jobs_out = []
     total_rev = 0.0
@@ -4258,11 +3682,12 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     location_rate_types = timesheet_data.get("location_rate_types", {})
     location_expected_hours = timesheet_data.get("location_expected_hours", {})
 
+    burden_mult = settings.get("laborBurdenMultiplier", _SETTINGS_DEFAULTS["laborBurdenMultiplier"])
     emp_rates: Dict[int, float] = {}
     for emp in employees_data["employees"]:
         rate = emp.get("hourlyRate")
         if rate is not None:
-            emp_rates[emp["id"]] = float(rate)
+            emp_rates[emp["id"]] = float(rate) * burden_mult
 
     days_in_period = (end_date - start_date).days + 1 if (start_date and end_date) else 365
     monthly_customers_credited: set = set()
@@ -4508,10 +3933,38 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         key=lambda x: x["date"],
     )
 
+    # Calculate non-productive waste for the same period
+    date_clause = ""
+    params: List[Any] = []
+    if start_date is not None and end_date is not None:
+        date_clause = "AND s.local_date >= %s AND s.local_date <= %s"
+        params = [start_date, end_date]
+
+    waste_rows = db.query_all(
+        f"""
+        SELECT s.total_hours, e.hourly_rate
+        FROM shifts s
+        JOIN employees e ON s.employee_id = e.id
+        WHERE s.clock_out IS NOT NULL AND s.time_category = 'non_productive'
+        {date_clause}
+        """,
+        tuple(params),
+    )
+    total_waste_cost = 0.0
+    total_waste_hours = 0.0
+    for wr in waste_rows:
+        w_h = float(wr["total_hours"] or 0)
+        w_r = float(wr["hourly_rate"] or 0)
+        total_waste_cost += (w_h * w_r * burden_mult)
+        total_waste_hours += w_h
+
     total_rev = sum(c["revenue"] for c in by_customer)
-    total_lc = sum(c["laborCost"] for c in by_customer)
+    total_lc = sum(c["laborCost"] for c in by_customer) # already burdened in _aggregate
     total_hours = round(sum(c["hours"] for c in by_customer), 2)
     total_visits = sum(c["visits"] for c in by_customer)
+
+    grand_total_labor = total_lc + total_waste_cost
+    waste_ratio = (total_waste_cost / grand_total_labor * 100) if grand_total_labor > 0 else 0.0
 
     return {
         "success": True,
@@ -4523,6 +3976,10 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             "revenue": round(total_rev, 2),
             "laborCost": round(total_lc, 2),
             "laborPct": round(total_lc / total_rev * 100, 1) if total_rev > 0 else None,
+            "wasteCost": round(total_waste_cost, 2),
+            "wasteHours": round(total_waste_hours, 2),
+            "wasteRatioPct": round(waste_ratio, 1),
+            "grandTotalLabor": round(grand_total_labor, 2),
             "netProfit": round(total_rev - total_lc, 2),
             "grossMarginPct": round((total_rev - total_lc) / total_rev * 100, 1) if total_rev > 0 else None,
             "hours": total_hours,
@@ -4568,6 +4025,7 @@ def admin_analytics_flagged(
     if flag:
         flagged = [c for c in flagged if c["flag"] == flag]
     flagged.sort(key=lambda c: (severity_order.get(c["flag"], 99), -(c.get("revenue") or 0)))
+    flagged_rows = [{**c, "flags": c.get("flagReasons", [])} for c in flagged]
     counts = {}
     for c in data["byCustomer"]:
         counts[c["flag"]] = counts.get(c["flag"], 0) + 1
@@ -4591,7 +4049,7 @@ def admin_analytics_flagged(
         },
         "flagCounts": counts,
         "flaggedCount": len(flagged),
-        "customers": flagged,
+        "customers": flagged_rows,
     }
 
 
@@ -4742,11 +4200,12 @@ def admin_analytics_customer(
     location_rate_types = timesheet_data.get("location_rate_types", {})
 
     emp_names: Dict[int, str] = {e["id"]: e["name"] for e in employees_data["employees"]}
+    burden_mult = settings.get("laborBurdenMultiplier", _SETTINGS_DEFAULTS["laborBurdenMultiplier"])
     emp_rates: Dict[int, float] = {}
     for emp in employees_data["employees"]:
         rate = emp.get("hourlyRate")
         if rate is not None:
-            emp_rates[emp["id"]] = float(rate)
+            emp_rates[emp["id"]] = float(rate) * burden_mult
 
     def _resolve_loc(location: str) -> Tuple[str, str]:
         resolved = location

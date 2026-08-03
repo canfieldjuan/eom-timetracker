@@ -141,7 +141,7 @@ def main():
     print("\nAuthenticating...")
     try:
         resp = api_call(f"{base}/api/auth/login", "POST", {
-            "username": args.username,
+            "name": args.username,
             "password": args.password,
         })
         token = resp.get("token") or resp.get("access_token")

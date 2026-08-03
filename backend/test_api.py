@@ -174,6 +174,245 @@ class TestTimesheetGpsFlow:
         })
         assert co.status_code == 200, co.text
 
+    def test_gps_override_metadata_persists(self, client, auth, emp_auth):
+        pin = client.patch("/api/admin/locations/pin", headers=auth, json={
+            "location": "123 Main St, Effingham",
+            "lat": 39.1205,
+            "lng": -88.5434,
+        })
+        assert pin.status_code == 200, pin.text
+
+        ci = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
+            "notes": "start with override",
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "parking_access",
+            "gpsOverrideDetail": "building locked",
+        })
+        assert ci.status_code == 200, ci.text
+        entry = ci.json()["entry"]
+        assert entry["clockInGpsMeta"]["override"] is True
+        assert entry["clockInGpsMeta"]["overrideReason"] == "parking_access"
+        assert entry["clockInGpsMeta"]["overrideDetail"] == "building locked"
+        assert entry["clockInGpsMeta"]["matchedLocation"] == "123 Main St, Effingham"
+        assert entry["clockInGpsMeta"]["distanceM"] > 0
+
+        visit = client.post("/api/timesheet/visit", headers=emp_auth, json={
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "customer_request",
+            "gpsOverrideDetail": "customer asked for curbside handoff",
+        })
+        assert visit.status_code == 200, visit.text
+        assert visit.json()["visit"]["gpsMeta"]["overrideReason"] == "customer_request"
+
+        depart = client.post("/api/timesheet/depart", headers=emp_auth, json={
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "other",
+            "gpsOverrideDetail": "manual departure verification",
+        })
+        assert depart.status_code == 200, depart.text
+        assert depart.json()["departure"]["gpsMeta"]["overrideReason"] == "other"
+
+        co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
+            "notes": "cleanup with override meta",
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "gps_signal",
+            "gpsOverrideDetail": "weak signal at end of shift",
+        })
+        assert co.status_code == 200, co.text
+        end_entry = co.json()["entry"]
+        assert end_entry["clockOutGpsMeta"]["overrideReason"] == "gps_signal"
+        assert end_entry["clockOutGpsMeta"]["matchedLocation"] == "123 Main St, Effingham"
+
+    def test_gps_override_is_required_when_far_from_saved_site(self, client, auth, emp_auth):
+        pin = client.patch("/api/admin/locations/pin", headers=auth, json={
+            "location": "123 Main St, Effingham",
+            "lat": 39.1205,
+            "lng": -88.5434,
+        })
+        assert pin.status_code == 200, pin.text
+
+        ci_blocked = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
+            "location": "123 Main St, Effingham",
+            "latitude": 38.0,
+            "longitude": -89.0,
+        })
+        assert ci_blocked.status_code == 400, ci_blocked.text
+        assert "Add an override reason to continue." in ci_blocked.text
+
+        ci = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
+            "location": "123 Main St, Effingham",
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "other",
+            "gpsOverrideDetail": "required override clock-in",
+        })
+        assert ci.status_code == 200, ci.text
+
+        visit_blocked = client.post("/api/timesheet/visit", headers=emp_auth, json={
+            "location": "123 Main St, Effingham",
+            "latitude": 38.0,
+            "longitude": -89.0,
+        })
+        assert visit_blocked.status_code == 400, visit_blocked.text
+        assert "Add an override reason to continue." in visit_blocked.text
+
+        visit = client.post("/api/timesheet/visit", headers=emp_auth, json={
+            "location": "123 Main St, Effingham",
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "customer_request",
+            "gpsOverrideDetail": "required override arrival",
+        })
+        assert visit.status_code == 200, visit.text
+
+        depart_blocked = client.post("/api/timesheet/depart", headers=emp_auth, json={
+            "latitude": 38.0,
+            "longitude": -89.0,
+        })
+        assert depart_blocked.status_code == 400, depart_blocked.text
+        assert "Add an override reason to continue." in depart_blocked.text
+
+        depart = client.post("/api/timesheet/depart", headers=emp_auth, json={
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "gps_signal",
+            "gpsOverrideDetail": "required override departure",
+        })
+        assert depart.status_code == 200, depart.text
+
+        co_blocked = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
+            "notes": "blocked without override",
+            "latitude": 38.0,
+            "longitude": -89.0,
+        })
+        assert co_blocked.status_code == 400, co_blocked.text
+        assert "Add an override reason to continue." in co_blocked.text
+
+        co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
+            "notes": "cleanup with override",
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "parking_access",
+            "gpsOverrideDetail": "required override clock-out",
+        })
+        assert co.status_code == 200, co.text
+
+    def test_gps_fallback_location_label_survives_db_roundtrip(self, client, auth, emp_auth):
+        pin = client.patch("/api/admin/locations/pin", headers=auth, json={
+            "location": "123 Main St, Effingham",
+            "lat": 39.1205,
+            "lng": -88.5434,
+        })
+        assert pin.status_code == 200, pin.text
+
+        ci = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "other",
+            "gpsOverrideDetail": "far away roundtrip test",
+        })
+        assert ci.status_code == 200, ci.text
+        assert ci.json()["entry"]["location"] == "GPS 38.00000,-89.00000"
+
+        status = client.get("/api/timesheet/current-status", headers=emp_auth)
+        assert status.status_code == 200, status.text
+        me = next(row for row in status.json()["currentlyWorking"] if row["employeeName"] == "Catalina Gomez")
+        assert me["location"] == "GPS 38.00000,-89.00000"
+
+        co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
+            "notes": "cleanup raw gps label",
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "other",
+            "gpsOverrideDetail": "raw gps cleanup override",
+        })
+        assert co.status_code == 200, co.text
+
+    def test_hours_report_includes_gps_exceptions(self, client, auth, emp_auth):
+        pin = client.patch("/api/admin/locations/pin", headers=auth, json={
+            "location": "123 Main St, Effingham",
+            "lat": 39.1205,
+            "lng": -88.5434,
+        })
+        assert pin.status_code == 200, pin.text
+
+        ci = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "other",
+            "gpsOverrideDetail": "report exception test",
+        })
+        assert ci.status_code == 200, ci.text
+        report_date = ci.json()["entry"]["date"]
+
+        co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
+            "notes": "cleanup report exception",
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "gps_signal",
+            "gpsOverrideDetail": "weak signal at end",
+        })
+        assert co.status_code == 200, co.text
+
+        report = client.get(f"/api/admin/reports/hours?period=day&date={report_date}", headers=auth)
+        assert report.status_code == 200, report.text
+        rows = report.json()["rows"]
+        catalina = [r for r in rows if r["employeeName"] == "Catalina Gomez"]
+        assert catalina, rows
+        latest = catalina[-1]
+        assert latest["gpsExceptions"]
+        assert "clock_in - other" in latest["gpsExceptionsText"]
+        assert "clock_out - gps_signal" in latest["gpsExceptionsText"]
+
+    def test_hours_report_can_filter_to_exception_shifts_only(self, client, auth, emp_auth):
+        pin = client.patch("/api/admin/locations/pin", headers=auth, json={
+            "location": "123 Main St, Effingham",
+            "lat": 39.1205,
+            "lng": -88.5434,
+        })
+        assert pin.status_code == 200, pin.text
+
+        normal_ci = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
+            "location": "123 Main St, Effingham",
+            "latitude": 39.1205,
+            "longitude": -88.5434,
+        })
+        assert normal_ci.status_code == 200, normal_ci.text
+        normal_co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
+            "notes": "normal cleanup",
+            "latitude": 39.1205,
+            "longitude": -88.5434,
+        })
+        assert normal_co.status_code == 200, normal_co.text
+
+        override_ci = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "other",
+            "gpsOverrideDetail": "exceptions only filter test",
+        })
+        assert override_ci.status_code == 200, override_ci.text
+        report_date = override_ci.json()["entry"]["date"]
+        override_co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
+            "notes": "override cleanup",
+            "latitude": 38.0,
+            "longitude": -89.0,
+            "gpsOverrideReason": "gps_signal",
+            "gpsOverrideDetail": "weak signal override",
+        })
+        assert override_co.status_code == 200, override_co.text
+
+        report = client.get(f"/api/admin/reports/hours?period=day&date={report_date}&exceptions_only=true", headers=auth)
+        assert report.status_code == 200, report.text
+        data = report.json()
+        assert data["exceptionsOnly"] is True
+        assert data["totalGpsExceptionShifts"] >= 1
+        assert all(row["gpsExceptions"] for row in data["rows"])
+
 
 # ===============================================================================
 # Existing analytics - regression: was returning 500 (byDay KeyError)

@@ -52,6 +52,7 @@ CREATE TABLE shifts (
     id            SERIAL PRIMARY KEY,
     employee_id   INTEGER NOT NULL REFERENCES employees(id),
     location_id   INTEGER REFERENCES locations(id),
+    location_label TEXT NOT NULL DEFAULT '',
     clock_in      TIMESTAMPTZ NOT NULL,
     clock_out     TIMESTAMPTZ,
     total_hours   NUMERIC(6, 2),
@@ -59,7 +60,9 @@ CREATE TABLE shifts (
     local_date    DATE,
     timezone      TEXT NOT NULL DEFAULT 'America/Chicago',
     clock_in_gps  JSONB,
+    clock_in_gps_meta JSONB,
     clock_out_gps JSONB,
+    clock_out_gps_meta JSONB,
     job_id        INTEGER REFERENCES jobs(id),
     time_category     TEXT NOT NULL DEFAULT 'productive'
                           CHECK (time_category IN ('productive', 'non_productive')),
@@ -74,9 +77,11 @@ CREATE TABLE visits (
     id            SERIAL PRIMARY KEY,
     shift_id      INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
     location_id   INTEGER REFERENCES locations(id),
+    location_label TEXT NOT NULL DEFAULT '',
     customer_name TEXT,
     arrival_time  TIMESTAMPTZ NOT NULL,
     gps           JSONB,
+    gps_meta      JSONB,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -85,9 +90,11 @@ CREATE TABLE departures (
     id             SERIAL PRIMARY KEY,
     shift_id       INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
     location_id    INTEGER REFERENCES locations(id),
+    location_label TEXT NOT NULL DEFAULT '',
     customer_name  TEXT,
     departure_time TIMESTAMPTZ NOT NULL,
     gps            JSONB,
+    gps_meta       JSONB,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
