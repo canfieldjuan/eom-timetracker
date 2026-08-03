@@ -4220,6 +4220,7 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
     )
     assert response.status_code == 200, response.text
     body = response.json()
+    forecast_as_of = date.fromisoformat(body["asOfDate"])
     jobs = {job["jobId"]: job for week in body["weeks"] for job in week["jobs"]}
     canonical_monthly_rows = [
         site
@@ -4254,8 +4255,28 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
     assert incomplete["plannedHours"] is None
     assert incomplete["estRevenue"] == 50
     assert incomplete["estLaborCost"] is None
-    assert {issue["code"] for issue in incomplete["issues"]} >= {
-        "missing_expected_hours"
+    assert "missing_expected_hours" not in {
+        issue["code"] for issue in incomplete["issues"]
+    }
+    assert incomplete["expectedHoursBaseline"] == {
+        "source": "insufficient_data",
+        "state": "learning",
+        "plannedHours": None,
+        "manualHours": None,
+        "suggestedHours": None,
+        "sampleSize": 0,
+        "minimumSampleSize": 3,
+        "observationPeriod": {
+            "startDate": str(forecast_as_of - timedelta(days=180)),
+            "endDate": str(forecast_as_of),
+            "lookbackDays": 180,
+        },
+        "exclusionRules": [
+            "requires_completed_job",
+            "requires_positive_paired_arrive_depart_interval",
+            "excludes_unpaired_or_invalid_site_events",
+            "excludes_unaccepted_qr_check_ins",
+        ],
     }
     assert body["summary"]["plannedHours"] is None
     assert body["summary"]["knownPlannedHours"] == pytest.approx(10)
@@ -4322,6 +4343,145 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
         }
         for site in canonical_monthly_rows
     ]
+
+
+def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
+    client,
+    auth,
+):
+    app_timezone = ZoneInfo("America/Chicago")
+    today = datetime.now(app_timezone).date()
+    future_day = today + timedelta(days=1)
+    completed_days = [
+        today - timedelta(days=21),
+        today - timedelta(days=14),
+        today - timedelta(days=7),
+    ]
+    durations = [2, 3, 7]
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "expected_hours_learning",
+                "commercial_evening_night",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "Expected Hours Learning",
+                site_type="Commercial",
+                rate=80,
+                rate_type="per_visit",
+                expected_hours=None,
+            )
+            employee_id = _employee(cur, "Expected Hours Learning", 22)
+            for index, (service_day, hours) in enumerate(
+                zip(completed_days, durations)
+            ):
+                local_start = datetime.combine(
+                    service_day,
+                    time(hour=18),
+                    tzinfo=app_timezone,
+                )
+                job_id = _job(
+                    cur,
+                    source_id=source_id,
+                    location_id=site_id,
+                    customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                    start=local_start.astimezone(timezone.utc),
+                    end=(local_start + timedelta(hours=hours)).astimezone(
+                        timezone.utc
+                    ),
+                    source_seed=f"expected-hours-learning-history-{index}",
+                )
+                cur.execute(
+                    "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                    (job_id,),
+                )
+                shift_start = local_start.astimezone(timezone.utc) - timedelta(
+                    minutes=15
+                )
+                shift_id = _shift(
+                    cur,
+                    employee_id=employee_id,
+                    start=shift_start,
+                    end=shift_start + timedelta(hours=hours, minutes=30),
+                    service_day=service_day,
+                    location_id=site_id,
+                    location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                    job_id=job_id,
+                )
+                _paired_version_two_visit(
+                    cur,
+                    employee_id=employee_id,
+                    shift_id=shift_id,
+                    location_id=site_id,
+                    job_id=job_id,
+                    arrival=local_start.astimezone(timezone.utc),
+                    departure=(
+                        local_start + timedelta(hours=hours)
+                    ).astimezone(timezone.utc),
+                    suffix=f"Expected Hours Learning {index}",
+                )
+
+            future_start = datetime.combine(
+                future_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            future_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=future_start.astimezone(timezone.utc),
+                end=(future_start + timedelta(hours=2)).astimezone(timezone.utc),
+                source_seed="expected-hours-learning-future",
+            )
+
+    forecast_response = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4},
+    )
+    assert forecast_response.status_code == 200, forecast_response.text
+    forecast_jobs = {
+        row["jobId"]: row
+        for week in forecast_response.json()["weeks"]
+        for row in week["jobs"]
+    }
+    forecast_job = forecast_jobs[future_job_id]
+    assert forecast_job["plannedHours"] is None
+    assert forecast_job["estRevenue"] == 80
+    assert "missing_expected_hours" not in {
+        issue["code"] for issue in forecast_job["issues"]
+    }
+    baseline = forecast_job["expectedHoursBaseline"]
+    assert baseline["source"] == "learned_suggestion"
+    assert baseline["state"] == "suggested"
+    assert baseline["suggestedHours"] == 3
+    assert baseline["plannedHours"] is None
+    assert baseline["manualHours"] is None
+    assert baseline["sampleSize"] == 3
+    assert baseline["minimumSampleSize"] == 3
+    assert baseline["observationPeriod"] == {
+        "startDate": str(completed_days[0]),
+        "endDate": str(completed_days[-1]),
+        "lookbackDays": 180,
+    }
+    assert "excludes_unpaired_or_invalid_site_events" in baseline["exclusionRules"]
+
+    schedule_response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(future_day), "end_date": str(future_day)},
+    )
+    assert schedule_response.status_code == 200, schedule_response.text
+    schedule_job = {
+        row["id"]: row for row in schedule_response.json()["jobs"]
+    }[future_job_id]
+    assert schedule_job["expectedHoursBaseline"] == baseline
+    assert schedule_job["siteEconomics"]["expectedHoursBaseline"] == baseline
+    assert schedule_job["issues"] == []
 
 
 def test_utilization_reconciles_complete_route_split_crew_and_categorized_time(

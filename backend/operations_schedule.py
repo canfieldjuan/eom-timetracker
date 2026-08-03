@@ -38,6 +38,14 @@ OPERATIONS_FORECAST_ALLOWED_WEEKS = {4, 8, 12}
 UTILIZATION_REVIEW_KEY_VERSION = "utilization-review.v1"
 UTILIZATION_EVIDENCE_VERSION = "utilization-classifier.v1"
 UTILIZATION_MISSING_DEPARTURE_CORRECTION = "utilization_missing_departure.v1"
+EXPECTED_HOURS_LEARNING_LOOKBACK_DAYS = 180
+EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES = 3
+EXPECTED_HOURS_LEARNING_EXCLUSION_RULES = (
+    "requires_completed_job",
+    "requires_positive_paired_arrive_depart_interval",
+    "excludes_unpaired_or_invalid_site_events",
+    "excludes_unaccepted_qr_check_ins",
+)
 
 
 class UtilizationMissingDepartureCorrectionRequest(BaseModel):
@@ -77,6 +85,32 @@ def _hours(start: datetime, end: datetime) -> float:
 
 def _issue(code: str, message: str) -> Dict[str, str]:
     return {"code": code, "message": message}
+
+
+def _median(values: List[float]) -> float:
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2
+
+
+def _empty_expected_hours_learning(
+    *,
+    observation_start: date,
+    observation_end: date,
+) -> Dict[str, Any]:
+    return {
+        "sampleSize": 0,
+        "minimumSampleSize": EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES,
+        "suggestedHours": None,
+        "observationPeriod": {
+            "startDate": str(observation_start),
+            "endDate": str(observation_end),
+            "lookbackDays": EXPECTED_HOURS_LEARNING_LOOKBACK_DAYS,
+        },
+        "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+    }
 
 
 def _query_all(
@@ -300,6 +334,204 @@ def _load_linked_job_metadata(
     }
 
 
+def _load_expected_hours_learning_by_site(
+    site_ids: Iterable[Any],
+    *,
+    observed_at: datetime,
+    app_timezone: ZoneInfo,
+    cursor: Optional[Any] = None,
+) -> Dict[int, Dict[str, Any]]:
+    resolved_site_ids = sorted(
+        {int(site_id) for site_id in site_ids if site_id is not None}
+    )
+    observed_local_day = observed_at.astimezone(app_timezone).date()
+    observation_start = observed_local_day - timedelta(
+        days=EXPECTED_HOURS_LEARNING_LOOKBACK_DAYS
+    )
+    observation_end = observed_local_day
+    learning = {
+        site_id: _empty_expected_hours_learning(
+            observation_start=observation_start,
+            observation_end=observation_end,
+        )
+        for site_id in resolved_site_ids
+    }
+    if not resolved_site_ids:
+        return learning
+
+    rows = _query_all(
+        """
+        WITH visit_evidence AS (
+            SELECT
+                v.id AS visit_id,
+                v.location_id,
+                v.arrival_time,
+                v.sequence_version,
+                d.id AS departure_id,
+                d.departure_time,
+                d.location_id AS departure_location_id,
+                COALESCE(
+                    CASE
+                        WHEN check_in_job.location_id = v.location_id
+                        THEN sci.job_id
+                    END,
+                    CASE
+                        WHEN shift_job.location_id = v.location_id
+                        THEN evidence_shift.job_id
+                    END
+                ) AS resolved_job_id,
+                (
+                    v.site_check_in_id IS NULL
+                    OR (
+                        (
+                            sci.classification IN ('on_time', 'late')
+                            AND sci.review_status = 'not_required'
+                        )
+                        OR (
+                            sci.classification = 'needs_review'
+                            AND sci.review_status = 'approved'
+                        )
+                    )
+                ) AS accepted_check_in
+            FROM visits v
+            JOIN shifts evidence_shift ON evidence_shift.id = v.shift_id
+            LEFT JOIN jobs shift_job ON shift_job.id = evidence_shift.job_id
+            LEFT JOIN site_check_ins sci ON sci.id = v.site_check_in_id
+            LEFT JOIN jobs check_in_job ON check_in_job.id = sci.job_id
+            LEFT JOIN departures d ON d.visit_id = v.id
+            WHERE v.location_id = ANY(%s)
+              AND v.sequence_version >= 2
+        ),
+        problem_jobs AS (
+            SELECT DISTINCT resolved_job_id
+            FROM visit_evidence
+            WHERE resolved_job_id IS NOT NULL
+              AND (
+                    departure_id IS NULL
+                    OR departure_time <= arrival_time
+                    OR departure_location_id IS DISTINCT FROM location_id
+                    OR NOT accepted_check_in
+              )
+        )
+        SELECT j.id AS job_id,
+               j.location_id,
+               j.scheduled_date,
+               SUM(EXTRACT(EPOCH FROM (ve.departure_time - ve.arrival_time))) / 3600.0
+                   AS person_hours,
+               COUNT(*) AS interval_count
+        FROM visit_evidence ve
+        JOIN jobs j ON j.id = ve.resolved_job_id
+                   AND j.location_id = ve.location_id
+        WHERE j.location_id = ANY(%s)
+          AND j.status = 'completed'
+          AND j.scheduled_date BETWEEN %s AND %s
+          AND ve.departure_id IS NOT NULL
+          AND ve.departure_time > ve.arrival_time
+          AND ve.departure_location_id IS NOT DISTINCT FROM ve.location_id
+          AND ve.accepted_check_in
+          AND NOT EXISTS (
+              SELECT 1
+              FROM problem_jobs problem
+              WHERE problem.resolved_job_id = j.id
+          )
+        GROUP BY j.id, j.location_id, j.scheduled_date
+        HAVING SUM(EXTRACT(EPOCH FROM (ve.departure_time - ve.arrival_time))) > 0
+        ORDER BY j.location_id, j.scheduled_date, j.id
+        """,
+        (
+            resolved_site_ids,
+            resolved_site_ids,
+            observation_start,
+            observation_end,
+        ),
+        cursor=cursor,
+    )
+
+    observations_by_site: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        observations_by_site[int(row["location_id"])].append(dict(row))
+    for site_id, observations in observations_by_site.items():
+        samples = [float(row["person_hours"]) for row in observations]
+        sample_size = len(samples)
+        first_date = min(row["scheduled_date"] for row in observations)
+        last_date = max(row["scheduled_date"] for row in observations)
+        learning[site_id] = {
+            "sampleSize": sample_size,
+            "minimumSampleSize": EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES,
+            "suggestedHours": (
+                round(_median(samples), 2)
+                if sample_size >= EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES
+                else None
+            ),
+            "observationPeriod": {
+                "startDate": str(first_date),
+                "endDate": str(last_date),
+                "lookbackDays": EXPECTED_HOURS_LEARNING_LOOKBACK_DAYS,
+            },
+            "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+        }
+    return learning
+
+
+def _expected_hours_baseline(
+    job: Dict[str, Any],
+    learning_by_site: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    planned_hours = (
+        float(job["site_expected_hours"])
+        if job.get("site_expected_hours") is not None
+        else None
+    )
+    if planned_hours is not None:
+        return {
+            "source": "manual",
+            "state": "manual",
+            "plannedHours": planned_hours,
+            "manualHours": planned_hours,
+            "suggestedHours": None,
+            "sampleSize": None,
+            "minimumSampleSize": EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES,
+            "observationPeriod": None,
+            "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+        }
+    site_id = job.get("location_id")
+    learning = (
+        (learning_by_site or {}).get(int(site_id))
+        if site_id is not None
+        else None
+    )
+    if learning is None:
+        return {
+            "source": "insufficient_data",
+            "state": "learning",
+            "plannedHours": None,
+            "manualHours": None,
+            "suggestedHours": None,
+            "sampleSize": 0,
+            "minimumSampleSize": EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES,
+            "observationPeriod": None,
+            "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+        }
+    suggested_hours = learning.get("suggestedHours")
+    source = "learned_suggestion" if suggested_hours is not None else "insufficient_data"
+    return {
+        "source": source,
+        "state": "suggested" if suggested_hours is not None else "learning",
+        "plannedHours": None,
+        "manualHours": None,
+        "suggestedHours": suggested_hours,
+        "sampleSize": int(learning.get("sampleSize") or 0),
+        "minimumSampleSize": int(
+            learning.get("minimumSampleSize")
+            or EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES
+        ),
+        "observationPeriod": learning.get("observationPeriod"),
+        "exclusionRules": list(
+            learning.get("exclusionRules") or EXPECTED_HOURS_LEARNING_EXCLUSION_RULES
+        ),
+    }
+
+
 def _job_issues(job: Dict[str, Any]) -> List[Dict[str, str]]:
     issues: List[Dict[str, str]] = []
     if job.get("location_id") is None:
@@ -311,13 +543,6 @@ def _job_issues(job: Dict[str, Any]) -> List[Dict[str, str]]:
             _issue("archived_site", "This scheduled job points to an archived Site.")
         )
     if job.get("location_id") is not None:
-        if job.get("site_expected_hours") is None:
-            issues.append(
-                _issue(
-                    "missing_expected_hours",
-                    "Expected labor hours per visit are not configured for this Site.",
-                )
-            )
         if job.get("rate") is None:
             issues.append(
                 _issue(
@@ -2678,6 +2903,7 @@ def _decorate_schedule_jobs(
     *,
     visible_range_start: Optional[datetime] = None,
     visible_range_end: Optional[datetime] = None,
+    expected_hours_learning_by_site: Optional[Dict[int, Dict[str, Any]]] = None,
     cursor: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = defaultdict(list)
@@ -2940,6 +3166,10 @@ def _decorate_schedule_jobs(
             if job.get("site_expected_hours") is not None
             else None
         )
+        expected_hours_baseline = _expected_hours_baseline(
+            job,
+            expected_hours_learning_by_site,
+        )
         in_progress = any(worker["status"] == "in_progress" for worker in workers)
         status = str(job.get("status") or "scheduled")
         included_in_plan = status != "cancelled" and _job_is_projection_eligible(job)
@@ -2966,6 +3196,7 @@ def _decorate_schedule_jobs(
                 "executionStatus": execution_status,
                 "includedInPlan": included_in_plan,
                 "plannedHours": planned_hours,
+                "expectedHoursBaseline": expected_hours_baseline,
                 "actualHours": round(actual_hours, 2),
                 "varianceHours": (
                     round(actual_hours - planned_hours, 2)
@@ -2989,6 +3220,7 @@ def _decorate_schedule_jobs(
                     ),
                     "rateType": job.get("rate_type"),
                     "expectedHours": planned_hours,
+                    "expectedHoursBaseline": expected_hours_baseline,
                 },
                 "issues": issues,
             }
@@ -3014,6 +3246,7 @@ def _forecast_job_values(
     job: Dict[str, Any],
     avg_hourly_rate: Optional[Decimal],
     monthly_allocations: Dict[int, int],
+    expected_hours_learning_by_site: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     issues = _job_issues(job)
     included_in_forecast = _job_is_projection_eligible(job)
@@ -3021,6 +3254,10 @@ def _forecast_job_values(
         float(job["site_expected_hours"])
         if job.get("site_expected_hours") is not None
         else None
+    )
+    expected_hours_baseline = _expected_hours_baseline(
+        job,
+        expected_hours_learning_by_site,
     )
     rate_cents = _money_cents(job.get("rate"))
     rate_type = job.get("rate_type")
@@ -3076,6 +3313,7 @@ def _forecast_job_values(
         "sourceRole": job.get("source_role"),
         "includedInForecast": included_in_forecast,
         "plannedHours": expected_hours,
+        "expectedHoursBaseline": expected_hours_baseline,
         "estRevenue": _money(revenue_cents),
         "estLaborCost": _money(labor_cents),
         "estNetProfit": _money(net_cents),
@@ -3307,6 +3545,7 @@ def _actual_profitability_row(
         "executionStatus": row.get("executionStatus"),
         "includedInProfitability": included,
         "plannedHours": row.get("plannedHours"),
+        "expectedHoursBaseline": row.get("expectedHoursBaseline"),
         "actualHours": row.get("actualHours"),
         "varianceHours": row.get("varianceHours"),
         "revenue": _money(revenue_cents),
@@ -4010,6 +4249,12 @@ def build_weekly_labor_profitability(
         allocation_jobs,
         app_timezone,
     )
+    expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
+        [job.get("location_id") for job in jobs],
+        observed_at=observed_at,
+        app_timezone=app_timezone,
+        cursor=cursor,
+    )
     schedule_jobs, unmatched = _decorate_schedule_jobs(
         jobs,
         range_start,
@@ -4018,6 +4263,7 @@ def build_weekly_labor_profitability(
         app_timezone,
         visible_range_start=range_start,
         visible_range_end=range_end,
+        expected_hours_learning_by_site=expected_hours_learning_by_site,
         cursor=cursor,
     )
     source_jobs = {int(job["id"]): job for job in jobs}
@@ -4391,8 +4637,18 @@ def build_operations_forecast(
         ):
             continue
         forecast_jobs.append(job)
+    expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
+        [job.get("location_id") for job in forecast_jobs],
+        observed_at=observed_at,
+        app_timezone=app_timezone,
+    )
     calculated = [
-        _forecast_job_values(job, avg_hourly_rate, monthly_allocations)
+        _forecast_job_values(
+            job,
+            avg_hourly_rate,
+            monthly_allocations,
+            expected_hours_learning_by_site,
+        )
         for job in forecast_jobs
     ]
 
@@ -4509,6 +4765,11 @@ def build_operations_schedule_router(
             window_start=range_start,
             window_end=range_end,
         )
+        expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
+            [job.get("location_id") for job in jobs],
+            observed_at=observed_at,
+            app_timezone=app_timezone,
+        )
         scheduled_starts = [
             job["scheduled_start"]
             for job in jobs
@@ -4527,6 +4788,7 @@ def build_operations_schedule_router(
             app_timezone,
             visible_range_start=range_start,
             visible_range_end=range_end,
+            expected_hours_learning_by_site=expected_hours_learning_by_site,
         )
         active_jobs = [job for job in schedule_jobs if job["includedInPlan"]]
         known_planned_hours = sum(
