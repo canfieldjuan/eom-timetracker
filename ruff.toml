@@ -1,0 +1,10 @@
+# Warn-first lint config. Focused on real-bug rules (pyflakes F + syntax E9),
+# not style, so the non-blocking CI report is high-signal. Broaden `select` and
+# make the CI job blocking once the backlog is triaged. See AUDIT_PROTOCOL.md.
+[lint]
+select = ["F", "E9"]
+
+[lint.per-file-ignores]
+# Tests intentionally shadow/redefine fixtures and import broadly.
+"backend/test_*.py" = ["F811", "F401"]
+"backend/conftest.py" = ["F811", "F401"]

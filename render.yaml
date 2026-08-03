@@ -16,14 +16,72 @@ services:
         value: /opt/render/project/data
       - key: TRUST_PROXY
         value: "true"
+      # Trusted proxy hops between the app and the internet: Cloudflare plus
+      # Render's load balancer. The real client IP is read this many hops from
+      # the right of X-Forwarded-For, ignoring client-prepended fake entries.
+      - key: TRUSTED_PROXY_HOPS
+        value: "2"
       - key: ACCESS_START_HOUR
         value: "6"
       - key: ACCESS_END_HOUR
         value: "22"
+      # Explicit all-days: the code default is Mon–Fri, which would 403 the
+      # dashboard AND (now) Saturday clock-ins — crews work Saturdays. Tighten by
+      # removing day numbers (0=Sun..6=Sat) if policy changes.
+      - key: ALLOWED_DAYS
+        value: "0,1,2,3,4,5,6"
+      # Block clock-in/arrive/QR-check-in outside ACCESS hours (clock-OUT and
+      # depart are never blocked, so nobody gets trapped in an open shift).
+      # Kill switch: set to "false" to disable without a deploy.
+      - key: ENFORCE_CLOCK_HOURS
+        value: "true"
       - key: DATABASE_URL
         fromDatabase:
           name: eom-timetracker-db
           property: connectionString
+      - key: ALLOWED_ORIGINS
+        value: https://effinghamofficemaids.com,https://www.effinghamofficemaids.com,https://effingham-office-maids-website.vercel.app
+      - key: ALLOWED_ORIGIN_REGEX
+        value: '^https://effingham-office-maids-[a-z0-9-]+-juan-canfields-projects\.vercel\.app$'
+      - key: PUBLIC_APP_URL
+        sync: false
+      - key: ALLOW_PUBLIC_REGISTRATION
+        value: "false"
+      # Receivables proxy config stays server-side. Base URL should be the Atlas
+      # EOM private service URL ending in /api/v1. Existing opaque tokens remain
+      # usable during rotation; the target token is the raw generated eomrx_v1_...
+      # value whose SHA-256 digest is stored on the Atlas service.
+      - key: ATLAS_RECEIVABLES_BASE_URL
+        sync: false
+      - key: ATLAS_RECEIVABLES_SERVICE_TOKEN
+        sync: false
+      - key: ATLAS_RECEIVABLES_TIMEOUT_SECONDS
+        value: "10"
+      # Funnel proxy config stays server-side. Base URL should be the Atlas EOM
+      # private service URL ending in /api/v1. The token is the raw generated
+      # eomf_v1_... bearer whose SHA-256 digest is stored on Atlas.
+      - key: ATLAS_FUNNEL_BASE_URL
+        sync: false
+      - key: ATLAS_FUNNEL_SERVICE_TOKEN
+        sync: false
+      - key: ATLAS_FUNNEL_TIMEOUT_SECONDS
+        value: "10"
+      # Estimate approval is intentionally limited to Juan's configured
+      # employee row; set this to that employee ID in the target environment.
+      - key: EOM_FUNNEL_APPROVER_EMPLOYEE_ID
+        sync: false
+      # Google Calendar is a one-way, read-only planning source. OAuth client
+      # material and the independent Fernet key remain server-side secrets.
+      - key: GOOGLE_CALENDAR_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CALENDAR_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_CALENDAR_REDIRECT_URI
+        sync: false
+      - key: GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: GOOGLE_CALENDAR_PORTAL_URL
+        value: https://effinghamofficemaids.com/portal.html
     disk:
       name: eom-data
       mountPath: /opt/render/project/data

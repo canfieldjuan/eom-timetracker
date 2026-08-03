@@ -25,7 +25,7 @@ def init_pool(database_url: str) -> None:
 @contextmanager
 def get_conn() -> Generator:
     if _pool is None:
-        raise RuntimeError("DB pool not initialized — call init_pool() first")
+        raise RuntimeError("DB pool not initialized -- call init_pool() first")
     conn = _pool.getconn()
     try:
         yield conn

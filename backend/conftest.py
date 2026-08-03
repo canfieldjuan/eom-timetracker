@@ -30,7 +30,24 @@ os.environ.setdefault("ACCESS_END_HOUR", "24")
 os.environ.setdefault("ALLOWED_IPS", "")
 os.environ.setdefault("TOKEN_TTL_HOURS", "12")
 os.environ.setdefault("MAX_ACTIVE_SHIFT_HOURS", "24")
-os.environ.setdefault("AUTO_CLOSE_STALE_SHIFTS", "false")
+os.environ.setdefault("LOGIN_RATE_LIMIT_MAX", "0")
+os.environ.setdefault("REGISTER_RATE_LIMIT_MAX", "0")
+os.environ.setdefault("ALLOW_PUBLIC_REGISTRATION", "false")
+os.environ.setdefault("ALLOWED_ORIGINS", "https://trusted.example")
+os.environ.setdefault("GOOGLE_CALENDAR_CLIENT_ID", "test-google-client")
+os.environ.setdefault("GOOGLE_CALENDAR_CLIENT_SECRET", "test-google-secret")
+os.environ.setdefault(
+    "GOOGLE_CALENDAR_REDIRECT_URI",
+    "https://api.example.test/api/google-calendar/oauth/callback",
+)
+os.environ.setdefault(
+    "GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY",
+    "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=",
+)
+os.environ.setdefault(
+    "GOOGLE_CALENDAR_PORTAL_URL", "https://portal.example.test/portal.html"
+)
+os.environ.setdefault("PUBLIC_APP_URL", "https://portal.example.test")
 
 SCHEMA_FILE = BACKEND_DIR / "schema.sql"
 
@@ -43,7 +60,24 @@ def _apply_schema(conn):
     """Drop and recreate all tables from schema.sql."""
     with conn.cursor() as cur:
         cur.execute("""
-            DROP TABLE IF EXISTS schedules, departures, visits, shifts, jobs, locations, employees, settings CASCADE
+            DROP TABLE IF EXISTS planned_visit_audit_events,
+                planned_visit_assignments, planned_service_visits,
+                google_calendar_event_mappings, calendar_import_previews,
+                crew_memberships, crews, google_calendar_oauth_states,
+                google_calendar_sources, google_calendar_connections,
+                eom_office_conversion_handoffs,
+                receivables_operation_attempts,
+                payroll_shift_corrections,
+                payroll_hour_correction_allocations,
+                payroll_hour_corrections,
+                payroll_verification_events, payroll_verification_batches,
+                time_data_correction_batches,
+                site_qr_action_receipts,
+                site_check_in_reconciliation_reviews, site_check_ins,
+                arrival_policy_revisions,
+                site_check_in_schedule_rules, site_check_in_schedules,
+                schedules, departures, visits,
+                shifts, jobs, locations, customers, employees, settings CASCADE
         """)
     conn.commit()
     sql = SCHEMA_FILE.read_text()
@@ -68,12 +102,28 @@ def _seed(conn):
         )
         cur.execute(
             """
-            INSERT INTO locations (address, customer_name, rate, rate_type, expected_hours)
-            VALUES ('123 Main St, Effingham', 'Test Customer', 150.00, 'per_visit', 3.0)
+            INSERT INTO locations (
+                address, customer_name, lat, lng,
+                rate, rate_type, expected_hours
+            )
+            VALUES (
+                '123 Main St, Effingham', 'Test Customer', 39.1203, -88.54335,
+                150.00, 'per_visit', 3.0
+            )
             ON CONFLICT (address) DO NOTHING
             """,
         )
     conn.commit()
+
+
+@pytest.fixture(autouse=True)
+def clear_receivables_operation_attempts(setup_db):
+    """Keep operation replay records isolated between API test cases."""
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM receivables_operation_attempts")
+    conn.commit()
+    conn.close()
 
 
 # -- session-scoped fixtures ----------------------------------------------------
@@ -147,19 +197,20 @@ def location_id():
 
 
 @pytest.fixture(scope="session")
-def completed_shift_id(client, auth, employee_id, location_id):
-    """Create and clock-out a shift, return its ID."""
-    ci = client.post("/api/timesheet/clock-in", headers=auth, json={
-        "employeeId": employee_id,
+def completed_shift_id(client, emp_auth, employee_id, location_id):
+    """Create and clock-out a shift owned by the employee, return its ID."""
+    ci = client.post("/api/timesheet/clock-in", headers=emp_auth, json={
         "location": "123 Main St, Effingham",
-        "timezone": "America/Chicago",
+        "latitude": 39.1203,
+        "longitude": -88.54335,
     })
     assert ci.status_code == 200, ci.text
     entry_id = ci.json()["entry"]["id"]
 
-    co = client.post("/api/timesheet/clock-out", headers=auth, json={
-        "employeeId": employee_id,
+    co = client.post("/api/timesheet/clock-out", headers=emp_auth, json={
         "notes": "test shift",
+        "latitude": 39.1203,
+        "longitude": -88.54335,
     })
     assert co.status_code == 200, co.text
     return entry_id

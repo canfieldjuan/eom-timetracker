@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Migrate flat JSON data (employees.json + timesheets.json) into PostgreSQL.
-Safe to run multiple times — uses INSERT ... ON CONFLICT DO NOTHING / DO UPDATE.
+Safe to run multiple times -- uses INSERT ... ON CONFLICT DO NOTHING / DO UPDATE.
 
 Usage:
     DATABASE_URL=postgresql://... python3 migrate_json_to_pg.py
@@ -40,7 +40,7 @@ def migrate_employees(cur, employees_data: dict) -> dict:
         cur.execute(
             """
             INSERT INTO employees (name, password_hash, active, role, hourly_rate, created_at, last_login_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, COALESCE(%s::timestamptz, NOW()), %s)
             ON CONFLICT (name) DO UPDATE SET
                 password_hash = EXCLUDED.password_hash,
                 active        = EXCLUDED.active,
@@ -55,41 +55,49 @@ def migrate_employees(cur, employees_data: dict) -> dict:
                 emp.get("active", True),
                 emp.get("role", "employee"),
                 emp.get("hourlyRate"),
-                emp.get("created") or "NOW()",
+                emp.get("created"),
                 emp.get("lastLogin"),
             ),
         )
         db_id = cur.fetchone()[0]
         id_map[emp["id"]] = db_id
-        print(f"  employee: {emp['name']} → db id {db_id}")
+        print(f"  employee: {emp['name']} -> db id {db_id}")
     return id_map
 
 
 def migrate_locations(cur, timesheet_data: dict) -> dict:
     """Insert locations. Returns {address: db_id}."""
     addr_map = {}
-    locations = timesheet_data.get("locations", [])
-    coords    = timesheet_data.get("location_coords", {})
-    customers = timesheet_data.get("location_customers", {})
-    rates     = timesheet_data.get("location_rates", {})
-    rate_types= timesheet_data.get("location_rate_types", {})
-    types     = timesheet_data.get("location_types", {})
-    freqs     = timesheet_data.get("location_frequencies", {})
+    locations       = timesheet_data.get("locations", [])
+    coords          = timesheet_data.get("location_coords", {})
+    customers       = timesheet_data.get("location_customers", {})
+    rates           = timesheet_data.get("location_rates", {})
+    rate_types      = timesheet_data.get("location_rate_types", {})
+    types           = timesheet_data.get("location_types", {})
+    freqs           = timesheet_data.get("location_frequencies", {})
+    expected_hours  = timesheet_data.get("location_expected_hours", {})
+    target_labor    = timesheet_data.get("location_target_labor", {})
+    min_margin      = timesheet_data.get("location_min_margin", {})
 
     for addr in locations:
         c = coords.get(addr, {})
         cur.execute(
             """
-            INSERT INTO locations (address, customer_name, location_type, rate, rate_type, frequency, lat, lng)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO locations
+              (address, customer_name, location_type, rate, rate_type, frequency, lat, lng,
+               expected_hours, target_labor_pct, min_margin_pct)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (address) DO UPDATE SET
-                customer_name = EXCLUDED.customer_name,
-                location_type = EXCLUDED.location_type,
-                rate          = EXCLUDED.rate,
-                rate_type     = EXCLUDED.rate_type,
-                frequency     = EXCLUDED.frequency,
-                lat           = EXCLUDED.lat,
-                lng           = EXCLUDED.lng
+                customer_name    = EXCLUDED.customer_name,
+                location_type    = EXCLUDED.location_type,
+                rate             = EXCLUDED.rate,
+                rate_type        = EXCLUDED.rate_type,
+                frequency        = EXCLUDED.frequency,
+                lat              = EXCLUDED.lat,
+                lng              = EXCLUDED.lng,
+                expected_hours   = EXCLUDED.expected_hours,
+                target_labor_pct = COALESCE(EXCLUDED.target_labor_pct, locations.target_labor_pct),
+                min_margin_pct   = COALESCE(EXCLUDED.min_margin_pct, locations.min_margin_pct)
             RETURNING id
             """,
             (
@@ -101,11 +109,14 @@ def migrate_locations(cur, timesheet_data: dict) -> dict:
                 freqs.get(addr),
                 c.get("lat"),
                 c.get("lng"),
+                expected_hours.get(addr),
+                target_labor.get(addr),
+                min_margin.get(addr),
             ),
         )
         db_id = cur.fetchone()[0]
         addr_map[addr] = db_id
-        print(f"  location: {addr[:60]} → db id {db_id}")
+        print(f"  location: {addr[:60]} -> db id {db_id}")
     return addr_map
 
 
@@ -124,23 +135,30 @@ def migrate_shifts(cur, timesheet_data: dict, emp_id_map: dict, addr_map: dict) 
         cur.execute(
             """
             INSERT INTO shifts
-              (employee_id, location_id, clock_in, clock_out, total_hours,
-               notes, local_date, timezone, clock_in_gps, clock_out_gps)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+              (employee_id, location_id, location_label, clock_in, clock_out, total_hours,
+               notes, local_date, timezone,
+               clock_in_gps, clock_in_gps_meta, clock_out_gps, clock_out_gps_meta,
+               time_category, non_productive_type)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT DO NOTHING
             RETURNING id
             """,
             (
                 emp_db_id,
                 loc_db_id,
+                entry.get("location", ""),
                 entry.get("clockIn"),
                 entry.get("clockOut"),
                 entry.get("totalHours"),
                 entry.get("notes", ""),
                 entry.get("date"),
                 entry.get("timezone", "America/Chicago"),
-                json.dumps(entry["clockInGps"])  if entry.get("clockInGps")  else None,
-                json.dumps(entry["clockOutGps"]) if entry.get("clockOutGps") else None,
+                json.dumps(entry["clockInGps"])      if entry.get("clockInGps")      else None,
+                json.dumps(entry["clockInGpsMeta"])  if entry.get("clockInGpsMeta")  else None,
+                json.dumps(entry["clockOutGps"])     if entry.get("clockOutGps")     else None,
+                json.dumps(entry["clockOutGpsMeta"]) if entry.get("clockOutGpsMeta") else None,
+                entry.get("timeCategory", "productive"),
+                entry.get("nonProductiveType"),
             ),
         )
         row = cur.fetchone()
@@ -148,25 +166,28 @@ def migrate_shifts(cur, timesheet_data: dict, emp_id_map: dict, addr_map: dict) 
             print(f"  SKIP shift id={entry.get('id')}: already exists")
             continue
         shift_db_id = row[0]
-        print(f"  shift id={entry.get('id')} → db id {shift_db_id}")
+        print(f"  shift id={entry.get('id')} -> db id {shift_db_id}")
 
         for visit in entry.get("visits", []):
             v_addr = visit.get("location", "")
             v_loc_id = addr_map.get(v_addr)
             cur.execute(
                 """
-                INSERT INTO visits (shift_id, location_id, customer_name, arrival_time, gps)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO visits
+                  (shift_id, location_id, location_label, customer_name, arrival_time, gps, gps_meta)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     shift_db_id,
                     v_loc_id,
+                    v_addr,
                     visit.get("customer") or None,
                     visit.get("arrivalTime"),
-                    json.dumps(visit["gps"]) if visit.get("gps") else None,
+                    json.dumps(visit["gps"])     if visit.get("gps")     else None,
+                    json.dumps(visit["gpsMeta"]) if visit.get("gpsMeta") else None,
                 ),
             )
-            print(f"    visit → {v_addr[:50]}")
+            print(f"    visit -> {v_addr[:50]}")
 
 
 def migrate_settings(cur, timesheet_data: dict) -> None:
@@ -209,23 +230,23 @@ def main():
     cur  = conn.cursor()
 
     try:
-        print("\n— Employees —")
+        print("\n-- Employees --")
         emp_id_map = migrate_employees(cur, employees_data)
 
-        print("\n— Locations —")
+        print("\n-- Locations --")
         addr_map = migrate_locations(cur, timesheet_data)
 
-        print("\n— Shifts & Visits —")
+        print("\n-- Shifts & Visits --")
         migrate_shifts(cur, timesheet_data, emp_id_map, addr_map)
 
-        print("\n— Settings —")
+        print("\n-- Settings --")
         migrate_settings(cur, timesheet_data)
 
         conn.commit()
         print("\nMigration complete.")
     except Exception as e:
         conn.rollback()
-        print(f"\nERROR — rolled back: {e}")
+        print(f"\nERROR -- rolled back: {e}")
         raise
     finally:
         conn.close()

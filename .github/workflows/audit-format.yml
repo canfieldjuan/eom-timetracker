@@ -1,0 +1,60 @@
+name: audit-format
+
+# Enforces the FORM of AUDIT_PROTOCOL.md (citations + the three-way sort) on
+# findings documents. It does NOT judge whether a finding is true — a reviewer
+# does. See AUDIT_PROTOCOL.md and scripts/check_audit_format.mjs.
+#
+# The checker self-scopes: it only enforces a .md file that opts in as a findings
+# document (has a Confirmed/Contradicted/Could-not-determine heading, or is named
+# AUDIT_FINDINGS.md). Every other .md (README, AUDIT_PROTOCOL.md, contract docs) is
+# skipped, so this never false-fails a non-findings doc.
+#   - Always: self-test the checker against the good/bad fixtures.
+#   - On PRs: run the checker over every changed *.md file (self-scoping does the rest).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  audit-format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Self-test — good fixture must pass, bad fixture must fail
+        run: |
+          set -e
+          node scripts/check_audit_format.mjs scripts/fixtures/audit-good.md
+          if node scripts/check_audit_format.mjs scripts/fixtures/audit-bad.md; then
+            echo "::error::audit-format checker did NOT reject the bad fixture — the gate is broken"
+            exit 1
+          fi
+          echo "Self-test passed: good fixture accepted, bad fixture rejected."
+
+      - name: Check changed markdown (checker self-scopes to findings docs)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -e
+          # Exclude scaffolding: fixtures are exercised by the self-test above, and
+          # .github templates intentionally carry placeholder bucket headings.
+          CHANGED=$(git diff --name-only --diff-filter=d "$BASE_SHA"...HEAD -- '*.md' ':(exclude)scripts/fixtures/**' ':(exclude).github/**' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "Scanning changed markdown:"
+            echo "$CHANGED"
+            node scripts/check_audit_format.mjs $CHANGED
+          else
+            echo "No changed markdown files."
+          fi
