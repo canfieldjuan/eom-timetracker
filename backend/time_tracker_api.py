@@ -28,7 +28,7 @@ from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple
 from urllib.parse import quote, urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import bcrypt
@@ -1768,13 +1768,13 @@ def build_public_current_status(
 
 
 def append_access_log(request: Request, action: str, allowed: bool, reason: str = "") -> None:
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = to_utc_iso(utc_now())
     local_date_text = local_date_for_logs()
     client_ip = get_client_ip(request)
     user_agent = request.headers.get("user-agent", "")
 
     entry = {
+        "eventId": str(uuid4()),
         "timestamp": timestamp,
         "action": action,
         "allowed": allowed,
@@ -1785,6 +1785,29 @@ def append_access_log(request: Request, action: str, allowed: bool, reason: str 
         "method": request.method,
     }
 
+    postgres_written = False
+    try:
+        _append_access_log_to_postgres(entry, local_date_text)
+        postgres_written = True
+    except Exception:
+        logger.warning("access_log_postgres_write_failed", exc_info=True)
+
+    try:
+        _append_access_log_to_file(entry, local_date_text)
+    except Exception:
+        logger.warning("access_log_file_write_failed", exc_info=True)
+
+    if not postgres_written:
+        return
+
+    try:
+        _maybe_prune_access_log_entries()
+    except Exception:
+        logger.warning("access_log_postgres_prune_failed", exc_info=True)
+
+
+def _append_access_log_to_file(entry: Dict[str, Any], local_date_text: str) -> None:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOGS_DIR / f"access_{local_date_text}.json"
 
     with ACCESS_LOG_WRITE_LOCK:
@@ -1795,30 +1818,22 @@ def append_access_log(request: Request, action: str, allowed: bool, reason: str 
             payload.append(entry)
             write_json_atomic(log_file, payload)
 
-    try:
-        _append_access_log_to_postgres(entry, local_date_text)
-    except Exception:
-        logger.warning("access_log_postgres_write_failed", exc_info=True)
-        return
-
-    try:
-        _maybe_prune_access_log_entries()
-    except Exception:
-        logger.warning("access_log_postgres_prune_failed", exc_info=True)
-
 
 def _append_access_log_to_postgres(entry: Dict[str, Any], local_date_text: str) -> None:
+    event_id = str(entry.get("eventId") or uuid4())
+    entry = {**entry, "eventId": event_id}
     logged_at = parse_utc_iso(str(entry["timestamp"]))
     log_date = date.fromisoformat(local_date_text)
     db.execute(
         """
         INSERT INTO access_log_entries (
-            logged_at, local_date, action, allowed, reason,
+            event_id, logged_at, local_date, action, allowed, reason,
             client_ip, user_agent, endpoint, method, entry
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
+            event_id,
             logged_at,
             log_date,
             str(entry.get("action", "")),
@@ -4173,6 +4188,7 @@ def _ensure_schema_migrations() -> None:
     db.execute("""
         CREATE TABLE IF NOT EXISTS access_log_entries (
             id          BIGSERIAL PRIMARY KEY,
+            event_id    TEXT NOT NULL,
             logged_at   TIMESTAMPTZ NOT NULL,
             local_date  DATE NOT NULL,
             action      TEXT NOT NULL,
@@ -4185,6 +4201,21 @@ def _ensure_schema_migrations() -> None:
             entry       JSONB NOT NULL,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
+    """)
+    db.execute("""
+        ALTER TABLE access_log_entries
+            ADD COLUMN IF NOT EXISTS event_id TEXT;
+
+        UPDATE access_log_entries
+        SET event_id = COALESCE(NULLIF(entry->>'eventId', ''), 'legacy-' || id::text)
+        WHERE event_id IS NULL OR event_id = '';
+
+        ALTER TABLE access_log_entries
+            ALTER COLUMN event_id SET NOT NULL;
+    """)
+    db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_access_log_entries_event_id
+        ON access_log_entries(event_id)
     """)
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_access_log_entries_local_date
@@ -12317,13 +12348,21 @@ def _dedupe_access_logs(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
     deduped: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for entry in entries:
-        key = json.dumps(entry, sort_keys=True, separators=(",", ":"))
-        if key in seen:
-            continue
-        seen.add(key)
+        event_id = str(entry.get("eventId") or "").strip()
+        if event_id:
+            key = f"event:{event_id}"
+            if key in seen:
+                continue
+            seen.add(key)
         deduped.append(entry)
 
     return sorted(deduped, key=lambda item: str(item.get("timestamp", "")))
+
+
+def _public_access_log_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    public_entry = dict(entry)
+    public_entry.pop("eventId", None)
+    return public_entry
 
 
 def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:
@@ -12343,12 +12382,15 @@ def read_access_logs_for_date(date_text: str) -> List[Dict[str, Any]]:
 
     file_logs = _read_access_logs_file_for_date(date_text)
     if postgres_logs is None:
-        return file_logs
+        return [_public_access_log_entry(entry) for entry in file_logs]
     if not postgres_logs:
-        return file_logs
+        return [_public_access_log_entry(entry) for entry in file_logs]
     if not file_logs:
-        return postgres_logs
-    return _dedupe_access_logs([*file_logs, *postgres_logs])
+        return [_public_access_log_entry(entry) for entry in postgres_logs]
+    return [
+        _public_access_log_entry(entry)
+        for entry in _dedupe_access_logs([*file_logs, *postgres_logs])
+    ]
 
 
 @app.get("/api/admin/logs/{date_text}")

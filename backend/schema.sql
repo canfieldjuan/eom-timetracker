@@ -86,6 +86,7 @@ CREATE TABLE eom_office_conversion_handoffs (
 -- writing the legacy JSON files and reads both sources for the admin log view.
 CREATE TABLE access_log_entries (
     id          BIGSERIAL PRIMARY KEY,
+    event_id    TEXT NOT NULL,
     logged_at   TIMESTAMPTZ NOT NULL,
     local_date  DATE NOT NULL,
     action      TEXT NOT NULL,
@@ -862,6 +863,8 @@ CREATE INDEX idx_locations_customer_id ON locations(customer_id);
 CREATE UNIQUE INDEX uq_locations_address_key
     ON locations(address_key) WHERE address_key IS NOT NULL;
 CREATE INDEX idx_employees_active    ON employees(active);
+CREATE UNIQUE INDEX uq_access_log_entries_event_id
+    ON access_log_entries(event_id);
 CREATE INDEX idx_access_log_entries_local_date
     ON access_log_entries(local_date, logged_at, id);
 CREATE INDEX idx_site_check_in_schedules_lookup
