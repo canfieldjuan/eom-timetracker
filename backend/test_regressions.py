@@ -1025,3 +1025,181 @@ class TestAccessLogDurability:
             """
         )
         assert row == {"index_name": "idx_access_log_entries_logged_at"}
+
+
+# ===============================================================================
+# admin_adjust_entry -- clearing a clock-out must not strand a second open shift
+# ===============================================================================
+
+class TestAdminClearClockOutGuard:
+    def _create_employee(self, name: str) -> int:
+        import db
+
+        return int(
+            db.execute_returning(
+                """
+                INSERT INTO employees (name, password_hash, role)
+                VALUES (%s, 'not-used', 'employee')
+                RETURNING id
+                """,
+                (name,),
+            )
+        )
+
+    def _create_shift(self, employee_id: int, clock_in: datetime, clock_out: datetime | None) -> int:
+        import db
+
+        hours = 0.0
+        if clock_out is not None:
+            hours = round((clock_out - clock_in).total_seconds() / 3600, 2)
+        return int(
+            db.execute_returning(
+                """
+                INSERT INTO shifts (
+                    employee_id, clock_in, clock_out, total_hours,
+                    local_date, timezone, notes
+                )
+                VALUES (%s, %s, %s, %s, %s, 'America/Chicago', 'clear-guard-test')
+                RETURNING id
+                """,
+                (
+                    employee_id,
+                    clock_in,
+                    clock_out,
+                    hours,
+                    clock_in.astimezone(ZoneInfo("America/Chicago")).date(),
+                ),
+            )
+        )
+
+    def _cleanup(self, employee_id: int) -> None:
+        import db
+
+        db.execute("DELETE FROM shifts WHERE employee_id = %s", (employee_id,))
+        db.execute("DELETE FROM employees WHERE id = %s", (employee_id,))
+
+    def test_admin_clear_clock_out_rejected_when_employee_has_other_open_shift(
+        self, client, auth
+    ):
+        employee_id = self._create_employee("Clear Guard Two Shifts Employee")
+        now = datetime.now(timezone.utc)
+        try:
+            closed_id = self._create_shift(
+                employee_id, now - timedelta(hours=6), now - timedelta(hours=2)
+            )
+            open_id = self._create_shift(employee_id, now - timedelta(hours=1), None)
+
+            response = client.patch(
+                f"/api/admin/entries/{closed_id}",
+                headers=auth,
+                json={"clockOut": ""},
+            )
+
+            assert response.status_code == 400, response.text
+            assert response.json()["error"] == (
+                f"Employee already has open shift {open_id}; "
+                "close it before reopening this entry"
+            )
+            import db
+
+            row = db.query_one(
+                "SELECT clock_out FROM shifts WHERE id = %s", (closed_id,)
+            )
+            assert row["clock_out"] is not None
+        finally:
+            self._cleanup(employee_id)
+
+    def test_admin_clear_clock_out_allowed_when_other_open_shift_is_payroll_resolved(
+        self, client, auth
+    ):
+        import db
+
+        employee_id = self._create_employee("Clear Guard Resolved Shift Employee")
+        now = datetime.now(timezone.utc)
+        try:
+            closed_id = self._create_shift(
+                employee_id, now - timedelta(hours=8), now - timedelta(hours=6)
+            )
+            resolved_open_id = self._create_shift(
+                employee_id, now - timedelta(hours=4), None
+            )
+            week_start = (
+                now.astimezone(ZoneInfo("America/Chicago")).date()
+                - timedelta(
+                    days=(
+                        now.astimezone(ZoneInfo("America/Chicago")).date().weekday() + 1
+                    )
+                    % 7
+                )
+            )
+            db.execute(
+                """
+                INSERT INTO payroll_shift_corrections (
+                    week_start, correction_date, employee_id, shift_id,
+                    source_clock_in, source_clock_out, source_total_minutes,
+                    corrected_clock_in, corrected_clock_out,
+                    corrected_break_minutes, corrected_total_minutes,
+                    reason, status, created_by_name
+                )
+                VALUES (%s, %s, %s, %s, %s, NULL, 0, %s, %s, 0, 120,
+                        'Resolved raw open shift for clear-guard test',
+                        'active', 'pytest')
+                """,
+                (
+                    week_start,
+                    (now - timedelta(hours=4))
+                    .astimezone(ZoneInfo("America/Chicago"))
+                    .date(),
+                    employee_id,
+                    resolved_open_id,
+                    now - timedelta(hours=4),
+                    now - timedelta(hours=4),
+                    now - timedelta(hours=2),
+                ),
+            )
+
+            response = client.patch(
+                f"/api/admin/entries/{closed_id}",
+                headers=auth,
+                json={"clockOut": ""},
+            )
+
+            assert response.status_code == 200, response.text
+            row = db.query_one(
+                "SELECT clock_out FROM shifts WHERE id = %s", (closed_id,)
+            )
+            assert row["clock_out"] is None
+        finally:
+            db.execute(
+                "DELETE FROM payroll_shift_corrections WHERE employee_id = %s",
+                (employee_id,),
+            )
+            self._cleanup(employee_id)
+
+    def test_admin_clear_clock_out_allowed_when_no_other_open_shift(
+        self, client, auth
+    ):
+        employee_id = self._create_employee("Clear Guard Single Shift Employee")
+        now = datetime.now(timezone.utc)
+        try:
+            closed_id = self._create_shift(
+                employee_id, now - timedelta(hours=3), now - timedelta(hours=1)
+            )
+
+            response = client.patch(
+                f"/api/admin/entries/{closed_id}",
+                headers=auth,
+                json={"clockOut": ""},
+            )
+
+            assert response.status_code == 200, response.text
+            import db
+
+            row = db.query_one(
+                "SELECT clock_out, total_hours FROM shifts WHERE id = %s",
+                (closed_id,),
+            )
+            assert row["clock_out"] is None
+            assert float(row["total_hours"]) == 0.0
+        finally:
+            self._cleanup(employee_id)
