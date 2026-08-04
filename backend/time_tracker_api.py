@@ -2581,6 +2581,21 @@ class TimeDataCorrectionApplyRequest(TimeDataCorrectionPlanRequest):
     confirmation: str = Field(min_length=1, max_length=100)
 
 
+class AtlasLinkageMappingEntry(BaseModel):
+    customerId: int = Field(gt=0)
+    atlasContactId: UUID
+
+
+class AtlasLinkageBackfillPlanRequest(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+    mappings: List[AtlasLinkageMappingEntry] = Field(min_length=1, max_length=200)
+
+
+class AtlasLinkageBackfillApplyRequest(AtlasLinkageBackfillPlanRequest):
+    planToken: str = Field(min_length=64, max_length=64)
+    confirmation: str = Field(min_length=1, max_length=100)
+
+
 class PayrollWeekRequest(BaseModel):
     weekStart: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
 
@@ -4185,6 +4200,28 @@ def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
     _ensure_employee_role_schema()
+    # atlas_contact_id shipped inside CREATE TABLE IF NOT EXISTS customers and
+    # was never applied via ALTER, so a customers table created before that
+    # revision would lack the column. Additive and idempotent.
+    db.execute(
+        "ALTER TABLE customers ADD COLUMN IF NOT EXISTS atlas_contact_id UUID"
+    )
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS atlas_linkage_backfill_batches (
+            id                     BIGSERIAL PRIMARY KEY,
+            plan_token             TEXT NOT NULL UNIQUE,
+            applied_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            applied_by_name        TEXT NOT NULL,
+            reason                 TEXT NOT NULL,
+            snapshot               JSONB NOT NULL,
+            result                 JSONB NOT NULL,
+            created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_atlas_linkage_backfill_batches_created
+            ON atlas_linkage_backfill_batches(created_at)
+    """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS access_log_entries (
             id          BIGSERIAL PRIMARY KEY,
@@ -12312,6 +12349,404 @@ def admin_apply_time_data_correction(
         "TIME_DATA_CORRECTION_APPLIED",
         True,
         f"batch={batch_id} deleted={len(result['deletedShiftIds'])} closed={len(result['closedShiftIds'])}",
+    )
+    return {
+        "success": True,
+        "batchId": batch_id,
+        "archiveStored": True,
+        **result,
+    }
+
+
+def build_atlas_linkage_audit() -> Dict[str, Any]:
+    """Report Customer <-> Atlas contact linkage integrity without writes."""
+    duplicate_rows = db.query_all(
+        """
+        SELECT
+            atlas_contact_id,
+            ARRAY_AGG(id ORDER BY id) AS customer_ids,
+            ARRAY_AGG(name ORDER BY id) AS customer_names,
+            ARRAY_AGG(active ORDER BY id) AS active_flags,
+            COUNT(*) AS copies
+        FROM customers
+        WHERE atlas_contact_id IS NOT NULL
+        GROUP BY atlas_contact_id
+        HAVING COUNT(*) > 1
+        ORDER BY COUNT(*) DESC, atlas_contact_id::text
+        """
+    )
+    unlinked_rows = db.query_all(
+        """
+        SELECT id, name, primary_contact_name, primary_phone, primary_email,
+               active, created_at
+        FROM customers
+        WHERE atlas_contact_id IS NULL
+        ORDER BY active DESC, name, id
+        """
+    )
+    orphan_rows = db.query_all(
+        """
+        SELECT
+            h.atlas_contact_id,
+            h.customer_id,
+            h.state,
+            c.atlas_contact_id AS customer_atlas_contact_id,
+            c.name AS customer_name
+        FROM eom_office_conversion_handoffs h
+        LEFT JOIN customers c ON c.id = h.customer_id
+        WHERE c.id IS NULL
+           OR c.atlas_contact_id IS NULL
+           OR c.atlas_contact_id <> h.atlas_contact_id
+        ORDER BY h.customer_id
+        """
+    )
+    linked_row = db.query_one(
+        "SELECT COUNT(*) AS n FROM customers WHERE atlas_contact_id IS NOT NULL"
+    )
+
+    duplicate_groups = [
+        {
+            "atlasContactId": str(row["atlas_contact_id"]),
+            "customerIds": [int(value) for value in row.get("customer_ids") or []],
+            "customerNames": list(row.get("customer_names") or []),
+            "activeFlags": [bool(value) for value in row.get("active_flags") or []],
+            "copies": int(row["copies"]),
+        }
+        for row in duplicate_rows
+    ]
+    unlinked_customers = [
+        {
+            "customerId": int(row["id"]),
+            "customerName": row["name"],
+            "primaryContactName": row.get("primary_contact_name"),
+            "primaryPhone": row.get("primary_phone"),
+            "primaryEmail": row.get("primary_email"),
+            "active": bool(row["active"]),
+            "createdAt": to_utc_iso(row["created_at"]) if row.get("created_at") else None,
+        }
+        for row in unlinked_rows
+    ]
+    handoff_orphans = [
+        {
+            "atlasContactId": str(row["atlas_contact_id"]),
+            "customerId": int(row["customer_id"]),
+            "handoffState": row["state"],
+            "customerName": row.get("customer_name"),
+            "customerAtlasContactId": (
+                str(row["customer_atlas_contact_id"])
+                if row.get("customer_atlas_contact_id")
+                else None
+            ),
+        }
+        for row in orphan_rows
+    ]
+    mapping_template = [
+        {
+            "customerId": row["customerId"],
+            "customerName": row["customerName"],
+            "atlasContactId": None,
+        }
+        for row in unlinked_customers
+        if row["active"]
+    ]
+    fingerprint_material = json.dumps(
+        {
+            "duplicateGroups": duplicate_groups,
+            "unlinkedCustomers": unlinked_customers,
+            "handoffOrphans": handoff_orphans,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "success": True,
+        "databaseReadOnly": True,
+        "generatedAt": to_utc_iso(utc_now()),
+        "inventoryFingerprint": hashlib.sha256(
+            fingerprint_material.encode("utf-8")
+        ).hexdigest(),
+        "summary": {
+            "duplicateGroups": len(duplicate_groups),
+            "duplicateExtraCustomers": sum(
+                group["copies"] - 1 for group in duplicate_groups
+            ),
+            "unlinkedCustomers": len(unlinked_customers),
+            "unlinkedActiveCustomers": len(mapping_template),
+            "linkedCustomers": int(linked_row["n"]) if linked_row else 0,
+            "handoffOrphans": len(handoff_orphans),
+        },
+        "duplicateGroups": duplicate_groups,
+        "unlinkedCustomers": unlinked_customers,
+        "handoffOrphans": handoff_orphans,
+        "mappingTemplate": mapping_template,
+    }
+
+
+def _build_atlas_linkage_backfill_plan(
+    payload: AtlasLinkageBackfillPlanRequest,
+    cursor: Any = None,
+    lock_rows: bool = False,
+) -> Dict[str, Any]:
+    reason = payload.reason.strip()
+    if len(reason) < 10:
+        raise HTTPException(
+            status_code=400,
+            detail="Backfill reason must be at least 10 characters",
+        )
+
+    customer_ids = [int(entry.customerId) for entry in payload.mappings]
+    if len(customer_ids) != len(set(customer_ids)):
+        raise HTTPException(
+            status_code=400,
+            detail="Each customer may appear only once in the mapping",
+        )
+    contact_ids = [str(entry.atlasContactId) for entry in payload.mappings]
+    if len(contact_ids) != len(set(contact_ids)):
+        raise HTTPException(
+            status_code=400,
+            detail="Each Atlas contact may appear only once in the mapping",
+        )
+    mapping_by_contact = {
+        str(entry.atlasContactId): int(entry.customerId)
+        for entry in payload.mappings
+    }
+
+    def _rows(sql: str, params: tuple) -> List[Dict[str, Any]]:
+        if cursor is not None:
+            cursor.execute(sql, params)
+            return [dict(row) for row in cursor.fetchall()]
+        return db.query_all(sql, params)
+
+    lock_clause = " FOR UPDATE" if lock_rows else ""
+    customer_rows = _rows(
+        "SELECT id, name, active, atlas_contact_id FROM customers "
+        "WHERE id = ANY(%s) ORDER BY id" + lock_clause,
+        (sorted(customer_ids),),
+    )
+    by_id = {int(row["id"]): row for row in customer_rows}
+    missing = sorted(set(customer_ids) - set(by_id))
+    if missing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Customer(s) {missing} no longer exist; reload the linkage audit",
+        )
+    for customer_id in customer_ids:
+        row = by_id[customer_id]
+        if row["atlas_contact_id"] is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Customer {customer_id} already carries an Atlas contact "
+                    "link; reload the linkage audit"
+                ),
+            )
+        if not row["active"]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Customer {customer_id} is archived; only active "
+                    "Customers can be backfilled"
+                ),
+            )
+
+    conflict_rows = _rows(
+        "SELECT id, atlas_contact_id FROM customers "
+        "WHERE atlas_contact_id = ANY(%s::uuid[])",
+        (contact_ids,),
+    )
+    if conflict_rows:
+        held = sorted(
+            {
+                f"{row['atlas_contact_id']} (customer {int(row['id'])})"
+                for row in conflict_rows
+            }
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Atlas contact(s) already linked to existing Customers: "
+                + "; ".join(held)
+            ),
+        )
+
+    handoff_rows = _rows(
+        "SELECT atlas_contact_id, customer_id FROM eom_office_conversion_handoffs "
+        "WHERE atlas_contact_id = ANY(%s::uuid[])",
+        (contact_ids,),
+    )
+    reserved = sorted(
+        str(row["atlas_contact_id"])
+        for row in handoff_rows
+        if mapping_by_contact.get(str(row["atlas_contact_id"]))
+        != int(row["customer_id"])
+    )
+    if reserved:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Atlas contact(s) already reserved by an office conversion "
+                "for a different Customer: " + ", ".join(reserved)
+            ),
+        )
+
+    normalized = sorted(
+        (
+            {
+                "customerId": int(entry.customerId),
+                "customerName": by_id[int(entry.customerId)]["name"],
+                "atlasContactId": str(entry.atlasContactId),
+            }
+            for entry in payload.mappings
+        ),
+        key=lambda row: row["customerId"],
+    )
+    snapshot = {
+        "reason": reason,
+        "mappings": normalized,
+        "customersBefore": [
+            {
+                "id": int(row["id"]),
+                "name": row["name"],
+                "active": bool(row["active"]),
+                "atlasContactId": None,
+            }
+            for row in sorted(customer_rows, key=lambda row: int(row["id"]))
+        ],
+    }
+    token_material = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    plan_token = hmac.new(
+        JWT_SECRET.encode("utf-8"),
+        token_material.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    count = len(normalized)
+    label = "CUSTOMER" if count == 1 else "CUSTOMERS"
+    return {
+        "success": True,
+        "databaseReadOnly": True,
+        "planToken": plan_token,
+        "confirmationPhrase": f"LINK {count} {label} TO ATLAS CONTACTS",
+        "summary": {"customersToLink": count},
+        "mappings": normalized,
+        "_archiveSnapshot": snapshot,
+    }
+
+
+@app.get("/api/admin/audits/atlas-linkage")
+def admin_atlas_linkage_audit(
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    result = build_atlas_linkage_audit()
+    append_access_log(
+        request,
+        "ATLAS_LINKAGE_AUDIT",
+        True,
+        "duplicates={duplicateGroups} unlinked={unlinkedCustomers} "
+        "orphans={handoffOrphans}".format(**result["summary"]),
+    )
+    return result
+
+
+@app.post("/api/admin/corrections/atlas-linkage/preview")
+def admin_atlas_linkage_backfill_preview(
+    payload: AtlasLinkageBackfillPlanRequest,
+    request: Request,
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    result = _build_atlas_linkage_backfill_plan(payload)
+    result.pop("_archiveSnapshot", None)
+    append_access_log(
+        request,
+        "ATLAS_LINKAGE_BACKFILL_PLAN",
+        True,
+        "link={customersToLink}".format(**result["summary"]),
+    )
+    return result
+
+
+@app.post("/api/admin/corrections/atlas-linkage/apply")
+def admin_apply_atlas_linkage_backfill(
+    payload: AtlasLinkageBackfillApplyRequest,
+    request: Request,
+    current_admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            plan = _build_atlas_linkage_backfill_plan(
+                payload, cursor=cur, lock_rows=True
+            )
+            if not hmac.compare_digest(payload.planToken, plan["planToken"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Backfill plan is stale or does not match; preview it again",
+                )
+            if payload.confirmation != plan["confirmationPhrase"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Type the exact confirmation phrase: "
+                        f"{plan['confirmationPhrase']}"
+                    ),
+                )
+
+            cur.execute(
+                """
+                INSERT INTO atlas_linkage_backfill_batches (
+                    plan_token,
+                    applied_by_employee_id,
+                    applied_by_name,
+                    reason,
+                    snapshot,
+                    result
+                )
+                VALUES (%s, %s, %s, %s, %s::jsonb, '{}'::jsonb)
+                RETURNING id
+                """,
+                (
+                    plan["planToken"],
+                    int(current_admin["id"]),
+                    current_admin["name"],
+                    payload.reason.strip(),
+                    json.dumps(plan["_archiveSnapshot"], sort_keys=True),
+                ),
+            )
+            batch_id = int(cur.fetchone()["id"])
+
+            linked_ids = []
+            for row in plan["mappings"]:
+                cur.execute(
+                    """
+                    UPDATE customers
+                    SET atlas_contact_id = %s, updated_at = NOW()
+                    WHERE id = %s AND atlas_contact_id IS NULL
+                    RETURNING id
+                    """,
+                    (row["atlasContactId"], row["customerId"]),
+                )
+                updated = cur.fetchone()
+                if not updated:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Customer {row['customerId']} changed before the "
+                            "backfill could be applied"
+                        ),
+                    )
+                linked_ids.append(int(updated["id"]))
+
+            result = {"linkedCustomerIds": sorted(linked_ids)}
+            cur.execute(
+                "UPDATE atlas_linkage_backfill_batches SET result = %s::jsonb WHERE id = %s",
+                (json.dumps(result, sort_keys=True), batch_id),
+            )
+
+    append_access_log(
+        request,
+        "ATLAS_LINKAGE_BACKFILL_APPLIED",
+        True,
+        f"batch={batch_id} linked={len(linked_ids)}",
     )
     return {
         "success": True,

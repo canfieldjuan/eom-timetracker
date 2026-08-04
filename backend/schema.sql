@@ -679,6 +679,19 @@ CREATE TABLE time_data_correction_batches (
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Recoverable before-images for explicitly confirmed Atlas-contact linkage
+-- backfills (customers.atlas_contact_id filled from an operator mapping).
+CREATE TABLE atlas_linkage_backfill_batches (
+    id                     BIGSERIAL PRIMARY KEY,
+    plan_token             TEXT NOT NULL UNIQUE,
+    applied_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    applied_by_name        TEXT NOT NULL,
+    reason                 TEXT NOT NULL,
+    snapshot               JSONB NOT NULL,
+    result                 JSONB NOT NULL,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Durable weekly payroll verification snapshots and audit trail. A payroll
 -- batch stores the source fingerprint Mayra verified; events preserve who moved
 -- the week through verify/reopen/finalize.
@@ -888,6 +901,8 @@ CREATE INDEX idx_site_check_in_reconciliation_reviews_lookup
     );
 CREATE INDEX idx_time_data_correction_batches_created
     ON time_data_correction_batches(created_at);
+CREATE INDEX idx_atlas_linkage_backfill_batches_created
+    ON atlas_linkage_backfill_batches(created_at);
 CREATE INDEX idx_payroll_verification_batches_status_week
     ON payroll_verification_batches(status, week_start);
 CREATE INDEX idx_payroll_verification_events_week
