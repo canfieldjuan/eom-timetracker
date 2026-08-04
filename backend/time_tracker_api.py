@@ -13423,6 +13423,52 @@ def _effective_payroll_shift_row(
     return effective
 
 
+def _payroll_overlapping_shift_ids(
+    shift_rows: List[Dict[str, Any]],
+    shift_corrections_by_shift_id: Dict[int, Dict[str, Any]],
+) -> set[int]:
+    """Ids of shifts whose effective closed interval overlaps another shift
+    of the same employee.
+
+    Overlap is strict (back-to-back end == next start is legal). Open and
+    non-positive-duration shifts are excluded -- they already carry their own
+    issue codes. Intervals are the post-correction ones and are re-sorted,
+    because a correction can reorder shifts relative to the raw fetch order.
+    Both members of an overlapping pair are flagged.
+    """
+    intervals_by_employee: Dict[int, List[Tuple[datetime, datetime, int]]] = {}
+    for raw_shift_row in shift_rows:
+        shift_row = _effective_payroll_shift_row(
+            raw_shift_row,
+            shift_corrections_by_shift_id.get(int(raw_shift_row["id"])),
+        )
+        clock_out = shift_row.get("clock_out")
+        if clock_out is None:
+            continue
+        clock_in = shift_row["clock_in"].astimezone(timezone.utc)
+        clock_out = clock_out.astimezone(timezone.utc)
+        if clock_out <= clock_in:
+            continue
+        intervals_by_employee.setdefault(int(shift_row["employee_id"]), []).append(
+            (clock_in, clock_out, int(shift_row["id"]))
+        )
+
+    flagged: set[int] = set()
+    for intervals in intervals_by_employee.values():
+        intervals.sort(key=lambda item: (item[0], item[2]))
+        running_end: Optional[datetime] = None
+        running_id: Optional[int] = None
+        for clock_in, clock_out, shift_id in intervals:
+            if running_end is not None and clock_in < running_end:
+                flagged.add(shift_id)
+                if running_id is not None:
+                    flagged.add(running_id)
+            if running_end is None or clock_out > running_end:
+                running_end = clock_out
+                running_id = shift_id
+    return flagged
+
+
 def _compute_payroll_weekly_hours(
     week_start_text: Optional[str],
     *,
@@ -13481,6 +13527,9 @@ def _compute_payroll_weekly_hours(
         )
     shift_corrections_by_shift_id = _payroll_shift_corrections_by_shift_id(
         shift_correction_rows
+    )
+    overlapping_shift_ids = _payroll_overlapping_shift_ids(
+        shift_rows, shift_corrections_by_shift_id
     )
 
     employee_lookup = {int(row["id"]): row for row in employee_rows}
@@ -13547,6 +13596,17 @@ def _compute_payroll_weekly_hours(
                 issue_at_utc,
             )
             continue
+
+        if int(shift_row["id"]) in overlapping_shift_ids:
+            # Flag without zeroing the minutes: blocking already prevents
+            # verify/finalize, and admins need the real magnitudes to fix it.
+            _add_payroll_issue(
+                employee_result,
+                "overlapping_shift",
+                shift_row,
+                "Shift overlaps another shift for this employee.",
+                issue_at_utc,
+            )
 
         overlap_start = max(clock_in, week_start_utc)
         overlap_end = min(clock_out, week_end_utc)
@@ -13996,6 +14056,9 @@ def _compute_payroll_timesheet(
     shift_corrections_by_shift_id = _payroll_shift_corrections_by_shift_id(
         shift_correction_rows
     )
+    overlapping_shift_ids = _payroll_overlapping_shift_ids(
+        shift_rows, shift_corrections_by_shift_id
+    )
     allocation_rows = _payroll_correction_allocation_rows(week_start, cursor=cursor)
     allocations_by_correction_id = _payroll_correction_allocations_by_correction_id(
         allocation_rows
@@ -14124,6 +14187,11 @@ def _compute_payroll_timesheet(
                     overlap_end,
                     break_minutes=int(shift_row.get("payroll_break_minutes") or 0),
                 )
+
+        # Same code the weekly producer emits, so the two views agree.
+        # The flagged set only ever contains closed valid-duration shifts.
+        if int(shift_row["id"]) in overlapping_shift_ids:
+            issue_codes.append("overlapping_shift")
 
         segment_count = len(segments)
         for index, segment in enumerate(segments, start=1):

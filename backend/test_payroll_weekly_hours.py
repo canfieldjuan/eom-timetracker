@@ -2727,7 +2727,7 @@ def test_void_payroll_correction_restores_shift_total_and_employee_role_is_denie
     auth,
     emp_auth,
 ):
-    week_start = date(2026, 9, 6)
+    week_start = date(2026, 6, 7)
     correction_date = week_start
     employee_id = _create_employee("Payroll Correction Void Worker")
     _delete_payroll_verification_weeks([week_start])
@@ -4904,5 +4904,206 @@ def test_employee_role_migration_allows_payroll_on_existing_constraints():
         assert row is not None
         assert row["role"] == "payroll"
     finally:
+        if employee_id is not None:
+            _delete_employees([employee_id])
+
+
+def test_overlapping_shifts_emit_issue_and_block_verify_and_finalize(client, auth):
+    week_start = date(2026, 6, 7)
+    service_day = week_start + timedelta(days=1)
+    employee_id = None
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        employee_id = _create_employee("Overlap Blocking Worker")
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 16),
+        )
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 10),
+            _local_dt(service_day, 12),
+        )
+
+        weekly = _weekly_hours(client, auth, week_start)
+        row = next(
+            employee
+            for employee in weekly["employees"]
+            if employee["employeeId"] == employee_id
+        )
+        assert "overlapping_shift" in row["issueCodes"]
+        # Flag, don't zero: both shifts keep their real magnitudes so the
+        # admin can see what to fix.
+        assert row["totalMinutes"] == 600
+        assert weekly["summary"]["hasBlockingIssues"] is True
+
+        verify = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": weekly["sourceFingerprint"],
+            },
+        )
+        assert verify.status_code == 409, verify.text
+        assert verify.json()["error"] == (
+            "Resolve payroll hour issues before verifying this week"
+        )
+
+        finalize = client.post(
+            "/api/admin/payroll/weekly-hours/finalize",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": weekly["sourceFingerprint"],
+            },
+        )
+        assert finalize.status_code == 409, finalize.text
+        assert finalize.json()["error"] == (
+            "Resolve payroll hour issues before finalizing this week"
+        )
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        if employee_id is not None:
+            _delete_employees([employee_id])
+
+
+def test_adjacent_back_to_back_shifts_do_not_flag_overlap(client, auth):
+    week_start = date(2026, 6, 7)
+    service_day = week_start + timedelta(days=2)
+    employee_id = None
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        employee_id = _create_employee("Back To Back Worker")
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 12),
+        )
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 12),
+            _local_dt(service_day, 16),
+        )
+
+        weekly = _weekly_hours(client, auth, week_start)
+        row = next(
+            employee
+            for employee in weekly["employees"]
+            if employee["employeeId"] == employee_id
+        )
+        assert "overlapping_shift" not in row["issueCodes"]
+        assert row["issueCodes"] == []
+        assert row["totalMinutes"] == 480
+        assert weekly["summary"]["hasBlockingIssues"] is False
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        if employee_id is not None:
+            _delete_employees([employee_id])
+
+
+def test_shift_correction_that_removes_overlap_clears_issue(client):
+    week_start = date(2026, 6, 7)
+    service_day = week_start + timedelta(days=3)
+    employee_id = None
+    payroll_id = None
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        payroll_id = _create_employee("Overlap Correction Mayra", role="payroll")
+        employee_id = _create_employee("Overlap Correction Worker")
+        payroll_auth = _login(client, "Overlap Correction Mayra")
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 12),
+        )
+        overlapping_shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 11),
+            _local_dt(service_day, 15),
+        )
+
+        before = _weekly_hours(client, payroll_auth, week_start)
+        before_row = next(
+            employee
+            for employee in before["employees"]
+            if employee["employeeId"] == employee_id
+        )
+        assert "overlapping_shift" in before_row["issueCodes"]
+
+        corrected = client.post(
+            "/api/admin/payroll/timesheet/shift-corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "shiftId": overlapping_shift_id,
+                "date": service_day.isoformat(),
+                "correctedClockIn": _local_dt(service_day, 12).isoformat(),
+                "correctedClockOut": _local_dt(service_day, 16).isoformat(),
+                "correctedBreakMinutes": 0,
+                "reason": "Second shift actually started at noon; no overlap.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+
+        after = _weekly_hours(client, payroll_auth, week_start)
+        after_row = next(
+            employee
+            for employee in after["employees"]
+            if employee["employeeId"] == employee_id
+        )
+        # The effective (corrected) intervals no longer overlap, so the
+        # issue clears without touching the raw rows.
+        assert "overlapping_shift" not in after_row["issueCodes"]
+        assert after["summary"]["hasBlockingIssues"] is False
+        assert after_row["totalMinutes"] == 480
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees(
+            [value for value in (employee_id, payroll_id) if value is not None]
+        )
+
+
+def test_payroll_timesheet_view_reports_overlapping_shift(client, auth):
+    week_start = date(2026, 6, 7)
+    service_day = week_start + timedelta(days=4)
+    employee_id = None
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        employee_id = _create_employee("Overlap Timesheet Worker")
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 16),
+        )
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 10),
+            _local_dt(service_day, 12),
+        )
+
+        timesheet = _payroll_timesheet(
+            client, auth, week_start, employee_id=employee_id
+        )
+        employee = next(
+            row
+            for row in timesheet["employees"]
+            if row["employeeId"] == employee_id
+        )
+        day_shifts = [
+            shift
+            for day in employee["days"]
+            for shift in day.get("shifts", [])
+        ]
+        assert day_shifts, "expected serialized shifts for the service day"
+        # Both producers must agree on the code.
+        assert all(
+            "overlapping_shift" in shift["issueCodes"] for shift in day_shifts
+        )
+        assert all(shift["status"] == "needs_review" for shift in day_shifts)
+    finally:
+        _delete_payroll_verification_weeks([week_start])
         if employee_id is not None:
             _delete_employees([employee_id])
