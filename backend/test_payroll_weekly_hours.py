@@ -2019,7 +2019,14 @@ def test_payroll_shift_correction_excludes_resolved_open_shift_from_status_views
 
         my_hours = client.get("/api/timesheet/my-hours", headers=employee_auth)
         assert my_hours.status_code == 200, my_hours.text
-        assert my_hours.json()["weeklyHours"] == 0.0
+        # The resolved open shift stays out of live status views and
+        # recentShifts, but weeklyHours now reports the payroll-effective
+        # (corrected) 3 paid hours instead of hiding them from the employee.
+        assert my_hours.json()["weeklyHours"] == 3.0
+        assert my_hours.json()["weeklyHoursBasis"] == {
+            "paidHours": 3.0,
+            "liveOpenHours": 0.0,
+        }
         assert my_hours.json()["recentShifts"] == []
 
         admin_hours = client.get(
@@ -2063,7 +2070,13 @@ def test_payroll_shift_correction_excludes_resolved_open_shift_from_status_views
 
         current_my_hours = client.get("/api/timesheet/my-hours", headers=employee_auth)
         assert current_my_hours.status_code == 200, current_my_hours.text
-        assert current_my_hours.json()["weeklyHours"] == 0.5
+        # 3.0 corrected paid hours from the resolved shift plus the 0.5 hours
+        # elapsed on the new open shift.
+        assert current_my_hours.json()["weeklyHours"] == 3.5
+        assert current_my_hours.json()["weeklyHoursBasis"] == {
+            "paidHours": 3.0,
+            "liveOpenHours": 0.5,
+        }
         assert current_my_hours.json()["recentShifts"] == [
             {
                 "date": service_day.isoformat(),
