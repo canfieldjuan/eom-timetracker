@@ -73,6 +73,7 @@ def _apply_schema(conn):
                 payroll_hour_corrections,
                 payroll_verification_events, payroll_verification_batches,
                 time_data_correction_batches,
+                atlas_linkage_backfill_batches,
                 site_qr_action_receipts,
                 site_check_in_reconciliation_reviews, site_check_ins,
                 arrival_policy_revisions,
