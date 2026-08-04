@@ -5795,6 +5795,7 @@ def test_expected_hours_baseline_acceptance_promotes_suggestion_to_planned_hours
     assert manual_site["expectedHoursSource"] == "manual"
     assert manual_site["expectedHoursLearningDecision"] is None
     assert manual_site["expectedHoursLearningFingerprint"] is None
+    assert manual_site["expectedHoursLearningSnapshot"] is None
     manual_row = db.query_one(
         """
         SELECT expected_hours_learning_snapshot

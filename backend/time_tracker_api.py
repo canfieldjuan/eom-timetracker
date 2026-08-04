@@ -9721,8 +9721,9 @@ SITE_SELECT_COLUMNS = """
     l.id, l.customer_id, l.address, l.address_key, l.customer_name,
     l.location_type, l.rate, l.rate_type, l.frequency, l.expected_hours,
     l.expected_hours_source, l.expected_hours_learning_decision,
-    l.expected_hours_learning_fingerprint, l.expected_hours_learning_decided_at,
-    l.expected_hours_learning_decided_by, l.expected_hours_learning_decision_reason,
+    l.expected_hours_learning_fingerprint, l.expected_hours_learning_snapshot,
+    l.expected_hours_learning_decided_at, l.expected_hours_learning_decided_by,
+    l.expected_hours_learning_decision_reason,
     l.target_labor_pct, l.min_margin_pct, l.lat, l.lng, l.service_scope,
     l.access_instructions, l.service_preferences, l.pet_notes,
     l.service_start_date, l.check_in_token_nonce, l.active, l.created_at,
@@ -9836,6 +9837,7 @@ def _serialize_site(row: Dict[str, Any]) -> Dict[str, Any]:
         "expectedHoursLearningFingerprint": row.get(
             "expected_hours_learning_fingerprint"
         ),
+        "expectedHoursLearningSnapshot": row.get("expected_hours_learning_snapshot"),
         "expectedHoursLearningDecidedAt": to_utc_iso(
             row["expected_hours_learning_decided_at"]
         )
