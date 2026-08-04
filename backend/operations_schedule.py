@@ -135,6 +135,17 @@ def _query_all(
     return _cursor_rows_as_dicts(cursor, cursor.fetchall())
 
 
+def _expected_hours_learning_site_ids(jobs: Iterable[Dict[str, Any]]) -> List[int]:
+    return sorted(
+        {
+            int(job["location_id"])
+            for job in jobs
+            if job.get("location_id") is not None
+            and job.get("site_expected_hours") is None
+        }
+    )
+
+
 def _local_bounds(
     start_date: date,
     end_date: date,
@@ -644,6 +655,10 @@ def _load_expected_hours_learning_by_site(
               AND location_id IS NOT NULL
               AND has_departure IS TRUE
               AND departure_time > arrival_time
+              AND arrival_time <= %s
+              AND departure_time <= %s
+              AND paid_clock_in <= %s
+              AND paid_clock_out <= %s
               AND departure_location_id IS NOT DISTINCT FROM location_id
               AND accepted_check_in IS TRUE
               AND paid_clock_in IS NOT NULL
@@ -669,6 +684,10 @@ def _load_expected_hours_learning_by_site(
                     OR paid_clock_out <= paid_clock_in
                     OR arrival_time < paid_clock_in
                     OR departure_time > paid_clock_out
+                    OR arrival_time > %s
+                    OR departure_time > %s
+                    OR paid_clock_in > %s
+                    OR paid_clock_out > %s
               )
         ),
         candidate_pairs AS (
@@ -709,6 +728,24 @@ def _load_expected_hours_learning_by_site(
                 WHERE overlap.visit_id = candidate.visit_id
             )
         ),
+        contradictory_departure_visits AS (
+            SELECT DISTINCT pair.visit_id
+            FROM paired_visit_evidence pair
+            JOIN departures other_departure
+              ON other_departure.shift_id = pair.shift_id
+             AND other_departure.id IS DISTINCT FROM pair.recorded_departure_id
+             AND pair.arrival_time < other_departure.departure_time
+             AND other_departure.departure_time <= pair.departure_time
+        ),
+        contradictory_departure_jobs AS (
+            SELECT DISTINCT candidate.job_id
+            FROM candidate_pairs candidate
+            WHERE EXISTS (
+                SELECT 1
+                FROM contradictory_departure_visits conflict
+                WHERE conflict.visit_id = candidate.visit_id
+            )
+        ),
         clean_pairs AS (
             SELECT candidate.*
             FROM candidate_pairs candidate
@@ -727,6 +764,11 @@ def _load_expected_hours_learning_by_site(
                   SELECT 1
                   FROM overlap_jobs overlap
                   WHERE overlap.job_id = candidate.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM contradictory_departure_jobs conflict
+                  WHERE conflict.job_id = candidate.job_id
               )
         ),
         scope_pairs AS (
@@ -788,6 +830,14 @@ def _load_expected_hours_learning_by_site(
             reviewed_departure_ids,
             timezone_name,
             timezone_name,
+            observed_at,
+            observed_at,
+            observed_at,
+            observed_at,
+            observed_at,
+            observed_at,
+            observed_at,
+            observed_at,
             observation_start,
             observation_end,
             resolved_site_ids,
@@ -4605,7 +4655,7 @@ def build_weekly_labor_profitability(
         app_timezone,
     )
     expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
-        [job.get("location_id") for job in jobs],
+        _expected_hours_learning_site_ids(jobs),
         observed_at=observed_at,
         app_timezone=app_timezone,
         cursor=cursor,
@@ -4993,7 +5043,7 @@ def build_operations_forecast(
             continue
         forecast_jobs.append(job)
     expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
-        [job.get("location_id") for job in forecast_jobs],
+        _expected_hours_learning_site_ids(forecast_jobs),
         observed_at=observed_at,
         app_timezone=app_timezone,
     )
@@ -5121,7 +5171,7 @@ def build_operations_schedule_router(
             window_end=range_end,
         )
         expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
-            [job.get("location_id") for job in jobs],
+            _expected_hours_learning_site_ids(jobs),
             observed_at=observed_at,
             app_timezone=app_timezone,
         )
