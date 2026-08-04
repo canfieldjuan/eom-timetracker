@@ -13621,18 +13621,23 @@ def _compute_payroll_weekly_hours(
         if collision is not None:
             # Flag without zeroing the minutes: blocking already prevents
             # verify/finalize, and admins need the real magnitudes to fix it.
-            # Date the issue at the collision instant, not the clock-in day:
-            # a multi-day shift may only collide on a later day.
-            collision_at_utc = max(collision["firstOverlapUtc"], week_start_utc)
-            if collision_at_utc >= week_end_utc:
-                collision_at_utc = week_start_utc
-            _add_payroll_issue(
-                employee_result,
-                "overlapping_shift",
-                shift_row,
-                "Shift overlaps another shift for this employee.",
-                collision_at_utc,
-            )
+            # Mark every in-week collision date -- not the clock-in day, and
+            # not only the first collision day -- so the weekly day statuses
+            # agree with the timesheet segments. A collision lying wholly
+            # outside this week is flagged in the week it belongs to.
+            for collision_day in sorted(collision["overlapDates"]):
+                if collision_day < week_start or collision_day > week_end:
+                    continue
+                day_start_utc = datetime.combine(
+                    collision_day, clock_time.min, tzinfo=APP_TIMEZONE
+                ).astimezone(timezone.utc)
+                _add_payroll_issue(
+                    employee_result,
+                    "overlapping_shift",
+                    shift_row,
+                    "Shift overlaps another shift for this employee.",
+                    max(collision["firstOverlapUtc"], day_start_utc),
+                )
 
         overlap_start = max(clock_in, week_start_utc)
         overlap_end = min(clock_out, week_end_utc)

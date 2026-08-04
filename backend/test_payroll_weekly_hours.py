@@ -5230,3 +5230,61 @@ def test_overlap_issue_attributed_to_collision_day(client, auth):
         _delete_payroll_verification_weeks([week_start])
         if employee_id is not None:
             _delete_employees([employee_id])
+
+
+def test_overlap_spanning_midnight_marks_every_collision_day(client, auth):
+    week_start = date(2026, 6, 7)
+    sunday = week_start
+    monday = week_start + timedelta(days=1)
+    employee_id = None
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        employee_id = _create_employee("Midnight Collision Worker")
+        first_shift_id = _create_shift(
+            employee_id,
+            _local_dt(sunday, 22),
+            _local_dt(monday, 6),
+        )
+        second_shift_id = _create_shift(
+            employee_id,
+            _local_dt(sunday, 23),
+            _local_dt(monday, 5),
+        )
+
+        weekly = _weekly_hours(client, auth, week_start)
+        row = next(
+            employee
+            for employee in weekly["employees"]
+            if employee["employeeId"] == employee_id
+        )
+        day_by_date = {day["date"]: day for day in row["days"]}
+        # The collision runs Sun 23:00 -> Mon 05:00, so BOTH days carry the
+        # code -- matching the timesheet segments on both days.
+        assert "overlapping_shift" in day_by_date[sunday.isoformat()]["issueCodes"]
+        assert "overlapping_shift" in day_by_date[monday.isoformat()]["issueCodes"]
+        overlap_issue_dates = {
+            issue["date"]
+            for issue in row["issues"]
+            if issue["code"] == "overlapping_shift"
+        }
+        assert overlap_issue_dates == {sunday.isoformat(), monday.isoformat()}
+
+        timesheet = _payroll_timesheet(
+            client, auth, week_start, employee_id=employee_id
+        )
+        employee = next(
+            r for r in timesheet["employees"] if r["employeeId"] == employee_id
+        )
+        for shift_id in (first_shift_id, second_shift_id):
+            segments = {
+                day["date"]: shift
+                for day in employee["days"]
+                for shift in day.get("shifts", [])
+                if shift["shiftId"] == shift_id
+            }
+            assert "overlapping_shift" in segments[sunday.isoformat()]["issueCodes"]
+            assert "overlapping_shift" in segments[monday.isoformat()]["issueCodes"]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        if employee_id is not None:
+            _delete_employees([employee_id])
