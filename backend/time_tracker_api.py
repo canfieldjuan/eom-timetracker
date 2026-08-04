@@ -13152,6 +13152,7 @@ def _payroll_source_fingerprint(
     shifts: List[Dict[str, Any]],
     corrections: Optional[List[Dict[str, Any]]] = None,
     shift_corrections: Optional[List[Dict[str, Any]]] = None,
+    blocking_issues: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     payload = {
         "timezone": TIMEZONE_NAME,
@@ -13203,6 +13204,13 @@ def _payroll_source_fingerprint(
             }
             for row in shift_corrections
         ]
+    if blocking_issues:
+        # Conditional like the keys above: a week without blocking issues
+        # hashes exactly as before, so stored verification proofs for clean
+        # weeks stay valid. A week whose recomputation now carries blocking
+        # issues (e.g. a rule such as overlapping_shift added after the
+        # proof was stored) diverges, so its proof correctly reads stale.
+        payload["blockingIssues"] = blocking_issues
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -13717,6 +13725,22 @@ def _compute_payroll_weekly_hours(
             or int(row["id"]) in corrected_employee_ids
         )
     ]
+    blocking_issue_digest = sorted(
+        (
+            {
+                "code": str(issue["code"]),
+                "shiftId": int(issue["shiftId"]),
+                "date": (
+                    issue["date"].isoformat()
+                    if isinstance(issue["date"], date)
+                    else str(issue["date"])
+                ),
+            }
+            for employee in employees
+            for issue in employee["issues"]
+        ),
+        key=lambda item: (item["date"], item["shiftId"], item["code"]),
+    )
 
     return {
         "success": True,
@@ -13733,6 +13757,7 @@ def _compute_payroll_weekly_hours(
             shifts=shift_rows,
             corrections=correction_rows,
             shift_corrections=shift_correction_rows,
+            blocking_issues=blocking_issue_digest,
         ),
         "employees": employees,
         "summary": {

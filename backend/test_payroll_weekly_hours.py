@@ -5288,3 +5288,131 @@ def test_overlap_spanning_midnight_marks_every_collision_day(client, auth):
         _delete_payroll_verification_weeks([week_start])
         if employee_id is not None:
             _delete_employees([employee_id])
+
+
+def test_source_fingerprint_unchanged_by_empty_blocking_issues():
+    kwargs = dict(
+        week_start=date(2026, 5, 3),
+        week_end=date(2026, 5, 9),
+        employees=[],
+        shifts=[],
+    )
+    base = time_tracker_api._payroll_source_fingerprint(**kwargs)
+    assert (
+        time_tracker_api._payroll_source_fingerprint(**kwargs, blocking_issues=[])
+        == base
+    )
+    assert (
+        time_tracker_api._payroll_source_fingerprint(
+            **kwargs,
+            blocking_issues=[
+                {"code": "overlapping_shift", "shiftId": 1, "date": "2026-05-04"}
+            ],
+        )
+        != base
+    )
+
+
+def _old_formula_fingerprint(week_start: date) -> str:
+    """The fingerprint a pre-overlap-rule deployment would have stored,
+    reconstructed from the same inputs the weekly computation uses."""
+    week_end_date, week_start_utc, week_end_utc = (
+        time_tracker_api._payroll_week_bounds(week_start)
+    )
+    shift_rows = time_tracker_api._payroll_overlapping_shift_rows(
+        week_start_utc, week_end_utc, time_tracker_api.utc_now()
+    )
+    employee_rows = db.query_all(
+        "SELECT id, name, active FROM employees ORDER BY LOWER(name), id"
+    )
+    fingerprint_rows = [row for row in employee_rows if bool(row["active"])]
+    return time_tracker_api._payroll_source_fingerprint(
+        week_start=week_start,
+        week_end=week_end_date,
+        employees=fingerprint_rows,
+        shifts=shift_rows,
+        corrections=[],
+        shift_corrections=[],
+    )
+
+
+def test_clean_week_fingerprint_matches_pre_rule_formula(client, auth):
+    week_start = date(2026, 4, 5)
+    service_day = week_start + timedelta(days=1)
+    employee_id = None
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        employee_id = _create_employee("Fingerprint Compat Worker")
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 12),
+        )
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 13),
+            _local_dt(service_day, 17),
+        )
+
+        weekly = _weekly_hours(client, auth, week_start)
+        assert weekly["summary"]["hasBlockingIssues"] is False
+        # No blocking issues -> the digest key is absent -> stored proofs
+        # from before the overlap rule keep matching byte for byte.
+        assert weekly["sourceFingerprint"] == _old_formula_fingerprint(week_start)
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        if employee_id is not None:
+            _delete_employees([employee_id])
+
+
+def test_stored_verification_reads_stale_when_new_rule_condemns_week(client, auth):
+    week_start = date(2026, 5, 3)
+    service_day = week_start + timedelta(days=1)
+    employee_id = None
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        employee_id = _create_employee("Predeploy Proof Worker")
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 16),
+        )
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 10),
+            _local_dt(service_day, 12),
+        )
+
+        # Simulate a proof stored by a deployment that predates the overlap
+        # rule: same rows, fingerprint computed without the issue digest.
+        pre_rule_fingerprint = _old_formula_fingerprint(week_start)
+        db.execute(
+            """
+            INSERT INTO payroll_verification_batches
+                (week_start, week_end, timezone, status, source_fingerprint,
+                 snapshot, verified_by_name)
+            VALUES (%s, %s, %s, 'verified', %s, '{}'::jsonb, 'Predeploy Mayra')
+            """,
+            (
+                week_start,
+                week_start + timedelta(days=6),
+                time_tracker_api.TIMEZONE_NAME,
+                pre_rule_fingerprint,
+            ),
+        )
+
+        status_response = client.get(
+            f"/api/admin/payroll/weekly-hours/verification?weekStart={week_start.isoformat()}",
+            headers=auth,
+        )
+        assert status_response.status_code == 200, status_response.text
+        body = status_response.json()
+        assert body["summary"]["hasBlockingIssues"] is True
+        assert body["currentSourceFingerprint"] != pre_rule_fingerprint
+        # The stored proof must not keep attesting a week the current rules
+        # find blocking.
+        assert body["verification"]["stale"] is True
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        if employee_id is not None:
+            _delete_employees([employee_id])
