@@ -9338,11 +9338,6 @@ def my_timesheet_hours(
         clock_time.min,
         tzinfo=APP_TIMEZONE,
     ).astimezone(timezone.utc)
-    week_end = datetime.combine(
-        week_start_date + timedelta(days=7),
-        clock_time.min,
-        tzinfo=APP_TIMEZONE,
-    ).astimezone(timezone.utc)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     today_str = local_date_string(now)
@@ -9353,7 +9348,40 @@ def my_timesheet_hours(
     ]
     my_entries = _exclude_payroll_resolved_open_entries(my_entries)
 
-    weekly_hours = 0.0
+    # Weekly hours use the payroll-effective math (shift corrections, local-week
+    # clipping, break minutes) so the number here matches what payroll pays once
+    # shifts close. Open shifts earn 0 there, so the currently-open non-stale
+    # shift is added back below as live elapsed time clipped to this week.
+    payroll_week = _compute_payroll_weekly_hours(
+        None,
+        employee_rows=[{
+            "id": employee_id,
+            "name": current_employee["name"],
+            "active": True,
+        }],
+    )
+    paid_weekly_minutes = 0
+    for payroll_employee in payroll_week.get("employees", []):
+        if int(payroll_employee.get("employeeId", 0)) == int(employee_id):
+            paid_weekly_minutes = int(payroll_employee.get("totalMinutes", 0))
+            break
+    paid_weekly_hours = paid_weekly_minutes / 60.0
+
+    live_open_hours = 0.0
+    for entry in my_entries:
+        if entry.get("clockOut") is not None:
+            continue
+        if _raw_open_entry_is_stale(entry, now):
+            continue
+        try:
+            open_clock_in = parse_utc_iso(str(entry.get("clockIn", "")).strip())
+        except ValueError:
+            continue
+        live_start = max(open_clock_in, week_start)
+        if live_start < now:
+            live_open_hours += (now - live_start).total_seconds() / 3600
+
+    weekly_hours = paid_weekly_hours + live_open_hours
     today_hours = 0.0
     monthly_hours = 0.0
     yearly_hours = 0.0
@@ -9371,8 +9399,6 @@ def my_timesheet_hours(
         total = entry_hours(entry, now)
         entry_date = local_date_string(clock_in_dt)
 
-        if week_start <= clock_in_dt < week_end:
-            weekly_hours += total
         if entry_date == today_str:
             today_hours += total
         if clock_in_dt >= month_start:
@@ -9403,6 +9429,10 @@ def my_timesheet_hours(
         "success": True,
         "todayHours": round(today_hours, 2),
         "weeklyHours": round(weekly_hours, 2),
+        "weeklyHoursBasis": {
+            "paidHours": round(paid_weekly_hours, 2),
+            "liveOpenHours": round(live_open_hours, 2),
+        },
         "monthlyHours": round(monthly_hours, 2),
         "yearlyHours": round(yearly_hours, 2),
         "recentShifts": recent_shifts[:30],
