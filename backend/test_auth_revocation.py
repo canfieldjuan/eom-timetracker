@@ -63,19 +63,8 @@ def test_change_password_revokes_prior_token(client):
         probe = client.get("/api/timesheet/my-hours", headers=_headers(old_token))
         assert probe.status_code == 200, probe.text
 
-        # The stamp uses strict less-than at second granularity, so a token
-        # minted in the same second as the change stays valid. Back-date the
-        # old token's iat to make the revocation deterministic.
-        decoded = jwt.decode(
-            old_token, time_tracker_api.JWT_SECRET,
-            algorithms=[time_tracker_api.JWT_ALGORITHM],
-        )
-        decoded["iat"] = int(decoded["iat"]) - 5
-        old_token = jwt.encode(
-            decoded, time_tracker_api.JWT_SECRET,
-            algorithm=time_tracker_api.JWT_ALGORITHM,
-        )
-
+        # No back-dating: the <= comparison revokes tokens issued in the same
+        # second as the change, so even this just-minted token dies.
         changed = _change_password(client, old_token, OLD_PASSWORD, NEW_PASSWORD)
         assert changed.status_code == 200, changed.text
 
@@ -154,6 +143,51 @@ def test_token_without_iat_rejected_after_password_change(client):
         )
         assert rejected.status_code == 401
         assert rejected.json()["error"] == "Token has been revoked"
+    finally:
+        _delete_employee(employee_id)
+
+
+def test_admin_password_reset_revokes_target_tokens(client, auth):
+    employee_id = _create_employee("Admin Reset Target Employee")
+    try:
+        old_token = time_tracker_api.create_auth_token(
+            employee_id, "Admin Reset Target Employee"
+        )
+        probe = client.get("/api/timesheet/my-hours", headers=_headers(old_token))
+        assert probe.status_code == 200, probe.text
+
+        reset = client.patch(
+            f"/api/admin/employees/{employee_id}",
+            headers=auth,
+            json={"password": "admin-reset-password-9"},
+        )
+        assert reset.status_code == 200, reset.text
+
+        rejected = client.get(
+            "/api/timesheet/my-hours", headers=_headers(old_token)
+        )
+        assert rejected.status_code == 401
+        assert rejected.json()["error"] == "Token has been revoked"
+
+        # A token issued after the stamp works. Back-date the stamp (rather
+        # than minting a future-iat token, which PyJWT rejects) so a normally
+        # minted token deterministically post-dates it.
+        assert db.query_one(
+            "SELECT password_changed_at FROM employees WHERE id = %s",
+            (employee_id,),
+        )["password_changed_at"] is not None
+        db.execute(
+            "UPDATE employees SET password_changed_at = "
+            "password_changed_at - INTERVAL '5 seconds' WHERE id = %s",
+            (employee_id,),
+        )
+        later_token = time_tracker_api.create_auth_token(
+            employee_id, "Admin Reset Target Employee"
+        )
+        accepted = client.get(
+            "/api/timesheet/my-hours", headers=_headers(later_token)
+        )
+        assert accepted.status_code == 200, accepted.text
     finally:
         _delete_employee(employee_id)
 
