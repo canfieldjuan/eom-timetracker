@@ -739,12 +739,14 @@ def _row_to_employee(row: Dict[str, Any]) -> Dict[str, Any]:
         "hourlyRate": float(rate) if rate is not None else None,
         "created":    to_utc_iso(created) if created else None,
         "lastLogin":  to_utc_iso(last_login) if last_login else None,
+        "passwordChangedAt": row.get("password_changed_at"),
     }
 
 
 def _load_employees_from_db() -> Dict[str, Any]:
     rows = db.query_all(
-        "SELECT id, name, password_hash, active, role, hourly_rate, created_at, last_login_at "
+        "SELECT id, name, password_hash, active, role, hourly_rate, created_at, last_login_at, "
+        "password_changed_at "
         "FROM employees ORDER BY id"
     )
     employees = [_row_to_employee(r) for r in rows]
@@ -761,14 +763,16 @@ def _save_employees_to_db(employees_data: Dict[str, Any], pre_ids: set) -> None:
                 cur.execute(
                     """
                     INSERT INTO employees
-                      (name, password_hash, active, role, hourly_rate, last_login_at)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                      (name, password_hash, active, role, hourly_rate, last_login_at,
+                       password_changed_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (name) DO UPDATE SET
                         password_hash = EXCLUDED.password_hash,
                         active        = EXCLUDED.active,
                         role          = EXCLUDED.role,
                         hourly_rate   = EXCLUDED.hourly_rate,
-                        last_login_at = EXCLUDED.last_login_at
+                        last_login_at = EXCLUDED.last_login_at,
+                        password_changed_at = EXCLUDED.password_changed_at
                     RETURNING id
                     """,
                     (
@@ -778,6 +782,7 @@ def _save_employees_to_db(employees_data: Dict[str, Any], pre_ids: set) -> None:
                         emp.get("role", "employee"),
                         emp.get("hourlyRate"),
                         emp.get("lastLogin"),
+                        emp.get("passwordChangedAt"),
                     ),
                 )
                 emp["id"] = cur.fetchone()[0]
@@ -789,7 +794,8 @@ def _save_employees_to_db(employees_data: Dict[str, Any], pre_ids: set) -> None:
                         active        = %s,
                         role          = %s,
                         hourly_rate   = %s,
-                        last_login_at = %s
+                        last_login_at = %s,
+                        password_changed_at = %s
                     WHERE id = %s
                     """,
                     (
@@ -798,6 +804,7 @@ def _save_employees_to_db(employees_data: Dict[str, Any], pre_ids: set) -> None:
                         emp.get("role", "employee"),
                         emp.get("hourlyRate"),
                         emp.get("lastLogin"),
+                        emp.get("passwordChangedAt"),
                         emp["id"],
                     ),
                 )
@@ -1496,7 +1503,23 @@ def _rate_limit_evict_expired(cutoff: float) -> None:
         del _RATE_LIMIT_BUCKETS[k]
 
 
-def create_auth_token(employee_id: int, employee_name: str, role: str = "employee") -> str:
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _password_stamp_micros(password_changed_at: datetime) -> int:
+    # Exact integer arithmetic: a float timestamp() round-trip can wobble in
+    # the last microsecond, and this value is compared for equality.
+    delta = password_changed_at - _EPOCH_UTC
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+
+
+def create_auth_token(
+    employee_id: int,
+    employee_name: str,
+    role: str = "employee",
+    *,
+    password_changed_at: Optional[datetime] = None,
+) -> str:
     now = utc_now()
     payload = {
         "sub": str(employee_id),
@@ -1505,6 +1528,12 @@ def create_auth_token(employee_id: int, employee_name: str, role: str = "employe
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(hours=TOKEN_TTL_HOURS)).timestamp()),
     }
+    # The token is bound to the account's password version: get_current_employee
+    # accepts a token only when this signed claim matches the account's current
+    # password_changed_at stamp (absent stamp accepts any token). Timestamp
+    # ordering cannot close the login-vs-change race; version equality can.
+    if password_changed_at is not None:
+        payload["pca"] = _password_stamp_micros(password_changed_at)
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
@@ -2034,6 +2063,26 @@ def get_current_employee(
     if not employee or not employee.get("active", True):
         append_access_log(request, "TOKEN_INVALID", False, "Employee account not found")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Employee account not found")
+
+    password_changed_at = employee.get("passwordChangedAt")
+    if password_changed_at is not None:
+        token_pca = decoded.get("pca")
+        # Version binding, not timestamp ordering: once a stamp exists, a
+        # token is valid only if it was minted against that exact stamp
+        # (login and change_password both embed it, signed). iat comparison
+        # cannot order a login racing a change, so it is not consulted.
+        if not (
+            isinstance(token_pca, int)
+            and token_pca == _password_stamp_micros(password_changed_at)
+        ):
+            append_access_log(
+                request, "TOKEN_INVALID", False,
+                "Token not bound to current password version"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+            )
 
     return {"id": employee["id"], "name": employee["name"], "role": employee.get("role", "employee")}
 
@@ -4221,6 +4270,10 @@ def _ensure_schema_migrations() -> None:
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_atlas_linkage_backfill_batches_created
             ON atlas_linkage_backfill_batches(created_at)
+    """)
+    db.execute("""
+        ALTER TABLE employees
+            ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS access_log_entries (
@@ -8459,14 +8512,27 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
             return False, None
 
         employee["lastLogin"] = to_utc_iso(utc_now())
-        return True, {"id": employee["id"], "name": employee["name"], "role": employee.get("role", "employee")}
+        return True, {
+            "id": employee["id"],
+            "name": employee["name"],
+            "role": employee.get("role", "employee"),
+            "passwordChangedAt": employee.get("passwordChangedAt"),
+        }
 
     ok, employee = update_employees(mutator)
     if not ok or not employee:
         append_access_log(request, "LOGIN_FAILED", False, "Invalid credentials")
         raise HTTPException(status_code=401, detail="Invalid name or password")
 
-    token = create_auth_token(employee["id"], employee["name"], employee.get("role", "employee"))
+    # The token is bound to the password version that was just verified
+    # (read under the same employee write lock), so a login racing a
+    # concurrent password change cannot outlive that change.
+    token = create_auth_token(
+        employee["id"],
+        employee["name"],
+        employee.get("role", "employee"),
+        password_changed_at=employee.get("passwordChangedAt"),
+    )
     append_access_log(request, "LOGIN_SUCCESS", True, f"Employee: {employee['name']}")
     return {
         "success": True,
@@ -8480,13 +8546,17 @@ def change_password(
     payload: ChangePasswordRequest,
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
-) -> Dict[str, bool]:
+) -> Dict[str, Any]:
     _rate_limit_check(
         request,
         key_prefix=f"change-password:{employee['id']}",
         max_calls=PASSWORD_CHANGE_RATE_LIMIT_MAX,
         window_seconds=PASSWORD_CHANGE_RATE_LIMIT_WINDOW_S,
     )
+
+    # The stamp is applied inside the same update_employees transaction as the
+    # new hash, so the password can never change without revoking old tokens.
+    stamp = utc_now()
 
     def mutator(employees_data: Dict[str, Any]) -> Tuple[bool, str]:
         account = find_employee_by_id(employees_data["employees"], int(employee["id"]))
@@ -8501,6 +8571,7 @@ def change_password(
             payload.new_password.encode("utf-8"),
             bcrypt.gensalt(10),
         ).decode("utf-8")
+        account["passwordChangedAt"] = stamp
         return True, "Password updated"
 
     updated, result = update_employees(mutator)
@@ -8519,7 +8590,15 @@ def change_password(
         True,
         f"Employee id={employee['id']}",
     )
-    return {"success": True}
+    return {
+        "success": True,
+        "token": create_auth_token(
+            int(employee["id"]),
+            employee["name"],
+            employee.get("role", "employee"),
+            password_changed_at=stamp,
+        ),
+    }
 
 
 def create_employee_account(
@@ -8672,6 +8751,9 @@ def admin_update_employee(
             )
         if hashed_password:
             emp["password"] = hashed_password
+            # An admin reset is the compromise-response path: revoke every
+            # token issued up to this moment, atomically with the new hash.
+            emp["passwordChangedAt"] = utc_now()
         if "hourlyRate" in payload:
             emp["hourlyRate"] = new_hourly_rate
         return True, {"id": emp["id"], "name": emp["name"], "role": emp["role"], "active": emp["active"], "hourlyRate": emp.get("hourlyRate")}

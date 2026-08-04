@@ -96,7 +96,9 @@ class TestAuth:
                 },
             )
             assert changed.status_code == 200
-            assert changed.json() == {"success": True}
+            changed_body = changed.json()
+            assert changed_body["success"] is True
+            fresh_auth = {"Authorization": f"Bearer {changed_body['token']}"}
 
             assert client.post(
                 "/api/auth/login",
@@ -107,9 +109,12 @@ class TestAuth:
                 json={"name": "Catalina Gomez", "password": changed_password},
             ).status_code == 200
 
+            # The change revokes tokens issued before it; the returned fresh
+            # token carries the session forward. Back-dated tokens are covered
+            # in test_auth_revocation.py; here the response token must work.
             same_password = client.post(
                 endpoint,
-                headers=emp_auth,
+                headers=fresh_auth,
                 json={
                     "currentPassword": changed_password,
                     "newPassword": changed_password,
@@ -119,7 +124,8 @@ class TestAuth:
             assert "must be different" in same_password.json()["error"]
         finally:
             db.execute(
-                "UPDATE employees SET password_hash = %s WHERE name = %s",
+                "UPDATE employees SET password_hash = %s, "
+                "password_changed_at = NULL WHERE name = %s",
                 (original_hash, "Catalina Gomez"),
             )
 
