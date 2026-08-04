@@ -368,6 +368,31 @@ def _load_expected_hours_learning_by_site(
             WHERE v.location_id = ANY(%s)
               AND v.sequence_version >= 2
         ),
+        reviewed_departures AS (
+            SELECT DISTINCT ON (
+                (correction.result ->> 'shiftId')::integer,
+                (correction.result ->> 'visitId')::integer
+            )
+                correction.id,
+                (correction.result ->> 'shiftId')::integer AS shift_id,
+                (correction.result ->> 'visitId')::integer AS visit_id,
+                (correction.result ->> 'locationId')::integer AS location_id,
+                (correction.result ->> 'effectiveDepartureAt')::timestamptz
+                    AS departure_time
+            FROM time_data_correction_batches correction
+            WHERE correction.snapshot ->> 'correctionType' = %s
+              AND correction.result ? 'shiftId'
+              AND correction.result ? 'visitId'
+              AND correction.result ? 'locationId'
+              AND correction.result ? 'effectiveDepartureAt'
+              AND correction.result ->> 'shiftId' ~ '^[0-9]+$'
+              AND correction.result ->> 'visitId' ~ '^[0-9]+$'
+              AND correction.result ->> 'locationId' ~ '^[0-9]+$'
+            ORDER BY
+                (correction.result ->> 'shiftId')::integer,
+                (correction.result ->> 'visitId')::integer,
+                correction.id DESC
+        ),
         visit_evidence AS (
             SELECT
                 v.id AS visit_id,
@@ -375,9 +400,20 @@ def _load_expected_hours_learning_by_site(
                 v.location_id,
                 v.arrival_time,
                 v.sequence_version,
-                d.id AS departure_id,
-                d.departure_time,
-                d.location_id AS departure_location_id,
+                d.id AS recorded_departure_id,
+                reviewed_departure.id AS reviewed_departure_id,
+                (
+                    d.id IS NOT NULL
+                    OR reviewed_departure.id IS NOT NULL
+                ) AS has_departure,
+                COALESCE(
+                    d.departure_time,
+                    reviewed_departure.departure_time
+                ) AS departure_time,
+                COALESCE(
+                    d.location_id,
+                    reviewed_departure.location_id
+                ) AS departure_location_id,
                 evidence_shift.time_category,
                 COALESCE(
                     correction.corrected_clock_in,
@@ -455,15 +491,20 @@ def _load_expected_hours_learning_by_site(
             LEFT JOIN site_check_ins sci ON sci.id = v.site_check_in_id
             LEFT JOIN jobs check_in_job ON check_in_job.id = sci.job_id
             LEFT JOIN departures d ON d.visit_id = v.id
-            WHERE v.sequence_version >= 2
+                                  AND d.shift_id = v.shift_id
+            LEFT JOIN reviewed_departures reviewed_departure
+                   ON reviewed_departure.visit_id = v.id
+                  AND reviewed_departure.shift_id = v.shift_id
+                  AND d.id IS NULL
         ),
         paired_visit_evidence AS (
             SELECT *,
                    EXTRACT(EPOCH FROM (departure_time - arrival_time)) AS raw_seconds
             FROM visit_evidence
             WHERE time_category = 'productive'
+              AND sequence_version >= 2
               AND location_id IS NOT NULL
-              AND departure_id IS NOT NULL
+              AND has_departure IS TRUE
               AND departure_time > arrival_time
               AND departure_location_id IS NOT DISTINCT FROM location_id
               AND accepted_check_in IS TRUE
@@ -479,8 +520,9 @@ def _load_expected_hours_learning_by_site(
             WHERE resolved_job_id IS NOT NULL
               AND (
                     time_category IS DISTINCT FROM 'productive'
+                    OR sequence_version < 2
                     OR location_id IS NULL
-                    OR departure_id IS NULL
+                    OR has_departure IS NOT TRUE
                     OR departure_time <= arrival_time
                     OR departure_location_id IS DISTINCT FROM location_id
                     OR accepted_check_in IS NOT TRUE
@@ -500,6 +542,16 @@ def _load_expected_hours_learning_by_site(
                        AND j.location_id = pairs.location_id
             WHERE j.status = 'completed'
               AND j.scheduled_date BETWEEN %s AND %s
+        ),
+        legacy_shift_jobs AS (
+            SELECT DISTINCT candidate.job_id
+            FROM candidate_pairs candidate
+            WHERE EXISTS (
+                SELECT 1
+                FROM visit_evidence legacy
+                WHERE legacy.shift_id = candidate.shift_id
+                  AND legacy.sequence_version < 2
+            )
         ),
         overlap_visits AS (
             SELECT DISTINCT left_pair.visit_id
@@ -527,6 +579,11 @@ def _load_expected_hours_learning_by_site(
                   SELECT 1
                   FROM invalid_jobs invalid
                   WHERE invalid.job_id = candidate.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM legacy_shift_jobs legacy
+                  WHERE legacy.job_id = candidate.job_id
               )
               AND NOT EXISTS (
                   SELECT 1
@@ -589,6 +646,7 @@ def _load_expected_hours_learning_by_site(
         """,
         (
             resolved_site_ids,
+            UTILIZATION_MISSING_DEPARTURE_CORRECTION,
             timezone_name,
             timezone_name,
             observation_start,
@@ -699,6 +757,13 @@ def _job_issues(job: Dict[str, Any]) -> List[Dict[str, str]]:
                 _issue(
                     "missing_rate",
                     "A service price is not configured for this Site.",
+                )
+            )
+        if job.get("site_expected_hours") is None:
+            issues.append(
+                _issue(
+                    "missing_expected_hours",
+                    "Expected service hours are not configured for this Site.",
                 )
             )
     if job.get("location_id") is not None and job.get("rate_type") not in {

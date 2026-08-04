@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -660,6 +661,67 @@ def _paired_version_two_visit(
         visit_id=visit_id,
     )
     return visit_id, departure_id
+
+
+def _reviewed_departure_correction(
+    cur,
+    *,
+    shift_id: int,
+    visit_id: int,
+    location_id: int,
+    effective_departure_at: datetime,
+    suffix: str,
+) -> int:
+    effective_departure_at = effective_departure_at.astimezone(timezone.utc).replace(
+        microsecond=0
+    )
+    review_key = f"test-reviewed-departure:{shift_id}:{visit_id}:{suffix}"
+    fingerprint = hashlib.sha256(review_key.encode("utf-8")).hexdigest()
+    snapshot = {
+        "correctionType": ops.UTILIZATION_MISSING_DEPARTURE_CORRECTION,
+        "requestFingerprint": fingerprint,
+        "reviewKey": review_key,
+        "evidenceVersion": ops.UTILIZATION_EVIDENCE_VERSION,
+        "evidenceFingerprint": fingerprint,
+        "evidence": {"test": suffix},
+    }
+    result = {
+        "correctionType": ops.UTILIZATION_MISSING_DEPARTURE_CORRECTION,
+        "reviewKey": review_key,
+        "evidenceVersion": ops.UTILIZATION_EVIDENCE_VERSION,
+        "evidenceFingerprint": fingerprint,
+        "shiftId": shift_id,
+        "visitId": visit_id,
+        "locationId": location_id,
+        "locationLabel": f"{TEST_PREFIX} Site {suffix}",
+        "jobId": None,
+        "effectiveDepartureAt": effective_departure_at.isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "derivedIntervalCount": 1,
+        "evidence": ["reviewed_departure"],
+    }
+    cur.execute(
+        """
+        INSERT INTO time_data_correction_batches (
+            plan_token,
+            applied_by_employee_id,
+            applied_by_name,
+            reason,
+            snapshot,
+            result
+        )
+        VALUES (%s, NULL, 'Mayra', %s, %s::jsonb, %s::jsonb)
+        RETURNING id
+        """,
+        (
+            f"test-reviewed-departure-{shift_id}-{visit_id}-{suffix}",
+            "Reviewed departure supplied by regression fixture.",
+            json.dumps(snapshot, sort_keys=True),
+            json.dumps(result, sort_keys=True),
+        ),
+    )
+    return int(cur.fetchone()[0])
 
 
 def _schedule_body(
@@ -4258,7 +4320,7 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
     assert incomplete["plannedHours"] is None
     assert incomplete["estRevenue"] == 50
     assert incomplete["estLaborCost"] is None
-    assert "missing_expected_hours" not in {
+    assert "missing_expected_hours" in {
         issue["code"] for issue in incomplete["issues"]
     }
     assert incomplete["expectedHoursBaseline"] == {
@@ -4437,6 +4499,32 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
                         at=departure,
                         suffix=f"Expected Hours Learning {index}",
                         visit_id=manual_visit_id,
+                    )
+                elif index == 1:
+                    reviewed_check_in_id = _check_in(
+                        cur,
+                        employee_id=employee_id,
+                        location_id=site_id,
+                        checked_in_at=arrival,
+                        job_id=job_id,
+                    )
+                    reviewed_visit_id = _visit(
+                        cur,
+                        shift_id=shift_id,
+                        location_id=site_id,
+                        at=arrival,
+                        suffix=f"Expected Hours Learning {index}",
+                        sequence_version=2,
+                        site_check_in_id=reviewed_check_in_id,
+                        job_id=job_id,
+                    )
+                    _reviewed_departure_correction(
+                        cur,
+                        shift_id=shift_id,
+                        visit_id=reviewed_visit_id,
+                        location_id=site_id,
+                        effective_departure_at=departure,
+                        suffix=f"Expected Hours Learning {index}",
                     )
                 else:
                     _paired_version_two_visit(
@@ -4733,6 +4821,127 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
                 suffix="Expected Hours Learning Non Productive",
             )
 
+            legacy_day = today - timedelta(days=8)
+            legacy_local_start = datetime.combine(
+                legacy_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            legacy_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=legacy_local_start.astimezone(timezone.utc),
+                end=(legacy_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-legacy-visit",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (legacy_job_id,),
+            )
+            legacy_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=legacy_local_start.astimezone(timezone.utc),
+                end=(legacy_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                service_day=legacy_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=legacy_job_id,
+            )
+            _paired_version_two_visit(
+                cur,
+                employee_id=employee_id,
+                shift_id=legacy_shift_id,
+                location_id=site_id,
+                job_id=legacy_job_id,
+                arrival=legacy_local_start.astimezone(timezone.utc),
+                departure=(legacy_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Legacy Valid Pair",
+            )
+            _visit(
+                cur,
+                shift_id=legacy_shift_id,
+                location_id=site_id,
+                at=(legacy_local_start + timedelta(minutes=30)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Legacy Visit",
+                sequence_version=1,
+            )
+
+            cross_shift_day = today - timedelta(days=9)
+            cross_shift_local_start = datetime.combine(
+                cross_shift_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            cross_shift_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=cross_shift_local_start.astimezone(timezone.utc),
+                end=(cross_shift_local_start + timedelta(hours=9)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-cross-shift-departure",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (cross_shift_job_id,),
+            )
+            cross_shift_visit_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=cross_shift_local_start.astimezone(timezone.utc),
+                end=(cross_shift_local_start + timedelta(hours=9)).astimezone(
+                    timezone.utc
+                ),
+                service_day=cross_shift_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=cross_shift_job_id,
+            )
+            cross_shift_departure_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=cross_shift_local_start.astimezone(timezone.utc),
+                end=(cross_shift_local_start + timedelta(hours=9)).astimezone(
+                    timezone.utc
+                ),
+                service_day=cross_shift_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=cross_shift_job_id,
+            )
+            cross_shift_visit_id = _visit(
+                cur,
+                shift_id=cross_shift_visit_shift_id,
+                location_id=site_id,
+                at=cross_shift_local_start.astimezone(timezone.utc),
+                suffix="Expected Hours Learning Cross Shift Visit",
+                sequence_version=2,
+                job_id=cross_shift_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=cross_shift_departure_shift_id,
+                location_id=site_id,
+                at=(cross_shift_local_start + timedelta(hours=9)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Cross Shift Departure",
+                visit_id=cross_shift_visit_id,
+            )
+
             future_start = datetime.combine(
                 future_day,
                 time(hour=18),
@@ -4762,7 +4971,7 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
     forecast_job = forecast_jobs[future_job_id]
     assert forecast_job["plannedHours"] is None
     assert forecast_job["estRevenue"] == 80
-    assert "missing_expected_hours" not in {
+    assert "missing_expected_hours" in {
         issue["code"] for issue in forecast_job["issues"]
     }
     baseline = forecast_job["expectedHoursBaseline"]
@@ -4791,7 +5000,9 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
     }[future_job_id]
     assert schedule_job["expectedHoursBaseline"] == baseline
     assert schedule_job["siteEconomics"]["expectedHoursBaseline"] == baseline
-    assert schedule_job["issues"] == []
+    assert {issue["code"] for issue in schedule_job["issues"]} == {
+        "missing_expected_hours"
+    }
 
 
 def test_utilization_reconciles_complete_route_split_crew_and_categorized_time(
