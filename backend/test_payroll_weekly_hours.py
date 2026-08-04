@@ -5107,3 +5107,126 @@ def test_payroll_timesheet_view_reports_overlapping_shift(client, auth):
         _delete_payroll_verification_weeks([week_start])
         if employee_id is not None:
             _delete_employees([employee_id])
+
+
+def test_corrected_shift_still_overlapping_stays_needs_review(client):
+    week_start = date(2026, 6, 7)
+    service_day = week_start + timedelta(days=5)
+    employee_id = None
+    payroll_id = None
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        payroll_id = _create_employee("Still Overlapping Mayra", role="payroll")
+        employee_id = _create_employee("Still Overlapping Worker")
+        payroll_auth = _login(client, "Still Overlapping Mayra")
+        _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 16),
+        )
+        corrected_shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 10),
+            _local_dt(service_day, 12),
+        )
+
+        corrected = client.post(
+            "/api/admin/payroll/timesheet/shift-corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "shiftId": corrected_shift_id,
+                "date": service_day.isoformat(),
+                "correctedClockIn": _local_dt(service_day, 10, 30).isoformat(),
+                "correctedClockOut": _local_dt(service_day, 12, 30).isoformat(),
+                "correctedBreakMinutes": 0,
+                "reason": "Shifted by half an hour; still overlaps the long shift.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+
+        timesheet = _payroll_timesheet(
+            client, payroll_auth, week_start, employee_id=employee_id
+        )
+        employee = next(
+            row
+            for row in timesheet["employees"]
+            if row["employeeId"] == employee_id
+        )
+        corrected_rows = [
+            shift
+            for day in employee["days"]
+            for shift in day.get("shifts", [])
+            if shift["shiftId"] == corrected_shift_id
+        ]
+        assert corrected_rows, "expected the corrected shift to be serialized"
+        # A correction that does not remove the overlap must not present the
+        # row as settled: nonempty issue codes win over "corrected".
+        assert all(
+            "overlapping_shift" in shift["issueCodes"] for shift in corrected_rows
+        )
+        assert all(shift["status"] == "needs_review" for shift in corrected_rows)
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees(
+            [value for value in (employee_id, payroll_id) if value is not None]
+        )
+
+
+def test_overlap_issue_attributed_to_collision_day(client, auth):
+    week_start = date(2026, 6, 7)
+    sunday = week_start
+    monday = week_start + timedelta(days=1)
+    employee_id = None
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        employee_id = _create_employee("Collision Day Worker")
+        overnight_shift_id = _create_shift(
+            employee_id,
+            _local_dt(sunday, 22),
+            _local_dt(monday, 6),
+        )
+        _create_shift(
+            employee_id,
+            _local_dt(monday, 4),
+            _local_dt(monday, 8),
+        )
+
+        weekly = _weekly_hours(client, auth, week_start)
+        row = next(
+            employee
+            for employee in weekly["employees"]
+            if employee["employeeId"] == employee_id
+        )
+        overlap_issues = [
+            issue for issue in row["issues"] if issue["code"] == "overlapping_shift"
+        ]
+        assert overlap_issues
+        # The collision starts Monday 04:00, so the issue belongs to Monday
+        # even though the overnight shift clocks in on Sunday.
+        assert all(
+            issue["date"] == monday.isoformat() for issue in overlap_issues
+        )
+        day_by_date = {day["date"]: day for day in row["days"]}
+        assert "overlapping_shift" in day_by_date[monday.isoformat()]["issueCodes"]
+        assert "overlapping_shift" not in day_by_date[sunday.isoformat()]["issueCodes"]
+
+        timesheet = _payroll_timesheet(
+            client, auth, week_start, employee_id=employee_id
+        )
+        employee = next(
+            r for r in timesheet["employees"] if r["employeeId"] == employee_id
+        )
+        overnight_segments = {
+            day["date"]: shift
+            for day in employee["days"]
+            for shift in day.get("shifts", [])
+            if shift["shiftId"] == overnight_shift_id
+        }
+        assert "overlapping_shift" not in overnight_segments[sunday.isoformat()]["issueCodes"]
+        assert "overlapping_shift" in overnight_segments[monday.isoformat()]["issueCodes"]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        if employee_id is not None:
+            _delete_employees([employee_id])

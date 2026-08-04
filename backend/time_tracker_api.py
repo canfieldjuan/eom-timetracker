@@ -13423,18 +13423,22 @@ def _effective_payroll_shift_row(
     return effective
 
 
-def _payroll_overlapping_shift_ids(
+def _payroll_overlapping_shift_collisions(
     shift_rows: List[Dict[str, Any]],
     shift_corrections_by_shift_id: Dict[int, Dict[str, Any]],
-) -> set[int]:
-    """Ids of shifts whose effective closed interval overlaps another shift
-    of the same employee.
+) -> Dict[int, Dict[str, Any]]:
+    """Collision info for shifts whose effective closed interval overlaps
+    another shift of the same employee, keyed by shift id.
 
-    Overlap is strict (back-to-back end == next start is legal). Open and
-    non-positive-duration shifts are excluded -- they already carry their own
-    issue codes. Intervals are the post-correction ones and are re-sorted,
-    because a correction can reorder shifts relative to the raw fetch order.
-    Both members of an overlapping pair are flagged.
+    Each value carries firstOverlapUtc (the earliest instant this shift
+    collides with another) and overlapDates (the local dates the collision
+    intervals cover), so issues can be attributed to the day the collision
+    actually happens rather than the shift's clock-in day. Overlap is strict
+    (back-to-back end == next start is legal). Open and non-positive-duration
+    shifts are excluded -- they already carry their own issue codes.
+    Intervals are the post-correction ones and are re-sorted, because a
+    correction can reorder shifts relative to the raw fetch order. Both
+    members of an overlapping pair are flagged.
     """
     intervals_by_employee: Dict[int, List[Tuple[datetime, datetime, int]]] = {}
     for raw_shift_row in shift_rows:
@@ -13453,20 +13457,36 @@ def _payroll_overlapping_shift_ids(
             (clock_in, clock_out, int(shift_row["id"]))
         )
 
-    flagged: set[int] = set()
+    collisions: Dict[int, Dict[str, Any]] = {}
+
+    def record(shift_id: int, overlap_start: datetime, overlap_end: datetime) -> None:
+        entry = collisions.setdefault(
+            shift_id,
+            {"firstOverlapUtc": overlap_start, "overlapDates": set()},
+        )
+        if overlap_start < entry["firstOverlapUtc"]:
+            entry["firstOverlapUtc"] = overlap_start
+        entry["overlapDates"].update(
+            local_day
+            for local_day, _seconds in _iter_payroll_local_day_slices(
+                overlap_start, overlap_end
+            )
+        )
+
     for intervals in intervals_by_employee.values():
         intervals.sort(key=lambda item: (item[0], item[2]))
         running_end: Optional[datetime] = None
         running_id: Optional[int] = None
         for clock_in, clock_out, shift_id in intervals:
             if running_end is not None and clock_in < running_end:
-                flagged.add(shift_id)
+                overlap_end = min(clock_out, running_end)
+                record(shift_id, clock_in, overlap_end)
                 if running_id is not None:
-                    flagged.add(running_id)
+                    record(running_id, clock_in, overlap_end)
             if running_end is None or clock_out > running_end:
                 running_end = clock_out
                 running_id = shift_id
-    return flagged
+    return collisions
 
 
 def _compute_payroll_weekly_hours(
@@ -13528,7 +13548,7 @@ def _compute_payroll_weekly_hours(
     shift_corrections_by_shift_id = _payroll_shift_corrections_by_shift_id(
         shift_correction_rows
     )
-    overlapping_shift_ids = _payroll_overlapping_shift_ids(
+    overlap_collisions = _payroll_overlapping_shift_collisions(
         shift_rows, shift_corrections_by_shift_id
     )
 
@@ -13597,15 +13617,21 @@ def _compute_payroll_weekly_hours(
             )
             continue
 
-        if int(shift_row["id"]) in overlapping_shift_ids:
+        collision = overlap_collisions.get(int(shift_row["id"]))
+        if collision is not None:
             # Flag without zeroing the minutes: blocking already prevents
             # verify/finalize, and admins need the real magnitudes to fix it.
+            # Date the issue at the collision instant, not the clock-in day:
+            # a multi-day shift may only collide on a later day.
+            collision_at_utc = max(collision["firstOverlapUtc"], week_start_utc)
+            if collision_at_utc >= week_end_utc:
+                collision_at_utc = week_start_utc
             _add_payroll_issue(
                 employee_result,
                 "overlapping_shift",
                 shift_row,
                 "Shift overlaps another shift for this employee.",
-                issue_at_utc,
+                collision_at_utc,
             )
 
         overlap_start = max(clock_in, week_start_utc)
@@ -13937,7 +13963,9 @@ def _serialize_payroll_timesheet_shift(
     )
     minutes = int(segment.get("minutes") or 0)
     correction_row = shift_row.get("payroll_shift_correction")
-    status = "corrected" if correction_row else ("needs_review" if issue_codes else "registered")
+    # Nonempty issue codes win over "corrected": a correction that still
+    # leaves the shift overlapping (or otherwise flagged) needs review.
+    status = "needs_review" if issue_codes else ("corrected" if correction_row else "registered")
     location_id = shift_row.get("location_id")
     job_id = shift_row.get("job_id")
     location_label = _payroll_timesheet_location_label(shift_row)
@@ -14056,7 +14084,7 @@ def _compute_payroll_timesheet(
     shift_corrections_by_shift_id = _payroll_shift_corrections_by_shift_id(
         shift_correction_rows
     )
-    overlapping_shift_ids = _payroll_overlapping_shift_ids(
+    overlap_collisions = _payroll_overlapping_shift_collisions(
         shift_rows, shift_corrections_by_shift_id
     )
     allocation_rows = _payroll_correction_allocation_rows(week_start, cursor=cursor)
@@ -14188,23 +14216,28 @@ def _compute_payroll_timesheet(
                     break_minutes=int(shift_row.get("payroll_break_minutes") or 0),
                 )
 
-        # Same code the weekly producer emits, so the two views agree.
-        # The flagged set only ever contains closed valid-duration shifts.
-        if int(shift_row["id"]) in overlapping_shift_ids:
-            issue_codes.append("overlapping_shift")
+        # Same code the weekly producer emits, so the two views agree. The
+        # collision map only ever contains closed valid-duration shifts, and
+        # the code lands on the segment(s) whose date the collision actually
+        # covers -- not every day a multi-day shift touches.
+        collision = overlap_collisions.get(int(shift_row["id"]))
+        collision_dates = collision["overlapDates"] if collision else None
 
         segment_count = len(segments)
         for index, segment in enumerate(segments, start=1):
             day = _payroll_day_map(employee).get(segment["date"].isoformat())
             if day is None:
                 continue
+            segment_issue_codes = issue_codes
+            if collision_dates and segment["date"] in collision_dates:
+                segment_issue_codes = [*issue_codes, "overlapping_shift"]
             day["shifts"].append(
                 _serialize_payroll_timesheet_shift(
                     shift_row,
                     segment=segment,
                     segment_index=index,
                     segment_count=segment_count,
-                    issue_codes=issue_codes,
+                    issue_codes=segment_issue_codes,
                 )
             )
 
