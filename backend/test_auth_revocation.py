@@ -169,25 +169,69 @@ def test_admin_password_reset_revokes_target_tokens(client, auth):
         assert rejected.status_code == 401
         assert rejected.json()["error"] == "Token has been revoked"
 
-        # A token issued after the stamp works. Back-date the stamp (rather
-        # than minting a future-iat token, which PyJWT rejects) so a normally
-        # minted token deterministically post-dates it.
-        assert db.query_one(
+        # A token bound to the new stamp works (this is what a post-reset
+        # login mints).
+        stamp = db.query_one(
             "SELECT password_changed_at FROM employees WHERE id = %s",
             (employee_id,),
-        )["password_changed_at"] is not None
-        db.execute(
-            "UPDATE employees SET password_changed_at = "
-            "password_changed_at - INTERVAL '5 seconds' WHERE id = %s",
-            (employee_id,),
-        )
+        )["password_changed_at"]
+        assert stamp is not None
         later_token = time_tracker_api.create_auth_token(
-            employee_id, "Admin Reset Target Employee"
+            employee_id,
+            "Admin Reset Target Employee",
+            password_changed_at=stamp,
         )
         accepted = client.get(
             "/api/timesheet/my-hours", headers=_headers(later_token)
         )
         assert accepted.status_code == 200, accepted.text
+    finally:
+        _delete_employee(employee_id)
+
+
+def test_unbound_token_issued_after_the_change_is_still_revoked(client):
+    """The login-vs-change race: a token whose iat postdates the stamp but
+    that was minted without knowledge of the new password version (no pca
+    claim) must not survive. Version binding, not timestamp ordering."""
+    employee_id = _create_employee("Race Window Employee")
+    try:
+        fresh_token = time_tracker_api.create_auth_token(
+            employee_id, "Race Window Employee"
+        )
+        changed = _change_password(client, fresh_token, OLD_PASSWORD, NEW_PASSWORD)
+        assert changed.status_code == 200, changed.text
+
+        # Minted after the stamp (iat >= stamp second) but unbound to it.
+        racing_token = time_tracker_api.create_auth_token(
+            employee_id, "Race Window Employee"
+        )
+        rejected = client.get(
+            "/api/timesheet/my-hours", headers=_headers(racing_token)
+        )
+        assert rejected.status_code == 401
+        assert rejected.json()["error"] == "Token has been revoked"
+    finally:
+        _delete_employee(employee_id)
+
+
+def test_login_after_password_change_mints_a_working_token(client):
+    employee_id = _create_employee("Relogin After Change Employee")
+    try:
+        first_token = time_tracker_api.create_auth_token(
+            employee_id, "Relogin After Change Employee"
+        )
+        changed = _change_password(client, first_token, OLD_PASSWORD, NEW_PASSWORD)
+        assert changed.status_code == 200, changed.text
+
+        login = client.post(
+            "/api/auth/login",
+            json={"name": "Relogin After Change Employee", "password": NEW_PASSWORD},
+        )
+        assert login.status_code == 200, login.text
+        probe = client.get(
+            "/api/timesheet/my-hours", headers=_headers(login.json()["token"])
+        )
+        assert probe.status_code == 200, probe.text
     finally:
         _delete_employee(employee_id)
 

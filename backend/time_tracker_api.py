@@ -1522,9 +1522,10 @@ def create_auth_token(
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(hours=TOKEN_TTL_HOURS)).timestamp()),
     }
-    # A token minted with knowledge of the current password stamp carries it
-    # (signed), exempting it from iat-based revocation: whole-second iat
-    # cannot order two events inside the same second, this claim can.
+    # The token is bound to the account's password version: get_current_employee
+    # accepts a token only when this signed claim matches the account's current
+    # password_changed_at stamp (absent stamp accepts any token). Timestamp
+    # ordering cannot close the login-vs-change race; version equality can.
     if password_changed_at is not None:
         payload["pca"] = _password_stamp_micros(password_changed_at)
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -2060,20 +2061,16 @@ def get_current_employee(
     password_changed_at = employee.get("passwordChangedAt")
     if password_changed_at is not None:
         token_pca = decoded.get("pca")
-        token_iat = decoded.get("iat")
-        # <= at second granularity also revokes tokens issued in the same
-        # second as the change; the fresh token returned by change_password
-        # is exempt because it carries the current stamp as a signed claim.
-        matches_current_stamp = (
+        # Version binding, not timestamp ordering: once a stamp exists, a
+        # token is valid only if it was minted against that exact stamp
+        # (login and change_password both embed it, signed). iat comparison
+        # cannot order a login racing a change, so it is not consulted.
+        if not (
             isinstance(token_pca, int)
             and token_pca == _password_stamp_micros(password_changed_at)
-        )
-        if not matches_current_stamp and (
-            token_iat is None
-            or int(token_iat) <= int(password_changed_at.timestamp())
         ):
             append_access_log(
-                request, "TOKEN_INVALID", False, "Token issued before password change"
+                request, "TOKEN_INVALID", False, "Token predates password change"
             )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -8471,14 +8468,27 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
             return False, None
 
         employee["lastLogin"] = to_utc_iso(utc_now())
-        return True, {"id": employee["id"], "name": employee["name"], "role": employee.get("role", "employee")}
+        return True, {
+            "id": employee["id"],
+            "name": employee["name"],
+            "role": employee.get("role", "employee"),
+            "passwordChangedAt": employee.get("passwordChangedAt"),
+        }
 
     ok, employee = update_employees(mutator)
     if not ok or not employee:
         append_access_log(request, "LOGIN_FAILED", False, "Invalid credentials")
         raise HTTPException(status_code=401, detail="Invalid name or password")
 
-    token = create_auth_token(employee["id"], employee["name"], employee.get("role", "employee"))
+    # The token is bound to the password version that was just verified
+    # (read under the same employee write lock), so a login racing a
+    # concurrent password change cannot outlive that change.
+    token = create_auth_token(
+        employee["id"],
+        employee["name"],
+        employee.get("role", "employee"),
+        password_changed_at=employee.get("passwordChangedAt"),
+    )
     append_access_log(request, "LOGIN_SUCCESS", True, f"Employee: {employee['name']}")
     return {
         "success": True,
