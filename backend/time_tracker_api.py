@@ -9278,13 +9278,16 @@ def admin_adjust_entry(
                 # Clear clock-out -> make shift active again. Reject when the
                 # employee already has another open entry (stale ones included:
                 # a raw check, unlike get_open_entry): two open shifts strand
-                # the older one until it trips the stale-shift guard.
+                # the older one until it trips the stale-shift guard. An open
+                # row resolved by an active payroll correction is deliberately
+                # parked, not strandable, so it does not block the clear.
                 other_open = next(
                     (
                         e for e in timesheet_data["entries"]
                         if e["id"] != entry_id
                         and e.get("employeeId") == entry.get("employeeId")
                         and e.get("clockOut") is None
+                        and not _entry_resolved_by_payroll_correction(e)
                     ),
                     None,
                 )
