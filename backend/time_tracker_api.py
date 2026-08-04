@@ -739,12 +739,14 @@ def _row_to_employee(row: Dict[str, Any]) -> Dict[str, Any]:
         "hourlyRate": float(rate) if rate is not None else None,
         "created":    to_utc_iso(created) if created else None,
         "lastLogin":  to_utc_iso(last_login) if last_login else None,
+        "passwordChangedAt": row.get("password_changed_at"),
     }
 
 
 def _load_employees_from_db() -> Dict[str, Any]:
     rows = db.query_all(
-        "SELECT id, name, password_hash, active, role, hourly_rate, created_at, last_login_at "
+        "SELECT id, name, password_hash, active, role, hourly_rate, created_at, last_login_at, "
+        "password_changed_at "
         "FROM employees ORDER BY id"
     )
     employees = [_row_to_employee(r) for r in rows]
@@ -2034,6 +2036,20 @@ def get_current_employee(
     if not employee or not employee.get("active", True):
         append_access_log(request, "TOKEN_INVALID", False, "Employee account not found")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Employee account not found")
+
+    password_changed_at = employee.get("passwordChangedAt")
+    if password_changed_at is not None:
+        token_iat = decoded.get("iat")
+        # Strict < at second granularity: the fresh token minted in the same
+        # second as the password change stays valid.
+        if token_iat is None or int(token_iat) < int(password_changed_at.timestamp()):
+            append_access_log(
+                request, "TOKEN_INVALID", False, "Token issued before password change"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+            )
 
     return {"id": employee["id"], "name": employee["name"], "role": employee.get("role", "employee")}
 
@@ -4185,6 +4201,10 @@ def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
     _ensure_employee_role_schema()
+    db.execute("""
+        ALTER TABLE employees
+            ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMPTZ
+    """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS access_log_entries (
             id          BIGSERIAL PRIMARY KEY,
@@ -8443,7 +8463,7 @@ def change_password(
     payload: ChangePasswordRequest,
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
-) -> Dict[str, bool]:
+) -> Dict[str, Any]:
     _rate_limit_check(
         request,
         key_prefix=f"change-password:{employee['id']}",
@@ -8476,13 +8496,30 @@ def change_password(
         )
         raise HTTPException(status_code=400, detail=result)
 
+    # Revoke every token issued before this change: stamp the column with a
+    # targeted UPDATE (not the full employee upsert) and hand back a fresh
+    # token minted at/after the stamp so this session survives. The stamp uses
+    # the app clock, not NOW(): the token iat comes from the same clock, so DB
+    # clock skew can never revoke the fresh token.
+    db.execute(
+        "UPDATE employees SET password_changed_at = %s WHERE id = %s",
+        (utc_now(), int(employee["id"])),
+    )
+
     append_access_log(
         request,
         "PASSWORD_CHANGED",
         True,
         f"Employee id={employee['id']}",
     )
-    return {"success": True}
+    return {
+        "success": True,
+        "token": create_auth_token(
+            int(employee["id"]),
+            employee["name"],
+            employee.get("role", "employee"),
+        ),
+    }
 
 
 def create_employee_account(
