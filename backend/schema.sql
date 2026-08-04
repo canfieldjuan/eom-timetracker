@@ -45,6 +45,19 @@ CREATE TABLE locations (
                         CHECK (rate_type IN ('per_visit', 'hourly', 'monthly')),
     frequency         TEXT,
     expected_hours    NUMERIC(6, 2),
+    expected_hours_source VARCHAR(32) NOT NULL DEFAULT 'manual'
+                          CHECK (expected_hours_source IN ('manual', 'learned_accepted')),
+    expected_hours_learning_decision VARCHAR(16)
+                          CHECK (expected_hours_learning_decision IN ('accepted', 'rejected')),
+    expected_hours_learning_fingerprint VARCHAR(64)
+                          CHECK (
+                              expected_hours_learning_fingerprint IS NULL
+                              OR expected_hours_learning_fingerprint ~ '^[0-9a-f]{64}$'
+                          ),
+    expected_hours_learning_snapshot JSONB,
+    expected_hours_learning_decided_at TIMESTAMPTZ,
+    expected_hours_learning_decided_by INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    expected_hours_learning_decision_reason TEXT NOT NULL DEFAULT '',
     target_labor_pct  NUMERIC(5, 2),
     min_margin_pct    NUMERIC(5, 2),
     lat               NUMERIC(10, 7),

@@ -11,6 +11,7 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
+import hmac
 import json
 import re
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -38,8 +39,10 @@ OPERATIONS_FORECAST_ALLOWED_WEEKS = {4, 8, 12}
 UTILIZATION_REVIEW_KEY_VERSION = "utilization-review.v1"
 UTILIZATION_EVIDENCE_VERSION = "utilization-classifier.v1"
 UTILIZATION_MISSING_DEPARTURE_CORRECTION = "utilization_missing_departure.v1"
+EXPECTED_HOURS_BASELINE_KEY_VERSION = "expected-hours-baseline.v1"
 EXPECTED_HOURS_LEARNING_LOOKBACK_DAYS = 180
 EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES = 3
+EXPECTED_HOURS_MAX = Decimal("9999.99")
 EXPECTED_HOURS_LEARNING_EXCLUSION_RULE_DEFINITIONS = (
     {"code": "requires_completed_job", "source": "candidate_pairs"},
     {"code": "requires_productive_v2_site_events", "source": "paired_visit_evidence"},
@@ -81,6 +84,18 @@ class UtilizationMissingDepartureCorrectionRequest(BaseModel):
     effectiveDepartureAt: datetime
     reason: str = Field(min_length=10, max_length=500)
     idempotencyKey: UUID
+
+
+class ExpectedHoursBaselineDecisionRequest(BaseModel):
+    baselineFingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    decision: str = Field(pattern="^(accept|reject)$")
+    expectedUpdateToken: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    reason: str = Field(default="", max_length=500)
 
 
 def _utc_iso(value: Optional[datetime]) -> Optional[str]:
@@ -137,6 +152,32 @@ def _empty_expected_hours_learning(
         },
         "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
     }
+
+
+def _entity_update_token(entity: str, row: Dict[str, Any]) -> str:
+    updated_at = row["updated_at"].astimezone(timezone.utc).isoformat(
+        timespec="microseconds"
+    )
+    canonical = f"{entity}:{int(row['id'])}:{updated_at}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _require_current_site_update_token(
+    site: Dict[str, Any],
+    expected_token: Optional[str],
+) -> None:
+    if expected_token is None:
+        return
+    if hmac.compare_digest(expected_token, _entity_update_token("site", site)):
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "stale_site_update",
+            "message": "Site changed after it was read; reload before retrying",
+            "details": {"siteId": int(site["id"])},
+        },
+    )
 
 
 def _cursor_rows_as_dicts(cursor: Any, rows: Iterable[Any]) -> List[Dict[str, Any]]:
@@ -338,6 +379,15 @@ def _load_jobs(
                l.customer_id, l.address AS site_address,
                l.location_type AS site_type, l.rate, l.rate_type,
                l.expected_hours AS site_expected_hours,
+               l.expected_hours_source AS site_expected_hours_source,
+               l.expected_hours_learning_decision
+                   AS site_expected_hours_learning_decision,
+               l.expected_hours_learning_fingerprint
+                   AS site_expected_hours_learning_fingerprint,
+               l.expected_hours_learning_snapshot
+                   AS site_expected_hours_learning_snapshot,
+               l.expected_hours_learning_decided_at
+                   AS site_expected_hours_learning_decided_at,
                l.target_labor_pct AS site_target_labor_pct,
                l.min_margin_pct AS site_min_margin_pct,
                l.active AS site_active,
@@ -938,6 +988,34 @@ def _load_expected_hours_learning_by_site(
     return learning
 
 
+def _expected_hours_baseline_fingerprint(
+    *,
+    site_id: int,
+    learning: Dict[str, Any],
+) -> Optional[str]:
+    suggested_hours = learning.get("suggestedHours")
+    if suggested_hours is None:
+        return None
+    payload = {
+        "version": EXPECTED_HOURS_BASELINE_KEY_VERSION,
+        "siteId": int(site_id),
+        "suggestedHours": float(suggested_hours),
+        "sampleSize": int(learning.get("sampleSize") or 0),
+        "minimumSampleSize": int(
+            learning.get("minimumSampleSize")
+            or EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES
+        ),
+        "observationPeriod": learning.get("observationPeriod"),
+        "exclusionRules": list(
+            learning.get("exclusionRules") or EXPECTED_HOURS_LEARNING_EXCLUSION_RULES
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _expected_hours_baseline(
     job: Dict[str, Any],
     learning_by_site: Optional[Dict[int, Dict[str, Any]]] = None,
@@ -948,16 +1026,58 @@ def _expected_hours_baseline(
         else None
     )
     if planned_hours is not None:
+        source = (
+            "learned_accepted"
+            if job.get("site_expected_hours_source") == "learned_accepted"
+            else "manual"
+        )
+        accepted_snapshot = (
+            job.get("site_expected_hours_learning_snapshot")
+            if isinstance(job.get("site_expected_hours_learning_snapshot"), dict)
+            else {}
+        )
         return {
-            "source": "manual",
-            "state": "manual",
+            "source": source,
+            "state": "accepted" if source == "learned_accepted" else "manual",
             "plannedHours": planned_hours,
-            "manualHours": planned_hours,
-            "suggestedHours": None,
-            "sampleSize": None,
-            "minimumSampleSize": EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES,
-            "observationPeriod": None,
-            "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+            "manualHours": planned_hours if source == "manual" else None,
+            "suggestedHours": (
+                accepted_snapshot.get("suggestedHours", planned_hours)
+                if source == "learned_accepted"
+                else None
+            ),
+            "sampleSize": accepted_snapshot.get("sampleSize")
+            if source == "learned_accepted"
+            else None,
+            "minimumSampleSize": (
+                int(
+                    accepted_snapshot.get("minimumSampleSize")
+                    or EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES
+                )
+                if source == "learned_accepted"
+                else EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES
+            ),
+            "observationPeriod": (
+                accepted_snapshot.get("observationPeriod")
+                if source == "learned_accepted"
+                else None
+            ),
+            "exclusionRules": list(
+                (
+                    accepted_snapshot.get("exclusionRules")
+                    if source == "learned_accepted"
+                    else None
+                )
+                or EXPECTED_HOURS_LEARNING_EXCLUSION_RULES
+            ),
+            "baselineFingerprint": (
+                (
+                    accepted_snapshot.get("baselineFingerprint")
+                    or job.get("site_expected_hours_learning_fingerprint")
+                )
+                if source == "learned_accepted"
+                else None
+            ),
         }
     site_id = job.get("location_id")
     learning = (
@@ -976,12 +1096,32 @@ def _expected_hours_baseline(
             "minimumSampleSize": EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES,
             "observationPeriod": None,
             "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+            "baselineFingerprint": None,
         }
     suggested_hours = learning.get("suggestedHours")
+    baseline_fingerprint = (
+        _expected_hours_baseline_fingerprint(
+            site_id=int(site_id),
+            learning=learning,
+        )
+        if site_id is not None
+        else None
+    )
+    rejected = (
+        suggested_hours is not None
+        and job.get("site_expected_hours_learning_decision") == "rejected"
+        and job.get("site_expected_hours_learning_fingerprint") == baseline_fingerprint
+    )
     source = "learned_suggestion" if suggested_hours is not None else "insufficient_data"
+    if rejected:
+        source = "learned_rejected"
     return {
         "source": source,
-        "state": "suggested" if suggested_hours is not None else "learning",
+        "state": (
+            "rejected"
+            if rejected
+            else ("suggested" if suggested_hours is not None else "learning")
+        ),
         "plannedHours": None,
         "manualHours": None,
         "suggestedHours": suggested_hours,
@@ -993,6 +1133,49 @@ def _expected_hours_baseline(
         "observationPeriod": learning.get("observationPeriod"),
         "exclusionRules": list(
             learning.get("exclusionRules") or EXPECTED_HOURS_LEARNING_EXCLUSION_RULES
+        ),
+        "baselineFingerprint": baseline_fingerprint,
+    }
+
+
+def _load_expected_hours_site(site_id: int, *, cursor: Any) -> Optional[Dict[str, Any]]:
+    cursor.execute(
+        """
+        SELECT id, expected_hours, expected_hours_source,
+               expected_hours_learning_decision,
+               expected_hours_learning_fingerprint,
+               expected_hours_learning_snapshot,
+               expected_hours_learning_decided_at,
+               expected_hours_learning_decided_by,
+               expected_hours_learning_decision_reason,
+               active, updated_at
+        FROM locations
+        WHERE id = %s
+        FOR UPDATE
+        """,
+        (site_id,),
+    )
+    row = cursor.fetchone()
+    return dict(row) if row is not None else None
+
+
+def _baseline_job_from_site(site: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(site["id"]),
+        "location_id": int(site["id"]),
+        "site_expected_hours": site.get("expected_hours"),
+        "site_expected_hours_source": site.get("expected_hours_source"),
+        "site_expected_hours_learning_decision": site.get(
+            "expected_hours_learning_decision"
+        ),
+        "site_expected_hours_learning_fingerprint": site.get(
+            "expected_hours_learning_fingerprint"
+        ),
+        "site_expected_hours_learning_snapshot": site.get(
+            "expected_hours_learning_snapshot"
+        ),
+        "site_expected_hours_learning_decided_at": site.get(
+            "expected_hours_learning_decided_at"
         ),
     }
 
@@ -5671,6 +5854,144 @@ def build_operations_schedule_router(
             inserted,
             idempotent_replay=False,
         )
+
+    @router.post("/api/admin/operations/sites/{site_id}/expected-hours-baseline/decision")
+    def decide_expected_hours_baseline(
+        site_id: int,
+        payload: ExpectedHoursBaselineDecisionRequest,
+        current_admin: Dict[str, Any] = Depends(get_current_admin),
+    ) -> Dict[str, Any]:
+        observed_at = now_provider().astimezone(timezone.utc)
+        reason = payload.reason.strip()
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                site = _load_expected_hours_site(site_id, cursor=cursor)
+                if site is None or not bool(site.get("active")):
+                    raise HTTPException(status_code=404, detail="Site not found")
+                _require_current_site_update_token(site, payload.expectedUpdateToken)
+                learning_by_site = _load_expected_hours_learning_by_site(
+                    [site_id],
+                    observed_at=observed_at,
+                    app_timezone=app_timezone,
+                    cursor=cursor,
+                )
+                baseline = _expected_hours_baseline(
+                    _baseline_job_from_site(site),
+                    learning_by_site,
+                )
+                current_fingerprint = baseline.get("baselineFingerprint")
+                if baseline["state"] != "suggested" or current_fingerprint is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "expected_hours_baseline_not_suggested",
+                            "message": (
+                                "This Site does not have a current expected-hours "
+                                "suggestion to decide."
+                            ),
+                            "details": {
+                                "siteId": site_id,
+                                "state": baseline["state"],
+                                "source": baseline["source"],
+                            },
+                        },
+                    )
+                if current_fingerprint != payload.baselineFingerprint:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "stale_expected_hours_baseline",
+                            "message": (
+                                "Expected-hours evidence changed after it was read; "
+                                "reload before deciding."
+                            ),
+                            "details": {
+                                "siteId": site_id,
+                                "currentFingerprint": current_fingerprint,
+                            },
+                        },
+                    )
+
+                baseline_snapshot_json = json.dumps(baseline, sort_keys=True)
+                if payload.decision == "accept":
+                    suggested_hours = Decimal(str(baseline["suggestedHours"])).quantize(
+                        Decimal("0.01"),
+                        rounding=ROUND_HALF_UP,
+                    )
+                    if suggested_hours > EXPECTED_HOURS_MAX:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "expected_hours_baseline_out_of_range",
+                                "message": (
+                                    "The learned expected-hours suggestion is outside "
+                                    "the supported Site expected-hours range."
+                                ),
+                                "details": {
+                                    "siteId": site_id,
+                                    "suggestedHours": float(suggested_hours),
+                                },
+                            },
+                        )
+                    cursor.execute(
+                        """
+                        UPDATE locations
+                        SET expected_hours = %s,
+                            expected_hours_source = 'learned_accepted',
+                            expected_hours_learning_decision = 'accepted',
+                            expected_hours_learning_fingerprint = %s,
+                            expected_hours_learning_snapshot = %s::jsonb,
+                            expected_hours_learning_decided_at = NOW(),
+                            expected_hours_learning_decided_by = %s,
+                            expected_hours_learning_decision_reason = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (
+                            suggested_hours,
+                            current_fingerprint,
+                            baseline_snapshot_json,
+                            int(current_admin["id"]),
+                            reason,
+                            site_id,
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE locations
+                        SET expected_hours_learning_decision = 'rejected',
+                            expected_hours_learning_fingerprint = %s,
+                            expected_hours_learning_snapshot = %s::jsonb,
+                            expected_hours_learning_decided_at = NOW(),
+                            expected_hours_learning_decided_by = %s,
+                            expected_hours_learning_decision_reason = %s,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (
+                            current_fingerprint,
+                            baseline_snapshot_json,
+                            int(current_admin["id"]),
+                            reason,
+                            site_id,
+                        ),
+                    )
+
+                updated_site = _load_expected_hours_site(site_id, cursor=cursor)
+                updated_baseline = _expected_hours_baseline(
+                    _baseline_job_from_site(updated_site),
+                    learning_by_site,
+                )
+
+        return {
+            "success": True,
+            "siteId": site_id,
+            "decision": payload.decision,
+            "expectedHours": updated_baseline["plannedHours"],
+            "expectedHoursBaseline": updated_baseline,
+            "siteUpdateToken": _entity_update_token("site", updated_site),
+        }
 
     @router.get("/api/admin/operations/forecast")
     def operations_forecast(

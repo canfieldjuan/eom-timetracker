@@ -715,6 +715,139 @@ def _paired_version_two_visit(
     return visit_id, departure_id
 
 
+def _seed_expected_hours_suggestion(
+    cur,
+    suffix: str,
+    *,
+    durations: list[float] | None = None,
+) -> dict[str, object]:
+    app_timezone = ZoneInfo("America/Chicago")
+    today = datetime.now(app_timezone).date()
+    source_id = _source(
+        cur,
+        f"expected_hours_decision_{suffix}",
+        "commercial_evening_night",
+    )
+    _, site_id = _customer_site(
+        cur,
+        f"Expected Hours Decision {suffix}",
+        site_type="Commercial",
+        rate=80,
+        rate_type="per_visit",
+        expected_hours=None,
+    )
+    employee_id = _employee(cur, f"Expected Hours Decision {suffix}", 25)
+    clean_durations = durations or [2, 3, 4]
+    completed_days = [
+        today - timedelta(days=21),
+        today - timedelta(days=14),
+        today - timedelta(days=7),
+    ][: len(clean_durations)]
+    for index, (completed_day, duration) in enumerate(
+        zip(completed_days, clean_durations)
+    ):
+        local_start = datetime.combine(
+            completed_day,
+            time(hour=18),
+            tzinfo=app_timezone,
+        )
+        job_id = _job(
+            cur,
+            source_id=source_id,
+            location_id=site_id,
+            customer_name=f"{TEST_PREFIX} Customer Expected Hours Decision {suffix}",
+            start=local_start.astimezone(timezone.utc),
+            end=(local_start + timedelta(hours=duration)).astimezone(timezone.utc),
+            source_seed=f"expected-hours-decision-{suffix}-{index}",
+        )
+        cur.execute("UPDATE jobs SET status = 'completed' WHERE id = %s", (job_id,))
+        shift_id = _shift(
+            cur,
+            employee_id=employee_id,
+            start=local_start.astimezone(timezone.utc),
+            end=(local_start + timedelta(hours=duration)).astimezone(timezone.utc),
+            service_day=completed_day,
+            location_id=site_id,
+            location_label=f"{TEST_PREFIX} Site Expected Hours Decision {suffix}",
+            job_id=job_id,
+        )
+        _paired_version_two_visit(
+            cur,
+            employee_id=employee_id,
+            shift_id=shift_id,
+            location_id=site_id,
+            job_id=job_id,
+            arrival=local_start.astimezone(timezone.utc),
+            departure=(local_start + timedelta(hours=duration)).astimezone(
+                timezone.utc
+            ),
+            suffix=f"Expected Hours Decision {suffix} {index}",
+        )
+
+    future_day = today + timedelta(days=1)
+    future_start = datetime.combine(future_day, time(hour=18), tzinfo=app_timezone)
+    future_job_id = _job(
+        cur,
+        source_id=source_id,
+        location_id=site_id,
+        customer_name=f"{TEST_PREFIX} Customer Expected Hours Decision {suffix}",
+        start=future_start.astimezone(timezone.utc),
+        end=(future_start + timedelta(hours=2)).astimezone(timezone.utc),
+        source_seed=f"expected-hours-decision-{suffix}-future",
+    )
+    return {
+        "sourceId": source_id,
+        "siteId": site_id,
+        "employeeId": employee_id,
+        "futureJobId": future_job_id,
+        "futureDay": future_day,
+    }
+
+
+def _add_expected_hours_learning_sample(
+    cur,
+    *,
+    source_id: int,
+    site_id: int,
+    employee_id: int,
+    suffix: str,
+    day: date,
+    duration: float,
+) -> None:
+    app_timezone = ZoneInfo("America/Chicago")
+    local_start = datetime.combine(day, time(hour=18), tzinfo=app_timezone)
+    job_id = _job(
+        cur,
+        source_id=source_id,
+        location_id=site_id,
+        customer_name=f"{TEST_PREFIX} Customer Expected Hours Decision {suffix}",
+        start=local_start.astimezone(timezone.utc),
+        end=(local_start + timedelta(hours=duration)).astimezone(timezone.utc),
+        source_seed=f"expected-hours-decision-{suffix}-extra",
+    )
+    cur.execute("UPDATE jobs SET status = 'completed' WHERE id = %s", (job_id,))
+    shift_id = _shift(
+        cur,
+        employee_id=employee_id,
+        start=local_start.astimezone(timezone.utc),
+        end=(local_start + timedelta(hours=duration)).astimezone(timezone.utc),
+        service_day=day,
+        location_id=site_id,
+        location_label=f"{TEST_PREFIX} Site Expected Hours Decision {suffix}",
+        job_id=job_id,
+    )
+    _paired_version_two_visit(
+        cur,
+        employee_id=employee_id,
+        shift_id=shift_id,
+        location_id=site_id,
+        job_id=job_id,
+        arrival=local_start.astimezone(timezone.utc),
+        departure=(local_start + timedelta(hours=duration)).astimezone(timezone.utc),
+        suffix=f"Expected Hours Decision {suffix} extra",
+    )
+
+
 def _reviewed_departure_correction(
     cur,
     *,
@@ -4470,6 +4603,7 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
             "lookbackDays": 180,
         },
         "exclusionRules": list(ops.EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+        "baselineFingerprint": None,
     }
     assert body["summary"]["plannedHours"] is None
     assert body["summary"]["knownPlannedHours"] == pytest.approx(10)
@@ -5553,6 +5687,231 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
     assert {issue["code"] for issue in schedule_job["issues"]} == {
         "missing_expected_hours"
     }
+
+
+def test_expected_hours_baseline_acceptance_promotes_suggestion_to_planned_hours(
+    client,
+    auth,
+):
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            seed = _seed_expected_hours_suggestion(cur, "Accept")
+
+    forecast_response = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4},
+    )
+    assert forecast_response.status_code == 200, forecast_response.text
+    forecast_job = {
+        row["jobId"]: row
+        for week in forecast_response.json()["weeks"]
+        for row in week["jobs"]
+    }[seed["futureJobId"]]
+    baseline = forecast_job["expectedHoursBaseline"]
+    assert baseline["source"] == "learned_suggestion"
+    assert baseline["state"] == "suggested"
+    assert baseline["plannedHours"] is None
+    assert baseline["suggestedHours"] == 3
+    assert re.fullmatch(r"[0-9a-f]{64}", baseline["baselineFingerprint"])
+
+    accepted = client.post(
+        f"/api/admin/operations/sites/{seed['siteId']}/expected-hours-baseline/decision",
+        headers=auth,
+        json={
+            "decision": "accept",
+            "baselineFingerprint": baseline["baselineFingerprint"],
+            "reason": "Use the current median after three clean visits",
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    accepted_body = accepted.json()
+    assert accepted_body["expectedHours"] == 3
+    accepted_baseline = accepted_body["expectedHoursBaseline"]
+    assert accepted_baseline["source"] == "learned_accepted"
+    assert accepted_baseline["state"] == "accepted"
+    assert accepted_baseline["plannedHours"] == 3
+    assert accepted_baseline["manualHours"] is None
+    assert accepted_baseline["suggestedHours"] == 3
+    assert accepted_baseline["sampleSize"] == 3
+    assert accepted_baseline["observationPeriod"] == baseline["observationPeriod"]
+    assert accepted_baseline["exclusionRules"] == baseline["exclusionRules"]
+    assert accepted_baseline["baselineFingerprint"] == baseline["baselineFingerprint"]
+    assert re.fullmatch(r"[0-9a-f]{64}", accepted_body["siteUpdateToken"])
+
+    row = db.query_one(
+        """
+        SELECT expected_hours, expected_hours_source,
+               expected_hours_learning_decision,
+               expected_hours_learning_fingerprint,
+               expected_hours_learning_snapshot,
+               expected_hours_learning_decision_reason
+        FROM locations
+        WHERE id = %s
+        """,
+        (seed["siteId"],),
+    )
+    assert float(row["expected_hours"]) == pytest.approx(3)
+    assert row["expected_hours_source"] == "learned_accepted"
+    assert row["expected_hours_learning_decision"] == "accepted"
+    assert row["expected_hours_learning_fingerprint"] == baseline["baselineFingerprint"]
+    assert row["expected_hours_learning_snapshot"]["baselineFingerprint"] == (
+        baseline["baselineFingerprint"]
+    )
+    assert row["expected_hours_learning_snapshot"]["sampleSize"] == 3
+    assert row["expected_hours_learning_decision_reason"] == (
+        "Use the current median after three clean visits"
+    )
+
+    refreshed_response = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4},
+    )
+    assert refreshed_response.status_code == 200, refreshed_response.text
+    refreshed_job = {
+        row["jobId"]: row
+        for week in refreshed_response.json()["weeks"]
+        for row in week["jobs"]
+    }[seed["futureJobId"]]
+    assert refreshed_job["plannedHours"] == 3
+    assert refreshed_job["estLaborCost"] is not None
+    assert "missing_expected_hours" not in {
+        issue["code"] for issue in refreshed_job["issues"]
+    }
+    assert refreshed_job["expectedHoursBaseline"]["state"] == "accepted"
+
+    manual_override = client.patch(
+        f"/api/admin/locations/{seed['siteId']}",
+        headers=auth,
+        json={
+            "expectedUpdateToken": accepted_body["siteUpdateToken"],
+            "expectedHours": 4,
+        },
+    )
+    assert manual_override.status_code == 200, manual_override.text
+    manual_site = manual_override.json()["location"]
+    assert manual_site["expectedHours"] == 4
+    assert manual_site["expectedHoursSource"] == "manual"
+    assert manual_site["expectedHoursLearningDecision"] is None
+    assert manual_site["expectedHoursLearningFingerprint"] is None
+    manual_row = db.query_one(
+        """
+        SELECT expected_hours_learning_snapshot
+        FROM locations
+        WHERE id = %s
+        """,
+        (seed["siteId"],),
+    )
+    assert manual_row["expected_hours_learning_snapshot"] is None
+
+
+def test_expected_hours_baseline_rejection_is_fingerprint_scoped(client, auth):
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            seed = _seed_expected_hours_suggestion(cur, "Reject")
+
+    forecast_response = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4},
+    )
+    assert forecast_response.status_code == 200, forecast_response.text
+    forecast_job = {
+        row["jobId"]: row
+        for week in forecast_response.json()["weeks"]
+        for row in week["jobs"]
+    }[seed["futureJobId"]]
+    baseline = forecast_job["expectedHoursBaseline"]
+    assert baseline["state"] == "suggested"
+
+    stale = client.post(
+        f"/api/admin/operations/sites/{seed['siteId']}/expected-hours-baseline/decision",
+        headers=auth,
+        json={
+            "decision": "reject",
+            "baselineFingerprint": "0" * 64,
+        },
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["code"] == "stale_expected_hours_baseline"
+
+    rejected = client.post(
+        f"/api/admin/operations/sites/{seed['siteId']}/expected-hours-baseline/decision",
+        headers=auth,
+        json={
+            "decision": "reject",
+            "baselineFingerprint": baseline["baselineFingerprint"],
+            "reason": "Wait for one more completed visit",
+        },
+    )
+    assert rejected.status_code == 200, rejected.text
+    rejected_baseline = rejected.json()["expectedHoursBaseline"]
+    assert rejected_baseline["source"] == "learned_rejected"
+    assert rejected_baseline["state"] == "rejected"
+    assert rejected_baseline["plannedHours"] is None
+    assert rejected_baseline["suggestedHours"] == 3
+    assert rejected_baseline["sampleSize"] == 3
+    assert rejected_baseline["baselineFingerprint"] == baseline["baselineFingerprint"]
+
+    row = db.query_one(
+        """
+        SELECT expected_hours, expected_hours_learning_decision,
+               expected_hours_learning_fingerprint,
+               expected_hours_learning_snapshot
+        FROM locations
+        WHERE id = %s
+        """,
+        (seed["siteId"],),
+    )
+    assert row["expected_hours"] is None
+    assert row["expected_hours_learning_decision"] == "rejected"
+    assert row["expected_hours_learning_fingerprint"] == baseline["baselineFingerprint"]
+    assert row["expected_hours_learning_snapshot"]["baselineFingerprint"] == (
+        baseline["baselineFingerprint"]
+    )
+
+    rejected_forecast = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4},
+    )
+    assert rejected_forecast.status_code == 200, rejected_forecast.text
+    rejected_job = {
+        row["jobId"]: row
+        for week in rejected_forecast.json()["weeks"]
+        for row in week["jobs"]
+    }[seed["futureJobId"]]
+    assert rejected_job["expectedHoursBaseline"]["state"] == "rejected"
+    assert rejected_job["plannedHours"] is None
+
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _add_expected_hours_learning_sample(
+                cur,
+                source_id=int(seed["sourceId"]),
+                site_id=int(seed["siteId"]),
+                employee_id=int(seed["employeeId"]),
+                suffix="Reject",
+                day=seed["futureDay"] - timedelta(days=2),
+                duration=8,
+            )
+
+    refreshed_response = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4},
+    )
+    assert refreshed_response.status_code == 200, refreshed_response.text
+    refreshed_job = {
+        row["jobId"]: row
+        for week in refreshed_response.json()["weeks"]
+        for row in week["jobs"]
+    }[seed["futureJobId"]]
+    refreshed_baseline = refreshed_job["expectedHoursBaseline"]
+    assert refreshed_baseline["state"] == "suggested"
+    assert refreshed_baseline["source"] == "learned_suggestion"
+    assert refreshed_baseline["baselineFingerprint"] != baseline["baselineFingerprint"]
 
 
 def test_expected_hours_learning_excludes_evidence_after_observed_at():
