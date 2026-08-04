@@ -38,6 +38,40 @@ OPERATIONS_FORECAST_ALLOWED_WEEKS = {4, 8, 12}
 UTILIZATION_REVIEW_KEY_VERSION = "utilization-review.v1"
 UTILIZATION_EVIDENCE_VERSION = "utilization-classifier.v1"
 UTILIZATION_MISSING_DEPARTURE_CORRECTION = "utilization_missing_departure.v1"
+EXPECTED_HOURS_LEARNING_LOOKBACK_DAYS = 180
+EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES = 3
+EXPECTED_HOURS_LEARNING_EXCLUSION_RULE_DEFINITIONS = (
+    {"code": "requires_completed_job", "source": "candidate_pairs"},
+    {"code": "requires_productive_v2_site_events", "source": "paired_visit_evidence"},
+    {
+        "code": "requires_positive_paired_arrive_depart_interval",
+        "source": "paired_visit_evidence",
+    },
+    {
+        "code": "requires_observed_evidence_at_or_before_request",
+        "source": "paired_visit_evidence",
+    },
+    {"code": "requires_valid_paid_envelope", "source": "paired_visit_evidence"},
+    {"code": "excludes_unpaired_or_invalid_site_events", "source": "invalid_jobs"},
+    {"code": "excludes_unaccepted_qr_check_ins", "source": "invalid_jobs"},
+    {"code": "excludes_legacy_site_events", "source": "legacy_shift_jobs"},
+    {"code": "excludes_overlapping_worker_intervals", "source": "overlap_jobs"},
+    {
+        "code": "excludes_embedded_arrival_conflicts",
+        "source": "contradictory_arrival_jobs",
+    },
+    {
+        "code": "excludes_contradictory_departure_events",
+        "source": "contradictory_departure_jobs",
+    },
+    {
+        "code": "excludes_unassigned_worker_intervals",
+        "source": "unassigned_worker_jobs",
+    },
+)
+EXPECTED_HOURS_LEARNING_EXCLUSION_RULES = tuple(
+    str(rule["code"]) for rule in EXPECTED_HOURS_LEARNING_EXCLUSION_RULE_DEFINITIONS
+)
 
 
 class UtilizationMissingDepartureCorrectionRequest(BaseModel):
@@ -79,6 +113,42 @@ def _issue(code: str, message: str) -> Dict[str, str]:
     return {"code": code, "message": message}
 
 
+def _median(values: List[float]) -> float:
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2
+
+
+def _empty_expected_hours_learning(
+    *,
+    observation_start: date,
+    observation_end: date,
+) -> Dict[str, Any]:
+    return {
+        "sampleSize": 0,
+        "minimumSampleSize": EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES,
+        "suggestedHours": None,
+        "observationPeriod": {
+            "startDate": str(observation_start),
+            "endDate": str(observation_end),
+            "lookbackDays": EXPECTED_HOURS_LEARNING_LOOKBACK_DAYS,
+        },
+        "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+    }
+
+
+def _cursor_rows_as_dicts(cursor: Any, rows: Iterable[Any]) -> List[Dict[str, Any]]:
+    materialized_rows = rows if isinstance(rows, list) else list(rows)
+    if not materialized_rows:
+        return []
+    if hasattr(materialized_rows[0], "keys"):
+        return [dict(row) for row in materialized_rows]
+    columns = [column[0] for column in cursor.description]
+    return [dict(zip(columns, row)) for row in materialized_rows]
+
+
 def _query_all(
     sql: str,
     params: tuple = (),
@@ -88,7 +158,18 @@ def _query_all(
     if cursor is None:
         return db.query_all(sql, params)
     cursor.execute(sql, params)
-    return [dict(row) for row in cursor.fetchall()]
+    return _cursor_rows_as_dicts(cursor, cursor.fetchall())
+
+
+def _expected_hours_learning_site_ids(jobs: Iterable[Dict[str, Any]]) -> List[int]:
+    return sorted(
+        {
+            int(job["location_id"])
+            for job in jobs
+            if job.get("location_id") is not None
+            and job.get("site_expected_hours") is None
+        }
+    )
 
 
 def _local_bounds(
@@ -300,6 +381,622 @@ def _load_linked_job_metadata(
     }
 
 
+def _candidate_reviewed_departures_for_learning(
+    site_ids: List[int],
+    *,
+    cursor: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    if not site_ids:
+        return []
+    return _query_all(
+        """
+        WITH correction_candidates AS (
+            SELECT correction.id,
+                   correction.snapshot,
+                   correction.result,
+                   (correction.result ->> 'shiftId')::integer AS shift_id,
+                   (correction.result ->> 'visitId')::integer AS visit_id
+            FROM time_data_correction_batches correction
+            WHERE correction.snapshot ->> 'correctionType' = %s
+              AND correction.result ? 'shiftId'
+              AND correction.result ? 'visitId'
+              AND correction.result ? 'locationId'
+              AND correction.result ? 'effectiveDepartureAt'
+              AND correction.result ->> 'shiftId' ~ '^[0-9]+$'
+              AND correction.result ->> 'visitId' ~ '^[0-9]+$'
+              AND correction.result ->> 'locationId' ~ '^[0-9]+$'
+        )
+        SELECT correction.id,
+               correction.snapshot,
+               correction.result,
+               correction.shift_id,
+               correction.visit_id
+        FROM correction_candidates correction
+        JOIN visits v ON v.id = correction.visit_id
+        WHERE v.location_id = ANY(%s)
+        ORDER BY correction.id
+        """,
+        (
+            UTILIZATION_MISSING_DEPARTURE_CORRECTION,
+            site_ids,
+        ),
+        cursor=cursor,
+    )
+
+
+def _current_reviewed_departure_ids_for_learning(
+    site_ids: List[int],
+    *,
+    cursor: Optional[Any] = None,
+) -> List[int]:
+    candidate_rows = _candidate_reviewed_departures_for_learning(
+        site_ids,
+        cursor=cursor,
+    )
+    if not candidate_rows:
+        return []
+
+    def resolve_valid_ids(active_cursor: Any) -> List[int]:
+        prepared_by_shift: Dict[int, List[Dict[str, Any]]] = {}
+        valid_ids: List[int] = []
+        for row in candidate_rows:
+            result = dict(row.get("result") or {})
+            snapshot = dict(row.get("snapshot") or {})
+            try:
+                shift_id = int(row.get("shift_id") or result["shiftId"])
+                visit_id = int(row.get("visit_id") or result["visitId"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if shift_id not in prepared_by_shift:
+                try:
+                    shift, visits, departures = _load_utilization_shift_evidence(
+                        active_cursor,
+                        shift_id,
+                    )
+                except HTTPException:
+                    prepared_by_shift[shift_id] = []
+                    continue
+                _, raw_review_items = _closed_shift_utilization(
+                    shift,
+                    visits,
+                    departures,
+                )
+                evidence_by_shift = {
+                    shift_id: _utilization_shift_evidence_snapshot(
+                        shift,
+                        visits,
+                        departures,
+                    )
+                }
+                prepared_by_shift[shift_id] = _prepare_utilization_review_items(
+                    raw_review_items,
+                    evidence_by_shift,
+                )
+
+            current_review = next(
+                (
+                    item
+                    for item in prepared_by_shift[shift_id]
+                    if item.get("code") == "missing_departure"
+                    and item.get("visitId") is not None
+                    and int(item["visitId"]) == visit_id
+                ),
+                None,
+            )
+            if current_review is None:
+                continue
+            if (
+                str(snapshot.get("reviewKey") or "")
+                == str(current_review["reviewKey"])
+                and str(snapshot.get("evidenceFingerprint") or "")
+                == str(current_review["evidenceFingerprint"])
+            ):
+                valid_ids.append(int(row["id"]))
+        return valid_ids
+
+    if cursor is not None:
+        return resolve_valid_ids(cursor)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as review_cursor:
+            return resolve_valid_ids(review_cursor)
+
+
+def _load_expected_hours_learning_by_site(
+    site_ids: Iterable[Any],
+    *,
+    observed_at: datetime,
+    app_timezone: ZoneInfo,
+    cursor: Optional[Any] = None,
+) -> Dict[int, Dict[str, Any]]:
+    resolved_site_ids = sorted(
+        {int(site_id) for site_id in site_ids if site_id is not None}
+    )
+    observed_local_day = observed_at.astimezone(app_timezone).date()
+    observation_start = observed_local_day - timedelta(
+        days=EXPECTED_HOURS_LEARNING_LOOKBACK_DAYS
+    )
+    observation_end = observed_local_day
+    learning = {
+        site_id: _empty_expected_hours_learning(
+            observation_start=observation_start,
+            observation_end=observation_end,
+        )
+        for site_id in resolved_site_ids
+    }
+    if not resolved_site_ids:
+        return learning
+
+    timezone_name = getattr(app_timezone, "key", str(app_timezone))
+    reviewed_departure_ids = _current_reviewed_departure_ids_for_learning(
+        resolved_site_ids,
+        cursor=cursor,
+    )
+    rows = _query_all(
+        """
+        WITH target_shifts AS (
+            SELECT DISTINCT v.shift_id
+            FROM visits v
+            WHERE v.location_id = ANY(%s)
+              AND v.sequence_version >= 2
+        ),
+        reviewed_departures AS (
+            SELECT DISTINCT ON (
+                (correction.result ->> 'shiftId')::integer,
+                (correction.result ->> 'visitId')::integer
+            )
+                correction.id,
+                (correction.result ->> 'shiftId')::integer AS shift_id,
+                (correction.result ->> 'visitId')::integer AS visit_id,
+                (correction.result ->> 'locationId')::integer AS location_id,
+                (correction.result ->> 'effectiveDepartureAt')::timestamptz
+                    AS departure_time
+            FROM time_data_correction_batches correction
+            WHERE correction.snapshot ->> 'correctionType' = %s
+              AND correction.id = ANY(%s::bigint[])
+              AND correction.result ? 'shiftId'
+              AND correction.result ? 'visitId'
+              AND correction.result ? 'locationId'
+              AND correction.result ? 'effectiveDepartureAt'
+              AND correction.result ->> 'shiftId' ~ '^[0-9]+$'
+              AND correction.result ->> 'visitId' ~ '^[0-9]+$'
+              AND correction.result ->> 'locationId' ~ '^[0-9]+$'
+            ORDER BY
+                (correction.result ->> 'shiftId')::integer,
+                (correction.result ->> 'visitId')::integer,
+                correction.id DESC
+        ),
+        visit_evidence AS (
+            SELECT
+                v.id AS visit_id,
+                evidence_shift.id AS shift_id,
+                v.location_id,
+                v.arrival_time,
+                v.sequence_version,
+                evidence_shift.employee_id,
+                d.id AS recorded_departure_id,
+                reviewed_departure.id AS reviewed_departure_id,
+                (
+                    d.id IS NOT NULL
+                    OR reviewed_departure.id IS NOT NULL
+                ) AS has_departure,
+                COALESCE(
+                    d.departure_time,
+                    reviewed_departure.departure_time
+                ) AS departure_time,
+                COALESCE(
+                    d.location_id,
+                    reviewed_departure.location_id
+                ) AS departure_location_id,
+                evidence_shift.time_category,
+                COALESCE(
+                    correction.corrected_clock_in,
+                    evidence_shift.clock_in
+                ) AS paid_clock_in,
+                COALESCE(
+                    correction.corrected_clock_out,
+                    evidence_shift.clock_out
+                ) AS paid_clock_out,
+                COALESCE(
+                    correction.corrected_break_minutes,
+                    0
+                ) AS payroll_break_minutes,
+                COALESCE(
+                    CASE
+                        WHEN v.site_check_in_id IS NOT NULL
+                         AND check_in_job.location_id = v.location_id
+                        THEN sci.job_id
+                    END,
+                    CASE
+                        WHEN v.site_check_in_id IS NULL
+                         AND visit_job.location_id = v.location_id
+                        THEN v.job_id
+                    END,
+                    CASE
+                        WHEN shift_job.location_id = v.location_id
+                        THEN evidence_shift.job_id
+                    END
+                ) AS resolved_job_id,
+                (
+                    v.site_check_in_id IS NULL
+                    OR (
+                        sci.employee_id = evidence_shift.employee_id
+                        AND sci.location_id = v.location_id
+                        AND DATE_TRUNC('second', sci.server_checked_in_at)
+                            = DATE_TRUNC('second', v.arrival_time)
+                        AND (
+                            (
+                                sci.classification IN ('on_time', 'late')
+                                AND sci.review_status = 'not_required'
+                            )
+                            OR (
+                                sci.classification = 'needs_review'
+                                AND sci.review_status = 'approved'
+                            )
+                        )
+                    )
+                ) AS accepted_check_in
+            FROM visits v
+            JOIN target_shifts target ON target.shift_id = v.shift_id
+            JOIN shifts evidence_shift ON evidence_shift.id = v.shift_id
+            LEFT JOIN LATERAL (
+                SELECT
+                    shift_correction.corrected_clock_in,
+                    shift_correction.corrected_clock_out,
+                    shift_correction.corrected_break_minutes
+                FROM payroll_shift_corrections shift_correction
+                WHERE shift_correction.shift_id = evidence_shift.id
+                  AND shift_correction.status = 'active'
+                  AND shift_correction.week_start = (
+                      COALESCE(
+                          evidence_shift.local_date,
+                          (evidence_shift.clock_in AT TIME ZONE %s)::date
+                      )
+                      - EXTRACT(
+                          DOW FROM COALESCE(
+                              evidence_shift.local_date,
+                              (evidence_shift.clock_in AT TIME ZONE %s)::date
+                          )
+                      )::integer
+                  )
+                ORDER BY shift_correction.week_start DESC, shift_correction.id DESC
+                LIMIT 1
+            ) correction ON TRUE
+            LEFT JOIN jobs visit_job ON visit_job.id = v.job_id
+            LEFT JOIN jobs shift_job ON shift_job.id = evidence_shift.job_id
+            LEFT JOIN site_check_ins sci ON sci.id = v.site_check_in_id
+            LEFT JOIN jobs check_in_job ON check_in_job.id = sci.job_id
+            LEFT JOIN departures d ON d.visit_id = v.id
+                                  AND d.shift_id = v.shift_id
+            LEFT JOIN reviewed_departures reviewed_departure
+                   ON reviewed_departure.visit_id = v.id
+                  AND reviewed_departure.shift_id = v.shift_id
+                  AND d.id IS NULL
+        ),
+        paired_visit_evidence AS (
+            SELECT *,
+                   EXTRACT(EPOCH FROM (departure_time - arrival_time)) AS raw_seconds
+            FROM visit_evidence
+            WHERE time_category = 'productive'
+              AND sequence_version >= 2
+              AND location_id IS NOT NULL
+              AND has_departure IS TRUE
+              AND departure_time > arrival_time
+              AND arrival_time <= %s
+              AND departure_time <= %s
+              AND paid_clock_in <= %s
+              AND paid_clock_out <= %s
+              AND departure_location_id IS NOT DISTINCT FROM location_id
+              AND accepted_check_in IS TRUE
+              AND paid_clock_in IS NOT NULL
+              AND paid_clock_out IS NOT NULL
+              AND paid_clock_out > paid_clock_in
+              AND arrival_time >= paid_clock_in
+              AND departure_time <= paid_clock_out
+        ),
+        invalid_jobs AS (
+            SELECT DISTINCT resolved_job_id AS job_id
+            FROM visit_evidence
+            WHERE resolved_job_id IS NOT NULL
+              AND (
+                    time_category IS DISTINCT FROM 'productive'
+                    OR sequence_version < 2
+                    OR location_id IS NULL
+                    OR has_departure IS NOT TRUE
+                    OR departure_time <= arrival_time
+                    OR departure_location_id IS DISTINCT FROM location_id
+                    OR accepted_check_in IS NOT TRUE
+                    OR paid_clock_in IS NULL
+                    OR paid_clock_out IS NULL
+                    OR paid_clock_out <= paid_clock_in
+                    OR arrival_time < paid_clock_in
+                    OR departure_time > paid_clock_out
+                    OR arrival_time > %s
+                    OR departure_time > %s
+                    OR paid_clock_in > %s
+                    OR paid_clock_out > %s
+              )
+        ),
+        candidate_pairs AS (
+            SELECT pairs.*,
+                   j.id AS job_id,
+                   j.scheduled_date
+            FROM paired_visit_evidence pairs
+            JOIN jobs j ON j.id = pairs.resolved_job_id
+                       AND j.location_id = pairs.location_id
+            WHERE j.status = 'completed'
+              AND j.scheduled_date BETWEEN %s AND %s
+        ),
+        legacy_shift_jobs AS (
+            SELECT DISTINCT candidate.job_id
+            FROM candidate_pairs candidate
+            WHERE EXISTS (
+                SELECT 1
+                FROM visit_evidence legacy
+                WHERE legacy.shift_id = candidate.shift_id
+                  AND legacy.sequence_version < 2
+            )
+        ),
+        overlap_visits AS (
+            SELECT DISTINCT left_pair.visit_id
+            FROM paired_visit_evidence left_pair
+            JOIN paired_visit_evidence right_pair
+              ON right_pair.employee_id = left_pair.employee_id
+             AND right_pair.visit_id <> left_pair.visit_id
+             AND left_pair.arrival_time < right_pair.departure_time
+             AND right_pair.arrival_time < left_pair.departure_time
+        ),
+        overlap_jobs AS (
+            SELECT DISTINCT candidate.job_id
+            FROM candidate_pairs candidate
+            WHERE EXISTS (
+                SELECT 1
+                FROM overlap_visits overlap
+                WHERE overlap.visit_id = candidate.visit_id
+            )
+        ),
+        contradictory_arrival_visits AS (
+            SELECT DISTINCT pair.visit_id
+            FROM paired_visit_evidence pair
+            JOIN visit_evidence other_arrival
+              ON other_arrival.shift_id = pair.shift_id
+             AND other_arrival.visit_id <> pair.visit_id
+             AND pair.arrival_time <= other_arrival.arrival_time
+             AND other_arrival.arrival_time < pair.departure_time
+        ),
+        contradictory_arrival_jobs AS (
+            SELECT DISTINCT candidate.job_id
+            FROM candidate_pairs candidate
+            WHERE EXISTS (
+                SELECT 1
+                FROM contradictory_arrival_visits conflict
+                WHERE conflict.visit_id = candidate.visit_id
+            )
+        ),
+        contradictory_departure_visits AS (
+            SELECT DISTINCT pair.visit_id
+            FROM paired_visit_evidence pair
+            JOIN departures other_departure
+              ON other_departure.shift_id = pair.shift_id
+             AND other_departure.id IS DISTINCT FROM pair.recorded_departure_id
+             AND pair.arrival_time < other_departure.departure_time
+             AND other_departure.departure_time <= pair.departure_time
+        ),
+        contradictory_departure_jobs AS (
+            SELECT DISTINCT candidate.job_id
+            FROM candidate_pairs candidate
+            WHERE EXISTS (
+                SELECT 1
+                FROM contradictory_departure_visits conflict
+                WHERE conflict.visit_id = candidate.visit_id
+            )
+        ),
+        unassigned_worker_jobs AS (
+            SELECT DISTINCT candidate.job_id
+            FROM candidate_pairs candidate
+            WHERE EXISTS (
+                SELECT 1
+                FROM paired_visit_evidence unassigned
+                WHERE unassigned.location_id = candidate.location_id
+                  AND unassigned.resolved_job_id IS NULL
+                  AND (unassigned.arrival_time AT TIME ZONE %s)::date
+                      = candidate.scheduled_date
+            )
+        ),
+        clean_pairs AS (
+            SELECT candidate.*
+            FROM candidate_pairs candidate
+            WHERE candidate.location_id = ANY(%s)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM invalid_jobs invalid
+                  WHERE invalid.job_id = candidate.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM legacy_shift_jobs legacy
+                  WHERE legacy.job_id = candidate.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM overlap_jobs overlap
+                  WHERE overlap.job_id = candidate.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM contradictory_arrival_jobs conflict
+                  WHERE conflict.job_id = candidate.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM contradictory_departure_jobs conflict
+                  WHERE conflict.job_id = candidate.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM unassigned_worker_jobs unassigned
+                  WHERE unassigned.job_id = candidate.job_id
+              )
+        ),
+        scope_pairs AS (
+            SELECT pairs.*
+            FROM paired_visit_evidence pairs
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM overlap_visits overlap
+                WHERE overlap.visit_id = pairs.visit_id
+            )
+        ),
+        shift_scopes AS (
+            SELECT shift_id,
+                   COUNT(DISTINCT location_id) AS location_count,
+                   COUNT(DISTINCT resolved_job_id)
+                       FILTER (WHERE resolved_job_id IS NOT NULL) AS job_count,
+                   COUNT(*) FILTER (WHERE resolved_job_id IS NULL)
+                       AS unassigned_job_count
+            FROM scope_pairs
+            GROUP BY shift_id
+        ),
+        shift_job_seconds AS (
+            SELECT clean.job_id,
+                   clean.location_id,
+                   clean.scheduled_date,
+                   clean.shift_id,
+                   GREATEST(
+                       SUM(clean.raw_seconds)
+                       - CASE
+                           WHEN MAX(scope.location_count) = 1
+                            AND MAX(scope.job_count) = 1
+                            AND MAX(scope.unassigned_job_count) = 0
+                           THEN LEAST(
+                               MAX(clean.payroll_break_minutes) * 60,
+                               SUM(clean.raw_seconds)
+                           )
+                           ELSE 0
+                         END,
+                       0
+                   ) AS person_seconds,
+                   COUNT(*) AS interval_count
+            FROM clean_pairs clean
+            JOIN shift_scopes scope ON scope.shift_id = clean.shift_id
+            GROUP BY clean.job_id, clean.location_id, clean.scheduled_date, clean.shift_id
+        )
+        SELECT job_id,
+               location_id,
+               scheduled_date,
+               SUM(person_seconds) / 3600.0 AS person_hours,
+               SUM(interval_count) AS interval_count
+        FROM shift_job_seconds
+        GROUP BY job_id, location_id, scheduled_date
+        HAVING SUM(person_seconds) > 0
+        ORDER BY location_id, scheduled_date, job_id
+        """,
+        (
+            resolved_site_ids,
+            UTILIZATION_MISSING_DEPARTURE_CORRECTION,
+            reviewed_departure_ids,
+            timezone_name,
+            timezone_name,
+            observed_at,
+            observed_at,
+            observed_at,
+            observed_at,
+            observed_at,
+            observed_at,
+            observed_at,
+            observed_at,
+            observation_start,
+            observation_end,
+            timezone_name,
+            resolved_site_ids,
+        ),
+        cursor=cursor,
+    )
+
+    observations_by_site: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        observations_by_site[int(row["location_id"])].append(dict(row))
+    for site_id, observations in observations_by_site.items():
+        samples = [float(row["person_hours"]) for row in observations]
+        sample_size = len(samples)
+        first_date = min(row["scheduled_date"] for row in observations)
+        last_date = max(row["scheduled_date"] for row in observations)
+        learning[site_id] = {
+            "sampleSize": sample_size,
+            "minimumSampleSize": EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES,
+            "suggestedHours": (
+                round(_median(samples), 2)
+                if sample_size >= EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES
+                else None
+            ),
+            "observationPeriod": {
+                "startDate": str(first_date),
+                "endDate": str(last_date),
+                "lookbackDays": EXPECTED_HOURS_LEARNING_LOOKBACK_DAYS,
+            },
+            "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+        }
+    return learning
+
+
+def _expected_hours_baseline(
+    job: Dict[str, Any],
+    learning_by_site: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    planned_hours = (
+        float(job["site_expected_hours"])
+        if job.get("site_expected_hours") is not None
+        else None
+    )
+    if planned_hours is not None:
+        return {
+            "source": "manual",
+            "state": "manual",
+            "plannedHours": planned_hours,
+            "manualHours": planned_hours,
+            "suggestedHours": None,
+            "sampleSize": None,
+            "minimumSampleSize": EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES,
+            "observationPeriod": None,
+            "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+        }
+    site_id = job.get("location_id")
+    learning = (
+        (learning_by_site or {}).get(int(site_id))
+        if site_id is not None
+        else None
+    )
+    if learning is None:
+        return {
+            "source": "insufficient_data",
+            "state": "learning",
+            "plannedHours": None,
+            "manualHours": None,
+            "suggestedHours": None,
+            "sampleSize": 0,
+            "minimumSampleSize": EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES,
+            "observationPeriod": None,
+            "exclusionRules": list(EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
+        }
+    suggested_hours = learning.get("suggestedHours")
+    source = "learned_suggestion" if suggested_hours is not None else "insufficient_data"
+    return {
+        "source": source,
+        "state": "suggested" if suggested_hours is not None else "learning",
+        "plannedHours": None,
+        "manualHours": None,
+        "suggestedHours": suggested_hours,
+        "sampleSize": int(learning.get("sampleSize") or 0),
+        "minimumSampleSize": int(
+            learning.get("minimumSampleSize")
+            or EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES
+        ),
+        "observationPeriod": learning.get("observationPeriod"),
+        "exclusionRules": list(
+            learning.get("exclusionRules") or EXPECTED_HOURS_LEARNING_EXCLUSION_RULES
+        ),
+    }
+
+
 def _job_issues(job: Dict[str, Any]) -> List[Dict[str, str]]:
     issues: List[Dict[str, str]] = []
     if job.get("location_id") is None:
@@ -311,18 +1008,18 @@ def _job_issues(job: Dict[str, Any]) -> List[Dict[str, str]]:
             _issue("archived_site", "This scheduled job points to an archived Site.")
         )
     if job.get("location_id") is not None:
-        if job.get("site_expected_hours") is None:
-            issues.append(
-                _issue(
-                    "missing_expected_hours",
-                    "Expected labor hours per visit are not configured for this Site.",
-                )
-            )
         if job.get("rate") is None:
             issues.append(
                 _issue(
                     "missing_rate",
                     "A service price is not configured for this Site.",
+                )
+            )
+        if job.get("site_expected_hours") is None:
+            issues.append(
+                _issue(
+                    "missing_expected_hours",
+                    "Expected service hours are not configured for this Site.",
                 )
             )
     if job.get("location_id") is not None and job.get("rate_type") not in {
@@ -2678,6 +3375,7 @@ def _decorate_schedule_jobs(
     *,
     visible_range_start: Optional[datetime] = None,
     visible_range_end: Optional[datetime] = None,
+    expected_hours_learning_by_site: Optional[Dict[int, Dict[str, Any]]] = None,
     cursor: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = defaultdict(list)
@@ -2940,6 +3638,10 @@ def _decorate_schedule_jobs(
             if job.get("site_expected_hours") is not None
             else None
         )
+        expected_hours_baseline = _expected_hours_baseline(
+            job,
+            expected_hours_learning_by_site,
+        )
         in_progress = any(worker["status"] == "in_progress" for worker in workers)
         status = str(job.get("status") or "scheduled")
         included_in_plan = status != "cancelled" and _job_is_projection_eligible(job)
@@ -2966,6 +3668,7 @@ def _decorate_schedule_jobs(
                 "executionStatus": execution_status,
                 "includedInPlan": included_in_plan,
                 "plannedHours": planned_hours,
+                "expectedHoursBaseline": expected_hours_baseline,
                 "actualHours": round(actual_hours, 2),
                 "varianceHours": (
                     round(actual_hours - planned_hours, 2)
@@ -2989,6 +3692,7 @@ def _decorate_schedule_jobs(
                     ),
                     "rateType": job.get("rate_type"),
                     "expectedHours": planned_hours,
+                    "expectedHoursBaseline": expected_hours_baseline,
                 },
                 "issues": issues,
             }
@@ -3014,6 +3718,7 @@ def _forecast_job_values(
     job: Dict[str, Any],
     avg_hourly_rate: Optional[Decimal],
     monthly_allocations: Dict[int, int],
+    expected_hours_learning_by_site: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     issues = _job_issues(job)
     included_in_forecast = _job_is_projection_eligible(job)
@@ -3021,6 +3726,10 @@ def _forecast_job_values(
         float(job["site_expected_hours"])
         if job.get("site_expected_hours") is not None
         else None
+    )
+    expected_hours_baseline = _expected_hours_baseline(
+        job,
+        expected_hours_learning_by_site,
     )
     rate_cents = _money_cents(job.get("rate"))
     rate_type = job.get("rate_type")
@@ -3076,6 +3785,7 @@ def _forecast_job_values(
         "sourceRole": job.get("source_role"),
         "includedInForecast": included_in_forecast,
         "plannedHours": expected_hours,
+        "expectedHoursBaseline": expected_hours_baseline,
         "estRevenue": _money(revenue_cents),
         "estLaborCost": _money(labor_cents),
         "estNetProfit": _money(net_cents),
@@ -3307,6 +4017,7 @@ def _actual_profitability_row(
         "executionStatus": row.get("executionStatus"),
         "includedInProfitability": included,
         "plannedHours": row.get("plannedHours"),
+        "expectedHoursBaseline": row.get("expectedHoursBaseline"),
         "actualHours": row.get("actualHours"),
         "varianceHours": row.get("varianceHours"),
         "revenue": _money(revenue_cents),
@@ -4010,6 +4721,12 @@ def build_weekly_labor_profitability(
         allocation_jobs,
         app_timezone,
     )
+    expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
+        _expected_hours_learning_site_ids(jobs),
+        observed_at=observed_at,
+        app_timezone=app_timezone,
+        cursor=cursor,
+    )
     schedule_jobs, unmatched = _decorate_schedule_jobs(
         jobs,
         range_start,
@@ -4018,6 +4735,7 @@ def build_weekly_labor_profitability(
         app_timezone,
         visible_range_start=range_start,
         visible_range_end=range_end,
+        expected_hours_learning_by_site=expected_hours_learning_by_site,
         cursor=cursor,
     )
     source_jobs = {int(job["id"]): job for job in jobs}
@@ -4116,7 +4834,7 @@ def _load_utilization_shift_evidence(
     shift_row = cursor.fetchone()
     if not shift_row:
         raise HTTPException(status_code=404, detail="Paid shift not found")
-    shift = dict(shift_row)
+    shift = _cursor_rows_as_dicts(cursor, [shift_row])[0]
     if lock_shift:
         # The shift row is the first mutable evidence lock. Take table-level
         # read locks only after it so job deletion cannot hold the shift while
@@ -4154,7 +4872,7 @@ def _load_utilization_shift_evidence(
         """,
         (shift_id,),
     )
-    visits = [dict(row) for row in cursor.fetchall()]
+    visits = _cursor_rows_as_dicts(cursor, cursor.fetchall())
     cursor.execute(
         """
         SELECT id, shift_id, visit_id, location_id, location_label,
@@ -4165,7 +4883,7 @@ def _load_utilization_shift_evidence(
         """,
         (shift_id,),
     )
-    departures = [dict(row) for row in cursor.fetchall()]
+    departures = _cursor_rows_as_dicts(cursor, cursor.fetchall())
     return shift, visits, departures
 
 
@@ -4391,8 +5109,18 @@ def build_operations_forecast(
         ):
             continue
         forecast_jobs.append(job)
+    expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
+        _expected_hours_learning_site_ids(forecast_jobs),
+        observed_at=observed_at,
+        app_timezone=app_timezone,
+    )
     calculated = [
-        _forecast_job_values(job, avg_hourly_rate, monthly_allocations)
+        _forecast_job_values(
+            job,
+            avg_hourly_rate,
+            monthly_allocations,
+            expected_hours_learning_by_site,
+        )
         for job in forecast_jobs
     ]
 
@@ -4509,6 +5237,11 @@ def build_operations_schedule_router(
             window_start=range_start,
             window_end=range_end,
         )
+        expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
+            _expected_hours_learning_site_ids(jobs),
+            observed_at=observed_at,
+            app_timezone=app_timezone,
+        )
         scheduled_starts = [
             job["scheduled_start"]
             for job in jobs
@@ -4527,6 +5260,7 @@ def build_operations_schedule_router(
             app_timezone,
             visible_range_start=range_start,
             visible_range_end=range_end,
+            expected_hours_learning_by_site=expected_hours_learning_by_site,
         )
         active_jobs = [job for job in schedule_jobs if job["includedInPlan"]]
         known_planned_hours = sum(

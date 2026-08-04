@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -80,6 +81,58 @@ def test_correction_evidence_locks_shift_before_joined_mutable_inputs():
     assert cursor.queries[1] == "LOCK TABLE site_check_ins, jobs IN SHARE MODE"
     assert "FROM visits v" in cursor.queries[2]
     assert "FROM departures" in cursor.queries[3]
+
+
+def test_query_all_maps_plain_cursor_tuple_rows():
+    class PlainCursor:
+        description = (("id",), ("name",))
+
+        def __init__(self):
+            self.executed = None
+            self.params = None
+
+        def execute(self, query, params=None):
+            self.executed = query
+            self.params = params
+
+        def fetchall(self):
+            return [(17, "Reviewed")]
+
+    cursor = PlainCursor()
+
+    rows = ops._query_all("SELECT id, name FROM reviews WHERE id = %s", (17,), cursor=cursor)
+
+    assert rows == [{"id": 17, "name": "Reviewed"}]
+    assert cursor.executed == "SELECT id, name FROM reviews WHERE id = %s"
+    assert cursor.params == (17,)
+
+
+def test_expected_hours_learning_site_ids_skip_manual_expected_hours():
+    assert ops._expected_hours_learning_site_ids(
+        [
+            {"location_id": 17, "site_expected_hours": 2.5},
+            {"location_id": 18, "site_expected_hours": None},
+            {"location_id": 19, "site_expected_hours": 0},
+            {"location_id": None, "site_expected_hours": None},
+            {"location_id": 18, "site_expected_hours": None},
+        ]
+    ) == [18]
+    assert ops.EXPECTED_HOURS_LEARNING_EXCLUSION_RULES == tuple(
+        rule["code"]
+        for rule in ops.EXPECTED_HOURS_LEARNING_EXCLUSION_RULE_DEFINITIONS
+    )
+    assert {
+        rule["source"]
+        for rule in ops.EXPECTED_HOURS_LEARNING_EXCLUSION_RULE_DEFINITIONS
+    } >= {
+        "paired_visit_evidence",
+        "invalid_jobs",
+        "legacy_shift_jobs",
+        "overlap_jobs",
+        "contradictory_arrival_jobs",
+        "contradictory_departure_jobs",
+        "unassigned_worker_jobs",
+    }
 
 
 def test_aggregate_break_minutes_do_not_shorten_multi_site_segments():
@@ -568,14 +621,15 @@ def _visit(
     suffix: str,
     sequence_version: int = 1,
     site_check_in_id: int | None = None,
+    job_id: int | None = None,
 ) -> int:
     cur.execute(
         """
         INSERT INTO visits (
             shift_id, location_id, location_label, customer_name,
-            arrival_time, sequence_version, site_check_in_id
+            arrival_time, sequence_version, site_check_in_id, job_id
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -586,6 +640,7 @@ def _visit(
             at,
             sequence_version,
             site_check_in_id,
+            job_id,
         ),
     )
     return int(cur.fetchone()[0])
@@ -647,6 +702,7 @@ def _paired_version_two_visit(
         suffix=suffix,
         sequence_version=2,
         site_check_in_id=check_in_id,
+        job_id=job_id,
     )
     departure_id = _departure(
         cur,
@@ -657,6 +713,148 @@ def _paired_version_two_visit(
         visit_id=visit_id,
     )
     return visit_id, departure_id
+
+
+def _reviewed_departure_correction(
+    cur,
+    *,
+    shift_id: int,
+    visit_id: int,
+    location_id: int,
+    effective_departure_at: datetime,
+    suffix: str,
+) -> int:
+    effective_departure_at = effective_departure_at.astimezone(timezone.utc).replace(
+        microsecond=0
+    )
+    review_key = f"test-reviewed-departure:{shift_id}:{visit_id}:{suffix}"
+    fingerprint = hashlib.sha256(review_key.encode("utf-8")).hexdigest()
+    cur.execute(
+        """
+        SELECT s.id, s.employee_id, e.name AS employee_name,
+               s.location_id, s.location_label, s.job_id,
+               s.clock_in, s.clock_out, s.time_category,
+               s.non_productive_type
+        FROM shifts s
+        JOIN employees e ON e.id = s.employee_id
+        WHERE s.id = %s
+        """,
+        (shift_id,),
+    )
+    shift_row = cur.fetchone()
+    shift = dict(zip([column[0] for column in cur.description], shift_row))
+    cur.execute(
+        """
+        SELECT v.id, v.shift_id, v.location_id, v.location_label,
+               v.arrival_time, v.sequence_version, v.site_check_in_id,
+               sci.employee_id AS check_in_employee_id,
+               sci.location_id AS check_in_location_id,
+               sci.server_checked_in_at AS check_in_at,
+               sci.classification AS check_in_classification,
+               sci.review_status AS check_in_review_status,
+               COALESCE(
+                   CASE
+                       WHEN check_in_job.location_id = v.location_id
+                       THEN sci.job_id
+                   END,
+                   CASE
+                       WHEN shift_job.location_id = v.location_id
+                       THEN evidence_shift.job_id
+                   END
+               ) AS job_id
+        FROM visits v
+        JOIN shifts evidence_shift ON evidence_shift.id = v.shift_id
+        LEFT JOIN jobs shift_job ON shift_job.id = evidence_shift.job_id
+        LEFT JOIN site_check_ins sci ON sci.id = v.site_check_in_id
+        LEFT JOIN jobs check_in_job ON check_in_job.id = sci.job_id
+        WHERE v.shift_id = %s
+        ORDER BY v.arrival_time, v.id
+        """,
+        (shift_id,),
+    )
+    visit_columns = [column[0] for column in cur.description]
+    visits = [dict(zip(visit_columns, row)) for row in cur.fetchall()]
+    cur.execute(
+        """
+        SELECT id, shift_id, visit_id, location_id, location_label,
+               departure_time
+        FROM departures
+        WHERE shift_id = %s
+        ORDER BY departure_time, id
+        """,
+        (shift_id,),
+    )
+    departure_columns = [column[0] for column in cur.description]
+    departures = [dict(zip(departure_columns, row)) for row in cur.fetchall()]
+    _, raw_review_items = ops._closed_shift_utilization(
+        shift,
+        visits,
+        departures,
+    )
+    prepared_reviews = ops._prepare_utilization_review_items(
+        raw_review_items,
+        {
+            shift_id: ops._utilization_shift_evidence_snapshot(
+                shift,
+                visits,
+                departures,
+            )
+        },
+    )
+    target_review = next(
+        item
+        for item in prepared_reviews
+        if item["code"] == "missing_departure"
+        and item.get("visitId") is not None
+        and int(item["visitId"]) == visit_id
+    )
+    visit = next(row for row in visits if int(row["id"]) == visit_id)
+    snapshot = {
+        "correctionType": ops.UTILIZATION_MISSING_DEPARTURE_CORRECTION,
+        "requestFingerprint": fingerprint,
+        "reviewKey": target_review["reviewKey"],
+        "evidenceVersion": target_review["evidenceVersion"],
+        "evidenceFingerprint": target_review["evidenceFingerprint"],
+        "evidence": target_review["_evidenceSnapshot"],
+        "request": {"test": suffix},
+    }
+    result = {
+        "correctionType": ops.UTILIZATION_MISSING_DEPARTURE_CORRECTION,
+        "reviewKey": target_review["reviewKey"],
+        "evidenceVersion": target_review["evidenceVersion"],
+        "evidenceFingerprint": target_review["evidenceFingerprint"],
+        "shiftId": shift_id,
+        "visitId": visit_id,
+        "locationId": location_id,
+        "locationLabel": f"{TEST_PREFIX} Site {suffix}",
+        "jobId": int(visit["job_id"]) if visit.get("job_id") is not None else None,
+        "effectiveDepartureAt": effective_departure_at.isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "derivedIntervalCount": 1,
+        "evidence": ["reviewed_departure"],
+    }
+    cur.execute(
+        """
+        INSERT INTO time_data_correction_batches (
+            plan_token,
+            applied_by_employee_id,
+            applied_by_name,
+            reason,
+            snapshot,
+            result
+        )
+        VALUES (%s, NULL, 'Mayra', %s, %s::jsonb, %s::jsonb)
+        RETURNING id
+        """,
+        (
+            f"test-reviewed-departure-{shift_id}-{visit_id}-{suffix}",
+            "Reviewed departure supplied by regression fixture.",
+            json.dumps(snapshot, sort_keys=True),
+            json.dumps(result, sort_keys=True),
+        ),
+    )
+    return int(cur.fetchone()[0])
 
 
 def _schedule_body(
@@ -4220,6 +4418,7 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
     )
     assert response.status_code == 200, response.text
     body = response.json()
+    forecast_as_of = date.fromisoformat(body["asOfDate"])
     jobs = {job["jobId"]: job for week in body["weeks"] for job in week["jobs"]}
     canonical_monthly_rows = [
         site
@@ -4254,8 +4453,23 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
     assert incomplete["plannedHours"] is None
     assert incomplete["estRevenue"] == 50
     assert incomplete["estLaborCost"] is None
-    assert {issue["code"] for issue in incomplete["issues"]} >= {
-        "missing_expected_hours"
+    assert "missing_expected_hours" in {
+        issue["code"] for issue in incomplete["issues"]
+    }
+    assert incomplete["expectedHoursBaseline"] == {
+        "source": "insufficient_data",
+        "state": "learning",
+        "plannedHours": None,
+        "manualHours": None,
+        "suggestedHours": None,
+        "sampleSize": 0,
+        "minimumSampleSize": 3,
+        "observationPeriod": {
+            "startDate": str(forecast_as_of - timedelta(days=180)),
+            "endDate": str(forecast_as_of),
+            "lookbackDays": 180,
+        },
+        "exclusionRules": list(ops.EXPECTED_HOURS_LEARNING_EXCLUSION_RULES),
     }
     assert body["summary"]["plannedHours"] is None
     assert body["summary"]["knownPlannedHours"] == pytest.approx(10)
@@ -4322,6 +4536,1101 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
         }
         for site in canonical_monthly_rows
     ]
+
+
+def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
+    client,
+    auth,
+):
+    app_timezone = ZoneInfo("America/Chicago")
+    today = datetime.now(app_timezone).date()
+    future_day = today + timedelta(days=1)
+    completed_days = [
+        today - timedelta(days=28),
+        today - timedelta(days=21),
+        today - timedelta(days=14),
+        today - timedelta(days=7),
+    ]
+    durations = [2, 3, 4, 7]
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "expected_hours_learning",
+                "commercial_evening_night",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "Expected Hours Learning",
+                site_type="Commercial",
+                rate=80,
+                rate_type="per_visit",
+                expected_hours=None,
+            )
+            _, other_site_id = _customer_site(
+                cur,
+                "Expected Hours Learning Other Site",
+                site_type="Commercial",
+                rate=80,
+                rate_type="per_visit",
+                expected_hours=None,
+            )
+            employee_id = _employee(cur, "Expected Hours Learning", 22)
+            other_employee_id = _employee(cur, "Expected Hours Learning Other", 22)
+            for index, (service_day, hours) in enumerate(
+                zip(completed_days, durations)
+            ):
+                local_start = datetime.combine(
+                    service_day,
+                    time(hour=18),
+                    tzinfo=app_timezone,
+                )
+                job_id = _job(
+                    cur,
+                    source_id=source_id,
+                    location_id=site_id,
+                    customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                    start=local_start.astimezone(timezone.utc),
+                    end=(local_start + timedelta(hours=hours)).astimezone(
+                        timezone.utc
+                    ),
+                    source_seed=f"expected-hours-learning-history-{index}",
+                )
+                cur.execute(
+                    "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                    (job_id,),
+                )
+                shift_start = local_start.astimezone(timezone.utc) - timedelta(
+                    minutes=15
+                )
+                shift_end = shift_start + timedelta(hours=hours, minutes=30)
+                shift_id = _shift(
+                    cur,
+                    employee_id=employee_id,
+                    start=shift_start,
+                    end=shift_end,
+                    service_day=service_day,
+                    location_id=site_id,
+                    location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                    job_id=None if index == 0 else job_id,
+                )
+                arrival = local_start.astimezone(timezone.utc)
+                departure = (local_start + timedelta(hours=hours)).astimezone(
+                    timezone.utc
+                )
+                if index == 0:
+                    manual_visit_id = _visit(
+                        cur,
+                        shift_id=shift_id,
+                        location_id=site_id,
+                        at=arrival,
+                        suffix=f"Expected Hours Learning {index}",
+                        sequence_version=2,
+                        job_id=job_id,
+                    )
+                    _departure(
+                        cur,
+                        shift_id=shift_id,
+                        location_id=site_id,
+                        at=departure,
+                        suffix=f"Expected Hours Learning {index}",
+                        visit_id=manual_visit_id,
+                    )
+                elif index == 1:
+                    reviewed_check_in_id = _check_in(
+                        cur,
+                        employee_id=employee_id,
+                        location_id=site_id,
+                        checked_in_at=arrival,
+                        job_id=job_id,
+                    )
+                    reviewed_visit_id = _visit(
+                        cur,
+                        shift_id=shift_id,
+                        location_id=site_id,
+                        at=arrival,
+                        suffix=f"Expected Hours Learning {index}",
+                        sequence_version=2,
+                        site_check_in_id=reviewed_check_in_id,
+                        job_id=job_id,
+                    )
+                    _reviewed_departure_correction(
+                        cur,
+                        shift_id=shift_id,
+                        visit_id=reviewed_visit_id,
+                        location_id=site_id,
+                        effective_departure_at=departure,
+                        suffix=f"Expected Hours Learning {index}",
+                    )
+                else:
+                    _paired_version_two_visit(
+                        cur,
+                        employee_id=employee_id,
+                        shift_id=shift_id,
+                        location_id=site_id,
+                        job_id=job_id,
+                        arrival=arrival,
+                        departure=departure,
+                        suffix=f"Expected Hours Learning {index}",
+                    )
+                if index == 2:
+                    service_week_start = service_day - timedelta(
+                        days=(service_day.weekday() + 1) % 7
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO payroll_shift_corrections (
+                            week_start,
+                            correction_date,
+                            employee_id,
+                            shift_id,
+                            source_clock_in,
+                            source_clock_out,
+                            source_break_minutes,
+                            source_total_minutes,
+                            corrected_clock_in,
+                            corrected_clock_out,
+                            corrected_break_minutes,
+                            corrected_total_minutes,
+                            reason,
+                            status,
+                            created_by_employee_id,
+                            created_by_name
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, NULL, 270,
+                            %s, %s, 60, 210,
+                            'Deduct scheduled meal break from learned hours.',
+                            'active',
+                            %s,
+                            'Mayra'
+                        )
+                        """,
+                        (
+                            service_week_start,
+                            service_day,
+                            employee_id,
+                            shift_id,
+                            shift_start,
+                            shift_end,
+                            shift_start,
+                            shift_end,
+                            employee_id,
+                        ),
+                    )
+
+            invalid_day = today - timedelta(days=3)
+            invalid_local_start = datetime.combine(
+                invalid_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            invalid_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=invalid_local_start.astimezone(timezone.utc),
+                end=(invalid_local_start + timedelta(hours=11)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-invalid-qr-identity",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (invalid_job_id,),
+            )
+            invalid_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=invalid_local_start.astimezone(timezone.utc)
+                - timedelta(minutes=15),
+                end=(invalid_local_start + timedelta(hours=11, minutes=15)).astimezone(
+                    timezone.utc
+                ),
+                service_day=invalid_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=invalid_job_id,
+            )
+            invalid_check_in_id = _check_in(
+                cur,
+                employee_id=other_employee_id,
+                location_id=site_id,
+                checked_in_at=invalid_local_start.astimezone(timezone.utc),
+                job_id=invalid_job_id,
+            )
+            invalid_visit_id = _visit(
+                cur,
+                shift_id=invalid_shift_id,
+                location_id=site_id,
+                at=invalid_local_start.astimezone(timezone.utc),
+                suffix="Expected Hours Learning Invalid",
+                sequence_version=2,
+                site_check_in_id=invalid_check_in_id,
+            )
+            _departure(
+                cur,
+                shift_id=invalid_shift_id,
+                location_id=site_id,
+                at=(invalid_local_start + timedelta(hours=11)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Invalid",
+                visit_id=invalid_visit_id,
+            )
+
+            outside_day = today - timedelta(days=4)
+            outside_local_start = datetime.combine(
+                outside_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            outside_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=outside_local_start.astimezone(timezone.utc),
+                end=(outside_local_start + timedelta(hours=9)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-outside-paid-shift",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (outside_job_id,),
+            )
+            outside_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=outside_local_start.astimezone(timezone.utc),
+                end=(outside_local_start + timedelta(hours=2)).astimezone(
+                    timezone.utc
+                ),
+                service_day=outside_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=outside_job_id,
+            )
+            outside_visit_id = _visit(
+                cur,
+                shift_id=outside_shift_id,
+                location_id=site_id,
+                at=(outside_local_start - timedelta(minutes=30)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Outside Paid Shift",
+                sequence_version=2,
+                job_id=outside_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=outside_shift_id,
+                location_id=site_id,
+                at=(outside_local_start + timedelta(hours=1)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Outside Paid Shift",
+                visit_id=outside_visit_id,
+            )
+
+            overlap_day = today - timedelta(days=5)
+            overlap_local_start = datetime.combine(
+                overlap_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            overlap_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=overlap_local_start.astimezone(timezone.utc),
+                end=(overlap_local_start + timedelta(hours=10)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-overlap",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (overlap_job_id,),
+            )
+            overlap_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=overlap_local_start.astimezone(timezone.utc),
+                end=(overlap_local_start + timedelta(hours=4)).astimezone(
+                    timezone.utc
+                ),
+                service_day=overlap_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=overlap_job_id,
+            )
+            first_overlap_visit = _visit(
+                cur,
+                shift_id=overlap_shift_id,
+                location_id=site_id,
+                at=overlap_local_start.astimezone(timezone.utc),
+                suffix="Expected Hours Learning Overlap A",
+                sequence_version=2,
+                job_id=overlap_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=overlap_shift_id,
+                location_id=site_id,
+                at=(overlap_local_start + timedelta(hours=2)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Overlap A",
+                visit_id=first_overlap_visit,
+            )
+            second_overlap_visit = _visit(
+                cur,
+                shift_id=overlap_shift_id,
+                location_id=site_id,
+                at=(overlap_local_start + timedelta(hours=1)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Overlap B",
+                sequence_version=2,
+                job_id=overlap_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=overlap_shift_id,
+                location_id=site_id,
+                at=(overlap_local_start + timedelta(hours=3)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Overlap B",
+                visit_id=second_overlap_visit,
+            )
+
+            non_productive_day = today - timedelta(days=6)
+            non_productive_local_start = datetime.combine(
+                non_productive_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            non_productive_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=non_productive_local_start.astimezone(timezone.utc),
+                end=(non_productive_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-non-productive",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (non_productive_job_id,),
+            )
+            non_productive_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=non_productive_local_start.astimezone(timezone.utc),
+                end=(non_productive_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                service_day=non_productive_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=non_productive_job_id,
+                time_category="non_productive",
+                non_productive_type="drive_time",
+            )
+            _paired_version_two_visit(
+                cur,
+                employee_id=employee_id,
+                shift_id=non_productive_shift_id,
+                location_id=site_id,
+                job_id=non_productive_job_id,
+                arrival=non_productive_local_start.astimezone(timezone.utc),
+                departure=(non_productive_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Non Productive",
+            )
+
+            legacy_day = today - timedelta(days=8)
+            legacy_local_start = datetime.combine(
+                legacy_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            legacy_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=legacy_local_start.astimezone(timezone.utc),
+                end=(legacy_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-legacy-visit",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (legacy_job_id,),
+            )
+            legacy_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=legacy_local_start.astimezone(timezone.utc),
+                end=(legacy_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                service_day=legacy_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=legacy_job_id,
+            )
+            _paired_version_two_visit(
+                cur,
+                employee_id=employee_id,
+                shift_id=legacy_shift_id,
+                location_id=site_id,
+                job_id=legacy_job_id,
+                arrival=legacy_local_start.astimezone(timezone.utc),
+                departure=(legacy_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Legacy Valid Pair",
+            )
+            _visit(
+                cur,
+                shift_id=legacy_shift_id,
+                location_id=site_id,
+                at=(legacy_local_start + timedelta(minutes=30)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Legacy Visit",
+                sequence_version=1,
+            )
+
+            cross_shift_day = today - timedelta(days=9)
+            cross_shift_local_start = datetime.combine(
+                cross_shift_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            cross_shift_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=cross_shift_local_start.astimezone(timezone.utc),
+                end=(cross_shift_local_start + timedelta(hours=9)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-cross-shift-departure",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (cross_shift_job_id,),
+            )
+            cross_shift_visit_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=cross_shift_local_start.astimezone(timezone.utc),
+                end=(cross_shift_local_start + timedelta(hours=9)).astimezone(
+                    timezone.utc
+                ),
+                service_day=cross_shift_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=cross_shift_job_id,
+            )
+            cross_shift_departure_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=cross_shift_local_start.astimezone(timezone.utc),
+                end=(cross_shift_local_start + timedelta(hours=9)).astimezone(
+                    timezone.utc
+                ),
+                service_day=cross_shift_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=cross_shift_job_id,
+            )
+            cross_shift_visit_id = _visit(
+                cur,
+                shift_id=cross_shift_visit_shift_id,
+                location_id=site_id,
+                at=cross_shift_local_start.astimezone(timezone.utc),
+                suffix="Expected Hours Learning Cross Shift Visit",
+                sequence_version=2,
+                job_id=cross_shift_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=cross_shift_departure_shift_id,
+                location_id=site_id,
+                at=(cross_shift_local_start + timedelta(hours=9)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Cross Shift Departure",
+                visit_id=cross_shift_visit_id,
+            )
+
+            stale_review_day = today - timedelta(days=10)
+            stale_review_local_start = datetime.combine(
+                stale_review_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            stale_original_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=stale_review_local_start.astimezone(timezone.utc),
+                end=(stale_review_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-stale-reviewed-original",
+            )
+            stale_poison_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=stale_review_local_start.astimezone(timezone.utc),
+                end=(stale_review_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-stale-reviewed-poison",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (stale_poison_job_id,),
+            )
+            stale_review_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=stale_review_local_start.astimezone(timezone.utc),
+                end=(stale_review_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                service_day=stale_review_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=stale_original_job_id,
+            )
+            stale_review_visit_id = _visit(
+                cur,
+                shift_id=stale_review_shift_id,
+                location_id=site_id,
+                at=stale_review_local_start.astimezone(timezone.utc),
+                suffix="Expected Hours Learning Stale Reviewed",
+                sequence_version=2,
+            )
+            _reviewed_departure_correction(
+                cur,
+                shift_id=stale_review_shift_id,
+                visit_id=stale_review_visit_id,
+                location_id=site_id,
+                effective_departure_at=(
+                    stale_review_local_start + timedelta(hours=8)
+                ).astimezone(timezone.utc),
+                suffix="Expected Hours Learning Stale Reviewed",
+            )
+            cur.execute(
+                "UPDATE shifts SET job_id = %s WHERE id = %s",
+                (stale_poison_job_id, stale_review_shift_id),
+            )
+
+            qr_mismatch_day = today - timedelta(days=11)
+            qr_mismatch_local_start = datetime.combine(
+                qr_mismatch_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            qr_identity_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=qr_mismatch_local_start.astimezone(timezone.utc),
+                end=(qr_mismatch_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-qr-identity",
+            )
+            qr_visit_poison_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=qr_mismatch_local_start.astimezone(timezone.utc),
+                end=(qr_mismatch_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-qr-visit-poison",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (qr_visit_poison_job_id,),
+            )
+            qr_mismatch_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=qr_mismatch_local_start.astimezone(timezone.utc),
+                end=(qr_mismatch_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                service_day=qr_mismatch_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+            )
+            qr_identity_check_in_id = _check_in(
+                cur,
+                employee_id=employee_id,
+                location_id=site_id,
+                checked_in_at=qr_mismatch_local_start.astimezone(timezone.utc),
+                job_id=qr_identity_job_id,
+            )
+            qr_mismatch_visit_id = _visit(
+                cur,
+                shift_id=qr_mismatch_shift_id,
+                location_id=site_id,
+                at=qr_mismatch_local_start.astimezone(timezone.utc),
+                suffix="Expected Hours Learning QR Mismatch",
+                sequence_version=2,
+                site_check_in_id=qr_identity_check_in_id,
+                job_id=qr_visit_poison_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=qr_mismatch_shift_id,
+                location_id=site_id,
+                at=(qr_mismatch_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning QR Mismatch",
+                visit_id=qr_mismatch_visit_id,
+            )
+
+            paid_overlap_day = today - timedelta(days=12)
+            paid_overlap_local_start = datetime.combine(
+                paid_overlap_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            paid_overlap_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=paid_overlap_local_start.astimezone(timezone.utc),
+                end=(paid_overlap_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-paid-overlap",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (paid_overlap_job_id,),
+            )
+            first_paid_overlap_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=paid_overlap_local_start.astimezone(timezone.utc),
+                end=(paid_overlap_local_start + timedelta(hours=4)).astimezone(
+                    timezone.utc
+                ),
+                service_day=paid_overlap_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=paid_overlap_job_id,
+            )
+            second_paid_overlap_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=(paid_overlap_local_start + timedelta(hours=1)).astimezone(
+                    timezone.utc
+                ),
+                end=(paid_overlap_local_start + timedelta(hours=5)).astimezone(
+                    timezone.utc
+                ),
+                service_day=paid_overlap_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=paid_overlap_job_id,
+            )
+            first_paid_overlap_visit_id = _visit(
+                cur,
+                shift_id=first_paid_overlap_shift_id,
+                location_id=site_id,
+                at=paid_overlap_local_start.astimezone(timezone.utc),
+                suffix="Expected Hours Learning Paid Overlap A",
+                sequence_version=2,
+                job_id=paid_overlap_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=first_paid_overlap_shift_id,
+                location_id=site_id,
+                at=(paid_overlap_local_start + timedelta(hours=3)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Paid Overlap A",
+                visit_id=first_paid_overlap_visit_id,
+            )
+            second_paid_overlap_visit_id = _visit(
+                cur,
+                shift_id=second_paid_overlap_shift_id,
+                location_id=site_id,
+                at=(paid_overlap_local_start + timedelta(hours=1)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Paid Overlap B",
+                sequence_version=2,
+                job_id=paid_overlap_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=second_paid_overlap_shift_id,
+                location_id=site_id,
+                at=(paid_overlap_local_start + timedelta(hours=4)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Paid Overlap B",
+                visit_id=second_paid_overlap_visit_id,
+            )
+
+            orphan_departure_day = today - timedelta(days=13)
+            orphan_departure_local_start = datetime.combine(
+                orphan_departure_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            orphan_departure_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=orphan_departure_local_start.astimezone(timezone.utc),
+                end=(orphan_departure_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-orphan-departure",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (orphan_departure_job_id,),
+            )
+            orphan_departure_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=orphan_departure_local_start.astimezone(timezone.utc),
+                end=(orphan_departure_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                service_day=orphan_departure_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=orphan_departure_job_id,
+            )
+            orphan_departure_visit_id, _ = _paired_version_two_visit(
+                cur,
+                employee_id=employee_id,
+                shift_id=orphan_departure_shift_id,
+                location_id=site_id,
+                job_id=orphan_departure_job_id,
+                arrival=orphan_departure_local_start.astimezone(timezone.utc),
+                departure=(orphan_departure_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Orphan Departure",
+            )
+            assert orphan_departure_visit_id is not None
+            _departure(
+                cur,
+                shift_id=orphan_departure_shift_id,
+                location_id=site_id,
+                at=(orphan_departure_local_start + timedelta(hours=2)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Orphan Departure",
+                visit_id=None,
+            )
+
+            embedded_arrival_day = today - timedelta(days=16)
+            embedded_arrival_local_start = datetime.combine(
+                embedded_arrival_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            embedded_arrival_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=embedded_arrival_local_start.astimezone(timezone.utc),
+                end=(embedded_arrival_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-embedded-arrival",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (embedded_arrival_job_id,),
+            )
+            embedded_arrival_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=embedded_arrival_local_start.astimezone(timezone.utc),
+                end=(embedded_arrival_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                service_day=embedded_arrival_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=embedded_arrival_job_id,
+            )
+            _paired_version_two_visit(
+                cur,
+                employee_id=employee_id,
+                shift_id=embedded_arrival_shift_id,
+                location_id=site_id,
+                job_id=embedded_arrival_job_id,
+                arrival=embedded_arrival_local_start.astimezone(timezone.utc),
+                departure=(embedded_arrival_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Embedded Arrival",
+            )
+            _visit(
+                cur,
+                shift_id=embedded_arrival_shift_id,
+                location_id=other_site_id,
+                at=(embedded_arrival_local_start + timedelta(hours=2)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Embedded Arrival Other Site",
+                sequence_version=2,
+            )
+
+            unassigned_worker_day = today - timedelta(days=17)
+            unassigned_worker_local_start = datetime.combine(
+                unassigned_worker_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            unassigned_worker_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=unassigned_worker_local_start.astimezone(timezone.utc),
+                end=(unassigned_worker_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                source_seed="expected-hours-learning-unassigned-worker",
+            )
+            cur.execute(
+                "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                (unassigned_worker_job_id,),
+            )
+            assigned_worker_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=unassigned_worker_local_start.astimezone(timezone.utc),
+                end=(unassigned_worker_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                service_day=unassigned_worker_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+                job_id=unassigned_worker_job_id,
+            )
+            _paired_version_two_visit(
+                cur,
+                employee_id=employee_id,
+                shift_id=assigned_worker_shift_id,
+                location_id=site_id,
+                job_id=unassigned_worker_job_id,
+                arrival=unassigned_worker_local_start.astimezone(timezone.utc),
+                departure=(unassigned_worker_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Assigned Worker",
+            )
+            unassigned_worker_shift_id = _shift(
+                cur,
+                employee_id=other_employee_id,
+                start=unassigned_worker_local_start.astimezone(timezone.utc),
+                end=(unassigned_worker_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                service_day=unassigned_worker_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Expected Hours Learning",
+            )
+            unassigned_worker_visit_id = _visit(
+                cur,
+                shift_id=unassigned_worker_shift_id,
+                location_id=site_id,
+                at=unassigned_worker_local_start.astimezone(timezone.utc),
+                suffix="Expected Hours Learning Unassigned Worker",
+                sequence_version=2,
+            )
+            _departure(
+                cur,
+                shift_id=unassigned_worker_shift_id,
+                location_id=site_id,
+                at=(unassigned_worker_local_start + timedelta(hours=8)).astimezone(
+                    timezone.utc
+                ),
+                suffix="Expected Hours Learning Unassigned Worker",
+                visit_id=unassigned_worker_visit_id,
+            )
+
+            future_start = datetime.combine(
+                future_day,
+                time(hour=18),
+                tzinfo=app_timezone,
+            )
+            future_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Expected Hours Learning",
+                start=future_start.astimezone(timezone.utc),
+                end=(future_start + timedelta(hours=2)).astimezone(timezone.utc),
+                source_seed="expected-hours-learning-future",
+            )
+
+    forecast_response = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4},
+    )
+    assert forecast_response.status_code == 200, forecast_response.text
+    forecast_jobs = {
+        row["jobId"]: row
+        for week in forecast_response.json()["weeks"]
+        for row in week["jobs"]
+    }
+    forecast_job = forecast_jobs[future_job_id]
+    assert forecast_job["plannedHours"] is None
+    assert forecast_job["estRevenue"] == 80
+    assert "missing_expected_hours" in {
+        issue["code"] for issue in forecast_job["issues"]
+    }
+    baseline = forecast_job["expectedHoursBaseline"]
+    assert baseline["source"] == "learned_suggestion"
+    assert baseline["state"] == "suggested"
+    assert baseline["suggestedHours"] == 3
+    assert baseline["plannedHours"] is None
+    assert baseline["manualHours"] is None
+    assert baseline["sampleSize"] == 4
+    assert baseline["minimumSampleSize"] == 3
+    assert baseline["observationPeriod"] == {
+        "startDate": str(completed_days[0]),
+        "endDate": str(completed_days[-1]),
+        "lookbackDays": 180,
+    }
+    assert "excludes_unpaired_or_invalid_site_events" in baseline["exclusionRules"]
+
+    schedule_response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(future_day), "end_date": str(future_day)},
+    )
+    assert schedule_response.status_code == 200, schedule_response.text
+    schedule_job = {
+        row["id"]: row for row in schedule_response.json()["jobs"]
+    }[future_job_id]
+    assert schedule_job["expectedHoursBaseline"] == baseline
+    assert schedule_job["siteEconomics"]["expectedHoursBaseline"] == baseline
+    assert {issue["code"] for issue in schedule_job["issues"]} == {
+        "missing_expected_hours"
+    }
+
+
+def test_expected_hours_learning_excludes_evidence_after_observed_at():
+    app_timezone = ZoneInfo("America/Chicago")
+    observed_local = datetime(2026, 7, 20, 9, tzinfo=app_timezone)
+    future_local_starts = [
+        datetime(2026, 7, 20, hour, tzinfo=app_timezone)
+        for hour in (10, 13, 16)
+    ]
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "expected_hours_learning_future_evidence",
+                "commercial_evening_night",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "Expected Hours Learning Future Evidence",
+                site_type="Commercial",
+                rate=80,
+                rate_type="per_visit",
+                expected_hours=None,
+            )
+            employee_id = _employee(cur, "Expected Hours Learning Future Evidence", 22)
+            for index, local_start in enumerate(future_local_starts):
+                job_id = _job(
+                    cur,
+                    source_id=source_id,
+                    location_id=site_id,
+                    customer_name=(
+                        f"{TEST_PREFIX} Customer Expected Hours Learning Future"
+                    ),
+                    start=local_start.astimezone(timezone.utc),
+                    end=(local_start + timedelta(hours=1)).astimezone(timezone.utc),
+                    source_seed=f"expected-hours-learning-future-evidence-{index}",
+                )
+                cur.execute(
+                    "UPDATE jobs SET status = 'completed' WHERE id = %s",
+                    (job_id,),
+                )
+                shift_id = _shift(
+                    cur,
+                    employee_id=employee_id,
+                    start=(local_start - timedelta(minutes=5)).astimezone(
+                        timezone.utc
+                    ),
+                    end=(local_start + timedelta(hours=1, minutes=5)).astimezone(
+                        timezone.utc
+                    ),
+                    service_day=local_start.date(),
+                    location_id=site_id,
+                    location_label=(
+                        f"{TEST_PREFIX} Site Expected Hours Learning Future"
+                    ),
+                    job_id=job_id,
+                )
+                _paired_version_two_visit(
+                    cur,
+                    employee_id=employee_id,
+                    shift_id=shift_id,
+                    location_id=site_id,
+                    job_id=job_id,
+                    arrival=local_start.astimezone(timezone.utc),
+                    departure=(local_start + timedelta(hours=1)).astimezone(
+                        timezone.utc
+                    ),
+                    suffix=f"Expected Hours Learning Future Evidence {index}",
+                )
+
+    learning = ops._load_expected_hours_learning_by_site(
+        [site_id],
+        observed_at=observed_local.astimezone(timezone.utc),
+        app_timezone=app_timezone,
+    )
+
+    assert learning[site_id]["sampleSize"] == 0
+    assert learning[site_id]["suggestedHours"] is None
 
 
 def test_utilization_reconciles_complete_route_split_crew_and_categorized_time(
