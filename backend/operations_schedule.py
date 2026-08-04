@@ -40,11 +40,37 @@ UTILIZATION_EVIDENCE_VERSION = "utilization-classifier.v1"
 UTILIZATION_MISSING_DEPARTURE_CORRECTION = "utilization_missing_departure.v1"
 EXPECTED_HOURS_LEARNING_LOOKBACK_DAYS = 180
 EXPECTED_HOURS_LEARNING_MIN_COMPLETED_OCCURRENCES = 3
-EXPECTED_HOURS_LEARNING_EXCLUSION_RULES = (
-    "requires_completed_job",
-    "requires_positive_paired_arrive_depart_interval",
-    "excludes_unpaired_or_invalid_site_events",
-    "excludes_unaccepted_qr_check_ins",
+EXPECTED_HOURS_LEARNING_EXCLUSION_RULE_DEFINITIONS = (
+    {"code": "requires_completed_job", "source": "candidate_pairs"},
+    {"code": "requires_productive_v2_site_events", "source": "paired_visit_evidence"},
+    {
+        "code": "requires_positive_paired_arrive_depart_interval",
+        "source": "paired_visit_evidence",
+    },
+    {
+        "code": "requires_observed_evidence_at_or_before_request",
+        "source": "paired_visit_evidence",
+    },
+    {"code": "requires_valid_paid_envelope", "source": "paired_visit_evidence"},
+    {"code": "excludes_unpaired_or_invalid_site_events", "source": "invalid_jobs"},
+    {"code": "excludes_unaccepted_qr_check_ins", "source": "invalid_jobs"},
+    {"code": "excludes_legacy_site_events", "source": "legacy_shift_jobs"},
+    {"code": "excludes_overlapping_worker_intervals", "source": "overlap_jobs"},
+    {
+        "code": "excludes_embedded_arrival_conflicts",
+        "source": "contradictory_arrival_jobs",
+    },
+    {
+        "code": "excludes_contradictory_departure_events",
+        "source": "contradictory_departure_jobs",
+    },
+    {
+        "code": "excludes_unassigned_worker_intervals",
+        "source": "unassigned_worker_jobs",
+    },
+)
+EXPECTED_HOURS_LEARNING_EXCLUSION_RULES = tuple(
+    str(rule["code"]) for rule in EXPECTED_HOURS_LEARNING_EXCLUSION_RULE_DEFINITIONS
 )
 
 
@@ -114,7 +140,7 @@ def _empty_expected_hours_learning(
 
 
 def _cursor_rows_as_dicts(cursor: Any, rows: Iterable[Any]) -> List[Dict[str, Any]]:
-    materialized_rows = list(rows)
+    materialized_rows = rows if isinstance(rows, list) else list(rows)
     if not materialized_rows:
         return []
     if hasattr(materialized_rows[0], "keys"):
@@ -728,6 +754,24 @@ def _load_expected_hours_learning_by_site(
                 WHERE overlap.visit_id = candidate.visit_id
             )
         ),
+        contradictory_arrival_visits AS (
+            SELECT DISTINCT pair.visit_id
+            FROM paired_visit_evidence pair
+            JOIN visit_evidence other_arrival
+              ON other_arrival.shift_id = pair.shift_id
+             AND other_arrival.visit_id <> pair.visit_id
+             AND pair.arrival_time <= other_arrival.arrival_time
+             AND other_arrival.arrival_time < pair.departure_time
+        ),
+        contradictory_arrival_jobs AS (
+            SELECT DISTINCT candidate.job_id
+            FROM candidate_pairs candidate
+            WHERE EXISTS (
+                SELECT 1
+                FROM contradictory_arrival_visits conflict
+                WHERE conflict.visit_id = candidate.visit_id
+            )
+        ),
         contradictory_departure_visits AS (
             SELECT DISTINCT pair.visit_id
             FROM paired_visit_evidence pair
@@ -744,6 +788,18 @@ def _load_expected_hours_learning_by_site(
                 SELECT 1
                 FROM contradictory_departure_visits conflict
                 WHERE conflict.visit_id = candidate.visit_id
+            )
+        ),
+        unassigned_worker_jobs AS (
+            SELECT DISTINCT candidate.job_id
+            FROM candidate_pairs candidate
+            WHERE EXISTS (
+                SELECT 1
+                FROM paired_visit_evidence unassigned
+                WHERE unassigned.location_id = candidate.location_id
+                  AND unassigned.resolved_job_id IS NULL
+                  AND (unassigned.arrival_time AT TIME ZONE %s)::date
+                      = candidate.scheduled_date
             )
         ),
         clean_pairs AS (
@@ -767,8 +823,18 @@ def _load_expected_hours_learning_by_site(
               )
               AND NOT EXISTS (
                   SELECT 1
+                  FROM contradictory_arrival_jobs conflict
+                  WHERE conflict.job_id = candidate.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
                   FROM contradictory_departure_jobs conflict
                   WHERE conflict.job_id = candidate.job_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM unassigned_worker_jobs unassigned
+                  WHERE unassigned.job_id = candidate.job_id
               )
         ),
         scope_pairs AS (
@@ -840,6 +906,7 @@ def _load_expected_hours_learning_by_site(
             observed_at,
             observation_start,
             observation_end,
+            timezone_name,
             resolved_site_ids,
         ),
         cursor=cursor,
