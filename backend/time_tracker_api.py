@@ -1503,8 +1503,14 @@ def _rate_limit_evict_expired(cutoff: float) -> None:
         del _RATE_LIMIT_BUCKETS[k]
 
 
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
 def _password_stamp_micros(password_changed_at: datetime) -> int:
-    return int(password_changed_at.timestamp() * 1_000_000)
+    # Exact integer arithmetic: a float timestamp() round-trip can wobble in
+    # the last microsecond, and this value is compared for equality.
+    delta = password_changed_at - _EPOCH_UTC
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
 
 
 def create_auth_token(
@@ -2070,7 +2076,8 @@ def get_current_employee(
             and token_pca == _password_stamp_micros(password_changed_at)
         ):
             append_access_log(
-                request, "TOKEN_INVALID", False, "Token predates password change"
+                request, "TOKEN_INVALID", False,
+                "Token not bound to current password version"
             )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

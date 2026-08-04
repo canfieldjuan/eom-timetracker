@@ -1,11 +1,13 @@
 """
-Password-change token revocation.
+Password-change token revocation via version binding.
 
-A password change stamps employees.password_changed_at; any token whose iat
-predates the stamp is rejected with 401 "Token has been revoked". The change
-response returns a fresh token minted at/after the stamp so the current
-session survives. A NULL stamp (deploy day, password never changed) leaves
-every existing token valid.
+A password change stamps employees.password_changed_at, and every minted
+token carries the stamp it was issued against as a signed pca claim. Once a
+stamp exists, get_current_employee accepts only tokens whose pca matches the
+current stamp; unbound or stale-version tokens get 401 "Token has been
+revoked" regardless of their iat. The change response returns a fresh token
+bound to the new stamp so the current session survives. A NULL stamp (deploy
+day, password never changed) leaves every existing token valid.
 
 Run:  cd backend && pytest -v test_auth_revocation.py
 """
@@ -63,8 +65,8 @@ def test_change_password_revokes_prior_token(client):
         probe = client.get("/api/timesheet/my-hours", headers=_headers(old_token))
         assert probe.status_code == 200, probe.text
 
-        # No back-dating: the <= comparison revokes tokens issued in the same
-        # second as the change, so even this just-minted token dies.
+        # No back-dating needed: this just-minted token carries no pca claim,
+        # so once the change stamps a version it is revoked regardless of iat.
         changed = _change_password(client, old_token, OLD_PASSWORD, NEW_PASSWORD)
         assert changed.status_code == 200, changed.text
 
