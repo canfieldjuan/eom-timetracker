@@ -113,6 +113,16 @@ def _empty_expected_hours_learning(
     }
 
 
+def _cursor_rows_as_dicts(cursor: Any, rows: Iterable[Any]) -> List[Dict[str, Any]]:
+    materialized_rows = list(rows)
+    if not materialized_rows:
+        return []
+    if hasattr(materialized_rows[0], "keys"):
+        return [dict(row) for row in materialized_rows]
+    columns = [column[0] for column in cursor.description]
+    return [dict(zip(columns, row)) for row in materialized_rows]
+
+
 def _query_all(
     sql: str,
     params: tuple = (),
@@ -122,7 +132,7 @@ def _query_all(
     if cursor is None:
         return db.query_all(sql, params)
     cursor.execute(sql, params)
-    return [dict(row) for row in cursor.fetchall()]
+    return _cursor_rows_as_dicts(cursor, cursor.fetchall())
 
 
 def _local_bounds(
@@ -334,6 +344,126 @@ def _load_linked_job_metadata(
     }
 
 
+def _candidate_reviewed_departures_for_learning(
+    site_ids: List[int],
+    *,
+    cursor: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    if not site_ids:
+        return []
+    return _query_all(
+        """
+        WITH correction_candidates AS (
+            SELECT correction.id,
+                   correction.snapshot,
+                   correction.result,
+                   (correction.result ->> 'shiftId')::integer AS shift_id,
+                   (correction.result ->> 'visitId')::integer AS visit_id
+            FROM time_data_correction_batches correction
+            WHERE correction.snapshot ->> 'correctionType' = %s
+              AND correction.result ? 'shiftId'
+              AND correction.result ? 'visitId'
+              AND correction.result ? 'locationId'
+              AND correction.result ? 'effectiveDepartureAt'
+              AND correction.result ->> 'shiftId' ~ '^[0-9]+$'
+              AND correction.result ->> 'visitId' ~ '^[0-9]+$'
+              AND correction.result ->> 'locationId' ~ '^[0-9]+$'
+        )
+        SELECT correction.id,
+               correction.snapshot,
+               correction.result,
+               correction.shift_id,
+               correction.visit_id
+        FROM correction_candidates correction
+        JOIN visits v ON v.id = correction.visit_id
+        WHERE v.location_id = ANY(%s)
+        ORDER BY correction.id
+        """,
+        (
+            UTILIZATION_MISSING_DEPARTURE_CORRECTION,
+            site_ids,
+        ),
+        cursor=cursor,
+    )
+
+
+def _current_reviewed_departure_ids_for_learning(
+    site_ids: List[int],
+    *,
+    cursor: Optional[Any] = None,
+) -> List[int]:
+    candidate_rows = _candidate_reviewed_departures_for_learning(
+        site_ids,
+        cursor=cursor,
+    )
+    if not candidate_rows:
+        return []
+
+    def resolve_valid_ids(active_cursor: Any) -> List[int]:
+        prepared_by_shift: Dict[int, List[Dict[str, Any]]] = {}
+        valid_ids: List[int] = []
+        for row in candidate_rows:
+            result = dict(row.get("result") or {})
+            snapshot = dict(row.get("snapshot") or {})
+            try:
+                shift_id = int(row.get("shift_id") or result["shiftId"])
+                visit_id = int(row.get("visit_id") or result["visitId"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if shift_id not in prepared_by_shift:
+                try:
+                    shift, visits, departures = _load_utilization_shift_evidence(
+                        active_cursor,
+                        shift_id,
+                    )
+                except HTTPException:
+                    prepared_by_shift[shift_id] = []
+                    continue
+                _, raw_review_items = _closed_shift_utilization(
+                    shift,
+                    visits,
+                    departures,
+                )
+                evidence_by_shift = {
+                    shift_id: _utilization_shift_evidence_snapshot(
+                        shift,
+                        visits,
+                        departures,
+                    )
+                }
+                prepared_by_shift[shift_id] = _prepare_utilization_review_items(
+                    raw_review_items,
+                    evidence_by_shift,
+                )
+
+            current_review = next(
+                (
+                    item
+                    for item in prepared_by_shift[shift_id]
+                    if item.get("code") == "missing_departure"
+                    and item.get("visitId") is not None
+                    and int(item["visitId"]) == visit_id
+                ),
+                None,
+            )
+            if current_review is None:
+                continue
+            if (
+                str(snapshot.get("reviewKey") or "")
+                == str(current_review["reviewKey"])
+                and str(snapshot.get("evidenceFingerprint") or "")
+                == str(current_review["evidenceFingerprint"])
+            ):
+                valid_ids.append(int(row["id"]))
+        return valid_ids
+
+    if cursor is not None:
+        return resolve_valid_ids(cursor)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as review_cursor:
+            return resolve_valid_ids(review_cursor)
+
+
 def _load_expected_hours_learning_by_site(
     site_ids: Iterable[Any],
     *,
@@ -360,6 +490,10 @@ def _load_expected_hours_learning_by_site(
         return learning
 
     timezone_name = getattr(app_timezone, "key", str(app_timezone))
+    reviewed_departure_ids = _current_reviewed_departure_ids_for_learning(
+        resolved_site_ids,
+        cursor=cursor,
+    )
     rows = _query_all(
         """
         WITH target_shifts AS (
@@ -381,6 +515,7 @@ def _load_expected_hours_learning_by_site(
                     AS departure_time
             FROM time_data_correction_batches correction
             WHERE correction.snapshot ->> 'correctionType' = %s
+              AND correction.id = ANY(%s::bigint[])
               AND correction.result ? 'shiftId'
               AND correction.result ? 'visitId'
               AND correction.result ? 'locationId'
@@ -400,6 +535,7 @@ def _load_expected_hours_learning_by_site(
                 v.location_id,
                 v.arrival_time,
                 v.sequence_version,
+                evidence_shift.employee_id,
                 d.id AS recorded_departure_id,
                 reviewed_departure.id AS reviewed_departure_id,
                 (
@@ -429,12 +565,14 @@ def _load_expected_hours_learning_by_site(
                 ) AS payroll_break_minutes,
                 COALESCE(
                     CASE
-                        WHEN visit_job.location_id = v.location_id
-                        THEN v.job_id
+                        WHEN v.site_check_in_id IS NOT NULL
+                         AND check_in_job.location_id = v.location_id
+                        THEN sci.job_id
                     END,
                     CASE
-                        WHEN check_in_job.location_id = v.location_id
-                        THEN sci.job_id
+                        WHEN v.site_check_in_id IS NULL
+                         AND visit_job.location_id = v.location_id
+                        THEN v.job_id
                     END,
                     CASE
                         WHEN shift_job.location_id = v.location_id
@@ -557,7 +695,7 @@ def _load_expected_hours_learning_by_site(
             SELECT DISTINCT left_pair.visit_id
             FROM paired_visit_evidence left_pair
             JOIN paired_visit_evidence right_pair
-              ON right_pair.shift_id = left_pair.shift_id
+              ON right_pair.employee_id = left_pair.employee_id
              AND right_pair.visit_id <> left_pair.visit_id
              AND left_pair.arrival_time < right_pair.departure_time
              AND right_pair.arrival_time < left_pair.departure_time
@@ -647,6 +785,7 @@ def _load_expected_hours_learning_by_site(
         (
             resolved_site_ids,
             UTILIZATION_MISSING_DEPARTURE_CORRECTION,
+            reviewed_departure_ids,
             timezone_name,
             timezone_name,
             observation_start,
@@ -4578,7 +4717,7 @@ def _load_utilization_shift_evidence(
     shift_row = cursor.fetchone()
     if not shift_row:
         raise HTTPException(status_code=404, detail="Paid shift not found")
-    shift = dict(shift_row)
+    shift = _cursor_rows_as_dicts(cursor, [shift_row])[0]
     if lock_shift:
         # The shift row is the first mutable evidence lock. Take table-level
         # read locks only after it so job deletion cannot hold the shift while
@@ -4616,7 +4755,7 @@ def _load_utilization_shift_evidence(
         """,
         (shift_id,),
     )
-    visits = [dict(row) for row in cursor.fetchall()]
+    visits = _cursor_rows_as_dicts(cursor, cursor.fetchall())
     cursor.execute(
         """
         SELECT id, shift_id, visit_id, location_id, location_label,
@@ -4627,7 +4766,7 @@ def _load_utilization_shift_evidence(
         """,
         (shift_id,),
     )
-    departures = [dict(row) for row in cursor.fetchall()]
+    departures = _cursor_rows_as_dicts(cursor, cursor.fetchall())
     return shift, visits, departures
 
 
