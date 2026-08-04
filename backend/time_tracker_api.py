@@ -4415,6 +4415,65 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE locations ADD COLUMN IF NOT EXISTS expected_hours NUMERIC(6,2)"
     )
+    db.execute("""
+        ALTER TABLE locations
+            ADD COLUMN IF NOT EXISTS expected_hours_source VARCHAR(32)
+                NOT NULL DEFAULT 'manual';
+        ALTER TABLE locations
+            ADD COLUMN IF NOT EXISTS expected_hours_learning_decision VARCHAR(16);
+        ALTER TABLE locations
+            ADD COLUMN IF NOT EXISTS expected_hours_learning_fingerprint VARCHAR(64);
+        ALTER TABLE locations
+            ADD COLUMN IF NOT EXISTS expected_hours_learning_snapshot JSONB;
+        ALTER TABLE locations
+            ADD COLUMN IF NOT EXISTS expected_hours_learning_decided_at TIMESTAMPTZ;
+        ALTER TABLE locations
+            ADD COLUMN IF NOT EXISTS expected_hours_learning_decided_by
+                INTEGER REFERENCES employees(id) ON DELETE SET NULL;
+        ALTER TABLE locations
+            ADD COLUMN IF NOT EXISTS expected_hours_learning_decision_reason
+                TEXT NOT NULL DEFAULT '';
+    """)
+    db.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'locations'::regclass
+                  AND conname = 'locations_expected_hours_source_check'
+            ) THEN
+                ALTER TABLE locations
+                    ADD CONSTRAINT locations_expected_hours_source_check
+                    CHECK (expected_hours_source IN ('manual', 'learned_accepted'));
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'locations'::regclass
+                  AND conname = 'locations_expected_hours_learning_decision_check'
+            ) THEN
+                ALTER TABLE locations
+                    ADD CONSTRAINT locations_expected_hours_learning_decision_check
+                    CHECK (
+                        expected_hours_learning_decision IS NULL
+                        OR expected_hours_learning_decision IN ('accepted', 'rejected')
+                    );
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'locations'::regclass
+                  AND conname = 'locations_expected_hours_learning_fingerprint_check'
+            ) THEN
+                ALTER TABLE locations
+                    ADD CONSTRAINT locations_expected_hours_learning_fingerprint_check
+                    CHECK (
+                        expected_hours_learning_fingerprint IS NULL
+                        OR expected_hours_learning_fingerprint ~ '^[0-9a-f]{64}$'
+                    );
+            END IF;
+        END $$;
+    """)
     db.execute(
         "ALTER TABLE locations ADD COLUMN IF NOT EXISTS check_in_token_nonce VARCHAR(64)"
     )
@@ -9661,6 +9720,10 @@ CUSTOMER_SELECT_COLUMNS = """
 SITE_SELECT_COLUMNS = """
     l.id, l.customer_id, l.address, l.address_key, l.customer_name,
     l.location_type, l.rate, l.rate_type, l.frequency, l.expected_hours,
+    l.expected_hours_source, l.expected_hours_learning_decision,
+    l.expected_hours_learning_fingerprint, l.expected_hours_learning_snapshot,
+    l.expected_hours_learning_decided_at, l.expected_hours_learning_decided_by,
+    l.expected_hours_learning_decision_reason,
     l.target_labor_pct, l.min_margin_pct, l.lat, l.lng, l.service_scope,
     l.access_instructions, l.service_preferences, l.pet_notes,
     l.service_start_date, l.check_in_token_nonce, l.active, l.created_at,
@@ -9768,6 +9831,25 @@ def _serialize_site(row: Dict[str, Any]) -> Dict[str, Any]:
             float(row["expected_hours"])
             if row.get("expected_hours") is not None
             else None
+        ),
+        "expectedHoursSource": str(row.get("expected_hours_source") or "manual"),
+        "expectedHoursLearningDecision": row.get("expected_hours_learning_decision"),
+        "expectedHoursLearningFingerprint": row.get(
+            "expected_hours_learning_fingerprint"
+        ),
+        "expectedHoursLearningSnapshot": row.get("expected_hours_learning_snapshot"),
+        "expectedHoursLearningDecidedAt": to_utc_iso(
+            row["expected_hours_learning_decided_at"]
+        )
+        if row.get("expected_hours_learning_decided_at") is not None
+        else None,
+        "expectedHoursLearningDecidedBy": (
+            int(row["expected_hours_learning_decided_by"])
+            if row.get("expected_hours_learning_decided_by") is not None
+            else None
+        ),
+        "expectedHoursLearningDecisionReason": str(
+            row.get("expected_hours_learning_decision_reason") or ""
         ),
         "targetLaborPct": (
             float(row["target_labor_pct"])
@@ -11050,6 +11132,18 @@ def admin_update_locations(
                         continue
                     assignments.append(f"{column} = %s")
                     params.append(values[request_field])
+                if "expectedHours" in present:
+                    assignments.extend(
+                        [
+                            "expected_hours_source = 'manual'",
+                            "expected_hours_learning_decision = NULL",
+                            "expected_hours_learning_fingerprint = NULL",
+                            "expected_hours_learning_snapshot = NULL",
+                            "expected_hours_learning_decided_at = NULL",
+                            "expected_hours_learning_decided_by = NULL",
+                            "expected_hours_learning_decision_reason = ''",
+                        ]
+                    )
                 if assignments:
                     assignments.append("updated_at = NOW()")
                     params.append(site_id)
@@ -11267,6 +11361,18 @@ def admin_patch_location(
                     continue
                 assignments.append(f"{column} = %s")
                 params.append(values[request_field])
+            if "expectedHours" in present:
+                assignments.extend(
+                    [
+                        "expected_hours_source = 'manual'",
+                        "expected_hours_learning_decision = NULL",
+                        "expected_hours_learning_fingerprint = NULL",
+                        "expected_hours_learning_snapshot = NULL",
+                        "expected_hours_learning_decided_at = NULL",
+                        "expected_hours_learning_decided_by = NULL",
+                        "expected_hours_learning_decision_reason = ''",
+                    ]
+                )
 
             if assignments:
                 assignments.append("updated_at = NOW()")
