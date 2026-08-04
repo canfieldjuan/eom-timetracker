@@ -9332,12 +9332,6 @@ def my_timesheet_hours(
     employee_id = current_employee["id"]
     now = utc_now()
 
-    week_start_date = local_sunday_week_start(now)
-    week_start = datetime.combine(
-        week_start_date,
-        clock_time.min,
-        tzinfo=APP_TIMEZONE,
-    ).astimezone(timezone.utc)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     year_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     today_str = local_date_string(now)
@@ -9351,37 +9345,62 @@ def my_timesheet_hours(
     # Weekly hours use the payroll-effective math (shift corrections, local-week
     # clipping, break minutes) so the number here matches what payroll pays once
     # shifts close. Open shifts earn 0 there, so the currently-open non-stale
-    # shift is added back below as live elapsed time clipped to this week.
+    # shift is added back as live elapsed time clipped to this week. Paid and
+    # live are both derived from ONE set of shift rows, fetched here, so a
+    # clock-out committing between two reads can never count the same shift as
+    # both paid and live.
+    payroll_week_start = _parse_payroll_week_start(None)
+    _, week_start_utc, week_end_utc = _payroll_week_bounds(payroll_week_start)
+    my_shift_rows = [
+        row
+        for row in _payroll_overlapping_shift_rows(week_start_utc, week_end_utc, now)
+        if int(row["employee_id"]) == int(employee_id)
+    ]
+    my_shift_correction_rows = _payroll_active_shift_correction_rows_for_shift_ids(
+        [int(row["id"]) for row in my_shift_rows]
+    )
     payroll_week = _compute_payroll_weekly_hours(
-        None,
+        payroll_week_start.isoformat(),
         employee_rows=[{
             "id": employee_id,
             "name": current_employee["name"],
             "active": True,
         }],
+        shift_rows=my_shift_rows,
+        shift_correction_rows=my_shift_correction_rows,
+        now_utc=now,
     )
     paid_weekly_minutes = 0
     for payroll_employee in payroll_week.get("employees", []):
         if int(payroll_employee.get("employeeId", 0)) == int(employee_id):
             paid_weekly_minutes = int(payroll_employee.get("totalMinutes", 0))
             break
-    paid_weekly_hours = paid_weekly_minutes / 60.0
 
+    my_corrections_by_shift_id = _payroll_shift_corrections_by_shift_id(
+        my_shift_correction_rows
+    )
     live_open_hours = 0.0
-    for entry in my_entries:
-        if entry.get("clockOut") is not None:
+    for shift_row in my_shift_rows:
+        effective_row = _effective_payroll_shift_row(
+            shift_row,
+            my_corrections_by_shift_id.get(int(shift_row["id"])),
+        )
+        if effective_row.get("clock_out") is not None:
             continue
-        if _raw_open_entry_is_stale(entry, now):
+        open_clock_in = effective_row.get("clock_in")
+        if open_clock_in is None:
             continue
-        try:
-            open_clock_in = parse_utc_iso(str(entry.get("clockIn", "")).strip())
-        except ValueError:
+        if (now - open_clock_in).total_seconds() / 3600 > MAX_ACTIVE_SHIFT_HOURS:
             continue
-        live_start = max(open_clock_in, week_start)
+        live_start = max(open_clock_in, week_start_utc)
         if live_start < now:
             live_open_hours += (now - live_start).total_seconds() / 3600
 
-    weekly_hours = paid_weekly_hours + live_open_hours
+    # Round the components first and sum the rounded values so weeklyHours
+    # always equals paidHours + liveOpenHours exactly as displayed.
+    paid_weekly_hours = round(paid_weekly_minutes / 60.0, 2)
+    live_open_hours = round(live_open_hours, 2)
+    weekly_hours = round(paid_weekly_hours + live_open_hours, 2)
     today_hours = 0.0
     monthly_hours = 0.0
     yearly_hours = 0.0

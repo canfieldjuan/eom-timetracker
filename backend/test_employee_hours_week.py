@@ -364,6 +364,38 @@ def test_my_hours_weekly_adds_live_open_shift_elapsed(
         _delete_employee(employee_id)
 
 
+def test_my_hours_weekly_equals_displayed_basis_sum(
+    client,
+    monkeypatch,
+):
+    employee_name = "Self Hours Rounding Employee"
+    employee_id = _create_employee(employee_name)
+    employee_headers = _employee_headers(employee_id, employee_name)
+    fixed_now = _utc_from_local(date(2026, 7, 22), 10)
+    monkeypatch.setattr(time_tracker_api, "utc_now", lambda: fixed_now)
+
+    try:
+        # One paid minute plus one live minute: each component rounds to 0.02,
+        # and the total must equal the displayed component sum (0.04), not a
+        # separately rounded raw sum (0.03).
+        _create_shift(employee_id, date(2026, 7, 20), 8, 1 / 60)
+        _create_open_shift(employee_id, fixed_now - timedelta(minutes=1))
+
+        response = client.get(
+            "/api/timesheet/my-hours",
+            headers=employee_headers,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["weeklyHoursBasis"] == {
+            "paidHours": 0.02,
+            "liveOpenHours": 0.02,
+        }
+        assert body["weeklyHours"] == 0.04
+    finally:
+        _delete_employee(employee_id)
+
+
 def test_my_hours_weekly_ignores_stale_open_shift(
     client,
     monkeypatch,
