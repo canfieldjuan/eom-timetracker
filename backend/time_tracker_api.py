@@ -9349,13 +9349,14 @@ def my_timesheet_hours(
     # live are both derived from ONE set of shift rows, fetched here, so a
     # clock-out committing between two reads can never count the same shift as
     # both paid and live.
-    payroll_week_start = _parse_payroll_week_start(None)
+    payroll_week_start = local_sunday_week_start(now)
     _, week_start_utc, week_end_utc = _payroll_week_bounds(payroll_week_start)
-    my_shift_rows = [
-        row
-        for row in _payroll_overlapping_shift_rows(week_start_utc, week_end_utc, now)
-        if int(row["employee_id"]) == int(employee_id)
-    ]
+    my_shift_rows = _payroll_overlapping_shift_rows(
+        week_start_utc,
+        week_end_utc,
+        now,
+        employee_id=int(employee_id),
+    )
     my_shift_correction_rows = _payroll_active_shift_correction_rows_for_shift_ids(
         [int(row["id"]) for row in my_shift_rows]
     )
@@ -12684,6 +12685,7 @@ def _payroll_overlapping_shift_rows(
     now_utc: datetime,
     *,
     cursor: Optional[Any] = None,
+    employee_id: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     return _payroll_query_all(
         """
@@ -12718,6 +12720,7 @@ def _payroll_overlapping_shift_rows(
                   )
               )
           )
+          AND (%s::integer IS NULL OR shift_row.employee_id = %s)
         ORDER BY shift_row.employee_id, shift_row.clock_in, shift_row.id
         """,
         (
@@ -12728,6 +12731,8 @@ def _payroll_overlapping_shift_rows(
             week_start_utc,
             week_start_utc,
             week_end_utc,
+            employee_id,
+            employee_id,
         ),
         cursor=cursor,
     )
