@@ -652,3 +652,93 @@ def test_atlas_funnel_proxy_keeps_service_token_server_side_and_forwards_only_ha
         "tracker_customer_id": 12,
         "tracker_site_id": 24,
     }
+
+
+def test_mark_lead_lost_proxies_reason_to_atlas(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+    calls: list[dict[str, object]] = []
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        calls.append({"path": path, "payload": payload, "key": idempotency_key})
+        return {
+            "success": True,
+            "contact_id": contact_id,
+            "lead_stage": "lost",
+            "reason_code": "spam",
+            "idempotent": False,
+        }
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    response = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/lost",
+        headers=auth,
+        json={"reasonCode": "spam", "note": "bot asked us to pay", "idempotencyKey": key},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["success"] is True
+    assert calls == [
+        {
+            "path": f"/eom-funnel/leads/{contact_id}/lost",
+            "payload": {"reason_code": "spam", "note": "bot asked us to pay"},
+            "key": key,
+        }
+    ]
+
+
+def test_mark_lead_lost_rejects_unknown_reason_code(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+
+    def never(*args, **kwargs):
+        raise AssertionError("Atlas must not be called for an invalid reason code")
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", never)
+    response = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/lost",
+        headers=auth,
+        json={"reasonCode": "banana", "idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 422
+
+
+def test_reopen_lead_proxies_to_atlas(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+    calls: list[dict[str, object]] = []
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        calls.append({"path": path, "payload": payload, "key": idempotency_key})
+        return {
+            "success": True,
+            "contact_id": contact_id,
+            "lead_stage": "new",
+            "idempotent": False,
+        }
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    response = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/reopen",
+        headers=auth,
+        json={"idempotencyKey": key},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["success"] is True
+    assert calls == [
+        {
+            "path": f"/eom-funnel/leads/{contact_id}/reopen",
+            "payload": {},
+            "key": key,
+        }
+    ]

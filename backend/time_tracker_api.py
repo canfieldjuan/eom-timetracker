@@ -2288,6 +2288,23 @@ class OfficeEstimateApprovalRequest(CustomerCreateRequest):
     idempotencyKey: UUID = Field(...)
 
 
+class FunnelLeadLostRequest(BaseModel):
+    """Office disposition for an Atlas lead that will not convert."""
+
+    reasonCode: str = Field(
+        ...,
+        pattern="^(spam|no_response|declined_after_estimate|price|other)$",
+    )
+    note: Optional[str] = Field(default=None, max_length=1000)
+    idempotencyKey: UUID = Field(...)
+
+
+class FunnelLeadReopenRequest(BaseModel):
+    """Return a previously-lost Atlas lead to the active queue."""
+
+    idempotencyKey: UUID = Field(...)
+
+
 class CustomerUpdateRequest(BaseModel):
     expectedUpdateToken: Optional[str] = Field(
         default=None,
@@ -10131,7 +10148,9 @@ def _insert_site(
     return int(cur.fetchone()["id"])
 
 
-def _require_juan_funnel_approver(admin: Dict[str, Any]) -> None:
+def _require_juan_funnel_approver(
+    admin: Dict[str, Any], *, action: str = "approve estimates"
+) -> None:
     """Require the configured stable employee identity, not a display name."""
     if EOM_FUNNEL_APPROVER_EMPLOYEE_ID <= 0:
         raise HTTPException(
@@ -10141,7 +10160,7 @@ def _require_juan_funnel_approver(admin: Dict[str, Any]) -> None:
     if int(admin["id"]) != EOM_FUNNEL_APPROVER_EMPLOYEE_ID:
         raise HTTPException(
             status_code=403,
-            detail="Only the configured EOM funnel approver may approve estimates",
+            detail=f"Only the configured EOM funnel approver may {action}",
         )
 
 
@@ -10665,6 +10684,72 @@ def admin_retry_funnel_handoff(
         content=jsonable_encoder(
             {"success": True, "idempotent": True, "handoff": visible}
         ),
+    )
+
+
+@app.post("/api/admin/funnel/leads/{contact_id}/lost")
+def admin_mark_funnel_lead_lost(
+    contact_id: UUID,
+    payload: FunnelLeadLostRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Disposition an Atlas lead that will not convert. No local Customer/Site
+    is created, so there is no pending-handoff row and no 202 retry path: Atlas
+    is the single owner of the lead's stage."""
+    _require_juan_funnel_approver(admin, action="mark leads lost")
+    _require_atlas_funnel_configuration()
+    contact_id_text = str(contact_id)
+    try:
+        atlas_result = _atlas_funnel_request(
+            f"/eom-funnel/leads/{contact_id_text}/lost",
+            admin,
+            payload={"reason_code": payload.reasonCode, "note": payload.note},
+            idempotency_key=str(payload.idempotencyKey),
+        )
+    except AtlasFunnelRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    append_access_log(
+        request,
+        "EOM_FUNNEL_LEAD_MARKED_LOST",
+        True,
+        f"contact={contact_id_text} reason={payload.reasonCode}",
+    )
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder({"success": True, "lead": atlas_result}),
+    )
+
+
+@app.post("/api/admin/funnel/leads/{contact_id}/reopen")
+def admin_reopen_funnel_lead(
+    contact_id: UUID,
+    payload: FunnelLeadReopenRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Return a previously-lost Atlas lead to the active review queue."""
+    _require_juan_funnel_approver(admin, action="reopen leads")
+    _require_atlas_funnel_configuration()
+    contact_id_text = str(contact_id)
+    try:
+        atlas_result = _atlas_funnel_request(
+            f"/eom-funnel/leads/{contact_id_text}/reopen",
+            admin,
+            payload={},
+            idempotency_key=str(payload.idempotencyKey),
+        )
+    except AtlasFunnelRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    append_access_log(
+        request,
+        "EOM_FUNNEL_LEAD_REOPENED",
+        True,
+        f"contact={contact_id_text}",
+    )
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder({"success": True, "lead": atlas_result}),
     )
 
 
