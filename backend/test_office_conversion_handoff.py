@@ -831,6 +831,93 @@ def test_mark_lead_lost_proxies_reason_to_atlas(
     ]
 
 
+def test_mark_lead_lost_clears_working_marker_before_reopen(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    lost_key = str(uuid.uuid4())
+    reopen_key = str(uuid.uuid4())
+    calls: list[dict[str, object]] = []
+
+    start = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/start-estimate",
+        headers=auth,
+    )
+    assert start.status_code == 200, start.text
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        calls.append({"path": path, "payload": payload, "key": idempotency_key})
+        if path.endswith("/lost"):
+            return {
+                "success": True,
+                "contact_id": contact_id,
+                "lead_stage": "lost",
+                "reason_code": "spam",
+                "idempotent": False,
+            }
+        return {
+            "success": True,
+            "contact_id": contact_id,
+            "lead_stage": "new",
+            "idempotent": False,
+        }
+
+    def atlas_read(path, admin, *, params=None):
+        return {
+            "leads": [
+                {
+                    "contactId": contact_id,
+                    "fullName": "Reopened Estimate Lead",
+                    "email": "lead@example.test",
+                    "phone": "217-555-0144",
+                    "address": "900 Lead Lane, Effingham, IL",
+                    "source": "website",
+                    "createdAt": "2026-07-27T12:00:00Z",
+                }
+            ],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+        }
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    lost = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/lost",
+        headers=auth,
+        json={"reasonCode": "spam", "note": "not a fit", "idempotencyKey": lost_key},
+    )
+    reopened = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/reopen",
+        headers=auth,
+        json={"idempotencyKey": reopen_key},
+    )
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
+    review = client.get("/api/admin/funnel/review", headers=auth)
+
+    assert lost.status_code == 200, lost.text
+    assert reopened.status_code == 200, reopened.text
+    assert review.status_code == 200, review.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS n FROM eom_lead_working WHERE atlas_contact_id = %s",
+        (contact_id,),
+    )["n"] == 0
+    assert review.json()["leads"][0]["contactId"] == contact_id
+    assert review.json()["workingLeads"] == []
+    assert calls == [
+        {
+            "path": f"/eom-funnel/leads/{contact_id}/lost",
+            "payload": {"reason_code": "spam", "note": "not a fit"},
+            "key": lost_key,
+        },
+        {
+            "path": f"/eom-funnel/leads/{contact_id}/reopen",
+            "payload": {},
+            "key": reopen_key,
+        },
+    ]
+
+
 def test_mark_lead_lost_rejects_unknown_reason_code(
     client, auth, monkeypatch, configured_office_conversion
 ):

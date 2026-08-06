@@ -10811,6 +10811,7 @@ def admin_mark_funnel_lead_lost(
         )
     except AtlasFunnelRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    _clear_working_lead_marker(contact_id_text)
     append_access_log(
         request,
         "EOM_FUNNEL_LEAD_MARKED_LOST",
