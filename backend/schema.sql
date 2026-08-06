@@ -96,11 +96,20 @@ CREATE TABLE eom_office_conversion_handoffs (
 );
 
 -- Local office state for Atlas leads Juan has accepted into the estimate
--- pipeline before the customer has approved pricing/schedule details.
+-- pipeline before the customer has approved pricing/schedule details. The
+-- version makes delayed browser actions fail closed after lost/reopen
+-- transitions.
 CREATE TABLE eom_lead_working (
     atlas_contact_id        UUID PRIMARY KEY,
+    state                   VARCHAR(16) NOT NULL DEFAULT 'working'
+                              CHECK (state IN ('working', 'lost', 'reopened')),
+    state_version           INTEGER NOT NULL DEFAULT 1 CHECK (state_version >= 1),
     marked_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    marked_by_employee_id   INTEGER NOT NULL REFERENCES employees(id) ON DELETE RESTRICT
+    marked_by_employee_id   INTEGER REFERENCES employees(id) ON DELETE RESTRICT,
+    lost_at                 TIMESTAMPTZ,
+    lost_by_employee_id     INTEGER REFERENCES employees(id) ON DELETE RESTRICT,
+    reopened_at             TIMESTAMPTZ,
+    reopened_by_employee_id INTEGER REFERENCES employees(id) ON DELETE RESTRICT
 );
 
 -- Request access diagnostics. During the file-to-Postgres cutover the API keeps

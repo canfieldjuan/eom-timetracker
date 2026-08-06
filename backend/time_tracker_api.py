@@ -2305,6 +2305,17 @@ class FunnelLeadReopenRequest(BaseModel):
     idempotencyKey: UUID = Field(...)
 
 
+class FunnelLeadStartEstimateRequest(BaseModel):
+    """Fresh lead-review state required before moving a lead to Working."""
+
+    expectedStateToken: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern="^[0-9a-f]{64}$",
+    )
+
+
 class CustomerUpdateRequest(BaseModel):
     expectedUpdateToken: Optional[str] = Field(
         default=None,
@@ -3954,10 +3965,63 @@ def _ensure_customer_site_schema() -> None:
                 """
                 CREATE TABLE IF NOT EXISTS eom_lead_working (
                     atlas_contact_id UUID PRIMARY KEY,
+                    state VARCHAR(16) NOT NULL DEFAULT 'working'
+                        CHECK (state IN ('working', 'lost', 'reopened')),
+                    state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version >= 1),
                     marked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     marked_by_employee_id INTEGER NOT NULL
-                        REFERENCES employees(id) ON DELETE RESTRICT
+                        REFERENCES employees(id) ON DELETE RESTRICT,
+                    lost_at TIMESTAMPTZ,
+                    lost_by_employee_id INTEGER REFERENCES employees(id) ON DELETE RESTRICT,
+                    reopened_at TIMESTAMPTZ,
+                    reopened_by_employee_id INTEGER REFERENCES employees(id) ON DELETE RESTRICT
                 );
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE eom_lead_working
+                    ADD COLUMN IF NOT EXISTS state VARCHAR(16) NOT NULL DEFAULT 'working';
+                ALTER TABLE eom_lead_working
+                    ADD COLUMN IF NOT EXISTS state_version INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE eom_lead_working
+                    ADD COLUMN IF NOT EXISTS lost_at TIMESTAMPTZ;
+                ALTER TABLE eom_lead_working
+                    ADD COLUMN IF NOT EXISTS lost_by_employee_id
+                        INTEGER REFERENCES employees(id) ON DELETE RESTRICT;
+                ALTER TABLE eom_lead_working
+                    ADD COLUMN IF NOT EXISTS reopened_at TIMESTAMPTZ;
+                ALTER TABLE eom_lead_working
+                    ADD COLUMN IF NOT EXISTS reopened_by_employee_id
+                        INTEGER REFERENCES employees(id) ON DELETE RESTRICT;
+                ALTER TABLE eom_lead_working
+                    ALTER COLUMN marked_by_employee_id DROP NOT NULL;
+                """
+            )
+            cur.execute(
+                """
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conrelid = 'eom_lead_working'::regclass
+                          AND conname = 'eom_lead_working_state_check'
+                    ) THEN
+                        ALTER TABLE eom_lead_working
+                            ADD CONSTRAINT eom_lead_working_state_check
+                            CHECK (state IN ('working', 'lost', 'reopened'));
+                    END IF;
+
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conrelid = 'eom_lead_working'::regclass
+                          AND conname = 'eom_lead_working_state_version_check'
+                    ) THEN
+                        ALTER TABLE eom_lead_working
+                            ADD CONSTRAINT eom_lead_working_state_version_check
+                            CHECK (state_version >= 1);
+                    END IF;
+                END $$;
                 """
             )
 
@@ -10394,21 +10458,44 @@ def _serialize_working_lead(
     lead: Dict[str, Any],
     marker: Dict[str, Any],
 ) -> Dict[str, Any]:
-    working_lead = dict(lead)
+    working_lead = _lead_with_state_token(lead, marker)
     marked_at = marker.get("marked_at")
     working_lead["markedAt"] = to_utc_iso(marked_at) if marked_at else None
-    working_lead["markedByEmployeeId"] = int(marker["marked_by_employee_id"])
+    working_lead["markedByEmployeeId"] = (
+        int(marker["marked_by_employee_id"])
+        if marker.get("marked_by_employee_id") is not None
+        else None
+    )
     return working_lead
 
 
-def _list_working_lead_markers(contact_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+def _lead_state_token(contact_id: str, state_version: int) -> str:
+    return hashlib.sha256(
+        f"eom-lead-working-state:v1:{contact_id}:{state_version}".encode("utf-8")
+    ).hexdigest()
+
+
+def _lead_with_state_token(
+    lead: Dict[str, Any],
+    marker: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    contact_id = str(lead["contactId"])
+    state_version = int(marker["state_version"]) if marker else 0
+    enriched = dict(lead)
+    enriched["stateToken"] = _lead_state_token(contact_id, state_version)
+    return enriched
+
+
+def _list_lead_state_markers(contact_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     if not contact_ids:
         return {}
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT atlas_contact_id, marked_at, marked_by_employee_id
+                SELECT atlas_contact_id, state, state_version, marked_at,
+                       marked_by_employee_id, lost_at, lost_by_employee_id,
+                       reopened_at, reopened_by_employee_id
                 FROM eom_lead_working
                 WHERE atlas_contact_id = ANY(%s::uuid[])
                 """,
@@ -10417,32 +10504,153 @@ def _list_working_lead_markers(contact_ids: List[str]) -> Dict[str, Dict[str, An
             return {str(row["atlas_contact_id"]): dict(row) for row in cur.fetchall()}
 
 
-def _mark_lead_working(contact_id: str, admin: Dict[str, Any]) -> Dict[str, Any]:
+def _mark_lead_working(
+    contact_id: str,
+    admin: Dict[str, Any],
+    expected_state_token: str,
+) -> Dict[str, Any]:
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
             cur.execute(
                 """
-                INSERT INTO eom_lead_working (atlas_contact_id, marked_by_employee_id)
-                VALUES (%s, %s)
-                ON CONFLICT (atlas_contact_id) DO UPDATE
-                SET marked_by_employee_id = eom_lead_working.marked_by_employee_id
-                RETURNING atlas_contact_id, marked_at, marked_by_employee_id
+                SELECT state
+                FROM eom_office_conversion_handoffs
+                WHERE atlas_contact_id = %s
                 """,
-                (contact_id, int(admin["id"])),
+                (contact_id,),
             )
+            handoff = cur.fetchone()
+            if handoff:
+                _raise_conflict(
+                    "funnel_lead_already_reserved",
+                    "This Atlas lead already has an office conversion approval",
+                    {"contactId": contact_id, "handoffState": str(handoff["state"])},
+                )
+
+            cur.execute(
+                """
+                SELECT atlas_contact_id, state, state_version, marked_at,
+                       marked_by_employee_id, lost_at, lost_by_employee_id,
+                       reopened_at, reopened_by_employee_id
+                FROM eom_lead_working
+                WHERE atlas_contact_id = %s
+                FOR UPDATE
+                """,
+                (contact_id,),
+            )
+            existing = cur.fetchone()
+            if existing and str(existing["state"]) == "working":
+                return dict(existing)
+
+            current_version = int(existing["state_version"]) if existing else 0
+            current_token = _lead_state_token(contact_id, current_version)
+            if not hmac.compare_digest(expected_state_token, current_token):
+                _raise_conflict(
+                    "funnel_lead_state_changed",
+                    "Lead review state changed; refresh before starting the estimate",
+                    {"contactId": contact_id},
+                )
+            if existing and str(existing["state"]) == "lost":
+                _raise_conflict(
+                    "funnel_lead_not_active",
+                    "This lead is not active; reopen it before starting the estimate",
+                    {"contactId": contact_id},
+                )
+
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE eom_lead_working
+                    SET state = 'working',
+                        state_version = state_version + 1,
+                        marked_at = NOW(),
+                        marked_by_employee_id = %s
+                    WHERE atlas_contact_id = %s
+                    RETURNING atlas_contact_id, state, state_version, marked_at,
+                              marked_by_employee_id, lost_at, lost_by_employee_id,
+                              reopened_at, reopened_by_employee_id
+                    """,
+                    (int(admin["id"]), contact_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO eom_lead_working (
+                        atlas_contact_id, state, state_version,
+                        marked_by_employee_id
+                    )
+                    VALUES (%s, 'working', 1, %s)
+                    RETURNING atlas_contact_id, state, state_version, marked_at,
+                              marked_by_employee_id, lost_at, lost_by_employee_id,
+                              reopened_at, reopened_by_employee_id
+                    """,
+                    (contact_id, int(admin["id"])),
+                )
             row = cur.fetchone()
             if not row:
                 raise RuntimeError("Working lead marker was saved but could not be reloaded")
             return dict(row)
 
 
+def _mark_lead_lost_locally(contact_id: str, admin: Dict[str, Any]) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO eom_lead_working (
+                    atlas_contact_id, state, state_version,
+                    lost_at, lost_by_employee_id
+                )
+                VALUES (%s, 'lost', 1, NOW(), %s)
+                ON CONFLICT (atlas_contact_id) DO UPDATE
+                SET state = 'lost',
+                    state_version = eom_lead_working.state_version + 1,
+                    lost_at = NOW(),
+                    lost_by_employee_id = EXCLUDED.lost_by_employee_id
+                RETURNING atlas_contact_id, state, state_version, marked_at,
+                          marked_by_employee_id, lost_at, lost_by_employee_id,
+                          reopened_at, reopened_by_employee_id
+                """,
+                (contact_id, int(admin["id"])),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Lost lead marker was saved but could not be reloaded")
+            return dict(row)
+
+
+def _mark_lead_reopened_locally(contact_id: str, admin: Dict[str, Any]) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO eom_lead_working (
+                    atlas_contact_id, state, state_version,
+                    reopened_at, reopened_by_employee_id
+                )
+                VALUES (%s, 'reopened', 1, NOW(), %s)
+                ON CONFLICT (atlas_contact_id) DO UPDATE
+                SET state = 'reopened',
+                    state_version = eom_lead_working.state_version + 1,
+                    reopened_at = NOW(),
+                    reopened_by_employee_id = EXCLUDED.reopened_by_employee_id
+                RETURNING atlas_contact_id, state, state_version, marked_at,
+                          marked_by_employee_id, lost_at, lost_by_employee_id,
+                          reopened_at, reopened_by_employee_id
+                """,
+                (contact_id, int(admin["id"])),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Reopened lead marker was saved but could not be reloaded")
+            return dict(row)
+
+
 def _clear_working_lead_marker(contact_id: str) -> None:
     with db.get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM eom_lead_working WHERE atlas_contact_id = %s",
-                (contact_id,),
-            )
+            cur.execute("DELETE FROM eom_lead_working WHERE atlas_contact_id = %s", (contact_id,))
 
 
 @app.get("/api/admin/customers")
@@ -10613,13 +10821,14 @@ def admin_approve_estimate(
 @app.post("/api/admin/funnel/leads/{contact_id}/start-estimate")
 def admin_start_funnel_lead_estimate(
     contact_id: UUID,
+    payload: FunnelLeadStartEstimateRequest,
     request: Request,
     admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     """Mark an Atlas lead as actively working before estimate approval."""
     _require_juan_funnel_approver(admin, action="start estimates")
     contact_id_text = str(contact_id)
-    marker = _mark_lead_working(contact_id_text, admin)
+    marker = _mark_lead_working(contact_id_text, admin, payload.expectedStateToken)
     append_access_log(
         request,
         "EOM_FUNNEL_LEAD_ESTIMATE_STARTED",
@@ -10632,6 +10841,7 @@ def admin_start_funnel_lead_estimate(
             "contactId": contact_id_text,
             "markedAt": to_utc_iso(marker["marked_at"]),
             "markedByEmployeeId": int(marker["marked_by_employee_id"]),
+            "stateToken": _lead_state_token(contact_id_text, int(marker["state_version"])),
         },
     }
 
@@ -10649,15 +10859,15 @@ def admin_list_funnel_review(
     content = _atlas_funnel_read("/eom-funnel/leads", admin, params=params)
     lead_page = _parse_atlas_lead_review_response(content)
     leads = lead_page["leads"]
-    working_markers = _list_working_lead_markers([lead["contactId"] for lead in leads])
+    lead_state_markers = _list_lead_state_markers([lead["contactId"] for lead in leads])
     new_leads: List[Dict[str, Any]] = []
     working_leads: List[Dict[str, Any]] = []
     for lead in leads:
-        marker = working_markers.get(str(lead["contactId"]))
-        if marker:
+        marker = lead_state_markers.get(str(lead["contactId"]))
+        if marker and str(marker["state"]) == "working":
             working_leads.append(_serialize_working_lead(lead, marker))
         else:
-            new_leads.append(lead)
+            new_leads.append(_lead_with_state_token(lead, marker))
     pending_handoffs = _list_pending_office_conversion_handoffs()
     append_access_log(
         request,
@@ -10811,7 +11021,7 @@ def admin_mark_funnel_lead_lost(
         )
     except AtlasFunnelRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    _clear_working_lead_marker(contact_id_text)
+    _mark_lead_lost_locally(contact_id_text, admin)
     append_access_log(
         request,
         "EOM_FUNNEL_LEAD_MARKED_LOST",
@@ -10844,6 +11054,7 @@ def admin_reopen_funnel_lead(
         )
     except AtlasFunnelRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    _mark_lead_reopened_locally(contact_id_text, admin)
     append_access_log(
         request,
         "EOM_FUNNEL_LEAD_REOPENED",

@@ -55,6 +55,10 @@ def _atlas_success(payload: dict[str, object], key: str) -> dict[str, object]:
     }
 
 
+def _state_token(api, contact_id: str, version: int = 0) -> str:
+    return api._lead_state_token(contact_id, version)
+
+
 def test_estimate_approval_creates_one_customer_site_and_never_sends_rate_or_schedule(
     client, auth, monkeypatch, configured_office_conversion
 ):
@@ -311,6 +315,7 @@ def test_funnel_review_lists_atlas_leads_and_pending_handoffs_without_writes(
             "address": "900 Lead Lane, Effingham, IL",
             "source": "website",
             "createdAt": "2026-07-27T12:00:00Z",
+            "stateToken": _state_token(api, contact_id),
         }
     ]
     assert data["cursor"] is None
@@ -342,10 +347,12 @@ def test_start_estimate_marks_lead_working_without_customer_site_or_atlas_write(
     response = client.post(
         f"/api/admin/funnel/leads/{contact_id}/start-estimate",
         headers=auth,
+        json={"expectedStateToken": _state_token(api, contact_id)},
     )
     replay = client.post(
         f"/api/admin/funnel/leads/{contact_id}/start-estimate",
         headers=auth,
+        json={"expectedStateToken": _state_token(api, contact_id)},
     )
 
     after_counts = {
@@ -361,15 +368,20 @@ def test_start_estimate_marks_lead_working_without_customer_site_or_atlas_write(
     assert replay.status_code == 200, replay.text
     assert response.json()["success"] is True
     assert response.json()["workingLead"]["contactId"] == contact_id
+    assert response.json()["workingLead"]["stateToken"] == _state_token(api, contact_id, 1)
     assert replay.json()["workingLead"]["markedAt"] == response.json()["workingLead"]["markedAt"]
     assert after_counts == {**before_counts, "working": 1}
 
 
-def test_start_estimate_requires_configured_funnel_approver(client, emp_auth):
+def test_start_estimate_requires_configured_funnel_approver(
+    client, emp_auth, configured_office_conversion
+):
+    api = configured_office_conversion
     contact_id = str(uuid.uuid4())
     response = client.post(
         f"/api/admin/funnel/leads/{contact_id}/start-estimate",
         headers=emp_auth,
+        json={"expectedStateToken": _state_token(api, contact_id)},
     )
 
     assert response.status_code == 403
@@ -389,6 +401,7 @@ def test_funnel_review_moves_marked_leads_to_working_bucket(
     start = client.post(
         f"/api/admin/funnel/leads/{working_contact_id}/start-estimate",
         headers=auth,
+        json={"expectedStateToken": _state_token(api, working_contact_id)},
     )
     assert start.status_code == 200, start.text
 
@@ -425,10 +438,12 @@ def test_funnel_review_moves_marked_leads_to_working_bucket(
     assert response.status_code == 200, response.text
     data = response.json()
     assert [lead["contactId"] for lead in data["leads"]] == [new_contact_id]
+    assert data["leads"][0]["stateToken"] == _state_token(api, new_contact_id)
     assert [lead["contactId"] for lead in data["workingLeads"]] == [working_contact_id]
     assert data["workingLeads"][0]["fullName"] == "Working Estimate Lead"
     assert data["workingLeads"][0]["markedAt"] == start.json()["workingLead"]["markedAt"]
     assert data["workingLeads"][0]["markedByEmployeeId"] == 1
+    assert data["workingLeads"][0]["stateToken"] == _state_token(api, working_contact_id, 1)
 
 
 def test_estimate_approval_clears_working_marker(
@@ -441,6 +456,7 @@ def test_estimate_approval_clears_working_marker(
     start = client.post(
         f"/api/admin/funnel/leads/{contact_id}/start-estimate",
         headers=auth,
+        json={"expectedStateToken": _state_token(api, contact_id)},
     )
     assert start.status_code == 200, start.text
 
@@ -455,6 +471,37 @@ def test_estimate_approval_clears_working_marker(
     )
 
     assert approval.status_code == 201, approval.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS n FROM eom_lead_working WHERE atlas_contact_id = %s",
+        (contact_id,),
+    )["n"] == 0
+
+
+def test_start_estimate_rejects_lead_after_office_conversion_handoff_exists(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        return _atlas_success(payload, idempotency_key)
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    approval = client.post(
+        "/api/admin/funnel/approve-estimate",
+        headers=auth,
+        json=_payload(contact_id, key),
+    )
+    stale_start = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/start-estimate",
+        headers=auth,
+        json={"expectedStateToken": _state_token(api, contact_id)},
+    )
+
+    assert approval.status_code == 201, approval.text
+    assert stale_start.status_code == 409
+    assert stale_start.json()["code"] == "funnel_lead_already_reserved"
     assert db.query_one(
         "SELECT COUNT(*) AS n FROM eom_lead_working WHERE atlas_contact_id = %s",
         (contact_id,),
@@ -831,7 +878,7 @@ def test_mark_lead_lost_proxies_reason_to_atlas(
     ]
 
 
-def test_mark_lead_lost_clears_working_marker_before_reopen(
+def test_mark_lead_lost_and_reopen_do_not_restore_working_marker(
     client, auth, monkeypatch, configured_office_conversion
 ):
     api = configured_office_conversion
@@ -843,6 +890,7 @@ def test_mark_lead_lost_clears_working_marker_before_reopen(
     start = client.post(
         f"/api/admin/funnel/leads/{contact_id}/start-estimate",
         headers=auth,
+        json={"expectedStateToken": _state_token(api, contact_id)},
     )
     assert start.status_code == 200, start.text
 
@@ -899,10 +947,11 @@ def test_mark_lead_lost_clears_working_marker_before_reopen(
     assert reopened.status_code == 200, reopened.text
     assert review.status_code == 200, review.text
     assert db.query_one(
-        "SELECT COUNT(*) AS n FROM eom_lead_working WHERE atlas_contact_id = %s",
+        "SELECT state, state_version FROM eom_lead_working WHERE atlas_contact_id = %s",
         (contact_id,),
-    )["n"] == 0
+    ) == {"state": "reopened", "state_version": 3}
     assert review.json()["leads"][0]["contactId"] == contact_id
+    assert review.json()["leads"][0]["stateToken"] == _state_token(api, contact_id, 3)
     assert review.json()["workingLeads"] == []
     assert calls == [
         {
@@ -916,6 +965,92 @@ def test_mark_lead_lost_clears_working_marker_before_reopen(
             "key": reopen_key,
         },
     ]
+
+
+def test_delayed_start_after_lost_or_reopen_fails_with_stale_state_token(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    stale_token = _state_token(api, contact_id)
+    lost_key = str(uuid.uuid4())
+    reopen_key = str(uuid.uuid4())
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        if path.endswith("/lost"):
+            return {
+                "success": True,
+                "contact_id": contact_id,
+                "lead_stage": "lost",
+                "reason_code": "spam",
+                "idempotent": False,
+            }
+        return {
+            "success": True,
+            "contact_id": contact_id,
+            "lead_stage": "new",
+            "idempotent": False,
+        }
+
+    def atlas_read(path, admin, *, params=None):
+        return {
+            "leads": [
+                {
+                    "contactId": contact_id,
+                    "fullName": "Reopened Estimate Lead",
+                    "email": "lead@example.test",
+                    "phone": "217-555-0144",
+                    "address": "900 Lead Lane, Effingham, IL",
+                    "source": "website",
+                    "createdAt": "2026-07-27T12:00:00Z",
+                }
+            ],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+        }
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    lost = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/lost",
+        headers=auth,
+        json={"reasonCode": "spam", "note": "not a fit", "idempotencyKey": lost_key},
+    )
+    stale_after_lost = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/start-estimate",
+        headers=auth,
+        json={"expectedStateToken": stale_token},
+    )
+    reopened = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/reopen",
+        headers=auth,
+        json={"idempotencyKey": reopen_key},
+    )
+    stale_after_reopen = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/start-estimate",
+        headers=auth,
+        json={"expectedStateToken": stale_token},
+    )
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
+    review = client.get("/api/admin/funnel/review", headers=auth)
+    fresh_start = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/start-estimate",
+        headers=auth,
+        json={"expectedStateToken": review.json()["leads"][0]["stateToken"]},
+    )
+
+    assert lost.status_code == 200, lost.text
+    assert stale_after_lost.status_code == 409
+    assert stale_after_lost.json()["code"] == "funnel_lead_state_changed"
+    assert reopened.status_code == 200, reopened.text
+    assert stale_after_reopen.status_code == 409
+    assert stale_after_reopen.json()["code"] == "funnel_lead_state_changed"
+    assert review.status_code == 200, review.text
+    assert review.json()["leads"][0]["contactId"] == contact_id
+    assert review.json()["leads"][0]["stateToken"] == _state_token(api, contact_id, 2)
+    assert review.json()["workingLeads"] == []
+    assert fresh_start.status_code == 200, fresh_start.text
+    assert fresh_start.json()["workingLead"]["stateToken"] == _state_token(api, contact_id, 3)
 
 
 def test_mark_lead_lost_rejects_unknown_reason_code(
