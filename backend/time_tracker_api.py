@@ -3889,6 +3889,7 @@ def normalize_site_address(address: str) -> str:
 
 
 CUSTOMER_SITE_MUTATION_LOCK = "eom_customer_site_mutations_v1"
+FUNNEL_LEAD_TRANSITION_LOCK = "eom_funnel_lead_transition_v1"
 
 
 def _lock_customer_site_mutations(cur: Any) -> None:
@@ -3896,6 +3897,14 @@ def _lock_customer_site_mutations(cur: Any) -> None:
     cur.execute(
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
         (CUSTOMER_SITE_MUTATION_LOCK,),
+    )
+
+
+def _lock_funnel_lead_transition(cur: Any, contact_id: str) -> None:
+    """Serialize one Atlas lead's local transition with its remote command."""
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+        (FUNNEL_LEAD_TRANSITION_LOCK, contact_id),
     )
 
 
@@ -10512,6 +10521,7 @@ def _mark_lead_working(
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_site_mutations(cur)
+            _lock_funnel_lead_transition(cur, contact_id)
             cur.execute(
                 """
                 SELECT state
@@ -10593,58 +10603,62 @@ def _mark_lead_working(
             return dict(row)
 
 
-def _mark_lead_lost_locally(contact_id: str, admin: Dict[str, Any]) -> Dict[str, Any]:
-    with db.get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                INSERT INTO eom_lead_working (
-                    atlas_contact_id, state, state_version,
-                    lost_at, lost_by_employee_id
-                )
-                VALUES (%s, 'lost', 1, NOW(), %s)
-                ON CONFLICT (atlas_contact_id) DO UPDATE
-                SET state = 'lost',
-                    state_version = eom_lead_working.state_version + 1,
-                    lost_at = NOW(),
-                    lost_by_employee_id = EXCLUDED.lost_by_employee_id
-                RETURNING atlas_contact_id, state, state_version, marked_at,
-                          marked_by_employee_id, lost_at, lost_by_employee_id,
-                          reopened_at, reopened_by_employee_id
-                """,
-                (contact_id, int(admin["id"])),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise RuntimeError("Lost lead marker was saved but could not be reloaded")
-            return dict(row)
+def _mark_lead_lost_locally(
+    cur: psycopg2.extras.RealDictCursor,
+    contact_id: str,
+    admin: Dict[str, Any],
+) -> Dict[str, Any]:
+    cur.execute(
+        """
+        INSERT INTO eom_lead_working (
+            atlas_contact_id, state, state_version,
+            lost_at, lost_by_employee_id
+        )
+        VALUES (%s, 'lost', 1, NOW(), %s)
+        ON CONFLICT (atlas_contact_id) DO UPDATE
+        SET state = 'lost',
+            state_version = eom_lead_working.state_version + 1,
+            lost_at = NOW(),
+            lost_by_employee_id = EXCLUDED.lost_by_employee_id
+        RETURNING atlas_contact_id, state, state_version, marked_at,
+                  marked_by_employee_id, lost_at, lost_by_employee_id,
+                  reopened_at, reopened_by_employee_id
+        """,
+        (contact_id, int(admin["id"])),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError("Lost lead marker was saved but could not be reloaded")
+    return dict(row)
 
 
-def _mark_lead_reopened_locally(contact_id: str, admin: Dict[str, Any]) -> Dict[str, Any]:
-    with db.get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                INSERT INTO eom_lead_working (
-                    atlas_contact_id, state, state_version,
-                    reopened_at, reopened_by_employee_id
-                )
-                VALUES (%s, 'reopened', 1, NOW(), %s)
-                ON CONFLICT (atlas_contact_id) DO UPDATE
-                SET state = 'reopened',
-                    state_version = eom_lead_working.state_version + 1,
-                    reopened_at = NOW(),
-                    reopened_by_employee_id = EXCLUDED.reopened_by_employee_id
-                RETURNING atlas_contact_id, state, state_version, marked_at,
-                          marked_by_employee_id, lost_at, lost_by_employee_id,
-                          reopened_at, reopened_by_employee_id
-                """,
-                (contact_id, int(admin["id"])),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise RuntimeError("Reopened lead marker was saved but could not be reloaded")
-            return dict(row)
+def _mark_lead_reopened_locally(
+    cur: psycopg2.extras.RealDictCursor,
+    contact_id: str,
+    admin: Dict[str, Any],
+) -> Dict[str, Any]:
+    cur.execute(
+        """
+        INSERT INTO eom_lead_working (
+            atlas_contact_id, state, state_version,
+            reopened_at, reopened_by_employee_id
+        )
+        VALUES (%s, 'reopened', 1, NOW(), %s)
+        ON CONFLICT (atlas_contact_id) DO UPDATE
+        SET state = 'reopened',
+            state_version = eom_lead_working.state_version + 1,
+            reopened_at = NOW(),
+            reopened_by_employee_id = EXCLUDED.reopened_by_employee_id
+        RETURNING atlas_contact_id, state, state_version, marked_at,
+                  marked_by_employee_id, lost_at, lost_by_employee_id,
+                  reopened_at, reopened_by_employee_id
+        """,
+        (contact_id, int(admin["id"])),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError("Reopened lead marker was saved but could not be reloaded")
+    return dict(row)
 
 
 def _clear_working_lead_marker(contact_id: str) -> None:
@@ -11012,16 +11026,19 @@ def admin_mark_funnel_lead_lost(
     _require_juan_funnel_approver(admin, action="mark leads lost")
     _require_atlas_funnel_configuration()
     contact_id_text = str(contact_id)
-    try:
-        atlas_result = _atlas_funnel_request(
-            f"/eom-funnel/leads/{contact_id_text}/lost",
-            admin,
-            payload={"reason_code": payload.reasonCode, "note": payload.note},
-            idempotency_key=str(payload.idempotencyKey),
-        )
-    except AtlasFunnelRequestError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    _mark_lead_lost_locally(contact_id_text, admin)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_funnel_lead_transition(cur, contact_id_text)
+            try:
+                atlas_result = _atlas_funnel_request(
+                    f"/eom-funnel/leads/{contact_id_text}/lost",
+                    admin,
+                    payload={"reason_code": payload.reasonCode, "note": payload.note},
+                    idempotency_key=str(payload.idempotencyKey),
+                )
+            except AtlasFunnelRequestError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            _mark_lead_lost_locally(cur, contact_id_text, admin)
     append_access_log(
         request,
         "EOM_FUNNEL_LEAD_MARKED_LOST",
@@ -11045,16 +11062,19 @@ def admin_reopen_funnel_lead(
     _require_juan_funnel_approver(admin, action="reopen leads")
     _require_atlas_funnel_configuration()
     contact_id_text = str(contact_id)
-    try:
-        atlas_result = _atlas_funnel_request(
-            f"/eom-funnel/leads/{contact_id_text}/reopen",
-            admin,
-            payload={},
-            idempotency_key=str(payload.idempotencyKey),
-        )
-    except AtlasFunnelRequestError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    _mark_lead_reopened_locally(contact_id_text, admin)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_funnel_lead_transition(cur, contact_id_text)
+            try:
+                atlas_result = _atlas_funnel_request(
+                    f"/eom-funnel/leads/{contact_id_text}/reopen",
+                    admin,
+                    payload={},
+                    idempotency_key=str(payload.idempotencyKey),
+                )
+            except AtlasFunnelRequestError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            _mark_lead_reopened_locally(cur, contact_id_text, admin)
     append_access_log(
         request,
         "EOM_FUNNEL_LEAD_REOPENED",

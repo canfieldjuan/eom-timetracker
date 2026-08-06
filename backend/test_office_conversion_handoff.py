@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 import uuid
 
 import pytest
@@ -1051,6 +1053,71 @@ def test_delayed_start_after_lost_or_reopen_fails_with_stale_state_token(
     assert review.json()["workingLeads"] == []
     assert fresh_start.status_code == 200, fresh_start.text
     assert fresh_start.json()["workingLead"]["stateToken"] == _state_token(api, contact_id, 3)
+
+
+def test_concurrent_lost_and_reopen_local_state_follows_remote_order(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    lost_key = str(uuid.uuid4())
+    reopen_key = str(uuid.uuid4())
+    lost_atlas_started = Event()
+    allow_lost_atlas = Event()
+    reopen_request_started = Event()
+    reopen_atlas_started = Event()
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        if path.endswith("/lost"):
+            lost_atlas_started.set()
+            assert allow_lost_atlas.wait(timeout=10)
+            return {
+                "success": True,
+                "contact_id": contact_id,
+                "lead_stage": "lost",
+                "reason_code": "spam",
+                "idempotent": False,
+            }
+        reopen_atlas_started.set()
+        return {
+            "success": True,
+            "contact_id": contact_id,
+            "lead_stage": "new",
+            "idempotent": False,
+        }
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+
+    def post_reopen():
+        reopen_request_started.set()
+        return client.post(
+            f"/api/admin/funnel/leads/{contact_id}/reopen",
+            headers=auth,
+            json={"idempotencyKey": reopen_key},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        lost_future = executor.submit(
+            client.post,
+            f"/api/admin/funnel/leads/{contact_id}/lost",
+            headers=auth,
+            json={"reasonCode": "spam", "note": "not a fit", "idempotencyKey": lost_key},
+        )
+        assert lost_atlas_started.wait(timeout=10)
+        reopen_future = executor.submit(post_reopen)
+        assert reopen_request_started.wait(timeout=10)
+        assert reopen_atlas_started.wait(timeout=0.25) is False
+
+        allow_lost_atlas.set()
+        lost = lost_future.result(timeout=10)
+        reopened = reopen_future.result(timeout=10)
+
+    assert lost.status_code == 200, lost.text
+    assert reopened.status_code == 200, reopened.text
+    assert db.query_one(
+        "SELECT state, state_version FROM eom_lead_working WHERE atlas_contact_id = %s",
+        (contact_id,),
+    ) == {"state": "reopened", "state_version": 2}
 
 
 def test_mark_lead_lost_rejects_unknown_reason_code(
