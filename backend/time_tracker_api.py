@@ -3950,6 +3950,16 @@ def _ensure_customer_site_schema() -> None:
                     ON eom_office_conversion_handoffs(state, updated_at);
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eom_lead_working (
+                    atlas_contact_id UUID PRIMARY KEY,
+                    marked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    marked_by_employee_id INTEGER NOT NULL
+                        REFERENCES employees(id) ON DELETE RESTRICT
+                );
+                """
+            )
 
             cur.execute(
                 """
@@ -10380,6 +10390,61 @@ def _finalized_office_conversion_after_lost_error_race(
     return refreshed
 
 
+def _serialize_working_lead(
+    lead: Dict[str, Any],
+    marker: Dict[str, Any],
+) -> Dict[str, Any]:
+    working_lead = dict(lead)
+    marked_at = marker.get("marked_at")
+    working_lead["markedAt"] = to_utc_iso(marked_at) if marked_at else None
+    working_lead["markedByEmployeeId"] = int(marker["marked_by_employee_id"])
+    return working_lead
+
+
+def _list_working_lead_markers(contact_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not contact_ids:
+        return {}
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT atlas_contact_id, marked_at, marked_by_employee_id
+                FROM eom_lead_working
+                WHERE atlas_contact_id = ANY(%s::uuid[])
+                """,
+                (contact_ids,),
+            )
+            return {str(row["atlas_contact_id"]): dict(row) for row in cur.fetchall()}
+
+
+def _mark_lead_working(contact_id: str, admin: Dict[str, Any]) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO eom_lead_working (atlas_contact_id, marked_by_employee_id)
+                VALUES (%s, %s)
+                ON CONFLICT (atlas_contact_id) DO UPDATE
+                SET marked_by_employee_id = eom_lead_working.marked_by_employee_id
+                RETURNING atlas_contact_id, marked_at, marked_by_employee_id
+                """,
+                (contact_id, int(admin["id"])),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Working lead marker was saved but could not be reloaded")
+            return dict(row)
+
+
+def _clear_working_lead_marker(contact_id: str) -> None:
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM eom_lead_working WHERE atlas_contact_id = %s",
+                (contact_id,),
+            )
+
+
 @app.get("/api/admin/customers")
 def admin_list_customers(
     request: Request,
@@ -10446,6 +10511,7 @@ def admin_approve_estimate(
     customer = reserved["customer"]
     contact_id = str(payload.atlasContactId)
     idempotency_key = str(payload.idempotencyKey)
+    _clear_working_lead_marker(contact_id)
 
     if handoff["state"] == "finalized":
         append_access_log(
@@ -10544,6 +10610,32 @@ def admin_approve_estimate(
     )
 
 
+@app.post("/api/admin/funnel/leads/{contact_id}/start-estimate")
+def admin_start_funnel_lead_estimate(
+    contact_id: UUID,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Mark an Atlas lead as actively working before estimate approval."""
+    _require_juan_funnel_approver(admin, action="start estimates")
+    contact_id_text = str(contact_id)
+    marker = _mark_lead_working(contact_id_text, admin)
+    append_access_log(
+        request,
+        "EOM_FUNNEL_LEAD_ESTIMATE_STARTED",
+        True,
+        f"contact={contact_id_text}",
+    )
+    return {
+        "success": True,
+        "workingLead": {
+            "contactId": contact_id_text,
+            "markedAt": to_utc_iso(marker["marked_at"]),
+            "markedByEmployeeId": int(marker["marked_by_employee_id"]),
+        },
+    }
+
+
 @app.get("/api/admin/funnel/review")
 def admin_list_funnel_review(
     request: Request,
@@ -10557,17 +10649,27 @@ def admin_list_funnel_review(
     content = _atlas_funnel_read("/eom-funnel/leads", admin, params=params)
     lead_page = _parse_atlas_lead_review_response(content)
     leads = lead_page["leads"]
+    working_markers = _list_working_lead_markers([lead["contactId"] for lead in leads])
+    new_leads: List[Dict[str, Any]] = []
+    working_leads: List[Dict[str, Any]] = []
+    for lead in leads:
+        marker = working_markers.get(str(lead["contactId"]))
+        if marker:
+            working_leads.append(_serialize_working_lead(lead, marker))
+        else:
+            new_leads.append(lead)
     pending_handoffs = _list_pending_office_conversion_handoffs()
     append_access_log(
         request,
         "EOM_FUNNEL_REVIEW_LISTED",
         True,
-        f"leads={len(leads)} pending={len(pending_handoffs)}",
+        f"leads={len(new_leads)} working={len(working_leads)} pending={len(pending_handoffs)}",
     )
     return {
         "success": True,
         "canApprove": _can_approve_eom_funnel(admin),
-        "leads": leads,
+        "leads": new_leads,
+        "workingLeads": working_leads,
         "cursor": lead_page["cursor"],
         "hasMore": lead_page["hasMore"],
         "nextCursor": lead_page["nextCursor"],

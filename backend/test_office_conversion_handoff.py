@@ -285,6 +285,7 @@ def test_funnel_review_lists_atlas_leads_and_pending_handoffs_without_writes(
         "customers": db.query_one("SELECT COUNT(*) AS n FROM customers")["n"],
         "sites": db.query_one("SELECT COUNT(*) AS n FROM locations")["n"],
         "handoffs": db.query_one("SELECT COUNT(*) AS n FROM eom_office_conversion_handoffs")["n"],
+        "working": db.query_one("SELECT COUNT(*) AS n FROM eom_lead_working")["n"],
     }
 
     monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
@@ -293,6 +294,7 @@ def test_funnel_review_lists_atlas_leads_and_pending_handoffs_without_writes(
         "customers": db.query_one("SELECT COUNT(*) AS n FROM customers")["n"],
         "sites": db.query_one("SELECT COUNT(*) AS n FROM locations")["n"],
         "handoffs": db.query_one("SELECT COUNT(*) AS n FROM eom_office_conversion_handoffs")["n"],
+        "working": db.query_one("SELECT COUNT(*) AS n FROM eom_lead_working")["n"],
     }
 
     assert pending.status_code == 202, pending.text
@@ -314,10 +316,149 @@ def test_funnel_review_lists_atlas_leads_and_pending_handoffs_without_writes(
     assert data["cursor"] is None
     assert data["hasMore"] is True
     assert data["nextCursor"] == "cursor-page-2-token"
+    assert data["workingLeads"] == []
     assert data["pendingHandoffs"][0]["contactId"] == contact_id
     assert data["pendingHandoffs"][0]["status"] == "pending"
     assert data["pendingHandoffs"][0]["lastError"] == "Atlas is temporarily unavailable"
     assert before_counts == after_counts
+
+
+def test_start_estimate_marks_lead_working_without_customer_site_or_atlas_write(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Starting an estimate must not write to Atlas")
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", unexpected)
+    before_counts = {
+        "customers": db.query_one("SELECT COUNT(*) AS n FROM customers")["n"],
+        "sites": db.query_one("SELECT COUNT(*) AS n FROM locations")["n"],
+        "handoffs": db.query_one("SELECT COUNT(*) AS n FROM eom_office_conversion_handoffs")["n"],
+    }
+
+    response = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/start-estimate",
+        headers=auth,
+    )
+    replay = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/start-estimate",
+        headers=auth,
+    )
+
+    after_counts = {
+        "customers": db.query_one("SELECT COUNT(*) AS n FROM customers")["n"],
+        "sites": db.query_one("SELECT COUNT(*) AS n FROM locations")["n"],
+        "handoffs": db.query_one("SELECT COUNT(*) AS n FROM eom_office_conversion_handoffs")["n"],
+        "working": db.query_one(
+            "SELECT COUNT(*) AS n FROM eom_lead_working WHERE atlas_contact_id = %s",
+            (contact_id,),
+        )["n"],
+    }
+    assert response.status_code == 200, response.text
+    assert replay.status_code == 200, replay.text
+    assert response.json()["success"] is True
+    assert response.json()["workingLead"]["contactId"] == contact_id
+    assert replay.json()["workingLead"]["markedAt"] == response.json()["workingLead"]["markedAt"]
+    assert after_counts == {**before_counts, "working": 1}
+
+
+def test_start_estimate_requires_configured_funnel_approver(client, emp_auth):
+    contact_id = str(uuid.uuid4())
+    response = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/start-estimate",
+        headers=emp_auth,
+    )
+
+    assert response.status_code == 403
+    assert db.query_one(
+        "SELECT COUNT(*) AS n FROM eom_lead_working WHERE atlas_contact_id = %s",
+        (contact_id,),
+    )["n"] == 0
+
+
+def test_funnel_review_moves_marked_leads_to_working_bucket(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    working_contact_id = str(uuid.uuid4())
+    new_contact_id = str(uuid.uuid4())
+
+    start = client.post(
+        f"/api/admin/funnel/leads/{working_contact_id}/start-estimate",
+        headers=auth,
+    )
+    assert start.status_code == 200, start.text
+
+    def atlas_read(path, admin, *, params=None):
+        return {
+            "leads": [
+                {
+                    "contactId": working_contact_id,
+                    "fullName": "Working Estimate Lead",
+                    "email": "working@example.test",
+                    "phone": "217-555-0144",
+                    "address": "900 Working Lane, Effingham, IL",
+                    "source": "website",
+                    "createdAt": "2026-07-27T12:00:00Z",
+                },
+                {
+                    "contactId": new_contact_id,
+                    "fullName": "New Estimate Lead",
+                    "email": "new@example.test",
+                    "phone": "217-555-0166",
+                    "address": "901 New Lane, Effingham, IL",
+                    "source": "website",
+                    "createdAt": "2026-07-28T12:00:00Z",
+                },
+            ],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+        }
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
+    response = client.get("/api/admin/funnel/review", headers=auth)
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert [lead["contactId"] for lead in data["leads"]] == [new_contact_id]
+    assert [lead["contactId"] for lead in data["workingLeads"]] == [working_contact_id]
+    assert data["workingLeads"][0]["fullName"] == "Working Estimate Lead"
+    assert data["workingLeads"][0]["markedAt"] == start.json()["workingLead"]["markedAt"]
+    assert data["workingLeads"][0]["markedByEmployeeId"] == 1
+
+
+def test_estimate_approval_clears_working_marker(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+
+    start = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/start-estimate",
+        headers=auth,
+    )
+    assert start.status_code == 200, start.text
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        return _atlas_success(payload, idempotency_key)
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    approval = client.post(
+        "/api/admin/funnel/approve-estimate",
+        headers=auth,
+        json=_payload(contact_id, key),
+    )
+
+    assert approval.status_code == 201, approval.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS n FROM eom_lead_working WHERE atlas_contact_id = %s",
+        (contact_id,),
+    )["n"] == 0
 
 
 def test_funnel_review_proxy_keeps_service_token_server_side(monkeypatch, configured_office_conversion):

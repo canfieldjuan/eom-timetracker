@@ -66,6 +66,7 @@ def _apply_schema(conn):
                 google_calendar_event_mappings, calendar_import_previews,
                 crew_memberships, crews, google_calendar_oauth_states,
                 google_calendar_sources, google_calendar_connections,
+                eom_lead_working,
                 eom_office_conversion_handoffs,
                 receivables_operation_attempts,
                 payroll_shift_corrections,

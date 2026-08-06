@@ -95,6 +95,14 @@ CREATE TABLE eom_office_conversion_handoffs (
     finalized_at             TIMESTAMPTZ
 );
 
+-- Local office state for Atlas leads Juan has accepted into the estimate
+-- pipeline before the customer has approved pricing/schedule details.
+CREATE TABLE eom_lead_working (
+    atlas_contact_id        UUID PRIMARY KEY,
+    marked_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    marked_by_employee_id   INTEGER NOT NULL REFERENCES employees(id) ON DELETE RESTRICT
+);
+
 -- Request access diagnostics. During the file-to-Postgres cutover the API keeps
 -- writing the legacy JSON files and reads both sources for the admin log view.
 CREATE TABLE access_log_entries (
