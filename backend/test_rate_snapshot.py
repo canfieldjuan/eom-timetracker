@@ -173,9 +173,14 @@ def _shift(
     hourly_rate_cents: int | None = None,
     time_category: str = "productive",
     non_productive_type: str | None = None,
+    extra_seconds: int = 0,
 ) -> int:
     clock_in = _local_dt(service_day, start_hour).astimezone(timezone.utc)
-    clock_out = _local_dt(service_day, end_hour).astimezone(timezone.utc)
+    # extra_seconds pushes the span off a whole hour so the labor cost lands on a
+    # sub-cent fraction -- the only way to exercise the rounding boundary.
+    clock_out = (
+        _local_dt(service_day, end_hour) + timedelta(seconds=extra_seconds)
+    ).astimezone(timezone.utc)
     return int(
         db.execute_returning(
             """
@@ -1084,3 +1089,162 @@ def test_migration_is_idempotent_and_keeps_existing_snapshots():
     api._ensure_schema_migrations()
 
     assert _snapshot_cents(shift_id) == 2000
+
+
+def test_mixed_rate_labor_rounds_once_not_per_bucket(client, auth):
+    """Sub-cent remainders must not each round up independently.
+
+    Two 1h1s segments at $20/h and $25/h cost 2000.5556c and 2500.6944c. Rounding
+    each bucket first reports 2001 + 2501 = 4502c; the exact combined cost is
+    4501.25c, which is 4501c. Rounding once at the end is the honest figure.
+    """
+    worker = _employee("Round Once Worker", 20.00)
+    source_id = _calendar_source("roundonce")
+    _, site_id, customer_name, address = _customer_site("RoundOnce")
+    job_id = _job(
+        source_id=source_id,
+        site_id=site_id,
+        customer_name=customer_name,
+        service_day=SERVICE_DAY,
+        seed="round-once-job",
+        start_hour=8,
+        end_hour=18,
+    )
+    _shift(
+        employee_id=worker,
+        site_id=site_id,
+        address=address,
+        service_day=SERVICE_DAY,
+        start_hour=9,
+        end_hour=10,
+        extra_seconds=1,
+        job_id=job_id,
+        hourly_rate_cents=2000,
+    )
+    _shift(
+        employee_id=worker,
+        site_id=site_id,
+        address=address,
+        service_day=SERVICE_DAY,
+        start_hour=13,
+        end_hour=14,
+        extra_seconds=1,
+        job_id=job_id,
+        hourly_rate_cents=2500,
+    )
+
+    schedule = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": SERVICE_DAY.isoformat(),
+            "end_date": SERVICE_DAY.isoformat(),
+        },
+    )
+    assert schedule.status_code == 200, schedule.text
+    scheduled_job = next(
+        job for job in schedule.json()["jobs"] if job["id"] == job_id
+    )
+    # 45.01, not the 45.02 that per-bucket rounding produced.
+    assert scheduled_job["actualLaborCost"] == pytest.approx(45.01)
+    assert scheduled_job["workers"][0]["laborCost"] == pytest.approx(45.01)
+
+
+def test_single_rate_labor_is_unchanged_by_the_bucketing(client, auth):
+    """The bucketed path must be arithmetically identical for one rate.
+
+    This is what lets the backfill be a no-op: every historical shift carries one
+    rate per worker, so bucketing cannot move a cent.
+    """
+    worker = _employee("Single Rate Worker", 20.00)
+    source_id = _calendar_source("singlerate")
+    _, site_id, customer_name, address = _customer_site("SingleRate")
+    job_id = _job(
+        source_id=source_id,
+        site_id=site_id,
+        customer_name=customer_name,
+        service_day=SERVICE_DAY,
+        seed="single-rate-job",
+        start_hour=8,
+        end_hour=18,
+    )
+    for start, end in ((9, 11), (13, 15)):
+        _shift(
+            employee_id=worker,
+            site_id=site_id,
+            address=address,
+            service_day=SERVICE_DAY,
+            start_hour=start,
+            end_hour=end,
+            job_id=job_id,
+            hourly_rate_cents=2000,
+        )
+
+    schedule = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": SERVICE_DAY.isoformat(),
+            "end_date": SERVICE_DAY.isoformat(),
+        },
+    )
+    assert schedule.status_code == 200, schedule.text
+    scheduled_job = next(
+        job for job in schedule.json()["jobs"] if job["id"] == job_id
+    )
+    assert scheduled_job["actualHours"] == pytest.approx(4.0)
+    assert scheduled_job["actualLaborCost"] == pytest.approx(80.0)
+
+
+def test_backfill_runs_after_the_first_run_json_import(client):
+    """Imported legacy shifts must be stamped, not left exposed to rate edits.
+
+    startup_event runs the schema migration (and therefore the backfill) BEFORE
+    _auto_migrate_if_empty imports legacy JSON, and the importer inserts shifts
+    without hourly_rate_cents. Without the re-run inside the imported branch,
+    every automatically imported historical shift would keep a NULL snapshot
+    forever -- exactly the rows that most need freezing.
+    """
+    worker = _employee("Import Backfill Worker", 21.50)
+    _, site_id, _, address = _customer_site("ImportBackfill")
+    # Stand in for the importer: a shift inserted with no snapshot, after the
+    # startup backfill has already run.
+    imported = _shift(
+        employee_id=worker,
+        site_id=site_id,
+        address=address,
+        service_day=SERVICE_DAY,
+        start_hour=9,
+        end_hour=11,
+        hourly_rate_cents=None,
+    )
+    assert _snapshot_cents(imported) is None
+
+    # The startup path re-runs the backfill when a legacy import happened.
+    api._backfill_shift_hourly_rate_snapshots()
+
+    assert _snapshot_cents(imported) == 2150
+
+    # Calling the function directly proves it works, not that startup calls it.
+    # Pin the wiring too: the backfill must run inside the imported-legacy-JSON
+    # branch, or imported history silently keeps a NULL snapshot.
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(api.startup_event))
+    imported_branch = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "imported_legacy_json"
+    ]
+    assert imported_branch, "startup_event no longer branches on imported_legacy_json"
+    called = {
+        node.func.id
+        for node in ast.walk(imported_branch[0])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "_backfill_shift_hourly_rate_snapshots" in called, (
+        "startup_event must re-run the rate backfill after a legacy JSON import"
+    )

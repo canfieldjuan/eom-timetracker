@@ -378,10 +378,12 @@ def _create_payroll_profitability_job_and_shift(
     service_day: date,
     local_start: datetime | None = None,
     local_end: datetime | None = None,
+    source_seed: str = "1",
 ) -> int:
     start = local_start or _local_dt(service_day, 9)
     end = local_end or _local_dt(service_day, 11)
-    source_key = "1" * 64
+    # source_key is UNIQUE, so a test that needs two jobs must vary the seed.
+    source_key = (source_seed * 64)[:64]
     with db.get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -401,8 +403,8 @@ def _create_payroll_profitability_job_and_shift(
                     'scheduled',
                     %s,
                     'payroll_labor_profitability_calendar',
-                    'payroll-labor-profitability-event',
-                    'payroll-labor-profitability-occurrence',
+                    %s,
+                    %s,
                     %s,
                     %s,
                     'Payroll Labor Profitability Customer'
@@ -415,6 +417,8 @@ def _create_payroll_profitability_job_and_shift(
                     start.astimezone(timezone.utc),
                     end.astimezone(timezone.utc),
                     source_id,
+                    f"payroll-labor-profitability-event-{source_seed}",
+                    f"payroll-labor-profitability-occurrence-{source_seed}",
                     source_key,
                     source_key,
                 ),
@@ -5462,3 +5466,245 @@ def test_stored_verification_reads_stale_when_new_rule_condemns_week(client, aut
         _delete_payroll_verification_weeks([week_start])
         if employee_id is not None:
             _delete_employees([employee_id])
+
+
+def _stamp_shift_snapshots(employee_id: int, service_day: date, cents_by_site: dict) -> None:
+    """Stamp each of the employee's shifts that day with its site's snapshot rate."""
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            for site_id, cents in cents_by_site.items():
+                cur.execute(
+                    """
+                    UPDATE shifts
+                    SET hourly_rate_cents = %s
+                    WHERE employee_id = %s AND local_date = %s AND location_id = %s
+                    """,
+                    (cents, employee_id, service_day, site_id),
+                )
+        conn.commit()
+
+
+def _allocate_correction_at_rate(
+    client,
+    *,
+    week_start: date,
+    service_day: date,
+    snapshot_cents_by_site,
+    live_rate_after,
+    label: str,
+    second_site: bool = False,
+    allocate_to_second_site: bool = False,
+):
+    """Build a corrected shift-day, stamp snapshots, raise the rate, then allocate.
+
+    Returns the allocation payload so the caller can assert how it was priced.
+    """
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    # Names are unique per test: employees persist across tests in a run.
+    payroll_name = f"Payroll Labor Profitability RS Payroll {label}"
+    worker_name = f"Payroll Labor Profitability RS Worker {label}"
+    _create_employee(payroll_name, role="payroll")
+    employee_id = _create_employee(worker_name, hourly_rate=20.00)
+    payroll_auth = _login(client, payroll_name)
+    source_id = _create_payroll_profitability_source()
+    _, site_id = _create_payroll_profitability_site()
+    job_id = _create_payroll_profitability_job_and_shift(
+        employee_id=employee_id,
+        site_id=site_id,
+        source_id=source_id,
+        service_day=service_day,
+    )
+    target_site_id = site_id
+    target_job_id = job_id
+    sites = {site_id: snapshot_cents_by_site[0]}
+    if second_site:
+        _, other_site_id = _create_payroll_profitability_site(
+            address=f"Payroll Labor Profitability RS Second {label}",
+        )
+        other_job_id = _create_payroll_profitability_job_and_shift(
+            employee_id=employee_id,
+            site_id=other_site_id,
+            source_id=source_id,
+            service_day=service_day,
+            local_start=_local_dt(service_day, 13),
+            local_end=_local_dt(service_day, 15),
+            source_seed="2",
+        )
+        sites[other_site_id] = snapshot_cents_by_site[1]
+        if allocate_to_second_site:
+            target_site_id = other_site_id
+            target_job_id = other_job_id
+
+    _stamp_shift_snapshots(
+        employee_id,
+        service_day,
+        {sid: cents for sid, cents in sites.items() if cents is not None},
+    )
+
+    # The raise lands AFTER the work was done. Nothing about the corrected hours
+    # should be priced from it.
+    db.execute(
+        "UPDATE employees SET hourly_rate = %s WHERE id = %s",
+        (live_rate_after, employee_id),
+    )
+
+    corrected = client.post(
+        "/api/admin/payroll/weekly-hours/corrections",
+        headers=payroll_auth,
+        json={
+            "weekStart": week_start.isoformat(),
+            "employeeId": employee_id,
+            "date": service_day.isoformat(),
+            "correctedTotalMinutes": 180 if not second_site else 300,
+            "reason": "Mayra corrected total hours.",
+        },
+    )
+    assert corrected.status_code == 200, corrected.text
+    correction_id = corrected.json()["correction"]["correctionId"]
+
+    allocated = client.post(
+        f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation",
+        headers=payroll_auth,
+        json={
+            "locationId": target_site_id,
+            "jobId": target_job_id,
+            "reason": "Juan assigned Mayra's correction to this Site.",
+        },
+    )
+    assert allocated.status_code == 200, allocated.text
+    return allocated.json()["allocation"]
+
+
+def test_correction_is_priced_from_the_shift_snapshot_not_the_live_rate(client):
+    """A correction adjusts hours already worked, so a later raise must not reprice it.
+
+    Shift worked at $20/h, employee raised to $25/h, then a +60 minute
+    correction is allocated. The stored cost must be 60 min @ $20/h = $20.00.
+    Pricing it at today's $25/h would restate history -- the defect #126 fixes.
+    """
+    allocation = _allocate_correction_at_rate(
+        client,
+        week_start=date(2026, 8, 16),
+        service_day=date(2026, 8, 17),
+        snapshot_cents_by_site=[2000],
+        live_rate_after=25.00,
+        label="Priced",
+    )
+    assert allocation["allocatedDeltaMinutes"] == 60
+    assert allocation["allocatedLaborCost"] == 20.0
+    assert allocation["laborCostComplete"] is True
+    # The audit half still tracks the live rate -- stored vs current is the pair.
+    assert allocation["currentAllocatedLaborCost"] == 25.0
+
+
+def test_correction_prices_from_the_snapshot_at_its_own_site(client):
+    """Two sites that day at different worked rates: the allocation's site wins."""
+    allocation = _allocate_correction_at_rate(
+        client,
+        week_start=date(2026, 8, 23),
+        service_day=date(2026, 8, 24),
+        snapshot_cents_by_site=[2000, 3000],
+        live_rate_after=50.00,
+        label="SitePrecedence",
+        second_site=True,
+        allocate_to_second_site=True,
+    )
+    # 60 minutes allocated at the SECOND site's $30/h snapshot, not the first
+    # site's $20/h and not today's $50/h.
+    assert allocation["allocatedDeltaMinutes"] == 60
+    assert allocation["allocatedLaborCost"] == 30.0
+    assert allocation["laborCostComplete"] is True
+
+
+def test_correction_fails_closed_when_that_days_snapshots_disagree(client):
+    """Two shifts at the SAME site that day carry different worked rates.
+
+    The allocation names that site, so the site rule finds two candidate rates
+    and the day-wide rule finds the same two. There is no basis for choosing,
+    so the cost is left unknown rather than silently picking one -- a guess here
+    would misprice money with no signal to the operator.
+    """
+    week_start = date(2026, 8, 30)
+    service_day = date(2026, 8, 31)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    _create_employee("Payroll Labor Profitability RS Ambiguous Payroll", role="payroll")
+    employee_id = _create_employee(
+        "Payroll Labor Profitability RS Ambiguous Worker", hourly_rate=20.00
+    )
+    payroll_auth = _login(client, "Payroll Labor Profitability RS Ambiguous Payroll")
+    source_id = _create_payroll_profitability_source()
+    _, site_id = _create_payroll_profitability_site()
+    job_id = _create_payroll_profitability_job_and_shift(
+        employee_id=employee_id,
+        site_id=site_id,
+        source_id=source_id,
+        service_day=service_day,
+    )
+    _create_payroll_profitability_job_and_shift(
+        employee_id=employee_id,
+        site_id=site_id,
+        source_id=source_id,
+        service_day=service_day,
+        local_start=_local_dt(service_day, 13),
+        local_end=_local_dt(service_day, 15),
+        source_seed="2",
+    )
+    # Same site, same day, two different worked rates.
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE shifts SET hourly_rate_cents = CASE
+                    WHEN EXTRACT(HOUR FROM clock_in AT TIME ZONE 'America/Chicago') < 12
+                    THEN 2000 ELSE 3000 END
+                WHERE employee_id = %s AND local_date = %s
+                """,
+                (employee_id, service_day),
+            )
+        conn.commit()
+
+    corrected = client.post(
+        "/api/admin/payroll/weekly-hours/corrections",
+        headers=payroll_auth,
+        json={
+            "weekStart": week_start.isoformat(),
+            "employeeId": employee_id,
+            "date": service_day.isoformat(),
+            "correctedTotalMinutes": 300,
+            "reason": "Mayra corrected total hours.",
+        },
+    )
+    assert corrected.status_code == 200, corrected.text
+    correction_id = corrected.json()["correction"]["correctionId"]
+    allocated = client.post(
+        f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation",
+        headers=payroll_auth,
+        json={
+            "locationId": site_id,
+            "jobId": job_id,
+            "reason": "Juan assigned Mayra's correction to this Site.",
+        },
+    )
+    assert allocated.status_code == 200, allocated.text
+    allocation = allocated.json()["allocation"]
+    assert allocation["allocatedLaborCost"] is None
+    assert allocation["laborCostComplete"] is False
+
+
+def test_correction_falls_back_to_the_live_rate_without_snapshots(client):
+    """Pre-migration shifts carry no snapshot, so behavior is unchanged."""
+    allocation = _allocate_correction_at_rate(
+        client,
+        week_start=date(2026, 9, 6),
+        service_day=date(2026, 9, 7),
+        snapshot_cents_by_site=[None],
+        live_rate_after=25.00,
+        label="Fallback",
+    )
+    # No snapshot anywhere that day -> the live $25/h applies, as it did before
+    # this change.
+    assert allocation["allocatedDeltaMinutes"] == 60
+    assert allocation["allocatedLaborCost"] == 25.0
+    assert allocation["laborCostComplete"] is True

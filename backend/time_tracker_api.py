@@ -5203,6 +5203,10 @@ def startup_event() -> None:
     # legacy Sites. Re-run the idempotent Customer/address backfill immediately.
     if imported_legacy_json:
         _ensure_customer_site_schema()
+        # The importer inserts shifts without hourly_rate_cents, and the backfill
+        # above already ran against an empty table, so imported history would
+        # keep a NULL snapshot forever and stay exposed to rate edits. Idempotent.
+        _backfill_shift_hourly_rate_snapshots()
     apply_bootstrap_admins()
 
 
@@ -15007,6 +15011,69 @@ def _payroll_delta_labor_cost_cents(
     )
 
 
+def _payroll_correction_rate_for_allocation(
+    cur: Any,
+    employee_id: int,
+    correction_date: Any,
+    location_id: int,
+    live_hourly_rate: Any,
+) -> Tuple[Any, bool]:
+    """Rate to price a correction at, preferring the rate the work was worked at.
+
+    A correction adjusts hours that were already worked, so pricing it from the
+    live employee rate would restate history the moment someone gets a raise --
+    the exact defect the per-shift snapshot exists to prevent. Corrections are
+    keyed by employee + date (never by shift), so the shift's rate has to be
+    resolved from that day's shifts.
+
+    Precedence:
+      1. Snapshots on that day at this allocation's site -- the allocation names
+         a location, so this is the most precise match available.
+      2. Otherwise, snapshots anywhere that day if they all agree on one rate.
+      3. Otherwise (snapshots that disagree and none at this site) fail closed:
+         return no rate, so the cost stays NULL and laborCostComplete is False
+         rather than guessing which rate the corrected hours belong to.
+      4. No snapshots at all (pre-migration rows, or a rate-less employee) falls
+         back to the live rate, which is the behavior that predates snapshots.
+
+    Returns (rate, resolved). ``resolved`` is False only for the fail-closed
+    case, which the caller must not paper over with the live rate.
+    """
+    cur.execute(
+        """
+        SELECT location_id, hourly_rate_cents
+        FROM shifts
+        WHERE employee_id = %s
+          AND local_date = %s
+          AND hourly_rate_cents IS NOT NULL
+        """,
+        (int(employee_id), correction_date),
+    )
+    rows = cur.fetchall() or []
+    if not rows:
+        return live_hourly_rate, True
+
+    def _rate(row: Any) -> Decimal:
+        return Decimal(int(row["hourly_rate_cents"])) / Decimal(100)
+
+    site_rates = {
+        _rate(row)
+        for row in rows
+        if row.get("location_id") is not None
+        and int(row["location_id"]) == int(location_id)
+    }
+    if len(site_rates) == 1:
+        return site_rates.pop(), True
+
+    day_rates = {_rate(row) for row in rows}
+    if len(day_rates) == 1:
+        return day_rates.pop(), True
+
+    # Either this site alone carried disagreeing rates, or the day did and none
+    # of them belong to this site. Guessing would silently misprice the money.
+    return None, False
+
+
 def _payroll_correction_candidate_sites(
     candidate_segments: List[Dict[str, Any]],
     correction_date: str,
@@ -16919,9 +16986,19 @@ def admin_allocate_payroll_hour_correction(
                 target=allocation_target,
                 delta_minutes=delta_minutes,
             )
-            labor_cost_cents = _payroll_delta_labor_cost_cents(
-                delta_minutes,
-                correction_row.get("hourly_rate"),
+            # Price the correction from the rate the work was worked at, not
+            # from whatever the employee earns today.
+            correction_rate, rate_resolved = _payroll_correction_rate_for_allocation(
+                cur,
+                employee_id=int(correction_row["employee_id"]),
+                correction_date=correction_row["correction_date"],
+                location_id=int(payload.locationId),
+                live_hourly_rate=correction_row.get("hourly_rate"),
+            )
+            labor_cost_cents = (
+                _payroll_delta_labor_cost_cents(delta_minutes, correction_rate)
+                if rate_resolved
+                else None
             )
             cur.execute(
                 """

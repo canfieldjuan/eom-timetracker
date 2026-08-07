@@ -3812,17 +3812,22 @@ def _decorate_schedule_jobs(
             ):
                 labor_cents = None
             else:
-                # One bucket per distinct rate. With a single rate this is
-                # arithmetically identical to the previous
-                # round(finalized_hours * rate), so backfilled history does not
-                # move by a cent.
-                labor_cents = sum(
-                    int(
-                        (Decimal(str(bucket_hours)) * Decimal(bucket_rate)).quantize(
-                            Decimal("1"), rounding=ROUND_HALF_UP
-                        )
-                    )
-                    for bucket_rate, bucket_hours in hours_by_rate_cents.items()
+                # One bucket per distinct rate, summed EXACTLY and rounded once
+                # at the end. Rounding each bucket first would let sub-cent
+                # remainders each round up independently: two one-second
+                # segments at $20/h and $25/h are 1.25 cents combined, which is
+                # one cent, not the two cents per-bucket rounding would report.
+                # With a single rate this is arithmetically identical to the
+                # previous round(finalized_hours * rate), so backfilled history
+                # does not move by a cent.
+                labor_cents = int(
+                    sum(
+                        (
+                            Decimal(str(bucket_hours)) * Decimal(bucket_rate)
+                            for bucket_rate, bucket_hours in hours_by_rate_cents.items()
+                        ),
+                        Decimal(0),
+                    ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
                 )
             if finalized_hours > 0 and labor_cents is None:
                 labor_complete = False
