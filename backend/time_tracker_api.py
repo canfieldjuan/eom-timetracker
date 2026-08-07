@@ -26,7 +26,7 @@ from datetime import date, datetime, time as clock_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from ipaddress import ip_address, ip_network
 from pathlib import Path
-from typing import Annotated, Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple
+from typing import Annotated, Any, Callable, Dict, FrozenSet, Iterable, List, Literal, Optional, Tuple
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -3319,6 +3319,56 @@ def _atlas_funnel_read(
     return content
 
 
+# Funnel capability names published by Atlas on the lead-review read. These are
+# the names Atlas emits (atlas_brain/eom_api/funnel.py::_CAPABILITY_ROUTES), not
+# names this service invents: a value here that Atlas never emits would gate a
+# control off permanently.
+ATLAS_FUNNEL_CAPABILITY_LEAD_LOST = "lead.lost"
+ATLAS_FUNNEL_CAPABILITY_LEAD_REOPEN = "lead.reopen"
+
+
+class AtlasFunnelCapabilityUnavailable(Exception):
+    """The deployed Atlas does not serve the capability this action requires.
+
+    A normal, expected state -- not a failure. Website (Vercel) and tracker
+    (Render) auto-deploy from main while Atlas is deployed by hand, so the
+    tracker running ahead of Atlas is the steady state. Distinct from
+    AtlasFunnelRequestError, which means Atlas was reached and something went
+    wrong; here Atlas is healthy and simply older than this caller.
+    """
+
+    def __init__(self, capability: str) -> None:
+        super().__init__(
+            f"The EOM funnel service does not yet support this action ({capability})"
+        )
+        self.capability = capability
+
+
+def _extract_atlas_funnel_capabilities(
+    content: Dict[str, Any]
+) -> Optional[FrozenSet[str]]:
+    """Capabilities Atlas advertises, or None when it did not advertise at all.
+
+    None (key absent) and frozenset() (key present but empty) both mean "no
+    capability confirmed", but only None means the deployed Atlas predates the
+    manifest. Kept distinct because it is the version signal, and because
+    collapsing them would make a rollback indistinguishable from a backend that
+    genuinely serves nothing.
+
+    Malformed shapes degrade to None rather than raising: an unreadable manifest
+    must not break the lead queue, and "cannot confirm" is already the safe
+    reading. Non-string members are dropped instead of poisoning the whole set.
+    """
+    if "capabilities" not in content:
+        return None
+    raw = content.get("capabilities")
+    if not isinstance(raw, list):
+        return None
+    return frozenset(
+        item.strip() for item in raw if isinstance(item, str) and item.strip()
+    )
+
+
 def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]:
     leads = content.get("leads")
     if not isinstance(leads, list):
@@ -3364,6 +3414,7 @@ def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]
         "cursor": cursor,
         "hasMore": has_more,
         "nextCursor": next_cursor,
+        "capabilities": _extract_atlas_funnel_capabilities(content),
     }
 
 
@@ -11116,6 +11167,13 @@ def admin_list_funnel_review(
         "hasMore": lead_page["hasMore"],
         "nextCursor": lead_page["nextCursor"],
         "pendingHandoffs": pending_handoffs,
+        # What the DEPLOYED Atlas serves, so the caller can gate a control
+        # instead of rendering one that 404s. `capabilitiesDeclared` false means
+        # Atlas predates the manifest and advertised nothing -- distinct from
+        # declaring an empty set, and the caller must treat both as "do not
+        # enable", per Atlas #2308.
+        "capabilities": sorted(lead_page["capabilities"] or ()),
+        "capabilitiesDeclared": lead_page["capabilities"] is not None,
     }
 
 
@@ -11231,6 +11289,44 @@ def admin_retry_funnel_handoff(
     )
 
 
+def _require_atlas_funnel_capability(capability: str, admin: Dict[str, Any]) -> None:
+    """Refuse an action the deployed Atlas cannot serve, before attempting it.
+
+    Reads the manifest rather than inferring capability from a failed mutation.
+    Atlas publishes this list precisely so callers stop guessing from failure
+    modes, and a 404 body cannot distinguish "route not deployed" from "contact
+    not found" -- guessing there would reinstate exactly what this slice removes.
+
+    Costs one read on a human-initiated action. The read is deliberately
+    limit=1: it is issued for the manifest, not for the page.
+    """
+    content = _atlas_funnel_read("/eom-funnel/leads", admin, params={"limit": 1})
+    capabilities = _extract_atlas_funnel_capabilities(content)
+    if capabilities is None or capability not in capabilities:
+        raise AtlasFunnelCapabilityUnavailable(capability)
+
+
+def _atlas_capability_unavailable_response(
+    exc: AtlasFunnelCapabilityUnavailable,
+) -> JSONResponse:
+    """A typed, machine-readable outcome -- not a generic failure toast.
+
+    501 rather than 5xx-generic: the upstream is healthy and simply does not
+    implement this yet, which is neither a transient outage (503, used by
+    _atlas_funnel_request for timeouts) nor a malformed response (502). Callers
+    branch on `error`, never on the prose.
+    """
+    return JSONResponse(
+        status_code=501,
+        content={
+            "success": False,
+            "error": "atlas_capability_unavailable",
+            "capability": exc.capability,
+            "message": str(exc),
+        },
+    )
+
+
 @app.post("/api/admin/funnel/leads/{contact_id}/lost")
 def admin_mark_funnel_lead_lost(
     contact_id: UUID,
@@ -11243,6 +11339,13 @@ def admin_mark_funnel_lead_lost(
     is the single owner of the lead's stage."""
     _require_juan_funnel_approver(admin, action="mark leads lost")
     _require_atlas_funnel_configuration()
+    # Before the DB lock: a capability refusal must not hold a row lock while
+    # this service talks to Atlas, and must not leave a local transition
+    # half-applied against a backend that cannot complete it.
+    try:
+        _require_atlas_funnel_capability(ATLAS_FUNNEL_CAPABILITY_LEAD_LOST, admin)
+    except AtlasFunnelCapabilityUnavailable as exc:
+        return _atlas_capability_unavailable_response(exc)
     contact_id_text = str(contact_id)
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -11279,6 +11382,13 @@ def admin_reopen_funnel_lead(
     """Return a previously-lost Atlas lead to the active review queue."""
     _require_juan_funnel_approver(admin, action="reopen leads")
     _require_atlas_funnel_configuration()
+    # Before the DB lock: a capability refusal must not hold a row lock while
+    # this service talks to Atlas, and must not leave a local transition
+    # half-applied against a backend that cannot complete it.
+    try:
+        _require_atlas_funnel_capability(ATLAS_FUNNEL_CAPABILITY_LEAD_REOPEN, admin)
+    except AtlasFunnelCapabilityUnavailable as exc:
+        return _atlas_capability_unavailable_response(exc)
     contact_id_text = str(contact_id)
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:

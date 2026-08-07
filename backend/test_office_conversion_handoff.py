@@ -36,6 +36,34 @@ def _payload(contact_id: str, key: str, *, rate: float = 175.0) -> dict[str, obj
     }
 
 
+# Every capability the deployed Atlas currently advertises. The fixture below
+# models a fully-deployed Atlas because that is the normal state; tests that
+# care about degradation override `_atlas_funnel_read` themselves.
+_ATLAS_FULL_CAPABILITIES = [
+    "lead.customer_handoff",
+    "lead.estimate_booking",
+    "lead.first_clean_booking",
+    "lead.lost",
+    "lead.reopen",
+    "onboarding.draft.approve_send",
+    "onboarding.draft.confirm_sent",
+    "onboarding.draft.edit",
+    "onboarding.draft.list",
+    "onboarding.draft.revoke",
+]
+
+
+def _capable_atlas_read(*_args, **_kwargs) -> dict[str, object]:
+    return {
+        "leads": [],
+        "limit": 1,
+        "cursor": None,
+        "hasMore": False,
+        "nextCursor": None,
+        "capabilities": list(_ATLAS_FULL_CAPABILITIES),
+    }
+
+
 @pytest.fixture
 def configured_office_conversion(monkeypatch):
     import time_tracker_api as api
@@ -862,6 +890,8 @@ def test_mark_lead_lost_proxies_reason_to_atlas(
             "idempotent": False,
         }
 
+    # This route now consults the capability manifest before proxying.
+    monkeypatch.setattr(api, "_atlas_funnel_read", _capable_atlas_read)
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
     response = client.post(
         f"/api/admin/funnel/leads/{contact_id}/lost",
@@ -931,6 +961,8 @@ def test_mark_lead_lost_and_reopen_do_not_restore_working_marker(
             "nextCursor": None,
         }
 
+    # This route now consults the capability manifest before proxying.
+    monkeypatch.setattr(api, "_atlas_funnel_read", _capable_atlas_read)
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
     lost = client.post(
         f"/api/admin/funnel/leads/{contact_id}/lost",
@@ -1012,6 +1044,8 @@ def test_delayed_start_after_lost_or_reopen_fails_with_stale_state_token(
             "nextCursor": None,
         }
 
+    # This route now consults the capability manifest before proxying.
+    monkeypatch.setattr(api, "_atlas_funnel_read", _capable_atlas_read)
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
     lost = client.post(
         f"/api/admin/funnel/leads/{contact_id}/lost",
@@ -1086,6 +1120,8 @@ def test_concurrent_lost_and_reopen_local_state_follows_remote_order(
             "idempotent": False,
         }
 
+    # This route now consults the capability manifest before proxying.
+    monkeypatch.setattr(api, "_atlas_funnel_read", _capable_atlas_read)
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
 
     def post_reopen():
@@ -1156,6 +1192,8 @@ def test_reopen_lead_proxies_to_atlas(
             "idempotent": False,
         }
 
+    # This route now consults the capability manifest before proxying.
+    monkeypatch.setattr(api, "_atlas_funnel_read", _capable_atlas_read)
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
     response = client.post(
         f"/api/admin/funnel/leads/{contact_id}/reopen",
@@ -1172,3 +1210,195 @@ def test_reopen_lead_proxies_to_atlas(
             "key": key,
         }
     ]
+
+
+# --- Slice 0E, tracker half: capability negotiation (website #112) ----------
+#
+# Website (Vercel) and tracker (Render) auto-deploy from main while Atlas is
+# deployed by hand, so the tracker running AHEAD of Atlas is the steady state.
+# These cover the three contract obligations: the manifest survives parsing, it
+# reaches the caller, and a mutation for an unconfirmed capability is refused
+# without the mutation ever reaching Atlas.
+
+
+def _atlas_read_returning(content):
+    def _read(*_args, **_kwargs):
+        return content
+    return _read
+
+
+def test_lead_review_parse_surfaces_atlas_capabilities(configured_office_conversion):
+    """The manifest must survive the parser, which builds a fresh dict."""
+    api = configured_office_conversion
+    parsed = api._parse_atlas_lead_review_response(
+        {
+            "leads": [],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+            "capabilities": ["lead.lost", "lead.reopen"],
+        }
+    )
+    assert parsed["capabilities"] == frozenset({"lead.lost", "lead.reopen"})
+
+
+def test_lead_review_parse_survives_an_atlas_without_the_manifest(
+    configured_office_conversion,
+):
+    """Backward compatibility: an Atlas predating #2308 sends no capabilities.
+
+    It must still parse -- the lead queue cannot depend on a field that older
+    deployments do not emit. `None` marks 'did not advertise', which is the
+    version signal and is deliberately distinct from an empty set.
+    """
+    api = configured_office_conversion
+    parsed = api._parse_atlas_lead_review_response(
+        {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None}
+    )
+    assert parsed["capabilities"] is None
+    assert parsed["leads"] == []
+
+
+def test_lead_review_parse_tolerates_a_malformed_manifest(
+    configured_office_conversion,
+):
+    """A manifest we cannot read must not break the queue.
+
+    'Cannot confirm' is already the safe reading, so a malformed shape degrades
+    to None rather than raising 502 -- the leads themselves are still valid.
+    """
+    api = configured_office_conversion
+    for bad in ("lead.lost", {"lead.lost": True}, 7):
+        parsed = api._parse_atlas_lead_review_response(
+            {
+                "leads": [],
+                "cursor": None,
+                "hasMore": False,
+                "nextCursor": None,
+                "capabilities": bad,
+            }
+        )
+        assert parsed["capabilities"] is None, bad
+
+
+def test_funnel_review_reports_capabilities_to_its_caller(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    """Without this the website half has nothing to gate on."""
+    api = configured_office_conversion
+    monkeypatch.setattr(api, "_atlas_funnel_read", _capable_atlas_read)
+
+    response = client.get("/api/admin/funnel/review", headers=auth)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["capabilitiesDeclared"] is True
+    assert "lead.lost" in body["capabilities"]
+    assert "lead.reopen" in body["capabilities"]
+
+
+def test_funnel_review_reports_undeclared_when_atlas_predates_the_manifest(
+    client, auth, monkeypatch, configured_office_conversion
+):
+    """An older Atlas must be reported as 'did not declare', not as 'serves nothing'.
+
+    The caller treats both as do-not-enable, but only this one means the
+    backend is behind -- collapsing them would make a rollback look identical
+    to a backend that genuinely serves nothing.
+    """
+    api = configured_office_conversion
+    monkeypatch.setattr(
+        api,
+        "_atlas_funnel_read",
+        _atlas_read_returning(
+            {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None}
+        ),
+    )
+
+    response = client.get("/api/admin/funnel/review", headers=auth)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["capabilitiesDeclared"] is False
+    assert body["capabilities"] == []
+
+
+@pytest.mark.parametrize(
+    "route, capability",
+    [("lost", "lead.lost"), ("reopen", "lead.reopen")],
+)
+def test_mutation_is_refused_without_calling_atlas_when_capability_absent(
+    client, auth, monkeypatch, configured_office_conversion, route, capability
+):
+    """The guarantee: a control the deployed Atlas cannot serve is refused here.
+
+    Asserts the mutation never reached Atlas. Refusing *after* proxying would
+    still 404 against an older backend, which is the failure this slice exists
+    to prevent.
+    """
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    without = [c for c in _ATLAS_FULL_CAPABILITIES if c != capability]
+    monkeypatch.setattr(
+        api,
+        "_atlas_funnel_read",
+        _atlas_read_returning(
+            {
+                "leads": [],
+                "cursor": None,
+                "hasMore": False,
+                "nextCursor": None,
+                "capabilities": without,
+            }
+        ),
+    )
+
+    def never_called(*_args, **_kwargs):
+        raise AssertionError("mutation reached Atlas despite the capability being absent")
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", never_called)
+
+    body = {"reasonCode": "spam", "note": "n", "idempotencyKey": str(uuid.uuid4())}
+    response = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/{route}",
+        headers=auth,
+        json=body if route == "lost" else {"idempotencyKey": body["idempotencyKey"]},
+    )
+
+    assert response.status_code == 501, response.text
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["error"] == "atlas_capability_unavailable"
+    assert payload["capability"] == capability
+
+
+@pytest.mark.parametrize("route, capability", [("lost", "lead.lost"), ("reopen", "lead.reopen")])
+def test_mutation_is_refused_when_atlas_predates_the_manifest(
+    client, auth, monkeypatch, configured_office_conversion, route, capability
+):
+    """Absence of the manifest is not permission to proceed."""
+    api = configured_office_conversion
+    contact_id = str(uuid.uuid4())
+    monkeypatch.setattr(
+        api,
+        "_atlas_funnel_read",
+        _atlas_read_returning(
+            {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None}
+        ),
+    )
+
+    def never_called(*_args, **_kwargs):
+        raise AssertionError("mutation reached an Atlas that never advertised the capability")
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", never_called)
+
+    response = client.post(
+        f"/api/admin/funnel/leads/{contact_id}/{route}",
+        headers=auth,
+        json={"reasonCode": "spam", "note": "n", "idempotencyKey": str(uuid.uuid4())}
+        if route == "lost"
+        else {"idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 501, response.text
+    assert response.json()["error"] == "atlas_capability_unavailable"
