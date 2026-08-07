@@ -1043,6 +1043,7 @@ def _save_timesheets_to_db(
     pre_shift_ids: set,
     pre_visit_counts: Dict[int, int],
     pre_departure_counts: Dict[int, int],
+    after_save: Optional[Callable[[Any], None]] = None,
 ) -> None:
     """Persist time evidence without mutating the server-authoritative Site list."""
     with db.get_conn() as conn:
@@ -1200,6 +1201,9 @@ def _save_timesheets_to_db(
                     ),
                 )
                 departure["id"] = int(cur.fetchone()[0])
+
+        if after_save is not None:
+            after_save(cur)
 
         cur.execute(
             "SELECT setval('shifts_id_seq', COALESCE(MAX(id), 1)) FROM shifts"
@@ -1387,7 +1391,10 @@ def timesheet_postgres_advisory_lock():
                 )
 
 
-def update_timesheets(mutator) -> Tuple[bool, Any]:
+def update_timesheets(
+    mutator,
+    after_save: Optional[Callable[[Any], None]] = None,
+) -> Tuple[bool, Any]:
     with TIMESHEET_WRITE_LOCK:
         with timesheet_postgres_advisory_lock():
             timesheet_data = _load_timesheets_from_db()
@@ -1407,6 +1414,7 @@ def update_timesheets(mutator) -> Tuple[bool, Any]:
                     pre_shift_ids,
                     pre_visit_counts,
                     pre_departure_counts,
+                    after_save=after_save,
                 )
             return ok, payload
 
@@ -2450,6 +2458,7 @@ class ClockInRequest(BaseModel):
     accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
+    idempotencyKey: Optional[UUID] = None
 
 
 class SiteQrRequest(BaseModel):
@@ -2626,6 +2635,7 @@ class ClockOutRequest(BaseModel):
     accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
+    idempotencyKey: Optional[UUID] = None
 
 
 class DepartRequest(BaseModel):
@@ -2635,6 +2645,7 @@ class DepartRequest(BaseModel):
     accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
+    idempotencyKey: Optional[UUID] = None
 
 
 class EntryAdjustRequest(BaseModel):
@@ -5106,6 +5117,29 @@ def _ensure_schema_migrations() -> None:
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_site_qr_action_receipts_shift
         ON site_qr_action_receipts(shift_id, server_recorded_at DESC)
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS plain_time_action_receipts (
+            id                    BIGSERIAL PRIMARY KEY,
+            employee_id           INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            shift_id              INTEGER REFERENCES shifts(id) ON DELETE SET NULL,
+            action                VARCHAR(16) NOT NULL
+                                      CHECK (action IN (
+                                          'clock-in', 'arrive',
+                                          'depart', 'clock-out'
+                                      )),
+            idempotency_key       UUID NOT NULL,
+            request_fingerprint   VARCHAR(64) NOT NULL
+                                      CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+            server_recorded_at    TIMESTAMPTZ NOT NULL,
+            response_body         JSONB NOT NULL,
+            created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (employee_id, idempotency_key)
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_plain_time_action_receipts_shift
+        ON plain_time_action_receipts(shift_id, server_recorded_at DESC)
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_week ON schedules(week_start)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_employee ON schedules(employee_id)")
@@ -7644,6 +7678,206 @@ def _record_explicit_site_action(
             return response
 
 
+PLAIN_TIME_ACTION_NAMES = ("clock-in", "arrive", "depart", "clock-out")
+PLAIN_TIME_ACTION_RECEIPT_UNIQUE_CONSTRAINT = (
+    "plain_time_action_receipts_employee_id_idempotency_key_key"
+)
+
+
+def _plain_time_action_request_fingerprint(
+    action: str,
+    payload: Optional[BaseModel],
+) -> str:
+    material = {
+        "action": action,
+        "payload": payload.model_dump(mode="json") if payload is not None else {},
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _plain_time_action_shift_id(result: Any, response: Dict[str, Any]) -> Optional[int]:
+    candidates = []
+    if isinstance(result, dict):
+        candidates.extend([result.get("entryId"), result.get("id")])
+    entry = response.get("entry")
+    if isinstance(entry, dict):
+        candidates.append(entry.get("id"))
+    for value in candidates:
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _plain_time_action_recorded_at(
+    action: str,
+    response: Dict[str, Any],
+) -> datetime:
+    if action in {"clock-in", "clock-out"}:
+        entry = response.get("entry") if isinstance(response, dict) else None
+        if isinstance(entry, dict):
+            key = "clockIn" if action == "clock-in" else "clockOut"
+            value = entry.get(key)
+            if value:
+                try:
+                    return parse_utc_iso(str(value))
+                except ValueError:
+                    pass
+    if action == "arrive":
+        visit = response.get("visit") if isinstance(response, dict) else None
+        if isinstance(visit, dict) and visit.get("arrivalTime"):
+            try:
+                return parse_utc_iso(str(visit["arrivalTime"]))
+            except ValueError:
+                pass
+    if action == "depart":
+        departure = response.get("departure") if isinstance(response, dict) else None
+        if isinstance(departure, dict) and departure.get("departureTime"):
+            try:
+                return parse_utc_iso(str(departure["departureTime"]))
+            except ValueError:
+                pass
+    return utc_now()
+
+
+def _plain_time_action_replay_response(
+    action: str,
+    payload: Optional[BaseModel],
+    employee: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    idempotency_key = getattr(payload, "idempotencyKey", None) if payload else None
+    if not idempotency_key:
+        return None
+    fingerprint = _plain_time_action_request_fingerprint(action, payload)
+    existing = db.query_one(
+        """
+        SELECT request_fingerprint, response_body
+        FROM plain_time_action_receipts
+        WHERE employee_id = %s
+          AND idempotency_key = %s
+        """,
+        (int(employee["id"]), str(idempotency_key)),
+    )
+    if not existing:
+        return None
+    if hmac.compare_digest(str(existing["request_fingerprint"]), fingerprint):
+        replay = dict(existing["response_body"])
+        replay["replayed"] = True
+        return replay
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "This time action key already belongs to different action details."
+        ),
+    )
+
+
+def update_timesheets_for_plain_time_action(
+    action: str,
+    payload: Optional[BaseModel],
+    employee: Dict[str, Any],
+    mutator: Callable[[Dict[str, Any]], Tuple[bool, Any]],
+    response_builder: Callable[[Any, Dict[str, Any]], Dict[str, Any]],
+) -> Tuple[bool, Any]:
+    if action not in PLAIN_TIME_ACTION_NAMES:
+        raise ValueError(f"Unsupported plain time action: {action}")
+
+    idempotency_key = getattr(payload, "idempotencyKey", None) if payload else None
+    fingerprint = (
+        _plain_time_action_request_fingerprint(action, payload)
+        if idempotency_key
+        else ""
+    )
+    employee_id = int(employee["id"])
+
+    with TIMESHEET_WRITE_LOCK:
+        with timesheet_postgres_advisory_lock():
+            replay = _plain_time_action_replay_response(action, payload, employee)
+            if replay is not None:
+                return True, replay
+
+            timesheet_data = _load_timesheets_from_db()
+            pre_shift_ids = {e["id"] for e in timesheet_data["entries"]}
+            pre_visit_counts = {
+                e["id"]: len(e.get("visits", [])) for e in timesheet_data["entries"]
+            }
+            pre_departure_counts = {
+                e["id"]: len(e.get("departures", []))
+                for e in timesheet_data["entries"]
+            }
+
+            ok, result = mutator(timesheet_data)
+            if not ok:
+                return ok, result
+            if (
+                not idempotency_key
+                and isinstance(result, dict)
+                and result.get("alreadyHere")
+            ):
+                return True, response_builder(result, timesheet_data)
+
+            holder: Dict[str, Any] = {}
+
+            def after_save(cur: Any) -> None:
+                response = response_builder(result, timesheet_data)
+                if idempotency_key:
+                    response = {**response, "replayed": False}
+                    cur.execute(
+                        """
+                        INSERT INTO plain_time_action_receipts (
+                            employee_id, shift_id, action, idempotency_key,
+                            request_fingerprint, server_recorded_at, response_body
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            employee_id,
+                            _plain_time_action_shift_id(result, response),
+                            action,
+                            str(idempotency_key),
+                            fingerprint,
+                            _plain_time_action_recorded_at(action, response),
+                            psycopg2.extras.Json(jsonable_encoder(response)),
+                        ),
+                    )
+                holder["response"] = response
+
+            try:
+                _save_timesheets_to_db(
+                    timesheet_data,
+                    pre_shift_ids,
+                    pre_visit_counts,
+                    pre_departure_counts,
+                    after_save=after_save,
+                )
+            except psycopg2.errors.UniqueViolation as exc:
+                constraint = getattr(getattr(exc, "diag", None), "constraint_name", "")
+                if (
+                    idempotency_key
+                    and constraint == PLAIN_TIME_ACTION_RECEIPT_UNIQUE_CONSTRAINT
+                ):
+                    replay = _plain_time_action_replay_response(
+                        action,
+                        payload,
+                        employee,
+                    )
+                    if replay is not None:
+                        return True, replay
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "This time action is still being recorded; retry the "
+                            "same request."
+                        ),
+                    ) from exc
+                raise
+            return True, holder["response"]
+
+
 @app.post("/api/timesheet/site-check-in/resolve")
 def resolve_site_check_in_qr(
     payload: SiteQrResolveRequest,
@@ -9437,6 +9671,9 @@ def clock_in(
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
+    replay = _plain_time_action_replay_response("clock-in", payload, employee)
+    if replay is not None:
+        return replay
     enforce_clock_action_hours(request)
     notes = payload.notes.strip()
     has_gps = payload.latitude is not None and payload.longitude is not None
@@ -9508,16 +9745,29 @@ def clock_in(
         timesheet_data["nextId"] = entry_id + 1
         return True, entry
 
-    ok, result = update_timesheets(mutator)
+    def response_builder(
+        result: Dict[str, Any],
+        timesheet_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        loc = result.get("location", "")
+        location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
+        result["customer"] = _resolve_customer(loc, location_customers)
+        return {"success": True, "entry": result}
+
+    ok, result = update_timesheets_for_plain_time_action(
+        "clock-in",
+        payload,
+        employee,
+        mutator,
+        response_builder,
+    )
     if not ok:
         append_access_log(request, "CLOCK_IN_FAILED", False, str(result))
         raise_timesheet_mutation_failure(result)
 
-    loc = result.get("location", "")
-    location_customers: Dict[str, str] = load_timesheets().get("location_customers", {})
-    result["customer"] = _resolve_customer(loc, location_customers)
+    loc = result.get("entry", {}).get("location", "")
     append_access_log(request, "CLOCK_IN_SUCCESS", True, f"Employee: {employee['name']} at {loc}")
-    return {"success": True, "entry": result}
+    return result
 
 
 @app.post("/api/timesheet/clock-out")
@@ -9577,18 +9827,25 @@ def clock_out(
 
         return True, open_entry
 
-    ok, result = update_timesheets(mutator)
+    ok, result = update_timesheets_for_plain_time_action(
+        "clock-out",
+        payload,
+        employee,
+        mutator,
+        lambda result, _timesheet_data: {"success": True, "entry": result},
+    )
     if not ok:
         append_access_log(request, "CLOCK_OUT_FAILED", False, str(result))
         raise_timesheet_mutation_failure(result)
 
-    append_access_log(
-        request,
-        "CLOCK_OUT_SUCCESS",
-        True,
-        f"Employee: {employee['name']}, Hours: {result.get('totalHours', 0)}",
-    )
-    return {"success": True, "entry": result}
+    if not result.get("replayed"):
+        append_access_log(
+            request,
+            "CLOCK_OUT_SUCCESS",
+            True,
+            f"Employee: {employee['name']}, Hours: {result.get('entry', {}).get('totalHours', 0)}",
+        )
+    return result
 
 
 @app.post("/api/timesheet/visit")
@@ -9598,6 +9855,9 @@ def log_visit(
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     """Auto-log an arrival at a new location during an active shift."""
+    replay = _plain_time_action_replay_response("arrive", payload, employee)
+    if replay is not None:
+        return replay
     enforce_clock_action_hours(request)
     has_gps = payload.latitude is not None and payload.longitude is not None
     now_utc = utc_now()
@@ -9633,7 +9893,10 @@ def log_visit(
         # Avoid duplicate: skip if location matches the most recent visit
         active_visit = get_active_visit(open_entry)
         if active_visit and active_visit.get("location") == location:
-            return False, "already_at_location"
+            return True, {
+                "alreadyHere": True,
+                "entryId": open_entry["id"],
+            }
 
         visit = {
             "arrivalTime": to_utc_iso(now_utc),
@@ -9660,15 +9923,24 @@ def log_visit(
 
         return True, {"visit": visit, "entryId": open_entry["id"]}
 
-    ok, result = update_timesheets(mutator)
+    ok, result = update_timesheets_for_plain_time_action(
+        "arrive",
+        payload,
+        employee,
+        mutator,
+        lambda result, _timesheet_data: {
+            "success": True,
+            "alreadyHere": bool(result.get("alreadyHere")),
+            **result,
+        },
+    )
     if not ok:
-        if result == "already_at_location":
-            return {"success": True, "alreadyHere": True}
         raise_timesheet_mutation_failure(result)
 
-    append_access_log(request, "VISIT_LOGGED", True,
-                      f"Employee: {employee['name']} arrived at {result['visit']['location']}")
-    return {"success": True, "alreadyHere": False, **result}
+    if not result.get("alreadyHere"):
+        append_access_log(request, "VISIT_LOGGED", True,
+                          f"Employee: {employee['name']} arrived at {result['visit']['location']}")
+    return result
 
 
 def get_active_visit(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -9771,18 +10043,25 @@ def depart_location(
 
         return True, {"departure": departure, "entryId": open_entry["id"]}
 
-    ok, result = update_timesheets(mutator)
+    ok, result = update_timesheets_for_plain_time_action(
+        "depart",
+        payload,
+        employee,
+        mutator,
+        lambda result, _timesheet_data: {"success": True, **result},
+    )
     if not ok:
         append_access_log(request, "DEPARTURE_FAILED", False, str(result))
         raise_timesheet_mutation_failure(result)
 
-    append_access_log(
-        request,
-        "DEPARTURE_LOGGED",
-        True,
-        f"Employee: {employee['name']} departed {result['departure']['location']}",
-    )
-    return {"success": True, **result}
+    if not result.get("replayed"):
+        append_access_log(
+            request,
+            "DEPARTURE_LOGGED",
+            True,
+            f"Employee: {employee['name']} departed {result['departure']['location']}",
+        )
+    return result
 
 
 @app.patch("/api/admin/entries/{entry_id}")
