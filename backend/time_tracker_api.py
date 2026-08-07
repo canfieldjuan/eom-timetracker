@@ -17774,6 +17774,7 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
 
     rows.sort(key=lambda r: (r["employeeName"].lower(), r["date"], r["clockIn"]))
     summary = sorted(emp_totals.values(), key=lambda e: e["employeeName"].lower())
+    total_hours = sum(s["totalHours"] for s in summary)
     for s in summary:
         s["totalHours"] = round(s["totalHours"], 2)
 
@@ -17785,7 +17786,7 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
         "exceptionsOnly": exceptions_only,
         "rows": rows,
         "summary": summary,
-        "totalHours": round(sum(s["totalHours"] for s in summary), 2),
+        "totalHours": round(total_hours, 2),
         "totalShifts": sum(s["totalShifts"] for s in summary),
         "totalGpsExceptionShifts": sum(1 for r in rows if r["gpsExceptions"]),
         "totalGpsExceptions": sum(len(r["gpsExceptions"]) for r in rows),
