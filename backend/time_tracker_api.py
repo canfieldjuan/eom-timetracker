@@ -20500,7 +20500,9 @@ def _analytics_linked_job_revenue_cents(
     return revenue_by_job, canonical_site_months, issues_by_job
 
 
-def _load_shift_rate_snapshots() -> Dict[int, float]:
+def _load_shift_rate_snapshots(
+    shift_ids: Optional[Iterable[int]] = None,
+) -> Dict[int, float]:
     """Map shift id -> the hourly rate that shift was worked at, in dollars.
 
     Only shifts that carry a snapshot appear. Callers fall back to the live
@@ -20511,6 +20513,31 @@ def _load_shift_rate_snapshots() -> Dict[int, float]:
     float is bit-identical to ``float(employees.hourly_rate)`` for the same
     two-decimal rate -- the backfill therefore cannot move any existing figure.
     """
+    scoped_ids: Optional[List[int]] = None
+    if shift_ids is not None:
+        scoped_ids = sorted(
+            {
+                int(shift_id)
+                for shift_id in shift_ids
+                if shift_id is not None and int(shift_id) > 0
+            }
+        )
+        if not scoped_ids:
+            return {}
+        rows = db.query_all(
+            """
+            SELECT id, hourly_rate_cents
+            FROM shifts
+            WHERE id = ANY(%s)
+              AND hourly_rate_cents IS NOT NULL
+            """,
+            (scoped_ids,),
+        )
+        return {
+            int(row["id"]): int(row["hourly_rate_cents"]) / 100.0
+            for row in rows
+        }
+
     rows = db.query_all(
         "SELECT id, hourly_rate_cents FROM shifts WHERE hourly_rate_cents IS NOT NULL"
     )
@@ -20572,6 +20599,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     )
 
     linked_period_job_ids: set[int] = set()
+    period_shift_ids: set[int] = set()
     for entry in timesheet_data["entries"]:
         if entry.get("clockOut") is None:
             continue
@@ -20587,6 +20615,9 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         entry_date = to_local(ci_dt).date()
         if start_date is not None and not (start_date <= entry_date <= end_date):
             continue
+        shift_id = _entry_shift_id(entry)
+        if shift_id is not None:
+            period_shift_ids.add(shift_id)
         visits = entry.get("visits") or []
         if visits:
             for visit in visits:
@@ -20613,7 +20644,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     # Per-shift snapshot wins over the live employee rate. The employee map is
     # only the fallback for shifts with no snapshot, so a rate edit moves future
     # shifts and leaves worked shifts alone.
-    shift_rates = _load_shift_rate_snapshots()
+    shift_rates = _load_shift_rate_snapshots(period_shift_ids)
 
     def _effective_rate(shift_id: Optional[int], emp_id: int) -> Optional[float]:
         if shift_id is not None:
@@ -21170,9 +21201,6 @@ def admin_analytics_customer(
         rate = emp.get("hourlyRate")
         if rate is not None:
             emp_rates[emp["id"]] = float(rate)
-    # Per-shift snapshot wins; the employee map is only the fallback for shifts
-    # with no snapshot. Both None still means "no rate" -> silent zero, as today.
-    shift_rates = _load_shift_rate_snapshots()
 
     def _resolve_loc(location: str) -> Tuple[str, str]:
         resolved = location
@@ -21197,6 +21225,7 @@ def admin_analytics_customer(
         return resolved, customer
 
     linked_period_job_ids: set[int] = set()
+    customer_shift_ids: set[int] = set()
     for entry in timesheet_data["entries"]:
         if entry.get("clockOut") is None:
             continue
@@ -21212,6 +21241,7 @@ def admin_analytics_customer(
         entry_date = to_local(ci_dt).date()
         if not (start_date <= entry_date <= end_date):
             continue
+        shift_id = _entry_shift_id(entry)
         visits = entry.get("visits") or []
         if visits:
             for visit in visits:
@@ -21220,6 +21250,8 @@ def admin_analytics_customer(
                 resolved_location, cust = _resolve_loc(visit.get("location", ""))
                 if cust != customer_name:
                     continue
+                if shift_id is not None:
+                    customer_shift_ids.add(shift_id)
                 job_id = _analytics_entry_job_id(visit.get("jobId"))
                 if job_id is not None:
                     linked_period_job_ids.add(job_id)
@@ -21227,6 +21259,8 @@ def admin_analytics_customer(
         resolved_location, cust = _resolve_loc(entry.get("location", ""))
         if cust != customer_name:
             continue
+        if shift_id is not None:
+            customer_shift_ids.add(shift_id)
         job_id = _analytics_entry_job_id(entry.get("jobId"))
         if job_id is not None:
             linked_period_job_ids.add(job_id)
@@ -21236,6 +21270,9 @@ def admin_analytics_customer(
         linked_job_revenue_issues,
     ) = _analytics_linked_job_revenue_cents(linked_period_job_ids)
     linked_jobs_credited: set[int] = set()
+    # Per-shift snapshot wins; the employee map is only the fallback for shifts
+    # with no snapshot. Both None still means "no rate" -> silent zero, as today.
+    shift_rates = _load_shift_rate_snapshots(customer_shift_ids)
 
     def _calc_revenue(
         resolved_location: str,

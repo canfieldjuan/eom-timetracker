@@ -16,6 +16,27 @@ import pytest
 SITE_GPS = {"latitude": 39.1203, "longitude": -88.54335}
 
 
+def _analytics_entry(
+    shift_id: int,
+    *,
+    employee_id: int = 7,
+    location: str = "123 Main St",
+    clock_in: str = "2026-03-25T14:00:00Z",
+    clock_out: str = "2026-03-25T16:00:00Z",
+) -> dict:
+    return {
+        "id": shift_id,
+        "employeeId": employee_id,
+        "employeeName": f"Employee {employee_id}",
+        "location": location,
+        "clockIn": clock_in,
+        "clockOut": clock_out,
+        "totalHours": 2,
+        "timeCategory": "productive",
+        "visits": [],
+    }
+
+
 def _access_log_entry(
     timestamp: str,
     action: str,
@@ -72,6 +93,131 @@ def _ensure_clocked_out(client, headers) -> None:
     """Best-effort cleanup: close any open shift for the auth'd user. Ignore
     errors (no-op when nothing is open)."""
     client.post("/api/timesheet/clock-out", headers=headers, json=SITE_GPS)
+
+
+def test_load_shift_rate_snapshots_scopes_query(monkeypatch):
+    import time_tracker_api as api
+
+    calls = []
+
+    def fake_query_all(sql, params=None):
+        calls.append((sql, params))
+        return [{"id": 17, "hourly_rate_cents": 1850}]
+
+    monkeypatch.setattr(api.db, "query_all", fake_query_all)
+
+    assert api._load_shift_rate_snapshots([17, 17, 0]) == {17: 18.5}
+    assert "WHERE id = ANY(%s)" in calls[0][0]
+    assert calls[0][1] == ([17],)
+
+    calls.clear()
+    assert api._load_shift_rate_snapshots([]) == {}
+    assert calls == []
+
+
+def test_period_analytics_scopes_rate_snapshots_to_period_shift_ids(monkeypatch):
+    import time_tracker_api as api
+
+    captured_shift_ids = []
+    monkeypatch.setattr(
+        api,
+        "load_timesheets",
+        lambda: {
+            "entries": [
+                _analytics_entry(101, location="Today Site"),
+                _analytics_entry(
+                    202,
+                    location="Old Site",
+                    clock_in="2026-03-20T14:00:00Z",
+                    clock_out="2026-03-20T16:00:00Z",
+                ),
+            ],
+            "location_customers": {
+                "Today Site": "Today Customer",
+                "Old Site": "Old Customer",
+            },
+            "location_rate_types": {},
+            "location_expected_hours": {},
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "load_employees",
+        lambda: {"employees": [{"id": 7, "name": "Employee 7", "hourlyRate": 18}]},
+    )
+    monkeypatch.setattr(api, "load_settings", lambda: dict(api._SETTINGS_DEFAULTS))
+    monkeypatch.setattr(
+        api,
+        "_analytics_linked_job_revenue_cents",
+        lambda _job_ids: ({}, set(), {}),
+    )
+
+    def fake_shift_rates(shift_ids=None):
+        captured_shift_ids.append(set(shift_ids or []))
+        return {}
+
+    monkeypatch.setattr(api, "_load_shift_rate_snapshots", fake_shift_rates)
+
+    result = api._compute_analytics("day", "2026-03-25")
+
+    assert result["success"] is True
+    assert captured_shift_ids == [{101}]
+
+
+def test_customer_analytics_scopes_rate_snapshots_to_matching_customer(monkeypatch):
+    import time_tracker_api as api
+
+    now = api.utc_now().replace(microsecond=0)
+    in_window_clock_in = api.to_utc_iso(now - timedelta(hours=3))
+    in_window_clock_out = api.to_utc_iso(now - timedelta(hours=1))
+    captured_shift_ids = []
+    monkeypatch.setattr(
+        api,
+        "load_timesheets",
+        lambda: {
+            "entries": [
+                _analytics_entry(
+                    301,
+                    location="Target Site",
+                    clock_in=in_window_clock_in,
+                    clock_out=in_window_clock_out,
+                ),
+                _analytics_entry(
+                    302,
+                    location="Other Site",
+                    clock_in=in_window_clock_in,
+                    clock_out=in_window_clock_out,
+                ),
+            ],
+            "location_customers": {
+                "Target Site": "Target Customer",
+                "Other Site": "Other Customer",
+            },
+            "location_rate_types": {},
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "load_employees",
+        lambda: {"employees": [{"id": 7, "name": "Employee 7", "hourlyRate": 18}]},
+    )
+    monkeypatch.setattr(api, "load_settings", lambda: dict(api._SETTINGS_DEFAULTS))
+    monkeypatch.setattr(
+        api,
+        "_analytics_linked_job_revenue_cents",
+        lambda _job_ids: ({}, set(), {}),
+    )
+
+    def fake_shift_rates(shift_ids=None):
+        captured_shift_ids.append(set(shift_ids or []))
+        return {}
+
+    monkeypatch.setattr(api, "_load_shift_rate_snapshots", fake_shift_rates)
+
+    result = api.admin_analytics_customer("Target Customer", request=None, weeks=1)
+
+    assert result["success"] is True
+    assert captured_shift_ids == [{301}]
 
 
 # ===============================================================================
