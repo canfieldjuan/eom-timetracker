@@ -738,10 +738,18 @@ def _seed_expected_hours_suggestion(
     )
     employee_id = _employee(cur, f"Expected Hours Decision {suffix}", 25)
     clean_durations = durations or [2, 3, 4]
+    # Anchor the completed visits to mid-week (Tuesday) of the three prior
+    # complete Sunday-weeks, not raw today-minus-N-days. The learning logic
+    # buckets visits by Sunday-week, so day-offsets landed in three distinct
+    # weeks on some weekdays and collapsed on others, flipping the learned
+    # sample and baseline state depending on the day the test ran (see #132).
+    # Week-anchoring keeps the sample deterministic while staying relative to
+    # "now" so it never drifts stale.
+    current_week_start = today - timedelta(days=(today.weekday() + 1) % 7)
     completed_days = [
-        today - timedelta(days=21),
-        today - timedelta(days=14),
-        today - timedelta(days=7),
+        current_week_start - timedelta(days=7 * 3 - 2),
+        current_week_start - timedelta(days=7 * 2 - 2),
+        current_week_start - timedelta(days=7 * 1 - 2),
     ][: len(clean_durations)]
     for index, (completed_day, duration) in enumerate(
         zip(completed_days, clean_durations)
