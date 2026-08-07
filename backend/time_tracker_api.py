@@ -14016,7 +14016,7 @@ def _hours_report_effective_shift_interval(
     if correction_row is not None:
         clock_in = correction_row["corrected_clock_in"].astimezone(timezone.utc)
         clock_out = correction_row["corrected_clock_out"].astimezone(timezone.utc)
-        hours = round(int(correction_row["corrected_total_minutes"]) / 60, 2)
+        hours = int(correction_row["corrected_total_minutes"]) / 60
         return clock_in, clock_out, hours
 
     if entry.get("clockOut") is None:

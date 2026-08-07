@@ -1311,6 +1311,119 @@ def test_hours_report_uses_active_payroll_shift_correction_for_json_csv_pdf(clie
         _delete_employees([value for value in (employee_id, admin_id) if value])
 
 
+def test_hours_report_aggregates_corrected_hours_before_rounding_totals(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=3)
+    admin_id = None
+    employee_id = None
+    try:
+        admin_id = _create_employee(
+            "Hours Report Aggregate Correction Mayra",
+            role="admin",
+        )
+        employee_id = _create_employee("Hours Report Aggregate Alma")
+        admin_auth = _login(client, "Hours Report Aggregate Correction Mayra")
+        morning_shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 9),
+            location_label="Hours Report Aggregate Morning Site",
+        )
+        afternoon_shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 13),
+            _local_dt(service_day, 14),
+            location_label="Hours Report Aggregate Afternoon Site",
+        )
+
+        for shift_id, corrected_clock_in, corrected_clock_out in (
+            (
+                morning_shift_id,
+                _local_dt(service_day, 8),
+                _local_dt(service_day, 12, 5),
+            ),
+            (
+                afternoon_shift_id,
+                _local_dt(service_day, 13),
+                _local_dt(service_day, 17, 5),
+            ),
+        ):
+            corrected = client.post(
+                "/api/admin/payroll/timesheet/shift-corrections",
+                headers=admin_auth,
+                json={
+                    "weekStart": week_start.isoformat(),
+                    "employeeId": employee_id,
+                    "shiftId": shift_id,
+                    "date": service_day.isoformat(),
+                    "correctedClockIn": corrected_clock_in.isoformat(),
+                    "correctedClockOut": corrected_clock_out.isoformat(),
+                    "correctedBreakMinutes": 0,
+                    "reason": "Mayra corrected the shift total for payroll reconciliation.",
+                },
+            )
+            assert corrected.status_code == 200, corrected.text
+
+        weekly = _weekly_hours(client, admin_auth, week_start)
+        weekly_employee = _employees_by_name(weekly)["Hours Report Aggregate Alma"]
+        assert weekly_employee["days"][3]["totalMinutes"] == 490
+        assert weekly_employee["days"][3]["totalHours"] == 8.17
+        assert weekly_employee["totalMinutes"] == 490
+        assert weekly_employee["totalHours"] == 8.17
+
+        query = (
+            "/api/admin/reports/hours"
+            f"?period=day&date={service_day.isoformat()}&employee_id={employee_id}"
+        )
+        response = client.get(query, headers=admin_auth)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["totalHours"] == 8.17
+        assert body["totalShifts"] == 2
+        assert body["summary"] == [
+            {
+                "employeeId": employee_id,
+                "employeeName": "Hours Report Aggregate Alma",
+                "totalHours": 8.17,
+                "totalShifts": 2,
+            },
+        ]
+        assert [row["hours"] for row in body["rows"]] == [4.08, 4.08]
+
+        export_response = client.get(
+            query.replace("/api/admin/reports/hours", "/api/admin/reports/hours/export"),
+            headers=admin_auth,
+        )
+        assert export_response.status_code == 200, export_response.text
+        csv_rows = list(csv.reader(StringIO(export_response.text)))
+        assert ["Total Hours", "8.17", "Total Shifts", "2"] in csv_rows
+        assert [
+            "Hours Report Aggregate Alma",
+            "2",
+            "8.17",
+        ] in csv_rows
+        detail_hours = [
+            row[4]
+            for row in csv_rows
+            if row[:1] == ["Hours Report Aggregate Alma"]
+            and row[1].startswith("Wed, Jul 22")
+        ]
+        assert detail_hours == ["4.08", "4.08"]
+
+        pdf_response = client.get(
+            query.replace("/api/admin/reports/hours", "/api/admin/reports/hours/pdf"),
+            headers=admin_auth,
+        )
+        assert pdf_response.status_code == 200, pdf_response.text
+        _assert_valid_pdf(pdf_response.content)
+        pdf_text = _normalized_text(_extract_pdf_text(pdf_response.content))
+        assert "Hours Report Aggregate Alma" in pdf_text
+        assert "8.17" in pdf_text
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, admin_id) if value])
+
+
 def test_admin_entry_adjust_rejects_active_payroll_shift_correction(client, auth):
     week_start = date(2026, 7, 19)
     service_day = week_start + timedelta(days=2)
