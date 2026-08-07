@@ -1059,14 +1059,24 @@ def _save_timesheets_to_db(
             is_new = entry["id"] not in pre_shift_ids
 
             if is_new:
+                # hourly_rate_cents is stamped here, at shift creation (clock-in
+                # is the only moment guaranteed to happen -- clock_out is
+                # nullable and shifts can stay open), and read straight from
+                # employees so no caller can supply or spoof it. The UPDATE
+                # branch below deliberately omits the column: a shift's rate is
+                # fixed once set, so clock-out, admin entry edits, job relink and
+                # categorization can never overwrite an existing snapshot.
                 cur.execute(
                     """
                     INSERT INTO shifts
                       (employee_id, location_id, location_label, clock_in, clock_out, total_hours,
                        notes, local_date, timezone, clock_in_gps, clock_in_gps_meta,
                        clock_out_gps, clock_out_gps_meta,
-                       job_id, time_category, non_productive_type)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       job_id, time_category, non_productive_type, hourly_rate_cents)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            (SELECT ROUND(e.hourly_rate * 100)
+                             FROM employees e
+                             WHERE e.id = %s))
                     RETURNING id
                     """,
                     (
@@ -1086,6 +1096,7 @@ def _save_timesheets_to_db(
                         entry.get("jobId"),
                         entry.get("timeCategory", "productive"),
                         entry.get("nonProductiveType"),
+                        entry["employeeId"],
                     ),
                 )
                 entry["id"] = cur.fetchone()[0]
@@ -4345,6 +4356,34 @@ def _ensure_employee_role_schema() -> None:
     )
 
 
+def _backfill_shift_hourly_rate_snapshots() -> None:
+    """Stamp shifts that predate the rate snapshot with the employee's current rate.
+
+    Numerically a no-op on the day it runs: it records exactly what every money
+    surface already computes from the live rate. Its purpose is to freeze that
+    figure so a later rate edit cannot restate it.
+
+    Honest caveat: rate changes made BEFORE this ran are unrecoverable, so this
+    records "the rate as of migration", not reconstructed history.
+
+    Idempotent by the `hourly_rate_cents IS NULL` guard -- a shift that already
+    carries a snapshot is never rewritten, so re-running changes nothing.
+    Employees with no configured rate leave the shift NULL rather than inventing
+    a zero; those shifts keep falling back to the live rate and therefore keep
+    each surface's existing missing-rate policy.
+    """
+    db.execute(
+        """
+        UPDATE shifts
+        SET hourly_rate_cents = ROUND(e.hourly_rate * 100)
+        FROM employees e
+        WHERE shifts.employee_id = e.id
+          AND shifts.hourly_rate_cents IS NULL
+          AND e.hourly_rate IS NOT NULL
+        """
+    )
+
+
 def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
@@ -4763,6 +4802,10 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS clock_out_gps_meta JSONB"
     )
+    db.execute(
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS hourly_rate_cents INTEGER"
+    )
+    _backfill_shift_hourly_rate_snapshots()
     db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS gps_meta JSONB"
     )
@@ -15296,10 +15339,16 @@ def _payroll_correction_labor_summary(
     labor_incomplete = False
     for correction in corrections:
         allocation = correction.get("allocation") or {}
+        # Prefer the value STORED at allocation time over the live recompute.
+        # Shift labor now comes from the per-shift rate snapshot; if allocations
+        # kept recomputing off the live rate, adjustedActualLaborCost would add a
+        # snapshot-rate addend to a live-rate addend for the same employee-day.
+        # currentAllocatedLaborCost is still serialized -- stored vs current is a
+        # deliberate audit pair -- it just no longer drives the money figure.
         cost_source = (
-            allocation.get("currentAllocatedLaborCost")
-            if "currentAllocatedLaborCost" in allocation
-            else allocation.get("allocatedLaborCost")
+            allocation.get("allocatedLaborCost")
+            if "allocatedLaborCost" in allocation
+            else allocation.get("currentAllocatedLaborCost")
         )
         cost_cents = _payroll_signed_money_cents(cost_source)
         if cost_cents is None:
@@ -18646,7 +18695,13 @@ def admin_waste_analysis(
                    EXTRACT(EPOCH FROM (s.clock_out - s.clock_in)) / 3600.0
                ) AS total_hours,
                s.time_category, s.non_productive_type,
-               s.notes, s.local_date, e.hourly_rate
+               s.notes, s.local_date,
+               -- Prefer the rate the shift was worked at; fall back to the live
+               -- rate only when the shift carries no snapshot. NULL on both
+               -- sides still means "no rate", so the zero-cost +
+               -- missingRateCount policy below is unchanged.
+               COALESCE(s.hourly_rate_cents::numeric / 100, e.hourly_rate)
+                   AS hourly_rate
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
         LEFT JOIN locations l ON s.location_id = l.id
@@ -19213,7 +19268,12 @@ def admin_get_job(
                    )
                END AS total_hours,
                s.notes,
-               e.hourly_rate
+               -- Prefer the rate the shift was worked at; fall back to the live
+               -- rate only when the shift carries no snapshot. NULL on both
+               -- sides still means "no rate", so the silent-zero labor cost
+               -- policy below is unchanged.
+               COALESCE(s.hourly_rate_cents::numeric / 100, e.hourly_rate)
+                   AS hourly_rate
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
         WHERE s.job_id = %s
@@ -19552,6 +19612,32 @@ def _analytics_linked_job_revenue_cents(
     return revenue_by_job, canonical_site_months, issues_by_job
 
 
+def _load_shift_rate_snapshots() -> Dict[int, float]:
+    """Map shift id -> the hourly rate that shift was worked at, in dollars.
+
+    Only shifts that carry a snapshot appear. Callers fall back to the live
+    employee rate for shifts that do not, which keeps pre-migration rows and
+    rate-less employees behaving exactly as they do today.
+
+    ``cents / 100`` is done in Python from an exact integer, so the resulting
+    float is bit-identical to ``float(employees.hourly_rate)`` for the same
+    two-decimal rate -- the backfill therefore cannot move any existing figure.
+    """
+    rows = db.query_all(
+        "SELECT id, hourly_rate_cents FROM shifts WHERE hourly_rate_cents IS NOT NULL"
+    )
+    return {int(row["id"]): int(row["hourly_rate_cents"]) / 100.0 for row in rows}
+
+
+def _entry_shift_id(entry: Dict[str, Any]) -> Optional[int]:
+    """Shift id for a timesheet entry -- entries are shifts, keyed by shift id."""
+    try:
+        shift_id = int(entry.get("id"))
+    except (TypeError, ValueError):
+        return None
+    return shift_id if shift_id > 0 else None
+
+
 def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     now = utc_now()
     local_now = to_local(now)
@@ -19636,6 +19722,19 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         rate = emp.get("hourlyRate")
         if rate is not None:
             emp_rates[emp["id"]] = float(rate)
+    # Per-shift snapshot wins over the live employee rate. The employee map is
+    # only the fallback for shifts with no snapshot, so a rate edit moves future
+    # shifts and leaves worked shifts alone.
+    shift_rates = _load_shift_rate_snapshots()
+
+    def _effective_rate(shift_id: Optional[int], emp_id: int) -> Optional[float]:
+        if shift_id is not None:
+            snapshot = shift_rates.get(shift_id)
+            if snapshot is not None:
+                return snapshot
+        # No snapshot and no live rate keeps returning None, which the caller
+        # still treats as free labor -- the pre-existing silent-zero policy.
+        return emp_rates.get(emp_id)
 
     linked_jobs_credited: set[int] = set()
     visited_customer_dates: set = set()  # (customer, date_key) - dedup multi-employee same-day visits
@@ -19675,6 +19774,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         date_key: str,
         is_visit: bool,
         job_id: Optional[int] = None,
+        shift_id: Optional[int] = None,
     ) -> None:
         # Determine first-arrival: deduplicates multi-employee same-day visits
         visit_key = (customer, date_key)
@@ -19719,7 +19819,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                     )
                 )
 
-        emp_rate = emp_rates.get(emp_id)
+        emp_rate = _effective_rate(shift_id, emp_id)
         labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
 
         exp_h = location_expected_hours.get(resolved_location)
@@ -19782,6 +19882,8 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             continue
 
         emp_id = int(entry.get("employeeId", 0))
+        # Every visit inside a shift was worked at that shift's rate.
+        shift_id = _entry_shift_id(entry)
         date_key = entry_date.strftime("%Y-%m-%d")
 
         visits = entry.get("visits") or []
@@ -19814,6 +19916,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                     date_key,
                     is_visit=True,
                     job_id=_analytics_entry_job_id(visit.get("jobId")),
+                    shift_id=shift_id,
                 )
         else:
             # Legacy / single-location shift
@@ -19829,6 +19932,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                 date_key,
                 is_visit=True,
                 job_id=_analytics_entry_job_id(entry.get("jobId")),
+                shift_id=shift_id,
             )
 
     def _classify(labor_pct, gross_margin, variance, rplh) -> Tuple[str, List[str]]:
@@ -20178,6 +20282,9 @@ def admin_analytics_customer(
         rate = emp.get("hourlyRate")
         if rate is not None:
             emp_rates[emp["id"]] = float(rate)
+    # Per-shift snapshot wins; the employee map is only the fallback for shifts
+    # with no snapshot. Both None still means "no rate" -> silent zero, as today.
+    shift_rates = _load_shift_rate_snapshots()
 
     def _resolve_loc(location: str) -> Tuple[str, str]:
         resolved = location
@@ -20370,7 +20477,10 @@ def admin_analytics_customer(
 
         emp_id = int(entry.get("employeeId", 0))
         emp_name = emp_names.get(emp_id, f"Employee {emp_id}")
-        emp_rate = emp_rates.get(emp_id)
+        # Every visit inside a shift was worked at that shift's rate.
+        shift_id = _entry_shift_id(entry)
+        snapshot_rate = shift_rates.get(shift_id) if shift_id is not None else None
+        emp_rate = snapshot_rate if snapshot_rate is not None else emp_rates.get(emp_id)
 
         days_since_sunday_entry = (entry_date.weekday() + 1) % 7
         week_start = entry_date - timedelta(days=days_since_sunday_entry)

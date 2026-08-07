@@ -1343,7 +1343,13 @@ def _load_time_evidence(
     linked_job_ids = [int(job_id) for job_id in visible_job_ids]
     shifts = _query_all(
         """
-        SELECT s.id, s.employee_id, e.name AS employee_name, e.hourly_rate,
+        SELECT s.id, s.employee_id, e.name AS employee_name,
+               -- Prefer the rate the shift was worked at; fall back to the live
+               -- employee rate only when the shift carries no snapshot. NULL on
+               -- both sides still means "no rate", so the fail-closed
+               -- missing_worker_rate policy downstream is unchanged.
+               COALESCE(s.hourly_rate_cents::numeric / 100, e.hourly_rate)
+                   AS hourly_rate,
                s.location_id, s.location_label,
                COALESCE(correction.corrected_clock_in, s.clock_in) AS clock_in,
                COALESCE(correction.corrected_clock_out, s.clock_out) AS clock_out,
@@ -1449,6 +1455,11 @@ def _load_time_evidence(
             departures[int(row["shift_id"])].append(row)
 
     qr_by_employee_site: Dict[Tuple[int, int], List[datetime]] = defaultdict(list)
+    # D2 (issue #126): QR-only presence rows have no shift, so they have no rate
+    # snapshot and stay on the live employee rate. They are deliberately out of
+    # scope: the segments they produce are presence-only (shift_id None, a
+    # one-microsecond span) and contribute zero finalized hours, so the live rate
+    # here is never multiplied into money today.
     qr_rows = _query_all(
         """
         SELECT sci.id, sci.employee_id, e.name AS employee_name, e.hourly_rate,
@@ -3733,6 +3744,7 @@ def _decorate_schedule_jobs(
                 ),
                 "intervals": [],
                 "finalizedHours": 0.0,
+                "_finalizedHoursByRateCents": {},
                 "inProgress": False,
                 "observedPresence": False,
             },
@@ -3761,6 +3773,17 @@ def _decorate_schedule_jobs(
         )
         if finalized:
             worker["finalizedHours"] += segment_hours or 0.0
+            # Bucket hours by the rate each segment was worked at. "hourlyRate"
+            # above is the first segment's rate; before per-shift snapshots every
+            # segment of an employee shared one live rate, so that was harmless.
+            # With snapshots two shifts of the same employee on the same job can
+            # legitimately carry different rates, and collapsing them onto the
+            # first would misprice the later one.
+            segment_rate_cents = _money_cents(segment.get("hourly_rate"))
+            hours_by_rate = worker["_finalizedHoursByRateCents"]
+            hours_by_rate[segment_rate_cents] = (
+                hours_by_rate.get(segment_rate_cents, 0.0) + (segment_hours or 0.0)
+            )
         elif bool(segment.get("in_progress", True)):
             worker["inProgress"] = True
         else:
@@ -3780,15 +3803,27 @@ def _decorate_schedule_jobs(
             observed_presence = bool(worker.pop("observedPresence"))
             actual_hours += finalized_hours
             rate_cents = _money_cents(worker.pop("hourlyRate"))
-            labor_cents = (
-                int(
-                    (Decimal(str(finalized_hours)) * Decimal(rate_cents)).quantize(
-                        Decimal("1"), rounding=ROUND_HALF_UP
+            hours_by_rate_cents = worker.pop("_finalizedHoursByRateCents")
+            # Fail closed: an unknown rate anywhere in this worker's segments
+            # makes the whole worker labor figure unknown, exactly as a worker
+            # with no configured rate does today.
+            if rate_cents is None or any(
+                key is None for key in hours_by_rate_cents
+            ):
+                labor_cents = None
+            else:
+                # One bucket per distinct rate. With a single rate this is
+                # arithmetically identical to the previous
+                # round(finalized_hours * rate), so backfilled history does not
+                # move by a cent.
+                labor_cents = sum(
+                    int(
+                        (Decimal(str(bucket_hours)) * Decimal(bucket_rate)).quantize(
+                            Decimal("1"), rounding=ROUND_HALF_UP
+                        )
                     )
+                    for bucket_rate, bucket_hours in hours_by_rate_cents.items()
                 )
-                if rate_cents is not None
-                else None
-            )
             if finalized_hours > 0 and labor_cents is None:
                 labor_complete = False
                 issues.append(

@@ -1585,7 +1585,18 @@ def test_payroll_timesheet_allocation_labels_and_rate_fingerprint(client):
             employee_id=employee_id,
         )
         third_allocation = third["employees"][0]["days"][1]["correction"]["allocation"]
+        # DELIBERATE CONTRACT FLIP (issue #126, rate snapshot). This test used to
+        # assert only the live recompute, which read as "a rate edit restates the
+        # allocation" -- the retroactive restatement #126 removes. Both halves of
+        # the audit pair are now pinned: currentAllocatedLaborCost still tracks
+        # today's rate (25.00), but the STORED allocatedLaborCost is frozen at the
+        # rate the correction was allocated at (20.00), and it is the stored value
+        # that _payroll_correction_labor_summary now sums into the money figures.
         assert third_allocation["currentAllocatedLaborCost"] == 25.0
+        assert third_allocation["allocatedLaborCost"] == 20.0
+        assert third_allocation["laborCostComplete"] is True
+        # D3: the fingerprint deliberately still hashes the live rate, so a rate
+        # edit still invalidates a verified payroll week. Out of scope for #126.
         assert third["timesheetSourceFingerprint"] != second["timesheetSourceFingerprint"]
     finally:
         _delete_payroll_verification_weeks([week_start])
@@ -4005,7 +4016,31 @@ def test_payroll_correction_allocation_attaches_site_proof_without_blending_actu
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
-def test_payroll_correction_allocation_recomputes_labor_after_rate_added(client):
+def test_payroll_correction_allocation_freezes_labor_after_rate_added(client):
+    """DELIBERATE CONTRACT FLIP (issue #126, rate snapshot).
+
+    This test used to assert that adding an hourly rate AFTER the fact
+    retroactively materialised a correction labor cost of 20.00 and an
+    adjustedActualLaborCost of 40 + 20 = 60. That retroactive restatement is
+    precisely the bug #126 fixes: an employee's rate must stay editable, but an
+    edit must only affect future work.
+
+    _payroll_correction_labor_summary now prefers the allocation cost STORED at
+    allocation time over the live recompute. The allocation was made while the
+    employee had no rate, so its stored cost is permanently unknown and the
+    summary stays incomplete rather than inventing 20.00 from today's rate.
+
+    This is also what closes the mixed-rate hole the issue flagged: shift labor
+    is about to come from the per-shift snapshot, so summing it with a
+    live-rate-recomputed allocation would have added a frozen figure to a
+    floating one for the same employee-day. adjustedActualLaborCost now fails
+    closed to None instead. knownAdjustedActualLaborCost still carries the
+    partial 40.00 so the known-vs-complete pair keeps working.
+
+    currentAllocatedLaborCost still recomputes live and is still asserted below:
+    stored-vs-current is an intentional audit pair, it just no longer drives the
+    money figure.
+    """
     week_start = date(2026, 7, 19)
     service_day = date(2026, 7, 20)
     _delete_payroll_labor_profitability_rows()
@@ -4074,26 +4109,37 @@ def test_payroll_correction_allocation_recomputes_labor_after_rate_added(client)
         assert body["issues"] == []
         assert body["payrollHours"]["allocatedCorrectionCount"] == 1
         assert body["payrollHours"]["invalidAllocationCount"] == 0
-        assert body["payrollHours"]["allocatedCorrectionLaborCost"] == 20.0
-        assert body["payrollHours"]["knownAllocatedCorrectionLaborCost"] == 20.0
-        assert body["payrollHours"]["allocatedCorrectionLaborCostComplete"] is True
+        # Frozen: the allocation was made with no rate, so its cost stays
+        # unknown. It is NOT restated from the rate added afterwards.
+        assert body["payrollHours"]["allocatedCorrectionLaborCost"] is None
+        assert body["payrollHours"]["knownAllocatedCorrectionLaborCost"] == 0.0
+        assert body["payrollHours"]["allocatedCorrectionLaborCostComplete"] is False
         correction = body["payrollHours"]["allocatedCorrections"][0]
         allocation = correction["allocation"]
         assert allocation["allocatedLaborCost"] is None
         assert allocation["laborCostComplete"] is False
+        # Audit pair: the live recompute is still reported, it just no longer
+        # drives allocatedCorrectionLaborCost above.
         assert allocation["currentAllocatedLaborCost"] == 20.0
         assert allocation["currentLaborCostComplete"] is True
+        # The shift itself carries no rate snapshot (it predates the rate), so it
+        # still falls back to the live rate -- unchanged behavior for shifts.
         assert body["summary"]["actualLaborCost"] == 40.0
-        assert body["summary"]["adjustedActualLaborCost"] == 60.0
-        assert body["summary"]["adjustedLaborCostComplete"] is True
+        # 40 + 20 = 60 is gone: a frozen shift figure is never summed with a
+        # live-rate allocation. The total fails closed instead.
+        assert body["summary"]["adjustedActualLaborCost"] is None
+        assert body["summary"]["adjustedLaborCostComplete"] is False
+        assert body["summary"]["knownAdjustedActualLaborCost"] == 40.0
         monday = next(row for row in body["byDay"] if row["date"] == "2026-07-20")
         assert monday["allocatedCorrections"] == [correction]
-        assert monday["adjustedActualLaborCost"] == 60.0
+        assert monday["adjustedActualLaborCost"] is None
+        assert monday["adjustedLaborCostComplete"] is False
+        assert monday["knownAdjustedActualLaborCost"] == 40.0
         site = monday["sites"][0]
         assert site["allocatedCorrections"] == [correction]
-        assert site["adjustedActualLaborCost"] == 60.0
+        assert site["adjustedActualLaborCost"] is None
         assert site["jobs"][0]["allocatedCorrections"] == [correction]
-        assert site["jobs"][0]["adjustedActualLaborCost"] == 60.0
+        assert site["jobs"][0]["adjustedActualLaborCost"] is None
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_payroll_labor_profitability_rows()

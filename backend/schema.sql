@@ -191,6 +191,12 @@ CREATE TABLE shifts (
     clock_out_gps       JSONB,
     clock_out_gps_meta  JSONB,
     job_id              INTEGER REFERENCES jobs(id),
+    -- Rate the shift was actually worked at, stamped once at clock-in and never
+    -- rewritten. employees.hourly_rate stays editable; money surfaces prefer
+    -- this snapshot so an edit only moves future work. NULL means "no snapshot"
+    -- (pre-migration row, or employee had no rate) and falls back to the live
+    -- rate, preserving each surface's existing missing-rate policy.
+    hourly_rate_cents   INTEGER,
     time_category       TEXT NOT NULL DEFAULT 'productive'
                             CHECK (time_category IN ('productive', 'non_productive')),
     non_productive_type TEXT
