@@ -2678,6 +2678,77 @@ def test_schedule_open_shift_identifies_worker_without_finalized_hours(client, a
     )
 
 
+def test_open_rateless_segment_does_not_poison_finalized_labor_cost(client, auth):
+    observed_at = datetime.now(timezone.utc).replace(microsecond=0)
+    app_timezone = ZoneInfo("America/Chicago")
+    service_day = observed_at.astimezone(app_timezone).date()
+    job_start = observed_at - timedelta(hours=2)
+    job_end = observed_at + timedelta(hours=1)
+    finalized_start = observed_at - timedelta(minutes=70)
+    finalized_end = observed_at - timedelta(minutes=10)
+    open_start = observed_at - timedelta(minutes=90)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "rateless_open_segment",
+                "residential_morning",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "Rateless Open Segment",
+                site_type="Residential",
+                rate=125,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+            job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Rateless Open Segment",
+                start=job_start,
+                end=job_end,
+                source_seed="rateless-open-segment",
+            )
+            employee_id = _employee(cur, "Rateless Open Segment", None)
+            _shift(
+                cur,
+                employee_id=employee_id,
+                start=open_start,
+                end=None,
+                service_day=service_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Rateless Open Segment",
+                job_id=job_id,
+            )
+            finalized_shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=finalized_start,
+                end=finalized_end,
+                service_day=service_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Rateless Open Segment",
+                job_id=job_id,
+            )
+            cur.execute(
+                "UPDATE shifts SET hourly_rate_cents = 1800 WHERE id = %s",
+                (finalized_shift_id,),
+            )
+
+    body = _schedule_body(client, auth, service_day)
+    job = _schedule_job(body, job_id)
+    worker = job["workers"][0]
+
+    assert job["actualHours"] == 1
+    assert job["actualLaborCost"] == 18
+    assert worker["status"] == "in_progress"
+    assert worker["hours"] == 1
+    assert worker["laborCost"] == 18
+    assert "missing_worker_rate" not in {issue["code"] for issue in job["issues"]}
+
+
 @pytest.mark.parametrize(
     ("classification", "review_status"),
     [
