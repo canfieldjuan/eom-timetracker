@@ -12266,6 +12266,7 @@ def timesheet_current_status(
     )
     response_rows = [
         {
+            "employeeId": row["id"],
             "employeeName": row["name"],
             "location": row["location"],
             "customer": row.get("customer", ""),
