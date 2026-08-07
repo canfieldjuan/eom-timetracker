@@ -94,6 +94,25 @@ def test_stale_shift_is_visible_blocks_actions_and_adds_no_payable_hours(
             "requiresAdminReview": True,
         }
         assert body["staleOpenShift"]["ageHours"] > 24
+        assert body["staleOpenShifts"] == []
+
+        admin_status = client.get("/api/timesheet/current-status", headers=auth)
+        assert admin_status.status_code == 200, admin_status.text
+        admin_stale = next(
+            row
+            for row in admin_status.json()["staleOpenShifts"]
+            if row["shiftId"] == shift_id
+        )
+        assert admin_stale == {
+            "shiftId": shift_id,
+            "employeeId": employee_id,
+            "employeeName": "Catalina Gomez",
+            "clockIn": admin_stale["clockIn"],
+            "location": "123 Main St, Effingham",
+            "ageHours": admin_stale["ageHours"],
+            "requiresAdminReview": True,
+        }
+        assert admin_stale["ageHours"] > 24
 
         attempts = [
             ("/api/timesheet/clock-in", {"location": "123 Main St, Effingham"}),

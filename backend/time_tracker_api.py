@@ -1334,6 +1334,20 @@ def stale_open_shift_summary(
     }
 
 
+def admin_stale_open_shift_summary(
+    entry: Dict[str, Any],
+    reference_time: datetime,
+) -> Optional[Dict[str, Any]]:
+    summary = stale_open_shift_summary(entry, reference_time)
+    if not summary:
+        return None
+    return {
+        **summary,
+        "employeeId": int(entry.get("employeeId", 0)),
+        "employeeName": str(entry.get("employeeName", "")),
+    }
+
+
 def stale_shift_review_failure(
     entry: Dict[str, Any],
     reference_time: datetime,
@@ -12543,6 +12557,17 @@ def timesheet_current_status(
         if own_stale_open
         else None
     )
+    stale_open_shifts = []
+    if employee.get("role") == "admin":
+        stale_open_shifts = [
+            summary
+            for entry in timesheet_data.get("entries", [])
+            for summary in [admin_stale_open_shift_summary(entry, now_utc)]
+            if summary
+        ]
+        stale_open_shifts.sort(
+            key=lambda item: (str(item.get("clockIn", "")), int(item.get("shiftId", 0)))
+        )
     response_rows = [
         {
             "employeeId": row["id"],
@@ -12566,6 +12591,7 @@ def timesheet_current_status(
         "success": True,
         "currentlyWorking": response_rows,
         "staleOpenShift": stale_open_shift,
+        "staleOpenShifts": stale_open_shifts,
     }
 
 
