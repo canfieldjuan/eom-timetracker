@@ -15319,15 +15319,17 @@ def _payroll_correction_rate_for_allocation(
     is frozen at its worked rate; a NULL-snapshot shift is not frozen, so it
     follows the live rate (unknown only when the employee has no live rate).
 
-    Precedence:
-      1. Scope to the shifts that worked this allocation's site (the allocation
-         names a location); if none did, consider the whole day.
-      2. If every shift in scope agrees on one effective rate, return it.
-      3. If they disagree, fail closed: return no rate, so the cost stays NULL
-         and laborCostComplete is False rather than guessing.
-      4. If scope contains unknown-rate work: with no snapshots anywhere, fall
-         back to the live rate (the pre-migration / rate-less behavior); but if
-         known snapshots coexist with unknown-rate work, fail closed.
+    Precedence, decided over the IN-SCOPE shifts only (the shifts that worked
+    this allocation's site if any did, otherwise the whole day -- an out-of-scope
+    site's shifts never influence the result):
+      1. Mixed frozen + live in scope -> FAIL CLOSED. The delta-minutes cannot
+         be attributed to the frozen vs the live shift, and treating it as live
+         would let a rate edit restate the frozen shift's portion.
+      2. All frozen and agreeing on one rate -> FROZEN at that rate.
+      3. All frozen but disagreeing -> FAIL CLOSED.
+      4. All live -> LIVE-tracked at the live rate (they all follow the one live
+         rate, so they never disagree); when no live rate is configured yet this
+         is the rate-less state -- live-tracked and unknown until a rate is set.
 
     A shift is "on that day" when its effective worked interval OVERLAPS the
     correction's local day, not merely when its clock-in local_date equals it: a
@@ -15404,52 +15406,52 @@ def _payroll_correction_rate_for_allocation(
         # No shift on that day: live rate, not frozen.
         return live_hourly_rate, True, False
 
-    live_rate_dec: Optional[Decimal] = (
-        Decimal(str(live_hourly_rate)) if live_hourly_rate is not None else None
-    )
-    any_snapshot = any(row.get("hourly_rate_cents") is not None for row in rows)
-
-    def _effective_rate(row: Any) -> Optional[Decimal]:
-        # A snapshotted shift is frozen at its worked rate; a NULL-snapshot shift
-        # follows the live rate (None only when the employee has no live rate).
-        cents = row.get("hourly_rate_cents")
-        if cents is not None:
-            return Decimal(int(cents)) / Decimal(100)
-        return live_rate_dec
-
     def _worked_here(row: Any) -> bool:
         return int(location_id) in {
             int(loc) for loc in (row.get("worked_location_ids") or [])
         }
 
-    # Scope to shifts that worked this allocation's site when any did; otherwise
-    # consider the whole day, matching the original site-then-day precedence.
+    # Scope FIRST: the shifts that worked this allocation's site when any did;
+    # otherwise the whole day. Everything below is decided over this scope only
+    # -- an out-of-scope site's shifts must never influence the classification.
     scope = [row for row in rows if _worked_here(row)] or rows
-    effective = [_effective_rate(row) for row in scope]
-    # The rate is only genuinely frozen when every in-scope shift is snapshotted.
-    # A NULL-snapshot shift follows the live rate, so even if it agrees today it
-    # will move on the next rate edit -- such an allocation must track live, not
-    # freeze.
-    scope_all_snapshotted = all(
-        row.get("hourly_rate_cents") is not None for row in scope
-    )
 
-    if any(rate is None for rate in effective):
-        # Unknown-rate work in scope. With no snapshots anywhere this is the
-        # pre-migration / rate-less fallback (return the live rate, which may be
-        # None -- the existing missing-rate behavior). But if known snapshots
-        # coexist with unknown-rate work, the scope is mixed and pricing it would
-        # be a guess, so fail closed.
-        if not any_snapshot:
-            return live_hourly_rate, True, False
+    # Partition the scope into frozen (snapshotted) and live (NULL-snapshot)
+    # shifts. A snapshotted shift is frozen at its worked rate; a NULL-snapshot
+    # shift is not frozen -- it follows the live rate, so it moves on the next
+    # rate edit.
+    frozen_rates: set = set()
+    has_frozen = False
+    has_live = False
+    for row in scope:
+        cents = row.get("hourly_rate_cents")
+        if cents is not None:
+            has_frozen = True
+            frozen_rates.add(Decimal(int(cents)) / Decimal(100))
+        else:
+            has_live = True
+
+    # Mixed frozen + live in scope: the correction's delta-minutes cannot be
+    # attributed to the frozen vs the live shift, and marking it live-tracked
+    # would let a later rate edit restate the frozen shift's portion. Fail
+    # closed -- unknown, never a confident guess that moves frozen history.
+    if has_frozen and has_live:
         return None, False, False
 
-    distinct = set(effective)
-    if len(distinct) == 1:
-        return distinct.pop(), True, scope_all_snapshotted
+    # All frozen: genuinely freezable only when the snapshots agree on one rate.
+    if has_frozen:
+        if len(frozen_rates) == 1:
+            return frozen_rates.pop(), True, True
+        return None, False, False
 
-    # Disagreeing effective rates in scope: guessing would misprice the money.
-    return None, False, False
+    # All live (or empty scope, which cannot happen here since rows is
+    # non-empty). Live shifts all follow the one live rate, so they never
+    # disagree. When the live rate is unknown (a NULL-snapshot shift and no
+    # configured rate) this is the pre-migration / rate-less state: live-tracked
+    # and unknown until a rate is set -- resolved True, not frozen, rate may be
+    # None, which the caller stores as NULL + is_live and values at the live
+    # recompute.
+    return live_hourly_rate, True, False
 
 
 def _payroll_correction_allocation_cost(

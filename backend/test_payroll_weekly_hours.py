@@ -5816,22 +5816,89 @@ def test_correction_fails_closed_when_a_null_snapshot_shift_diverges(client):
     assert allocation["laborCostComplete"] is False
 
 
-def test_correction_prices_when_the_null_snapshot_shift_agrees(client):
-    """Same mixed setup, but the live rate still matches the snapshot ($20).
+def test_correction_scope_ignores_an_unrelated_sites_snapshot(client):
+    """A correction at Site B is classified by B's shifts alone, not the whole day.
 
-    The rates agree today, so the correction resolves cleanly and its money
-    value is $20 -- but because a NULL-snapshot shift is in scope (it would move
-    on the next raise), finding 2 keeps the correction live-tracked rather than
-    freezing it: stored NULL, valued at the live recompute, known and complete.
+    The employee works a snapshotted shift at Site A and a NULL-snapshot (live)
+    shift at Site B on the same day. A correction allocated to Site B must be
+    live-tracked from B's own shift -- Site A's snapshot is out of scope and must
+    not drag B into fail-closed. (Before the fix the snapshot check spanned the
+    whole day, so Site A wrongly forced B to unresolved.)
+    """
+    week_start = date(2026, 9, 20)
+    service_day = date(2026, 9, 21)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    _create_employee("Payroll Labor Profitability SCOPE Payroll", role="payroll")
+    # Live rate configured, so Site B's NULL-snapshot shift follows it ($18).
+    employee_id = _create_employee(
+        "Payroll Labor Profitability SCOPE Worker", hourly_rate=18.00
+    )
+    payroll_auth = _login(client, "Payroll Labor Profitability SCOPE Payroll")
+    source_id = _create_payroll_profitability_source()
+    _, site_a = _create_payroll_profitability_site(address="Payroll Labor Profitability SCOPE A")
+    _, site_b = _create_payroll_profitability_site(address="Payroll Labor Profitability SCOPE B")
+
+    # Shift at Site A, snapshotted to $20.
+    _create_payroll_profitability_job_and_shift(
+        employee_id=employee_id, site_id=site_a, source_id=source_id,
+        service_day=service_day, local_start=_local_dt(service_day, 9),
+        local_end=_local_dt(service_day, 11), source_seed="5ca",
+    )
+    _stamp_shift_snapshots(employee_id, service_day, {site_a: 2000})
+    # Shift at Site B, snapshot cleared to NULL (a rate-less-at-clock-in row) so
+    # it follows the live rate.
+    before_b = _shift_ids(employee_id, service_day, site_b)
+    job_b = _create_payroll_profitability_job_and_shift(
+        employee_id=employee_id, site_id=site_b, source_id=source_id,
+        service_day=service_day, local_start=_local_dt(service_day, 13),
+        local_end=_local_dt(service_day, 15), source_seed="5cb",
+    )
+    b_id = (_shift_ids(employee_id, service_day, site_b) - before_b).pop()
+    db.execute("UPDATE shifts SET hourly_rate_cents = NULL WHERE id = %s", (b_id,))
+
+    corrected = client.post(
+        "/api/admin/payroll/weekly-hours/corrections",
+        headers=payroll_auth,
+        json={
+            "weekStart": week_start.isoformat(), "employeeId": employee_id,
+            "date": service_day.isoformat(), "correctedTotalMinutes": 300,
+            "reason": "Mayra corrected total hours.",
+        },
+    )
+    assert corrected.status_code == 200, corrected.text
+    correction_id = corrected.json()["correction"]["correctionId"]
+    allocated = client.post(
+        f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation",
+        headers=payroll_auth,
+        json={"locationId": site_b, "jobId": job_b, "reason": "Assigned to Site B."},
+    )
+    assert allocated.status_code == 200, allocated.text
+    allocation = allocated.json()["allocation"]
+    # Live-tracked from Site B's own shift, NOT fail-closed by Site A's snapshot.
+    assert allocation["laborCostIsLive"] is True
+    assert allocation["laborCostComplete"] is True
+    assert allocation["allocatedLaborCost"] is None
+    assert allocation["currentAllocatedLaborCost"] is not None
+
+
+def test_correction_fails_closed_when_frozen_and_live_shifts_coexist(client):
+    """A frozen $20 shift + a NULL-snapshot (live $20) shift: mixed, even agreeing.
+
+    The rates coincide today, but the scope is still MIXED -- one frozen shift
+    and one live shift. The correction's delta-minutes cannot be attributed to
+    the frozen vs the live shift, and marking it live-tracked (as it wrongly was)
+    would let a later rate edit restate the frozen shift's portion. So a mixed
+    scope must FAIL CLOSED even when the rates agree: unknown, never a confident
+    value that a raise could move.
     """
     allocation = _allocate_with_mixed_snapshot_shift(
         client, week_start=date(2026, 9, 13), service_day=date(2026, 9, 14),
         live_rate_after=20.00, label="Agree",
     )
-    assert allocation["laborCostComplete"] is True
     assert allocation["allocatedLaborCost"] is None
-    assert allocation["laborCostIsLive"] is True
-    assert allocation["currentAllocatedLaborCost"] == 20.0
+    assert allocation["laborCostComplete"] is False
+    assert allocation["laborCostIsLive"] is False
 
 
 def test_correction_candidate_splits_daily_labor_by_rate(client):
