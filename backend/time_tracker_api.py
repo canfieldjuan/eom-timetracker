@@ -1059,14 +1059,24 @@ def _save_timesheets_to_db(
             is_new = entry["id"] not in pre_shift_ids
 
             if is_new:
+                # hourly_rate_cents is stamped here, at shift creation (clock-in
+                # is the only moment guaranteed to happen -- clock_out is
+                # nullable and shifts can stay open), and read straight from
+                # employees so no caller can supply or spoof it. The UPDATE
+                # branch below deliberately omits the column: a shift's rate is
+                # fixed once set, so clock-out, admin entry edits, job relink and
+                # categorization can never overwrite an existing snapshot.
                 cur.execute(
                     """
                     INSERT INTO shifts
                       (employee_id, location_id, location_label, clock_in, clock_out, total_hours,
                        notes, local_date, timezone, clock_in_gps, clock_in_gps_meta,
                        clock_out_gps, clock_out_gps_meta,
-                       job_id, time_category, non_productive_type)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       job_id, time_category, non_productive_type, hourly_rate_cents)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            (SELECT ROUND(e.hourly_rate * 100)
+                             FROM employees e
+                             WHERE e.id = %s))
                     RETURNING id
                     """,
                     (
@@ -1086,6 +1096,7 @@ def _save_timesheets_to_db(
                         entry.get("jobId"),
                         entry.get("timeCategory", "productive"),
                         entry.get("nonProductiveType"),
+                        entry["employeeId"],
                     ),
                 )
                 entry["id"] = cur.fetchone()[0]
@@ -4396,6 +4407,135 @@ def _ensure_employee_role_schema() -> None:
     )
 
 
+def _backfill_shift_hourly_rate_snapshots() -> None:
+    """Stamp shifts that predate the rate snapshot with the employee's current rate.
+
+    Numerically a no-op on the day it runs: it records exactly what every money
+    surface already computes from the live rate. Its purpose is to freeze that
+    figure so a later rate edit cannot restate it.
+
+    Honest caveat: rate changes made BEFORE this ran are unrecoverable, so this
+    records "the rate as of migration", not reconstructed history.
+
+    Idempotent by the `hourly_rate_cents IS NULL` guard -- a shift that already
+    carries a snapshot is never rewritten, so re-running changes nothing.
+    Employees with no configured rate leave the shift NULL rather than inventing
+    a zero; those shifts keep falling back to the live rate and therefore keep
+    each surface's existing missing-rate policy.
+    """
+    db.execute(
+        """
+        UPDATE shifts
+        SET hourly_rate_cents = ROUND(e.hourly_rate * 100)
+        FROM employees e
+        WHERE shifts.employee_id = e.id
+          AND shifts.hourly_rate_cents IS NULL
+          AND e.hourly_rate IS NOT NULL
+        """
+    )
+
+
+_SHIFT_RATE_BACKFILL_MARKER = "_migration.rate_snapshot_shift_backfill_completed"
+# (The allocation reconcile is no longer marker-gated -- it runs re-runnably
+# over IS NULL rows -- so its old completion marker was removed.)
+
+
+def _run_one_time_shift_rate_backfill() -> None:
+    """Stamp pre-existing shifts once, on the boot that introduces the snapshot.
+
+    _ensure_schema_migrations runs on every startup, so calling the backfill
+    unconditionally would re-stamp a shift created AFTER the migration for an
+    employee who had no rate at the time -- freezing a rate the work was not
+    done at and breaking the documented "rate-less shifts follow the live rate"
+    contract. A persistent marker in ``settings`` makes this run exactly once:
+    the first boot stamps every then-existing NULL snapshot; every later boot
+    skips it, so a rate-less shift created afterwards keeps its NULL and its
+    live-rate fallback. The backfill and the marker commit together, so a
+    failure leaves both undone and the next boot retries cleanly.
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT 1 FROM settings WHERE key = %s",
+                (_SHIFT_RATE_BACKFILL_MARKER,),
+            )
+            if cur.fetchone():
+                return
+            cur.execute(
+                """
+                UPDATE shifts
+                SET hourly_rate_cents = ROUND(e.hourly_rate * 100)
+                FROM employees e
+                WHERE shifts.employee_id = e.id
+                  AND shifts.hourly_rate_cents IS NULL
+                  AND e.hourly_rate IS NOT NULL
+                """
+            )
+            cur.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, 'true'::jsonb) "
+                "ON CONFLICT (key) DO NOTHING",
+                (_SHIFT_RATE_BACKFILL_MARKER,),
+            )
+
+
+def _reconcile_unstamped_allocation_costs() -> None:
+    """Price any allocation whose cost provenance is unknown, re-runnably.
+
+    An allocation has NULL ``allocated_labor_cost_is_live`` in exactly two cases,
+    both meaning "written without this code's provenance logic": a row that
+    predates the column, or one an OLD app instance wrote during a rolling
+    deploy (its writer omits the column, so the nullable-no-default column stays
+    NULL). Both stored a live-rate cost that may disagree with the shift's worked
+    rate and must not be trusted as frozen.
+
+    Unlike the shift backfill -- where a NULL snapshot is a permanent, legitimate
+    state for a rate-less shift, so that backfill is one-time and marker-gated --
+    a NULL provenance here is always a transient "not yet reconciled" state that
+    the write path never produces. So this runs every boot but only touches
+    ``IS NULL`` rows: idempotent, cheap (normally zero rows), and it catches
+    deploy-window writes on the next boot. Each row is repriced through the same
+    resolver new allocations use, then stamped TRUE/FALSE so it is never
+    revisited. Reads treat a still-NULL row as live-valued in the meantime, so a
+    boundary row is never silently frozen while it waits.
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT a.id, a.employee_id, a.correction_date, a.location_id,
+                       a.allocated_delta_minutes, e.hourly_rate AS live_hourly_rate
+                FROM payroll_hour_correction_allocations a
+                JOIN employees e ON e.id = a.employee_id
+                WHERE a.status = 'active'
+                  AND a.allocated_labor_cost_is_live IS NULL
+                """
+            )
+            allocations = cur.fetchall() or []
+            for row in allocations:
+                rate, resolved, from_snapshot = _payroll_correction_rate_for_allocation(
+                    cur,
+                    employee_id=int(row["employee_id"]),
+                    correction_date=row["correction_date"],
+                    location_id=int(row["location_id"]),
+                    live_hourly_rate=row.get("live_hourly_rate"),
+                )
+                new_cost, is_live = _payroll_correction_allocation_cost(
+                    int(row["allocated_delta_minutes"]),
+                    rate,
+                    resolved,
+                    from_snapshot,
+                )
+                cur.execute(
+                    """
+                    UPDATE payroll_hour_correction_allocations
+                    SET allocated_labor_cost_cents = %s,
+                        allocated_labor_cost_is_live = %s
+                    WHERE id = %s
+                    """,
+                    (new_cost, is_live, int(row["id"])),
+                )
+
+
 def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
@@ -4815,6 +4955,46 @@ def _ensure_schema_migrations() -> None:
         "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS clock_out_gps_meta JSONB"
     )
     db.execute(
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS hourly_rate_cents INTEGER"
+    )
+    # DB-level snapshot stamp on every shift INSERT. The app also stamps at
+    # clock-in, but a mid-deploy OLD instance whose code predates the column
+    # omits it entirely; this trigger stamps those rows so the rolling-deploy
+    # window cannot leave a rated employee's shift unsnapshotted. Only fills a
+    # NULL (an app-supplied value wins) and leaves a rate-less employee NULL.
+    # CREATE OR REPLACE + DROP/CREATE TRIGGER are idempotent. NOTE: this is the
+    # only trigger in the codebase.
+    db.execute("""
+        CREATE OR REPLACE FUNCTION stamp_shift_hourly_rate_cents()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.hourly_rate_cents IS NULL THEN
+                SELECT ROUND(e.hourly_rate * 100)
+                  INTO NEW.hourly_rate_cents
+                  FROM employees e
+                 WHERE e.id = NEW.employee_id
+                   AND e.hourly_rate IS NOT NULL;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+    """)
+    # DROP + CREATE the trigger in a SINGLE transaction so the trigger is never
+    # absent between two committed statements -- otherwise an old app instance
+    # inserting a shift in that window would escape stamping. Kept as DROP/CREATE
+    # (rather than CREATE OR REPLACE TRIGGER, PG14+) so it is version-agnostic.
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DROP TRIGGER IF EXISTS trg_stamp_shift_hourly_rate_cents ON shifts"
+            )
+            cur.execute("""
+                CREATE TRIGGER trg_stamp_shift_hourly_rate_cents
+                    BEFORE INSERT ON shifts
+                    FOR EACH ROW
+                    EXECUTE FUNCTION stamp_shift_hourly_rate_cents()
+            """)
+    db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS gps_meta JSONB"
     )
     db.execute(
@@ -5048,6 +5228,24 @@ def _ensure_schema_migrations() -> None:
             CHECK (correction_date >= week_start AND correction_date < week_start + 7)
         )
     """)
+    # Cost provenance flag, three-state (TRUE live / FALSE frozen / NULL not yet
+    # reconciled). Nullable with NO default: a writer that omits it -- including
+    # an old app instance during a rolling deploy -- must leave NULL so the row
+    # is distinguishable from a genuinely-frozen FALSE and gets repriced. The
+    # DROP DEFAULT / DROP NOT NULL make this idempotent for any install that
+    # already added the column in its earlier NOT NULL DEFAULT FALSE shape.
+    db.execute(
+        "ALTER TABLE payroll_hour_correction_allocations "
+        "ADD COLUMN IF NOT EXISTS allocated_labor_cost_is_live BOOLEAN"
+    )
+    db.execute(
+        "ALTER TABLE payroll_hour_correction_allocations "
+        "ALTER COLUMN allocated_labor_cost_is_live DROP DEFAULT"
+    )
+    db.execute(
+        "ALTER TABLE payroll_hour_correction_allocations "
+        "ALTER COLUMN allocated_labor_cost_is_live DROP NOT NULL"
+    )
     db.execute("""
         CREATE TABLE IF NOT EXISTS payroll_shift_corrections (
             id                        BIGSERIAL PRIMARY KEY,
@@ -5175,6 +5373,22 @@ def _ensure_schema_migrations() -> None:
 
     ensure_calendar_schema()
 
+    # One-time rate backfills run LAST, after every CREATE TABLE / ALTER above.
+    # The allocation backfill queries payroll_hour_correction_allocations and
+    # payroll_shift_corrections, which are created earlier in this same function
+    # -- running the backfill before those CREATEs raised undefined_table and
+    # crashed startup on any upgrade from a schema predating payroll corrections.
+    # Both are marker-gated (exactly-once) and each commits its mutation and
+    # marker atomically, so their position only needs to be after their tables.
+    # Shift backfill: one-time (marker-gated) -- stamps only shifts predating the
+    # snapshot column, never re-stamping rate-less shifts created afterwards
+    # (their NULL is a permanent, legitimate state).
+    _run_one_time_shift_rate_backfill()
+    # Allocation reconcile: re-runnable over IS NULL rows -- reprices allocations
+    # that predate the provenance column or were written by an old instance
+    # during a rolling deploy, catching the latter on the next boot.
+    _reconcile_unstamped_allocation_costs()
+
 
 def _auto_migrate_if_empty() -> bool:
     """Run JSON->PostgreSQL migration if the employees table is empty."""
@@ -5211,6 +5425,10 @@ def startup_event() -> None:
     # legacy Sites. Re-run the idempotent Customer/address backfill immediately.
     if imported_legacy_json:
         _ensure_customer_site_schema()
+        # The importer inserts shifts without hourly_rate_cents, and the backfill
+        # above already ran against an empty table, so imported history would
+        # keep a NULL snapshot forever and stay exposed to rate edits. Idempotent.
+        _backfill_shift_hourly_rate_snapshots()
     apply_bootstrap_admins()
 
 
@@ -12262,6 +12480,7 @@ def _correction_shift_snapshots(
             s.job_id,
             s.time_category,
             s.non_productive_type,
+            s.hourly_rate_cents,
             s.created_at
         FROM shifts s
         JOIN employees e ON e.id = s.employee_id
@@ -12559,6 +12778,13 @@ def _correction_shift_snapshots(
             "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
             "timeCategory": row.get("time_category") or "productive",
             "nonProductiveType": row.get("non_productive_type"),
+            # The worked-rate snapshot is part of a shift's identity for
+            # deduplication: two otherwise-identical shifts at different rates
+            # are NOT interchangeable, and the archived before-image must retain
+            # each shift's rate so a deletion never loses that evidence. It is
+            # not in the signature exclusion set, so it participates in the
+            # consistency check automatically.
+            "hourlyRateCents": int(row["hourly_rate_cents"]) if row.get("hourly_rate_cents") is not None else None,
             "createdAt": to_utc_iso(row["created_at"]),
             "visits": visits_by_shift.get(shift_id, []),
             "departures": departures_by_shift.get(shift_id, []),
@@ -15074,6 +15300,182 @@ def _payroll_delta_labor_cost_cents(
     )
 
 
+def _payroll_correction_rate_for_allocation(
+    cur: Any,
+    employee_id: int,
+    correction_date: Any,
+    location_id: int,
+    live_hourly_rate: Any,
+) -> Tuple[Any, bool, bool]:
+    """Rate to price a correction at, preferring the rate the work was worked at.
+
+    A correction adjusts hours that were already worked, so pricing it from the
+    live employee rate would restate history the moment someone gets a raise --
+    the exact defect the per-shift snapshot exists to prevent. Corrections are
+    keyed by employee + date (never by shift), so the shift's rate has to be
+    resolved from that day's shifts.
+
+    Each overlapping shift contributes its effective rate: a snapshotted shift
+    is frozen at its worked rate; a NULL-snapshot shift is not frozen, so it
+    follows the live rate (unknown only when the employee has no live rate).
+
+    Precedence, decided over the IN-SCOPE shifts only (the shifts that worked
+    this allocation's site if any did, otherwise the whole day -- an out-of-scope
+    site's shifts never influence the result):
+      1. Mixed frozen + live in scope -> FAIL CLOSED. The delta-minutes cannot
+         be attributed to the frozen vs the live shift, and treating it as live
+         would let a rate edit restate the frozen shift's portion.
+      2. All frozen and agreeing on one rate -> FROZEN at that rate.
+      3. All frozen but disagreeing -> FAIL CLOSED.
+      4. All live -> LIVE-tracked at the live rate (they all follow the one live
+         rate, so they never disagree); when no live rate is configured yet this
+         is the rate-less state -- live-tracked and unknown until a rate is set.
+
+    A shift is "on that day" when its effective worked interval OVERLAPS the
+    correction's local day, not merely when its clock-in local_date equals it: a
+    shift crossing local midnight has its minutes attributed to both day slices
+    by weekly payroll (via _iter_payroll_local_day_slices), so a correction on
+    the spillover day must see that shift's rate. Corrected clock times take
+    precedence over the raw ones, matching _effective_payroll_shift_row.
+
+    Returns (rate, resolved, from_snapshot). ``resolved`` is False only for the
+    fail-closed case, which the caller must not paper over with the live rate.
+    ``from_snapshot`` is True only when the rate is genuinely frozen -- every
+    in-scope shift carried a snapshot. When it is False but ``resolved`` is True,
+    the rate came from the live employee rate (no snapshot in scope, or a
+    NULL-snapshot shift is in scope), so the caller must NOT freeze the cost:
+    such an allocation has to keep tracking the live rate, exactly as the
+    NULL-snapshot shift's own labor does, or a later rate edit would move the
+    shift labor while the correction stayed frozen.
+    """
+    if not isinstance(correction_date, date):
+        correction_date = datetime.strptime(str(correction_date), "%Y-%m-%d").date()
+    # Local-day bounds as UTC instants. A shift overlaps this local day iff it
+    # started before the day ended and had not yet ended when the day began --
+    # exactly the condition under which _iter_payroll_local_day_slices emits a
+    # slice for this day.
+    day_start_utc = datetime.combine(
+        correction_date, clock_time.min, tzinfo=APP_TIMEZONE
+    ).astimezone(timezone.utc)
+    day_end_utc = datetime.combine(
+        correction_date + timedelta(days=1), clock_time.min, tzinfo=APP_TIMEZONE
+    ).astimezone(timezone.utc)
+    # Each overlapping shift, its snapshot rate, and the full set of sites it
+    # actually worked: its home location plus every visit's location. A
+    # multi-stop shift homed at A that visits B genuinely worked at B, and
+    # weekly profitability attributes those minutes to the visit sites, so a
+    # correction at B must see this shift's rate too -- keying only on the home
+    # location_id would miss it.
+    # ALL overlapping shifts, snapshot or not. A NULL-snapshot shift is not
+    # frozen -- it is priced from the live rate everywhere else -- so it must
+    # participate here too: if the employee worked a frozen $20 shift and a
+    # NULL-snapshot shift on the same site/day and the live rate has since moved
+    # to $25, the day's effective rates disagree and the correction must fail
+    # closed rather than confidently return $20.
+    cur.execute(
+        """
+        SELECT s.id,
+               s.hourly_rate_cents,
+               ARRAY_REMOVE(
+                   ARRAY_APPEND(
+                       ARRAY_AGG(DISTINCT v.location_id),
+                       s.location_id
+                   ),
+                   NULL
+               ) AS worked_location_ids
+        FROM shifts s
+        LEFT JOIN LATERAL (
+            SELECT corrected_clock_in, corrected_clock_out
+            FROM payroll_shift_corrections psc
+            WHERE psc.shift_id = s.id AND psc.status = 'active'
+            LIMIT 1
+        ) corr ON TRUE
+        LEFT JOIN visits v ON v.shift_id = s.id
+        WHERE s.employee_id = %s
+          AND COALESCE(corr.corrected_clock_in, s.clock_in) < %s
+          AND (
+                COALESCE(corr.corrected_clock_out, s.clock_out) IS NULL
+                OR COALESCE(corr.corrected_clock_out, s.clock_out) > %s
+          )
+        GROUP BY s.id, s.hourly_rate_cents, s.location_id
+        """,
+        (int(employee_id), day_end_utc, day_start_utc),
+    )
+    rows = cur.fetchall() or []
+    if not rows:
+        # No shift on that day: live rate, not frozen.
+        return live_hourly_rate, True, False
+
+    def _worked_here(row: Any) -> bool:
+        return int(location_id) in {
+            int(loc) for loc in (row.get("worked_location_ids") or [])
+        }
+
+    # Scope FIRST: the shifts that worked this allocation's site when any did;
+    # otherwise the whole day. Everything below is decided over this scope only
+    # -- an out-of-scope site's shifts must never influence the classification.
+    scope = [row for row in rows if _worked_here(row)] or rows
+
+    # Partition the scope into frozen (snapshotted) and live (NULL-snapshot)
+    # shifts. A snapshotted shift is frozen at its worked rate; a NULL-snapshot
+    # shift is not frozen -- it follows the live rate, so it moves on the next
+    # rate edit.
+    frozen_rates: set = set()
+    has_frozen = False
+    has_live = False
+    for row in scope:
+        cents = row.get("hourly_rate_cents")
+        if cents is not None:
+            has_frozen = True
+            frozen_rates.add(Decimal(int(cents)) / Decimal(100))
+        else:
+            has_live = True
+
+    # Mixed frozen + live in scope: the correction's delta-minutes cannot be
+    # attributed to the frozen vs the live shift, and marking it live-tracked
+    # would let a later rate edit restate the frozen shift's portion. Fail
+    # closed -- unknown, never a confident guess that moves frozen history.
+    if has_frozen and has_live:
+        return None, False, False
+
+    # All frozen: genuinely freezable only when the snapshots agree on one rate.
+    if has_frozen:
+        if len(frozen_rates) == 1:
+            return frozen_rates.pop(), True, True
+        return None, False, False
+
+    # All live (or empty scope, which cannot happen here since rows is
+    # non-empty). Live shifts all follow the one live rate, so they never
+    # disagree. When the live rate is unknown (a NULL-snapshot shift and no
+    # configured rate) this is the pre-migration / rate-less state: live-tracked
+    # and unknown until a rate is set -- resolved True, not frozen, rate may be
+    # None, which the caller stores as NULL + is_live and values at the live
+    # recompute.
+    return live_hourly_rate, True, False
+
+
+def _payroll_correction_allocation_cost(
+    delta_minutes: int,
+    rate: Any,
+    resolved: bool,
+    from_snapshot: bool,
+) -> Tuple[Optional[int], bool]:
+    """Map a resolver verdict to (stored_labor_cost_cents, is_live).
+
+    - Snapshot rate -> freeze the computed cents (is_live False).
+    - Live-rate fallback (resolved but not from a snapshot) -> store NULL and
+      mark is_live, so the allocation is valued at the live recompute and tracks
+      later rate edits, consistent with its NULL-snapshot shift's own labor.
+    - Fail-closed (unresolved) -> store NULL, not live: cost is unknown and the
+      allocation reads incomplete for review.
+    """
+    if resolved and from_snapshot:
+        return _payroll_delta_labor_cost_cents(delta_minutes, rate), False
+    if resolved:
+        return None, True
+    return None, False
+
+
 def _payroll_correction_candidate_sites(
     candidate_segments: List[Dict[str, Any]],
     correction_date: str,
@@ -15406,11 +15808,19 @@ def _payroll_correction_labor_summary(
     labor_incomplete = False
     for correction in corrections:
         allocation = correction.get("allocation") or {}
-        cost_source = (
-            allocation.get("currentAllocatedLaborCost")
-            if "currentAllocatedLaborCost" in allocation
-            else allocation.get("allocatedLaborCost")
-        )
+        # A frozen allocation (priced from a snapshot) drives the money figure
+        # from its STORED cost, so a later rate edit cannot restate it. A
+        # live-tracked allocation (its shift carried no snapshot, so its labor
+        # follows the live rate) stores NULL and is valued at the live recompute,
+        # staying consistent with that shift's own live-rate labor. Anything else
+        # with no stored cost is a fail-closed unknown and reads incomplete.
+        stored_cost = allocation.get("allocatedLaborCost")
+        if stored_cost is not None:
+            cost_source = stored_cost
+        elif allocation.get("laborCostIsLive"):
+            cost_source = allocation.get("currentAllocatedLaborCost")
+        else:
+            cost_source = None
         cost_cents = _payroll_signed_money_cents(cost_source)
         if cost_cents is None:
             labor_incomplete = True
@@ -16151,12 +16561,31 @@ def _payroll_correction_rows(
 def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, Any]:
     delta_minutes = int(row["allocated_delta_minutes"])
     stored_labor_cost_cents = row.get("allocated_labor_cost_cents")
+    raw_is_live = row.get("allocated_labor_cost_is_live")
+    # NULL provenance = not yet reconciled (a row that predates the column or was
+    # written by an old instance mid-deploy). Its stored cost is an untrusted
+    # live-rate figure, so DO NOT treat it as frozen: value it at the live
+    # recompute, exactly like a live-tracked row, until the next boot's reconcile
+    # stamps it. Only an explicit FALSE keeps the stored cents authoritative.
+    reconcile_pending = raw_is_live is None
+    is_live = reconcile_pending or bool(raw_is_live)
+    # For a pending row the stored cents are not authoritative, so drop them from
+    # the frozen-cost view; the live recompute below carries the money instead.
+    frozen_cost_cents = None if reconcile_pending else stored_labor_cost_cents
     current_labor_cost_cents = stored_labor_cost_cents
     if "employee_hourly_rate" in row:
         current_labor_cost_cents = _payroll_delta_labor_cost_cents(
             delta_minutes,
             row.get("employee_hourly_rate"),
         )
+    # A frozen allocation is complete when its stored cost is present. A
+    # live-tracked (or not-yet-reconciled) allocation stores/shows no frozen cost
+    # and is valued at the live recompute, so it is complete whenever the live
+    # rate is known. Anything else is a fail-closed unknown.
+    effective_complete = (
+        frozen_cost_cents is not None
+        or (is_live and current_labor_cost_cents is not None)
+    )
     return {
         "allocationId": int(row["id"]),
         "correctionId": int(row["correction_id"]),
@@ -16174,8 +16603,9 @@ def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, A
         "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
         "allocatedDeltaMinutes": delta_minutes,
         "allocatedDeltaHours": round(delta_minutes / 60, 2),
-        "allocatedLaborCost": _payroll_signed_money(stored_labor_cost_cents),
-        "laborCostComplete": stored_labor_cost_cents is not None,
+        "allocatedLaborCost": _payroll_signed_money(frozen_cost_cents),
+        "laborCostComplete": effective_complete,
+        "laborCostIsLive": is_live,
         "currentAllocatedLaborCost": _payroll_signed_money(current_labor_cost_cents),
         "currentLaborCostComplete": current_labor_cost_cents is not None,
         "reason": str(row["reason"]),
@@ -16980,9 +17410,22 @@ def admin_allocate_payroll_hour_correction(
                 target=allocation_target,
                 delta_minutes=delta_minutes,
             )
-            labor_cost_cents = _payroll_delta_labor_cost_cents(
+            # Price the correction from the rate the work was worked at, not
+            # from whatever the employee earns today.
+            correction_rate, rate_resolved, rate_from_snapshot = (
+                _payroll_correction_rate_for_allocation(
+                    cur,
+                    employee_id=int(correction_row["employee_id"]),
+                    correction_date=correction_row["correction_date"],
+                    location_id=int(payload.locationId),
+                    live_hourly_rate=correction_row.get("hourly_rate"),
+                )
+            )
+            labor_cost_cents, labor_cost_is_live = _payroll_correction_allocation_cost(
                 delta_minutes,
-                correction_row.get("hourly_rate"),
+                correction_rate,
+                rate_resolved,
+                rate_from_snapshot,
             )
             cur.execute(
                 """
@@ -17004,6 +17447,13 @@ def admin_allocate_payroll_hour_correction(
                 )
                 and int(existing["allocated_delta_minutes"]) == delta_minutes
                 and existing.get("allocated_labor_cost_cents") == labor_cost_cents
+                # A NULL provenance means the existing row was never reconciled
+                # (predates the column, or an old instance wrote it mid-deploy),
+                # so it is never idempotent -- fall through and rewrite it with an
+                # explicit TRUE/FALSE rather than leave it unstamped.
+                and existing.get("allocated_labor_cost_is_live") is not None
+                and bool(existing.get("allocated_labor_cost_is_live"))
+                    == labor_cost_is_live
                 and str(existing["reason"]) == payload.reason
             ):
                 saved = dict(existing)
@@ -17029,11 +17479,12 @@ def admin_allocate_payroll_hour_correction(
                         job_id,
                         allocated_delta_minutes,
                         allocated_labor_cost_cents,
+                        allocated_labor_cost_is_live,
                         reason,
                         created_by_employee_id,
                         created_by_name
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING *
                     """,
                     (
@@ -17045,6 +17496,7 @@ def admin_allocate_payroll_hour_correction(
                         int(payload.jobId) if payload.jobId is not None else None,
                         delta_minutes,
                         labor_cost_cents,
+                        labor_cost_is_live,
                         payload.reason,
                         int(current_payroll["id"]),
                         str(current_payroll["name"]),
@@ -17147,6 +17599,19 @@ def admin_void_payroll_hour_correction_allocation(
                 ),
             )
             saved = dict(cur.fetchone())
+            # A live-tracked allocation stores NULL cost and is only serialized
+            # complete when the employee's current rate is present to recompute
+            # its live value. RETURNING * has no rate column, so inject it here
+            # the same way the allocate endpoint does -- otherwise a voided
+            # live-tracked allocation would serialize as incomplete.
+            cur.execute(
+                "SELECT hourly_rate FROM employees WHERE id = %s",
+                (int(saved["employee_id"]),),
+            )
+            employee_rate_row = cur.fetchone()
+            saved["employee_hourly_rate"] = (
+                employee_rate_row["hourly_rate"] if employee_rate_row else None
+            )
             _enrich_payroll_correction_allocation_target_labels(saved, cursor=cur)
             result = {
                 "success": True,
@@ -17821,7 +18286,13 @@ def admin_reports_hours_pdf(
 def load_settings(*, cursor: Optional[Any] = None) -> Dict[str, Any]:
     defaults: Dict[str, Any] = _SETTINGS_DEFAULTS.copy()
     rows = _payroll_query_all("SELECT key, value FROM settings", cursor=cursor)
-    data: Dict[str, Any] = {r["key"]: r["value"] for r in rows}
+    # Keys prefixed with "_" are internal state (e.g. one-time migration
+    # completion markers) that piggyback on the settings table for atomicity.
+    # They must never surface in load_settings() output, which feeds the public
+    # GET /api/admin/settings response and the PUT round-trip.
+    data: Dict[str, Any] = {
+        r["key"]: r["value"] for r in rows if not r["key"].startswith("_")
+    }
     for k, v in defaults.items():
         if k not in data:
             data[k] = v
@@ -18756,7 +19227,13 @@ def admin_waste_analysis(
                    EXTRACT(EPOCH FROM (s.clock_out - s.clock_in)) / 3600.0
                ) AS total_hours,
                s.time_category, s.non_productive_type,
-               s.notes, s.local_date, e.hourly_rate
+               s.notes, s.local_date,
+               -- Prefer the rate the shift was worked at; fall back to the live
+               -- rate only when the shift carries no snapshot. NULL on both
+               -- sides still means "no rate", so the zero-cost +
+               -- missingRateCount policy below is unchanged.
+               COALESCE(s.hourly_rate_cents::numeric / 100, e.hourly_rate)
+                   AS hourly_rate
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
         LEFT JOIN locations l ON s.location_id = l.id
@@ -19323,7 +19800,12 @@ def admin_get_job(
                    )
                END AS total_hours,
                s.notes,
-               e.hourly_rate
+               -- Prefer the rate the shift was worked at; fall back to the live
+               -- rate only when the shift carries no snapshot. NULL on both
+               -- sides still means "no rate", so the silent-zero labor cost
+               -- policy below is unchanged.
+               COALESCE(s.hourly_rate_cents::numeric / 100, e.hourly_rate)
+                   AS hourly_rate
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
         WHERE s.job_id = %s
@@ -19662,6 +20144,32 @@ def _analytics_linked_job_revenue_cents(
     return revenue_by_job, canonical_site_months, issues_by_job
 
 
+def _load_shift_rate_snapshots() -> Dict[int, float]:
+    """Map shift id -> the hourly rate that shift was worked at, in dollars.
+
+    Only shifts that carry a snapshot appear. Callers fall back to the live
+    employee rate for shifts that do not, which keeps pre-migration rows and
+    rate-less employees behaving exactly as they do today.
+
+    ``cents / 100`` is done in Python from an exact integer, so the resulting
+    float is bit-identical to ``float(employees.hourly_rate)`` for the same
+    two-decimal rate -- the backfill therefore cannot move any existing figure.
+    """
+    rows = db.query_all(
+        "SELECT id, hourly_rate_cents FROM shifts WHERE hourly_rate_cents IS NOT NULL"
+    )
+    return {int(row["id"]): int(row["hourly_rate_cents"]) / 100.0 for row in rows}
+
+
+def _entry_shift_id(entry: Dict[str, Any]) -> Optional[int]:
+    """Shift id for a timesheet entry -- entries are shifts, keyed by shift id."""
+    try:
+        shift_id = int(entry.get("id"))
+    except (TypeError, ValueError):
+        return None
+    return shift_id if shift_id > 0 else None
+
+
 def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     now = utc_now()
     local_now = to_local(now)
@@ -19746,6 +20254,19 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         rate = emp.get("hourlyRate")
         if rate is not None:
             emp_rates[emp["id"]] = float(rate)
+    # Per-shift snapshot wins over the live employee rate. The employee map is
+    # only the fallback for shifts with no snapshot, so a rate edit moves future
+    # shifts and leaves worked shifts alone.
+    shift_rates = _load_shift_rate_snapshots()
+
+    def _effective_rate(shift_id: Optional[int], emp_id: int) -> Optional[float]:
+        if shift_id is not None:
+            snapshot = shift_rates.get(shift_id)
+            if snapshot is not None:
+                return snapshot
+        # No snapshot and no live rate keeps returning None, which the caller
+        # still treats as free labor -- the pre-existing silent-zero policy.
+        return emp_rates.get(emp_id)
 
     linked_jobs_credited: set[int] = set()
     visited_customer_dates: set = set()  # (customer, date_key) - dedup multi-employee same-day visits
@@ -19785,6 +20306,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         date_key: str,
         is_visit: bool,
         job_id: Optional[int] = None,
+        shift_id: Optional[int] = None,
     ) -> None:
         # Determine first-arrival: deduplicates multi-employee same-day visits
         visit_key = (customer, date_key)
@@ -19829,7 +20351,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                     )
                 )
 
-        emp_rate = emp_rates.get(emp_id)
+        emp_rate = _effective_rate(shift_id, emp_id)
         labor_cost = (emp_rate * hours) if emp_rate is not None else 0.0
 
         exp_h = location_expected_hours.get(resolved_location)
@@ -19892,6 +20414,8 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
             continue
 
         emp_id = int(entry.get("employeeId", 0))
+        # Every visit inside a shift was worked at that shift's rate.
+        shift_id = _entry_shift_id(entry)
         date_key = entry_date.strftime("%Y-%m-%d")
 
         visits = entry.get("visits") or []
@@ -19924,6 +20448,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                     date_key,
                     is_visit=True,
                     job_id=_analytics_entry_job_id(visit.get("jobId")),
+                    shift_id=shift_id,
                 )
         else:
             # Legacy / single-location shift
@@ -19939,6 +20464,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                 date_key,
                 is_visit=True,
                 job_id=_analytics_entry_job_id(entry.get("jobId")),
+                shift_id=shift_id,
             )
 
     def _classify(labor_pct, gross_margin, variance, rplh) -> Tuple[str, List[str]]:
@@ -20288,6 +20814,9 @@ def admin_analytics_customer(
         rate = emp.get("hourlyRate")
         if rate is not None:
             emp_rates[emp["id"]] = float(rate)
+    # Per-shift snapshot wins; the employee map is only the fallback for shifts
+    # with no snapshot. Both None still means "no rate" -> silent zero, as today.
+    shift_rates = _load_shift_rate_snapshots()
 
     def _resolve_loc(location: str) -> Tuple[str, str]:
         resolved = location
@@ -20480,7 +21009,10 @@ def admin_analytics_customer(
 
         emp_id = int(entry.get("employeeId", 0))
         emp_name = emp_names.get(emp_id, f"Employee {emp_id}")
-        emp_rate = emp_rates.get(emp_id)
+        # Every visit inside a shift was worked at that shift's rate.
+        shift_id = _entry_shift_id(entry)
+        snapshot_rate = shift_rates.get(shift_id) if shift_id is not None else None
+        emp_rate = snapshot_rate if snapshot_rate is not None else emp_rates.get(emp_id)
 
         days_since_sunday_entry = (entry_date.weekday() + 1) % 7
         week_start = entry_date - timedelta(days=days_since_sunday_entry)

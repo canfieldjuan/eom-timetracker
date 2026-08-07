@@ -1343,7 +1343,13 @@ def _load_time_evidence(
     linked_job_ids = [int(job_id) for job_id in visible_job_ids]
     shifts = _query_all(
         """
-        SELECT s.id, s.employee_id, e.name AS employee_name, e.hourly_rate,
+        SELECT s.id, s.employee_id, e.name AS employee_name,
+               -- Prefer the rate the shift was worked at; fall back to the live
+               -- employee rate only when the shift carries no snapshot. NULL on
+               -- both sides still means "no rate", so the fail-closed
+               -- missing_worker_rate policy downstream is unchanged.
+               COALESCE(s.hourly_rate_cents::numeric / 100, e.hourly_rate)
+                   AS hourly_rate,
                s.location_id, s.location_label,
                COALESCE(correction.corrected_clock_in, s.clock_in) AS clock_in,
                COALESCE(correction.corrected_clock_out, s.clock_out) AS clock_out,
@@ -1449,6 +1455,11 @@ def _load_time_evidence(
             departures[int(row["shift_id"])].append(row)
 
     qr_by_employee_site: Dict[Tuple[int, int], List[datetime]] = defaultdict(list)
+    # D2 (issue #126): QR-only presence rows have no shift, so they have no rate
+    # snapshot and stay on the live employee rate. They are deliberately out of
+    # scope: the segments they produce are presence-only (shift_id None, a
+    # one-microsecond span) and contribute zero finalized hours, so the live rate
+    # here is never multiplied into money today.
     qr_rows = _query_all(
         """
         SELECT sci.id, sci.employee_id, e.name AS employee_name, e.hourly_rate,
@@ -3560,7 +3571,7 @@ def _decorate_schedule_jobs(
     visible_range_end: Optional[datetime] = None,
     expected_hours_learning_by_site: Optional[Dict[int, Dict[str, Any]]] = None,
     cursor: Optional[Any] = None,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[int, Optional[int]]]:
     jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = defaultdict(list)
     jobs_by_id = {int(job["id"]): job for job in jobs}
     for job in jobs:
@@ -3668,6 +3679,10 @@ def _decorate_schedule_jobs(
     )
 
     workers_by_job: Dict[int, Dict[int, Dict[str, Any]]] = defaultdict(dict)
+    # shift id -> effective snapshot rate in cents, so the daily profitability
+    # split can weight each day by labor without carrying the rate on the
+    # (contract-pinned) interval dicts. Same effective rate the worker total uses.
+    shift_rate_cents: Dict[int, Optional[int]] = {}
     unmatched: List[Dict[str, Any]] = []
     resolved_segments: List[Dict[str, Any]] = []
     for segment in segments:
@@ -3721,6 +3736,11 @@ def _decorate_schedule_jobs(
         reason = resolved["reason"]
         job_id = int(job["id"])
         employee_id = int(segment["employee_id"])
+        segment_shift_id = segment.get("shift_id")
+        if segment_shift_id is not None:
+            shift_rate_cents[int(segment_shift_id)] = _money_cents(
+                segment.get("hourly_rate")
+            )
         worker = workers_by_job[job_id].setdefault(
             employee_id,
             {
@@ -3733,6 +3753,7 @@ def _decorate_schedule_jobs(
                 ),
                 "intervals": [],
                 "finalizedHours": 0.0,
+                "_finalizedHoursByRateCents": {},
                 "inProgress": False,
                 "observedPresence": False,
             },
@@ -3761,6 +3782,17 @@ def _decorate_schedule_jobs(
         )
         if finalized:
             worker["finalizedHours"] += segment_hours or 0.0
+            # Bucket hours by the rate each segment was worked at. "hourlyRate"
+            # above is the first segment's rate; before per-shift snapshots every
+            # segment of an employee shared one live rate, so that was harmless.
+            # With snapshots two shifts of the same employee on the same job can
+            # legitimately carry different rates, and collapsing them onto the
+            # first would misprice the later one.
+            segment_rate_cents = _money_cents(segment.get("hourly_rate"))
+            hours_by_rate = worker["_finalizedHoursByRateCents"]
+            hours_by_rate[segment_rate_cents] = (
+                hours_by_rate.get(segment_rate_cents, 0.0) + (segment_hours or 0.0)
+            )
         elif bool(segment.get("in_progress", True)):
             worker["inProgress"] = True
         else:
@@ -3780,15 +3812,32 @@ def _decorate_schedule_jobs(
             observed_presence = bool(worker.pop("observedPresence"))
             actual_hours += finalized_hours
             rate_cents = _money_cents(worker.pop("hourlyRate"))
-            labor_cents = (
-                int(
-                    (Decimal(str(finalized_hours)) * Decimal(rate_cents)).quantize(
-                        Decimal("1"), rounding=ROUND_HALF_UP
-                    )
+            hours_by_rate_cents = worker.pop("_finalizedHoursByRateCents")
+            # Fail closed: an unknown rate anywhere in this worker's segments
+            # makes the whole worker labor figure unknown, exactly as a worker
+            # with no configured rate does today.
+            if rate_cents is None or any(
+                key is None for key in hours_by_rate_cents
+            ):
+                labor_cents = None
+            else:
+                # One bucket per distinct rate, summed EXACTLY and rounded once
+                # at the end. Rounding each bucket first would let sub-cent
+                # remainders each round up independently: two one-second
+                # segments at $20/h and $25/h are 1.25 cents combined, which is
+                # one cent, not the two cents per-bucket rounding would report.
+                # With a single rate this is arithmetically identical to the
+                # previous round(finalized_hours * rate), so backfilled history
+                # does not move by a cent.
+                labor_cents = int(
+                    sum(
+                        (
+                            Decimal(str(bucket_hours)) * Decimal(bucket_rate)
+                            for bucket_rate, bucket_hours in hours_by_rate_cents.items()
+                        ),
+                        Decimal(0),
+                    ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
                 )
-                if rate_cents is not None
-                else None
-            )
             if finalized_hours > 0 and labor_cents is None:
                 labor_complete = False
                 issues.append(
@@ -3880,7 +3929,7 @@ def _decorate_schedule_jobs(
                 "issues": issues,
             }
         )
-    return output, unmatched
+    return output, unmatched, shift_rate_cents
 
 
 def _complete_total(
@@ -4316,13 +4365,28 @@ def _daily_worker_rows(
     app_timezone: ZoneInfo,
     range_start: datetime,
     range_end: datetime,
+    shift_rate_cents: Optional[Dict[int, Optional[int]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
+    rate_by_shift = shift_rate_cents or {}
     hours_by_day: Dict[str, float] = defaultdict(float)
+    # Weight the labor split by each day's actual labor (rate x hours), not by
+    # hours alone: an employee who worked 1h at $20 on Monday and 1h at $30 on
+    # Tuesday must read $20/$30, not the $25/$25 an equal-hours split produces.
+    # Each interval's rate comes from its shift's snapshot (the same effective
+    # rate the worker total is built from), looked up rather than carried on the
+    # interval so the schedule response shape is untouched. With a single rate
+    # the labor weight is proportional to hours, so this is identical to the
+    # previous hours-weighted behavior.
+    labor_weight_by_day: Dict[str, float] = defaultdict(float)
     for interval in worker.get("intervals") or []:
         if not interval.get("finalized") or not interval.get("intervalEnd"):
             continue
         interval_start = _parse_utc_iso(str(interval["intervalStart"]))
         interval_end = _parse_utc_iso(str(interval["intervalEnd"]))
+        shift_id = interval.get("shiftId")
+        interval_rate_cents = (
+            rate_by_shift.get(int(shift_id)) if shift_id is not None else None
+        )
         for local_day, hours in _local_interval_grid_day_slices(
             interval_start,
             interval_end,
@@ -4330,11 +4394,18 @@ def _daily_worker_rows(
             range_end=range_end,
             app_timezone=app_timezone,
         ):
-            hours_by_day[local_day.isoformat()] += hours
+            day_key = local_day.isoformat()
+            hours_by_day[day_key] += hours
+            if interval_rate_cents is not None:
+                labor_weight_by_day[day_key] += hours * interval_rate_cents
 
     labor_cents = _money_cents(worker.get("laborCost"))
+    # Allocating a known total by labor weight keeps every day rate-correct and
+    # still sums exactly to that total. The total is None (fail-closed) whenever
+    # any of the worker's segments had an unknown rate, so no day is priced from
+    # a partial rate picture.
     labor_by_day = (
-        _allocate_cents_by_weight(labor_cents, dict(hours_by_day))
+        _allocate_cents_by_weight(labor_cents, dict(labor_weight_by_day))
         if labor_cents is not None
         else {}
     )
@@ -4408,6 +4479,7 @@ def _daily_profitability_job_rows(
     app_timezone: ZoneInfo,
     range_start: datetime,
     range_end: datetime,
+    shift_rate_cents: Optional[Dict[int, Optional[int]]] = None,
 ) -> List[Dict[str, Any]]:
     revenue_date = str(profit_row.get("profitabilityDate") or profit_row.get("scheduledDate") or "")
     worker_rows_by_day: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -4417,6 +4489,7 @@ def _daily_profitability_job_rows(
             app_timezone=app_timezone,
             range_start=range_start,
             range_end=range_end,
+            shift_rate_cents=shift_rate_cents,
         ).items():
             worker_rows_by_day[day].append(daily_worker)
 
@@ -4519,6 +4592,39 @@ def _payroll_local_hours_by_day(
     return hours_by_day
 
 
+def _payroll_local_labor_weight_by_day(
+    intervals: List[Dict[str, Any]],
+    *,
+    shift_rate_cents: Dict[int, Optional[int]],
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> Dict[str, float]:
+    """Per-day labor weight (rate x hours) over the same day slices as the hours
+    map, so a mixed-rate worker total splits by labor instead of by hours."""
+    labor_weight_by_day: Dict[str, float] = defaultdict(float)
+    for interval in intervals:
+        if not interval.get("finalized") or not interval.get("intervalEnd"):
+            continue
+        shift_id = interval.get("shiftId")
+        rate_cents = (
+            shift_rate_cents.get(int(shift_id)) if shift_id is not None else None
+        )
+        if rate_cents is None:
+            continue
+        interval_start = _parse_utc_iso(str(interval["intervalStart"]))
+        interval_end = _parse_utc_iso(str(interval["intervalEnd"]))
+        for local_day, hours in _local_interval_day_slices(
+            interval_start,
+            interval_end,
+            range_start=range_start,
+            range_end=range_end,
+            app_timezone=app_timezone,
+        ):
+            labor_weight_by_day[local_day.isoformat()] += hours * rate_cents
+    return labor_weight_by_day
+
+
 def _payroll_correction_candidate_segments(
     profit_jobs: List[Dict[str, Any]],
     decorated_jobs: Dict[int, Dict[str, Any]],
@@ -4527,7 +4633,9 @@ def _payroll_correction_candidate_segments(
     app_timezone: ZoneInfo,
     range_start: datetime,
     range_end: datetime,
+    shift_rate_cents: Optional[Dict[int, Optional[int]]] = None,
 ) -> List[Dict[str, Any]]:
+    rate_by_shift = shift_rate_cents or {}
     segments: List[Dict[str, Any]] = []
     profit_jobs_by_id = {int(row["jobId"]): row for row in profit_jobs}
     for job_id, profit_row in profit_jobs_by_id.items():
@@ -4546,8 +4654,22 @@ def _payroll_correction_candidate_segments(
             if not hours_by_day:
                 continue
             worker_labor_cents = _money_cents(worker.get("laborCost"))
+            # Split the worker's job labor across days by each day's actual labor
+            # (rate x hours), mirroring _daily_worker_rows, so a day worked at a
+            # different snapshot rate is priced at that rate rather than the
+            # equal-hours average. Single-rate days weight proportional to hours,
+            # so the split is unchanged there.
+            labor_weight_by_day = _payroll_local_labor_weight_by_day(
+                worker.get("intervals") or [],
+                shift_rate_cents=rate_by_shift,
+                app_timezone=app_timezone,
+                range_start=range_start,
+                range_end=range_end,
+            )
             labor_by_day = (
-                _allocate_cents_by_weight(worker_labor_cents, dict(hours_by_day))
+                _allocate_cents_by_weight(
+                    worker_labor_cents, dict(labor_weight_by_day)
+                )
                 if worker_labor_cents is not None
                 else {}
             )
@@ -4910,7 +5032,7 @@ def build_weekly_labor_profitability(
         app_timezone=app_timezone,
         cursor=cursor,
     )
-    schedule_jobs, unmatched = _decorate_schedule_jobs(
+    schedule_jobs, unmatched, shift_rate_cents = _decorate_schedule_jobs(
         jobs,
         range_start,
         range_end,
@@ -4947,6 +5069,7 @@ def build_weekly_labor_profitability(
             app_timezone=app_timezone,
             range_start=range_start,
             range_end=range_end,
+            shift_rate_cents=shift_rate_cents,
         )
     ]
 
@@ -4962,6 +5085,7 @@ def build_weekly_labor_profitability(
         app_timezone=app_timezone,
         range_start=range_start,
         range_end=range_end,
+        shift_rate_cents=shift_rate_cents,
     )
     return {
         "success": True,
@@ -5435,7 +5559,7 @@ def build_operations_schedule_router(
         ]
         evidence_range_start = min([range_start, *scheduled_starts])
         evidence_range_end = max([range_end, *scheduled_ends])
-        schedule_jobs, unmatched = _decorate_schedule_jobs(
+        schedule_jobs, unmatched, _ = _decorate_schedule_jobs(
             jobs,
             evidence_range_start,
             evidence_range_end,
