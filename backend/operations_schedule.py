@@ -3811,14 +3811,12 @@ def _decorate_schedule_jobs(
             in_progress = bool(worker.pop("inProgress"))
             observed_presence = bool(worker.pop("observedPresence"))
             actual_hours += finalized_hours
-            rate_cents = _money_cents(worker.pop("hourlyRate"))
+            worker.pop("hourlyRate")
             hours_by_rate_cents = worker.pop("_finalizedHoursByRateCents")
             # Fail closed: an unknown rate anywhere in this worker's segments
             # makes the whole worker labor figure unknown, exactly as a worker
             # with no configured rate does today.
-            if rate_cents is None or any(
-                key is None for key in hours_by_rate_cents
-            ):
+            if any(key is None for key in hours_by_rate_cents):
                 labor_cents = None
             else:
                 # One bucket per distinct rate, summed EXACTLY and rounded once
