@@ -7679,6 +7679,9 @@ def _record_explicit_site_action(
 
 
 PLAIN_TIME_ACTION_NAMES = ("clock-in", "arrive", "depart", "clock-out")
+PLAIN_TIME_ACTION_RECEIPT_UNIQUE_CONSTRAINT = (
+    "plain_time_action_receipts_employee_id_idempotency_key_key"
+)
 
 
 def _plain_time_action_request_fingerprint(
@@ -7741,6 +7744,38 @@ def _plain_time_action_recorded_at(
     return utc_now()
 
 
+def _plain_time_action_replay_response(
+    action: str,
+    payload: Optional[BaseModel],
+    employee: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    idempotency_key = getattr(payload, "idempotencyKey", None) if payload else None
+    if not idempotency_key:
+        return None
+    fingerprint = _plain_time_action_request_fingerprint(action, payload)
+    existing = db.query_one(
+        """
+        SELECT request_fingerprint, response_body
+        FROM plain_time_action_receipts
+        WHERE employee_id = %s
+          AND idempotency_key = %s
+        """,
+        (int(employee["id"]), str(idempotency_key)),
+    )
+    if not existing:
+        return None
+    if hmac.compare_digest(str(existing["request_fingerprint"]), fingerprint):
+        replay = dict(existing["response_body"])
+        replay["replayed"] = True
+        return replay
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "This time action key already belongs to different action details."
+        ),
+    )
+
+
 def update_timesheets_for_plain_time_action(
     action: str,
     payload: Optional[BaseModel],
@@ -7761,31 +7796,9 @@ def update_timesheets_for_plain_time_action(
 
     with TIMESHEET_WRITE_LOCK:
         with timesheet_postgres_advisory_lock():
-            if idempotency_key:
-                existing = db.query_one(
-                    """
-                    SELECT request_fingerprint, response_body
-                    FROM plain_time_action_receipts
-                    WHERE employee_id = %s
-                      AND idempotency_key = %s
-                    """,
-                    (employee_id, str(idempotency_key)),
-                )
-                if existing:
-                    if hmac.compare_digest(
-                        str(existing["request_fingerprint"]),
-                        fingerprint,
-                    ):
-                        replay = dict(existing["response_body"])
-                        replay["replayed"] = True
-                        return True, replay
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "This time action key already belongs to different "
-                            "action details."
-                        ),
-                    )
+            replay = _plain_time_action_replay_response(action, payload, employee)
+            if replay is not None:
+                return True, replay
 
             timesheet_data = _load_timesheets_from_db()
             pre_shift_ids = {e["id"] for e in timesheet_data["entries"]}
@@ -7827,13 +7840,35 @@ def update_timesheets_for_plain_time_action(
                     )
                 holder["response"] = response
 
-            _save_timesheets_to_db(
-                timesheet_data,
-                pre_shift_ids,
-                pre_visit_counts,
-                pre_departure_counts,
-                after_save=after_save,
-            )
+            try:
+                _save_timesheets_to_db(
+                    timesheet_data,
+                    pre_shift_ids,
+                    pre_visit_counts,
+                    pre_departure_counts,
+                    after_save=after_save,
+                )
+            except psycopg2.errors.UniqueViolation as exc:
+                constraint = getattr(getattr(exc, "diag", None), "constraint_name", "")
+                if (
+                    idempotency_key
+                    and constraint == PLAIN_TIME_ACTION_RECEIPT_UNIQUE_CONSTRAINT
+                ):
+                    replay = _plain_time_action_replay_response(
+                        action,
+                        payload,
+                        employee,
+                    )
+                    if replay is not None:
+                        return True, replay
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "This time action is still being recorded; retry the "
+                            "same request."
+                        ),
+                    ) from exc
+                raise
             return True, holder["response"]
 
 
@@ -9630,6 +9665,9 @@ def clock_in(
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
+    replay = _plain_time_action_replay_response("clock-in", payload, employee)
+    if replay is not None:
+        return replay
     enforce_clock_action_hours(request)
     notes = payload.notes.strip()
     has_gps = payload.latitude is not None and payload.longitude is not None
@@ -9810,6 +9848,9 @@ def log_visit(
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     """Auto-log an arrival at a new location during an active shift."""
+    replay = _plain_time_action_replay_response("arrive", payload, employee)
+    if replay is not None:
+        return replay
     enforce_clock_action_hours(request)
     has_gps = payload.latitude is not None and payload.longitude is not None
     now_utc = utc_now()
@@ -9845,7 +9886,10 @@ def log_visit(
         # Avoid duplicate: skip if location matches the most recent visit
         active_visit = get_active_visit(open_entry)
         if active_visit and active_visit.get("location") == location:
-            return False, "already_at_location"
+            return True, {
+                "alreadyHere": True,
+                "entryId": open_entry["id"],
+            }
 
         visit = {
             "arrivalTime": to_utc_iso(now_utc),
@@ -9879,17 +9923,16 @@ def log_visit(
         mutator,
         lambda result, _timesheet_data: {
             "success": True,
-            "alreadyHere": False,
+            "alreadyHere": bool(result.get("alreadyHere")),
             **result,
         },
     )
     if not ok:
-        if result == "already_at_location":
-            return {"success": True, "alreadyHere": True}
         raise_timesheet_mutation_failure(result)
 
-    append_access_log(request, "VISIT_LOGGED", True,
-                      f"Employee: {employee['name']} arrived at {result['visit']['location']}")
+    if not result.get("alreadyHere"):
+        append_access_log(request, "VISIT_LOGGED", True,
+                          f"Employee: {employee['name']} arrived at {result['visit']['location']}")
     return result
 
 

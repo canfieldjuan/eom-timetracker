@@ -2097,6 +2097,162 @@ class TestTimesheetGpsFlow:
         finally:
             _clear_catalina_time_entries()
 
+    def test_plain_time_action_replays_before_clock_action_hours_gate(
+        self,
+        client,
+        emp_auth,
+        monkeypatch,
+    ):
+        import time_tracker_api as api
+
+        _clear_catalina_time_entries()
+        original_enforcer = api.enforce_clock_action_hours
+
+        def blocked_hours(_request):
+            raise api.HTTPException(status_code=403, detail="clock window closed")
+
+        try:
+            clock_in_body = {
+                "location": "123 Main St, Effingham",
+                "latitude": 39.1201,
+                "longitude": -88.5432,
+                "idempotencyKey": str(uuid.uuid4()),
+            }
+            first_clock_in = client.post(
+                "/api/timesheet/clock-in",
+                headers=emp_auth,
+                json=clock_in_body,
+            )
+            assert first_clock_in.status_code == 200, first_clock_in.text
+
+            monkeypatch.setattr(api, "enforce_clock_action_hours", blocked_hours)
+            replay_clock_in = client.post(
+                "/api/timesheet/clock-in",
+                headers=emp_auth,
+                json=clock_in_body,
+            )
+            assert replay_clock_in.status_code == 200, replay_clock_in.text
+            assert replay_clock_in.json()["replayed"] is True
+            assert (
+                replay_clock_in.json()["entry"]["clockIn"]
+                == first_clock_in.json()["entry"]["clockIn"]
+            )
+
+            monkeypatch.setattr(api, "enforce_clock_action_hours", original_enforcer)
+            arrive_body = {
+                "location": "123 Main St, Effingham",
+                "latitude": 39.1201,
+                "longitude": -88.5432,
+                "idempotencyKey": str(uuid.uuid4()),
+            }
+            first_arrive = client.post(
+                "/api/timesheet/visit",
+                headers=emp_auth,
+                json=arrive_body,
+            )
+            assert first_arrive.status_code == 200, first_arrive.text
+
+            monkeypatch.setattr(api, "enforce_clock_action_hours", blocked_hours)
+            replay_arrive = client.post(
+                "/api/timesheet/visit",
+                headers=emp_auth,
+                json=arrive_body,
+            )
+            assert replay_arrive.status_code == 200, replay_arrive.text
+            assert replay_arrive.json()["replayed"] is True
+            assert (
+                replay_arrive.json()["visit"]["arrivalTime"]
+                == first_arrive.json()["visit"]["arrivalTime"]
+            )
+        finally:
+            _clear_catalina_time_entries()
+
+    def test_already_here_success_is_receipted_and_replayed_after_departure(
+        self,
+        client,
+        emp_auth,
+    ):
+        employee_id = _clear_catalina_time_entries()
+        try:
+            clock_in = client.post(
+                "/api/timesheet/clock-in",
+                headers=emp_auth,
+                json={
+                    "location": "123 Main St, Effingham",
+                    "latitude": 39.1201,
+                    "longitude": -88.5432,
+                },
+            )
+            assert clock_in.status_code == 200, clock_in.text
+
+            first_arrive = client.post(
+                "/api/timesheet/visit",
+                headers=emp_auth,
+                json={
+                    "location": "123 Main St, Effingham",
+                    "latitude": 39.1201,
+                    "longitude": -88.5432,
+                },
+            )
+            assert first_arrive.status_code == 200, first_arrive.text
+            assert first_arrive.json()["alreadyHere"] is False
+
+            already_here_body = {
+                "location": "123 Main St, Effingham",
+                "latitude": 39.1201,
+                "longitude": -88.5432,
+                "idempotencyKey": str(uuid.uuid4()),
+            }
+            already_here = client.post(
+                "/api/timesheet/visit",
+                headers=emp_auth,
+                json=already_here_body,
+            )
+            assert already_here.status_code == 200, already_here.text
+            assert already_here.json()["alreadyHere"] is True
+            assert already_here.json()["replayed"] is False
+
+            depart = client.post(
+                "/api/timesheet/depart",
+                headers=emp_auth,
+                json={
+                    "latitude": 39.1204,
+                    "longitude": -88.5434,
+                },
+            )
+            assert depart.status_code == 200, depart.text
+
+            replay = client.post(
+                "/api/timesheet/visit",
+                headers=emp_auth,
+                json=already_here_body,
+            )
+            assert replay.status_code == 200, replay.text
+            assert replay.json()["alreadyHere"] is True
+            assert replay.json()["replayed"] is True
+
+            counts = db.query_one(
+                """
+                SELECT
+                    COUNT(DISTINCT v.id) AS visits,
+                    COUNT(DISTINCT d.id) AS departures,
+                    COUNT(DISTINCT r.id) AS receipts
+                FROM shifts s
+                LEFT JOIN visits v ON v.shift_id = s.id
+                LEFT JOIN departures d ON d.shift_id = s.id
+                LEFT JOIN plain_time_action_receipts r ON r.shift_id = s.id
+                WHERE s.employee_id = %s
+                """,
+                (employee_id,),
+            )
+            assert counts == {
+                "visits": 1,
+                "departures": 1,
+                "receipts": 1,
+            }
+        finally:
+            _clear_catalina_time_entries()
+
     def test_server_requires_gps_or_explicit_override_for_every_time_action(
         self,
         client,
