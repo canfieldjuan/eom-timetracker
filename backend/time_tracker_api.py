@@ -7813,6 +7813,12 @@ def update_timesheets_for_plain_time_action(
             ok, result = mutator(timesheet_data)
             if not ok:
                 return ok, result
+            if (
+                not idempotency_key
+                and isinstance(result, dict)
+                and result.get("alreadyHere")
+            ):
+                return True, response_builder(result, timesheet_data)
 
             holder: Dict[str, Any] = {}
 
@@ -9832,12 +9838,13 @@ def clock_out(
         append_access_log(request, "CLOCK_OUT_FAILED", False, str(result))
         raise_timesheet_mutation_failure(result)
 
-    append_access_log(
-        request,
-        "CLOCK_OUT_SUCCESS",
-        True,
-        f"Employee: {employee['name']}, Hours: {result.get('entry', {}).get('totalHours', 0)}",
-    )
+    if not result.get("replayed"):
+        append_access_log(
+            request,
+            "CLOCK_OUT_SUCCESS",
+            True,
+            f"Employee: {employee['name']}, Hours: {result.get('entry', {}).get('totalHours', 0)}",
+        )
     return result
 
 
@@ -10047,12 +10054,13 @@ def depart_location(
         append_access_log(request, "DEPARTURE_FAILED", False, str(result))
         raise_timesheet_mutation_failure(result)
 
-    append_access_log(
-        request,
-        "DEPARTURE_LOGGED",
-        True,
-        f"Employee: {employee['name']} departed {result['departure']['location']}",
-    )
+    if not result.get("replayed"):
+        append_access_log(
+            request,
+            "DEPARTURE_LOGGED",
+            True,
+            f"Employee: {employee['name']} departed {result['departure']['location']}",
+        )
     return result
 
 

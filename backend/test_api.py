@@ -1924,7 +1924,17 @@ class TestTimesheetGpsFlow:
         self,
         client,
         emp_auth,
+        monkeypatch,
     ):
+        import time_tracker_api as api
+
+        access_log_actions = []
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, _allowed, _reason="": access_log_actions.append(action),
+        )
+
         employee_id = _clear_catalina_time_entries()
         try:
             clock_in_body = {
@@ -2009,6 +2019,7 @@ class TestTimesheetGpsFlow:
                 replay_depart.json()["departure"]["departureTime"]
                 == first_depart.json()["departure"]["departureTime"]
             )
+            assert access_log_actions.count("DEPARTURE_LOGGED") == 1
 
             clock_out_body = {
                 "notes": "cleanup",
@@ -2035,6 +2046,7 @@ class TestTimesheetGpsFlow:
                 replay_clock_out.json()["entry"]["clockOut"]
                 == first_clock_out.json()["entry"]["clockOut"]
             )
+            assert access_log_actions.count("CLOCK_OUT_SUCCESS") == 1
 
             counts = db.query_one(
                 """
@@ -2171,7 +2183,10 @@ class TestTimesheetGpsFlow:
         self,
         client,
         emp_auth,
+        monkeypatch,
     ):
+        import time_tracker_api as api
+
         employee_id = _clear_catalina_time_entries()
         try:
             clock_in = client.post(
@@ -2196,6 +2211,30 @@ class TestTimesheetGpsFlow:
             )
             assert first_arrive.status_code == 200, first_arrive.text
             assert first_arrive.json()["alreadyHere"] is False
+
+            original_save_timesheets = api._save_timesheets_to_db
+
+            def fail_unkeyed_already_here_save(*_args, **_kwargs):
+                raise AssertionError("unkeyed already-here arrival must not save timesheets")
+
+            monkeypatch.setattr(
+                api,
+                "_save_timesheets_to_db",
+                fail_unkeyed_already_here_save,
+            )
+            unkeyed_already_here = client.post(
+                "/api/timesheet/visit",
+                headers=emp_auth,
+                json={
+                    "location": "123 Main St, Effingham",
+                    "latitude": 39.1201,
+                    "longitude": -88.5432,
+                },
+            )
+            assert unkeyed_already_here.status_code == 200, unkeyed_already_here.text
+            assert unkeyed_already_here.json()["alreadyHere"] is True
+            assert "replayed" not in unkeyed_already_here.json()
+            monkeypatch.setattr(api, "_save_timesheets_to_db", original_save_timesheets)
 
             already_here_body = {
                 "location": "123 Main St, Effingham",
