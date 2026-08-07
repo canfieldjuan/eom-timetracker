@@ -14215,6 +14215,51 @@ def _payroll_shift_corrections_by_shift_id(
     }
 
 
+def _hours_report_entry_shift_id(entry: Dict[str, Any]) -> Optional[int]:
+    try:
+        shift_id = int(entry.get("id") or 0)
+    except (TypeError, ValueError):
+        return None
+    if shift_id <= 0:
+        return None
+    return shift_id
+
+
+def _hours_report_shift_ids(entries: Iterable[Dict[str, Any]]) -> List[int]:
+    shift_ids: set[int] = set()
+    for entry in entries:
+        shift_id = _hours_report_entry_shift_id(entry)
+        if shift_id is not None:
+            shift_ids.add(shift_id)
+    return sorted(shift_ids)
+
+
+def _hours_report_effective_shift_interval(
+    entry: Dict[str, Any],
+    correction_row: Optional[Dict[str, Any]],
+    reference_time: datetime,
+) -> Optional[Tuple[datetime, datetime, float]]:
+    if correction_row is not None:
+        clock_in = correction_row["corrected_clock_in"].astimezone(timezone.utc)
+        clock_out = correction_row["corrected_clock_out"].astimezone(timezone.utc)
+        hours = int(correction_row["corrected_total_minutes"]) / 60
+        return clock_in, clock_out, hours
+
+    if entry.get("clockOut") is None:
+        return None
+
+    ci_str = str(entry.get("clockIn", "")).strip()
+    if not ci_str:
+        return None
+    try:
+        clock_in = parse_utc_iso(ci_str)
+        clock_out = parse_utc_iso(str(entry["clockOut"]))
+    except (KeyError, ValueError):
+        return None
+
+    return clock_in, clock_out, entry_hours(entry, reference_time)
+
+
 def _payroll_raw_shift_total_minutes(shift_row: Dict[str, Any]) -> int:
     clock_out = shift_row.get("clock_out")
     if clock_out is None:
@@ -18133,20 +18178,30 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
     )
     employees_data = load_employees()
     emp_names = {emp["id"]: emp["name"] for emp in employees_data["employees"]}
+    shift_corrections_by_shift_id = _payroll_shift_corrections_by_shift_id(
+        _payroll_active_shift_correction_rows_for_shift_ids(
+            _hours_report_shift_ids(timesheet_data["entries"]),
+        ),
+    )
 
     rows = []
     emp_totals: Dict[int, Dict[str, Any]] = {}
 
     for entry in timesheet_data["entries"]:
-        if entry.get("clockOut") is None:
+        shift_id = _hours_report_entry_shift_id(entry)
+        shift_correction = (
+            shift_corrections_by_shift_id.get(shift_id)
+            if shift_id is not None
+            else None
+        )
+        effective_interval = _hours_report_effective_shift_interval(
+            entry,
+            shift_correction,
+            now,
+        )
+        if effective_interval is None:
             continue
-        ci_str = str(entry.get("clockIn", "")).strip()
-        if not ci_str:
-            continue
-        try:
-            ci_dt = parse_utc_iso(ci_str)
-        except ValueError:
-            continue
+        ci_dt, co_dt, hours = effective_interval
 
         entry_date = to_local(ci_dt).date()
         if not (start_date <= entry_date <= end_date):
@@ -18157,13 +18212,7 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
             continue
 
         emp_name = emp_names.get(emp_id, str(entry.get("employeeName", f"Employee {emp_id}")))
-        hours = entry_hours(entry, now)
-
-        try:
-            co_dt = parse_utc_iso(str(entry["clockOut"]))
-            co_display = local_clock_string(co_dt)
-        except (ValueError, KeyError):
-            co_display = "-"
+        co_display = local_clock_string(co_dt)
 
         loc = entry.get("location", "")
         gps_exceptions = collect_entry_gps_exceptions(entry)
@@ -18190,6 +18239,7 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
 
     rows.sort(key=lambda r: (r["employeeName"].lower(), r["date"], r["clockIn"]))
     summary = sorted(emp_totals.values(), key=lambda e: e["employeeName"].lower())
+    total_hours = sum(s["totalHours"] for s in summary)
     for s in summary:
         s["totalHours"] = round(s["totalHours"], 2)
 
@@ -18201,7 +18251,7 @@ def _compute_hours_report(period: str, date_str: Optional[str], employee_id: Opt
         "exceptionsOnly": exceptions_only,
         "rows": rows,
         "summary": summary,
-        "totalHours": round(sum(s["totalHours"] for s in summary), 2),
+        "totalHours": round(total_hours, 2),
         "totalShifts": sum(s["totalShifts"] for s in summary),
         "totalGpsExceptionShifts": sum(1 for r in rows if r["gpsExceptions"]),
         "totalGpsExceptions": sum(len(r["gpsExceptions"]) for r in rows),
