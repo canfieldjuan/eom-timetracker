@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import hashlib
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import bcrypt
+import psycopg2.extras
 import pytest
 
 import db
@@ -257,6 +259,23 @@ def _cleanup() -> None:
             """,
             owned,
         )
+    # Correction/allocation rows reference PREFIX locations with ON DELETE
+    # RESTRICT, so they must go before the location delete below.
+    db.execute(
+        """
+        DELETE FROM payroll_hour_correction_allocations
+        WHERE employee_id IN (SELECT id FROM employees WHERE name LIKE %s)
+           OR location_id IN (SELECT id FROM locations WHERE address LIKE %s)
+        """,
+        owned,
+    )
+    db.execute(
+        """
+        DELETE FROM payroll_hour_corrections
+        WHERE employee_id IN (SELECT id FROM employees WHERE name LIKE %s)
+        """,
+        (f"{PREFIX}%",),
+    )
     db.execute(
         """
         DELETE FROM shifts
@@ -1248,3 +1267,267 @@ def test_backfill_runs_after_the_first_run_json_import(client):
     assert "_backfill_shift_hourly_rate_snapshots" in called, (
         "startup_event must re-run the rate backfill after a legacy JSON import"
     )
+
+
+# --- 4. correction rate resolver: shifts spanning local midnight --------------
+
+def _insert_cross_midnight_shift(
+    *, employee_id, site_id, address, start_day, start_hour, end_day, end_hour,
+    hourly_rate_cents,
+):
+    """A shift whose worked interval crosses local midnight.
+
+    local_date is the clock-in day, but weekly payroll attributes the minutes to
+    both local days. Inserted directly so the two days differ.
+    """
+    clock_in = _local_dt(start_day, start_hour).astimezone(timezone.utc)
+    clock_out = _local_dt(end_day, end_hour).astimezone(timezone.utc)
+    return int(
+        db.execute_returning(
+            """
+            INSERT INTO shifts (
+                employee_id, location_id, location_label,
+                clock_in, clock_out, total_hours, local_date, timezone,
+                time_category, hourly_rate_cents, notes
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'America/Chicago',
+                    'productive', %s, 'cross-midnight test')
+            RETURNING id
+            """,
+            (
+                employee_id, site_id, address, clock_in, clock_out,
+                round((clock_out - clock_in).total_seconds() / 3600, 2),
+                start_day, hourly_rate_cents,
+            ),
+        )
+    )
+
+
+def _resolve_correction_rate(employee_id, correction_date, location_id, live_rate):
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            return api._payroll_correction_rate_for_allocation(
+                cur,
+                employee_id=employee_id,
+                correction_date=correction_date,
+                location_id=location_id,
+                live_hourly_rate=live_rate,
+            )
+
+
+def test_correction_resolver_matches_a_shift_that_spilled_over_midnight():
+    """A shift crossing midnight is attributed to both days; a correction on the
+    spillover day must price from its snapshot, not the post-raise live rate."""
+    worker = _employee("Midnight", 20.00)
+    _, site_id, _, address = _customer_site("Midnight")
+    # Worked 23:00 Tue -> 01:00 Wed local, snapshotted at $20. local_date = Tue.
+    _insert_cross_midnight_shift(
+        employee_id=worker, site_id=site_id, address=address,
+        start_day=SERVICE_DAY, start_hour=23,
+        end_day=NEXT_SERVICE_DAY, end_hour=1,
+        hourly_rate_cents=2000,
+    )
+    _set_rate(worker, 50.00)  # raise lands after the work
+
+    # The spillover day (Wed) is NOT the shift's local_date, yet the resolver
+    # must still see the $20 snapshot via interval overlap.
+    rate, resolved = _resolve_correction_rate(worker, NEXT_SERVICE_DAY, site_id, 50.00)
+    assert resolved is True
+    assert rate == Decimal("20")
+
+    # The clock-in day (Tue) resolves the same snapshot.
+    rate_in, resolved_in = _resolve_correction_rate(worker, SERVICE_DAY, site_id, 50.00)
+    assert resolved_in is True
+    assert rate_in == Decimal("20")
+
+    # A day the shift never touched still falls back to the live rate.
+    untouched = SERVICE_DAY - timedelta(days=3)
+    rate_none, resolved_none = _resolve_correction_rate(worker, untouched, site_id, 50.00)
+    assert resolved_none is True
+    assert rate_none == 50.00
+
+
+# --- 5. one-time backfill gating (no re-stamp on later boots) ------------------
+
+def _clear_marker(key):
+    db.execute("DELETE FROM settings WHERE key = %s", (key,))
+
+
+def _marker_present(key):
+    return db.query_one("SELECT 1 FROM settings WHERE key = %s", (key,)) is not None
+
+
+def test_one_time_shift_backfill_stamps_preexisting_then_never_reruns():
+    """First run stamps then-existing NULL snapshots and marks itself done; a
+    later run must not touch anything, so a rate-less shift created afterwards
+    keeps its NULL and its live-rate fallback."""
+    _clear_marker(api._SHIFT_RATE_BACKFILL_MARKER)
+    rated = _employee("OneTimeRated", 30.00)
+    _, site_id, _, address = _customer_site("OneTime")
+    pre_existing = _shift(
+        employee_id=rated, site_id=site_id, address=address,
+        service_day=SERVICE_DAY, start_hour=9, end_hour=11, hourly_rate_cents=None,
+    )
+
+    api._run_one_time_shift_rate_backfill()
+
+    assert _snapshot_cents(pre_existing) == 3000
+    assert _marker_present(api._SHIFT_RATE_BACKFILL_MARKER)
+
+    # A rate-less shift created AFTER the migration, whose employee later gains a
+    # rate, must NOT be re-stamped on a subsequent boot.
+    later_unrated_emp = _employee("OneTimeLater", None)
+    later_shift = _shift(
+        employee_id=later_unrated_emp, site_id=site_id, address=address,
+        service_day=SERVICE_DAY, start_hour=13, end_hour=15, hourly_rate_cents=None,
+    )
+    _set_rate(later_unrated_emp, 40.00)
+
+    api._run_one_time_shift_rate_backfill()  # simulated reboot
+
+    assert _snapshot_cents(later_shift) is None
+    # The genuine pre-existing stamp is untouched too.
+    assert _snapshot_cents(pre_existing) == 3000
+
+
+def test_one_time_shift_backfill_is_a_noop_once_marked():
+    """With the marker already present (post-migration steady state), a shift
+    created rate-less then given a rate stays NULL across the backfill."""
+    # Ensure marked done.
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES (%s, 'true'::jsonb) "
+        "ON CONFLICT (key) DO NOTHING",
+        (api._SHIFT_RATE_BACKFILL_MARKER,),
+    )
+    emp = _employee("MarkedNoop", None)
+    _, site_id, _, address = _customer_site("MarkedNoop")
+    shift_id = _shift(
+        employee_id=emp, site_id=site_id, address=address,
+        service_day=SERVICE_DAY, start_hour=9, end_hour=11, hourly_rate_cents=None,
+    )
+    _set_rate(emp, 25.00)
+
+    api._run_one_time_shift_rate_backfill()
+
+    assert _snapshot_cents(shift_id) is None
+
+
+# --- 6. one-time migration of existing allocation costs -----------------------
+
+def _seed_correction_with_allocation(
+    *, employee_id, location_id, correction_date, week_start, delta_minutes,
+    stored_cost_cents,
+):
+    """Insert an active correction + allocation with a chosen stored cost.
+
+    Used to stand in for a row written BEFORE the allocation cost became
+    authoritative -- its stored cost is whatever the live rate was then.
+    """
+    correction_id = int(
+        db.execute_returning(
+            """
+            INSERT INTO payroll_hour_corrections (
+                week_start, correction_date, employee_id,
+                corrected_total_minutes, reason, status, created_by_name
+            )
+            VALUES (%s, %s, %s, %s, %s, 'active', 'Seed Payroll')
+            RETURNING id
+            """,
+            (week_start, correction_date, employee_id, 180, "Seed correction."),
+        )
+    )
+    allocation_id = int(
+        db.execute_returning(
+            """
+            INSERT INTO payroll_hour_correction_allocations (
+                correction_id, week_start, correction_date, employee_id,
+                location_id, allocated_delta_minutes, allocated_labor_cost_cents,
+                reason, status, created_by_name
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', 'Seed Payroll')
+            RETURNING id
+            """,
+            (
+                correction_id, week_start, correction_date, employee_id,
+                location_id, delta_minutes, stored_cost_cents,
+                "Seed allocation.",
+            ),
+        )
+    )
+    return allocation_id
+
+
+def _allocation_cost(allocation_id):
+    row = db.query_one(
+        "SELECT allocated_labor_cost_cents FROM payroll_hour_correction_allocations WHERE id = %s",
+        (allocation_id,),
+    )
+    return row["allocated_labor_cost_cents"]
+
+
+def test_one_time_allocation_backfill_reprices_existing_rows_from_the_snapshot():
+    """An allocation stored at the old live rate is repriced to the shift's
+    worked-rate snapshot, so adjusted profitability stops mixing rates. Gated by
+    a marker: it runs once, and clearing the marker re-enables it."""
+    worker = _employee("AllocMig", 20.00)
+    _, site_id, _, address = _customer_site("AllocMig")
+    # Worked at $20, snapshotted; the employee was later raised to $25.
+    _shift(
+        employee_id=worker, site_id=site_id, address=address,
+        service_day=SERVICE_DAY, start_hour=9, end_hour=12, hourly_rate_cents=2000,
+    )
+    _set_rate(worker, 25.00)
+    # Pre-migration row: +60 min stored at the $25 live rate ($25.00), which is
+    # inconsistent with the frozen $20 shift labor.
+    allocation_id = _seed_correction_with_allocation(
+        employee_id=worker, location_id=site_id,
+        correction_date=SERVICE_DAY, week_start=SERVICE_DAY,
+        delta_minutes=60, stored_cost_cents=2500,
+    )
+    assert _allocation_cost(allocation_id) == 2500
+
+    _clear_marker(api._ALLOCATION_RATE_BACKFILL_MARKER)
+    api._run_one_time_allocation_rate_backfill()
+
+    # Repriced to 60 min @ the $20 snapshot = $20.00.
+    assert _allocation_cost(allocation_id) == 2000
+    assert _marker_present(api._ALLOCATION_RATE_BACKFILL_MARKER)
+
+    # Gated: a second run with the marker present is a no-op even if the stored
+    # value drifts.
+    db.execute(
+        "UPDATE payroll_hour_correction_allocations SET allocated_labor_cost_cents = 9999 WHERE id = %s",
+        (allocation_id,),
+    )
+    api._run_one_time_allocation_rate_backfill()
+    assert _allocation_cost(allocation_id) == 9999
+
+    # Clearing the marker re-enables the deterministic recompute.
+    _clear_marker(api._ALLOCATION_RATE_BACKFILL_MARKER)
+    api._run_one_time_allocation_rate_backfill()
+    assert _allocation_cost(allocation_id) == 2000
+
+
+def test_one_time_allocation_backfill_fails_closed_on_disagreeing_snapshots():
+    """If that day's snapshots disagree and none is at the allocation's site, the
+    resolver fails closed, so the migrated cost becomes NULL rather than a guess."""
+    worker = _employee("AllocMigAmbig", 20.00)
+    _, site_a, _, addr_a = _customer_site("AllocMigAmbigA")
+    _, site_b, _, addr_b = _customer_site("AllocMigAmbigB")
+    _, site_c, _, addr_c = _customer_site("AllocMigAmbigC")
+    # Two shifts that day at different rates, at sites A and B.
+    _shift(employee_id=worker, site_id=site_a, address=addr_a,
+           service_day=SERVICE_DAY, start_hour=8, end_hour=10, hourly_rate_cents=2000)
+    _shift(employee_id=worker, site_id=site_b, address=addr_b,
+           service_day=SERVICE_DAY, start_hour=12, end_hour=14, hourly_rate_cents=3000)
+    # Allocation points at site C, which has no shift that day -> ambiguous.
+    allocation_id = _seed_correction_with_allocation(
+        employee_id=worker, location_id=site_c,
+        correction_date=SERVICE_DAY, week_start=SERVICE_DAY,
+        delta_minutes=60, stored_cost_cents=2500,
+    )
+
+    _clear_marker(api._ALLOCATION_RATE_BACKFILL_MARKER)
+    api._run_one_time_allocation_rate_backfill()
+
+    assert _allocation_cost(allocation_id) is None

@@ -4384,6 +4384,108 @@ def _backfill_shift_hourly_rate_snapshots() -> None:
     )
 
 
+_SHIFT_RATE_BACKFILL_MARKER = "rate_snapshot_shift_backfill_completed"
+_ALLOCATION_RATE_BACKFILL_MARKER = "rate_snapshot_allocation_backfill_completed"
+
+
+def _run_one_time_shift_rate_backfill() -> None:
+    """Stamp pre-existing shifts once, on the boot that introduces the snapshot.
+
+    _ensure_schema_migrations runs on every startup, so calling the backfill
+    unconditionally would re-stamp a shift created AFTER the migration for an
+    employee who had no rate at the time -- freezing a rate the work was not
+    done at and breaking the documented "rate-less shifts follow the live rate"
+    contract. A persistent marker in ``settings`` makes this run exactly once:
+    the first boot stamps every then-existing NULL snapshot; every later boot
+    skips it, so a rate-less shift created afterwards keeps its NULL and its
+    live-rate fallback. The backfill and the marker commit together, so a
+    failure leaves both undone and the next boot retries cleanly.
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT 1 FROM settings WHERE key = %s",
+                (_SHIFT_RATE_BACKFILL_MARKER,),
+            )
+            if cur.fetchone():
+                return
+            cur.execute(
+                """
+                UPDATE shifts
+                SET hourly_rate_cents = ROUND(e.hourly_rate * 100)
+                FROM employees e
+                WHERE shifts.employee_id = e.id
+                  AND shifts.hourly_rate_cents IS NULL
+                  AND e.hourly_rate IS NOT NULL
+                """
+            )
+            cur.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, 'true'::jsonb) "
+                "ON CONFLICT (key) DO NOTHING",
+                (_SHIFT_RATE_BACKFILL_MARKER,),
+            )
+
+
+def _run_one_time_allocation_rate_backfill() -> None:
+    """Reprice existing active correction allocations to their worked rate, once.
+
+    Allocation labor cost became authoritative for adjusted profitability in the
+    same change that froze shift labor to the per-shift snapshot. Rows written
+    before this deploy stored the live rate at allocation time, which can differ
+    from the shift's worked rate, leaving adjusted profitability internally
+    inconsistent (frozen shift labor + a stale allocation addend). Recompute each
+    active allocation through the same worked-rate resolver used for new
+    allocations so both halves agree. Deterministic from frozen snapshots, but
+    gated by a marker so it does not rewrite every allocation on every boot.
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT 1 FROM settings WHERE key = %s",
+                (_ALLOCATION_RATE_BACKFILL_MARKER,),
+            )
+            if cur.fetchone():
+                return
+            cur.execute(
+                """
+                SELECT a.id, a.employee_id, a.correction_date, a.location_id,
+                       a.allocated_delta_minutes, e.hourly_rate AS live_hourly_rate
+                FROM payroll_hour_correction_allocations a
+                JOIN employees e ON e.id = a.employee_id
+                WHERE a.status = 'active'
+                """
+            )
+            allocations = cur.fetchall() or []
+            for row in allocations:
+                rate, resolved = _payroll_correction_rate_for_allocation(
+                    cur,
+                    employee_id=int(row["employee_id"]),
+                    correction_date=row["correction_date"],
+                    location_id=int(row["location_id"]),
+                    live_hourly_rate=row.get("live_hourly_rate"),
+                )
+                new_cost = (
+                    _payroll_delta_labor_cost_cents(
+                        int(row["allocated_delta_minutes"]), rate
+                    )
+                    if resolved
+                    else None
+                )
+                cur.execute(
+                    """
+                    UPDATE payroll_hour_correction_allocations
+                    SET allocated_labor_cost_cents = %s
+                    WHERE id = %s
+                    """,
+                    (new_cost, int(row["id"])),
+                )
+            cur.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, 'true'::jsonb) "
+                "ON CONFLICT (key) DO NOTHING",
+                (_ALLOCATION_RATE_BACKFILL_MARKER,),
+            )
+
+
 def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
@@ -4805,7 +4907,12 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS hourly_rate_cents INTEGER"
     )
-    _backfill_shift_hourly_rate_snapshots()
+    # One-time, marker-gated so it stamps only the shifts that predate the
+    # snapshot column and never re-stamps rate-less shifts created afterwards.
+    _run_one_time_shift_rate_backfill()
+    # One-time reprice of allocations written before their cost became
+    # authoritative, so shift labor and correction labor agree post-migration.
+    _run_one_time_allocation_rate_backfill()
     db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS gps_meta JSONB"
     )
@@ -15036,18 +15143,47 @@ def _payroll_correction_rate_for_allocation(
       4. No snapshots at all (pre-migration rows, or a rate-less employee) falls
          back to the live rate, which is the behavior that predates snapshots.
 
+    A shift is "on that day" when its effective worked interval OVERLAPS the
+    correction's local day, not merely when its clock-in local_date equals it: a
+    shift crossing local midnight has its minutes attributed to both day slices
+    by weekly payroll (via _iter_payroll_local_day_slices), so a correction on
+    the spillover day must see that shift's rate. Corrected clock times take
+    precedence over the raw ones, matching _effective_payroll_shift_row.
+
     Returns (rate, resolved). ``resolved`` is False only for the fail-closed
     case, which the caller must not paper over with the live rate.
     """
+    if not isinstance(correction_date, date):
+        correction_date = datetime.strptime(str(correction_date), "%Y-%m-%d").date()
+    # Local-day bounds as UTC instants. A shift overlaps this local day iff it
+    # started before the day ended and had not yet ended when the day began --
+    # exactly the condition under which _iter_payroll_local_day_slices emits a
+    # slice for this day.
+    day_start_utc = datetime.combine(
+        correction_date, clock_time.min, tzinfo=APP_TIMEZONE
+    ).astimezone(timezone.utc)
+    day_end_utc = datetime.combine(
+        correction_date + timedelta(days=1), clock_time.min, tzinfo=APP_TIMEZONE
+    ).astimezone(timezone.utc)
     cur.execute(
         """
-        SELECT location_id, hourly_rate_cents
-        FROM shifts
-        WHERE employee_id = %s
-          AND local_date = %s
-          AND hourly_rate_cents IS NOT NULL
+        SELECT s.location_id, s.hourly_rate_cents
+        FROM shifts s
+        LEFT JOIN LATERAL (
+            SELECT corrected_clock_in, corrected_clock_out
+            FROM payroll_shift_corrections psc
+            WHERE psc.shift_id = s.id AND psc.status = 'active'
+            LIMIT 1
+        ) corr ON TRUE
+        WHERE s.employee_id = %s
+          AND s.hourly_rate_cents IS NOT NULL
+          AND COALESCE(corr.corrected_clock_in, s.clock_in) < %s
+          AND (
+                COALESCE(corr.corrected_clock_out, s.clock_out) IS NULL
+                OR COALESCE(corr.corrected_clock_out, s.clock_out) > %s
+          )
         """,
-        (int(employee_id), correction_date),
+        (int(employee_id), day_end_utc, day_start_utc),
     )
     rows = cur.fetchall() or []
     if not rows:
