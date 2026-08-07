@@ -1,0 +1,296 @@
+{
+  "contractName": "eom-time-clock",
+  "version": 1,
+  "owner": "Effingham Office Maids employee time clock",
+  "scope": {
+    "paidTimeWorkflow": [
+      "clock-in",
+      "arrive",
+      "depart",
+      "clock-out"
+    ],
+    "qrWorkflow": "site-evidence-only",
+    "notes": [
+      "The QR site check-in flow records arrival/departure evidence and must not be treated as proof that a paid shift was created.",
+      "The portal calls frontendPath values through its API base; the backend serves the matching backendPath values under /api."
+    ]
+  },
+  "sharedRequestFields": {
+    "gpsTimeAction": [
+      "latitude",
+      "longitude",
+      "accuracy",
+      "gpsOverrideReason",
+      "gpsOverrideDetail",
+      "idempotencyKey"
+    ]
+  },
+  "endpoints": [
+    {
+      "id": "current-status",
+      "workflow": "paid-time-status",
+      "method": "GET",
+      "frontendPath": "/timesheet/current-status",
+      "backendPath": "/api/timesheet/current-status",
+      "auth": "employee-or-admin",
+      "requestModel": null,
+      "requestFields": [],
+      "responseFields": [
+        "success",
+        "currentlyWorking",
+        "staleOpenShift",
+        "staleOpenShifts"
+      ],
+      "currentlyWorkingFields": [
+        "employeeId",
+        "employeeName",
+        "location",
+        "customer",
+        "clockInTime",
+        "hoursWorked",
+        "notes",
+        "clockInGps",
+        "clockInGpsMeta",
+        "visits",
+        "departures",
+        "activeVisit",
+        "canDepart"
+      ]
+    },
+    {
+      "id": "clock-in",
+      "workflow": "paid-time-action",
+      "method": "POST",
+      "frontendPath": "/timesheet/clock-in",
+      "backendPath": "/api/timesheet/clock-in",
+      "auth": "employee",
+      "statusAction": "clock-in",
+      "requestModel": "ClockInRequest",
+      "requestFields": [
+        "location",
+        "notes",
+        "latitude",
+        "longitude",
+        "accuracy",
+        "gpsOverrideReason",
+        "gpsOverrideDetail",
+        "idempotencyKey"
+      ],
+      "responseFields": [
+        "success",
+        "entry"
+      ],
+      "staleShiftErrorCode": "STALE_SHIFT_REQUIRES_REVIEW"
+    },
+    {
+      "id": "arrive",
+      "workflow": "paid-time-action",
+      "method": "POST",
+      "frontendPath": "/timesheet/visit",
+      "backendPath": "/api/timesheet/visit",
+      "auth": "employee",
+      "statusAction": "arrive",
+      "requestModel": "ClockInRequest",
+      "requestFields": [
+        "location",
+        "notes",
+        "latitude",
+        "longitude",
+        "accuracy",
+        "gpsOverrideReason",
+        "gpsOverrideDetail",
+        "idempotencyKey"
+      ],
+      "responseFields": [
+        "success",
+        "alreadyHere",
+        "entryId",
+        "visit"
+      ],
+      "staleShiftErrorCode": "STALE_SHIFT_REQUIRES_REVIEW"
+    },
+    {
+      "id": "depart",
+      "workflow": "paid-time-action",
+      "method": "POST",
+      "frontendPath": "/timesheet/depart",
+      "backendPath": "/api/timesheet/depart",
+      "auth": "employee",
+      "statusAction": "depart",
+      "requestModel": "DepartRequest",
+      "requestFields": [
+        "notes",
+        "latitude",
+        "longitude",
+        "accuracy",
+        "gpsOverrideReason",
+        "gpsOverrideDetail",
+        "idempotencyKey"
+      ],
+      "responseFields": [
+        "success",
+        "departure"
+      ],
+      "staleShiftErrorCode": "STALE_SHIFT_REQUIRES_REVIEW"
+    },
+    {
+      "id": "clock-out",
+      "workflow": "paid-time-action",
+      "method": "POST",
+      "frontendPath": "/timesheet/clock-out",
+      "backendPath": "/api/timesheet/clock-out",
+      "auth": "employee",
+      "statusAction": "clock-out",
+      "requestModel": "ClockOutRequest",
+      "requestFields": [
+        "notes",
+        "latitude",
+        "longitude",
+        "accuracy",
+        "gpsOverrideReason",
+        "gpsOverrideDetail",
+        "idempotencyKey"
+      ],
+      "responseFields": [
+        "success",
+        "entry"
+      ],
+      "staleShiftErrorCode": "STALE_SHIFT_REQUIRES_REVIEW"
+    },
+    {
+      "id": "qr-resolve",
+      "workflow": "qr-site-evidence",
+      "method": "POST",
+      "frontendPath": "/timesheet/site-check-in/resolve",
+      "backendPath": "/api/timesheet/site-check-in/resolve",
+      "auth": "employee",
+      "requestModel": "SiteQrResolveRequest",
+      "requestFields": [
+        "token"
+      ],
+      "responseFields": [
+        "success",
+        "site",
+        "actionState"
+      ]
+    },
+    {
+      "id": "qr-submit",
+      "workflow": "qr-site-evidence",
+      "method": "POST",
+      "frontendPath": "/timesheet/site-check-in",
+      "backendPath": "/api/timesheet/site-check-in",
+      "auth": "employee",
+      "requestModel": "SiteCheckInRequest",
+      "requestFields": [
+        "employeeId",
+        "siteId",
+        "token",
+        "scannedAt",
+        "latitude",
+        "longitude",
+        "accuracy",
+        "action",
+        "actionStateToken",
+        "idempotencyKey"
+      ],
+      "responseFields": [
+        "success",
+        "checkIn",
+        "action",
+        "outcome",
+        "replayed",
+        "actionState"
+      ]
+    },
+    {
+      "id": "my-hours",
+      "workflow": "employee-hours",
+      "method": "GET",
+      "frontendPath": "/timesheet/my-hours",
+      "backendPath": "/api/timesheet/my-hours",
+      "auth": "employee",
+      "requestModel": null,
+      "requestFields": [],
+      "responseFields": [
+        "success",
+        "todayHours",
+        "weeklyHours",
+        "monthlyHours",
+        "yearlyHours",
+        "recentShifts"
+      ]
+    },
+    {
+      "id": "time-data-correction-inventory",
+      "workflow": "admin-corrections",
+      "method": "GET",
+      "frontendPath": "/admin/corrections/time-data",
+      "backendPath": "/api/admin/corrections/time-data",
+      "auth": "admin",
+      "requestModel": null,
+      "requestFields": [],
+      "responseFields": [
+        "success",
+        "summary",
+        "duplicateShiftGroups",
+        "staleOpenShifts"
+      ]
+    },
+    {
+      "id": "time-data-correction-preview",
+      "workflow": "admin-corrections",
+      "method": "POST",
+      "frontendPath": "/admin/corrections/time-data/preview",
+      "backendPath": "/api/admin/corrections/time-data/preview",
+      "auth": "admin",
+      "requestModel": "TimeDataCorrectionPlanRequest",
+      "requestFields": [
+        "reason",
+        "duplicateResolutions",
+        "staleShiftClosures"
+      ],
+      "responseFields": [
+        "success",
+        "summary",
+        "planToken"
+      ]
+    },
+    {
+      "id": "time-data-correction-apply",
+      "workflow": "admin-corrections",
+      "method": "POST",
+      "frontendPath": "/admin/corrections/time-data/apply",
+      "backendPath": "/api/admin/corrections/time-data/apply",
+      "auth": "admin",
+      "requestModel": "TimeDataCorrectionApplyRequest",
+      "requestFields": [
+        "reason",
+        "duplicateResolutions",
+        "staleShiftClosures",
+        "planToken",
+        "confirmation"
+      ],
+      "responseFields": [
+        "success",
+        "summary",
+        "archiveId"
+      ]
+    },
+    {
+      "id": "hours-report",
+      "workflow": "admin-hours-report",
+      "method": "GET",
+      "frontendPath": "/admin/reports/hours",
+      "backendPath": "/api/admin/reports/hours",
+      "auth": "admin",
+      "requestModel": null,
+      "requestFields": [],
+      "responseFields": [
+        "success",
+        "summary",
+        "employees"
+      ]
+    }
+  ]
+}
