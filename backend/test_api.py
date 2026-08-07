@@ -2147,6 +2147,7 @@ class TestTimesheetGpsFlow:
         status1 = client.get("/api/timesheet/current-status", headers=emp_auth)
         assert status1.status_code == 200, status1.text
         me1 = next(row for row in status1.json()["currentlyWorking"] if row["employeeName"] == "Catalina Gomez")
+        assert me1["employeeId"] == ci.json()["entry"]["employeeId"]
         assert me1["canDepart"] is True
         assert me1["activeVisit"]["location"] == "123 Main St, Effingham"
 
