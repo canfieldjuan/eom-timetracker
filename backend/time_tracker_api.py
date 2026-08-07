@@ -15141,15 +15141,19 @@ def _payroll_correction_rate_for_allocation(
     keyed by employee + date (never by shift), so the shift's rate has to be
     resolved from that day's shifts.
 
+    Each overlapping shift contributes its effective rate: a snapshotted shift
+    is frozen at its worked rate; a NULL-snapshot shift is not frozen, so it
+    follows the live rate (unknown only when the employee has no live rate).
+
     Precedence:
-      1. Snapshots on that day at this allocation's site -- the allocation names
-         a location, so this is the most precise match available.
-      2. Otherwise, snapshots anywhere that day if they all agree on one rate.
-      3. Otherwise (snapshots that disagree and none at this site) fail closed:
-         return no rate, so the cost stays NULL and laborCostComplete is False
-         rather than guessing which rate the corrected hours belong to.
-      4. No snapshots at all (pre-migration rows, or a rate-less employee) falls
-         back to the live rate, which is the behavior that predates snapshots.
+      1. Scope to the shifts that worked this allocation's site (the allocation
+         names a location); if none did, consider the whole day.
+      2. If every shift in scope agrees on one effective rate, return it.
+      3. If they disagree, fail closed: return no rate, so the cost stays NULL
+         and laborCostComplete is False rather than guessing.
+      4. If scope contains unknown-rate work: with no snapshots anywhere, fall
+         back to the live rate (the pre-migration / rate-less behavior); but if
+         known snapshots coexist with unknown-rate work, fail closed.
 
     A shift is "on that day" when its effective worked interval OVERLAPS the
     correction's local day, not merely when its clock-in local_date equals it: a
@@ -15179,6 +15183,12 @@ def _payroll_correction_rate_for_allocation(
     # weekly profitability attributes those minutes to the visit sites, so a
     # correction at B must see this shift's rate too -- keying only on the home
     # location_id would miss it.
+    # ALL overlapping shifts, snapshot or not. A NULL-snapshot shift is not
+    # frozen -- it is priced from the live rate everywhere else -- so it must
+    # participate here too: if the employee worked a frozen $20 shift and a
+    # NULL-snapshot shift on the same site/day and the live rate has since moved
+    # to $25, the day's effective rates disagree and the correction must fail
+    # closed rather than confidently return $20.
     cur.execute(
         """
         SELECT s.id,
@@ -15199,7 +15209,6 @@ def _payroll_correction_rate_for_allocation(
         ) corr ON TRUE
         LEFT JOIN visits v ON v.shift_id = s.id
         WHERE s.employee_id = %s
-          AND s.hourly_rate_cents IS NOT NULL
           AND COALESCE(corr.corrected_clock_in, s.clock_in) < %s
           AND (
                 COALESCE(corr.corrected_clock_out, s.clock_out) IS NULL
@@ -15213,26 +15222,44 @@ def _payroll_correction_rate_for_allocation(
     if not rows:
         return live_hourly_rate, True
 
-    def _rate(row: Any) -> Decimal:
-        return Decimal(int(row["hourly_rate_cents"])) / Decimal(100)
+    live_rate_dec: Optional[Decimal] = (
+        Decimal(str(live_hourly_rate)) if live_hourly_rate is not None else None
+    )
+    any_snapshot = any(row.get("hourly_rate_cents") is not None for row in rows)
 
-    # A shift counts toward this site when it worked there at all -- home or any
-    # visit. Two shifts that both worked this site at different rates therefore
-    # land in the fail-closed branch below rather than silently returning one.
-    site_rates = {
-        _rate(row)
-        for row in rows
-        if int(location_id) in {int(loc) for loc in (row.get("worked_location_ids") or [])}
-    }
-    if len(site_rates) == 1:
-        return site_rates.pop(), True
+    def _effective_rate(row: Any) -> Optional[Decimal]:
+        # A snapshotted shift is frozen at its worked rate; a NULL-snapshot shift
+        # follows the live rate (None only when the employee has no live rate).
+        cents = row.get("hourly_rate_cents")
+        if cents is not None:
+            return Decimal(int(cents)) / Decimal(100)
+        return live_rate_dec
 
-    day_rates = {_rate(row) for row in rows}
-    if len(day_rates) == 1:
-        return day_rates.pop(), True
+    def _worked_here(row: Any) -> bool:
+        return int(location_id) in {
+            int(loc) for loc in (row.get("worked_location_ids") or [])
+        }
 
-    # Either this site alone carried disagreeing rates, or the day did and none
-    # of them belong to this site. Guessing would silently misprice the money.
+    # Scope to shifts that worked this allocation's site when any did; otherwise
+    # consider the whole day, matching the original site-then-day precedence.
+    scope = [row for row in rows if _worked_here(row)] or rows
+    effective = [_effective_rate(row) for row in scope]
+
+    if any(rate is None for rate in effective):
+        # Unknown-rate work in scope. With no snapshots anywhere this is the
+        # pre-migration / rate-less fallback (return the live rate, which may be
+        # None -- the existing missing-rate behavior). But if known snapshots
+        # coexist with unknown-rate work, the scope is mixed and pricing it would
+        # be a guess, so fail closed.
+        if not any_snapshot:
+            return live_hourly_rate, True
+        return None, False
+
+    distinct = set(effective)
+    if len(distinct) == 1:
+        return distinct.pop(), True
+
+    # Disagreeing effective rates in scope: guessing would misprice the money.
     return None, False
 
 

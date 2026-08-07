@@ -1649,3 +1649,63 @@ def test_correction_snapshot_serializes_the_rate_and_separates_rate_duplicates()
     sig_20 = api._correction_metadata_signature(by_id[shift_20])
     sig_25 = api._correction_metadata_signature(by_id[shift_25])
     assert sig_20 != sig_25
+
+
+def test_daily_profitability_splits_labor_by_rate_not_by_hours(client, monkeypatch):
+    """One job, one worker, two days at different snapshot rates.
+
+    Before the fix the worker's correct $50 job total was re-split across the two
+    days purely by hours (1h/1h), reporting $25/$25. The daily split must weight
+    by each day's actual labor, so the days read $20 and $30 while the job total
+    stays $50.
+    """
+    # Mint the token before "now" moves: a token issued in 2050 would not
+    # validate against the real clock.
+    payroll_auth = _payroll_auth(client)
+    monkeypatch.setattr(
+        api, "utc_now", lambda: datetime(2050, 3, 17, 18, tzinfo=timezone.utc)
+    )
+    worker = _employee("Split Worker", 99.00)  # live rate is irrelevant; shifts carry snapshots
+    source_id = _calendar_source("split")
+    _, site_id, customer_name, address = _customer_site("Split")
+    job_id = _job(
+        source_id=source_id,
+        site_id=site_id,
+        customer_name=customer_name,
+        service_day=SERVICE_DAY,
+        seed="split-job",
+    )
+    _shift(
+        employee_id=worker,
+        site_id=site_id,
+        address=address,
+        service_day=SERVICE_DAY,
+        start_hour=9,
+        end_hour=10,
+        job_id=job_id,
+        hourly_rate_cents=2000,
+    )
+    _shift(
+        employee_id=worker,
+        site_id=site_id,
+        address=address,
+        service_day=NEXT_SERVICE_DAY,
+        start_hour=9,
+        end_hour=10,
+        job_id=job_id,
+        hourly_rate_cents=3000,
+    )
+
+    resp = client.get(
+        "/api/admin/payroll/labor-profitability",
+        headers=payroll_auth,
+        params={"weekStart": WEEK_START.isoformat()},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "byDay" in body, list(body.keys())
+    days = {row["date"]: row for row in body["byDay"]}
+    assert days[SERVICE_DAY.isoformat()]["actualLaborCost"] == pytest.approx(20.0)
+    assert days[NEXT_SERVICE_DAY.isoformat()]["actualLaborCost"] == pytest.approx(30.0)
+    assert body["summary"]["actualLaborCost"] == pytest.approx(50.0)
+    assert body["summary"]["laborCostComplete"] is True

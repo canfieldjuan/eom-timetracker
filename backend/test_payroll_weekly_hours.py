@@ -5708,3 +5708,86 @@ def test_correction_falls_back_to_the_live_rate_without_snapshots(client):
     assert allocation["allocatedDeltaMinutes"] == 60
     assert allocation["allocatedLaborCost"] == 25.0
     assert allocation["laborCostComplete"] is True
+
+
+def _allocate_with_mixed_snapshot_shift(client, *, week_start, service_day, live_rate_after, label):
+    """One snapshotted shift + one NULL-snapshot shift at the same site/day.
+
+    A NULL-snapshot shift follows the live rate, so once the rate moves it is a
+    second effective rate for the day. Returns the allocation payload.
+    """
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    payroll_name = f"Payroll Labor Profitability MIX Payroll {label}"
+    worker_name = f"Payroll Labor Profitability MIX Worker {label}"
+    _create_employee(payroll_name, role="payroll")
+    employee_id = _create_employee(worker_name, hourly_rate=20.00)
+    payroll_auth = _login(client, payroll_name)
+    source_id = _create_payroll_profitability_source()
+    _, site_id = _create_payroll_profitability_site()
+
+    # Shift A, then stamp only it to $20; shift B is created afterward so it keeps
+    # a NULL snapshot at the same site/day.
+    job_a = _create_payroll_profitability_job_and_shift(
+        employee_id=employee_id, site_id=site_id, source_id=source_id,
+        service_day=service_day, source_seed="1",
+    )
+    _stamp_shift_snapshots(employee_id, service_day, {site_id: 2000})
+    _create_payroll_profitability_job_and_shift(
+        employee_id=employee_id, site_id=site_id, source_id=source_id,
+        service_day=service_day, local_start=_local_dt(service_day, 13),
+        local_end=_local_dt(service_day, 15), source_seed="2",
+    )
+
+    db.execute(
+        "UPDATE employees SET hourly_rate = %s WHERE id = %s",
+        (live_rate_after, employee_id),
+    )
+    corrected = client.post(
+        "/api/admin/payroll/weekly-hours/corrections",
+        headers=payroll_auth,
+        json={
+            "weekStart": week_start.isoformat(),
+            "employeeId": employee_id,
+            "date": service_day.isoformat(),
+            "correctedTotalMinutes": 300,
+            "reason": "Mayra corrected total hours.",
+        },
+    )
+    assert corrected.status_code == 200, corrected.text
+    correction_id = corrected.json()["correction"]["correctionId"]
+    allocated = client.post(
+        f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation",
+        headers=payroll_auth,
+        json={"locationId": site_id, "jobId": job_a, "reason": "Assigned to this Site."},
+    )
+    assert allocated.status_code == 200, allocated.text
+    return allocated.json()["allocation"]
+
+
+def test_correction_fails_closed_when_a_null_snapshot_shift_diverges(client):
+    """A frozen $20 shift + a NULL-snapshot shift now following a $25 live rate.
+
+    The day's effective rates disagree ($20 vs $25), so the correction must fail
+    closed rather than confidently price at the one frozen snapshot it can see.
+    """
+    allocation = _allocate_with_mixed_snapshot_shift(
+        client, week_start=date(2026, 9, 6), service_day=date(2026, 9, 7),
+        live_rate_after=25.00, label="Diverge",
+    )
+    assert allocation["allocatedLaborCost"] is None
+    assert allocation["laborCostComplete"] is False
+
+
+def test_correction_prices_when_the_null_snapshot_shift_agrees(client):
+    """Same mixed setup, but the live rate still matches the snapshot ($20).
+
+    The NULL-snapshot shift's effective rate equals the frozen rate, so the day
+    agrees and the correction prices cleanly at $20.
+    """
+    allocation = _allocate_with_mixed_snapshot_shift(
+        client, week_start=date(2026, 9, 13), service_day=date(2026, 9, 14),
+        live_rate_after=20.00, label="Agree",
+    )
+    assert allocation["laborCostComplete"] is True
+    assert allocation["allocatedLaborCost"] is not None
