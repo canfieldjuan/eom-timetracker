@@ -1531,3 +1531,121 @@ def test_one_time_allocation_backfill_fails_closed_on_disagreeing_snapshots():
     api._run_one_time_allocation_rate_backfill()
 
     assert _allocation_cost(allocation_id) is None
+
+
+# --- 7. resolver sees visit locations (multi-stop shifts), fails closed -------
+
+def _add_visit(shift_id: int, location_id: int, address: str, arrival: datetime) -> int:
+    return int(
+        db.execute_returning(
+            """
+            INSERT INTO visits (shift_id, location_id, location_label,
+                                arrival_time, sequence_version)
+            VALUES (%s, %s, %s, %s, 2)
+            RETURNING id
+            """,
+            (shift_id, location_id, address, arrival.astimezone(timezone.utc)),
+        )
+    )
+
+
+def test_correction_resolver_sees_visited_sites_not_only_the_home_location():
+    """A multi-stop shift homed at A that visits B genuinely worked at B. A
+    second shift homed at B at a different rate makes B ambiguous, so a
+    correction allocated to B must fail closed rather than confidently return
+    the second shift's rate."""
+    worker = _employee("MultiStop", 20.00)
+    _, site_a, _, addr_a = _customer_site("MultiStopA")
+    _, site_b, _, addr_b = _customer_site("MultiStopB")
+
+    # Shift 1: home A, $20, visits B mid-shift.
+    shift_a = _shift(
+        employee_id=worker, site_id=site_a, address=addr_a,
+        service_day=SERVICE_DAY, start_hour=8, end_hour=12, hourly_rate_cents=2000,
+    )
+    _add_visit(shift_a, site_b, addr_b, _local_dt(SERVICE_DAY, 10))
+
+    # Shift 2 same day: home B, $25 (a different worked rate at B).
+    _shift(
+        employee_id=worker, site_id=site_b, address=addr_b,
+        service_day=SERVICE_DAY, start_hour=13, end_hour=15, hourly_rate_cents=2500,
+    )
+    _set_rate(worker, 99.00)
+
+    # B saw both $20 (via shift_a's visit) and $25 (shift_b's home): ambiguous.
+    rate, resolved = _resolve_correction_rate(worker, SERVICE_DAY, site_b, 99.00)
+    assert resolved is False
+    assert rate is None
+
+    # Site A saw only $20 (shift_a's home) -> still resolves cleanly.
+    rate_a, resolved_a = _resolve_correction_rate(worker, SERVICE_DAY, site_a, 99.00)
+    assert resolved_a is True
+    assert rate_a == Decimal("20")
+
+
+def test_correction_resolver_single_stop_home_site_unaffected():
+    """A plain single-stop shift (home == worked site, no extra visits) prices
+    from its snapshot exactly as before."""
+    worker = _employee("SingleStop", 18.00)
+    _, site_id, _, address = _customer_site("SingleStop")
+    _shift(
+        employee_id=worker, site_id=site_id, address=address,
+        service_day=SERVICE_DAY, start_hour=9, end_hour=11, hourly_rate_cents=1800,
+    )
+    _set_rate(worker, 40.00)
+
+    rate, resolved = _resolve_correction_rate(worker, SERVICE_DAY, site_id, 40.00)
+    assert resolved is True
+    assert rate == Decimal("18")
+
+
+# --- 8. migration markers stay out of the public settings surface -------------
+
+def test_migration_markers_are_not_exposed_in_settings():
+    """The one-time backfill markers piggyback on the settings table but must
+    never leak into load_settings() / GET /api/admin/settings."""
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES (%s, 'true'::jsonb) "
+        "ON CONFLICT (key) DO NOTHING",
+        (api._SHIFT_RATE_BACKFILL_MARKER,),
+    )
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES (%s, 'true'::jsonb) "
+        "ON CONFLICT (key) DO NOTHING",
+        (api._ALLOCATION_RATE_BACKFILL_MARKER,),
+    )
+
+    settings = api.load_settings()
+    assert api._SHIFT_RATE_BACKFILL_MARKER not in settings
+    assert api._ALLOCATION_RATE_BACKFILL_MARKER not in settings
+    assert not any(k.startswith("_") for k in settings)
+    # A real setting is still present.
+    assert "laborPctTarget" in settings
+
+
+# --- 9. correction archive preserves the rate snapshot ------------------------
+
+def test_correction_snapshot_serializes_the_rate_and_separates_rate_duplicates():
+    """The archived correction snapshot must carry hourly_rate_cents, and two
+    otherwise-identical shifts at different rates must NOT hash as consistent
+    duplicates."""
+    worker = _employee("ArchiveRate", 20.00)
+    _, site_id, _, address = _customer_site("ArchiveRate")
+    shift_20 = _shift(
+        employee_id=worker, site_id=site_id, address=address,
+        service_day=SERVICE_DAY, start_hour=9, end_hour=11, hourly_rate_cents=2000,
+    )
+    shift_25 = _shift(
+        employee_id=worker, site_id=site_id, address=address,
+        service_day=SERVICE_DAY, start_hour=9, end_hour=11, hourly_rate_cents=2500,
+    )
+
+    snapshots = api._correction_shift_snapshots([shift_20, shift_25])
+    by_id = {int(s["id"]): s for s in snapshots}
+    assert by_id[shift_20]["hourlyRateCents"] == 2000
+    assert by_id[shift_25]["hourlyRateCents"] == 2500
+
+    # Same clock times/location but different rate -> distinct signatures.
+    sig_20 = api._correction_metadata_signature(by_id[shift_20])
+    sig_25 = api._correction_metadata_signature(by_id[shift_25])
+    assert sig_20 != sig_25

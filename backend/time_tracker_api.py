@@ -4384,8 +4384,8 @@ def _backfill_shift_hourly_rate_snapshots() -> None:
     )
 
 
-_SHIFT_RATE_BACKFILL_MARKER = "rate_snapshot_shift_backfill_completed"
-_ALLOCATION_RATE_BACKFILL_MARKER = "rate_snapshot_allocation_backfill_completed"
+_SHIFT_RATE_BACKFILL_MARKER = "_migration.rate_snapshot_shift_backfill_completed"
+_ALLOCATION_RATE_BACKFILL_MARKER = "_migration.rate_snapshot_allocation_backfill_completed"
 
 
 def _run_one_time_shift_rate_backfill() -> None:
@@ -12306,6 +12306,7 @@ def _correction_shift_snapshots(
             s.job_id,
             s.time_category,
             s.non_productive_type,
+            s.hourly_rate_cents,
             s.created_at
         FROM shifts s
         JOIN employees e ON e.id = s.employee_id
@@ -12603,6 +12604,13 @@ def _correction_shift_snapshots(
             "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
             "timeCategory": row.get("time_category") or "productive",
             "nonProductiveType": row.get("non_productive_type"),
+            # The worked-rate snapshot is part of a shift's identity for
+            # deduplication: two otherwise-identical shifts at different rates
+            # are NOT interchangeable, and the archived before-image must retain
+            # each shift's rate so a deletion never loses that evidence. It is
+            # not in the signature exclusion set, so it participates in the
+            # consistency check automatically.
+            "hourlyRateCents": int(row["hourly_rate_cents"]) if row.get("hourly_rate_cents") is not None else None,
             "createdAt": to_utc_iso(row["created_at"]),
             "visits": visits_by_shift.get(shift_id, []),
             "departures": departures_by_shift.get(shift_id, []),
@@ -15165,9 +15173,23 @@ def _payroll_correction_rate_for_allocation(
     day_end_utc = datetime.combine(
         correction_date + timedelta(days=1), clock_time.min, tzinfo=APP_TIMEZONE
     ).astimezone(timezone.utc)
+    # Each overlapping shift, its snapshot rate, and the full set of sites it
+    # actually worked: its home location plus every visit's location. A
+    # multi-stop shift homed at A that visits B genuinely worked at B, and
+    # weekly profitability attributes those minutes to the visit sites, so a
+    # correction at B must see this shift's rate too -- keying only on the home
+    # location_id would miss it.
     cur.execute(
         """
-        SELECT s.location_id, s.hourly_rate_cents
+        SELECT s.id,
+               s.hourly_rate_cents,
+               ARRAY_REMOVE(
+                   ARRAY_APPEND(
+                       ARRAY_AGG(DISTINCT v.location_id),
+                       s.location_id
+                   ),
+                   NULL
+               ) AS worked_location_ids
         FROM shifts s
         LEFT JOIN LATERAL (
             SELECT corrected_clock_in, corrected_clock_out
@@ -15175,6 +15197,7 @@ def _payroll_correction_rate_for_allocation(
             WHERE psc.shift_id = s.id AND psc.status = 'active'
             LIMIT 1
         ) corr ON TRUE
+        LEFT JOIN visits v ON v.shift_id = s.id
         WHERE s.employee_id = %s
           AND s.hourly_rate_cents IS NOT NULL
           AND COALESCE(corr.corrected_clock_in, s.clock_in) < %s
@@ -15182,6 +15205,7 @@ def _payroll_correction_rate_for_allocation(
                 COALESCE(corr.corrected_clock_out, s.clock_out) IS NULL
                 OR COALESCE(corr.corrected_clock_out, s.clock_out) > %s
           )
+        GROUP BY s.id, s.hourly_rate_cents, s.location_id
         """,
         (int(employee_id), day_end_utc, day_start_utc),
     )
@@ -15192,11 +15216,13 @@ def _payroll_correction_rate_for_allocation(
     def _rate(row: Any) -> Decimal:
         return Decimal(int(row["hourly_rate_cents"])) / Decimal(100)
 
+    # A shift counts toward this site when it worked there at all -- home or any
+    # visit. Two shifts that both worked this site at different rates therefore
+    # land in the fail-closed branch below rather than silently returning one.
     site_rates = {
         _rate(row)
         for row in rows
-        if row.get("location_id") is not None
-        and int(row["location_id"]) == int(location_id)
+        if int(location_id) in {int(loc) for loc in (row.get("worked_location_ids") or [])}
     }
     if len(site_rates) == 1:
         return site_rates.pop(), True
@@ -17973,7 +17999,13 @@ def admin_reports_hours_pdf(
 def load_settings(*, cursor: Optional[Any] = None) -> Dict[str, Any]:
     defaults: Dict[str, Any] = _SETTINGS_DEFAULTS.copy()
     rows = _payroll_query_all("SELECT key, value FROM settings", cursor=cursor)
-    data: Dict[str, Any] = {r["key"]: r["value"] for r in rows}
+    # Keys prefixed with "_" are internal state (e.g. one-time migration
+    # completion markers) that piggyback on the settings table for atomicity.
+    # They must never surface in load_settings() output, which feeds the public
+    # GET /api/admin/settings response and the PUT round-trip.
+    data: Dict[str, Any] = {
+        r["key"]: r["value"] for r in rows if not r["key"].startswith("_")
+    }
     for k, v in defaults.items():
         if k not in data:
             data[k] = v
