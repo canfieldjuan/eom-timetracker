@@ -480,6 +480,28 @@ CREATE TABLE site_qr_action_receipts (
     UNIQUE (employee_id, location_id, device_scanned_at)
 );
 
+-- Immutable request/response envelopes for ordinary paid-time button actions.
+-- The shifts, visits, and departures tables remain authoritative; these rows
+-- let the employee portal safely replay a committed action after a lost
+-- response without creating a second shift event.
+CREATE TABLE plain_time_action_receipts (
+    id                    BIGSERIAL PRIMARY KEY,
+    employee_id           INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    shift_id              INTEGER REFERENCES shifts(id) ON DELETE SET NULL,
+    action                VARCHAR(16) NOT NULL
+                              CHECK (action IN (
+                                  'clock-in', 'arrive',
+                                  'depart', 'clock-out'
+                              )),
+    idempotency_key       UUID NOT NULL,
+    request_fingerprint   VARCHAR(64) NOT NULL
+                              CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+    server_recorded_at    TIMESTAMPTZ NOT NULL,
+    response_body         JSONB NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (employee_id, idempotency_key)
+);
+
 -- Append-only admin dispositions for derived reconciliation exceptions. A
 -- disposition applies only to the exact evidence fingerprint that was
 -- reviewed; changed QR or timecard evidence automatically reopens the row.
@@ -971,6 +993,8 @@ CREATE INDEX idx_site_check_ins_review
     ON site_check_ins(review_status, server_checked_in_at DESC);
 CREATE INDEX idx_site_qr_action_receipts_shift
     ON site_qr_action_receipts(shift_id, server_recorded_at DESC);
+CREATE INDEX idx_plain_time_action_receipts_shift
+    ON plain_time_action_receipts(shift_id, server_recorded_at DESC);
 CREATE INDEX idx_site_check_in_reconciliation_reviews_lookup
     ON site_check_in_reconciliation_reviews(
         occurrence_key, evidence_fingerprint, reviewed_at DESC

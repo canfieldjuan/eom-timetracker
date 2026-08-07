@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Barrier, Event, Lock
+import uuid
 
 import bcrypt
 import pytest
@@ -1259,6 +1260,7 @@ class TestQrEventSchemaMigration:
         import time_tracker_api as api
 
         api.db.execute("""
+            DROP TABLE IF EXISTS plain_time_action_receipts;
             DROP TABLE IF EXISTS site_qr_action_receipts;
             DROP INDEX IF EXISTS uq_departures_visit_id;
             DROP INDEX IF EXISTS uq_visits_site_check_in_id;
@@ -1323,6 +1325,9 @@ class TestQrEventSchemaMigration:
             assert legacy_columns == []
             assert api.db.query_one(
                 "SELECT to_regclass('site_qr_action_receipts') AS table_name"
+            ) == {"table_name": None}
+            assert api.db.query_one(
+                "SELECT to_regclass('plain_time_action_receipts') AS table_name"
             ) == {"table_name": None}
 
             api._ensure_schema_migrations()
@@ -1528,6 +1533,51 @@ class TestQrEventSchemaMigration:
                   AND indexname = 'idx_site_qr_action_receipts_shift'
             """)
             assert "(shift_id, server_recorded_at DESC)" in receipt_index["indexdef"]
+
+            plain_receipt_columns = {
+                row["column_name"]: row
+                for row in api.db.query_all("""
+                    SELECT column_name, udt_name, is_nullable, column_default
+                    FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'plain_time_action_receipts'
+                """)
+            }
+            assert {
+                name: column["udt_name"]
+                for name, column in plain_receipt_columns.items()
+            } == {
+                "id": "int8",
+                "employee_id": "int4",
+                "shift_id": "int4",
+                "action": "varchar",
+                "idempotency_key": "uuid",
+                "request_fingerprint": "varchar",
+                "server_recorded_at": "timestamptz",
+                "response_body": "jsonb",
+                "created_at": "timestamptz",
+            }
+            assert plain_receipt_columns["response_body"]["is_nullable"] == "NO"
+
+            plain_receipt_constraints = "\n".join(
+                row["definition"]
+                for row in api.db.query_all("""
+                    SELECT pg_get_constraintdef(oid) AS definition
+                    FROM pg_constraint
+                    WHERE conrelid = 'plain_time_action_receipts'::regclass
+                """)
+            )
+            assert "UNIQUE (employee_id, idempotency_key)" in plain_receipt_constraints
+            for required_value in ("clock-in", "arrive", "depart", "clock-out"):
+                assert required_value in plain_receipt_constraints
+
+            plain_receipt_index = api.db.query_one("""
+                SELECT indexdef
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname = 'idx_plain_time_action_receipts_shift'
+            """)
+            assert "(shift_id, server_recorded_at DESC)" in plain_receipt_index["indexdef"]
         finally:
             api.db.execute("DELETE FROM shifts WHERE id = %s", (shift_id,))
 
@@ -1771,6 +1821,28 @@ class TestVisitJobIdentity:
             _delete_profitability_rows(job_ids=job_ids, site_ids=site_ids)
 
 
+def _clear_catalina_time_entries() -> int:
+    employee = db.query_one(
+        "SELECT id FROM employees WHERE name = %s",
+        ("Catalina Gomez",),
+    )
+    employee_id = int(employee["id"])
+    shift_rows = db.query_all(
+        "SELECT id FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    )
+    shift_ids = [int(row["id"]) for row in shift_rows]
+    db.execute(
+        "DELETE FROM plain_time_action_receipts WHERE employee_id = %s",
+        (employee_id,),
+    )
+    if shift_ids:
+        db.execute("DELETE FROM departures WHERE shift_id = ANY(%s)", (shift_ids,))
+        db.execute("DELETE FROM visits WHERE shift_id = ANY(%s)", (shift_ids,))
+        db.execute("DELETE FROM shifts WHERE id = ANY(%s)", (shift_ids,))
+    return employee_id
+
+
 class TestTimesheetGpsFlow:
     def test_timesheet_locations_exposes_match_radius(self, client, emp_auth):
         r = client.get("/api/timesheet/locations", headers=emp_auth)
@@ -1847,6 +1919,183 @@ class TestTimesheetGpsFlow:
         assert r2.status_code == 200, r2.text
         assert r2.json()["entry"]["clockOutGps"]["lat"] == pytest.approx(39.1205)
         assert r2.json()["entry"]["clockOutGps"]["accuracy"] == pytest.approx(11.4)
+
+    def test_plain_time_action_idempotency_replays_committed_successes(
+        self,
+        client,
+        emp_auth,
+    ):
+        employee_id = _clear_catalina_time_entries()
+        try:
+            clock_in_body = {
+                "location": "123 Main St, Effingham",
+                "latitude": 39.1201,
+                "longitude": -88.5432,
+                "accuracy": 7.25,
+                "idempotencyKey": str(uuid.uuid4()),
+            }
+            first_clock_in = client.post(
+                "/api/timesheet/clock-in",
+                headers=emp_auth,
+                json=clock_in_body,
+            )
+            assert first_clock_in.status_code == 200, first_clock_in.text
+            assert first_clock_in.json()["replayed"] is False
+            replay_clock_in = client.post(
+                "/api/timesheet/clock-in",
+                headers=emp_auth,
+                json=clock_in_body,
+            )
+            assert replay_clock_in.status_code == 200, replay_clock_in.text
+            assert replay_clock_in.json()["replayed"] is True
+            assert replay_clock_in.json()["entry"]["id"] == first_clock_in.json()["entry"]["id"]
+            assert (
+                replay_clock_in.json()["entry"]["clockIn"]
+                == first_clock_in.json()["entry"]["clockIn"]
+            )
+
+            arrive_body = {
+                "location": "123 Main St, Effingham",
+                "latitude": 39.1201,
+                "longitude": -88.5432,
+                "accuracy": 7.25,
+                "idempotencyKey": str(uuid.uuid4()),
+            }
+            first_arrive = client.post(
+                "/api/timesheet/visit",
+                headers=emp_auth,
+                json=arrive_body,
+            )
+            assert first_arrive.status_code == 200, first_arrive.text
+            assert first_arrive.json()["replayed"] is False
+            replay_arrive = client.post(
+                "/api/timesheet/visit",
+                headers=emp_auth,
+                json=arrive_body,
+            )
+            assert replay_arrive.status_code == 200, replay_arrive.text
+            assert replay_arrive.json()["replayed"] is True
+            assert replay_arrive.json()["visit"]["id"] == first_arrive.json()["visit"]["id"]
+            assert (
+                replay_arrive.json()["visit"]["arrivalTime"]
+                == first_arrive.json()["visit"]["arrivalTime"]
+            )
+
+            depart_body = {
+                "latitude": 39.1204,
+                "longitude": -88.5434,
+                "accuracy": 11.4,
+                "idempotencyKey": str(uuid.uuid4()),
+            }
+            first_depart = client.post(
+                "/api/timesheet/depart",
+                headers=emp_auth,
+                json=depart_body,
+            )
+            assert first_depart.status_code == 200, first_depart.text
+            assert first_depart.json()["replayed"] is False
+            replay_depart = client.post(
+                "/api/timesheet/depart",
+                headers=emp_auth,
+                json=depart_body,
+            )
+            assert replay_depart.status_code == 200, replay_depart.text
+            assert replay_depart.json()["replayed"] is True
+            assert (
+                replay_depart.json()["departure"]["id"]
+                == first_depart.json()["departure"]["id"]
+            )
+            assert (
+                replay_depart.json()["departure"]["departureTime"]
+                == first_depart.json()["departure"]["departureTime"]
+            )
+
+            clock_out_body = {
+                "notes": "cleanup",
+                "latitude": 39.1205,
+                "longitude": -88.5435,
+                "accuracy": 11.4,
+                "idempotencyKey": str(uuid.uuid4()),
+            }
+            first_clock_out = client.post(
+                "/api/timesheet/clock-out",
+                headers=emp_auth,
+                json=clock_out_body,
+            )
+            assert first_clock_out.status_code == 200, first_clock_out.text
+            assert first_clock_out.json()["replayed"] is False
+            replay_clock_out = client.post(
+                "/api/timesheet/clock-out",
+                headers=emp_auth,
+                json=clock_out_body,
+            )
+            assert replay_clock_out.status_code == 200, replay_clock_out.text
+            assert replay_clock_out.json()["replayed"] is True
+            assert (
+                replay_clock_out.json()["entry"]["clockOut"]
+                == first_clock_out.json()["entry"]["clockOut"]
+            )
+
+            counts = db.query_one(
+                """
+                SELECT
+                    COUNT(DISTINCT s.id) AS shifts,
+                    COUNT(DISTINCT v.id) AS visits,
+                    COUNT(DISTINCT d.id) AS departures,
+                    COUNT(DISTINCT r.id) AS receipts
+                FROM shifts s
+                LEFT JOIN visits v ON v.shift_id = s.id
+                LEFT JOIN departures d ON d.shift_id = s.id
+                LEFT JOIN plain_time_action_receipts r ON r.shift_id = s.id
+                WHERE s.employee_id = %s
+                """,
+                (employee_id,),
+            )
+            assert counts == {
+                "shifts": 1,
+                "visits": 1,
+                "departures": 1,
+                "receipts": 4,
+            }
+        finally:
+            _clear_catalina_time_entries()
+
+    def test_plain_time_action_idempotency_rejects_changed_retry(
+        self,
+        client,
+        emp_auth,
+    ):
+        _clear_catalina_time_entries()
+        try:
+            key = str(uuid.uuid4())
+            first = client.post(
+                "/api/timesheet/clock-in",
+                headers=emp_auth,
+                json={
+                    "location": "123 Main St, Effingham",
+                    "notes": "first attempt",
+                    "latitude": 39.1201,
+                    "longitude": -88.5432,
+                    "idempotencyKey": key,
+                },
+            )
+            assert first.status_code == 200, first.text
+
+            changed_retry = client.post(
+                "/api/timesheet/clock-in",
+                headers=emp_auth,
+                json={
+                    "location": "123 Main St, Effingham",
+                    "notes": "changed retry",
+                    "latitude": 39.1201,
+                    "longitude": -88.5432,
+                    "idempotencyKey": key,
+                },
+            )
+            assert changed_retry.status_code == 409, changed_retry.text
+            assert "different action details" in changed_retry.text
+        finally:
+            _clear_catalina_time_entries()
 
     def test_server_requires_gps_or_explicit_override_for_every_time_action(
         self,
