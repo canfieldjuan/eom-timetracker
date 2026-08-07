@@ -1331,18 +1331,18 @@ def test_correction_resolver_matches_a_shift_that_spilled_over_midnight():
 
     # The spillover day (Wed) is NOT the shift's local_date, yet the resolver
     # must still see the $20 snapshot via interval overlap.
-    rate, resolved = _resolve_correction_rate(worker, NEXT_SERVICE_DAY, site_id, 50.00)
+    rate, resolved, _ = _resolve_correction_rate(worker, NEXT_SERVICE_DAY, site_id, 50.00)
     assert resolved is True
     assert rate == Decimal("20")
 
     # The clock-in day (Tue) resolves the same snapshot.
-    rate_in, resolved_in = _resolve_correction_rate(worker, SERVICE_DAY, site_id, 50.00)
+    rate_in, resolved_in, _ = _resolve_correction_rate(worker, SERVICE_DAY, site_id, 50.00)
     assert resolved_in is True
     assert rate_in == Decimal("20")
 
     # A day the shift never touched still falls back to the live rate.
     untouched = SERVICE_DAY - timedelta(days=3)
-    rate_none, resolved_none = _resolve_correction_rate(worker, untouched, site_id, 50.00)
+    rate_none, resolved_none, _ = _resolve_correction_rate(worker, untouched, site_id, 50.00)
     assert resolved_none is True
     assert rate_none == 50.00
 
@@ -1573,12 +1573,12 @@ def test_correction_resolver_sees_visited_sites_not_only_the_home_location():
     _set_rate(worker, 99.00)
 
     # B saw both $20 (via shift_a's visit) and $25 (shift_b's home): ambiguous.
-    rate, resolved = _resolve_correction_rate(worker, SERVICE_DAY, site_b, 99.00)
+    rate, resolved, _ = _resolve_correction_rate(worker, SERVICE_DAY, site_b, 99.00)
     assert resolved is False
     assert rate is None
 
     # Site A saw only $20 (shift_a's home) -> still resolves cleanly.
-    rate_a, resolved_a = _resolve_correction_rate(worker, SERVICE_DAY, site_a, 99.00)
+    rate_a, resolved_a, _ = _resolve_correction_rate(worker, SERVICE_DAY, site_a, 99.00)
     assert resolved_a is True
     assert rate_a == Decimal("20")
 
@@ -1594,7 +1594,7 @@ def test_correction_resolver_single_stop_home_site_unaffected():
     )
     _set_rate(worker, 40.00)
 
-    rate, resolved = _resolve_correction_rate(worker, SERVICE_DAY, site_id, 40.00)
+    rate, resolved, _ = _resolve_correction_rate(worker, SERVICE_DAY, site_id, 40.00)
     assert resolved is True
     assert rate == Decimal("18")
 
@@ -1709,3 +1709,35 @@ def test_daily_profitability_splits_labor_by_rate_not_by_hours(client, monkeypat
     assert days[NEXT_SERVICE_DAY.isoformat()]["actualLaborCost"] == pytest.approx(30.0)
     assert body["summary"]["actualLaborCost"] == pytest.approx(50.0)
     assert body["summary"]["laborCostComplete"] is True
+
+
+def test_one_time_backfills_are_declared_after_their_tables(client):
+    """Deploy-breaker guard for the schema-migration order.
+
+    _ensure_schema_migrations runs on every startup. The allocation backfill
+    queries payroll_hour_correction_allocations and its resolver queries
+    payroll_shift_corrections; if the backfill calls precede those CREATE TABLEs
+    (as they originally did), an upgrade from a schema predating payroll
+    corrections raises undefined_table and the service never starts. The test
+    harness applies schema.sql fresh so the tables always exist, so this asserts
+    the ordering structurally: both one-time backfills must be CALLED after the
+    correction-table CREATEs within the migration function's source.
+    """
+    import inspect
+
+    src = inspect.getsource(api._ensure_schema_migrations)
+    create_alloc = src.index(
+        "CREATE TABLE IF NOT EXISTS payroll_hour_correction_allocations"
+    )
+    create_shift_corr = src.index(
+        "CREATE TABLE IF NOT EXISTS payroll_shift_corrections"
+    )
+    shift_backfill = src.index("_run_one_time_shift_rate_backfill()")
+    alloc_backfill = src.index("_run_one_time_allocation_rate_backfill()")
+    # The allocation backfill (and its resolver) depend on both correction
+    # tables; the shift backfill only needs shifts.hourly_rate_cents, but both
+    # are kept together at the end, after all DDL.
+    assert shift_backfill > create_alloc
+    assert shift_backfill > create_shift_corr
+    assert alloc_backfill > create_alloc
+    assert alloc_backfill > create_shift_corr

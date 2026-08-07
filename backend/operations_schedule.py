@@ -4592,6 +4592,39 @@ def _payroll_local_hours_by_day(
     return hours_by_day
 
 
+def _payroll_local_labor_weight_by_day(
+    intervals: List[Dict[str, Any]],
+    *,
+    shift_rate_cents: Dict[int, Optional[int]],
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> Dict[str, float]:
+    """Per-day labor weight (rate x hours) over the same day slices as the hours
+    map, so a mixed-rate worker total splits by labor instead of by hours."""
+    labor_weight_by_day: Dict[str, float] = defaultdict(float)
+    for interval in intervals:
+        if not interval.get("finalized") or not interval.get("intervalEnd"):
+            continue
+        shift_id = interval.get("shiftId")
+        rate_cents = (
+            shift_rate_cents.get(int(shift_id)) if shift_id is not None else None
+        )
+        if rate_cents is None:
+            continue
+        interval_start = _parse_utc_iso(str(interval["intervalStart"]))
+        interval_end = _parse_utc_iso(str(interval["intervalEnd"]))
+        for local_day, hours in _local_interval_day_slices(
+            interval_start,
+            interval_end,
+            range_start=range_start,
+            range_end=range_end,
+            app_timezone=app_timezone,
+        ):
+            labor_weight_by_day[local_day.isoformat()] += hours * rate_cents
+    return labor_weight_by_day
+
+
 def _payroll_correction_candidate_segments(
     profit_jobs: List[Dict[str, Any]],
     decorated_jobs: Dict[int, Dict[str, Any]],
@@ -4600,7 +4633,9 @@ def _payroll_correction_candidate_segments(
     app_timezone: ZoneInfo,
     range_start: datetime,
     range_end: datetime,
+    shift_rate_cents: Optional[Dict[int, Optional[int]]] = None,
 ) -> List[Dict[str, Any]]:
+    rate_by_shift = shift_rate_cents or {}
     segments: List[Dict[str, Any]] = []
     profit_jobs_by_id = {int(row["jobId"]): row for row in profit_jobs}
     for job_id, profit_row in profit_jobs_by_id.items():
@@ -4619,8 +4654,22 @@ def _payroll_correction_candidate_segments(
             if not hours_by_day:
                 continue
             worker_labor_cents = _money_cents(worker.get("laborCost"))
+            # Split the worker's job labor across days by each day's actual labor
+            # (rate x hours), mirroring _daily_worker_rows, so a day worked at a
+            # different snapshot rate is priced at that rate rather than the
+            # equal-hours average. Single-rate days weight proportional to hours,
+            # so the split is unchanged there.
+            labor_weight_by_day = _payroll_local_labor_weight_by_day(
+                worker.get("intervals") or [],
+                shift_rate_cents=rate_by_shift,
+                app_timezone=app_timezone,
+                range_start=range_start,
+                range_end=range_end,
+            )
             labor_by_day = (
-                _allocate_cents_by_weight(worker_labor_cents, dict(hours_by_day))
+                _allocate_cents_by_weight(
+                    worker_labor_cents, dict(labor_weight_by_day)
+                )
                 if worker_labor_cents is not None
                 else {}
             )
@@ -5036,6 +5085,7 @@ def build_weekly_labor_profitability(
         app_timezone=app_timezone,
         range_start=range_start,
         range_end=range_end,
+        shift_rate_cents=shift_rate_cents,
     )
     return {
         "success": True,

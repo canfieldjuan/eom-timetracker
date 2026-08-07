@@ -1589,15 +1589,16 @@ def test_payroll_timesheet_allocation_labels_and_rate_fingerprint(client):
             employee_id=employee_id,
         )
         third_allocation = third["employees"][0]["days"][1]["correction"]["allocation"]
-        # DELIBERATE CONTRACT FLIP (issue #126, rate snapshot). This test used to
-        # assert only the live recompute, which read as "a rate edit restates the
-        # allocation" -- the retroactive restatement #126 removes. Both halves of
-        # the audit pair are now pinned: currentAllocatedLaborCost still tracks
-        # today's rate (25.00), but the STORED allocatedLaborCost is frozen at the
-        # rate the correction was allocated at (20.00), and it is the stored value
-        # that _payroll_correction_labor_summary now sums into the money figures.
+        # This correction's shift carries NO snapshot: the profitability test
+        # helper raw-inserts the shift without hourly_rate_cents, so it follows
+        # the live rate exactly as the shift's own labor does. Finding 2 (#126):
+        # a correction on an unfrozen shift must NOT itself freeze -- it stays
+        # live-tracked (stored NULL, valued at the live recompute), or the
+        # correction would stick while the shift labor moved on a rate edit.
+        # After the raise it therefore reads $25, consistent with the shift.
+        assert third_allocation["allocatedLaborCost"] is None
+        assert third_allocation["laborCostIsLive"] is True
         assert third_allocation["currentAllocatedLaborCost"] == 25.0
-        assert third_allocation["allocatedLaborCost"] == 20.0
         assert third_allocation["laborCostComplete"] is True
         # D3: the fingerprint deliberately still hashes the live rate, so a rate
         # edit still invalidates a verified payroll week. Out of scope for #126.
@@ -3875,7 +3876,13 @@ def test_payroll_correction_allocation_attaches_site_proof_without_blending_actu
         assert allocation["jobId"] == job_id
         assert allocation["allocatedDeltaMinutes"] == 60
         assert allocation["allocatedDeltaHours"] == 1.0
-        assert allocation["allocatedLaborCost"] == 20.0
+        # The profitability helper's shift carries no snapshot, so this
+        # correction is live-tracked (finding 2, #126): stored NULL, valued at
+        # the live recompute -- the cost is known ($20) and complete, but not
+        # frozen, so it would move with a later rate edit like the shift's labor.
+        assert allocation["allocatedLaborCost"] is None
+        assert allocation["laborCostIsLive"] is True
+        assert allocation["currentAllocatedLaborCost"] == 20.0
         assert allocation["laborCostComplete"] is True
 
         response = client.get(
@@ -4020,30 +4027,22 @@ def test_payroll_correction_allocation_attaches_site_proof_without_blending_actu
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
-def test_payroll_correction_allocation_freezes_labor_after_rate_added(client):
-    """DELIBERATE CONTRACT FLIP (issue #126, rate snapshot).
+def test_payroll_correction_on_a_rateless_shift_tracks_the_live_rate(client):
+    """A correction on a NULL-snapshot (rate-less) shift tracks the live rate.
 
-    This test used to assert that adding an hourly rate AFTER the fact
-    retroactively materialised a correction labor cost of 20.00 and an
-    adjustedActualLaborCost of 40 + 20 = 60. That retroactive restatement is
-    precisely the bug #126 fixes: an employee's rate must stay editable, but an
-    edit must only affect future work.
+    The shift here carries no snapshot (the employee had no rate at clock-in),
+    so its own labor follows the live rate: once a rate is added, the shift
+    reads $40 (2h x $20). Finding 2 (#126): the correction on that shift must
+    track the live rate the same way -- if it stayed frozen/incomplete while the
+    shift labor moved, adjusted profitability would be internally inconsistent
+    (a live shift addend plus a stale correction addend for one employee-day).
 
-    _payroll_correction_labor_summary now prefers the allocation cost STORED at
-    allocation time over the live recompute. The allocation was made while the
-    employee had no rate, so its stored cost is permanently unknown and the
-    summary stays incomplete rather than inventing 20.00 from today's rate.
-
-    This is also what closes the mixed-rate hole the issue flagged: shift labor
-    is about to come from the per-shift snapshot, so summing it with a
-    live-rate-recomputed allocation would have added a frozen figure to a
-    floating one for the same employee-day. adjustedActualLaborCost now fails
-    closed to None instead. knownAdjustedActualLaborCost still carries the
-    partial 40.00 so the known-vs-complete pair keeps working.
-
-    currentAllocatedLaborCost still recomputes live and is still asserted below:
-    stored-vs-current is an intentional audit pair, it just no longer drives the
-    money figure.
+    So, unlike a genuinely snapshotted correction (which freezes), this one is
+    live-tracked: stored cost NULL + laborCostIsLive, valued at the live
+    recompute. Before a rate exists it is unknown/incomplete; after the rate is
+    added it becomes $20 and adjustedActualLaborCost is a consistent 40 + 20 =
+    60, both addends at the live rate. This is NOT the retroactive restatement
+    of a frozen shift -- the shift was never frozen.
     """
     week_start = date(2026, 7, 19)
     service_day = date(2026, 7, 20)
@@ -4113,37 +4112,38 @@ def test_payroll_correction_allocation_freezes_labor_after_rate_added(client):
         assert body["issues"] == []
         assert body["payrollHours"]["allocatedCorrectionCount"] == 1
         assert body["payrollHours"]["invalidAllocationCount"] == 0
-        # Frozen: the allocation was made with no rate, so its cost stays
-        # unknown. It is NOT restated from the rate added afterwards.
-        assert body["payrollHours"]["allocatedCorrectionLaborCost"] is None
-        assert body["payrollHours"]["knownAllocatedCorrectionLaborCost"] == 0.0
-        assert body["payrollHours"]["allocatedCorrectionLaborCostComplete"] is False
+        # Live-tracked: the shift carries no snapshot, so the correction follows
+        # the live rate. Once the rate is added it is known ($20) and complete,
+        # consistent with the shift's own live-rate labor -- NOT a restatement of
+        # a frozen shift, because this shift was never frozen.
+        assert body["payrollHours"]["allocatedCorrectionLaborCost"] == 20.0
+        assert body["payrollHours"]["knownAllocatedCorrectionLaborCost"] == 20.0
+        assert body["payrollHours"]["allocatedCorrectionLaborCostComplete"] is True
         correction = body["payrollHours"]["allocatedCorrections"][0]
         allocation = correction["allocation"]
         assert allocation["allocatedLaborCost"] is None
-        assert allocation["laborCostComplete"] is False
-        # Audit pair: the live recompute is still reported, it just no longer
-        # drives allocatedCorrectionLaborCost above.
+        assert allocation["laborCostIsLive"] is True
+        assert allocation["laborCostComplete"] is True
         assert allocation["currentAllocatedLaborCost"] == 20.0
         assert allocation["currentLaborCostComplete"] is True
-        # The shift itself carries no rate snapshot (it predates the rate), so it
-        # still falls back to the live rate -- unchanged behavior for shifts.
+        # The shift carries no rate snapshot (it predates the rate), so it falls
+        # back to the live rate -- $40 for 2h at $20.
         assert body["summary"]["actualLaborCost"] == 40.0
-        # 40 + 20 = 60 is gone: a frozen shift figure is never summed with a
-        # live-rate allocation. The total fails closed instead.
-        assert body["summary"]["adjustedActualLaborCost"] is None
-        assert body["summary"]["adjustedLaborCostComplete"] is False
-        assert body["summary"]["knownAdjustedActualLaborCost"] == 40.0
+        # 40 + 20 = 60, both addends at the live rate for the same employee-day:
+        # a live shift and its live-tracked correction stay consistent.
+        assert body["summary"]["adjustedActualLaborCost"] == 60.0
+        assert body["summary"]["adjustedLaborCostComplete"] is True
+        assert body["summary"]["knownAdjustedActualLaborCost"] == 60.0
         monday = next(row for row in body["byDay"] if row["date"] == "2026-07-20")
         assert monday["allocatedCorrections"] == [correction]
-        assert monday["adjustedActualLaborCost"] is None
-        assert monday["adjustedLaborCostComplete"] is False
-        assert monday["knownAdjustedActualLaborCost"] == 40.0
+        assert monday["adjustedActualLaborCost"] == 60.0
+        assert monday["adjustedLaborCostComplete"] is True
+        assert monday["knownAdjustedActualLaborCost"] == 60.0
         site = monday["sites"][0]
         assert site["allocatedCorrections"] == [correction]
-        assert site["adjustedActualLaborCost"] is None
+        assert site["adjustedActualLaborCost"] == 60.0
         assert site["jobs"][0]["allocatedCorrections"] == [correction]
-        assert site["jobs"][0]["adjustedActualLaborCost"] is None
+        assert site["jobs"][0]["adjustedActualLaborCost"] == 60.0
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_payroll_labor_profitability_rows()
@@ -5594,6 +5594,9 @@ def test_correction_is_priced_from_the_shift_snapshot_not_the_live_rate(client):
     assert allocation["allocatedDeltaMinutes"] == 60
     assert allocation["allocatedLaborCost"] == 20.0
     assert allocation["laborCostComplete"] is True
+    # Genuinely frozen: the shift is snapshotted, so the stored cost is
+    # authoritative and cannot move. Distinct from a live-tracked allocation.
+    assert allocation["laborCostIsLive"] is False
     # The audit half still tracks the live rate -- stored vs current is the pair.
     assert allocation["currentAllocatedLaborCost"] == 25.0
 
@@ -5694,7 +5697,13 @@ def test_correction_fails_closed_when_that_days_snapshots_disagree(client):
 
 
 def test_correction_falls_back_to_the_live_rate_without_snapshots(client):
-    """Pre-migration shifts carry no snapshot, so behavior is unchanged."""
+    """No snapshot that day -> the correction is live-tracked, not frozen.
+
+    Finding 2 (#126): a shift with no snapshot follows the live rate, so a
+    correction on it must keep tracking the live rate too -- stored NULL, valued
+    at the live recompute -- or a later raise would move the shift labor while
+    the correction stayed frozen. The money value is the live $25 and complete.
+    """
     allocation = _allocate_correction_at_rate(
         client,
         week_start=date(2026, 9, 6),
@@ -5703,10 +5712,10 @@ def test_correction_falls_back_to_the_live_rate_without_snapshots(client):
         live_rate_after=25.00,
         label="Fallback",
     )
-    # No snapshot anywhere that day -> the live $25/h applies, as it did before
-    # this change.
     assert allocation["allocatedDeltaMinutes"] == 60
-    assert allocation["allocatedLaborCost"] == 25.0
+    assert allocation["allocatedLaborCost"] is None
+    assert allocation["laborCostIsLive"] is True
+    assert allocation["currentAllocatedLaborCost"] == 25.0
     assert allocation["laborCostComplete"] is True
 
 
@@ -5782,12 +5791,113 @@ def test_correction_fails_closed_when_a_null_snapshot_shift_diverges(client):
 def test_correction_prices_when_the_null_snapshot_shift_agrees(client):
     """Same mixed setup, but the live rate still matches the snapshot ($20).
 
-    The NULL-snapshot shift's effective rate equals the frozen rate, so the day
-    agrees and the correction prices cleanly at $20.
+    The rates agree today, so the correction resolves cleanly and its money
+    value is $20 -- but because a NULL-snapshot shift is in scope (it would move
+    on the next raise), finding 2 keeps the correction live-tracked rather than
+    freezing it: stored NULL, valued at the live recompute, known and complete.
     """
     allocation = _allocate_with_mixed_snapshot_shift(
         client, week_start=date(2026, 9, 13), service_day=date(2026, 9, 14),
         live_rate_after=20.00, label="Agree",
     )
     assert allocation["laborCostComplete"] is True
-    assert allocation["allocatedLaborCost"] is not None
+    assert allocation["allocatedLaborCost"] is None
+    assert allocation["laborCostIsLive"] is True
+    assert allocation["currentAllocatedLaborCost"] == 20.0
+
+
+def test_correction_candidate_splits_daily_labor_by_rate(client):
+    """The correction-candidate daily labor must split by rate, not by hours.
+
+    One worker, one job, two snapshotted shifts: 1h Monday at $20 and 1h Tuesday
+    at $30 (job total $50). A Monday correction's candidate site/job labor must
+    read $20 (Monday's actual rate), not the $25 an equal-hours split of the $50
+    total would produce -- the sibling of the _daily_worker_rows fix.
+    """
+    week_start = date(2026, 7, 19)
+    monday = date(2026, 7, 20)
+    tuesday = date(2026, 7, 21)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    employee_id = None
+    payroll_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Split Payroll", role="payroll"
+        )
+        employee_id = _create_employee(
+            "Payroll Labor Profitability Split Worker", hourly_rate=30
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Split Payroll")
+        source_id = _create_payroll_profitability_source()
+        _, site_id = _create_payroll_profitability_site()
+        # Monday shift on a job, snapshotted at $20.
+        job_id = _create_payroll_profitability_job_and_shift(
+            employee_id=employee_id,
+            site_id=site_id,
+            source_id=source_id,
+            service_day=monday,
+            local_start=_local_dt(monday, 9),
+            local_end=_local_dt(monday, 10),
+            source_seed="dead",
+        )
+        # A second shift on the SAME job the next day, snapshotted at $30.
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO shifts (
+                        employee_id, location_id, location_label, job_id,
+                        clock_in, clock_out, total_hours, local_date, timezone,
+                        time_category, notes, hourly_rate_cents
+                    )
+                    VALUES (%s, %s, 'Payroll Labor Profitability Site', %s,
+                            %s, %s, 1.00, %s, 'America/Chicago',
+                            'productive', 'split tue', 3000)
+                    """,
+                    (
+                        employee_id, site_id, job_id,
+                        _local_dt(tuesday, 9).astimezone(timezone.utc),
+                        _local_dt(tuesday, 10).astimezone(timezone.utc),
+                        tuesday,
+                    ),
+                )
+            conn.commit()
+        _stamp_shift_snapshots(employee_id, monday, {site_id: 2000})
+
+        # An unallocated Monday correction surfaces Monday's candidate labor.
+        corrected = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": monday.isoformat(),
+                "correctedTotalMinutes": 120,
+                "reason": "Mayra corrected Monday.",
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+
+        response = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        correction = next(
+            row for row in body["payrollHours"]["unallocatedCorrections"]
+            if row["date"] == monday.isoformat()
+        )
+        site = next(
+            s for s in correction["candidateSites"] if s["locationId"] == site_id
+        )
+        # Monday's actual labor is $20 (1h at the $20 snapshot), not the $25 an
+        # equal-hours split of the $50 job total would report.
+        assert site["actualLaborCost"] == 20.0
+        job = next(j for j in site["jobs"] if j["jobId"] == job_id)
+        assert job["actualLaborCost"] == 20.0
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([v for v in (employee_id, payroll_id) if v])

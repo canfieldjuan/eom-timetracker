@@ -4457,27 +4457,27 @@ def _run_one_time_allocation_rate_backfill() -> None:
             )
             allocations = cur.fetchall() or []
             for row in allocations:
-                rate, resolved = _payroll_correction_rate_for_allocation(
+                rate, resolved, from_snapshot = _payroll_correction_rate_for_allocation(
                     cur,
                     employee_id=int(row["employee_id"]),
                     correction_date=row["correction_date"],
                     location_id=int(row["location_id"]),
                     live_hourly_rate=row.get("live_hourly_rate"),
                 )
-                new_cost = (
-                    _payroll_delta_labor_cost_cents(
-                        int(row["allocated_delta_minutes"]), rate
-                    )
-                    if resolved
-                    else None
+                new_cost, is_live = _payroll_correction_allocation_cost(
+                    int(row["allocated_delta_minutes"]),
+                    rate,
+                    resolved,
+                    from_snapshot,
                 )
                 cur.execute(
                     """
                     UPDATE payroll_hour_correction_allocations
-                    SET allocated_labor_cost_cents = %s
+                    SET allocated_labor_cost_cents = %s,
+                        allocated_labor_cost_is_live = %s
                     WHERE id = %s
                     """,
-                    (new_cost, int(row["id"])),
+                    (new_cost, is_live, int(row["id"])),
                 )
             cur.execute(
                 "INSERT INTO settings (key, value) VALUES (%s, 'true'::jsonb) "
@@ -4907,12 +4907,6 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS hourly_rate_cents INTEGER"
     )
-    # One-time, marker-gated so it stamps only the shifts that predate the
-    # snapshot column and never re-stamps rate-less shifts created afterwards.
-    _run_one_time_shift_rate_backfill()
-    # One-time reprice of allocations written before their cost became
-    # authoritative, so shift labor and correction labor agree post-migration.
-    _run_one_time_allocation_rate_backfill()
     db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS gps_meta JSONB"
     )
@@ -5147,6 +5141,12 @@ def _ensure_schema_migrations() -> None:
             CHECK (correction_date >= week_start AND correction_date < week_start + 7)
         )
     """)
+    # Additive for installs whose allocation table predates the live-rate flag.
+    db.execute(
+        "ALTER TABLE payroll_hour_correction_allocations "
+        "ADD COLUMN IF NOT EXISTS allocated_labor_cost_is_live "
+        "BOOLEAN NOT NULL DEFAULT FALSE"
+    )
     db.execute("""
         CREATE TABLE IF NOT EXISTS payroll_shift_corrections (
             id                        BIGSERIAL PRIMARY KEY,
@@ -5273,6 +5273,20 @@ def _ensure_schema_migrations() -> None:
     from calendar_import_store import ensure_schema as ensure_calendar_schema
 
     ensure_calendar_schema()
+
+    # One-time rate backfills run LAST, after every CREATE TABLE / ALTER above.
+    # The allocation backfill queries payroll_hour_correction_allocations and
+    # payroll_shift_corrections, which are created earlier in this same function
+    # -- running the backfill before those CREATEs raised undefined_table and
+    # crashed startup on any upgrade from a schema predating payroll corrections.
+    # Both are marker-gated (exactly-once) and each commits its mutation and
+    # marker atomically, so their position only needs to be after their tables.
+    # Shift backfill: stamps only shifts predating the snapshot column, never
+    # re-stamping rate-less shifts created afterwards.
+    _run_one_time_shift_rate_backfill()
+    # Allocation backfill: reprices allocations written before their cost became
+    # authoritative, so shift labor and correction labor agree post-migration.
+    _run_one_time_allocation_rate_backfill()
 
 
 def _auto_migrate_if_empty() -> bool:
@@ -15132,7 +15146,7 @@ def _payroll_correction_rate_for_allocation(
     correction_date: Any,
     location_id: int,
     live_hourly_rate: Any,
-) -> Tuple[Any, bool]:
+) -> Tuple[Any, bool, bool]:
     """Rate to price a correction at, preferring the rate the work was worked at.
 
     A correction adjusts hours that were already worked, so pricing it from the
@@ -15162,8 +15176,15 @@ def _payroll_correction_rate_for_allocation(
     the spillover day must see that shift's rate. Corrected clock times take
     precedence over the raw ones, matching _effective_payroll_shift_row.
 
-    Returns (rate, resolved). ``resolved`` is False only for the fail-closed
-    case, which the caller must not paper over with the live rate.
+    Returns (rate, resolved, from_snapshot). ``resolved`` is False only for the
+    fail-closed case, which the caller must not paper over with the live rate.
+    ``from_snapshot`` is True only when the rate is genuinely frozen -- every
+    in-scope shift carried a snapshot. When it is False but ``resolved`` is True,
+    the rate came from the live employee rate (no snapshot in scope, or a
+    NULL-snapshot shift is in scope), so the caller must NOT freeze the cost:
+    such an allocation has to keep tracking the live rate, exactly as the
+    NULL-snapshot shift's own labor does, or a later rate edit would move the
+    shift labor while the correction stayed frozen.
     """
     if not isinstance(correction_date, date):
         correction_date = datetime.strptime(str(correction_date), "%Y-%m-%d").date()
@@ -15220,7 +15241,8 @@ def _payroll_correction_rate_for_allocation(
     )
     rows = cur.fetchall() or []
     if not rows:
-        return live_hourly_rate, True
+        # No shift on that day: live rate, not frozen.
+        return live_hourly_rate, True, False
 
     live_rate_dec: Optional[Decimal] = (
         Decimal(str(live_hourly_rate)) if live_hourly_rate is not None else None
@@ -15244,6 +15266,13 @@ def _payroll_correction_rate_for_allocation(
     # consider the whole day, matching the original site-then-day precedence.
     scope = [row for row in rows if _worked_here(row)] or rows
     effective = [_effective_rate(row) for row in scope]
+    # The rate is only genuinely frozen when every in-scope shift is snapshotted.
+    # A NULL-snapshot shift follows the live rate, so even if it agrees today it
+    # will move on the next rate edit -- such an allocation must track live, not
+    # freeze.
+    scope_all_snapshotted = all(
+        row.get("hourly_rate_cents") is not None for row in scope
+    )
 
     if any(rate is None for rate in effective):
         # Unknown-rate work in scope. With no snapshots anywhere this is the
@@ -15252,14 +15281,36 @@ def _payroll_correction_rate_for_allocation(
         # coexist with unknown-rate work, the scope is mixed and pricing it would
         # be a guess, so fail closed.
         if not any_snapshot:
-            return live_hourly_rate, True
-        return None, False
+            return live_hourly_rate, True, False
+        return None, False, False
 
     distinct = set(effective)
     if len(distinct) == 1:
-        return distinct.pop(), True
+        return distinct.pop(), True, scope_all_snapshotted
 
     # Disagreeing effective rates in scope: guessing would misprice the money.
+    return None, False, False
+
+
+def _payroll_correction_allocation_cost(
+    delta_minutes: int,
+    rate: Any,
+    resolved: bool,
+    from_snapshot: bool,
+) -> Tuple[Optional[int], bool]:
+    """Map a resolver verdict to (stored_labor_cost_cents, is_live).
+
+    - Snapshot rate -> freeze the computed cents (is_live False).
+    - Live-rate fallback (resolved but not from a snapshot) -> store NULL and
+      mark is_live, so the allocation is valued at the live recompute and tracks
+      later rate edits, consistent with its NULL-snapshot shift's own labor.
+    - Fail-closed (unresolved) -> store NULL, not live: cost is unknown and the
+      allocation reads incomplete for review.
+    """
+    if resolved and from_snapshot:
+        return _payroll_delta_labor_cost_cents(delta_minutes, rate), False
+    if resolved:
+        return None, True
     return None, False
 
 
@@ -15595,17 +15646,19 @@ def _payroll_correction_labor_summary(
     labor_incomplete = False
     for correction in corrections:
         allocation = correction.get("allocation") or {}
-        # Prefer the value STORED at allocation time over the live recompute.
-        # Shift labor now comes from the per-shift rate snapshot; if allocations
-        # kept recomputing off the live rate, adjustedActualLaborCost would add a
-        # snapshot-rate addend to a live-rate addend for the same employee-day.
-        # currentAllocatedLaborCost is still serialized -- stored vs current is a
-        # deliberate audit pair -- it just no longer drives the money figure.
-        cost_source = (
-            allocation.get("allocatedLaborCost")
-            if "allocatedLaborCost" in allocation
-            else allocation.get("currentAllocatedLaborCost")
-        )
+        # A frozen allocation (priced from a snapshot) drives the money figure
+        # from its STORED cost, so a later rate edit cannot restate it. A
+        # live-tracked allocation (its shift carried no snapshot, so its labor
+        # follows the live rate) stores NULL and is valued at the live recompute,
+        # staying consistent with that shift's own live-rate labor. Anything else
+        # with no stored cost is a fail-closed unknown and reads incomplete.
+        stored_cost = allocation.get("allocatedLaborCost")
+        if stored_cost is not None:
+            cost_source = stored_cost
+        elif allocation.get("laborCostIsLive"):
+            cost_source = allocation.get("currentAllocatedLaborCost")
+        else:
+            cost_source = None
         cost_cents = _payroll_signed_money_cents(cost_source)
         if cost_cents is None:
             labor_incomplete = True
@@ -16346,12 +16399,21 @@ def _payroll_correction_rows(
 def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, Any]:
     delta_minutes = int(row["allocated_delta_minutes"])
     stored_labor_cost_cents = row.get("allocated_labor_cost_cents")
+    is_live = bool(row.get("allocated_labor_cost_is_live"))
     current_labor_cost_cents = stored_labor_cost_cents
     if "employee_hourly_rate" in row:
         current_labor_cost_cents = _payroll_delta_labor_cost_cents(
             delta_minutes,
             row.get("employee_hourly_rate"),
         )
+    # A live-tracked allocation stores NULL but is valued at the live recompute,
+    # so its cost is known (and complete) whenever the live rate is known. A
+    # frozen allocation is complete when its stored cost is present. A NULL that
+    # is neither frozen nor live-tracked is a fail-closed unknown.
+    effective_complete = (
+        stored_labor_cost_cents is not None
+        or (is_live and current_labor_cost_cents is not None)
+    )
     return {
         "allocationId": int(row["id"]),
         "correctionId": int(row["correction_id"]),
@@ -16370,7 +16432,8 @@ def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, A
         "allocatedDeltaMinutes": delta_minutes,
         "allocatedDeltaHours": round(delta_minutes / 60, 2),
         "allocatedLaborCost": _payroll_signed_money(stored_labor_cost_cents),
-        "laborCostComplete": stored_labor_cost_cents is not None,
+        "laborCostComplete": effective_complete,
+        "laborCostIsLive": is_live,
         "currentAllocatedLaborCost": _payroll_signed_money(current_labor_cost_cents),
         "currentLaborCostComplete": current_labor_cost_cents is not None,
         "reason": str(row["reason"]),
@@ -17177,17 +17240,20 @@ def admin_allocate_payroll_hour_correction(
             )
             # Price the correction from the rate the work was worked at, not
             # from whatever the employee earns today.
-            correction_rate, rate_resolved = _payroll_correction_rate_for_allocation(
-                cur,
-                employee_id=int(correction_row["employee_id"]),
-                correction_date=correction_row["correction_date"],
-                location_id=int(payload.locationId),
-                live_hourly_rate=correction_row.get("hourly_rate"),
+            correction_rate, rate_resolved, rate_from_snapshot = (
+                _payroll_correction_rate_for_allocation(
+                    cur,
+                    employee_id=int(correction_row["employee_id"]),
+                    correction_date=correction_row["correction_date"],
+                    location_id=int(payload.locationId),
+                    live_hourly_rate=correction_row.get("hourly_rate"),
+                )
             )
-            labor_cost_cents = (
-                _payroll_delta_labor_cost_cents(delta_minutes, correction_rate)
-                if rate_resolved
-                else None
+            labor_cost_cents, labor_cost_is_live = _payroll_correction_allocation_cost(
+                delta_minutes,
+                correction_rate,
+                rate_resolved,
+                rate_from_snapshot,
             )
             cur.execute(
                 """
@@ -17209,6 +17275,8 @@ def admin_allocate_payroll_hour_correction(
                 )
                 and int(existing["allocated_delta_minutes"]) == delta_minutes
                 and existing.get("allocated_labor_cost_cents") == labor_cost_cents
+                and bool(existing.get("allocated_labor_cost_is_live"))
+                    == labor_cost_is_live
                 and str(existing["reason"]) == payload.reason
             ):
                 saved = dict(existing)
@@ -17234,11 +17302,12 @@ def admin_allocate_payroll_hour_correction(
                         job_id,
                         allocated_delta_minutes,
                         allocated_labor_cost_cents,
+                        allocated_labor_cost_is_live,
                         reason,
                         created_by_employee_id,
                         created_by_name
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING *
                     """,
                     (
@@ -17250,6 +17319,7 @@ def admin_allocate_payroll_hour_correction(
                         int(payload.jobId) if payload.jobId is not None else None,
                         delta_minutes,
                         labor_cost_cents,
+                        labor_cost_is_live,
                         payload.reason,
                         int(current_payroll["id"]),
                         str(current_payroll["name"]),

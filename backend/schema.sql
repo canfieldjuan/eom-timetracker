@@ -807,6 +807,11 @@ CREATE TABLE payroll_hour_correction_allocations (
                                        AND allocated_delta_minutes <> 0
                                    ),
     allocated_labor_cost_cents INTEGER,
+    -- TRUE when allocated_labor_cost_cents is NULL because the correction is
+    -- priced from the live employee rate (its shift carried no snapshot), so it
+    -- must be valued at the live recompute and track later rate edits rather
+    -- than read as an unknown/fail-closed cost.
+    allocated_labor_cost_is_live BOOLEAN NOT NULL DEFAULT FALSE,
     reason                     TEXT NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 500),
     status                     VARCHAR(16) NOT NULL DEFAULT 'active'
                                    CHECK (status IN ('active', 'superseded', 'voided')),
