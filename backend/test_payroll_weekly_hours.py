@@ -5929,3 +5929,76 @@ def test_correction_candidate_splits_daily_labor_by_rate(client):
         _delete_payroll_verification_weeks([week_start])
         _delete_payroll_labor_profitability_rows()
         _delete_employees([v for v in (employee_id, payroll_id) if v])
+
+
+def test_void_of_a_live_tracked_allocation_serializes_the_live_cost(client):
+    """Voiding a live-tracked allocation must report its live value, not None.
+
+    A live-tracked allocation (shift had no snapshot) stores NULL cost and is
+    only serialized complete when the employee's current rate is injected. The
+    void endpoint returns RETURNING * (no rate column), so without injecting the
+    rate a voided live-tracked allocation would serialize as incomplete/None.
+    """
+    week_start = date(2026, 9, 6)
+    service_day = date(2026, 9, 7)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    label = "VoidLive"
+    payroll_name = f"Payroll Labor Profitability RS Payroll {label}"
+    worker_name = f"Payroll Labor Profitability RS Worker {label}"
+    _create_employee(payroll_name, role="payroll")
+    employee_id = _create_employee(worker_name, hourly_rate=20.00)
+    payroll_auth = _login(client, payroll_name)
+    source_id = _create_payroll_profitability_source()
+    _, site_id = _create_payroll_profitability_site()
+    job_id = _create_payroll_profitability_job_and_shift(
+        employee_id=employee_id,
+        site_id=site_id,
+        source_id=source_id,
+        service_day=service_day,
+    )
+    # No snapshot on the shift -> the allocation resolves via the live rate.
+    _stamp_shift_snapshots(employee_id, service_day, {site_id: None})
+
+    corrected = client.post(
+        "/api/admin/payroll/weekly-hours/corrections",
+        headers=payroll_auth,
+        json={
+            "weekStart": week_start.isoformat(),
+            "employeeId": employee_id,
+            "date": service_day.isoformat(),
+            "correctedTotalMinutes": 180,
+            "reason": "Mayra corrected total hours.",
+        },
+    )
+    assert corrected.status_code == 200, corrected.text
+    correction_id = corrected.json()["correction"]["correctionId"]
+
+    allocated = client.post(
+        f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation",
+        headers=payroll_auth,
+        json={
+            "locationId": site_id,
+            "jobId": job_id,
+            "reason": "Juan assigned Mayra's correction to this Site.",
+        },
+    )
+    assert allocated.status_code == 200, allocated.text
+    alloc = allocated.json()["allocation"]
+    # Precondition: it really is live-tracked (no snapshot -> live rate).
+    assert alloc["laborCostIsLive"] is True
+    assert alloc["allocatedLaborCost"] is None
+    assert alloc["currentAllocatedLaborCost"] is not None
+    live_cost = alloc["currentAllocatedLaborCost"]
+
+    voided = client.post(
+        f"/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation/void",
+        headers=payroll_auth,
+        json={"reason": "Reallocating this correction elsewhere."},
+    )
+    assert voided.status_code == 200, voided.text
+    void_alloc = voided.json()["allocation"]
+    # The void response must carry the live valuation, not serialize as None.
+    assert void_alloc["laborCostIsLive"] is True
+    assert void_alloc["currentAllocatedLaborCost"] == live_cost
+    assert void_alloc["laborCostComplete"] is True

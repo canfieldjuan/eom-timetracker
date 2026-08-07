@@ -1801,3 +1801,29 @@ def test_pending_allocation_is_valued_live_not_frozen(client):
     assert out["laborCostIsLive"] is True
     assert out["currentAllocatedLaborCost"] == 20.0
     assert out["laborCostComplete"] is True
+
+
+def test_trigger_reinstall_has_no_uncommitted_drop_window(client):
+    """The trigger DROP + CREATE must run in ONE transaction.
+
+    db.execute commits each statement in its own transaction, so a separate
+    DROP TRIGGER then CREATE TRIGGER would leave a window with no trigger, and
+    an old app instance inserting a shift in that window would escape stamping.
+    Assert structurally that both DDL statements execute on one get_conn block.
+    """
+    import inspect
+
+    src = inspect.getsource(api._ensure_schema_migrations)
+    drop = src.index("DROP TRIGGER IF EXISTS trg_stamp_shift_hourly_rate_cents")
+    create = src.index("CREATE TRIGGER trg_stamp_shift_hourly_rate_cents")
+    # The get_conn block that wraps them must open before the DROP and both
+    # statements must be executed on that same cursor (no db.execute between).
+    block_open = src.rindex("with db.get_conn() as conn:", 0, drop)
+    between = src[block_open:create]
+    assert "db.execute(" not in between, (
+        "DROP and CREATE TRIGGER must share one transaction, not separate "
+        "db.execute() calls"
+    )
+    assert between.count("cur.execute(") >= 1
+    # And the CREATE is inside the same block (no new get_conn between them).
+    assert "with db.get_conn() as conn:" not in src[drop:create]

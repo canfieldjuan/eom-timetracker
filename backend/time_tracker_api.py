@@ -4928,15 +4928,21 @@ def _ensure_schema_migrations() -> None:
         END;
         $$ LANGUAGE plpgsql;
     """)
-    db.execute(
-        "DROP TRIGGER IF EXISTS trg_stamp_shift_hourly_rate_cents ON shifts"
-    )
-    db.execute("""
-        CREATE TRIGGER trg_stamp_shift_hourly_rate_cents
-            BEFORE INSERT ON shifts
-            FOR EACH ROW
-            EXECUTE FUNCTION stamp_shift_hourly_rate_cents()
-    """)
+    # DROP + CREATE the trigger in a SINGLE transaction so the trigger is never
+    # absent between two committed statements -- otherwise an old app instance
+    # inserting a shift in that window would escape stamping. Kept as DROP/CREATE
+    # (rather than CREATE OR REPLACE TRIGGER, PG14+) so it is version-agnostic.
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DROP TRIGGER IF EXISTS trg_stamp_shift_hourly_rate_cents ON shifts"
+            )
+            cur.execute("""
+                CREATE TRIGGER trg_stamp_shift_hourly_rate_cents
+                    BEFORE INSERT ON shifts
+                    FOR EACH ROW
+                    EXECUTE FUNCTION stamp_shift_hourly_rate_cents()
+            """)
     db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS gps_meta JSONB"
     )
@@ -17481,6 +17487,19 @@ def admin_void_payroll_hour_correction_allocation(
                 ),
             )
             saved = dict(cur.fetchone())
+            # A live-tracked allocation stores NULL cost and is only serialized
+            # complete when the employee's current rate is present to recompute
+            # its live value. RETURNING * has no rate column, so inject it here
+            # the same way the allocate endpoint does -- otherwise a voided
+            # live-tracked allocation would serialize as incomplete.
+            cur.execute(
+                "SELECT hourly_rate FROM employees WHERE id = %s",
+                (int(saved["employee_id"]),),
+            )
+            employee_rate_row = cur.fetchone()
+            saved["employee_hourly_rate"] = (
+                employee_rate_row["hourly_rate"] if employee_rate_row else None
+            )
             _enrich_payroll_correction_allocation_target_labels(saved, cursor=cur)
             result = {
                 "success": True,
