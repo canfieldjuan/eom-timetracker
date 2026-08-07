@@ -205,6 +205,34 @@ CREATE TABLE shifts (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Stamp every shift with the employee's current rate at INSERT, in the
+-- DATABASE rather than the app, so it applies regardless of which app instance
+-- (or a mid-deploy old instance that predates the column in its code) wrote the
+-- row. Only fills a NULL -- an explicit value from the app is left untouched --
+-- and a rate-less employee leaves the snapshot NULL so the shift keeps
+-- following the live rate. This is the only trigger in the schema; it exists
+-- specifically to close the rolling-deployment window where an old instance's
+-- clock-in would otherwise store no snapshot.
+CREATE OR REPLACE FUNCTION stamp_shift_hourly_rate_cents()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.hourly_rate_cents IS NULL THEN
+        SELECT ROUND(e.hourly_rate * 100)
+          INTO NEW.hourly_rate_cents
+          FROM employees e
+         WHERE e.id = NEW.employee_id
+           AND e.hourly_rate IS NOT NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_stamp_shift_hourly_rate_cents ON shifts;
+CREATE TRIGGER trg_stamp_shift_hourly_rate_cents
+    BEFORE INSERT ON shifts
+    FOR EACH ROW
+    EXECUTE FUNCTION stamp_shift_hourly_rate_cents();
+
 -- Visits (multi-stop tracking within a shift)
 CREATE TABLE visits (
     id             SERIAL PRIMARY KEY,
@@ -807,11 +835,18 @@ CREATE TABLE payroll_hour_correction_allocations (
                                        AND allocated_delta_minutes <> 0
                                    ),
     allocated_labor_cost_cents INTEGER,
-    -- TRUE when allocated_labor_cost_cents is NULL because the correction is
-    -- priced from the live employee rate (its shift carried no snapshot), so it
-    -- must be valued at the live recompute and track later rate edits rather
-    -- than read as an unknown/fail-closed cost.
-    allocated_labor_cost_is_live BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Provenance of the cost, three-state on purpose:
+    --   TRUE  = live-tracked (shift carried no snapshot); cost stored NULL and
+    --           valued at the live recompute so it tracks later rate edits.
+    --   FALSE = frozen from a snapshot (or fail-closed unknown); the stored
+    --           cents are authoritative and a rate edit cannot restate them.
+    --   NULL  = not yet reconciled -- a row written before this column existed,
+    --           or by an old app instance during a rolling deploy. Such rows are
+    --           repriced on the next boot and, until then, are valued at the
+    --           live recompute rather than trusted as frozen. NO DEFAULT: a
+    --           writer that omits the column must leave it NULL, not FALSE, so
+    --           it is distinguishable and reconcilable.
+    allocated_labor_cost_is_live BOOLEAN,
     reason                     TEXT NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 500),
     status                     VARCHAR(16) NOT NULL DEFAULT 'active'
                                    CHECK (status IN ('active', 'superseded', 'voided')),

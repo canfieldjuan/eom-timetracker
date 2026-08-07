@@ -4385,7 +4385,8 @@ def _backfill_shift_hourly_rate_snapshots() -> None:
 
 
 _SHIFT_RATE_BACKFILL_MARKER = "_migration.rate_snapshot_shift_backfill_completed"
-_ALLOCATION_RATE_BACKFILL_MARKER = "_migration.rate_snapshot_allocation_backfill_completed"
+# (The allocation reconcile is no longer marker-gated -- it runs re-runnably
+# over IS NULL rows -- so its old completion marker was removed.)
 
 
 def _run_one_time_shift_rate_backfill() -> None:
@@ -4426,26 +4427,28 @@ def _run_one_time_shift_rate_backfill() -> None:
             )
 
 
-def _run_one_time_allocation_rate_backfill() -> None:
-    """Reprice existing active correction allocations to their worked rate, once.
+def _reconcile_unstamped_allocation_costs() -> None:
+    """Price any allocation whose cost provenance is unknown, re-runnably.
 
-    Allocation labor cost became authoritative for adjusted profitability in the
-    same change that froze shift labor to the per-shift snapshot. Rows written
-    before this deploy stored the live rate at allocation time, which can differ
-    from the shift's worked rate, leaving adjusted profitability internally
-    inconsistent (frozen shift labor + a stale allocation addend). Recompute each
-    active allocation through the same worked-rate resolver used for new
-    allocations so both halves agree. Deterministic from frozen snapshots, but
-    gated by a marker so it does not rewrite every allocation on every boot.
+    An allocation has NULL ``allocated_labor_cost_is_live`` in exactly two cases,
+    both meaning "written without this code's provenance logic": a row that
+    predates the column, or one an OLD app instance wrote during a rolling
+    deploy (its writer omits the column, so the nullable-no-default column stays
+    NULL). Both stored a live-rate cost that may disagree with the shift's worked
+    rate and must not be trusted as frozen.
+
+    Unlike the shift backfill -- where a NULL snapshot is a permanent, legitimate
+    state for a rate-less shift, so that backfill is one-time and marker-gated --
+    a NULL provenance here is always a transient "not yet reconciled" state that
+    the write path never produces. So this runs every boot but only touches
+    ``IS NULL`` rows: idempotent, cheap (normally zero rows), and it catches
+    deploy-window writes on the next boot. Each row is repriced through the same
+    resolver new allocations use, then stamped TRUE/FALSE so it is never
+    revisited. Reads treat a still-NULL row as live-valued in the meantime, so a
+    boundary row is never silently frozen while it waits.
     """
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT 1 FROM settings WHERE key = %s",
-                (_ALLOCATION_RATE_BACKFILL_MARKER,),
-            )
-            if cur.fetchone():
-                return
             cur.execute(
                 """
                 SELECT a.id, a.employee_id, a.correction_date, a.location_id,
@@ -4453,6 +4456,7 @@ def _run_one_time_allocation_rate_backfill() -> None:
                 FROM payroll_hour_correction_allocations a
                 JOIN employees e ON e.id = a.employee_id
                 WHERE a.status = 'active'
+                  AND a.allocated_labor_cost_is_live IS NULL
                 """
             )
             allocations = cur.fetchall() or []
@@ -4479,11 +4483,6 @@ def _run_one_time_allocation_rate_backfill() -> None:
                     """,
                     (new_cost, is_live, int(row["id"])),
                 )
-            cur.execute(
-                "INSERT INTO settings (key, value) VALUES (%s, 'true'::jsonb) "
-                "ON CONFLICT (key) DO NOTHING",
-                (_ALLOCATION_RATE_BACKFILL_MARKER,),
-            )
 
 
 def _ensure_schema_migrations() -> None:
@@ -4907,6 +4906,37 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS hourly_rate_cents INTEGER"
     )
+    # DB-level snapshot stamp on every shift INSERT. The app also stamps at
+    # clock-in, but a mid-deploy OLD instance whose code predates the column
+    # omits it entirely; this trigger stamps those rows so the rolling-deploy
+    # window cannot leave a rated employee's shift unsnapshotted. Only fills a
+    # NULL (an app-supplied value wins) and leaves a rate-less employee NULL.
+    # CREATE OR REPLACE + DROP/CREATE TRIGGER are idempotent. NOTE: this is the
+    # only trigger in the codebase.
+    db.execute("""
+        CREATE OR REPLACE FUNCTION stamp_shift_hourly_rate_cents()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.hourly_rate_cents IS NULL THEN
+                SELECT ROUND(e.hourly_rate * 100)
+                  INTO NEW.hourly_rate_cents
+                  FROM employees e
+                 WHERE e.id = NEW.employee_id
+                   AND e.hourly_rate IS NOT NULL;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+    """)
+    db.execute(
+        "DROP TRIGGER IF EXISTS trg_stamp_shift_hourly_rate_cents ON shifts"
+    )
+    db.execute("""
+        CREATE TRIGGER trg_stamp_shift_hourly_rate_cents
+            BEFORE INSERT ON shifts
+            FOR EACH ROW
+            EXECUTE FUNCTION stamp_shift_hourly_rate_cents()
+    """)
     db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS gps_meta JSONB"
     )
@@ -5141,11 +5171,23 @@ def _ensure_schema_migrations() -> None:
             CHECK (correction_date >= week_start AND correction_date < week_start + 7)
         )
     """)
-    # Additive for installs whose allocation table predates the live-rate flag.
+    # Cost provenance flag, three-state (TRUE live / FALSE frozen / NULL not yet
+    # reconciled). Nullable with NO default: a writer that omits it -- including
+    # an old app instance during a rolling deploy -- must leave NULL so the row
+    # is distinguishable from a genuinely-frozen FALSE and gets repriced. The
+    # DROP DEFAULT / DROP NOT NULL make this idempotent for any install that
+    # already added the column in its earlier NOT NULL DEFAULT FALSE shape.
     db.execute(
         "ALTER TABLE payroll_hour_correction_allocations "
-        "ADD COLUMN IF NOT EXISTS allocated_labor_cost_is_live "
-        "BOOLEAN NOT NULL DEFAULT FALSE"
+        "ADD COLUMN IF NOT EXISTS allocated_labor_cost_is_live BOOLEAN"
+    )
+    db.execute(
+        "ALTER TABLE payroll_hour_correction_allocations "
+        "ALTER COLUMN allocated_labor_cost_is_live DROP DEFAULT"
+    )
+    db.execute(
+        "ALTER TABLE payroll_hour_correction_allocations "
+        "ALTER COLUMN allocated_labor_cost_is_live DROP NOT NULL"
     )
     db.execute("""
         CREATE TABLE IF NOT EXISTS payroll_shift_corrections (
@@ -5281,12 +5323,14 @@ def _ensure_schema_migrations() -> None:
     # crashed startup on any upgrade from a schema predating payroll corrections.
     # Both are marker-gated (exactly-once) and each commits its mutation and
     # marker atomically, so their position only needs to be after their tables.
-    # Shift backfill: stamps only shifts predating the snapshot column, never
-    # re-stamping rate-less shifts created afterwards.
+    # Shift backfill: one-time (marker-gated) -- stamps only shifts predating the
+    # snapshot column, never re-stamping rate-less shifts created afterwards
+    # (their NULL is a permanent, legitimate state).
     _run_one_time_shift_rate_backfill()
-    # Allocation backfill: reprices allocations written before their cost became
-    # authoritative, so shift labor and correction labor agree post-migration.
-    _run_one_time_allocation_rate_backfill()
+    # Allocation reconcile: re-runnable over IS NULL rows -- reprices allocations
+    # that predate the provenance column or were written by an old instance
+    # during a rolling deploy, catching the latter on the next boot.
+    _reconcile_unstamped_allocation_costs()
 
 
 def _auto_migrate_if_empty() -> bool:
@@ -16399,19 +16443,29 @@ def _payroll_correction_rows(
 def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, Any]:
     delta_minutes = int(row["allocated_delta_minutes"])
     stored_labor_cost_cents = row.get("allocated_labor_cost_cents")
-    is_live = bool(row.get("allocated_labor_cost_is_live"))
+    raw_is_live = row.get("allocated_labor_cost_is_live")
+    # NULL provenance = not yet reconciled (a row that predates the column or was
+    # written by an old instance mid-deploy). Its stored cost is an untrusted
+    # live-rate figure, so DO NOT treat it as frozen: value it at the live
+    # recompute, exactly like a live-tracked row, until the next boot's reconcile
+    # stamps it. Only an explicit FALSE keeps the stored cents authoritative.
+    reconcile_pending = raw_is_live is None
+    is_live = reconcile_pending or bool(raw_is_live)
+    # For a pending row the stored cents are not authoritative, so drop them from
+    # the frozen-cost view; the live recompute below carries the money instead.
+    frozen_cost_cents = None if reconcile_pending else stored_labor_cost_cents
     current_labor_cost_cents = stored_labor_cost_cents
     if "employee_hourly_rate" in row:
         current_labor_cost_cents = _payroll_delta_labor_cost_cents(
             delta_minutes,
             row.get("employee_hourly_rate"),
         )
-    # A live-tracked allocation stores NULL but is valued at the live recompute,
-    # so its cost is known (and complete) whenever the live rate is known. A
-    # frozen allocation is complete when its stored cost is present. A NULL that
-    # is neither frozen nor live-tracked is a fail-closed unknown.
+    # A frozen allocation is complete when its stored cost is present. A
+    # live-tracked (or not-yet-reconciled) allocation stores/shows no frozen cost
+    # and is valued at the live recompute, so it is complete whenever the live
+    # rate is known. Anything else is a fail-closed unknown.
     effective_complete = (
-        stored_labor_cost_cents is not None
+        frozen_cost_cents is not None
         or (is_live and current_labor_cost_cents is not None)
     )
     return {
@@ -16431,7 +16485,7 @@ def _serialize_payroll_correction_allocation(row: Dict[str, Any]) -> Dict[str, A
         "jobId": int(row["job_id"]) if row.get("job_id") is not None else None,
         "allocatedDeltaMinutes": delta_minutes,
         "allocatedDeltaHours": round(delta_minutes / 60, 2),
-        "allocatedLaborCost": _payroll_signed_money(stored_labor_cost_cents),
+        "allocatedLaborCost": _payroll_signed_money(frozen_cost_cents),
         "laborCostComplete": effective_complete,
         "laborCostIsLive": is_live,
         "currentAllocatedLaborCost": _payroll_signed_money(current_labor_cost_cents),
@@ -17275,6 +17329,11 @@ def admin_allocate_payroll_hour_correction(
                 )
                 and int(existing["allocated_delta_minutes"]) == delta_minutes
                 and existing.get("allocated_labor_cost_cents") == labor_cost_cents
+                # A NULL provenance means the existing row was never reconciled
+                # (predates the column, or an old instance wrote it mid-deploy),
+                # so it is never idempotent -- fall through and rewrite it with an
+                # explicit TRUE/FALSE rather than leave it unstamped.
+                and existing.get("allocated_labor_cost_is_live") is not None
                 and bool(existing.get("allocated_labor_cost_is_live"))
                     == labor_cost_is_live
                 and str(existing["reason"]) == payload.reason

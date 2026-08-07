@@ -1218,16 +1218,17 @@ def test_single_rate_labor_is_unchanged_by_the_bucketing(client, auth):
 def test_backfill_runs_after_the_first_run_json_import(client):
     """Imported legacy shifts must be stamped, not left exposed to rate edits.
 
-    startup_event runs the schema migration (and therefore the backfill) BEFORE
-    _auto_migrate_if_empty imports legacy JSON, and the importer inserts shifts
-    without hourly_rate_cents. Without the re-run inside the imported branch,
-    every automatically imported historical shift would keep a NULL snapshot
-    forever -- exactly the rows that most need freezing.
+    An imported shift is inserted without hourly_rate_cents. The BEFORE INSERT
+    trigger now stamps it at insert time from the employee's current rate, so
+    imported history is frozen regardless of which code path wrote it -- the
+    trigger subsumes the earlier concern that imported rows kept a NULL snapshot.
+    The startup path also re-runs the backfill after a legacy import as a
+    defensive belt-and-suspenders (pinned by the AST check below).
     """
     worker = _employee("Import Backfill Worker", 21.50)
     _, site_id, _, address = _customer_site("ImportBackfill")
-    # Stand in for the importer: a shift inserted with no snapshot, after the
-    # startup backfill has already run.
+    # Stand in for the importer: a shift inserted with no explicit snapshot. The
+    # insert trigger stamps it from the employee's rate ($21.50 -> 2150).
     imported = _shift(
         employee_id=worker,
         site_id=site_id,
@@ -1237,11 +1238,11 @@ def test_backfill_runs_after_the_first_run_json_import(client):
         end_hour=11,
         hourly_rate_cents=None,
     )
-    assert _snapshot_cents(imported) is None
+    assert _snapshot_cents(imported) == 2150
 
-    # The startup path re-runs the backfill when a legacy import happened.
+    # The backfill re-run is a harmless no-op now (nothing left NULL), but must
+    # stay wired for defense in depth.
     api._backfill_shift_hourly_rate_snapshots()
-
     assert _snapshot_cents(imported) == 2150
 
     # Calling the function directly proves it works, not that startup calls it.
@@ -1465,10 +1466,19 @@ def _allocation_cost(allocation_id):
     return row["allocated_labor_cost_cents"]
 
 
-def test_one_time_allocation_backfill_reprices_existing_rows_from_the_snapshot():
-    """An allocation stored at the old live rate is repriced to the shift's
-    worked-rate snapshot, so adjusted profitability stops mixing rates. Gated by
-    a marker: it runs once, and clearing the marker re-enables it."""
+def _allocation_is_live(allocation_id):
+    row = db.query_one(
+        "SELECT allocated_labor_cost_is_live FROM payroll_hour_correction_allocations WHERE id = %s",
+        (allocation_id,),
+    )
+    return row["allocated_labor_cost_is_live"]
+
+
+def test_allocation_reconcile_reprices_unstamped_rows_from_the_snapshot():
+    """An unstamped allocation (NULL provenance -- a pre-migration row, or one an
+    old instance wrote mid-deploy) is repriced to the shift's worked-rate
+    snapshot and stamped, so adjusted profitability stops mixing rates. Runs
+    re-runnably over IS NULL rows only, so a stamped row is never revisited."""
     worker = _employee("AllocMig", 20.00)
     _, site_id, _, address = _customer_site("AllocMig")
     # Worked at $20, snapshotted; the employee was later raised to $25.
@@ -1477,7 +1487,7 @@ def test_one_time_allocation_backfill_reprices_existing_rows_from_the_snapshot()
         service_day=SERVICE_DAY, start_hour=9, end_hour=12, hourly_rate_cents=2000,
     )
     _set_rate(worker, 25.00)
-    # Pre-migration row: +60 min stored at the $25 live rate ($25.00), which is
+    # Unstamped row (provenance NULL): +60 min stored at the $25 live rate,
     # inconsistent with the frozen $20 shift labor.
     allocation_id = _seed_correction_with_allocation(
         employee_id=worker, location_id=site_id,
@@ -1485,32 +1495,27 @@ def test_one_time_allocation_backfill_reprices_existing_rows_from_the_snapshot()
         delta_minutes=60, stored_cost_cents=2500,
     )
     assert _allocation_cost(allocation_id) == 2500
+    assert _allocation_is_live(allocation_id) is None  # unreconciled
 
-    _clear_marker(api._ALLOCATION_RATE_BACKFILL_MARKER)
-    api._run_one_time_allocation_rate_backfill()
+    api._reconcile_unstamped_allocation_costs()
 
-    # Repriced to 60 min @ the $20 snapshot = $20.00.
+    # Repriced to 60 min @ the $20 snapshot = $20.00, and stamped frozen.
     assert _allocation_cost(allocation_id) == 2000
-    assert _marker_present(api._ALLOCATION_RATE_BACKFILL_MARKER)
+    assert _allocation_is_live(allocation_id) is False
 
-    # Gated: a second run with the marker present is a no-op even if the stored
-    # value drifts.
+    # Idempotent: now that the row is stamped (not NULL), a second run leaves it
+    # alone even if the stored value drifts -- it is no longer an IS NULL row.
     db.execute(
         "UPDATE payroll_hour_correction_allocations SET allocated_labor_cost_cents = 9999 WHERE id = %s",
         (allocation_id,),
     )
-    api._run_one_time_allocation_rate_backfill()
+    api._reconcile_unstamped_allocation_costs()
     assert _allocation_cost(allocation_id) == 9999
 
-    # Clearing the marker re-enables the deterministic recompute.
-    _clear_marker(api._ALLOCATION_RATE_BACKFILL_MARKER)
-    api._run_one_time_allocation_rate_backfill()
-    assert _allocation_cost(allocation_id) == 2000
 
-
-def test_one_time_allocation_backfill_fails_closed_on_disagreeing_snapshots():
+def test_allocation_reconcile_fails_closed_on_disagreeing_snapshots():
     """If that day's snapshots disagree and none is at the allocation's site, the
-    resolver fails closed, so the migrated cost becomes NULL rather than a guess."""
+    resolver fails closed, so the reconciled cost becomes NULL rather than a guess."""
     worker = _employee("AllocMigAmbig", 20.00)
     _, site_a, _, addr_a = _customer_site("AllocMigAmbigA")
     _, site_b, _, addr_b = _customer_site("AllocMigAmbigB")
@@ -1527,10 +1532,10 @@ def test_one_time_allocation_backfill_fails_closed_on_disagreeing_snapshots():
         delta_minutes=60, stored_cost_cents=2500,
     )
 
-    _clear_marker(api._ALLOCATION_RATE_BACKFILL_MARKER)
-    api._run_one_time_allocation_rate_backfill()
+    api._reconcile_unstamped_allocation_costs()
 
     assert _allocation_cost(allocation_id) is None
+    assert _allocation_is_live(allocation_id) is False  # fail-closed, not live
 
 
 # --- 7. resolver sees visit locations (multi-stop shifts), fails closed -------
@@ -1602,22 +1607,17 @@ def test_correction_resolver_single_stop_home_site_unaffected():
 # --- 8. migration markers stay out of the public settings surface -------------
 
 def test_migration_markers_are_not_exposed_in_settings():
-    """The one-time backfill markers piggyback on the settings table but must
-    never leak into load_settings() / GET /api/admin/settings."""
+    """The one-time shift-backfill marker piggybacks on the settings table but
+    must never leak into load_settings() / GET /api/admin/settings. (The
+    allocation reconcile is no longer marker-gated, so it has no marker.)"""
     db.execute(
         "INSERT INTO settings (key, value) VALUES (%s, 'true'::jsonb) "
         "ON CONFLICT (key) DO NOTHING",
         (api._SHIFT_RATE_BACKFILL_MARKER,),
     )
-    db.execute(
-        "INSERT INTO settings (key, value) VALUES (%s, 'true'::jsonb) "
-        "ON CONFLICT (key) DO NOTHING",
-        (api._ALLOCATION_RATE_BACKFILL_MARKER,),
-    )
 
     settings = api.load_settings()
     assert api._SHIFT_RATE_BACKFILL_MARKER not in settings
-    assert api._ALLOCATION_RATE_BACKFILL_MARKER not in settings
     assert not any(k.startswith("_") for k in settings)
     # A real setting is still present.
     assert "laborPctTarget" in settings
@@ -1733,11 +1733,71 @@ def test_one_time_backfills_are_declared_after_their_tables(client):
         "CREATE TABLE IF NOT EXISTS payroll_shift_corrections"
     )
     shift_backfill = src.index("_run_one_time_shift_rate_backfill()")
-    alloc_backfill = src.index("_run_one_time_allocation_rate_backfill()")
-    # The allocation backfill (and its resolver) depend on both correction
+    alloc_reconcile = src.index("_reconcile_unstamped_allocation_costs()")
+    # The allocation reconcile (and its resolver) depend on both correction
     # tables; the shift backfill only needs shifts.hourly_rate_cents, but both
     # are kept together at the end, after all DDL.
     assert shift_backfill > create_alloc
     assert shift_backfill > create_shift_corr
-    assert alloc_backfill > create_alloc
-    assert alloc_backfill > create_shift_corr
+    assert alloc_reconcile > create_alloc
+    assert alloc_reconcile > create_shift_corr
+
+
+# --- 9. rolling-deploy safety: insert trigger + reconcilable provenance --------
+
+def test_insert_trigger_stamps_shift_regardless_of_writer(client):
+    """A shift inserted with no snapshot (as an old app instance would during a
+    rolling deploy) is stamped at INSERT by the DB trigger for a rated employee,
+    and left NULL for a rate-less one so it keeps following the live rate."""
+    rated = _employee("TrigRated", 22.00)
+    rateless = _employee("TrigRateless", None)
+    _, site_id, _, address = _customer_site("Trig")
+
+    rated_shift = _shift(
+        employee_id=rated, site_id=site_id, address=address,
+        service_day=SERVICE_DAY, start_hour=9, end_hour=11, hourly_rate_cents=None,
+    )
+    rateless_shift = _shift(
+        employee_id=rateless, site_id=site_id, address=address,
+        service_day=SERVICE_DAY, start_hour=9, end_hour=11, hourly_rate_cents=None,
+    )
+
+    # The trigger filled the rated employee's NULL insert from employees.hourly_rate.
+    assert _snapshot_cents(rated_shift) == 2200
+    # Nothing to copy for a rate-less employee -> stays NULL (follows live rate).
+    assert _snapshot_cents(rateless_shift) is None
+
+
+def test_pending_allocation_is_valued_live_not_frozen(client):
+    """An allocation with NULL provenance (a pre-migration / deploy-window write)
+    stores a stale live-rate cost, but must NOT be read as frozen: its frozen
+    cost is dropped and it is valued at the live recompute until reconcile.
+
+    The serializer call is pure; ``client`` only ensures the shared DB session
+    fixture runs so the per-test cleanup can connect."""
+    row = {
+        "id": 1,
+        "correction_id": 1,
+        "week_start": SERVICE_DAY,
+        "correction_date": SERVICE_DAY,
+        "employee_id": 1,
+        "location_id": 1,
+        "job_id": None,
+        "location_customer_id": None,
+        "superseded_by": None,
+        "voided_by_name": None,
+        "created_by_name": "Seed",
+        "allocated_delta_minutes": 60,
+        "allocated_labor_cost_cents": 2500,      # stale live-rate cost from an old write
+        "allocated_labor_cost_is_live": None,    # provenance unknown / unreconciled
+        "employee_hourly_rate": 20,              # live rate now $20 -> current 60min = $20
+        "reason": "Pending row.",
+        "status": "active",
+    }
+    out = api._serialize_payroll_correction_allocation(row)
+    # Not trusted as frozen: the stored $25 is dropped from the frozen view...
+    assert out["allocatedLaborCost"] is None
+    # ...and it is valued at the live recompute, known and complete.
+    assert out["laborCostIsLive"] is True
+    assert out["currentAllocatedLaborCost"] == 20.0
+    assert out["laborCostComplete"] is True

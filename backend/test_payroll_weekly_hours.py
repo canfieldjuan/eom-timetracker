@@ -1513,6 +1513,11 @@ def test_payroll_timesheet_allocation_labels_and_rate_fingerprint(client):
             source_id=source_id,
             service_day=service_day,
         )
+        # This test exercises the LIVE-tracked correction path, which requires a
+        # shift with no snapshot (a pre-migration or rate-less-at-clock-in row).
+        # The insert trigger now stamps every insert for a rated employee, so
+        # clear this shift's snapshot back to NULL to recreate that state.
+        _stamp_shift_snapshots(employee_id, service_day, {site_id: None})
         corrected = client.post(
             "/api/admin/payroll/weekly-hours/corrections",
             headers=payroll_auth,
@@ -3845,6 +3850,10 @@ def test_payroll_correction_allocation_attaches_site_proof_without_blending_actu
             source_id=source_id,
             service_day=service_day,
         )
+        # Live-tracked path needs a snapshot-less shift; the insert trigger now
+        # stamps rated-employee inserts, so clear it back to NULL to recreate the
+        # pre-migration / rate-less-at-clock-in state this test exercises.
+        _stamp_shift_snapshots(employee_id, service_day, {site_id: None})
         corrected = client.post(
             "/api/admin/payroll/weekly-hours/corrections",
             headers=payroll_auth,
@@ -5468,6 +5477,18 @@ def test_stored_verification_reads_stale_when_new_rule_condemns_week(client, aut
             _delete_employees([employee_id])
 
 
+def _shift_ids(employee_id: int, service_day: date, site_id: int) -> set:
+    """Ids of the employee's shifts at one site/day -- used to pick out a shift
+    created after a known baseline (the insert trigger stamps by default, so a
+    genuinely NULL-snapshot shift has to be identified and cleared explicitly)."""
+    rows = db.query_all(
+        "SELECT id FROM shifts "
+        "WHERE employee_id = %s AND local_date = %s AND location_id = %s",
+        (employee_id, service_day, site_id),
+    )
+    return {int(r["id"]) for r in rows}
+
+
 def _stamp_shift_snapshots(employee_id: int, service_day: date, cents_by_site: dict) -> None:
     """Stamp each of the employee's shifts that day with its site's snapshot rate."""
     with db.get_conn() as conn:
@@ -5536,11 +5557,11 @@ def _allocate_correction_at_rate(
             target_site_id = other_site_id
             target_job_id = other_job_id
 
-    _stamp_shift_snapshots(
-        employee_id,
-        service_day,
-        {sid: cents for sid, cents in sites.items() if cents is not None},
-    )
+    # Pass every site, including the None ones: the BEFORE INSERT trigger now
+    # stamps a rated employee's shift on creation, so a "no snapshot" case (a
+    # pre-migration row, or a shift clocked in while the employee was rate-less)
+    # must be produced by explicitly clearing the snapshot back to NULL here.
+    _stamp_shift_snapshots(employee_id, service_day, sites)
 
     # The raise lands AFTER the work was done. Nothing about the corrected hours
     # should be priced from it.
@@ -5735,17 +5756,24 @@ def _allocate_with_mixed_snapshot_shift(client, *, week_start, service_day, live
     source_id = _create_payroll_profitability_source()
     _, site_id = _create_payroll_profitability_site()
 
-    # Shift A, then stamp only it to $20; shift B is created afterward so it keeps
-    # a NULL snapshot at the same site/day.
+    # Shift A stamped to $20. Shift B must keep a NULL snapshot (a rate-less-at-
+    # clock-in / pre-migration row), but the BEFORE INSERT trigger now stamps
+    # every insert for a rated employee -- so after creating B we identify it by
+    # id-diff and explicitly clear its snapshot back to NULL.
     job_a = _create_payroll_profitability_job_and_shift(
         employee_id=employee_id, site_id=site_id, source_id=source_id,
         service_day=service_day, source_seed="1",
     )
     _stamp_shift_snapshots(employee_id, service_day, {site_id: 2000})
+    before_b = _shift_ids(employee_id, service_day, site_id)
     _create_payroll_profitability_job_and_shift(
         employee_id=employee_id, site_id=site_id, source_id=source_id,
         service_day=service_day, local_start=_local_dt(service_day, 13),
         local_end=_local_dt(service_day, 15), source_seed="2",
+    )
+    b_id = (_shift_ids(employee_id, service_day, site_id) - before_b).pop()
+    db.execute(
+        "UPDATE shifts SET hourly_rate_cents = NULL WHERE id = %s", (b_id,)
     )
 
     db.execute(
