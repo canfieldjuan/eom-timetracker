@@ -15050,6 +15050,7 @@ def _compute_payroll_weekly_hours(
     shift_correction_rows: Optional[List[Dict[str, Any]]] = None,
     now_utc: Optional[datetime] = None,
     include_timesheet_adjustments: bool = True,
+    selected_employee_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     week_start = _parse_payroll_week_start(week_start_text)
     week_end, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
@@ -15110,6 +15111,10 @@ def _compute_payroll_weekly_hours(
         int(row["id"]): _empty_payroll_employee(row, week_start)
         for row in employee_rows
         if bool(row["active"])
+        or (
+            selected_employee_id is not None
+            and int(row["id"]) == int(selected_employee_id)
+        )
     }
     shifted_employee_ids: set[int] = set()
     corrected_employee_ids: set[int] = set()
@@ -15298,6 +15303,10 @@ def _compute_payroll_weekly_hours(
             bool(row["active"])
             or int(row["id"]) in shifted_employee_ids
             or int(row["id"]) in corrected_employee_ids
+            or (
+                selected_employee_id is not None
+                and int(row["id"]) == int(selected_employee_id)
+            )
         )
     ]
     blocking_issue_digest = sorted(
@@ -15469,6 +15478,7 @@ def _payroll_timesheet_source_fingerprint(
     week_end: date,
     employees: List[Dict[str, Any]],
     shifts: List[Dict[str, Any]],
+    excluded_shifts: List[Dict[str, Any]],
     corrections: List[Dict[str, Any]],
     shift_corrections: List[Dict[str, Any]],
     allocations: List[Dict[str, Any]],
@@ -15535,6 +15545,33 @@ def _payroll_timesheet_source_fingerprint(
                 "non_productive_type": row.get("non_productive_type"),
             }
             for row in shifts
+        ],
+        "excludedShifts": [
+            {
+                "row_id": str(row.get("rowId") or ""),
+                "source_kind": str(row.get("sourceKind") or "recorded"),
+                "shift_id": (
+                    int(row["shiftId"])
+                    if row.get("shiftId") is not None
+                    else None
+                ),
+                "manual_shift_id": row.get("manualShiftId"),
+                "employee_id": int(row["employeeId"]),
+                "date": str(row.get("date") or ""),
+                "clock_in": str((row.get("clockIn") or {}).get("iso") or ""),
+                "clock_out": str((row.get("clockOut") or {}).get("iso") or ""),
+                "total_minutes": int(row.get("totalMinutes") or 0),
+                "break_minutes": int(row.get("breakMinutes") or 0),
+                "location_id": (
+                    int(row["locationId"])
+                    if row.get("locationId") is not None
+                    else None
+                ),
+                "exclusion_version": int(
+                    (row.get("exclusion") or {}).get("version") or 0
+                ),
+            }
+            for row in excluded_shifts
         ],
         "corrections": [
             {
@@ -15608,6 +15645,7 @@ def _payroll_employee_timesheet_source_fingerprint(
     week_end: date,
     employees: List[Dict[str, Any]],
     shifts: List[Dict[str, Any]],
+    excluded_shifts: List[Dict[str, Any]],
     corrections: List[Dict[str, Any]],
     shift_corrections: List[Dict[str, Any]],
     allocations: List[Dict[str, Any]],
@@ -15622,6 +15660,11 @@ def _payroll_employee_timesheet_source_fingerprint(
         week_end=week_end,
         employees=[row for row in employees if int(row["id"]) == employee_id],
         shifts=[row for row in shifts if int(row["employee_id"]) == employee_id],
+        excluded_shifts=[
+            row
+            for row in excluded_shifts
+            if int(row["employeeId"]) == employee_id
+        ],
         corrections=employee_corrections,
         shift_corrections=[
             row
@@ -15958,7 +16001,6 @@ def _compute_payroll_timesheet(
     excluded_shift_rows = _payroll_excluded_timesheet_rows(
         week_start,
         cursor=cursor,
-        employee_id=employee_id,
     )
     correction_rows = _payroll_correction_rows(week_start, cursor=cursor)
     shift_correction_rows = _payroll_active_shift_correction_rows_for_shift_ids(
@@ -15983,6 +16025,7 @@ def _compute_payroll_timesheet(
         correction_rows=correction_rows,
         shift_correction_rows=shift_correction_rows,
         now_utc=now_utc,
+        selected_employee_id=employee_id,
     )
     settings = load_settings(cursor=cursor)
     profitability = build_weekly_labor_profitability(
@@ -15997,6 +16040,7 @@ def _compute_payroll_timesheet(
             "grossMarginMin",
             _SETTINGS_DEFAULTS["grossMarginMin"],
         ),
+        payroll_week_start=week_start,
         cursor=cursor,
     )
     correction_details_by_id = {
@@ -16173,6 +16217,7 @@ def _compute_payroll_timesheet(
                 week_end=week_end,
                 employees=employee_rows,
                 shifts=shift_rows,
+                excluded_shifts=excluded_shift_rows,
                 corrections=correction_rows,
                 shift_corrections=shift_correction_rows,
                 allocations=allocation_rows,
@@ -16195,6 +16240,7 @@ def _compute_payroll_timesheet(
             week_end=week_end,
             employees=employee_rows,
             shifts=shift_rows,
+            excluded_shifts=excluded_shift_rows,
             corrections=correction_rows,
             shift_corrections=shift_correction_rows,
             allocations=allocation_rows,
@@ -18019,6 +18065,7 @@ def _payroll_correction_candidate_detail_for_row(
             "grossMarginMin",
             _SETTINGS_DEFAULTS["grossMarginMin"],
         ),
+        payroll_week_start=week_start,
         cursor=cur,
     )
     candidate_segments = result.pop("_payrollCorrectionCandidateSegments", [])
@@ -18465,6 +18512,9 @@ def admin_apply_payroll_timesheet_changes(
                             int(payload.employeeId),
                         )
                     )
+                    batch_source_fingerprint = employee_source_fingerprint or str(
+                        before["timesheetSourceFingerprint"]
+                    )
                     accepted_source_fingerprints = {
                         employee_source_fingerprint,
                         str(before["timesheetSourceFingerprint"]),
@@ -18499,7 +18549,7 @@ def admin_apply_payroll_timesheet_changes(
                             int(payload.employeeId),
                             payload.reason,
                             json.dumps(payload.model_dump(mode="json")["operations"], sort_keys=True),
-                            employee_source_fingerprint,
+                            batch_source_fingerprint,
                             int(current_payroll["id"]),
                             str(current_payroll["name"]),
                         ),
@@ -18868,6 +18918,10 @@ def admin_apply_payroll_timesheet_changes(
                             int(payload.employeeId),
                         )
                     )
+                    batch_after_source_fingerprint = (
+                        after_employee_source_fingerprint
+                        or str(timesheet["timesheetSourceFingerprint"])
+                    )
                     cur.execute(
                         """
                         UPDATE payroll_timesheet_change_batches
@@ -18876,7 +18930,7 @@ def admin_apply_payroll_timesheet_changes(
                         """,
                         (
                             json.dumps(operation_audit, sort_keys=True),
-                            after_employee_source_fingerprint,
+                            batch_after_source_fingerprint,
                             batch_id,
                         ),
                     )
@@ -20158,6 +20212,7 @@ def admin_payroll_labor_profitability(
                     "grossMarginMin",
                     _SETTINGS_DEFAULTS["grossMarginMin"],
                 ),
+                payroll_week_start=parsed_week_start,
                 cursor=cur,
             )
     candidate_segments = result.pop("_payrollCorrectionCandidateSegments", [])
