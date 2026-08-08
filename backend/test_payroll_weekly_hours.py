@@ -3783,6 +3783,18 @@ def test_payroll_verification_reports_stale_and_requires_reverify_before_finaliz
         assert reverified.status_code == 200, reverified.text
         assert reverified.json()["verification"]["status"] == "verified"
 
+        # Finalize now requires the money sign-off too; verify payroll dollars.
+        second_timesheet = _payroll_timesheet(client, auth, week_start)
+        money_verified = client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "moneyFingerprint": second_timesheet["timesheetSourceFingerprint"],
+            },
+        )
+        assert money_verified.status_code == 200, money_verified.text
+
         finalized = client.post(
             "/api/admin/payroll/weekly-hours/finalize",
             headers=auth,
@@ -7768,6 +7780,139 @@ def test_money_verification_goes_stale_when_an_unstamped_shift_is_repriced(clien
         assert after["moneyVerification"]["stale"] is True, (
             "money must go stale when an unstamped shift is repriced by a rate edit"
         )
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+# --- #138 Slice 4: finalize requires money; money-verify accepts finalized ----
+
+def _verify_hours_and_money(client, auth, week_start):
+    weekly = _weekly_hours(client, auth, week_start)
+    timesheet = _payroll_timesheet(client, auth, week_start)
+    hv = client.post(
+        "/api/admin/payroll/weekly-hours/verify",
+        headers=auth,
+        json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+    )
+    assert hv.status_code == 200, hv.text
+    mv = client.post(
+        "/api/admin/payroll/money/verify",
+        headers=auth,
+        json={"weekStart": week_start.isoformat(), "moneyFingerprint": timesheet["timesheetSourceFingerprint"]},
+    )
+    assert mv.status_code == 200, mv.text
+    return weekly, timesheet
+
+
+def test_finalize_requires_money_verified_then_succeeds(client, auth):
+    week_start = date(2026, 10, 11)  # Sunday
+    employee_id = _create_employee("Payroll Finalize Money Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )
+        weekly = _weekly_hours(client, auth, week_start)
+        client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        # Hours verified but money not yet -> finalize is blocked.
+        blocked = client.post(
+            "/api/admin/payroll/weekly-hours/finalize",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        assert blocked.status_code == 409, blocked.text
+        assert blocked.json()["error"] == "Verify payroll dollars before finalizing"
+
+        # Verify money, then finalize succeeds (both truths signed off).
+        timesheet = _payroll_timesheet(client, auth, week_start)
+        client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "moneyFingerprint": timesheet["timesheetSourceFingerprint"]},
+        )
+        finalized = client.post(
+            "/api/admin/payroll/weekly-hours/finalize",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        assert finalized.status_code == 200, finalized.text
+        assert finalized.json()["verification"]["status"] == "finalized"
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_finalize_blocked_when_money_is_stale(client, auth):
+    week_start = date(2026, 10, 18)  # Sunday
+    employee_id = _create_employee("Payroll Finalize Stale Money Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )
+        weekly, _timesheet = _verify_hours_and_money(client, auth, week_start)
+        # A money-only change (shift categorization) leaves hours current but
+        # makes the money sign-off stale -> finalize must block on money.
+        db.execute("UPDATE shifts SET time_category = 'non_productive' WHERE id = %s", (shift_id,))
+        stale = client.post(
+            "/api/admin/payroll/weekly-hours/finalize",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["error"] == (
+            "Payroll dollars are stale; reopen and verify money before finalizing"
+        )
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_money_verify_allowed_on_a_finalized_hours_week(client, auth):
+    # A week finalized BEFORE money verification existed (hours 'finalized', no
+    # money batch) must be back-verifiable for money without a needless reopen.
+    week_start = date(2026, 10, 25)  # Sunday
+    employee_id = _create_employee("Payroll Finalized Backverify Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )
+        weekly = _weekly_hours(client, auth, week_start)
+        client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        # Simulate a legacy finalized week: flip the hours batch to 'finalized'
+        # directly (a pre-money-verification finalize path).
+        db.execute(
+            """
+            UPDATE payroll_verification_batches
+            SET status = 'finalized', finalized_by_name = 'Legacy', finalized_at = NOW()
+            WHERE week_start = %s
+            """,
+            (week_start,),
+        )
+        timesheet = _payroll_timesheet(client, auth, week_start)
+        money = client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "moneyFingerprint": timesheet["timesheetSourceFingerprint"]},
+        )
+        assert money.status_code == 200, money.text
+        assert money.json()["moneyVerification"]["status"] == "verified"
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_employees([employee_id])
