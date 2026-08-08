@@ -72,6 +72,7 @@ def _apply_schema(conn):
                 payroll_shift_corrections,
                 payroll_hour_correction_allocations,
                 payroll_hour_corrections,
+                payroll_money_verification_events, payroll_money_verification_batches,
                 payroll_verification_events, payroll_verification_batches,
                 time_data_correction_batches,
                 atlas_linkage_backfill_batches,
