@@ -2075,6 +2075,28 @@ def test_missing_site_does_not_report_site_economics_issues():
     assert "missing_rate" not in issue_codes
 
 
+def test_missing_expected_hours_is_learning_state_not_site_issue():
+    start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    issue_codes = {
+        issue["code"]
+        for issue in _job_issues(
+            {
+                "location_id": 88,
+                "site_active": True,
+                "site_expected_hours": None,
+                "rate": Decimal("120.00"),
+                "rate_type": "per_visit",
+                "source_role": "residential_morning",
+                "source_all_day": False,
+                "scheduled_start": start,
+                "scheduled_end": start + timedelta(hours=2),
+            }
+        )
+    }
+
+    assert "missing_expected_hours" not in issue_codes
+
+
 def test_closed_shift_preserves_initial_site_before_first_visit():
     shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
     visit_start = shift_start + timedelta(hours=2)
@@ -4665,7 +4687,7 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
     assert incomplete["plannedHours"] is None
     assert incomplete["estRevenue"] == 50
     assert incomplete["estLaborCost"] is None
-    assert "missing_expected_hours" in {
+    assert "missing_expected_hours" not in {
         issue["code"] for issue in incomplete["issues"]
     }
     assert incomplete["expectedHoursBaseline"] == {
@@ -5734,7 +5756,7 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
     forecast_job = forecast_jobs[future_job_id]
     assert forecast_job["plannedHours"] is None
     assert forecast_job["estRevenue"] == 80
-    assert "missing_expected_hours" in {
+    assert "missing_expected_hours" not in {
         issue["code"] for issue in forecast_job["issues"]
     }
     baseline = forecast_job["expectedHoursBaseline"]
@@ -5763,8 +5785,8 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
     }[future_job_id]
     assert schedule_job["expectedHoursBaseline"] == baseline
     assert schedule_job["siteEconomics"]["expectedHoursBaseline"] == baseline
-    assert {issue["code"] for issue in schedule_job["issues"]} == {
-        "missing_expected_hours"
+    assert "missing_expected_hours" not in {
+        issue["code"] for issue in schedule_job["issues"]
     }
 
 

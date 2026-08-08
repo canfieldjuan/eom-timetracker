@@ -1198,13 +1198,6 @@ def _job_issues(job: Dict[str, Any]) -> List[Dict[str, str]]:
                     "A service price is not configured for this Site.",
                 )
             )
-        if job.get("site_expected_hours") is None:
-            issues.append(
-                _issue(
-                    "missing_expected_hours",
-                    "Expected service hours are not configured for this Site.",
-                )
-            )
     if job.get("location_id") is not None and job.get("rate_type") not in {
         "per_visit",
         "hourly",
