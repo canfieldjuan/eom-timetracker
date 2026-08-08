@@ -17194,10 +17194,11 @@ def _lock_payroll_source_rows(cur: Any) -> None:
 
 def _lock_payroll_money_source_rows(cur: Any) -> None:
     # Superset of the hours source lock: the money fingerprint also hashes each
-    # shift's location/customer LABELS (joined from locations/customers), so
-    # those tables must be locked too or a concurrent Site edit could commit
-    # between the proof read and the verification commit, persisting an
-    # already-stale money proof.
+    # shift's location/customer LABELS (joined from locations/customers) and the
+    # allocation-validity payload derived from job candidates (which reads
+    # `jobs`). All of those tables must be locked or a concurrent Site/job edit
+    # could commit between the proof read and the verification/finalize commit,
+    # persisting an already-stale money proof.
     cur.execute(
         """
         LOCK TABLE
@@ -17207,7 +17208,8 @@ def _lock_payroll_money_source_rows(cur: Any) -> None:
             payroll_hour_correction_allocations,
             employees,
             locations,
-            customers
+            customers,
+            jobs
         IN SHARE MODE
         """
     )
