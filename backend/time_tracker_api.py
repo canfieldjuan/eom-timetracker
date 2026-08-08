@@ -14583,15 +14583,18 @@ def _payroll_source_fingerprint(
         "shifts": [
             {
                 "id": int(row["id"]),
-                "source_kind": str(row.get("payroll_source_kind") or "recorded"),
-                "manual_shift_id": (
-                    str(row["manual_shift_id"])
-                    if row.get("manual_shift_id") is not None
-                    else None
-                ),
                 "employee_id": int(row["employee_id"]),
                 "clock_in": to_utc_iso(row["clock_in"]),
                 "clock_out": to_utc_iso(row["clock_out"]) if row.get("clock_out") else None,
+                **(
+                    {
+                        "source_kind": "manual",
+                        "manual_shift_id": str(row["manual_shift_id"]),
+                    }
+                    if row.get("payroll_source_kind") == "manual"
+                    and row.get("manual_shift_id") is not None
+                    else {}
+                ),
             }
             for row in shifts
         ],
@@ -15250,13 +15253,19 @@ def _compute_payroll_weekly_hours(
     if include_timesheet_adjustments:
         exclusion_rows = _payroll_query_all(
             """
-            SELECT exclusion.employee_id
+            SELECT exclusion.employee_id, exclusion.id AS overlay_id
             FROM payroll_shift_exclusions exclusion
             WHERE exclusion.week_start = %s
               AND exclusion.status = 'active'
-            ORDER BY exclusion.employee_id, exclusion.id
+            UNION ALL
+            SELECT manual.employee_id, manual.id AS overlay_id
+            FROM payroll_manual_shift_versions manual
+            WHERE manual.week_start = %s
+              AND manual.status = 'current'
+              AND manual.included = FALSE
+            ORDER BY employee_id, overlay_id
             """,
-            (week_start,),
+            (week_start, week_start),
             cursor=cursor,
         )
         for exclusion_row in exclusion_rows:
@@ -15592,6 +15601,54 @@ def _payroll_timesheet_source_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _payroll_employee_timesheet_source_fingerprint(
+    *,
+    employee_id: int,
+    week_start: date,
+    week_end: date,
+    employees: List[Dict[str, Any]],
+    shifts: List[Dict[str, Any]],
+    corrections: List[Dict[str, Any]],
+    shift_corrections: List[Dict[str, Any]],
+    allocations: List[Dict[str, Any]],
+    correction_details: List[Dict[str, Any]],
+) -> str:
+    employee_corrections = [
+        row for row in corrections if int(row["employee_id"]) == employee_id
+    ]
+    correction_ids = {int(row["id"]) for row in employee_corrections}
+    return _payroll_timesheet_source_fingerprint(
+        week_start=week_start,
+        week_end=week_end,
+        employees=[row for row in employees if int(row["id"]) == employee_id],
+        shifts=[row for row in shifts if int(row["employee_id"]) == employee_id],
+        corrections=employee_corrections,
+        shift_corrections=[
+            row
+            for row in shift_corrections
+            if int(row["employee_id"]) == employee_id
+        ],
+        allocations=[
+            row for row in allocations if int(row["correction_id"]) in correction_ids
+        ],
+        correction_details=[
+            detail
+            for detail in correction_details
+            if int(detail.get("employeeId") or 0) == employee_id
+        ],
+    )
+
+
+def _payroll_selected_employee_timesheet_fingerprint(
+    timesheet: Dict[str, Any],
+    employee_id: int,
+) -> str:
+    for employee in timesheet.get("employees") or []:
+        if int(employee.get("employeeId") or 0) == employee_id:
+            return str(employee.get("timesheetSourceFingerprint") or "")
+    return ""
+
+
 def _serialize_payroll_timesheet_shift(
     shift_row: Dict[str, Any],
     *,
@@ -15616,10 +15673,15 @@ def _serialize_payroll_timesheet_shift(
     job_id = shift_row.get("job_id")
     location_label = _payroll_timesheet_location_label(shift_row)
     customer_name = _payroll_timesheet_customer_name(shift_row)
+    source_kind = str(shift_row.get("payroll_source_kind") or "recorded")
     source_clock_in = clock_in
     source_clock_out = clock_out
     source_total_minutes = minutes
-    source_break_minutes = None
+    source_break_minutes = (
+        int(shift_row.get("payroll_break_minutes") or 0)
+        if source_kind == "manual"
+        else None
+    )
     if correction_row:
         source_clock_in = correction_row["source_clock_in"].astimezone(timezone.utc)
         source_clock_out_value = correction_row.get("source_clock_out")
@@ -15650,7 +15712,6 @@ def _serialize_payroll_timesheet_shift(
         can_correct_closed_shift
         or can_correct_open_shift
     )
-    source_kind = str(shift_row.get("payroll_source_kind") or "recorded")
     manual_shift_id = (
         str(shift_row["manual_shift_id"])
         if source_kind == "manual" and shift_row.get("manual_shift_id") is not None
@@ -15680,7 +15741,9 @@ def _serialize_payroll_timesheet_shift(
         "totalMinutes": minutes,
         "totalHours": round(minutes / 60, 2),
         "breakMinutes": (
-            int(correction_row["corrected_break_minutes"]) if correction_row else None
+            int(correction_row["corrected_break_minutes"])
+            if correction_row
+            else source_break_minutes
         ),
         "locationId": int(location_id) if location_id is not None else None,
         "locationLabel": location_label,
@@ -15788,15 +15851,29 @@ def _payroll_excluded_timesheet_rows(
     )
 
     result: List[Dict[str, Any]] = []
+    _week_end, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
     for row in recorded_rows:
         corrected = row.get("correction_id") is not None
         clock_in = row["corrected_clock_in"] if corrected else row["clock_in"]
         clock_out = row["corrected_clock_out"] if corrected else row.get("clock_out")
-        total_minutes = (
-            int(row["corrected_total_minutes"])
-            if corrected
-            else _payroll_raw_shift_total_minutes(row)
+        overlap_start = max(clock_in.astimezone(timezone.utc), week_start_utc)
+        overlap_end = (
+            min(clock_out.astimezone(timezone.utc), week_end_utc)
+            if clock_out is not None
+            else overlap_start
         )
+        break_minutes = int(row.get("corrected_break_minutes") or 0)
+        segments = (
+            _payroll_timesheet_segment_bounds(
+                overlap_start,
+                overlap_end,
+                break_minutes=break_minutes,
+            )
+            if overlap_end > overlap_start
+            else []
+        )
+        total_minutes = sum(int(segment.get("minutes") or 0) for segment in segments)
+        display_date = to_local(overlap_start).date()
         result.append(
             {
                 "rowId": f"excluded:recorded:{int(row['id'])}",
@@ -15805,12 +15882,12 @@ def _payroll_excluded_timesheet_rows(
                 "shiftId": int(row["id"]),
                 "manualShiftId": None,
                 "employeeId": int(row["employee_id"]),
-                "date": to_local(clock_in).date().isoformat(),
+                "date": display_date.isoformat(),
                 "clockIn": _payroll_timesheet_datetime(clock_in),
                 "clockOut": _payroll_timesheet_datetime(clock_out),
                 "totalMinutes": total_minutes,
                 "totalHours": round(total_minutes / 60, 2),
-                "breakMinutes": int(row.get("corrected_break_minutes") or 0),
+                "breakMinutes": break_minutes,
                 "locationId": int(row["location_id"]) if row.get("location_id") else None,
                 "locationLabel": _payroll_timesheet_location_label(row),
                 "customerName": _payroll_timesheet_customer_name(row),
@@ -15931,6 +16008,7 @@ def _compute_payroll_timesheet(
         ).values()
         for detail in rows
     }
+    correction_details = list(correction_details_by_id.values())
 
     for employee in weekly_hours["employees"]:
         for day in employee["days"]:
@@ -16088,6 +16166,19 @@ def _compute_payroll_timesheet(
                 day["status"] = "corrected"
             elif day["shifts"] or int(day.get("totalMinutes") or 0) > 0:
                 day["status"] = "registered"
+        employee["timesheetSourceFingerprint"] = (
+            _payroll_employee_timesheet_source_fingerprint(
+                employee_id=int(employee["employeeId"]),
+                week_start=week_start,
+                week_end=week_end,
+                employees=employee_rows,
+                shifts=shift_rows,
+                corrections=correction_rows,
+                shift_corrections=shift_correction_rows,
+                allocations=allocation_rows,
+                correction_details=correction_details,
+            )
+        )
 
     total_minutes = sum(int(employee["totalMinutes"]) for employee in filtered_employees)
     return {
@@ -16107,7 +16198,7 @@ def _compute_payroll_timesheet(
             corrections=correction_rows,
             shift_corrections=shift_correction_rows,
             allocations=allocation_rows,
-            correction_details=list(correction_details_by_id.values()),
+            correction_details=correction_details,
         ),
         "selectedEmployeeId": int(employee_id) if employee_id is not None else None,
         "capabilities": {
@@ -17583,6 +17674,33 @@ def _payroll_shift_source_work_date(shift_row: Dict[str, Any]) -> date:
     return to_local(shift_row["clock_in"]).date()
 
 
+def _payroll_shift_dates_in_week(
+    shift_row: Dict[str, Any],
+    *,
+    week_start_utc: datetime,
+    week_end_utc: datetime,
+    observed_at: datetime,
+) -> set[date]:
+    clock_in = shift_row["clock_in"].astimezone(timezone.utc)
+    clock_out_value = shift_row.get("clock_out")
+    clock_out = (
+        clock_out_value.astimezone(timezone.utc)
+        if clock_out_value is not None
+        else observed_at.astimezone(timezone.utc)
+    )
+    overlap_start = max(clock_in, week_start_utc)
+    overlap_end = min(clock_out, week_end_utc)
+    if overlap_end <= overlap_start:
+        return set()
+    return {
+        local_day
+        for local_day, _seconds in _iter_payroll_local_day_slices(
+            overlap_start,
+            overlap_end,
+        )
+    }
+
+
 def _ensure_payroll_shift_correction_source_date(
     shift_row: Dict[str, Any],
     correction_date: date,
@@ -18283,6 +18401,7 @@ def admin_apply_payroll_timesheet_changes(
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
     week_start = _parse_payroll_week_start(payload.weekStart)
+    _week_end, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
     request_fingerprint = _payroll_timesheet_change_request_fingerprint(payload)
     observed_at = utc_now()
     result: Dict[str, Any]
@@ -18340,9 +18459,23 @@ def admin_apply_payroll_timesheet_changes(
                         employee_id=int(payload.employeeId),
                         cursor=cur,
                     )
-                    if not hmac.compare_digest(
-                        payload.expectedTimesheetSourceFingerprint,
+                    employee_source_fingerprint = (
+                        _payroll_selected_employee_timesheet_fingerprint(
+                            before,
+                            int(payload.employeeId),
+                        )
+                    )
+                    accepted_source_fingerprints = {
+                        employee_source_fingerprint,
                         str(before["timesheetSourceFingerprint"]),
+                    }
+                    if not any(
+                        candidate
+                        and hmac.compare_digest(
+                            payload.expectedTimesheetSourceFingerprint,
+                            candidate,
+                        )
+                        for candidate in accepted_source_fingerprints
                     ):
                         raise HTTPException(
                             status_code=409,
@@ -18366,7 +18499,7 @@ def admin_apply_payroll_timesheet_changes(
                             int(payload.employeeId),
                             payload.reason,
                             json.dumps(payload.model_dump(mode="json")["operations"], sort_keys=True),
-                            before["timesheetSourceFingerprint"],
+                            employee_source_fingerprint,
                             int(current_payroll["id"]),
                             str(current_payroll["name"]),
                         ),
@@ -18486,12 +18619,80 @@ def admin_apply_payroll_timesheet_changes(
                                 employee_id=int(payload.employeeId),
                             )
                             source_date = _payroll_shift_source_work_date(shift_row)
-                            if not (week_start <= source_date < week_start + timedelta(days=7)):
+                            if action in {"exclude_recorded", "restore_recorded"}:
+                                belongs_to_week = _payroll_shift_overlaps_week(
+                                    shift_row,
+                                    week_start_utc=week_start_utc,
+                                    week_end_utc=week_end_utc,
+                                    now_utc=observed_at,
+                                )
+                            else:
+                                belongs_to_week = (
+                                    week_start
+                                    <= source_date
+                                    < week_start + timedelta(days=7)
+                                )
+                            if not belongs_to_week:
                                 raise HTTPException(
                                     status_code=400,
                                     detail="Shift does not belong to the selected payroll week",
                                 )
-                            touched_dates.add(source_date)
+                            cur.execute(
+                                """
+                                SELECT * FROM payroll_shift_corrections
+                                WHERE week_start = %s AND shift_id = %s AND status = 'active'
+                                FOR UPDATE
+                                """,
+                                (week_start, int(shift_row["id"])),
+                            )
+                            existing_correction_row = cur.fetchone()
+                            existing_correction = (
+                                dict(existing_correction_row)
+                                if existing_correction_row is not None
+                                else None
+                            )
+                            cur.execute(
+                                """
+                                SELECT * FROM payroll_shift_exclusions
+                                WHERE week_start = %s AND shift_id = %s AND status = 'active'
+                                FOR UPDATE
+                                """,
+                                (week_start, int(shift_row["id"])),
+                            )
+                            active_exclusion_row = cur.fetchone()
+                            active_exclusion = (
+                                dict(active_exclusion_row)
+                                if active_exclusion_row is not None
+                                else None
+                            )
+                            if action in {
+                                "correct_recorded",
+                                "clear_recorded_correction",
+                            } and active_exclusion is not None:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="Restore the recorded shift before editing it",
+                                )
+                            effective_before = _effective_payroll_shift_row(
+                                shift_row,
+                                existing_correction,
+                            )
+                            touched_dates.update(
+                                _payroll_shift_dates_in_week(
+                                    shift_row,
+                                    week_start_utc=week_start_utc,
+                                    week_end_utc=week_end_utc,
+                                    observed_at=observed_at,
+                                )
+                            )
+                            touched_dates.update(
+                                _payroll_shift_dates_in_week(
+                                    effective_before,
+                                    week_start_utc=week_start_utc,
+                                    week_end_utc=week_end_utc,
+                                    observed_at=observed_at,
+                                )
+                            )
                             audit.update({"shiftId": int(shift_row["id"]), "before": None})
 
                             if action == "correct_recorded":
@@ -18499,24 +18700,15 @@ def admin_apply_payroll_timesheet_changes(
                                     _payroll_change_shift_values(operation, week_start, observed_at)
                                 )
                                 _ensure_payroll_shift_correction_source_date(shift_row, work_date)
-                                cur.execute(
-                                    """
-                                    SELECT * FROM payroll_shift_corrections
-                                    WHERE week_start = %s AND shift_id = %s AND status = 'active'
-                                    FOR UPDATE
-                                    """,
-                                    (week_start, int(shift_row["id"])),
-                                )
-                                existing = cur.fetchone()
-                                audit["before"] = dict(existing) if existing else None
-                                if existing:
+                                audit["before"] = existing_correction
+                                if existing_correction:
                                     cur.execute(
                                         """
                                         UPDATE payroll_shift_corrections
                                         SET status = 'superseded', updated_at = NOW()
                                         WHERE id = %s
                                         """,
-                                        (int(existing["id"]),),
+                                        (int(existing_correction["id"]),),
                                     )
                                 cur.execute(
                                     """
@@ -18548,33 +18740,38 @@ def admin_apply_payroll_timesheet_changes(
                                     ),
                                 )
                                 saved = dict(cur.fetchone())
-                                if existing:
+                                if existing_correction:
                                     cur.execute(
                                         """
                                         UPDATE payroll_shift_corrections
                                         SET superseded_by = %s, updated_at = NOW()
                                         WHERE id = %s
                                         """,
-                                        (int(saved["id"]), int(existing["id"])),
+                                        (
+                                            int(saved["id"]),
+                                            int(existing_correction["id"]),
+                                        ),
                                     )
+                                touched_dates.update(
+                                    _payroll_shift_dates_in_week(
+                                        _effective_payroll_shift_row(shift_row, saved),
+                                        week_start_utc=week_start_utc,
+                                        week_end_utc=week_end_utc,
+                                        observed_at=observed_at,
+                                    )
+                                )
                                 audit["after"] = saved
 
                             elif action == "clear_recorded_correction":
-                                cur.execute(
-                                    """
-                                    SELECT * FROM payroll_shift_corrections
-                                    WHERE week_start = %s AND shift_id = %s AND status = 'active'
-                                    FOR UPDATE
-                                    """,
-                                    (week_start, int(shift_row["id"])),
-                                )
-                                existing = cur.fetchone()
-                                if existing is None:
+                                if existing_correction is None:
                                     raise HTTPException(
                                         status_code=404,
                                         detail="Active payroll shift correction not found",
                                     )
-                                _ensure_shift_correction_void_keeps_single_open_shift(cur, dict(existing))
+                                _ensure_shift_correction_void_keeps_single_open_shift(
+                                    cur,
+                                    existing_correction,
+                                )
                                 cur.execute(
                                     """
                                     UPDATE payroll_shift_corrections
@@ -18588,21 +18785,18 @@ def admin_apply_payroll_timesheet_changes(
                                         int(current_payroll["id"]),
                                         str(current_payroll["name"]),
                                         payload.reason,
-                                        int(existing["id"]),
+                                        int(existing_correction["id"]),
                                     ),
                                 )
-                                audit.update({"before": dict(existing), "after": dict(cur.fetchone())})
+                                audit.update(
+                                    {
+                                        "before": existing_correction,
+                                        "after": dict(cur.fetchone()),
+                                    }
+                                )
 
                             elif action == "exclude_recorded":
-                                cur.execute(
-                                    """
-                                    SELECT * FROM payroll_shift_exclusions
-                                    WHERE week_start = %s AND shift_id = %s AND status = 'active'
-                                    FOR UPDATE
-                                    """,
-                                    (week_start, int(shift_row["id"])),
-                                )
-                                if cur.fetchone() is not None:
+                                if active_exclusion is not None:
                                     raise HTTPException(status_code=409, detail="Shift is already excluded")
                                 cur.execute(
                                     """
@@ -18626,16 +18820,7 @@ def admin_apply_payroll_timesheet_changes(
                                 audit["after"] = dict(cur.fetchone())
 
                             else:
-                                cur.execute(
-                                    """
-                                    SELECT * FROM payroll_shift_exclusions
-                                    WHERE week_start = %s AND shift_id = %s AND status = 'active'
-                                    FOR UPDATE
-                                    """,
-                                    (week_start, int(shift_row["id"])),
-                                )
-                                exclusion = cur.fetchone()
-                                if exclusion is None:
+                                if active_exclusion is None:
                                     raise HTTPException(status_code=404, detail="Active shift exclusion not found")
                                 cur.execute(
                                     """
@@ -18652,10 +18837,15 @@ def admin_apply_payroll_timesheet_changes(
                                         str(current_payroll["name"]),
                                         payload.reason,
                                         batch_id,
-                                        int(exclusion["id"]),
+                                        int(active_exclusion["id"]),
                                     ),
                                 )
-                                audit.update({"before": dict(exclusion), "after": dict(cur.fetchone())})
+                                audit.update(
+                                    {
+                                        "before": active_exclusion,
+                                        "after": dict(cur.fetchone()),
+                                    }
+                                )
 
                         operation_audit.append(jsonable_encoder(audit))
 
@@ -18672,6 +18862,12 @@ def admin_apply_payroll_timesheet_changes(
                         employee_id=int(payload.employeeId),
                         cursor=cur,
                     )
+                    after_employee_source_fingerprint = (
+                        _payroll_selected_employee_timesheet_fingerprint(
+                            timesheet,
+                            int(payload.employeeId),
+                        )
+                    )
                     cur.execute(
                         """
                         UPDATE payroll_timesheet_change_batches
@@ -18680,7 +18876,7 @@ def admin_apply_payroll_timesheet_changes(
                         """,
                         (
                             json.dumps(operation_audit, sort_keys=True),
-                            timesheet["timesheetSourceFingerprint"],
+                            after_employee_source_fingerprint,
                             batch_id,
                         ),
                     )
