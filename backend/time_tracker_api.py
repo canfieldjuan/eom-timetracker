@@ -17194,10 +17194,11 @@ def _lock_payroll_source_rows(cur: Any) -> None:
 
 def _lock_payroll_money_source_rows(cur: Any) -> None:
     # Superset of the hours source lock: the money fingerprint also hashes each
-    # shift's location/customer LABELS (joined from locations/customers), so
-    # those tables must be locked too or a concurrent Site edit could commit
-    # between the proof read and the verification commit, persisting an
-    # already-stale money proof.
+    # shift's location/customer LABELS (joined from locations/customers) and the
+    # allocation-validity payload derived from job candidates (which reads
+    # `jobs`). All of those tables must be locked or a concurrent Site/job edit
+    # could commit between the proof read and the verification/finalize commit,
+    # persisting an already-stale money proof.
     cur.execute(
         """
         LOCK TABLE
@@ -17207,7 +17208,8 @@ def _lock_payroll_money_source_rows(cur: Any) -> None:
             payroll_hour_correction_allocations,
             employees,
             locations,
-            customers
+            customers,
+            jobs
         IN SHARE MODE
         """
     )
@@ -17640,11 +17642,14 @@ def _ensure_hours_verified_and_current(
     action: str,
 ) -> None:
     """Money can only be signed off on top of a CURRENT hours sign-off. Requires
-    the hours batch to be 'verified' with a fingerprint matching the freshly
+    the hours batch to be a settled verified state ('verified', or 'finalized' --
+    which is only reachable from verified) with a fingerprint matching the freshly
     recomputed hours snapshot; otherwise the dollars would rest on hours nobody
-    has reviewed (or that changed since)."""
+    has reviewed (or that changed since). Accepting 'finalized' lets a settled
+    week be money-verified (e.g. back-verifying a week finalized before money
+    verification existed) without a needless reopen."""
     hours_row = _get_payroll_verification_batch(cur, week_start)
-    if hours_row is None or str(hours_row["status"]) != "verified":
+    if hours_row is None or str(hours_row["status"]) not in ("verified", "finalized"):
         raise HTTPException(
             status_code=409,
             detail=f"Verify the payroll week's hours before {action}",
@@ -17656,6 +17661,32 @@ def _ensure_hours_verified_and_current(
             status_code=409,
             detail=f"Payroll hours changed since they were verified; "
             f"reopen and verify hours before {action}",
+        )
+
+
+def _ensure_payroll_money_signed_off(
+    cur: Any,
+    week_start: date,
+    money_row: Optional[Dict[str, Any]],
+) -> None:
+    """The whole-payroll FINALIZED state requires a CURRENT money sign-off: money
+    must be 'verified' with a fingerprint matching the freshly recomputed payroll
+    dollars. Enforced on BOTH the fresh finalize and the idempotent re-finalize of
+    an already-finalized week, so a week whose money was reopened (or went stale)
+    after finalize is never (re-)reported as settled."""
+    timesheet = _compute_payroll_timesheet(week_start.isoformat(), cursor=cur)
+    if money_row is None or str(money_row["status"]) != "verified":
+        raise HTTPException(
+            status_code=409,
+            detail="Verify payroll dollars before finalizing",
+        )
+    if not hmac.compare_digest(
+        str(money_row["source_fingerprint"]),
+        timesheet["timesheetSourceFingerprint"],
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Payroll dollars are stale; reopen and verify money before finalizing",
         )
 
 
@@ -20087,16 +20118,24 @@ def admin_finalize_payroll_weekly_hours(
     result: Dict[str, Any]
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Fixed lock order (hours week -> money week -> source rows), matching
+            # the money-verify path so finalize and money verify cannot deadlock.
             _lock_payroll_verification_week(cur, week_start)
-            _lock_payroll_source_rows(cur)
+            _lock_payroll_money_verification_week(cur, week_start)
+            _lock_payroll_money_source_rows(cur)
             data = _compute_payroll_weekly_hours(week_start.isoformat(), cursor=cur)
             _ensure_payroll_snapshot_current(payload.sourceFingerprint, data, "finalizing")
             _ensure_payroll_snapshot_has_no_blocking_issues(data, "finalizing this week")
             row = _get_payroll_verification_batch(cur, week_start, lock=True)
+            money_row = _get_payroll_money_verification_batch(cur, week_start, lock=True)
             if row is None:
                 raise HTTPException(status_code=409, detail="Verify the payroll week before finalizing")
             if row["status"] == "finalized":
                 if hmac.compare_digest(str(row["source_fingerprint"]), data["sourceFingerprint"]):
+                    # Re-finalizing an already-finalized week still requires the
+                    # money sign-off to be current: reopening money after finalize
+                    # must not leave the week reported as settled.
+                    _ensure_payroll_money_signed_off(cur, week_start, money_row)
                     result = {
                         "success": True,
                         "action": "finalize",
@@ -20120,6 +20159,10 @@ def admin_finalize_payroll_weekly_hours(
                     detail="Verified payroll week is stale; reopen and verify again before finalizing",
                 )
             else:
+                # FINALIZED is the terminal state of the WHOLE payroll: it requires
+                # BOTH truths signed off and current. Hours are verified+current
+                # (checked above); the money sign-off must also be current.
+                _ensure_payroll_money_signed_off(cur, week_start, money_row)
                 before_state = _payroll_verification_state(row)
                 cur.execute(
                     """
