@@ -15171,6 +15171,13 @@ def _payroll_timesheet_source_fingerprint(
                 "job_id": int(row["job_id"]) if row.get("job_id") is not None else None,
                 "allocated_delta_minutes": int(row["allocated_delta_minutes"]),
                 "allocated_labor_cost_cents": row.get("allocated_labor_cost_cents"),
+                # Provenance is part of the money truth: a flip between live and
+                # frozen valuation changes the payroll dollars this row stands
+                # for even when the stored cents are momentarily equal, so the
+                # money fingerprint must move when it flips. Without this, a
+                # startup reconcile could re-value an already-signed-off week
+                # without invalidating its (future) money verification.
+                "allocated_labor_cost_is_live": row.get("allocated_labor_cost_is_live"),
                 "employee_hourly_rate": (
                     str(row["employee_hourly_rate"])
                     if row.get("employee_hourly_rate") is not None

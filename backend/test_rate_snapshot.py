@@ -1474,6 +1474,13 @@ def _allocation_is_live(allocation_id):
     return row["allocated_labor_cost_is_live"]
 
 
+def _timesheet_fingerprint(week_start):
+    """The money-inclusive fingerprint the payroll timesheet emits."""
+    return api._compute_payroll_timesheet(week_start.isoformat())[
+        "timesheetSourceFingerprint"
+    ]
+
+
 def test_allocation_reconcile_reprices_unstamped_rows_from_the_snapshot():
     """An unstamped allocation (NULL provenance -- a pre-migration row, or one an
     old instance wrote mid-deploy) is repriced to the shift's worked-rate
@@ -1511,6 +1518,50 @@ def test_allocation_reconcile_reprices_unstamped_rows_from_the_snapshot():
     )
     api._reconcile_unstamped_allocation_costs()
     assert _allocation_cost(allocation_id) == 9999
+
+
+def test_money_fingerprint_moves_on_allocation_provenance_flip_alone():
+    """Contract 1 (#138): a live<->frozen provenance flip changes the money
+    fingerprint even when the stored cents do not move. The allocation is seeded
+    with cents that already equal the snapshot reprice, so the reconcile flips
+    ``allocated_labor_cost_is_live`` (NULL -> False) WITHOUT touching the cents --
+    isolating provenance as the only changed input. Without provenance in the
+    fingerprint, the startup reconcile could silently re-value an already
+    signed-off week without invalidating its (future) money verification."""
+    worker = _employee("MoneyFpFlip", 20.00)
+    _, site_id, _, address = _customer_site("MoneyFpFlip")
+    # Worked at $20, snapshotted on the shift.
+    _shift(
+        employee_id=worker, site_id=site_id, address=address,
+        service_day=SERVICE_DAY, start_hour=9, end_hour=12, hourly_rate_cents=2000,
+    )
+    # Stored cents ALREADY equal 60 min @ the $20 snapshot ($20.00), so the
+    # reconcile changes only the provenance flag, never the cents.
+    allocation_id = _seed_correction_with_allocation(
+        employee_id=worker, location_id=site_id,
+        correction_date=SERVICE_DAY, week_start=WEEK_START,
+        delta_minutes=60, stored_cost_cents=2000,
+    )
+    assert _allocation_cost(allocation_id) == 2000
+    assert _allocation_is_live(allocation_id) is None  # unreconciled
+
+    fp_before = _timesheet_fingerprint(WEEK_START)
+
+    api._reconcile_unstamped_allocation_costs()
+    assert _allocation_cost(allocation_id) == 2000        # cents unchanged
+    assert _allocation_is_live(allocation_id) is False    # provenance flipped
+
+    fp_after = _timesheet_fingerprint(WEEK_START)
+    assert fp_after != fp_before, (
+        "a provenance flip must move the money fingerprint even with equal cents"
+    )
+
+    # Exactly once + idempotent: the row is now stamped (not IS NULL), so a second
+    # reconcile is a no-op and the fingerprint is stable -- the transition
+    # invalidates money verification once, not on every startup.
+    api._reconcile_unstamped_allocation_costs()
+    assert _allocation_is_live(allocation_id) is False
+    assert _timesheet_fingerprint(WEEK_START) == fp_after
 
 
 def test_allocation_reconcile_fails_closed_on_disagreeing_snapshots():
