@@ -963,6 +963,78 @@ CREATE TABLE payroll_shift_corrections (
     CHECK (corrected_clock_out > corrected_clock_in)
 );
 
+CREATE TABLE payroll_timesheet_change_batches (
+    id                          BIGSERIAL PRIMARY KEY,
+    request_id                  UUID NOT NULL UNIQUE,
+    request_fingerprint         VARCHAR(64) NOT NULL
+                                    CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+    week_start                  DATE NOT NULL,
+    employee_id                 INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    reason                      TEXT NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 500),
+    operations                  JSONB NOT NULL,
+    before_source_fingerprint   VARCHAR(64) NOT NULL
+                                    CHECK (before_source_fingerprint ~ '^[0-9a-f]{64}$'),
+    after_source_fingerprint    VARCHAR(64)
+                                    CHECK (
+                                        after_source_fingerprint IS NULL
+                                        OR after_source_fingerprint ~ '^[0-9a-f]{64}$'
+                                    ),
+    created_by_employee_id      INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_by_name             TEXT NOT NULL,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE payroll_manual_shift_versions (
+    id                        BIGSERIAL PRIMARY KEY,
+    manual_shift_id           UUID NOT NULL,
+    version                   INTEGER NOT NULL CHECK (version > 0),
+    week_start                DATE NOT NULL,
+    work_date                 DATE NOT NULL,
+    employee_id               INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    clock_in                  TIMESTAMPTZ NOT NULL,
+    clock_out                 TIMESTAMPTZ NOT NULL,
+    break_minutes             INTEGER NOT NULL DEFAULT 0 CHECK (break_minutes BETWEEN 0 AND 1440),
+    total_minutes             INTEGER NOT NULL CHECK (total_minutes BETWEEN 0 AND 1440),
+    location_id               INTEGER REFERENCES locations(id) ON DELETE RESTRICT,
+    included                  BOOLEAN NOT NULL DEFAULT TRUE,
+    status                    VARCHAR(16) NOT NULL DEFAULT 'current'
+                                  CHECK (status IN ('current', 'superseded')),
+    reason                    TEXT NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 500),
+    change_batch_id           BIGINT NOT NULL REFERENCES payroll_timesheet_change_batches(id)
+                                  ON DELETE RESTRICT,
+    created_by_employee_id    INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_by_name           TEXT NOT NULL,
+    superseded_by             BIGINT REFERENCES payroll_manual_shift_versions(id) ON DELETE SET NULL,
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (manual_shift_id, version),
+    CHECK (work_date >= week_start AND work_date < week_start + 7),
+    CHECK (clock_out > clock_in)
+);
+
+CREATE TABLE payroll_shift_exclusions (
+    id                        BIGSERIAL PRIMARY KEY,
+    week_start                DATE NOT NULL,
+    employee_id               INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    shift_id                  INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+    reason                    TEXT NOT NULL CHECK (char_length(reason) BETWEEN 3 AND 500),
+    status                    VARCHAR(16) NOT NULL DEFAULT 'active'
+                                  CHECK (status IN ('active', 'voided')),
+    change_batch_id           BIGINT NOT NULL REFERENCES payroll_timesheet_change_batches(id)
+                                  ON DELETE RESTRICT,
+    created_by_employee_id    INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_by_name           TEXT NOT NULL,
+    voided_by_employee_id     INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    voided_by_name            TEXT,
+    voided_reason             TEXT,
+    voided_by_change_batch_id BIGINT REFERENCES payroll_timesheet_change_batches(id)
+                                  ON DELETE RESTRICT,
+    voided_at                 TIMESTAMPTZ,
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (status <> 'voided' OR voided_at IS NOT NULL)
+);
+
 -- Durable business-scoped operation identity for Atlas money writes. The row
 -- survives browser/tab/admin changes and is resolved only after Atlas confirms
 -- the result, so an ambiguous retry cannot mint a second receipt. Payment
@@ -1074,6 +1146,18 @@ CREATE UNIQUE INDEX uq_payroll_shift_corrections_active_shift
     WHERE status = 'active';
 CREATE INDEX idx_payroll_shift_corrections_week
     ON payroll_shift_corrections(week_start, status, correction_date);
+CREATE INDEX idx_payroll_timesheet_change_batches_week
+    ON payroll_timesheet_change_batches(week_start, employee_id, created_at);
+CREATE UNIQUE INDEX uq_payroll_manual_shift_versions_current
+    ON payroll_manual_shift_versions(manual_shift_id)
+    WHERE status = 'current';
+CREATE INDEX idx_payroll_manual_shift_versions_week
+    ON payroll_manual_shift_versions(week_start, employee_id, work_date, status);
+CREATE UNIQUE INDEX uq_payroll_shift_exclusions_active
+    ON payroll_shift_exclusions(week_start, shift_id)
+    WHERE status = 'active';
+CREATE INDEX idx_payroll_shift_exclusions_week
+    ON payroll_shift_exclusions(week_start, employee_id, status);
 CREATE INDEX idx_receivables_operation_attempts_state
     ON receivables_operation_attempts(state, updated_at);
 CREATE UNIQUE INDEX uq_receivables_operation_attempts_active_identity

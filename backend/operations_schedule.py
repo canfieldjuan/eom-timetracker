@@ -1325,6 +1325,7 @@ def _load_time_evidence(
     visible_job_ids: Iterable[int],
     *,
     timezone_name: str = "America/Chicago",
+    payroll_week_start: Optional[date] = None,
     cursor: Optional[Any] = None,
 ) -> Tuple[
     List[Dict[str, Any]],
@@ -1415,6 +1416,52 @@ def _load_time_evidence(
         ),
         cursor=cursor,
     )
+
+    if payroll_week_start is not None:
+        excluded_shift_ids = {
+            int(row["shift_id"])
+            for row in _query_all(
+                """
+                SELECT shift_id
+                FROM payroll_shift_exclusions
+                WHERE week_start = %s
+                  AND status = 'active'
+                """,
+                (payroll_week_start,),
+                cursor=cursor,
+            )
+        }
+        shifts = [
+            row for row in shifts if int(row["id"]) not in excluded_shift_ids
+        ]
+        manual_shifts = _query_all(
+            """
+            SELECT
+                -manual.id AS id,
+                manual.employee_id,
+                employee.name AS employee_name,
+                employee.hourly_rate,
+                manual.location_id,
+                COALESCE(location.address, '') AS location_label,
+                manual.clock_in,
+                manual.clock_out,
+                manual.break_minutes AS payroll_break_minutes,
+                NULL::integer AS job_id
+            FROM payroll_manual_shift_versions manual
+            JOIN employees employee ON employee.id = manual.employee_id
+            LEFT JOIN locations location ON location.id = manual.location_id
+            WHERE manual.week_start = %s
+              AND manual.status = 'current'
+              AND manual.included = TRUE
+              AND manual.clock_in < %s
+              AND manual.clock_out > %s
+            ORDER BY manual.clock_in, manual.id
+            """,
+            (payroll_week_start, range_end, range_start),
+            cursor=cursor,
+        )
+        shifts.extend(manual_shifts)
+        shifts.sort(key=lambda row: (row["clock_in"], int(row["id"])))
 
     shift_ids = [int(row["id"]) for row in shifts]
     visits: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
@@ -3563,6 +3610,7 @@ def _decorate_schedule_jobs(
     visible_range_start: Optional[datetime] = None,
     visible_range_end: Optional[datetime] = None,
     expected_hours_learning_by_site: Optional[Dict[int, Dict[str, Any]]] = None,
+    payroll_week_start: Optional[date] = None,
     cursor: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[int, Optional[int]]]:
     jobs_by_site_date: Dict[Tuple[int, date], List[Dict[str, Any]]] = defaultdict(list)
@@ -3596,6 +3644,7 @@ def _decorate_schedule_jobs(
         observed_at,
         jobs_by_id,
         timezone_name=getattr(app_timezone, "key", str(app_timezone)),
+        payroll_week_start=payroll_week_start,
         cursor=cursor,
     )
     linked_jobs_by_id = dict(jobs_by_id)
@@ -4997,6 +5046,7 @@ def build_weekly_labor_profitability(
     now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     default_target_labor_pct: Optional[float] = None,
     default_min_margin_pct: Optional[float] = None,
+    payroll_week_start: Optional[date] = None,
     cursor: Optional[Any] = None,
 ) -> Dict[str, Any]:
     app_timezone = ZoneInfo(timezone_name)
@@ -5032,6 +5082,7 @@ def build_weekly_labor_profitability(
         visible_range_start=range_start,
         visible_range_end=range_end,
         expected_hours_learning_by_site=expected_hours_learning_by_site,
+        payroll_week_start=payroll_week_start,
         cursor=cursor,
     )
     source_jobs = {int(job["id"]): job for job in jobs}

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 import inspect
 from io import BytesIO, StringIO
+import json
 from types import SimpleNamespace
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import bcrypt
@@ -106,6 +110,14 @@ def _delete_employees(employee_ids: list[int]) -> None:
 def _delete_payroll_verification_weeks(week_starts: list[date]) -> None:
     for week_start in week_starts:
         db.execute(
+            "DELETE FROM payroll_shift_exclusions WHERE week_start = %s",
+            (week_start,),
+        )
+        db.execute(
+            "DELETE FROM payroll_manual_shift_versions WHERE week_start = %s",
+            (week_start,),
+        )
+        db.execute(
             "DELETE FROM payroll_shift_corrections WHERE week_start = %s",
             (week_start,),
         )
@@ -119,6 +131,10 @@ def _delete_payroll_verification_weeks(week_starts: list[date]) -> None:
         )
         db.execute(
             "DELETE FROM payroll_money_verification_batches WHERE week_start = %s",
+            (week_start,),
+        )
+        db.execute(
+            "DELETE FROM payroll_timesheet_change_batches WHERE week_start = %s",
             (week_start,),
         )
 
@@ -963,6 +979,9 @@ def test_payroll_timesheet_exposes_shift_rows_for_employee_week(client):
             "breakMinutesTracked": False,
             "shiftBreakCorrections": True,
             "locationAllocatedCorrections": True,
+            "atomicTimesheetChanges": True,
+            "manualShiftRows": True,
+            "shiftExclusions": True,
         }
         assert body["breakPolicy"]["tracked"] is False
         assert body["breakPolicy"]["correctionSupported"] is True
@@ -1785,6 +1804,913 @@ def test_payroll_shift_correction_supersedes_and_voids(client):
         assert wednesday["status"] == "registered"
         assert wednesday["totalMinutes"] == 120
         assert "correction" not in wednesday["shifts"][0]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_atomic_timesheet_changes_add_edit_exclude_restore_manual_rows(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=2)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Manual Rows Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Manual Rows Alma")
+        payroll_auth = _login(client, "Payroll Manual Rows Mayra")
+        before = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
+
+        add_request_id = str(uuid4())
+        added = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": add_request_id,
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["timesheetSourceFingerprint"],
+                "reason": "Employee missed both Site clock-ins.",
+                "operations": [
+                    {
+                        "action": "add_manual",
+                        "clientRowId": "draft-a",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 8).isoformat(),
+                        "clockOut": _local_dt(service_day, 11).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    },
+                    {
+                        "action": "add_manual",
+                        "clientRowId": "draft-b",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 12).isoformat(),
+                        "clockOut": _local_dt(service_day, 14, 30).isoformat(),
+                        "breakMinutes": 15,
+                        "locationId": None,
+                    },
+                ],
+            },
+        )
+        assert added.status_code == 200, added.text
+        body = added.json()
+        assert body["action"] == "save_timesheet_changes"
+        assert body["idempotent"] is False
+        tuesday = body["timesheet"]["employees"][0]["days"][2]
+        assert tuesday["totalMinutes"] == 315
+        assert [row["sourceKind"] for row in tuesday["shifts"]] == ["manual", "manual"]
+        assert all(row["shiftId"] is None for row in tuesday["shifts"])
+        assert [row["breakMinutes"] for row in tuesday["shifts"]] == [0, 15]
+        assert [row["original"]["breakMinutes"] for row in tuesday["shifts"]] == [0, 15]
+        manual_ids = [row["manualShiftId"] for row in tuesday["shifts"]]
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM shifts WHERE employee_id = %s",
+            (employee_id,),
+        ) == {"n": 0}
+
+        repeated = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": add_request_id,
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["timesheetSourceFingerprint"],
+                "reason": "Employee missed both Site clock-ins.",
+                "operations": [
+                    {
+                        "action": "add_manual",
+                        "clientRowId": "draft-a",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 8).isoformat(),
+                        "clockOut": _local_dt(service_day, 11).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    },
+                    {
+                        "action": "add_manual",
+                        "clientRowId": "draft-b",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 12).isoformat(),
+                        "clockOut": _local_dt(service_day, 14, 30).isoformat(),
+                        "breakMinutes": 15,
+                        "locationId": None,
+                    },
+                ],
+            },
+        )
+        assert repeated.status_code == 200, repeated.text
+        assert repeated.json()["idempotent"] is True
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM payroll_manual_shift_versions WHERE employee_id = %s",
+            (employee_id,),
+        ) == {"n": 2}
+
+        changed = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": body["timesheet"]["timesheetSourceFingerprint"],
+                "reason": "Supervisor confirmed revised first shift and removed duplicate second shift.",
+                "operations": [
+                    {
+                        "action": "edit_manual",
+                        "manualShiftId": manual_ids[0],
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 8).isoformat(),
+                        "clockOut": _local_dt(service_day, 12).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    },
+                    {"action": "exclude_manual", "manualShiftId": manual_ids[1]},
+                ],
+            },
+        )
+        assert changed.status_code == 200, changed.text
+        changed_day = changed.json()["timesheet"]["employees"][0]["days"][2]
+        assert changed_day["totalMinutes"] == 240
+        assert len(changed_day["shifts"]) == 1
+        assert len(changed_day["excludedShifts"]) == 1
+        assert changed_day["excludedShifts"][0]["canRestore"] is True
+
+        restored = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": changed.json()["timesheet"]["timesheetSourceFingerprint"],
+                "reason": "Supervisor restored the second confirmed shift.",
+                "operations": [{"action": "restore_manual", "manualShiftId": manual_ids[1]}],
+            },
+        )
+        assert restored.status_code == 200, restored.text
+        restored_day = restored.json()["timesheet"]["employees"][0]["days"][2]
+        assert restored_day["totalMinutes"] == 375
+        assert len(restored_day["shifts"]) == 2
+        assert restored_day["excludedShifts"] == []
+        versions = db.query_all(
+            """
+            SELECT manual_shift_id, version, status, included
+            FROM payroll_manual_shift_versions
+            WHERE employee_id = %s
+            ORDER BY manual_shift_id, version
+            """,
+            (employee_id,),
+        )
+        assert len(versions) == 5
+        assert sum(1 for row in versions if row["status"] == "current") == 2
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_atomic_timesheet_changes_exclude_restore_recorded_without_raw_mutation(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=3)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Exclusion Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Exclusion Alma")
+        payroll_auth = _login(client, "Payroll Exclusion Mayra")
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 8),
+            _local_dt(service_day, 10),
+        )
+        raw_before = db.query_one("SELECT * FROM shifts WHERE id = %s", (shift_id,))
+        before = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
+
+        excluded = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["timesheetSourceFingerprint"],
+                "reason": "Duplicate clock record excluded from payroll.",
+                "operations": [{"action": "exclude_recorded", "shiftId": shift_id}],
+            },
+        )
+        assert excluded.status_code == 200, excluded.text
+        day = excluded.json()["timesheet"]["employees"][0]["days"][3]
+        assert day["totalMinutes"] == 0
+        assert day["shifts"] == []
+        assert day["excludedShifts"][0]["shiftId"] == shift_id
+        assert db.query_one("SELECT * FROM shifts WHERE id = %s", (shift_id,)) == raw_before
+
+        blocked_edit = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": excluded.json()["timesheet"][
+                    "employees"
+                ][0]["timesheetSourceFingerprint"],
+                "reason": "Excluded evidence must be restored before editing.",
+                "operations": [
+                    {
+                        "action": "correct_recorded",
+                        "shiftId": shift_id,
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 8).isoformat(),
+                        "clockOut": _local_dt(service_day, 10, 30).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+        assert blocked_edit.status_code == 409, blocked_edit.text
+        assert blocked_edit.json()["error"] == (
+            "Restore the recorded shift before editing it"
+        )
+
+        excluded_employee_token = excluded.json()["timesheet"]["employees"][0][
+            "timesheetSourceFingerprint"
+        ]
+        db.execute(
+            "UPDATE shifts SET clock_out = %s, total_hours = 3.00 WHERE id = %s",
+            (_local_dt(service_day, 11).astimezone(timezone.utc), shift_id),
+        )
+        stale_restore = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": excluded_employee_token,
+                "reason": "Stale excluded evidence must not be restored.",
+                "operations": [{"action": "restore_recorded", "shiftId": shift_id}],
+            },
+        )
+        assert stale_restore.status_code == 409, stale_restore.text
+        refreshed = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        assert (
+            refreshed["employees"][0]["timesheetSourceFingerprint"]
+            != excluded_employee_token
+        )
+
+        restored = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": refreshed["employees"][0][
+                    "timesheetSourceFingerprint"
+                ],
+                "reason": "Supervisor confirmed the recorded shift belongs in payroll.",
+                "operations": [{"action": "restore_recorded", "shiftId": shift_id}],
+            },
+        )
+        assert restored.status_code == 200, restored.text
+        restored_day = restored.json()["timesheet"]["employees"][0]["days"][3]
+        assert restored_day["totalMinutes"] == 180
+        assert restored_day["excludedShifts"] == []
+        assert db.query_one(
+            "SELECT clock_out, total_hours FROM shifts WHERE id = %s",
+            (shift_id,),
+        ) == {
+            "clock_out": _local_dt(service_day, 11).astimezone(timezone.utc),
+            "total_hours": Decimal("3.00"),
+        }
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_atomic_timesheet_can_exclude_and_restore_a_shift_spilling_into_the_week(client):
+    week_start = date(2026, 7, 19)
+    shift_start = week_start - timedelta(days=1)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Spillover Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Spillover Alma")
+        payroll_auth = _login(client, "Payroll Spillover Mayra")
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(shift_start, 22),
+            _local_dt(week_start, 2),
+        )
+        before = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
+        sunday = before["employees"][0]["days"][0]
+        assert sunday["totalMinutes"] == 120
+        assert sunday["shifts"][0]["shiftId"] == shift_id
+
+        excluded = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["employees"][0][
+                    "timesheetSourceFingerprint"
+                ],
+                "reason": "Saturday shift does not belong in Sunday payroll.",
+                "operations": [{"action": "exclude_recorded", "shiftId": shift_id}],
+            },
+        )
+        assert excluded.status_code == 200, excluded.text
+        excluded_sunday = excluded.json()["timesheet"]["employees"][0]["days"][0]
+        assert excluded_sunday["totalMinutes"] == 0
+        assert excluded_sunday["shifts"] == []
+        assert excluded_sunday["excludedShifts"][0]["shiftId"] == shift_id
+        assert excluded_sunday["excludedShifts"][0]["date"] == week_start.isoformat()
+        assert excluded_sunday["excludedShifts"][0]["totalMinutes"] == 120
+
+        restored = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": excluded.json()["timesheet"][
+                    "employees"
+                ][0]["timesheetSourceFingerprint"],
+                "reason": "Sunday spillover hours were confirmed for payroll.",
+                "operations": [{"action": "restore_recorded", "shiftId": shift_id}],
+            },
+        )
+        assert restored.status_code == 200, restored.text
+        restored_sunday = restored.json()["timesheet"]["employees"][0]["days"][0]
+        assert restored_sunday["totalMinutes"] == 120
+        assert restored_sunday["excludedShifts"] == []
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_recorded_shift_changes_retire_day_totals_on_every_affected_date(client):
+    week_start = date(2026, 7, 19)
+    monday = week_start + timedelta(days=1)
+    tuesday = week_start + timedelta(days=2)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Multi Day Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Multi Day Alma")
+        payroll_auth = _login(client, "Payroll Multi Day Mayra")
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(monday, 22),
+            _local_dt(tuesday, 2),
+        )
+        for correction_day in (monday, tuesday):
+            corrected = client.post(
+                "/api/admin/payroll/weekly-hours/corrections",
+                headers=payroll_auth,
+                json={
+                    "weekStart": week_start.isoformat(),
+                    "employeeId": employee_id,
+                    "date": correction_day.isoformat(),
+                    "correctedTotalMinutes": 180,
+                    "reason": "Legacy total awaiting shift-level review.",
+                },
+            )
+            assert corrected.status_code == 200, corrected.text
+        before = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
+
+        excluded = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["employees"][0][
+                    "timesheetSourceFingerprint"
+                ],
+                "reason": "The overnight shift was duplicate evidence.",
+                "operations": [{"action": "exclude_recorded", "shiftId": shift_id}],
+            },
+        )
+        assert excluded.status_code == 200, excluded.text
+        days = excluded.json()["timesheet"]["employees"][0]["days"]
+        assert days[1]["totalMinutes"] == 0
+        assert days[2]["totalMinutes"] == 0
+        statuses = db.query_all(
+            """
+            SELECT correction_date, status
+            FROM payroll_hour_corrections
+            WHERE week_start = %s AND employee_id = %s
+            ORDER BY correction_date
+            """,
+            (week_start, employee_id),
+        )
+        assert statuses == [
+            {"correction_date": monday, "status": "voided"},
+            {"correction_date": tuesday, "status": "voided"},
+        ]
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_excluded_manual_shift_keeps_an_inactive_employee_visible(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=2)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Inactive Manual Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Inactive Manual Alma")
+        payroll_auth = _login(client, "Payroll Inactive Manual Mayra")
+        before = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
+        added = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["employees"][0][
+                    "timesheetSourceFingerprint"
+                ],
+                "reason": "Manual shift added before deactivation.",
+                "operations": [
+                    {
+                        "action": "add_manual",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 8).isoformat(),
+                        "clockOut": _local_dt(service_day, 10).isoformat(),
+                        "breakMinutes": 10,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+        assert added.status_code == 200, added.text
+        manual_id = added.json()["timesheet"]["employees"][0]["days"][2]["shifts"][0][
+            "manualShiftId"
+        ]
+        excluded = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": added.json()["timesheet"][
+                    "employees"
+                ][0]["timesheetSourceFingerprint"],
+                "reason": "Manual shift excluded before deactivation.",
+                "operations": [{"action": "exclude_manual", "manualShiftId": manual_id}],
+            },
+        )
+        assert excluded.status_code == 200, excluded.text
+        db.execute("UPDATE employees SET active = FALSE WHERE id = %s", (employee_id,))
+
+        inactive = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        assert inactive["summary"]["employeeCount"] == 1
+        assert inactive["employees"][0]["active"] is False
+        excluded_rows = inactive["employees"][0]["days"][2]["excludedShifts"]
+        assert excluded_rows[0]["manualShiftId"] == manual_id
+        assert excluded_rows[0]["breakMinutes"] == 10
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_inactive_employee_can_add_their_first_manual_payroll_shift(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=2)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Inactive First Edit Mayra", role="payroll")
+        employee_id = _create_employee(
+            "Payroll Inactive First Edit Alma",
+            active=False,
+        )
+        payroll_auth = _login(client, "Payroll Inactive First Edit Mayra")
+
+        before = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        assert before["summary"]["employeeCount"] == 1
+        assert before["employees"][0]["active"] is False
+        employee_token = before["employees"][0]["timesheetSourceFingerprint"]
+        assert len(employee_token) == 64
+
+        added = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": employee_token,
+                "reason": "Historical worker missed the first payroll clock record.",
+                "operations": [
+                    {
+                        "action": "add_manual",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 8).isoformat(),
+                        "clockOut": _local_dt(service_day, 10).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+        assert added.status_code == 200, added.text
+        assert added.json()["timesheet"]["employees"][0]["days"][2][
+            "totalMinutes"
+        ] == 120
+        batch = db.query_one(
+            """
+            SELECT before_source_fingerprint, after_source_fingerprint
+            FROM payroll_timesheet_change_batches
+            WHERE employee_id = %s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (employee_id,),
+        )
+        assert len(batch["before_source_fingerprint"]) == 64
+        assert len(batch["after_source_fingerprint"]) == 64
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_employee_timesheet_token_ignores_unrelated_employee_clock_changes(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=1)
+    payroll_id = None
+    first_employee_id = None
+    second_employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Scoped Token Mayra", role="payroll")
+        first_employee_id = _create_employee("Payroll Scoped Token Alma")
+        second_employee_id = _create_employee("Payroll Scoped Token Berta")
+        payroll_auth = _login(client, "Payroll Scoped Token Mayra")
+        before = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=first_employee_id,
+        )
+        first_token = before["employees"][0]["timesheetSourceFingerprint"]
+        global_token = before["timesheetSourceFingerprint"]
+
+        _create_shift(
+            second_employee_id,
+            _local_dt(service_day, 7),
+            _local_dt(service_day, 9),
+        )
+        after_other_clock = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=first_employee_id,
+        )
+        assert after_other_clock["timesheetSourceFingerprint"] != global_token
+        assert after_other_clock["employees"][0]["timesheetSourceFingerprint"] == first_token
+
+        saved = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": first_employee_id,
+                "expectedTimesheetSourceFingerprint": first_token,
+                "reason": "Unrelated employee clocks do not stale this row.",
+                "operations": [
+                    {
+                        "action": "add_manual",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 10).isoformat(),
+                        "clockOut": _local_dt(service_day, 11).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+        assert saved.status_code == 200, saved.text
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees(
+            [
+                value
+                for value in (first_employee_id, second_employee_id, payroll_id)
+                if value
+            ]
+        )
+
+
+def test_atomic_timesheet_changes_are_stale_safe_atomic_and_retire_day_total(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=1)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Atomic Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Atomic Alma")
+        payroll_auth = _login(client, "Payroll Atomic Mayra")
+        baseline = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
+        correction = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": service_day.isoformat(),
+                "correctedTotalMinutes": 60,
+                "reason": "Legacy total before granular evidence arrived.",
+            },
+        )
+        assert correction.status_code == 200, correction.text
+        with_total = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
+
+        failed = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": with_total["timesheetSourceFingerprint"],
+                "reason": "This whole batch must roll back.",
+                "operations": [
+                    {
+                        "action": "add_manual",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 8).isoformat(),
+                        "clockOut": _local_dt(service_day, 10).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    },
+                    {"action": "exclude_recorded", "shiftId": 2147483647},
+                ],
+            },
+        )
+        assert failed.status_code == 404, failed.text
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM payroll_manual_shift_versions WHERE employee_id = %s",
+            (employee_id,),
+        ) == {"n": 0}
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM payroll_timesheet_change_batches WHERE employee_id = %s",
+            (employee_id,),
+        ) == {"n": 0}
+
+        added = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": with_total["timesheetSourceFingerprint"],
+                "reason": "Granular row replaces the legacy day total.",
+                "operations": [{
+                    "action": "add_manual",
+                    "date": service_day.isoformat(),
+                    "clockIn": _local_dt(service_day, 8).isoformat(),
+                    "clockOut": _local_dt(service_day, 10).isoformat(),
+                    "breakMinutes": 0,
+                    "locationId": None,
+                }],
+            },
+        )
+        assert added.status_code == 200, added.text
+        day = added.json()["timesheet"]["employees"][0]["days"][1]
+        assert day["totalMinutes"] == 120
+        assert day.get("correction") is None
+        assert db.query_one(
+            """
+            SELECT status FROM payroll_hour_corrections
+            WHERE week_start = %s AND employee_id = %s AND correction_date = %s
+            ORDER BY id DESC LIMIT 1
+            """,
+            (week_start, employee_id, service_day),
+        ) == {"status": "voided"}
+
+        stale = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": baseline["timesheetSourceFingerprint"],
+                "reason": "Stale browser must not overwrite current payroll.",
+                "operations": [{
+                    "action": "add_manual",
+                    "date": service_day.isoformat(),
+                    "clockIn": _local_dt(service_day, 11).isoformat(),
+                    "clockOut": _local_dt(service_day, 12).isoformat(),
+                    "breakMinutes": 0,
+                    "locationId": None,
+                }],
+            },
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["error"] == "Payroll timesheet changed; refresh before saving"
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_manual_shift_overlap_blocks_verification_and_verified_week_locks_changes(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=4)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Overlap Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Overlap Alma")
+        payroll_auth = _login(client, "Payroll Overlap Mayra")
+        before = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
+        added = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["timesheetSourceFingerprint"],
+                "reason": "Supervisor supplied two overlapping records for review.",
+                "operations": [
+                    {
+                        "action": "add_manual",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 8).isoformat(),
+                        "clockOut": _local_dt(service_day, 11).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    },
+                    {
+                        "action": "add_manual",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 10).isoformat(),
+                        "clockOut": _local_dt(service_day, 12).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    },
+                ],
+            },
+        )
+        assert added.status_code == 200, added.text
+        added_body = added.json()["timesheet"]
+        assert added_body["summary"]["hasBlockingIssues"] is True
+        assert added_body["summary"]["issueCount"] == 2
+        assert all(
+            issue["code"] == "overlapping_shift" and issue["manualShiftId"]
+            for issue in added_body["employees"][0]["issues"]
+        )
+        blocked = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": added_body["sourceFingerprint"],
+            },
+        )
+        assert blocked.status_code == 409, blocked.text
+
+        manual_ids = [
+            row["manualShiftId"]
+            for row in added_body["employees"][0]["days"][4]["shifts"]
+        ]
+        resolved_request_id = str(uuid4())
+        resolved_request = {
+            "requestId": resolved_request_id,
+            "weekStart": week_start.isoformat(),
+            "employeeId": employee_id,
+            "expectedTimesheetSourceFingerprint": added_body["timesheetSourceFingerprint"],
+            "reason": "Supervisor identified the second row as duplicate.",
+            "operations": [{"action": "exclude_manual", "manualShiftId": manual_ids[1]}],
+        }
+        resolved = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json=resolved_request,
+        )
+        assert resolved.status_code == 200, resolved.text
+        resolved_body = resolved.json()["timesheet"]
+        assert resolved_body["summary"]["hasBlockingIssues"] is False
+        verified = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=payroll_auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": resolved_body["sourceFingerprint"],
+                "reason": "Mayra verified the resolved payroll week.",
+            },
+        )
+        assert verified.status_code == 200, verified.text
+
+        repeated_after_verification = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json=resolved_request,
+        )
+        assert repeated_after_verification.status_code == 200, repeated_after_verification.text
+        assert repeated_after_verification.json()["idempotent"] is True
+
+        locked = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": resolved_body["timesheetSourceFingerprint"],
+                "reason": "This edit requires reopening first.",
+                "operations": [{
+                    "action": "edit_manual",
+                    "manualShiftId": manual_ids[0],
+                    "date": service_day.isoformat(),
+                    "clockIn": _local_dt(service_day, 8).isoformat(),
+                    "clockOut": _local_dt(service_day, 11, 30).isoformat(),
+                    "breakMinutes": 0,
+                    "locationId": None,
+                }],
+            },
+        )
+        assert locked.status_code == 409, locked.text
+        assert locked.json()["error"] == "Reopen the payroll week before changing corrections"
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_manual_payroll_rows_do_not_enter_employee_or_general_hours(client, auth, monkeypatch):
+    week_start = date(2026, 8, 2)
+    service_day = week_start + timedelta(days=3)
+    observed_at = _local_dt(week_start + timedelta(days=5), 12).astimezone(timezone.utc)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Scope Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Scope Alma")
+        payroll_auth = _login(client, "Payroll Scope Mayra")
+        employee_auth = _login(client, "Payroll Scope Alma")
+        monkeypatch.setattr(time_tracker_api, "utc_now", lambda: observed_at)
+        before = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
+        added = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["timesheetSourceFingerprint"],
+                "reason": "Payroll-only verification row.",
+                "operations": [{
+                    "action": "add_manual",
+                    "date": service_day.isoformat(),
+                    "clockIn": _local_dt(service_day, 8).isoformat(),
+                    "clockOut": _local_dt(service_day, 10).isoformat(),
+                    "breakMinutes": 0,
+                    "locationId": None,
+                }],
+            },
+        )
+        assert added.status_code == 200, added.text
+        assert added.json()["timesheet"]["summary"]["totalMinutes"] == 120
+
+        my_hours = client.get("/api/timesheet/my-hours", headers=employee_auth)
+        assert my_hours.status_code == 200, my_hours.text
+        assert my_hours.json()["weeklyHours"] == 0
+
+        general_report = client.get(
+            f"/api/admin/reports/hours?period=week&date={service_day.isoformat()}&employee_id={employee_id}",
+            headers=auth,
+        )
+        assert general_report.status_code == 200, general_report.text
+        assert general_report.json()["rows"] == []
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_employees([value for value in (employee_id, payroll_id) if value])
@@ -3114,7 +4040,9 @@ def test_void_payroll_correction_restores_shift_total_and_employee_role_is_denie
 
 def test_payroll_verification_schema_migration_installs_existing_deployments():
     db.execute(
-        "DROP TABLE IF EXISTS payroll_shift_corrections, "
+        "DROP TABLE IF EXISTS payroll_shift_exclusions, "
+        "payroll_manual_shift_versions, payroll_timesheet_change_batches, "
+        "payroll_shift_corrections, "
         "payroll_hour_correction_allocations, "
         "payroll_hour_corrections, "
         "payroll_verification_events, payroll_verification_batches"
@@ -3135,6 +4063,15 @@ def test_payroll_verification_schema_migration_installs_existing_deployments():
     )
     shift_correction_table = db.query_one(
         "SELECT to_regclass('payroll_shift_corrections') AS table_name"
+    )
+    change_batch_table = db.query_one(
+        "SELECT to_regclass('payroll_timesheet_change_batches') AS table_name"
+    )
+    manual_shift_table = db.query_one(
+        "SELECT to_regclass('payroll_manual_shift_versions') AS table_name"
+    )
+    exclusion_table = db.query_one(
+        "SELECT to_regclass('payroll_shift_exclusions') AS table_name"
     )
     status_check = db.query_one(
         """
@@ -3157,6 +4094,9 @@ def test_payroll_verification_schema_migration_installs_existing_deployments():
     assert allocation_table["table_name"] == "payroll_hour_correction_allocations"
     assert shift_correction_table is not None
     assert shift_correction_table["table_name"] == "payroll_shift_corrections"
+    assert change_batch_table == {"table_name": "payroll_timesheet_change_batches"}
+    assert manual_shift_table == {"table_name": "payroll_manual_shift_versions"}
+    assert exclusion_table == {"table_name": "payroll_shift_exclusions"}
     assert status_check == {"found": 1}
 
 
@@ -3419,6 +4359,101 @@ def test_payroll_labor_profitability_reports_actual_site_margin_without_rates(
             }
         ]
         assert "hourlyRate" not in response.text
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_payroll_labor_profitability_rows()
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_labor_profitability_applies_manual_and_exclusion_overlays(client):
+    week_start = date(2026, 7, 19)
+    service_day = date(2026, 7, 20)
+    _delete_payroll_labor_profitability_rows()
+    _delete_payroll_verification_weeks([week_start])
+    employee_id = None
+    payroll_id = None
+    try:
+        payroll_id = _create_employee(
+            "Payroll Labor Profitability Overlay Mayra",
+            role="payroll",
+        )
+        employee_id = _create_employee(
+            "Payroll Labor Profitability Overlay Worker",
+            hourly_rate=20,
+        )
+        payroll_auth = _login(client, "Payroll Labor Profitability Overlay Mayra")
+        source_id = _create_payroll_profitability_source()
+        _, site_id = _create_payroll_profitability_site()
+        job_id = _create_payroll_profitability_job_only(
+            site_id=site_id,
+            source_id=source_id,
+            scheduled_date=service_day,
+            scheduled_start=_local_dt(service_day, 8),
+            scheduled_end=_local_dt(service_day, 15),
+            source_key="d" * 64,
+        )
+        shift_id = _create_payroll_profitability_shift_evidence(
+            employee_id=employee_id,
+            site_id=site_id,
+            job_id=job_id,
+            local_start=_local_dt(service_day, 8),
+            local_end=_local_dt(service_day, 11),
+        )
+        before = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+
+        changed = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["employees"][0][
+                    "timesheetSourceFingerprint"
+                ],
+                "reason": "Duplicate clock excluded and missed Site shift restored.",
+                "operations": [
+                    {"action": "exclude_recorded", "shiftId": shift_id},
+                    {
+                        "action": "add_manual",
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 12).isoformat(),
+                        "clockOut": _local_dt(service_day, 14).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": site_id,
+                    },
+                ],
+            },
+        )
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["timesheet"]["summary"]["totalHours"] == 2.0
+
+        response = client.get(
+            f"/api/admin/payroll/labor-profitability?weekStart={week_start.isoformat()}",
+            headers=payroll_auth,
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["payrollHours"]["totalHours"] == 2.0
+        assert body["summary"]["actualHours"] == 2.0
+        assert body["summary"]["actualLaborCost"] == 40.0
+        job = next(row for row in body["jobs"] if row["jobId"] == job_id)
+        assert job["actualHours"] == 2.0
+        assert job["actualLaborCost"] == 40.0
+        assert job["workers"] == [
+            {
+                "employeeId": employee_id,
+                "employeeName": "Payroll Labor Profitability Overlay Worker",
+                "hours": 2.0,
+                "laborCost": 40.0,
+                "status": "finalized",
+            }
+        ]
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_payroll_labor_profitability_rows()
@@ -5671,6 +6706,52 @@ def test_source_fingerprint_unchanged_by_empty_blocking_issues():
             ],
         )
         != base
+    )
+
+
+def test_recorded_shift_source_fingerprint_keeps_the_pre_overlay_shape():
+    week_start = date(2026, 5, 3)
+    week_end = date(2026, 5, 9)
+    clock_in = _local_dt(week_start + timedelta(days=1), 8)
+    clock_out = _local_dt(week_start + timedelta(days=1), 10)
+    employees = [{"id": 7, "name": "Fingerprint Alma", "active": True}]
+    shifts = [
+        {
+            "id": 81,
+            "employee_id": 7,
+            "clock_in": clock_in,
+            "clock_out": clock_out,
+            "payroll_source_kind": "recorded",
+            "manual_shift_id": None,
+        }
+    ]
+    legacy_payload = {
+        "timezone": time_tracker_api.TIMEZONE_NAME,
+        "weekStart": week_start.isoformat(),
+        "weekEnd": week_end.isoformat(),
+        "employees": [{"id": 7, "name": "Fingerprint Alma", "active": True}],
+        "shifts": [
+            {
+                "id": 81,
+                "employee_id": 7,
+                "clock_in": time_tracker_api.to_utc_iso(clock_in),
+                "clock_out": time_tracker_api.to_utc_iso(clock_out),
+            }
+        ],
+    }
+    expected = hashlib.sha256(
+        json.dumps(legacy_payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    assert (
+        time_tracker_api._payroll_source_fingerprint(
+            week_start=week_start,
+            week_end=week_end,
+            employees=employees,
+            shifts=shifts,
+        )
+        == expected
     )
 
 
