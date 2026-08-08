@@ -72,6 +72,7 @@ PAYROLL_ROLE = "payroll"
 EMPLOYEE_ROLES = (ADMIN_ROLE, EMPLOYEE_ROLE, PAYROLL_ROLE)
 PAYROLL_READ_ROLES = {ADMIN_ROLE, PAYROLL_ROLE}
 PAYROLL_VERIFICATION_LOCK_PREFIX = "eom_payroll_verification_week_v1"
+PAYROLL_MONEY_VERIFICATION_LOCK_PREFIX = "eom_payroll_money_verification_week_v1"
 EMPLOYEE_WRITE_LOCK = threading.Lock()
 TIMESHEET_WRITE_LOCK = threading.Lock()
 TIMESHEET_PG_ADVISORY_LOCK_ID = 5_107_202_064
@@ -2737,6 +2738,16 @@ class PayrollReopenRequest(PayrollWeekRequest):
         return value.strip() if isinstance(value, str) else value
 
 
+class PayrollMoneyVerificationRequest(PayrollWeekRequest):
+    moneyFingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    reason: str = Field(default="", max_length=500)
+
+    @field_validator("moneyFingerprint", "reason", mode="before")
+    @classmethod
+    def strip_money_verification_text(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class PayrollCorrectionRequest(PayrollWeekRequest):
     employeeId: int = Field(gt=0)
     date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
@@ -5223,6 +5234,51 @@ def _ensure_schema_migrations() -> None:
             created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+    # Money (payroll dollars) verification: a second, independent truth from the
+    # hours sign-off. Mirrors the hours tables but has NO finalized state -- the
+    # payroll-level FINALIZED lives on the hours batch, gated on a current money
+    # verification. source_fingerprint here is the money-inclusive timesheet
+    # fingerprint (timesheetSourceFingerprint).
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS payroll_money_verification_batches (
+            id                      BIGSERIAL PRIMARY KEY,
+            week_start              DATE NOT NULL UNIQUE,
+            week_end                DATE NOT NULL,
+            timezone                TEXT NOT NULL,
+            status                  VARCHAR(16) NOT NULL DEFAULT 'verified'
+                                        CHECK (status IN ('verified', 'reopened')),
+            source_fingerprint      VARCHAR(64) NOT NULL
+                                        CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+            snapshot                JSONB NOT NULL,
+            verified_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            verified_by_name        TEXT NOT NULL,
+            verified_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            reopened_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            reopened_by_name        TEXT,
+            reopened_reason         TEXT,
+            reopened_at             TIMESTAMPTZ,
+            created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (week_end = week_start + 6)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS payroll_money_verification_events (
+            id                 BIGSERIAL PRIMARY KEY,
+            batch_id           BIGINT NOT NULL REFERENCES payroll_money_verification_batches(id) ON DELETE CASCADE,
+            week_start         DATE NOT NULL,
+            action             VARCHAR(16) NOT NULL
+                                   CHECK (action IN ('verify', 'reopen')),
+            actor_employee_id  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            actor_name         TEXT NOT NULL,
+            reason             TEXT NOT NULL DEFAULT '',
+            source_fingerprint VARCHAR(64) NOT NULL
+                                   CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+            before_state       JSONB,
+            after_state        JSONB NOT NULL,
+            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS payroll_hour_corrections (
             id                       BIGSERIAL PRIMARY KEY,
@@ -5375,6 +5431,18 @@ def _ensure_schema_migrations() -> None:
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_payroll_verification_events_batch
         ON payroll_verification_events(batch_id, created_at)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payroll_money_verification_batches_status_week
+        ON payroll_money_verification_batches(status, week_start)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payroll_money_verification_events_week
+        ON payroll_money_verification_events(week_start, created_at)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_payroll_money_verification_events_batch
+        ON payroll_money_verification_events(batch_id, created_at)
     """)
     db.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_payroll_hour_corrections_active_day
@@ -14410,6 +14478,7 @@ def _payroll_overlapping_shift_rows(
             shift_row.clock_in,
             shift_row.clock_out,
             shift_row.total_hours,
+            shift_row.hourly_rate_cents,
             shift_row.local_date,
             shift_row.timezone,
             shift_row.location_id,
@@ -15078,6 +15147,21 @@ def _payroll_timesheet_allocation_validity_payload(
     return payload
 
 
+def _payroll_effective_shift_rate_cents(
+    shift: Dict[str, Any],
+    rate_cents_by_employee: Dict[int, Optional[int]],
+) -> Optional[int]:
+    """The rate a shift's labor is actually priced at: its stamped snapshot if
+    present, else the employee's current live rate. This is what money
+    verification signs off -- an UNSTAMPED shift is repriced by a live-rate edit,
+    so its effective rate must move the money fingerprint (a stamped shift is
+    frozen, so a rate edit correctly does NOT move it)."""
+    snapshot = shift.get("hourly_rate_cents")
+    if snapshot is not None:
+        return int(snapshot)
+    return rate_cents_by_employee.get(int(shift["employee_id"]))
+
+
 def _payroll_timesheet_source_fingerprint(
     *,
     week_start: date,
@@ -15089,6 +15173,18 @@ def _payroll_timesheet_source_fingerprint(
     allocations: List[Dict[str, Any]],
     correction_details: List[Dict[str, Any]],
 ) -> str:
+    rate_cents_by_employee: Dict[int, Optional[int]] = {
+        int(row["id"]): (
+            int(
+                (Decimal(str(row["hourly_rate"])) * 100).to_integral_value(
+                    rounding=ROUND_HALF_UP
+                )
+            )
+            if row.get("hourly_rate") is not None
+            else None
+        )
+        for row in employees
+    }
     payload = {
         "timezone": TIMEZONE_NAME,
         "weekStart": week_start.isoformat(),
@@ -15111,6 +15207,9 @@ def _payroll_timesheet_source_fingerprint(
                 ),
                 "total_hours": (
                     str(row["total_hours"]) if row.get("total_hours") is not None else None
+                ),
+                "effective_hourly_rate_cents": _payroll_effective_shift_rate_cents(
+                    row, rate_cents_by_employee
                 ),
                 "local_date": (
                     row["local_date"].isoformat()
@@ -15313,7 +15412,7 @@ def _compute_payroll_timesheet(
     now_utc = utc_now()
     employee_rows = _payroll_query_all(
         """
-        SELECT id, name, active
+        SELECT id, name, active, hourly_rate
         FROM employees
         ORDER BY LOWER(name), id
         """,
@@ -16476,6 +16575,27 @@ def _lock_payroll_source_rows(cur: Any) -> None:
     )
 
 
+def _lock_payroll_money_source_rows(cur: Any) -> None:
+    # Superset of the hours source lock: the money fingerprint also hashes each
+    # shift's location/customer LABELS (joined from locations/customers), so
+    # those tables must be locked too or a concurrent Site edit could commit
+    # between the proof read and the verification commit, persisting an
+    # already-stale money proof.
+    cur.execute(
+        """
+        LOCK TABLE
+            shifts,
+            payroll_shift_corrections,
+            payroll_hour_corrections,
+            payroll_hour_correction_allocations,
+            employees,
+            locations,
+            customers
+        IN SHARE MODE
+        """
+    )
+
+
 def _lock_payroll_correction_write_tables(cur: Any) -> None:
     cur.execute(
         """
@@ -16695,6 +16815,227 @@ def _ensure_payroll_snapshot_has_no_blocking_issues(data: Dict[str, Any], action
         raise HTTPException(
             status_code=409,
             detail=f"Resolve payroll hour issues before {action}",
+        )
+
+
+# --- Money (payroll dollars) verification -----------------------------------
+# A second, independent verification truth, mirroring the hours machinery above
+# but keyed on the money-inclusive timesheet fingerprint
+# (data["timesheetSourceFingerprint"]) and with NO finalized state -- the
+# payroll-level FINALIZED lives on the hours batch (gated on a current money
+# verification). Staleness is fingerprint-based, exactly like hours.
+
+def _lock_payroll_money_verification_week(cur: Any, week_start: date) -> None:
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (f"{PAYROLL_MONEY_VERIFICATION_LOCK_PREFIX}:{week_start.isoformat()}",),
+    )
+
+
+def _get_payroll_money_verification_batch(
+    cur: Any,
+    week_start: date,
+    *,
+    lock: bool = False,
+) -> Optional[Dict[str, Any]]:
+    lock_clause = " FOR UPDATE" if lock else ""
+    cur.execute(
+        f"""
+        SELECT *
+        FROM payroll_money_verification_batches
+        WHERE week_start = %s
+        {lock_clause}
+        """,
+        (week_start,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _payroll_money_verification_state(
+    row: Optional[Dict[str, Any]],
+    *,
+    current_money_fingerprint: Optional[str] = None,
+) -> Dict[str, Any]:
+    if row is None:
+        return {
+            "status": "unverified",
+            "batchId": None,
+            "moneyFingerprint": None,
+            "stale": False,
+            "verifiedAt": None,
+            "verifiedByName": None,
+            "reopenedAt": None,
+            "reopenedByName": None,
+            "reopenedReason": None,
+        }
+
+    money_fingerprint = str(row["source_fingerprint"])
+    stale = (
+        current_money_fingerprint is not None
+        and not hmac.compare_digest(money_fingerprint, current_money_fingerprint)
+    )
+    return {
+        "status": str(row["status"]),
+        "batchId": int(row["id"]),
+        "moneyFingerprint": money_fingerprint,
+        "stale": stale,
+        "verifiedAt": _payroll_verification_iso(row.get("verified_at")),
+        "verifiedByName": str(row["verified_by_name"]),
+        "reopenedAt": _payroll_verification_iso(row.get("reopened_at")),
+        "reopenedByName": (
+            str(row["reopened_by_name"])
+            if row.get("reopened_by_name") is not None
+            else None
+        ),
+        "reopenedReason": row.get("reopened_reason"),
+    }
+
+
+def _insert_payroll_money_verification_event(
+    cur: Any,
+    *,
+    batch_row: Dict[str, Any],
+    action: str,
+    actor: Dict[str, Any],
+    reason: str,
+    before_state: Optional[Dict[str, Any]],
+    after_state: Dict[str, Any],
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO payroll_money_verification_events (
+            batch_id,
+            week_start,
+            action,
+            actor_employee_id,
+            actor_name,
+            reason,
+            source_fingerprint,
+            before_state,
+            after_state
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+        """,
+        (
+            int(batch_row["id"]),
+            batch_row["week_start"],
+            action,
+            int(actor["id"]),
+            str(actor["name"]),
+            reason.strip(),
+            str(batch_row["source_fingerprint"]),
+            json.dumps(before_state, sort_keys=True) if before_state is not None else None,
+            json.dumps(after_state, sort_keys=True),
+        ),
+    )
+
+
+def _insert_payroll_money_verification_batch(
+    cur: Any,
+    *,
+    data: Dict[str, Any],
+    actor: Dict[str, Any],
+) -> Dict[str, Any]:
+    cur.execute(
+        """
+        INSERT INTO payroll_money_verification_batches (
+            week_start,
+            week_end,
+            timezone,
+            status,
+            source_fingerprint,
+            snapshot,
+            verified_by_employee_id,
+            verified_by_name
+        )
+        VALUES (%s, %s, %s, 'verified', %s, %s::jsonb, %s, %s)
+        RETURNING *
+        """,
+        (
+            data["weekStart"],
+            data["weekEnd"],
+            data["timezone"],
+            data["timesheetSourceFingerprint"],
+            json.dumps(data, sort_keys=True),
+            int(actor["id"]),
+            str(actor["name"]),
+        ),
+    )
+    return dict(cur.fetchone())
+
+
+def _update_payroll_money_verification_batch(
+    cur: Any,
+    *,
+    batch_id: int,
+    data: Dict[str, Any],
+    actor: Dict[str, Any],
+) -> Dict[str, Any]:
+    cur.execute(
+        """
+        UPDATE payroll_money_verification_batches
+        SET
+            week_end = %s,
+            timezone = %s,
+            status = 'verified',
+            source_fingerprint = %s,
+            snapshot = %s::jsonb,
+            verified_by_employee_id = %s,
+            verified_by_name = %s,
+            verified_at = NOW(),
+            updated_at = NOW()
+        WHERE id = %s
+        RETURNING *
+        """,
+        (
+            data["weekEnd"],
+            data["timezone"],
+            data["timesheetSourceFingerprint"],
+            json.dumps(data, sort_keys=True),
+            int(actor["id"]),
+            str(actor["name"]),
+            batch_id,
+        ),
+    )
+    return dict(cur.fetchone())
+
+
+def _ensure_payroll_money_snapshot_current(
+    payload_fingerprint: str,
+    data: Dict[str, Any],
+    action: str,
+) -> None:
+    if not hmac.compare_digest(payload_fingerprint, data["timesheetSourceFingerprint"]):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Payroll dollars changed; refresh before {action}",
+        )
+
+
+def _ensure_hours_verified_and_current(
+    cur: Any,
+    week_start: date,
+    hours_data: Dict[str, Any],
+    action: str,
+) -> None:
+    """Money can only be signed off on top of a CURRENT hours sign-off. Requires
+    the hours batch to be 'verified' with a fingerprint matching the freshly
+    recomputed hours snapshot; otherwise the dollars would rest on hours nobody
+    has reviewed (or that changed since)."""
+    hours_row = _get_payroll_verification_batch(cur, week_start)
+    if hours_row is None or str(hours_row["status"]) != "verified":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Verify the payroll week's hours before {action}",
+        )
+    if not hmac.compare_digest(
+        str(hours_row["source_fingerprint"]), hours_data["sourceFingerprint"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Payroll hours changed since they were verified; "
+            f"reopen and verify hours before {action}",
         )
 
 
@@ -17450,31 +17791,50 @@ def admin_payroll_weekly_hours_verification(
     week_start: Optional[str] = Query(default=None, alias="weekStart"),
     _: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
-    data = _compute_payroll_weekly_hours(_payroll_week_start_query(request, week_start))
+    # Both truths are read from ONE timesheet computation (which internally
+    # computes the weekly hours), so the hours and money fingerprints/summary can
+    # never be derived from different source snapshots -- otherwise the page
+    # could show hours as current while presenting money from a later state.
+    timesheet = _compute_payroll_timesheet(_payroll_week_start_query(request, week_start))
+    parsed_week_start = _parse_payroll_week_start(timesheet["weekStart"])
     row = db.query_one(
         """
         SELECT *
         FROM payroll_verification_batches
         WHERE week_start = %s
         """,
-        (_parse_payroll_week_start(data["weekStart"]),),
+        (parsed_week_start,),
+    )
+    money_row = db.query_one(
+        """
+        SELECT *
+        FROM payroll_money_verification_batches
+        WHERE week_start = %s
+        """,
+        (parsed_week_start,),
     )
     append_access_log(
         request,
         "PAYROLL_WEEKLY_HOURS_VERIFICATION",
         True,
-        f"week={data['weekStart']} status={row['status'] if row else 'unverified'}",
+        f"week={timesheet['weekStart']} status={row['status'] if row else 'unverified'}"
+        f" money={money_row['status'] if money_row else 'unverified'}",
     )
     return {
         "success": True,
-        "weekStart": data["weekStart"],
-        "weekEnd": data["weekEnd"],
-        "timezone": data["timezone"],
-        "currentSourceFingerprint": data["sourceFingerprint"],
-        "summary": data["summary"],
+        "weekStart": timesheet["weekStart"],
+        "weekEnd": timesheet["weekEnd"],
+        "timezone": timesheet["timezone"],
+        "currentSourceFingerprint": timesheet["sourceFingerprint"],
+        "currentMoneyFingerprint": timesheet["timesheetSourceFingerprint"],
+        "summary": timesheet["summary"],
         "verification": _payroll_verification_state(
             row,
-            current_source_fingerprint=data["sourceFingerprint"],
+            current_source_fingerprint=timesheet["sourceFingerprint"],
+        ),
+        "moneyVerification": _payroll_money_verification_state(
+            money_row,
+            current_money_fingerprint=timesheet["timesheetSourceFingerprint"],
         ),
     }
 
@@ -18136,6 +18496,160 @@ def admin_reopen_payroll_weekly_hours(
         "PAYROLL_WEEKLY_HOURS_REOPEN",
         True,
         f"week={week_start.isoformat()} batch={result['verification']['batchId']} idempotent={result['idempotent']}",
+    )
+    return result
+
+
+@app.post("/api/admin/payroll/money/verify")
+def admin_verify_payroll_money(
+    payload: PayrollMoneyVerificationRequest,
+    request: Request,
+    current_payroll: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    week_start = _parse_payroll_week_start(payload.weekStart)
+    result: Dict[str, Any]
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Fixed lock order (hours week -> money week -> source rows) so the
+            # money and finalize flows can never deadlock against each other.
+            _lock_payroll_verification_week(cur, week_start)
+            _lock_payroll_money_verification_week(cur, week_start)
+            _lock_payroll_money_source_rows(cur)
+            data = _compute_payroll_timesheet(week_start.isoformat(), cursor=cur)
+            _ensure_payroll_money_snapshot_current(payload.moneyFingerprint, data, "verifying")
+            # Money can only be signed off on top of a CURRENT hours sign-off.
+            hours_data = _compute_payroll_weekly_hours(week_start.isoformat(), cursor=cur)
+            _ensure_hours_verified_and_current(
+                cur, week_start, hours_data, "verifying payroll dollars"
+            )
+            row = _get_payroll_money_verification_batch(cur, week_start, lock=True)
+            if row and row["status"] == "verified":
+                if hmac.compare_digest(
+                    str(row["source_fingerprint"]), data["timesheetSourceFingerprint"]
+                ):
+                    result = {
+                        "success": True,
+                        "action": "verify",
+                        "idempotent": True,
+                        "timesheet": data,
+                        "moneyVerification": _payroll_money_verification_state(
+                            row,
+                            current_money_fingerprint=data["timesheetSourceFingerprint"],
+                        ),
+                    }
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Payroll dollars are already verified from a different source; reopen before verifying again",
+                    )
+            else:
+                before_state = _payroll_money_verification_state(row) if row else None
+                if row is None:
+                    saved = _insert_payroll_money_verification_batch(
+                        cur, data=data, actor=current_payroll
+                    )
+                else:
+                    saved = _update_payroll_money_verification_batch(
+                        cur, batch_id=int(row["id"]), data=data, actor=current_payroll
+                    )
+                after_state = _payroll_money_verification_state(
+                    saved, current_money_fingerprint=data["timesheetSourceFingerprint"]
+                )
+                _insert_payroll_money_verification_event(
+                    cur,
+                    batch_row=saved,
+                    action="verify",
+                    actor=current_payroll,
+                    reason=payload.reason,
+                    before_state=before_state,
+                    after_state=after_state,
+                )
+                result = {
+                    "success": True,
+                    "action": "verify",
+                    "idempotent": False,
+                    "timesheet": data,
+                    "moneyVerification": after_state,
+                }
+
+    append_access_log(
+        request,
+        "PAYROLL_MONEY_VERIFY",
+        True,
+        f"week={week_start.isoformat()} batch={result['moneyVerification']['batchId']} idempotent={result['idempotent']}",
+    )
+    return result
+
+
+@app.post("/api/admin/payroll/money/reopen")
+def admin_reopen_payroll_money(
+    payload: PayrollReopenRequest,
+    request: Request,
+    current_payroll: Dict[str, Any] = Depends(get_current_payroll),
+) -> Dict[str, Any]:
+    week_start = _parse_payroll_week_start(payload.weekStart)
+    reason = payload.reason.strip()
+    result: Dict[str, Any]
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_payroll_money_verification_week(cur, week_start)
+            row = _get_payroll_money_verification_batch(cur, week_start, lock=True)
+            if row is None:
+                raise HTTPException(
+                    status_code=404, detail="Payroll dollars have not been verified"
+                )
+            if row["status"] == "reopened":
+                result = {
+                    "success": True,
+                    "action": "reopen",
+                    "idempotent": True,
+                    "moneyVerification": _payroll_money_verification_state(row),
+                }
+            else:
+                before_state = _payroll_money_verification_state(row)
+                cur.execute(
+                    """
+                    UPDATE payroll_money_verification_batches
+                    SET
+                        status = 'reopened',
+                        reopened_by_employee_id = %s,
+                        reopened_by_name = %s,
+                        reopened_reason = %s,
+                        reopened_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (
+                        int(current_payroll["id"]),
+                        str(current_payroll["name"]),
+                        reason,
+                        int(row["id"]),
+                    ),
+                )
+                saved = dict(cur.fetchone())
+                after_state = _payroll_money_verification_state(saved)
+                _insert_payroll_money_verification_event(
+                    cur,
+                    batch_row=saved,
+                    action="reopen",
+                    actor=current_payroll,
+                    reason=reason,
+                    before_state=before_state,
+                    after_state=after_state,
+                )
+                result = {
+                    "success": True,
+                    "action": "reopen",
+                    "idempotent": False,
+                    "moneyVerification": after_state,
+                }
+
+    append_access_log(
+        request,
+        "PAYROLL_MONEY_REOPEN",
+        True,
+        f"week={week_start.isoformat()} batch={result['moneyVerification']['batchId']} idempotent={result['idempotent']}",
     )
     return result
 

@@ -822,6 +822,50 @@ CREATE TABLE payroll_verification_events (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Money (payroll dollars) verification is a SECOND, independent truth from the
+-- hours sign-off above: it signs off rates, correction amounts, allocations and
+-- their live/frozen provenance. It mirrors the hours tables but has NO finalized
+-- state -- the payroll-level FINALIZED lives on payroll_verification_batches
+-- (the hours batch), gated on a current money verification. source_fingerprint
+-- here is the money-inclusive timesheet fingerprint.
+CREATE TABLE payroll_money_verification_batches (
+    id                       BIGSERIAL PRIMARY KEY,
+    week_start               DATE NOT NULL UNIQUE,
+    week_end                 DATE NOT NULL,
+    timezone                 TEXT NOT NULL,
+    status                   VARCHAR(16) NOT NULL DEFAULT 'verified'
+                                 CHECK (status IN ('verified', 'reopened')),
+    source_fingerprint       VARCHAR(64) NOT NULL
+                                 CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+    snapshot                 JSONB NOT NULL,
+    verified_by_employee_id  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    verified_by_name         TEXT NOT NULL,
+    verified_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reopened_by_employee_id  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    reopened_by_name         TEXT,
+    reopened_reason          TEXT,
+    reopened_at              TIMESTAMPTZ,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (week_end = week_start + 6)
+);
+
+CREATE TABLE payroll_money_verification_events (
+    id                 BIGSERIAL PRIMARY KEY,
+    batch_id           BIGINT NOT NULL REFERENCES payroll_money_verification_batches(id) ON DELETE CASCADE,
+    week_start         DATE NOT NULL,
+    action             VARCHAR(16) NOT NULL
+                           CHECK (action IN ('verify', 'reopen')),
+    actor_employee_id  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    actor_name         TEXT NOT NULL,
+    reason             TEXT NOT NULL DEFAULT '',
+    source_fingerprint VARCHAR(64) NOT NULL
+                           CHECK (source_fingerprint ~ '^[0-9a-f]{64}$'),
+    before_state       JSONB,
+    after_state        JSONB NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE payroll_hour_corrections (
     id                       BIGSERIAL PRIMARY KEY,
     week_start               DATE NOT NULL,
@@ -1009,6 +1053,12 @@ CREATE INDEX idx_payroll_verification_events_week
     ON payroll_verification_events(week_start, created_at);
 CREATE INDEX idx_payroll_verification_events_batch
     ON payroll_verification_events(batch_id, created_at);
+CREATE INDEX idx_payroll_money_verification_batches_status_week
+    ON payroll_money_verification_batches(status, week_start);
+CREATE INDEX idx_payroll_money_verification_events_week
+    ON payroll_money_verification_events(week_start, created_at);
+CREATE INDEX idx_payroll_money_verification_events_batch
+    ON payroll_money_verification_events(batch_id, created_at);
 CREATE UNIQUE INDEX uq_payroll_hour_corrections_active_day
     ON payroll_hour_corrections(week_start, employee_id, correction_date)
     WHERE status = 'active';

@@ -117,6 +117,10 @@ def _delete_payroll_verification_weeks(week_starts: list[date]) -> None:
             "DELETE FROM payroll_verification_batches WHERE week_start = %s",
             (week_start,),
         )
+        db.execute(
+            "DELETE FROM payroll_money_verification_batches WHERE week_start = %s",
+            (week_start,),
+        )
 
 
 def _login(client, name: str, password: str = "payroll1234") -> dict[str, str]:
@@ -6367,3 +6371,322 @@ def test_void_of_a_live_tracked_allocation_serializes_the_live_cost(client):
     assert void_alloc["laborCostIsLive"] is True
     assert void_alloc["currentAllocatedLaborCost"] == live_cost
     assert void_alloc["laborCostComplete"] is True
+
+
+# --- #138 Slice 2: money (payroll dollars) verification ----------------------
+
+def test_payroll_money_verification_full_flow_and_gates(client, auth):
+    week_start = date(2026, 9, 6)  # Sunday
+    employee_id = _create_employee("Payroll Money Verify Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )
+        weekly = _weekly_hours(client, auth, week_start)
+        timesheet = _payroll_timesheet(client, auth, week_start)
+        money_fp = timesheet["timesheetSourceFingerprint"]
+
+        # Money-verify is blocked until HOURS are verified.
+        blocked = client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "moneyFingerprint": money_fp},
+        )
+        assert blocked.status_code == 409, blocked.text
+        assert blocked.json()["error"] == (
+            "Verify the payroll week's hours before verifying payroll dollars"
+        )
+
+        # Verify hours first.
+        hours_verified = client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": weekly["sourceFingerprint"],
+            },
+        )
+        assert hours_verified.status_code == 200, hours_verified.text
+
+        # Optimistic-concurrency gate on the MONEY fingerprint.
+        stale_money = client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "moneyFingerprint": _different_fingerprint(money_fp),
+            },
+        )
+        assert stale_money.status_code == 409, stale_money.text
+        assert stale_money.json()["error"] == "Payroll dollars changed; refresh before verifying"
+
+        # Money-verify success.
+        money_verified = client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "moneyFingerprint": money_fp,
+                "reason": "Mayra checked rates and allocations before payout.",
+            },
+        )
+        assert money_verified.status_code == 200, money_verified.text
+        body = money_verified.json()
+        assert body["action"] == "verify"
+        assert body["idempotent"] is False
+        assert body["moneyVerification"]["status"] == "verified"
+        assert body["moneyVerification"]["moneyFingerprint"] == money_fp
+        assert body["moneyVerification"]["stale"] is False
+        assert body["moneyVerification"]["batchId"] is not None
+
+        # Idempotent re-verify with the same fingerprint.
+        repeated = client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "moneyFingerprint": money_fp},
+        )
+        assert repeated.status_code == 200, repeated.text
+        assert repeated.json()["idempotent"] is True
+
+        # GET returns BOTH hours and money states.
+        status_response = client.get(
+            f"/api/admin/payroll/weekly-hours/verification?weekStart={week_start.isoformat()}",
+            headers=auth,
+        )
+        assert status_response.status_code == 200, status_response.text
+        sb = status_response.json()
+        assert sb["currentMoneyFingerprint"] == money_fp
+        assert sb["verification"]["status"] == "verified"
+        assert sb["verification"]["stale"] is False
+        assert sb["moneyVerification"]["status"] == "verified"
+        assert sb["moneyVerification"]["stale"] is False
+
+        event_row = db.query_one(
+            """
+            SELECT COUNT(*) AS n
+            FROM payroll_money_verification_events
+            WHERE week_start = %s AND action = 'verify'
+            """,
+            (week_start,),
+        )
+        assert event_row is not None
+        assert event_row["n"] == 1
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_money_verification_staleness_is_independent_of_hours(client, auth):
+    week_start = date(2026, 9, 13)  # Sunday
+    employee_id = _create_employee("Payroll Money Independent Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )
+        weekly = _weekly_hours(client, auth, week_start)
+        timesheet = _payroll_timesheet(client, auth, week_start)
+        client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": weekly["sourceFingerprint"],
+            },
+        )
+        client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "moneyFingerprint": timesheet["timesheetSourceFingerprint"],
+            },
+        )
+
+        # A MONEY-ONLY change: time_category is hashed by the money fingerprint
+        # but NOT the hours fingerprint (which hashes only clock times).
+        db.execute(
+            "UPDATE shifts SET time_category = 'non_productive' WHERE id = %s",
+            (shift_id,),
+        )
+
+        after_money = client.get(
+            f"/api/admin/payroll/weekly-hours/verification?weekStart={week_start.isoformat()}",
+            headers=auth,
+        ).json()
+        assert after_money["verification"]["status"] == "verified"
+        assert after_money["verification"]["stale"] is False, (
+            "hours verification must stay fresh on a money-only change"
+        )
+        assert after_money["moneyVerification"]["status"] == "verified"
+        assert after_money["moneyVerification"]["stale"] is True, (
+            "money verification must go stale on a money-only change"
+        )
+
+        # An HOURS change (clock time) invalidates BOTH truths.
+        db.execute(
+            """
+            UPDATE shifts
+            SET clock_out = clock_out + interval '30 minutes',
+                total_hours = total_hours + 0.5
+            WHERE id = %s
+            """,
+            (shift_id,),
+        )
+        both = client.get(
+            f"/api/admin/payroll/weekly-hours/verification?weekStart={week_start.isoformat()}",
+            headers=auth,
+        ).json()
+        assert both["verification"]["stale"] is True
+        assert both["moneyVerification"]["stale"] is True
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_payroll_money_reopen_and_never_verified_guard(client, auth):
+    week_start = date(2026, 9, 20)  # Sunday
+    employee_id = _create_employee("Payroll Money Reopen Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        missing = client.post(
+            "/api/admin/payroll/money/reopen",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "reason": "nothing to reopen yet"},
+        )
+        assert missing.status_code == 404, missing.text
+        assert missing.json()["error"] == "Payroll dollars have not been verified"
+
+        _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )
+        weekly = _weekly_hours(client, auth, week_start)
+        timesheet = _payroll_timesheet(client, auth, week_start)
+        client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "sourceFingerprint": weekly["sourceFingerprint"],
+            },
+        )
+        client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "moneyFingerprint": timesheet["timesheetSourceFingerprint"],
+            },
+        )
+
+        reopened = client.post(
+            "/api/admin/payroll/money/reopen",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "reason": "Re-checking a rate before payout."},
+        )
+        assert reopened.status_code == 200, reopened.text
+        assert reopened.json()["moneyVerification"]["status"] == "reopened"
+        assert reopened.json()["idempotent"] is False
+
+        repeated = client.post(
+            "/api/admin/payroll/money/reopen",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "reason": "still re-checking that rate"},
+        )
+        assert repeated.status_code == 200, repeated.text
+        assert repeated.json()["idempotent"] is True
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_money_verification_stays_fresh_when_a_stamped_shift_rate_is_edited(client, auth):
+    # A stamped shift's labor is frozen at its snapshot, so a later live-rate
+    # edit must NOT reprice it -- money verification must stay fresh (no false
+    # positive from the effective-rate hashing).
+    week_start = date(2026, 9, 27)  # Sunday
+    employee_id = _create_employee("Payroll Stamped Rate Worker", hourly_rate=20.00)
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )  # trigger-stamped at $20
+        weekly = _weekly_hours(client, auth, week_start)
+        timesheet = _payroll_timesheet(client, auth, week_start)
+        client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "moneyFingerprint": timesheet["timesheetSourceFingerprint"]},
+        )
+
+        db.execute("UPDATE employees SET hourly_rate = 25.00 WHERE id = %s", (employee_id,))
+
+        after = client.get(
+            f"/api/admin/payroll/weekly-hours/verification?weekStart={week_start.isoformat()}",
+            headers=auth,
+        ).json()
+        assert after["verification"]["stale"] is False
+        assert after["moneyVerification"]["stale"] is False, (
+            "a live-rate edit must not stale money when every shift is stamped (frozen)"
+        )
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_money_verification_goes_stale_when_an_unstamped_shift_is_repriced(client, auth):
+    # An UNSTAMPED shift (NULL snapshot) is priced at the live rate, so a
+    # live-rate edit reprices its payroll dollars -- money verification MUST go
+    # stale while hours (which is rate-blind) stays fresh. Regression for the
+    # effective-rate hashing (P1).
+    week_start = date(2026, 10, 4)  # Sunday
+    employee_id = _create_employee("Payroll Unstamped Rate Worker", hourly_rate=20.00)
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )
+        # Make it a rate-less / pre-migration row priced at the live rate.
+        db.execute("UPDATE shifts SET hourly_rate_cents = NULL WHERE id = %s", (shift_id,))
+        weekly = _weekly_hours(client, auth, week_start)
+        timesheet = _payroll_timesheet(client, auth, week_start)
+        client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "moneyFingerprint": timesheet["timesheetSourceFingerprint"]},
+        )
+
+        db.execute("UPDATE employees SET hourly_rate = 25.00 WHERE id = %s", (employee_id,))
+
+        after = client.get(
+            f"/api/admin/payroll/weekly-hours/verification?weekStart={week_start.isoformat()}",
+            headers=auth,
+        ).json()
+        assert after["verification"]["stale"] is False, "hours stays fresh on a rate-only change"
+        assert after["moneyVerification"]["stale"] is True, (
+            "money must go stale when an unstamped shift is repriced by a rate edit"
+        )
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
