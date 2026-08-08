@@ -2300,7 +2300,7 @@ def test_manual_payroll_rows_do_not_enter_employee_or_general_hours(client, auth
         assert my_hours.json()["weeklyHours"] == 0
 
         general_report = client.get(
-            f"/api/admin/reports/hours?period=week&date={service_day.isoformat()}&employeeId={employee_id}",
+            f"/api/admin/reports/hours?period=week&date={service_day.isoformat()}&employee_id={employee_id}",
             headers=auth,
         )
         assert general_report.status_code == 200, general_report.text
