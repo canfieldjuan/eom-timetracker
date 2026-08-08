@@ -14478,6 +14478,7 @@ def _payroll_overlapping_shift_rows(
             shift_row.clock_in,
             shift_row.clock_out,
             shift_row.total_hours,
+            shift_row.hourly_rate_cents,
             shift_row.local_date,
             shift_row.timezone,
             shift_row.location_id,
@@ -15146,6 +15147,21 @@ def _payroll_timesheet_allocation_validity_payload(
     return payload
 
 
+def _payroll_effective_shift_rate_cents(
+    shift: Dict[str, Any],
+    rate_cents_by_employee: Dict[int, Optional[int]],
+) -> Optional[int]:
+    """The rate a shift's labor is actually priced at: its stamped snapshot if
+    present, else the employee's current live rate. This is what money
+    verification signs off -- an UNSTAMPED shift is repriced by a live-rate edit,
+    so its effective rate must move the money fingerprint (a stamped shift is
+    frozen, so a rate edit correctly does NOT move it)."""
+    snapshot = shift.get("hourly_rate_cents")
+    if snapshot is not None:
+        return int(snapshot)
+    return rate_cents_by_employee.get(int(shift["employee_id"]))
+
+
 def _payroll_timesheet_source_fingerprint(
     *,
     week_start: date,
@@ -15157,6 +15173,18 @@ def _payroll_timesheet_source_fingerprint(
     allocations: List[Dict[str, Any]],
     correction_details: List[Dict[str, Any]],
 ) -> str:
+    rate_cents_by_employee: Dict[int, Optional[int]] = {
+        int(row["id"]): (
+            int(
+                (Decimal(str(row["hourly_rate"])) * 100).to_integral_value(
+                    rounding=ROUND_HALF_UP
+                )
+            )
+            if row.get("hourly_rate") is not None
+            else None
+        )
+        for row in employees
+    }
     payload = {
         "timezone": TIMEZONE_NAME,
         "weekStart": week_start.isoformat(),
@@ -15179,6 +15207,9 @@ def _payroll_timesheet_source_fingerprint(
                 ),
                 "total_hours": (
                     str(row["total_hours"]) if row.get("total_hours") is not None else None
+                ),
+                "effective_hourly_rate_cents": _payroll_effective_shift_rate_cents(
+                    row, rate_cents_by_employee
                 ),
                 "local_date": (
                     row["local_date"].isoformat()
@@ -15381,7 +15412,7 @@ def _compute_payroll_timesheet(
     now_utc = utc_now()
     employee_rows = _payroll_query_all(
         """
-        SELECT id, name, active
+        SELECT id, name, active, hourly_rate
         FROM employees
         ORDER BY LOWER(name), id
         """,
@@ -16539,6 +16570,27 @@ def _lock_payroll_source_rows(cur: Any) -> None:
             payroll_hour_corrections,
             payroll_hour_correction_allocations,
             employees
+        IN SHARE MODE
+        """
+    )
+
+
+def _lock_payroll_money_source_rows(cur: Any) -> None:
+    # Superset of the hours source lock: the money fingerprint also hashes each
+    # shift's location/customer LABELS (joined from locations/customers), so
+    # those tables must be locked too or a concurrent Site edit could commit
+    # between the proof read and the verification commit, persisting an
+    # already-stale money proof.
+    cur.execute(
+        """
+        LOCK TABLE
+            shifts,
+            payroll_shift_corrections,
+            payroll_hour_corrections,
+            payroll_hour_correction_allocations,
+            employees,
+            locations,
+            customers
         IN SHARE MODE
         """
     )
@@ -17739,8 +17791,12 @@ def admin_payroll_weekly_hours_verification(
     week_start: Optional[str] = Query(default=None, alias="weekStart"),
     _: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
-    data = _compute_payroll_weekly_hours(_payroll_week_start_query(request, week_start))
-    parsed_week_start = _parse_payroll_week_start(data["weekStart"])
+    # Both truths are read from ONE timesheet computation (which internally
+    # computes the weekly hours), so the hours and money fingerprints/summary can
+    # never be derived from different source snapshots -- otherwise the page
+    # could show hours as current while presenting money from a later state.
+    timesheet = _compute_payroll_timesheet(_payroll_week_start_query(request, week_start))
+    parsed_week_start = _parse_payroll_week_start(timesheet["weekStart"])
     row = db.query_one(
         """
         SELECT *
@@ -17749,9 +17805,6 @@ def admin_payroll_weekly_hours_verification(
         """,
         (parsed_week_start,),
     )
-    # Money verification is a second, independent truth read alongside hours. Its
-    # staleness is computed against the money-inclusive timesheet fingerprint.
-    timesheet = _compute_payroll_timesheet(data["weekStart"])
     money_row = db.query_one(
         """
         SELECT *
@@ -17764,20 +17817,20 @@ def admin_payroll_weekly_hours_verification(
         request,
         "PAYROLL_WEEKLY_HOURS_VERIFICATION",
         True,
-        f"week={data['weekStart']} status={row['status'] if row else 'unverified'}"
+        f"week={timesheet['weekStart']} status={row['status'] if row else 'unverified'}"
         f" money={money_row['status'] if money_row else 'unverified'}",
     )
     return {
         "success": True,
-        "weekStart": data["weekStart"],
-        "weekEnd": data["weekEnd"],
-        "timezone": data["timezone"],
-        "currentSourceFingerprint": data["sourceFingerprint"],
+        "weekStart": timesheet["weekStart"],
+        "weekEnd": timesheet["weekEnd"],
+        "timezone": timesheet["timezone"],
+        "currentSourceFingerprint": timesheet["sourceFingerprint"],
         "currentMoneyFingerprint": timesheet["timesheetSourceFingerprint"],
-        "summary": data["summary"],
+        "summary": timesheet["summary"],
         "verification": _payroll_verification_state(
             row,
-            current_source_fingerprint=data["sourceFingerprint"],
+            current_source_fingerprint=timesheet["sourceFingerprint"],
         ),
         "moneyVerification": _payroll_money_verification_state(
             money_row,
@@ -18461,7 +18514,7 @@ def admin_verify_payroll_money(
             # money and finalize flows can never deadlock against each other.
             _lock_payroll_verification_week(cur, week_start)
             _lock_payroll_money_verification_week(cur, week_start)
-            _lock_payroll_source_rows(cur)
+            _lock_payroll_money_source_rows(cur)
             data = _compute_payroll_timesheet(week_start.isoformat(), cursor=cur)
             _ensure_payroll_money_snapshot_current(payload.moneyFingerprint, data, "verifying")
             # Money can only be signed off on top of a CURRENT hours sign-off.

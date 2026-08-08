@@ -6605,3 +6605,88 @@ def test_payroll_money_reopen_and_never_verified_guard(client, auth):
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_employees([employee_id])
+
+
+def test_money_verification_stays_fresh_when_a_stamped_shift_rate_is_edited(client, auth):
+    # A stamped shift's labor is frozen at its snapshot, so a later live-rate
+    # edit must NOT reprice it -- money verification must stay fresh (no false
+    # positive from the effective-rate hashing).
+    week_start = date(2026, 9, 27)  # Sunday
+    employee_id = _create_employee("Payroll Stamped Rate Worker", hourly_rate=20.00)
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )  # trigger-stamped at $20
+        weekly = _weekly_hours(client, auth, week_start)
+        timesheet = _payroll_timesheet(client, auth, week_start)
+        client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "moneyFingerprint": timesheet["timesheetSourceFingerprint"]},
+        )
+
+        db.execute("UPDATE employees SET hourly_rate = 25.00 WHERE id = %s", (employee_id,))
+
+        after = client.get(
+            f"/api/admin/payroll/weekly-hours/verification?weekStart={week_start.isoformat()}",
+            headers=auth,
+        ).json()
+        assert after["verification"]["stale"] is False
+        assert after["moneyVerification"]["stale"] is False, (
+            "a live-rate edit must not stale money when every shift is stamped (frozen)"
+        )
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_money_verification_goes_stale_when_an_unstamped_shift_is_repriced(client, auth):
+    # An UNSTAMPED shift (NULL snapshot) is priced at the live rate, so a
+    # live-rate edit reprices its payroll dollars -- money verification MUST go
+    # stale while hours (which is rate-blind) stays fresh. Regression for the
+    # effective-rate hashing (P1).
+    week_start = date(2026, 10, 4)  # Sunday
+    employee_id = _create_employee("Payroll Unstamped Rate Worker", hourly_rate=20.00)
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )
+        # Make it a rate-less / pre-migration row priced at the live rate.
+        db.execute("UPDATE shifts SET hourly_rate_cents = NULL WHERE id = %s", (shift_id,))
+        weekly = _weekly_hours(client, auth, week_start)
+        timesheet = _payroll_timesheet(client, auth, week_start)
+        client.post(
+            "/api/admin/payroll/weekly-hours/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        client.post(
+            "/api/admin/payroll/money/verify",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "moneyFingerprint": timesheet["timesheetSourceFingerprint"]},
+        )
+
+        db.execute("UPDATE employees SET hourly_rate = 25.00 WHERE id = %s", (employee_id,))
+
+        after = client.get(
+            f"/api/admin/payroll/weekly-hours/verification?weekStart={week_start.isoformat()}",
+            headers=auth,
+        ).json()
+        assert after["verification"]["stale"] is False, "hours stays fresh on a rate-only change"
+        assert after["moneyVerification"]["stale"] is True, (
+            "money must go stale when an unstamped shift is repriced by a rate edit"
+        )
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
