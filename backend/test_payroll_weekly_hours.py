@@ -7916,3 +7916,47 @@ def test_money_verify_allowed_on_a_finalized_hours_week(client, auth):
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_employees([employee_id])
+
+
+def test_reopening_money_after_finalize_blocks_idempotent_re_finalize(client, auth):
+    # finalize -> reopen money -> re-finalize must NOT report the week settled
+    # while the dollars are explicitly unsigned; the idempotent finalized branch
+    # enforces the money gate too.
+    week_start = date(2026, 11, 1)  # Sunday
+    employee_id = _create_employee("Payroll Reopen-Money Finalize Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        _create_shift(
+            employee_id,
+            _local_dt(week_start + timedelta(days=1), 8),
+            _local_dt(week_start + timedelta(days=1), 12),
+        )
+        weekly, _timesheet = _verify_hours_and_money(client, auth, week_start)
+        finalized = client.post(
+            "/api/admin/payroll/weekly-hours/finalize",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        assert finalized.status_code == 200, finalized.text
+        assert finalized.json()["verification"]["status"] == "finalized"
+
+        # Reopen ONLY the money sign-off (hours batch stays finalized).
+        reopened = client.post(
+            "/api/admin/payroll/money/reopen",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "reason": "Re-checking a rate before payout."},
+        )
+        assert reopened.status_code == 200, reopened.text
+        assert reopened.json()["moneyVerification"]["status"] == "reopened"
+
+        # A re-finalize must now 409 instead of idempotently returning success.
+        re_finalize = client.post(
+            "/api/admin/payroll/weekly-hours/finalize",
+            headers=auth,
+            json={"weekStart": week_start.isoformat(), "sourceFingerprint": weekly["sourceFingerprint"]},
+        )
+        assert re_finalize.status_code == 409, re_finalize.text
+        assert re_finalize.json()["error"] == "Verify payroll dollars before finalizing"
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])

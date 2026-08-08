@@ -17662,6 +17662,32 @@ def _ensure_hours_verified_and_current(
         )
 
 
+def _ensure_payroll_money_signed_off(
+    cur: Any,
+    week_start: date,
+    money_row: Optional[Dict[str, Any]],
+) -> None:
+    """The whole-payroll FINALIZED state requires a CURRENT money sign-off: money
+    must be 'verified' with a fingerprint matching the freshly recomputed payroll
+    dollars. Enforced on BOTH the fresh finalize and the idempotent re-finalize of
+    an already-finalized week, so a week whose money was reopened (or went stale)
+    after finalize is never (re-)reported as settled."""
+    timesheet = _compute_payroll_timesheet(week_start.isoformat(), cursor=cur)
+    if money_row is None or str(money_row["status"]) != "verified":
+        raise HTTPException(
+            status_code=409,
+            detail="Verify payroll dollars before finalizing",
+        )
+    if not hmac.compare_digest(
+        str(money_row["source_fingerprint"]),
+        timesheet["timesheetSourceFingerprint"],
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Payroll dollars are stale; reopen and verify money before finalizing",
+        )
+
+
 def _parse_payroll_correction_date(date_text: str, week_start: date) -> date:
     try:
         correction_date = datetime.strptime(date_text, "%Y-%m-%d").date()
@@ -20104,6 +20130,10 @@ def admin_finalize_payroll_weekly_hours(
                 raise HTTPException(status_code=409, detail="Verify the payroll week before finalizing")
             if row["status"] == "finalized":
                 if hmac.compare_digest(str(row["source_fingerprint"]), data["sourceFingerprint"]):
+                    # Re-finalizing an already-finalized week still requires the
+                    # money sign-off to be current: reopening money after finalize
+                    # must not leave the week reported as settled.
+                    _ensure_payroll_money_signed_off(cur, week_start, money_row)
                     result = {
                         "success": True,
                         "action": "finalize",
@@ -20129,22 +20159,8 @@ def admin_finalize_payroll_weekly_hours(
             else:
                 # FINALIZED is the terminal state of the WHOLE payroll: it requires
                 # BOTH truths signed off and current. Hours are verified+current
-                # (checked above); the money sign-off must also be verified with a
-                # fingerprint matching the freshly recomputed payroll dollars.
-                timesheet = _compute_payroll_timesheet(week_start.isoformat(), cursor=cur)
-                if money_row is None or str(money_row["status"]) != "verified":
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Verify payroll dollars before finalizing",
-                    )
-                if not hmac.compare_digest(
-                    str(money_row["source_fingerprint"]),
-                    timesheet["timesheetSourceFingerprint"],
-                ):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Payroll dollars are stale; reopen and verify money before finalizing",
-                    )
+                # (checked above); the money sign-off must also be current.
+                _ensure_payroll_money_signed_off(cur, week_start, money_row)
                 before_state = _payroll_verification_state(row)
                 cur.execute(
                     """
