@@ -11466,10 +11466,17 @@ def _finalized_customer_atlas_reservation_for_key(
     neither needs anything from Atlas and both are true regardless of what
     Atlas currently serves:
 
-    - the same details are a replay, answered with the Customer that key
-      created, so a capability rollback cannot break the replay guarantee;
+    - the same details on a finalized key are a replay, answered with the
+      Customer that key created, so a capability rollback cannot break the
+      replay guarantee;
     - different details are invalid key reuse, refused with the same 409 the
       reservation path raises, so it cannot hide behind deployment state.
+
+    Pending reservations are read too, and only for the mismatch answer: a key
+    is just as invalid to reuse while its first attempt is still unfinished,
+    and the reservation path that would otherwise catch it sits behind
+    capability negotiation. A pending key with matching details falls through
+    to be re-driven normally.
     """
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -11477,7 +11484,7 @@ def _finalized_customer_atlas_reservation_for_key(
                 """
                 SELECT *
                 FROM eom_customer_atlas_reservations
-                WHERE idempotency_key = %s AND state = 'finalized'
+                WHERE idempotency_key = %s
                 """,
                 (idempotency_key,),
             )
@@ -11493,6 +11500,8 @@ def _finalized_customer_atlas_reservation_for_key(
                     "This key was already used with different customer details",
                     {"reservationId": str(reservation["id"])},
                 )
+            if reservation["state"] != "finalized":
+                return None
             return {
                 "reservation": reservation,
                 "customer": _canonical_customer(

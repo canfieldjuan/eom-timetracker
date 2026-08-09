@@ -1003,3 +1003,47 @@ def test_a_finalizing_create_is_never_missing_from_the_customers_listing(
     )
     # Briefly in both would be acceptable and self-correcting; in neither is not.
     assert in_customers or in_pending
+
+
+def test_key_reuse_on_a_pending_reservation_is_refused_under_rollback(
+    client, auth, monkeypatch
+):
+    """A key is just as invalid to reuse while its first attempt is unfinished.
+
+    The reservation path that normally catches this sits behind capability
+    negotiation, so with the capability withdrawn it never runs.
+    """
+    key = str(uuid.uuid4())
+    name = _name("Pending Reuse")
+
+    def _explode(url, *, headers=None, json=None, timeout=None):
+        raise requests.RequestException("connection refused")
+
+    monkeypatch.setattr(api.requests, "post", _explode)
+    pending = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": key},
+    )
+    assert pending.status_code == 202, pending.text
+
+    reduced = [
+        capability
+        for capability in ATLAS_FULL_CAPABILITIES
+        if capability != "contact.operator_mutation"
+    ]
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        lambda url, **_: _Response(200, {"leads": [], "capabilities": reduced}),
+    )
+
+    reused = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": _name("Pending Reuse Other"), "idempotencyKey": key},
+    )
+
+    assert reused.status_code == 409, reused.text
+    assert reused.json()["code"] == "customer_atlas_retry_mismatch"
+    assert _reservation_rows(_name("Pending Reuse Other")) == []
