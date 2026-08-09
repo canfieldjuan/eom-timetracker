@@ -12304,10 +12304,13 @@ def admin_retry_customer_atlas_reservation(
         True,
         f"reservation={reservation_id} customer={customer['id']}",
     )
+    # `idempotent` describes the operation, not the endpoint: this re-drives a
+    # reservation that already existed, exactly as the create route does when it
+    # finds one, so both must label it the same way.
     return JSONResponse(
         status_code=200,
         content=jsonable_encoder(
-            {"success": True, "idempotent": False, "customer": customer}
+            {"success": True, "idempotent": True, "customer": customer}
         ),
     )
 

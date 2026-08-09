@@ -376,6 +376,9 @@ def test_local_failure_after_atlas_success_recovers_against_the_same_contact(
     )
 
     assert retry.status_code == 200, retry.text
+    # The same re-drive must be labelled the same way whichever endpoint the
+    # caller used to reach it.
+    assert retry.json()["idempotent"] is True
     customer = retry.json()["customer"]
     assert customer["atlasContactId"] == fake_atlas_contact_id(key)
     assert len(_customer_rows(name)) == 1
