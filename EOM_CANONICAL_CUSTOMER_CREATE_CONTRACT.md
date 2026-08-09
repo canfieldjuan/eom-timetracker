@@ -64,6 +64,18 @@ compensating delete is ever issued against a contact Atlas already created.
 | Same key, different customer details | 409 `customer_atlas_retry_mismatch` | No second Customer |
 | Caller supplied `atlasContactId` | 422 | No Customer |
 | Another writer linked the Customer first | 409 `customer_atlas_link_conflict` | Their link stands; reservation stays pending |
+| Tracker has no Atlas credentials | 503 | **No Customer, no reservation** |
+
+A replay of a completed key is answered from local state *before* capability
+negotiation: the Customer already exists, so it asks nothing of Atlas and keeps
+working even if Atlas has since rolled the capability back. That lookup matches
+on key **and** request fingerprint — matching on the key alone would turn a key
+reused with different details into a silent replay of the first customer, when
+that has to fail closed.
+
+Missing credentials sit with the 501 rather than the 202: it is a deterministic
+local certainty, not an outage, so banking a reservation would only record an
+operation that can never succeed on any retry.
 
 The 501 and the 202 rows are the two sides of one boundary, and the difference
 is deliberate. A manifest that **says** the capability is absent is a definite

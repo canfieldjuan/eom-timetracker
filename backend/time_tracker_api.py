@@ -11431,6 +11431,63 @@ def _list_pending_customer_atlas_reservations() -> List[Dict[str, Any]]:
             ]
 
 
+def _finalized_customer_atlas_reservation(
+    reservation_id: str,
+) -> Optional[Dict[str, Any]]:
+    """The saga result for a reservation another attempt already finalized."""
+    reservation = _customer_atlas_reservation(reservation_id)
+    if not reservation or reservation["state"] != "finalized":
+        return None
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            return {
+                "reservation": reservation,
+                "customer": _canonical_customer(
+                    cur, int(reservation["customer_id"])
+                ),
+            }
+
+
+def _finalized_customer_atlas_reservation_for_key(
+    idempotency_key: str,
+    request_fingerprint: str,
+) -> Optional[Dict[str, Any]]:
+    """A completed operation for this key AND these details, if one exists.
+
+    Looked up before capability negotiation so a replay keeps working even if
+    Atlas has since withdrawn or rolled back the capability: the Customer this
+    key created already exists, and re-answering with it asks nothing of Atlas.
+
+    The fingerprint is part of the lookup, not a later check. Matching on the
+    key alone would turn a key reused with DIFFERENT customer details into a
+    silent replay of the first customer, when that has to fail closed.
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM eom_customer_atlas_reservations
+                WHERE idempotency_key = %s AND state = 'finalized'
+                """,
+                (idempotency_key,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            reservation = dict(row)
+            if not hmac.compare_digest(
+                str(reservation["request_fingerprint"]), request_fingerprint
+            ):
+                return None
+            return {
+                "reservation": reservation,
+                "customer": _canonical_customer(
+                    cur, int(reservation["customer_id"])
+                ),
+            }
+
+
 def _customer_atlas_reservation(reservation_id: str) -> Optional[Dict[str, Any]]:
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -11724,7 +11781,17 @@ def _run_customer_atlas_reservation(
         )
         atlas_contact_id = _atlas_contact_id_from_operator_result(atlas_result)
     except AtlasFunnelRequestError as exc:
-        _note_customer_atlas_error(str(reservation["id"]), str(exc))
+        if not _note_customer_atlas_error(str(reservation["id"]), str(exc)):
+            # The conditional update matched nothing, so this reservation is no
+            # longer pending: a concurrent attempt on the same key finalized it
+            # while this one was failing. Reporting our own timeout would tell
+            # the operator to retry a Customer that already exists. Same race,
+            # and same resolution, as the office-conversion saga.
+            finalized = _finalized_customer_atlas_reservation(
+                str(reservation["id"])
+            )
+            if finalized is not None:
+                return finalized, None
         return None, exc
     try:
         return (
@@ -11766,6 +11833,13 @@ def _customer_atlas_capability_refusal(
     retryable record. So fall through and let the mutation attempt create that
     record.
     """
+    # A tracker with no Atlas credentials is a deterministic local "no", not an
+    # outage: it will never reach Atlas on any retry, so it must refuse here
+    # rather than bank a reservation that can only fail. Deliberately outside
+    # the catch below -- otherwise its 503 would be mistaken for an unreachable
+    # Atlas and escape later from the mutation call, which raises HTTPException
+    # rather than AtlasFunnelRequestError for this case.
+    _require_atlas_funnel_configuration()
     try:
         _require_atlas_funnel_capability(
             ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION, admin
@@ -12060,6 +12134,38 @@ def admin_create_customer(
             "atlasContactId is assigned by Atlas and cannot be supplied",
             {"atlasContactId": "system managed"},
         )
+    # A key whose operation already completed is answered from local state.
+    # This precedes capability negotiation on purpose: the Customer exists, the
+    # replay asks nothing of Atlas, and refusing it because Atlas has since
+    # rolled the capability back would break the documented replay guarantee.
+    if payload.idempotencyKey is not None:
+        completed = _finalized_customer_atlas_reservation_for_key(
+            str(payload.idempotencyKey),
+            _customer_atlas_fingerprint(
+                _customer_atlas_stored_payload(payload),
+                mode="create",
+                customer_id=None,
+            ),
+        )
+        if completed is not None:
+            append_access_log(
+                request,
+                "CUSTOMER_CREATE_REPLAYED",
+                True,
+                f"customer={completed['reservation']['customer_id']} "
+                f"by {admin['name']}",
+            )
+            return JSONResponse(
+                status_code=200,
+                content=jsonable_encoder(
+                    {
+                        "success": True,
+                        "idempotent": True,
+                        "customer": completed["customer"],
+                    }
+                ),
+            )
+
     # Refused before any local write, so a partially-deployed Atlas cannot
     # leave a Customer behind.
     refusal = _customer_atlas_capability_refusal(admin)

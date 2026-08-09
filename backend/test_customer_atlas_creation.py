@@ -16,6 +16,7 @@ import requests
 
 import db
 import time_tracker_api as api
+from time_tracker_api import CustomerCreateRequest
 from conftest import ATLAS_FULL_CAPABILITIES, fake_atlas_contact_id
 
 TEST_PREFIX = "ZZ-0C-TEST"
@@ -802,3 +803,104 @@ def test_reconcile_refuses_when_another_writer_wins_the_link(
     )
     assert reservation["state"] == "pending"
     assert "customer_atlas_link_conflict" in reservation["last_error"]
+
+
+# --- review round 2 (PR #149) ------------------------------------------------
+
+
+def test_an_unconfigured_tracker_refuses_before_banking_a_reservation(
+    client, auth, monkeypatch
+):
+    """Missing Atlas credentials are a local certainty, not an outage.
+
+    Reserving would bank an operation that can never succeed on any retry, and
+    the mutation call raises HTTPException rather than AtlasFunnelRequestError
+    for this case, so it escaped as a bare 503 leaving a reason-less pending row.
+    """
+    monkeypatch.setattr(api, "ATLAS_FUNNEL_SERVICE_TOKEN", "")
+    name = _name("Unconfigured")
+
+    response = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 503, response.text
+    assert _customer_rows(name) == []
+    assert _reservation_rows(name) == []
+
+
+def test_a_finalized_key_replays_even_after_atlas_withdraws_the_capability(
+    client, auth, monkeypatch
+):
+    """The Customer already exists, so the replay asks nothing of Atlas."""
+    key = str(uuid.uuid4())
+    name = _name("Replay After Rollback")
+    payload = {"name": name, "idempotencyKey": key}
+
+    created = client.post("/api/admin/customers", headers=auth, json=payload)
+    assert created.status_code == 201, created.text
+
+    reduced = [
+        capability
+        for capability in ATLAS_FULL_CAPABILITIES
+        if capability != "contact.operator_mutation"
+    ]
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        lambda url, **_: _Response(200, {"leads": [], "capabilities": reduced}),
+    )
+
+    replayed = client.post("/api/admin/customers", headers=auth, json=payload)
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["idempotent"] is True
+    assert replayed.json()["customer"]["id"] == created.json()["customer"]["id"]
+    assert len(_customer_rows(name)) == 1
+
+
+def test_a_failing_attempt_reports_the_success_a_concurrent_one_committed(
+    client, auth, monkeypatch
+):
+    """Do not tell the operator to retry a Customer that now exists.
+
+    Two attempts drive one reservation; the winner finalizes while the loser is
+    still failing. The loser's conditional error update matches nothing, which
+    is the signal to re-read rather than report a stale pending outcome.
+    """
+    _capture_atlas_posts(monkeypatch)
+    key = str(uuid.uuid4())
+    name = _name("Concurrent Winner")
+
+    # Bank a pending reservation by failing the first attempt.
+    def _explode(url, *, headers=None, json=None, timeout=None):
+        raise requests.RequestException("connection refused")
+
+    monkeypatch.setattr(api.requests, "post", _explode)
+    first = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": key},
+    )
+    assert first.status_code == 202, first.text
+    reservation_id = first.json()["reservation"]["reservationId"]
+
+    # The retry fails at the transport, but a "concurrent" attempt finalizes
+    # the very same reservation first.
+    def _finalize_then_fail(url, *, headers=None, json=None, timeout=None):
+        api._finalize_customer_atlas_reservation(
+            reservation_id,
+            fake_atlas_contact_id(key),
+            CustomerCreateRequest(name=name),
+        )
+        raise requests.RequestException("connection refused")
+
+    monkeypatch.setattr(api.requests, "post", _finalize_then_fail)
+    retry = client.post(
+        f"/api/admin/customers/reservations/{reservation_id}/retry", headers=auth
+    )
+
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["customer"]["atlasContactId"] == fake_atlas_contact_id(key)
+    assert len(_customer_rows(name)) == 1
