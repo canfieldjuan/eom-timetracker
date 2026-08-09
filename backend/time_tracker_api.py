@@ -11442,8 +11442,21 @@ def _customer_atlas_reservation(reservation_id: str) -> Optional[Dict[str, Any]]
             return dict(row) if row else None
 
 
+def _customer_request_from_row(row: Dict[str, Any]) -> CustomerCreateRequest:
+    """Rebuild the create request that describes an existing Customer."""
+    return CustomerCreateRequest(
+        name=str(row["name"]),
+        primaryContactName=row.get("primary_contact_name"),
+        primaryPhone=row.get("primary_phone"),
+        primaryEmail=row.get("primary_email"),
+        billingName=row.get("billing_name"),
+        billingEmail=row.get("billing_email"),
+        billingAddress=row.get("billing_address"),
+    )
+
+
 def _reserve_customer_atlas_creation(
-    payload: CustomerCreateRequest,
+    payload: Optional[CustomerCreateRequest],
     admin: Dict[str, Any],
     *,
     customer_id: Optional[int] = None,
@@ -11453,47 +11466,17 @@ def _reserve_customer_atlas_creation(
     Validates everything the eventual local insert will validate BEFORE the
     reservation exists, so a payload that cannot succeed locally never reaches
     Atlas and never strands an orphan contact.
+
+    For `link_existing` the payload is read from the LOCKED Customer row rather
+    than from a snapshot the caller took earlier. A snapshot would let a
+    concurrent identity edit slip in between the read and the lock, and Atlas
+    would then match or create a contact for the old name/phone/email and link
+    it to the edited Customer.
     """
     mode = "link_existing" if customer_id is not None else "create"
-    stored_payload = _customer_atlas_stored_payload(payload)
-    fingerprint = _customer_atlas_fingerprint(
-        stored_payload, mode=mode, customer_id=customer_id
-    )
-    # A caller-supplied key is what buys replay protection: the same key always
-    # resolves to the same reservation and therefore the same Atlas contact.
-    #
-    # When none is supplied we mint a fresh one rather than deriving it from the
-    # payload. A derived key looks safer but is not: two genuinely distinct
-    # customers can share every field (equal names are normal here -- Edward
-    # Jones and Mid Illinois are live examples), and a derived key would
-    # silently merge them into one Customer. Losing replay protection for a
-    # caller that opted out of it is recoverable and visible; silently merging
-    # two real customers is neither.
-    key = str(payload.idempotencyKey or uuid4())
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_site_mutations(cur)
-            cur.execute(
-                """
-                SELECT *
-                FROM eom_customer_atlas_reservations
-                WHERE idempotency_key = %s
-                FOR UPDATE
-                """,
-                (key,),
-            )
-            existing = cur.fetchone()
-            if existing:
-                row = dict(existing)
-                if not hmac.compare_digest(
-                    str(row["request_fingerprint"]), fingerprint
-                ):
-                    _raise_conflict(
-                        "customer_atlas_retry_mismatch",
-                        "This key was already used with different customer details",
-                        {"reservationId": str(row["id"])},
-                    )
-                return row, False
 
             if mode == "link_existing":
                 customer = _customer_row(cur, int(customer_id), for_update=True)
@@ -11524,7 +11507,48 @@ def _reserve_customer_atlas_creation(
                         "This Customer already has a pending Atlas reservation",
                         {"reservationId": str(open_reservation["id"])},
                     )
-            elif payload.primarySite is not None:
+                payload = _customer_request_from_row(customer)
+
+            stored_payload = _customer_atlas_stored_payload(payload)
+            fingerprint = _customer_atlas_fingerprint(
+                stored_payload, mode=mode, customer_id=customer_id
+            )
+            # A caller-supplied key is what buys replay protection: the same key
+            # always resolves to the same reservation and therefore the same
+            # Atlas contact.
+            #
+            # When none is supplied we mint a fresh one rather than deriving it
+            # from the payload. A derived key looks safer but is not: two
+            # genuinely distinct customers can share every field (equal names
+            # are normal here -- Edward Jones and Mid Illinois are live
+            # examples), and a derived key would silently merge them into one
+            # Customer. Losing replay protection for a caller that opted out of
+            # it is recoverable and visible; silently merging two real customers
+            # is neither.
+            key = str(payload.idempotencyKey or uuid4())
+            cur.execute(
+                """
+                SELECT *
+                FROM eom_customer_atlas_reservations
+                WHERE idempotency_key = %s
+                FOR UPDATE
+                """,
+                (key,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                row = dict(existing)
+                if not hmac.compare_digest(
+                    str(row["request_fingerprint"]), fingerprint
+                ):
+                    _raise_conflict(
+                        "customer_atlas_retry_mismatch",
+                        "This key was already used with different customer details",
+                        {"reservationId": str(row["id"])},
+                    )
+                return row, False
+
+            if mode == "create" and payload.primarySite is not None:
                 # Pre-flight the address uniqueness the finalizing insert will
                 # enforce. Raising here costs nothing; raising after Atlas has
                 # already created the contact would strand it.
@@ -11598,6 +11622,25 @@ def _finalize_customer_atlas_reservation(
                     """,
                     (atlas_contact_id, customer_id),
                 )
+                if cur.rowcount == 0:
+                    # Someone linked this Customer while we were talking to
+                    # Atlas -- the legacy linkage-backfill endpoint takes the
+                    # same mutation lock and can land in that gap. Finalizing
+                    # anyway would record the reservation against contact A
+                    # while the Customer points at contact B.
+                    current = _customer_row(cur, customer_id, for_update=True)
+                    linked = (
+                        str(current["atlas_contact_id"])
+                        if current and current.get("atlas_contact_id") is not None
+                        else None
+                    )
+                    if linked != atlas_contact_id:
+                        _raise_conflict(
+                            "customer_atlas_link_conflict",
+                            "This Customer was linked to a different Atlas "
+                            "contact while this reconciliation was in flight",
+                            {"customerId": customer_id, "atlasContactId": linked},
+                        )
             else:
                 customer_id = _insert_customer(
                     cur, payload, atlas_contact_id=atlas_contact_id
@@ -11706,6 +11749,35 @@ def _run_customer_atlas_reservation(
         )
         _note_customer_atlas_error(str(reservation["id"]), str(exc))
         return None, failure
+
+
+def _customer_atlas_capability_refusal(
+    admin: Dict[str, Any],
+) -> Optional[JSONResponse]:
+    """Refuse early only when Atlas AFFIRMS it cannot serve this mutation.
+
+    The distinction matters. A manifest that says the capability is absent is a
+    definite "no": refusing before any local write is correct, and a reservation
+    would be litter for an operation that can never succeed on this deployment.
+
+    A manifest we could not READ is an outage, not a refusal. Aborting there
+    would return 503 with no reservation and lose the operator's entry -- the
+    opposite of the promise that an unreachable Atlas still leaves a visible,
+    retryable record. So fall through and let the mutation attempt create that
+    record.
+    """
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION, admin
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        return _atlas_capability_unavailable_response(exc)
+    except HTTPException as exc:
+        logger.warning(
+            "Atlas capability manifest unreadable (status=%s); reserving anyway",
+            exc.status_code,
+        )
+    return None
 
 
 def _customer_atlas_pending_response(
@@ -11988,20 +12060,17 @@ def admin_create_customer(
             "atlasContactId is assigned by Atlas and cannot be supplied",
             {"atlasContactId": "system managed"},
         )
-    try:
-        _require_atlas_funnel_capability(
-            ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION, admin
-        )
-    except AtlasFunnelCapabilityUnavailable as exc:
-        # Refused before any local write, so a partially-deployed Atlas cannot
-        # leave a Customer behind.
+    # Refused before any local write, so a partially-deployed Atlas cannot
+    # leave a Customer behind.
+    refusal = _customer_atlas_capability_refusal(admin)
+    if refusal is not None:
         append_access_log(
             request,
             "CUSTOMER_CREATE_CAPABILITY_UNAVAILABLE",
             False,
-            f"capability={exc.capability}",
+            f"capability={ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION}",
         )
-        return _atlas_capability_unavailable_response(exc)
+        return refusal
 
     reservation, created = _reserve_customer_atlas_creation(payload, admin)
     if reservation["state"] == "finalized":
@@ -12041,11 +12110,15 @@ def admin_create_customer(
         f"Customer {customer['id']} contact={result['reservation']['atlas_contact_id']} "
         f"by {admin['name']}",
     )
+    # A first-time create keeps the exact legacy body. `idempotent` appears only
+    # where it carries information the status code does not -- on a replay or a
+    # recovered retry, which return 200.
+    body: Dict[str, Any] = {"success": True, "customer": customer}
+    if not created:
+        body["idempotent"] = True
     return JSONResponse(
         status_code=201 if created else 200,
-        content=jsonable_encoder(
-            {"success": True, "idempotent": not created, "customer": customer}
-        ),
+        content=jsonable_encoder(body),
     )
 
 
@@ -12081,12 +12154,9 @@ def admin_retry_customer_atlas_reservation(
             ),
         )
 
-    try:
-        _require_atlas_funnel_capability(
-            ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION, admin
-        )
-    except AtlasFunnelCapabilityUnavailable as exc:
-        return _atlas_capability_unavailable_response(exc)
+    refusal = _customer_atlas_capability_refusal(admin)
+    if refusal is not None:
+        return refusal
 
     payload = CustomerCreateRequest(**(reservation["payload"] or {}))
     result, failure = _run_customer_atlas_reservation(reservation, payload, admin)
@@ -12142,25 +12212,17 @@ def admin_link_customer_to_atlas(
             },
         )
 
-    try:
-        _require_atlas_funnel_capability(
-            ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION, admin
-        )
-    except AtlasFunnelCapabilityUnavailable as exc:
-        return _atlas_capability_unavailable_response(exc)
+    refusal = _customer_atlas_capability_refusal(admin)
+    if refusal is not None:
+        return refusal
 
-    payload = CustomerCreateRequest(
-        name=str(existing["name"]),
-        primaryContactName=existing.get("primary_contact_name"),
-        primaryPhone=existing.get("primary_phone"),
-        primaryEmail=existing.get("primary_email"),
-        billingName=existing.get("billing_name"),
-        billingEmail=existing.get("billing_email"),
-        billingAddress=existing.get("billing_address"),
-    )
+    # The identity sent to Atlas is built from the row under its lock inside the
+    # reservation, not from the unlocked pre-check above: a concurrent edit
+    # between the two would otherwise link a contact created for stale details.
     reservation, created = _reserve_customer_atlas_creation(
-        payload, admin, customer_id=customer_id
+        None, admin, customer_id=customer_id
     )
+    payload = CustomerCreateRequest(**(reservation["payload"] or {}))
     result, failure = _run_customer_atlas_reservation(reservation, payload, admin)
     if failure is not None:
         append_access_log(

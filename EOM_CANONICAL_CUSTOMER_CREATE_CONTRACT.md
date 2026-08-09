@@ -63,6 +63,19 @@ compensating delete is ever issued against a contact Atlas already created.
 | Deployed Atlas lacks the capability | 501, `error: atlas_capability_unavailable` | **No Customer, no reservation, no Atlas call** |
 | Same key, different customer details | 409 `customer_atlas_retry_mismatch` | No second Customer |
 | Caller supplied `atlasContactId` | 422 | No Customer |
+| Another writer linked the Customer first | 409 `customer_atlas_link_conflict` | Their link stands; reservation stays pending |
+
+The 501 and the 202 rows are the two sides of one boundary, and the difference
+is deliberate. A manifest that **says** the capability is absent is a definite
+no: refusing before any local write is right, and a reservation would be litter
+for an operation that can never succeed on this deployment. A manifest that
+**cannot be read** is an outage, not a refusal — aborting there would return 503
+with no reservation and lose the operator's entry, so that path falls through
+and lets the mutation attempt create the retryable record.
+
+A first-time create returns exactly the legacy `{"success": true, "customer":
+...}` body. `idempotent` appears only on the 200 replay and the 202, where it
+carries information the status code does not already give.
 
 Retry: `POST /api/admin/customers/reservations/{reservation_id}/retry`.
 Reconcile an existing unlinked Customer:
@@ -137,6 +150,14 @@ Also out of scope, deliberately:
 6. PATCH cannot change or clear the link; echoing the stored value succeeds.
 7. Reconciling an unlinked Customer removes it from the linkage audit's
    `unlinkedCustomers`.
+8. An unreadable capability manifest still leaves a pending reservation, while a
+   manifest that denies the capability leaves none.
+9. Reconciliation sends the identity the Customer has when its row is locked, so
+   an edit racing the capability read cannot link a contact built from stale
+   details.
+10. When another writer links the Customer while the saga is out at Atlas, the
+    reservation stays pending with the reason recorded rather than claiming a
+    link it never made.
 
 Covered by `backend/test_customer_atlas_creation.py` and the additions to
 `backend/test_atlas_linkage.py`.

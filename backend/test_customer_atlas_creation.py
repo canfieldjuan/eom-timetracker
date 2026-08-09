@@ -650,3 +650,155 @@ def test_a_local_refusal_after_atlas_success_is_recorded_on_the_reservation(
     reservation = _reservation_rows(name)[0]
     assert reservation["state"] == "pending"
     assert "duplicate_site_address" in reservation["last_error"]
+
+
+# --- review round 1 (PR #149): outage, response shape, and two races --------
+
+
+def test_an_unreadable_capability_manifest_still_leaves_a_reservation(
+    client, auth, monkeypatch
+):
+    """A total Atlas outage must not lose the operator's entry.
+
+    The capability read is a fail-fast optimization. When it cannot be read at
+    all that is an outage, not a refusal, so the request must still produce the
+    documented pending-and-retryable record instead of a bare 503.
+    """
+
+    def _explode(*args, **kwargs):
+        raise requests.RequestException("connection refused")
+
+    monkeypatch.setattr(api.requests, "get", _explode)
+    monkeypatch.setattr(api.requests, "post", _explode)
+    name = _name("Manifest Unreadable")
+
+    response = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 202, response.text
+    assert response.json()["error"] == "customer_atlas_pending"
+    assert _customer_rows(name) == []
+    reservations = _reservation_rows(name)
+    assert len(reservations) == 1
+    assert reservations[0]["state"] == "pending"
+
+
+def test_a_capability_atlas_denies_is_still_refused_without_a_reservation(
+    client, auth, monkeypatch
+):
+    """The opposite side of the boundary above: a definite no writes nothing."""
+    reduced = [
+        name
+        for name in ATLAS_FULL_CAPABILITIES
+        if name != "contact.operator_mutation"
+    ]
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        lambda url, **_: _Response(200, {"leads": [], "capabilities": reduced}),
+    )
+    name = _name("Denied Capability")
+
+    response = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 501, response.text
+    assert _reservation_rows(name) == []
+
+
+def test_a_first_time_create_returns_the_legacy_response_shape(client, auth):
+    """Existing consumers keep exactly the body they had before slice 0C."""
+    key = str(uuid.uuid4())
+    name = _name("Legacy Shape")
+    payload = {"name": name, "idempotencyKey": key}
+
+    created = client.post("/api/admin/customers", headers=auth, json=payload)
+    assert created.status_code == 201, created.text
+    assert set(created.json()) == {"success", "customer"}
+
+    # The replay is where an idempotency indicator carries information the
+    # status code does not already give.
+    replayed = client.post("/api/admin/customers", headers=auth, json=payload)
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["idempotent"] is True
+
+
+def test_reconcile_sends_the_identity_the_customer_has_when_it_is_locked(
+    client, auth, monkeypatch
+):
+    """A concurrent edit must not be overwritten by a stale snapshot.
+
+    The capability read sits between the route's unlocked pre-check and the
+    locked reservation, so editing the Customer during that call reproduces the
+    exact gap. Atlas must receive the CURRENT identity, or it would create a
+    contact for the old details and link it to the edited Customer.
+    """
+    name = _name("Renamed Mid Flight")
+    renamed = _name("Renamed Mid Flight NEW")
+    customer_id = _unlinked_customer(name)
+    calls = _capture_atlas_posts(monkeypatch)
+    real_get = api.requests.get
+
+    def _get_then_rename(url, **kwargs):
+        db.execute(
+            "UPDATE customers SET name = %s, primary_phone = %s WHERE id = %s",
+            (renamed, "217-555-0777", customer_id),
+        )
+        return real_get(url, **kwargs)
+
+    monkeypatch.setattr(api.requests, "get", _get_then_rename)
+
+    response = client.post(
+        f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth
+    )
+
+    assert response.status_code == 200, response.text
+    assert calls[0]["json"]["full_name"] == renamed
+    assert calls[0]["json"]["phone"] == "217-555-0777"
+
+
+def test_reconcile_refuses_when_another_writer_wins_the_link(
+    client, auth, monkeypatch
+):
+    """Never record a reservation against a contact the Customer does not have.
+
+    The legacy linkage-backfill endpoint takes the same mutation lock and can
+    land while the saga is out at Atlas. Finalizing regardless would leave the
+    reservation pointing at contact A and the Customer at contact B.
+    """
+    name = _name("Link Race")
+    customer_id = _unlinked_customer(name)
+    other_contact = str(uuid.uuid4())
+    real_post = api.requests.post
+
+    def _post_then_link(url, **kwargs):
+        response = real_post(url, **kwargs)
+        db.execute(
+            "UPDATE customers SET atlas_contact_id = %s WHERE id = %s",
+            (other_contact, customer_id),
+        )
+        return response
+
+    monkeypatch.setattr(api.requests, "post", _post_then_link)
+
+    response = client.post(
+        f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "customer_atlas_link_conflict"
+    # The other writer's link stands, and our reservation stays pending with
+    # the reason recorded rather than claiming a link it never made.
+    assert str(_customer_rows(name)[0]["atlas_contact_id"]) == other_contact
+    reservation = db.query_one(
+        "SELECT * FROM eom_customer_atlas_reservations WHERE customer_id = %s",
+        (customer_id,),
+    )
+    assert reservation["state"] == "pending"
+    assert "customer_atlas_link_conflict" in reservation["last_error"]
