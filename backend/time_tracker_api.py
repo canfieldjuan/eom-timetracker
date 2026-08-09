@@ -11414,21 +11414,29 @@ def _serialize_customer_atlas_reservation(row: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
-def _list_pending_customer_atlas_reservations() -> List[Dict[str, Any]]:
-    with db.get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT *
-                FROM eom_customer_atlas_reservations
-                WHERE state = 'pending'
-                ORDER BY updated_at DESC, created_at DESC
-                """
-            )
-            return [
-                _serialize_customer_atlas_reservation(dict(row))
-                for row in cur.fetchall()
-            ]
+def _list_pending_customer_atlas_reservations(cur: Any) -> List[Dict[str, Any]]:
+    """Pending reservations, read on the caller's cursor.
+
+    Takes a cursor so the customers listing can read both representations
+    back-to-back on one connection, and read THIS one first. Ordering is what
+    matters: finalization inserts the Customer and flips the reservation in one
+    transaction, so reading customers first would let that commit land in the
+    gap and produce a response showing the operation in neither collection.
+    Reading reservations first makes the worst case a row that appears briefly
+    in both, which self-corrects on the next load and never hides work.
+    """
+    cur.execute(
+        """
+        SELECT *
+        FROM eom_customer_atlas_reservations
+        WHERE state = 'pending'
+        ORDER BY updated_at DESC, created_at DESC
+        """
+    )
+    return [
+        _serialize_customer_atlas_reservation(dict(row))
+        for row in cur.fetchall()
+    ]
 
 
 def _finalized_customer_atlas_reservation(
@@ -11452,15 +11460,16 @@ def _finalized_customer_atlas_reservation_for_key(
     idempotency_key: str,
     request_fingerprint: str,
 ) -> Optional[Dict[str, Any]]:
-    """A completed operation for this key AND these details, if one exists.
+    """Resolve a key that already belongs to a completed operation.
 
-    Looked up before capability negotiation so a replay keeps working even if
-    Atlas has since withdrawn or rolled back the capability: the Customer this
-    key created already exists, and re-answering with it asks nothing of Atlas.
+    Both answers are given locally, before capability negotiation, because
+    neither needs anything from Atlas and both are true regardless of what
+    Atlas currently serves:
 
-    The fingerprint is part of the lookup, not a later check. Matching on the
-    key alone would turn a key reused with DIFFERENT customer details into a
-    silent replay of the first customer, when that has to fail closed.
+    - the same details are a replay, answered with the Customer that key
+      created, so a capability rollback cannot break the replay guarantee;
+    - different details are invalid key reuse, refused with the same 409 the
+      reservation path raises, so it cannot hide behind deployment state.
     """
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -11479,7 +11488,11 @@ def _finalized_customer_atlas_reservation_for_key(
             if not hmac.compare_digest(
                 str(reservation["request_fingerprint"]), request_fingerprint
             ):
-                return None
+                _raise_conflict(
+                    "customer_atlas_retry_mismatch",
+                    "This key was already used with different customer details",
+                    {"reservationId": str(reservation["id"])},
+                )
             return {
                 "reservation": reservation,
                 "customer": _canonical_customer(
@@ -12089,6 +12102,7 @@ def admin_list_customers(
     active_clause = "" if includeArchived else " WHERE c.active = true"
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            pending_reservations = _list_pending_customer_atlas_reservations(cur)
             cur.execute(
                 f"SELECT {CUSTOMER_SELECT_COLUMNS} FROM customers c"
                 f"{active_clause} ORDER BY lower(c.name), c.id"
@@ -12101,7 +12115,6 @@ def admin_list_customers(
                 )
                 for row in rows
             ]
-    pending_reservations = _list_pending_customer_atlas_reservations()
     append_access_log(request, "CUSTOMERS_LISTED", True, f"{len(customers)} customers")
     # `pendingAtlasReservations` is additive: the `customers` shape the deployed
     # portals read is unchanged. Customer creates that reached Atlas but have

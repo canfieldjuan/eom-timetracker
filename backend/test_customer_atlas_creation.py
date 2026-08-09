@@ -904,3 +904,102 @@ def test_a_failing_attempt_reports_the_success_a_concurrent_one_committed(
     assert retry.status_code == 200, retry.text
     assert retry.json()["customer"]["atlasContactId"] == fake_atlas_contact_id(key)
     assert len(_customer_rows(name)) == 1
+
+
+# --- review round 3 (PR #149) ------------------------------------------------
+
+
+def test_key_reuse_is_refused_even_when_atlas_withdraws_the_capability(
+    client, auth, monkeypatch
+):
+    """Invalid key reuse is a local fact and must not hide behind Atlas state.
+
+    Both answers for an already-completed key are decidable locally, so neither
+    should depend on what the deployed Atlas currently serves.
+    """
+    key = str(uuid.uuid4())
+    name = _name("Reuse Under Rollback")
+
+    created = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": key},
+    )
+    assert created.status_code == 201, created.text
+
+    reduced = [
+        capability
+        for capability in ATLAS_FULL_CAPABILITIES
+        if capability != "contact.operator_mutation"
+    ]
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        lambda url, **_: _Response(200, {"leads": [], "capabilities": reduced}),
+    )
+
+    reused = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": _name("Reuse Under Rollback Other"), "idempotencyKey": key},
+    )
+
+    assert reused.status_code == 409, reused.text
+    assert reused.json()["code"] == "customer_atlas_retry_mismatch"
+    assert _customer_rows(_name("Reuse Under Rollback Other")) == []
+
+
+def test_a_finalizing_create_is_never_missing_from_the_customers_listing(
+    client, auth, monkeypatch
+):
+    """Reservations are read before customers so nothing can fall between them.
+
+    Finalization inserts the Customer and flips the reservation in one
+    transaction. The hook below commits it in the gap BETWEEN the listing's two
+    reads, which is the exact interleaving that used to return a response
+    showing the operation in neither collection.
+    """
+    _capture_atlas_posts(monkeypatch)
+    key = str(uuid.uuid4())
+    name = _name("Finalizing Blink")
+
+    # Bank a pending reservation.
+    def _explode(url, *, headers=None, json=None, timeout=None):
+        raise requests.RequestException("connection refused")
+
+    monkeypatch.setattr(api.requests, "post", _explode)
+    pending = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": key},
+    )
+    assert pending.status_code == 202, pending.text
+    reservation_id = pending.json()["reservation"]["reservationId"]
+
+    real_list = api._list_pending_customer_atlas_reservations
+    fired = {"done": False}
+
+    def _finalize_then_list(*args, **kwargs):
+        if not fired["done"]:
+            fired["done"] = True
+            api._finalize_customer_atlas_reservation(
+                reservation_id,
+                fake_atlas_contact_id(key),
+                CustomerCreateRequest(name=name),
+            )
+        return real_list(*args, **kwargs)
+
+    monkeypatch.setattr(
+        api, "_list_pending_customer_atlas_reservations", _finalize_then_list
+    )
+
+    listing = client.get("/api/admin/customers", headers=auth)
+    assert listing.status_code == 200, listing.text
+    body = listing.json()
+
+    in_customers = any(customer["name"] == name for customer in body["customers"])
+    in_pending = any(
+        row["customerName"] == name for row in body["pendingAtlasReservations"]
+    )
+    # Briefly in both would be acceptable and self-correcting; in neither is not.
+    assert in_customers or in_pending
