@@ -1665,6 +1665,19 @@ def test_payroll_shift_correction_allows_anomalous_long_source_shift(client):
             _local_dt(service_day + timedelta(days=2), 8),
         )
 
+        before = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        source_segment = before["employees"][0]["days"][1]["shifts"][0]
+        continuation_segment = before["employees"][0]["days"][2]["shifts"][0]
+        assert source_segment["fieldSupport"]["clockIn"]["correction"] is True
+        assert source_segment["fieldSupport"]["clockOut"]["correction"] is True
+        assert continuation_segment["fieldSupport"]["clockIn"]["correction"] is False
+        assert continuation_segment["fieldSupport"]["clockOut"]["correction"] is False
+
         corrected = client.post(
             "/api/admin/payroll/timesheet/shift-corrections",
             headers=payroll_auth,
@@ -1689,7 +1702,7 @@ def test_payroll_shift_correction_allows_anomalous_long_source_shift(client):
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
-def test_payroll_timesheet_does_not_offer_row_edit_for_midnight_boundary_shift(
+def test_payroll_timesheet_offers_row_edit_for_midnight_boundary_shift(
     client,
 ):
     week_start = date(2026, 7, 19)
@@ -1719,9 +1732,9 @@ def test_payroll_timesheet_does_not_offer_row_edit_for_midnight_boundary_shift(
         assert shift["segmentCount"] == 1
         assert shift["spansMultipleDays"] is False
         assert shift["fieldSupport"] == {
-            "clockIn": {"display": True, "correction": False},
-            "clockOut": {"display": True, "correction": False},
-            "breakMinutes": {"display": True, "correction": False},
+            "clockIn": {"display": True, "correction": True},
+            "clockOut": {"display": True, "correction": True},
+            "breakMinutes": {"display": True, "correction": True},
             "totalHours": {"display": True, "correction": False},
         }
     finally:

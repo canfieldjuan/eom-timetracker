@@ -16627,24 +16627,9 @@ def _serialize_payroll_timesheet_shift(
         source_total_minutes = int(correction_row["source_total_minutes"])
         source_break_minutes = correction_row.get("source_break_minutes")
     source_starts_on_segment_date = to_local(source_clock_in).date() == segment["date"]
-    source_ends_on_segment_date = (
+    can_correct_shift = source_starts_on_segment_date and (
         source_clock_out is not None
-        and to_local(source_clock_out).date() == segment["date"]
-    )
-    can_correct_closed_shift = (
-        segment_count == 1
-        and source_starts_on_segment_date
-        and source_ends_on_segment_date
-    )
-    can_correct_open_shift = (
-        segment_count == 1
-        and source_clock_out is None
-        and source_starts_on_segment_date
-        and "missing_clock_out" in issue_codes
-    )
-    can_correct_shift = (
-        can_correct_closed_shift
-        or can_correct_open_shift
+        or "missing_clock_out" in issue_codes
     )
     manual_shift_id = (
         str(shift_row["manual_shift_id"])
