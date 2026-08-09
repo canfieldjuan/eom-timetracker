@@ -67,6 +67,7 @@ def _apply_schema(conn):
                 crew_memberships, crews, google_calendar_oauth_states,
                 google_calendar_sources, google_calendar_connections,
                 eom_lead_working,
+                eom_customer_atlas_reservations,
                 eom_office_conversion_handoffs,
                 receivables_operation_attempts,
                 payroll_shift_exclusions,
@@ -142,6 +143,94 @@ def clear_access_log_entries(setup_db):
         cur.execute("DELETE FROM access_log_entries")
     conn.commit()
     conn.close()
+
+
+# Every capability the deployed Atlas advertises today. Kept here rather than in
+# one test module because Customer creation now needs
+# `contact.operator_mutation` on any suite that creates a Customer.
+ATLAS_FULL_CAPABILITIES = [
+    "contact.operator_mutation",
+    "lead.customer_handoff",
+    "lead.estimate_booking",
+    "lead.first_clean_booking",
+    "lead.lost",
+    "lead.reopen",
+    "onboarding.draft.approve_send",
+    "onboarding.draft.confirm_sent",
+    "onboarding.draft.edit",
+    "onboarding.draft.list",
+    "onboarding.draft.revoke",
+]
+
+
+def fake_atlas_contact_id(idempotency_key: str) -> str:
+    """The contact id the fake Atlas assigns for one idempotency key.
+
+    Derived from the key, not random, so a replay resolves to the SAME contact
+    exactly as the real Atlas receipt does. Tests assert on that identity.
+    """
+    import uuid as _uuid
+
+    return str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"atlas-operator-contact:{idempotency_key}"))
+
+
+class _FakeAtlasResponse:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+@pytest.fixture(autouse=True)
+def stub_atlas_funnel(setup_db, monkeypatch):
+    """Default every test to a healthy, fully-capable Atlas.
+
+    Since Slice 0C, creating a Customer calls Atlas, so without this seam the
+    unrelated Customer/Site suites would fail on funnel configuration rather
+    than on what they actually assert.
+
+    Deliberately patched at the HTTP boundary (`requests`) rather than at
+    `_atlas_funnel_request` / `_atlas_funnel_read`: the real transport, header,
+    and error-mapping code then still runs, and the suites that unit-test that
+    transport by patching `requests` themselves keep working. Because this
+    fixture is autouse it is set up first, so any explicit per-test monkeypatch
+    -- at either level -- wins.
+    """
+    import time_tracker_api as api
+
+    def _get(url, *, headers=None, params=None, timeout=None):
+        return _FakeAtlasResponse(
+            200,
+            {
+                "leads": [],
+                "cursor": None,
+                "hasMore": False,
+                "nextCursor": None,
+                "capabilities": list(ATLAS_FULL_CAPABILITIES),
+            },
+        )
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        if not str(url).endswith(api.ATLAS_OPERATOR_CONTACTS_PATH):
+            raise AssertionError(f"unstubbed Atlas funnel call: {url}")
+        key = (headers or {}).get("Idempotency-Key", "")
+        return _FakeAtlasResponse(
+            201,
+            {
+                "success": True,
+                "contactId": fake_atlas_contact_id(key),
+                "operation": "contact_created",
+                "idempotent": False,
+                "contact": {},
+            },
+        )
+
+    monkeypatch.setattr(api, "ATLAS_FUNNEL_BASE_URL", "https://atlas.example.test/api/v1")
+    monkeypatch.setattr(api, "ATLAS_FUNNEL_SERVICE_TOKEN", "tracker-only-test-token")
+    monkeypatch.setattr(api.requests, "get", _get)
+    monkeypatch.setattr(api.requests, "post", _post)
 
 
 # -- session-scoped fixtures ----------------------------------------------------

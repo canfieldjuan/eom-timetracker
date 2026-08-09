@@ -39,6 +39,11 @@ def _clean_test_rows() -> None:
                 (f"{TEST_PREFIX}%",),
             )
             cur.execute(
+                "DELETE FROM eom_customer_atlas_reservations WHERE customer_id IN "
+                "(SELECT id FROM customers WHERE name LIKE %s)",
+                (f"{TEST_PREFIX}%",),
+            )
+            cur.execute(
                 "DELETE FROM customers WHERE name LIKE %s",
                 (f"{TEST_PREFIX}%",),
             )

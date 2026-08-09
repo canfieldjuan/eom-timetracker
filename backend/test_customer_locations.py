@@ -78,6 +78,11 @@ def _clean_test_rows() -> None:
                 (f"{TEST_PREFIX}%",),
             )
             cur.execute(
+                "DELETE FROM eom_customer_atlas_reservations WHERE customer_id IN "
+                "(SELECT id FROM customers WHERE name LIKE %s)",
+                (f"{TEST_PREFIX}%",),
+            )
+            cur.execute(
                 "DELETE FROM customers WHERE name LIKE %s",
                 (f"{TEST_PREFIX}%",),
             )
@@ -267,7 +272,6 @@ def test_customer_patch_distinguishes_omission_from_explicit_null(client, auth):
         billingName="Original Billing",
         billingEmail="accounts@example.test",
         billingAddress="20 Billing Road, Effingham, IL 62401",
-        atlasContactId="11111111-1111-1111-1111-111111111111",
     )
     customer_id = customer["id"]
     preserved_columns = (
@@ -292,7 +296,8 @@ def test_customer_patch_distinguishes_omission_from_explicit_null(client, auth):
     assert canonical["primaryPhone"] == "217-555-0199"
     assert canonical["primaryEmail"] == "original@example.test"
     assert canonical["billingEmail"] == "accounts@example.test"
-    assert canonical["atlasContactId"] == "11111111-1111-1111-1111-111111111111"
+    # The Atlas link is assigned at creation and is not a patchable field.
+    assert canonical["atlasContactId"] == customer["atlasContactId"]
     after_phone = _customer_row(customer_id)
     assert {column: after_phone[column] for column in preserved_columns} == {
         column: before[column] for column in preserved_columns
@@ -569,7 +574,6 @@ def test_site_patch_rejects_stale_owning_customer_token_before_writing(client, a
         client,
         auth,
         "Owning Customer Token Drift",
-        atlasContactId="11111111-1111-1111-1111-111111111111",
     )
     site = _create_site(
         client,
@@ -586,7 +590,7 @@ def test_site_patch_rejects_stale_owning_customer_token_before_writing(client, a
         headers=auth,
         json={
             "expectedUpdateToken": customer["updateToken"],
-            "atlasContactId": "22222222-2222-2222-2222-222222222222",
+            "primaryContactName": "Token Drift Contact",
         },
     )
     assert customer_update.status_code == 200, customer_update.text
@@ -623,7 +627,6 @@ def test_site_patch_accepts_current_site_and_owning_customer_tokens(client, auth
         client,
         auth,
         "Current Owning Customer Token",
-        atlasContactId="33333333-3333-3333-3333-333333333333",
     )
     site = _create_site(
         client,

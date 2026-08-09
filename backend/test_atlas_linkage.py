@@ -29,6 +29,11 @@ def _clean_test_rows() -> None:
         (f"{TEST_PREFIX}%",),
     )
     db.execute(
+        "DELETE FROM eom_customer_atlas_reservations WHERE customer_id IN "
+        "(SELECT id FROM customers WHERE name LIKE %s)",
+        (f"{TEST_PREFIX}%",),
+    )
+    db.execute(
         "DELETE FROM atlas_linkage_backfill_batches WHERE snapshot::text LIKE %s",
         (f"%{TEST_PREFIX}%",),
     )
@@ -297,6 +302,51 @@ def test_backfill_apply_guards(client, auth, emp_auth):
     )
     assert replay.status_code == 409
     assert _customer_link(customer) == contact
+
+
+# -- reconcile through Atlas (slice 0C) -------------------------------------------
+
+
+def test_reconcile_clears_a_customer_out_of_the_unlinked_audit(client, auth):
+    """The audit is how the backfill of the two live unlinked Customers is proved.
+
+    Reconciling through the canonical path must remove the Customer from
+    `unlinkedCustomers`, not merely stamp a column.
+    """
+    unlinked = _create_customer("Reconcile Me")
+
+    before = client.get(AUDIT_PATH, headers=auth).json()
+    assert unlinked in {row["customerId"] for row in before["unlinkedCustomers"]}
+
+    linked = client.post(
+        f"/api/admin/customers/{unlinked}/atlas-contact", headers=auth
+    )
+    assert linked.status_code == 200, linked.text
+
+    after = client.get(AUDIT_PATH, headers=auth).json()
+    assert unlinked not in {row["customerId"] for row in after["unlinkedCustomers"]}
+    assert _customer_link(unlinked) == linked.json()["customer"]["atlasContactId"]
+
+
+def test_reconcile_refuses_a_second_concurrent_reservation(client, auth, monkeypatch):
+    """One open reservation per Customer, so a double click cannot double-create."""
+    import requests as _requests
+
+    import time_tracker_api as api
+
+    def _explode(url, *, headers=None, json=None, timeout=None):
+        raise _requests.RequestException("connection refused")
+
+    monkeypatch.setattr(api.requests, "post", _explode)
+    unlinked = _create_customer("Reconcile Twice")
+
+    first = client.post(f"/api/admin/customers/{unlinked}/atlas-contact", headers=auth)
+    assert first.status_code == 202, first.text
+
+    second = client.post(f"/api/admin/customers/{unlinked}/atlas-contact", headers=auth)
+    assert second.status_code == 409, second.text
+    assert second.json()["code"] == "customer_atlas_reservation_open"
+    assert _customer_link(unlinked) is None
 
 
 # -- schema ----------------------------------------------------------------------
