@@ -16596,6 +16596,7 @@ def _serialize_payroll_timesheet_shift(
     segment_index: int,
     segment_count: int,
     issue_codes: List[str],
+    week_end_utc: datetime,
 ) -> Dict[str, Any]:
     clock_in = shift_row["clock_in"].astimezone(timezone.utc)
     clock_out_value = shift_row.get("clock_out")
@@ -16643,8 +16644,17 @@ def _serialize_payroll_timesheet_shift(
         if source_clock_out is not None
         else segment_count
     )
+    recorded_source_interval_is_editable = (
+        source_clock_out is not None
+        and source_segment_count <= 2
+        and source_clock_out <= week_end_utc
+    )
     can_correct_shift = (
-        (source_kind == "manual" or source_segment_count == 1)
+        (
+            source_kind == "manual"
+            or recorded_source_interval_is_editable
+            or (source_clock_out is None and source_segment_count == 1)
+        )
         and source_starts_on_segment_date
         and (
             source_clock_out is not None
@@ -17064,6 +17074,7 @@ def _compute_payroll_timesheet(
                     segment_index=index,
                     segment_count=segment_count,
                     issue_codes=segment_issue_codes,
+                    week_end_utc=week_end_utc,
                 )
             )
 

@@ -1816,6 +1816,51 @@ def test_payroll_timesheet_offers_row_edit_for_midnight_boundary_shift(
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
+def test_payroll_timesheet_offers_source_row_edit_for_two_segment_shift(client):
+    week_start = date(2026, 7, 19)
+    service_day = week_start + timedelta(days=1)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Two Segment Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Two Segment Alma")
+        payroll_auth = _login(client, "Payroll Two Segment Mayra")
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(service_day, 7, 3),
+            _local_dt(service_day + timedelta(days=1), 7, 3),
+        )
+
+        body = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        employee = body["employees"][0]
+        source_segment = employee["days"][1]["shifts"][0]
+        continuation_segment = employee["days"][2]["shifts"][0]
+
+        assert source_segment["shiftId"] == shift_id
+        assert source_segment["segmentCount"] == 2
+        assert source_segment["fieldSupport"] == {
+            "clockIn": {"display": True, "correction": True},
+            "clockOut": {"display": True, "correction": True},
+            "breakMinutes": {"display": True, "correction": True},
+            "totalHours": {"display": True, "correction": False},
+        }
+        assert continuation_segment["shiftId"] == shift_id
+        assert continuation_segment["fieldSupport"] == {
+            "clockIn": {"display": True, "correction": False},
+            "clockOut": {"display": True, "correction": False},
+            "breakMinutes": {"display": True, "correction": False},
+            "totalHours": {"display": True, "correction": False},
+        }
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
 def test_payroll_timesheet_rejects_corrected_saturday_spillover(client):
     week_start = date(2026, 7, 19)
     saturday = week_start + timedelta(days=6)
