@@ -15810,7 +15810,13 @@ def _payroll_corrected_shift_total_minutes(
             status_code=400,
             detail="Corrected break minutes cannot exceed corrected shift length",
         )
-    return span_minutes - break_minutes
+    corrected_total_minutes = span_minutes - break_minutes
+    if corrected_total_minutes > 24 * 60:
+        raise HTTPException(
+            status_code=400,
+            detail="Corrected shift total cannot exceed 24 hours",
+        )
+    return corrected_total_minutes
 
 
 def _payroll_shift_overlaps_week(
@@ -16627,24 +16633,23 @@ def _serialize_payroll_timesheet_shift(
         source_total_minutes = int(correction_row["source_total_minutes"])
         source_break_minutes = correction_row.get("source_break_minutes")
     source_starts_on_segment_date = to_local(source_clock_in).date() == segment["date"]
-    source_ends_on_segment_date = (
-        source_clock_out is not None
-        and to_local(source_clock_out).date() == segment["date"]
-    )
-    can_correct_closed_shift = (
-        segment_count == 1
-        and source_starts_on_segment_date
-        and source_ends_on_segment_date
-    )
-    can_correct_open_shift = (
-        segment_count == 1
-        and source_clock_out is None
-        and source_starts_on_segment_date
-        and "missing_clock_out" in issue_codes
+    source_segment_count = (
+        len(
+            _payroll_timesheet_segment_bounds(
+                source_clock_in,
+                source_clock_out,
+            )
+        )
+        if source_clock_out is not None
+        else segment_count
     )
     can_correct_shift = (
-        can_correct_closed_shift
-        or can_correct_open_shift
+        (source_kind == "manual" or source_segment_count == 1)
+        and source_starts_on_segment_date
+        and (
+            source_clock_out is not None
+            or "missing_clock_out" in issue_codes
+        )
     )
     manual_shift_id = (
         str(shift_row["manual_shift_id"])
@@ -18606,6 +18611,7 @@ def _parse_payroll_shift_correction_datetime(value: str, field_name: str) -> dat
 
 def _ensure_payroll_shift_correction_dates(
     *,
+    week_start: date,
     correction_date: date,
     corrected_clock_in: datetime,
     corrected_clock_out: datetime,
@@ -18623,10 +18629,24 @@ def _ensure_payroll_shift_correction_dates(
         )
     local_clock_in_date = to_local(corrected_clock_in).date()
     local_clock_out_date = to_local(corrected_clock_out).date()
-    if local_clock_in_date != correction_date or local_clock_out_date != correction_date:
+    if local_clock_in_date != correction_date:
         raise HTTPException(
             status_code=400,
-            detail="Corrected shift times must stay on the correction date",
+            detail="Corrected clock-in must stay on the correction date",
+        )
+    if local_clock_out_date not in {
+        correction_date,
+        correction_date + timedelta(days=1),
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Corrected clock-out must fall on the correction date or the next day",
+        )
+    _week_end, _week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
+    if corrected_clock_out > week_end_utc:
+        raise HTTPException(
+            status_code=400,
+            detail="Corrected clock-out must stay inside the selected payroll week",
         )
 
 
@@ -19085,6 +19105,7 @@ def _payroll_change_shift_values(
     clock_in = _parse_payroll_shift_correction_datetime(operation.clockIn, "clockIn")
     clock_out = _parse_payroll_shift_correction_datetime(operation.clockOut, "clockOut")
     _ensure_payroll_shift_correction_dates(
+        week_start=week_start,
         correction_date=work_date,
         corrected_clock_in=clock_in,
         corrected_clock_out=clock_out,
@@ -19896,6 +19917,7 @@ def admin_create_payroll_shift_correction(
     )
     observed_at = utc_now()
     _ensure_payroll_shift_correction_dates(
+        week_start=week_start,
         correction_date=correction_date,
         corrected_clock_in=corrected_clock_in,
         corrected_clock_out=corrected_clock_out,
