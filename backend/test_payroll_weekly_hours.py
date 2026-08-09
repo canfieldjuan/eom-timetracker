@@ -1816,7 +1816,7 @@ def test_payroll_timesheet_offers_row_edit_for_midnight_boundary_shift(
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 
-def test_payroll_timesheet_includes_corrected_saturday_spillover_in_next_week(client):
+def test_payroll_timesheet_rejects_corrected_saturday_spillover(client):
     week_start = date(2026, 7, 19)
     saturday = week_start + timedelta(days=6)
     next_week_start = week_start + timedelta(days=7)
@@ -1860,20 +1860,37 @@ def test_payroll_timesheet_includes_corrected_saturday_spillover_in_next_week(cl
                 ],
             },
         )
-        assert corrected.status_code == 200, corrected.text
-        assert corrected.json()["timesheet"]["employees"][0]["days"][6][
-            "totalMinutes"
-        ] == 240
-
-        next_week = _payroll_timesheet(
-            client,
-            payroll_auth,
-            next_week_start,
-            employee_id=employee_id,
+        assert corrected.status_code == 400
+        assert corrected.json()["error"] == (
+            "Corrected clock-out must stay inside the selected payroll week"
         )
-        sunday = next_week["employees"][0]["days"][0]
-        assert sunday["totalMinutes"] == 60
-        assert sunday["shifts"][0]["shiftId"] == shift_id
+
+        manual = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["timesheetSourceFingerprint"],
+                "reason": "Manual shifts must stay inside their payroll week.",
+                "operations": [
+                    {
+                        "action": "add_manual",
+                        "clientRowId": "saturday-spillover",
+                        "date": saturday.isoformat(),
+                        "clockIn": _local_dt(saturday, 20).isoformat(),
+                        "clockOut": _local_dt(next_week_start, 1).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+        assert manual.status_code == 400
+        assert manual.json()["error"] == (
+            "Corrected clock-out must stay inside the selected payroll week"
+        )
     finally:
         _delete_payroll_verification_weeks([week_start, next_week_start])
         _delete_employees([value for value in (employee_id, payroll_id) if value])

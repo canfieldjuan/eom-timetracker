@@ -15583,24 +15583,6 @@ def _payroll_overlapping_shift_rows(
                       OR (shift_row.clock_in >= %s AND shift_row.clock_in < %s)
                   )
               )
-              OR EXISTS (
-                  SELECT 1
-                  FROM payroll_shift_corrections correction
-                  WHERE correction.shift_id = shift_row.id
-                    AND correction.status = 'active'
-                    AND correction.week_start = (
-                        COALESCE(
-                            shift_row.local_date,
-                            (shift_row.clock_in AT TIME ZONE %s)::date
-                        )
-                        - EXTRACT(DOW FROM COALESCE(
-                            shift_row.local_date,
-                            (shift_row.clock_in AT TIME ZONE %s)::date
-                        ))::integer
-                    )
-                    AND correction.corrected_clock_in < %s
-                    AND correction.corrected_clock_out > %s
-              )
           )
           AND (%s::integer IS NULL OR shift_row.employee_id = %s)
         ORDER BY shift_row.employee_id, shift_row.clock_in, shift_row.id
@@ -15613,10 +15595,6 @@ def _payroll_overlapping_shift_rows(
             week_start_utc,
             week_start_utc,
             week_end_utc,
-            TIMEZONE_NAME,
-            TIMEZONE_NAME,
-            week_end_utc,
-            week_start_utc,
             employee_id,
             employee_id,
         ),
@@ -18629,6 +18607,7 @@ def _parse_payroll_shift_correction_datetime(value: str, field_name: str) -> dat
 
 def _ensure_payroll_shift_correction_dates(
     *,
+    week_start: date,
     correction_date: date,
     corrected_clock_in: datetime,
     corrected_clock_out: datetime,
@@ -18658,6 +18637,11 @@ def _ensure_payroll_shift_correction_dates(
         raise HTTPException(
             status_code=400,
             detail="Corrected clock-out must fall on the correction date or the next day",
+        )
+    if local_clock_out_date >= week_start + timedelta(days=7):
+        raise HTTPException(
+            status_code=400,
+            detail="Corrected clock-out must stay inside the selected payroll week",
         )
 
 
@@ -19116,6 +19100,7 @@ def _payroll_change_shift_values(
     clock_in = _parse_payroll_shift_correction_datetime(operation.clockIn, "clockIn")
     clock_out = _parse_payroll_shift_correction_datetime(operation.clockOut, "clockOut")
     _ensure_payroll_shift_correction_dates(
+        week_start=week_start,
         correction_date=work_date,
         corrected_clock_in=clock_in,
         corrected_clock_out=clock_out,
@@ -19927,6 +19912,7 @@ def admin_create_payroll_shift_correction(
     )
     observed_at = utc_now()
     _ensure_payroll_shift_correction_dates(
+        week_start=week_start,
         correction_date=correction_date,
         corrected_clock_in=corrected_clock_in,
         corrected_clock_out=corrected_clock_out,
