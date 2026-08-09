@@ -16627,7 +16627,7 @@ def _serialize_payroll_timesheet_shift(
         source_total_minutes = int(correction_row["source_total_minutes"])
         source_break_minutes = correction_row.get("source_break_minutes")
     source_starts_on_segment_date = to_local(source_clock_in).date() == segment["date"]
-    can_correct_shift = source_starts_on_segment_date and (
+    can_correct_shift = segment_count == 1 and source_starts_on_segment_date and (
         source_clock_out is not None
         or "missing_clock_out" in issue_codes
     )
@@ -18608,10 +18608,18 @@ def _ensure_payroll_shift_correction_dates(
         )
     local_clock_in_date = to_local(corrected_clock_in).date()
     local_clock_out_date = to_local(corrected_clock_out).date()
-    if local_clock_in_date != correction_date or local_clock_out_date != correction_date:
+    if local_clock_in_date != correction_date:
         raise HTTPException(
             status_code=400,
-            detail="Corrected shift times must stay on the correction date",
+            detail="Corrected clock-in must stay on the correction date",
+        )
+    if local_clock_out_date not in {
+        correction_date,
+        correction_date + timedelta(days=1),
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Corrected clock-out must fall on the correction date or the next day",
         )
 
 

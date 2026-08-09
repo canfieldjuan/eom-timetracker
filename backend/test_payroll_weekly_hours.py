@@ -1673,8 +1673,8 @@ def test_payroll_shift_correction_allows_anomalous_long_source_shift(client):
         )
         source_segment = before["employees"][0]["days"][1]["shifts"][0]
         continuation_segment = before["employees"][0]["days"][2]["shifts"][0]
-        assert source_segment["fieldSupport"]["clockIn"]["correction"] is True
-        assert source_segment["fieldSupport"]["clockOut"]["correction"] is True
+        assert source_segment["fieldSupport"]["clockIn"]["correction"] is False
+        assert source_segment["fieldSupport"]["clockOut"]["correction"] is False
         assert continuation_segment["fieldSupport"]["clockIn"]["correction"] is False
         assert continuation_segment["fieldSupport"]["clockOut"]["correction"] is False
 
@@ -1737,6 +1737,38 @@ def test_payroll_timesheet_offers_row_edit_for_midnight_boundary_shift(
             "breakMinutes": {"display": True, "correction": True},
             "totalHours": {"display": True, "correction": False},
         }
+
+        corrected = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": body["timesheetSourceFingerprint"],
+                "reason": "Supervisor confirmed the overnight break.",
+                "operations": [
+                    {
+                        "action": "correct_recorded",
+                        "shiftId": shift_id,
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 20).isoformat(),
+                        "clockOut": _local_dt(
+                            service_day + timedelta(days=1), 0
+                        ).isoformat(),
+                        "breakMinutes": 15,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+
+        assert corrected.status_code == 200, corrected.text
+        corrected_shift = corrected.json()["timesheet"]["employees"][0]["days"][0][
+            "shifts"
+        ][0]
+        assert corrected_shift["breakMinutes"] == 15
+        assert corrected_shift["totalMinutes"] == 225
     finally:
         _delete_payroll_verification_weeks([week_start])
         _delete_employees([value for value in (employee_id, payroll_id) if value])
