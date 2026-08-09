@@ -1754,7 +1754,7 @@ def test_payroll_timesheet_offers_row_edit_for_midnight_boundary_shift(
                         "date": service_day.isoformat(),
                         "clockIn": _local_dt(service_day, 20).isoformat(),
                         "clockOut": _local_dt(
-                            service_day + timedelta(days=1), 0
+                            service_day + timedelta(days=1), 0, 30
                         ).isoformat(),
                         "breakMinutes": 15,
                         "locationId": None,
@@ -1768,9 +1768,114 @@ def test_payroll_timesheet_offers_row_edit_for_midnight_boundary_shift(
             "shifts"
         ][0]
         assert corrected_shift["breakMinutes"] == 15
-        assert corrected_shift["totalMinutes"] == 225
+        assert corrected_shift["totalMinutes"] == 240
+
+        refreshed = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+        refreshed_sunday = refreshed["employees"][0]["days"][0]["shifts"][0]
+        refreshed_monday = refreshed["employees"][0]["days"][1]["shifts"][0]
+        assert refreshed_sunday["fieldSupport"]["clockIn"]["correction"] is True
+        assert refreshed_sunday["fieldSupport"]["clockOut"]["correction"] is True
+        assert refreshed_monday["fieldSupport"]["clockIn"]["correction"] is False
+        assert refreshed_monday["fieldSupport"]["clockOut"]["correction"] is False
+
+        overlong = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": refreshed[
+                    "timesheetSourceFingerprint"
+                ],
+                "reason": "This attempted correction exceeds the stored limit.",
+                "operations": [
+                    {
+                        "action": "correct_recorded",
+                        "shiftId": shift_id,
+                        "date": service_day.isoformat(),
+                        "clockIn": _local_dt(service_day, 0).isoformat(),
+                        "clockOut": _local_dt(
+                            service_day + timedelta(days=1), 1
+                        ).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+        assert overlong.status_code == 400
+        assert overlong.json()["error"] == "Corrected shift total cannot exceed 24 hours"
     finally:
         _delete_payroll_verification_weeks([week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_timesheet_includes_corrected_saturday_spillover_in_next_week(client):
+    week_start = date(2026, 7, 19)
+    saturday = week_start + timedelta(days=6)
+    next_week_start = week_start + timedelta(days=7)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Spillover Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Spillover Alma")
+        payroll_auth = _login(client, "Payroll Spillover Mayra")
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(saturday, 20),
+            _local_dt(next_week_start, 0),
+        )
+        before = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+
+        corrected = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["timesheetSourceFingerprint"],
+                "reason": "Supervisor confirmed the Saturday overnight end time.",
+                "operations": [
+                    {
+                        "action": "correct_recorded",
+                        "shiftId": shift_id,
+                        "date": saturday.isoformat(),
+                        "clockIn": _local_dt(saturday, 20).isoformat(),
+                        "clockOut": _local_dt(next_week_start, 1).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+        assert corrected.status_code == 200, corrected.text
+        assert corrected.json()["timesheet"]["employees"][0]["days"][6][
+            "totalMinutes"
+        ] == 240
+
+        next_week = _payroll_timesheet(
+            client,
+            payroll_auth,
+            next_week_start,
+            employee_id=employee_id,
+        )
+        sunday = next_week["employees"][0]["days"][0]
+        assert sunday["totalMinutes"] == 60
+        assert sunday["shifts"][0]["shiftId"] == shift_id
+    finally:
+        _delete_payroll_verification_weeks([week_start, next_week_start])
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 

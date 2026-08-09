@@ -15583,6 +15583,24 @@ def _payroll_overlapping_shift_rows(
                       OR (shift_row.clock_in >= %s AND shift_row.clock_in < %s)
                   )
               )
+              OR EXISTS (
+                  SELECT 1
+                  FROM payroll_shift_corrections correction
+                  WHERE correction.shift_id = shift_row.id
+                    AND correction.status = 'active'
+                    AND correction.week_start = (
+                        COALESCE(
+                            shift_row.local_date,
+                            (shift_row.clock_in AT TIME ZONE %s)::date
+                        )
+                        - EXTRACT(DOW FROM COALESCE(
+                            shift_row.local_date,
+                            (shift_row.clock_in AT TIME ZONE %s)::date
+                        ))::integer
+                    )
+                    AND correction.corrected_clock_in < %s
+                    AND correction.corrected_clock_out > %s
+              )
           )
           AND (%s::integer IS NULL OR shift_row.employee_id = %s)
         ORDER BY shift_row.employee_id, shift_row.clock_in, shift_row.id
@@ -15595,6 +15613,10 @@ def _payroll_overlapping_shift_rows(
             week_start_utc,
             week_start_utc,
             week_end_utc,
+            TIMEZONE_NAME,
+            TIMEZONE_NAME,
+            week_end_utc,
+            week_start_utc,
             employee_id,
             employee_id,
         ),
@@ -15810,7 +15832,13 @@ def _payroll_corrected_shift_total_minutes(
             status_code=400,
             detail="Corrected break minutes cannot exceed corrected shift length",
         )
-    return span_minutes - break_minutes
+    corrected_total_minutes = span_minutes - break_minutes
+    if corrected_total_minutes > 24 * 60:
+        raise HTTPException(
+            status_code=400,
+            detail="Corrected shift total cannot exceed 24 hours",
+        )
+    return corrected_total_minutes
 
 
 def _payroll_shift_overlaps_week(
@@ -16627,7 +16655,17 @@ def _serialize_payroll_timesheet_shift(
         source_total_minutes = int(correction_row["source_total_minutes"])
         source_break_minutes = correction_row.get("source_break_minutes")
     source_starts_on_segment_date = to_local(source_clock_in).date() == segment["date"]
-    can_correct_shift = segment_count == 1 and source_starts_on_segment_date and (
+    source_segment_count = (
+        len(
+            _payroll_timesheet_segment_bounds(
+                source_clock_in,
+                source_clock_out,
+            )
+        )
+        if source_clock_out is not None
+        else segment_count
+    )
+    can_correct_shift = source_segment_count == 1 and source_starts_on_segment_date and (
         source_clock_out is not None
         or "missing_clock_out" in issue_codes
     )
