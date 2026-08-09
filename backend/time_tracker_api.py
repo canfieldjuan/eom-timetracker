@@ -2289,6 +2289,13 @@ class CustomerCreateRequest(BaseModel):
     billingAddress: Optional[str] = Field(default=None, max_length=SITE_ADDRESS_MAX_LENGTH)
     atlasContactId: Optional[UUID] = None
     primarySite: Optional[PrimarySiteCreateRequest] = None
+    # Slice 0C retry handle. Optional so the currently-deployed portal keeps
+    # working; when absent the server derives a stable key from the payload so
+    # a retry after a lost response still cannot create a second Atlas contact.
+    # `OfficeEstimateApprovalRequest` narrows this to required. Supplying it is
+    # what makes a retry after a lost response resolve to the same Atlas
+    # contact; without it each attempt is a distinct operation.
+    idempotencyKey: Optional[UUID] = None
 
     @field_validator("name", mode="before")
     @classmethod
@@ -3425,6 +3432,17 @@ def _atlas_funnel_read(
 # control off permanently.
 ATLAS_FUNNEL_CAPABILITY_LEAD_LOST = "lead.lost"
 ATLAS_FUNNEL_CAPABILITY_LEAD_REOPEN = "lead.reopen"
+ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION = "contact.operator_mutation"
+
+# The Atlas operator-mutation boundary this service writes customers through.
+# `_atlas_funnel_request` requires the "/eom-funnel/" prefix and prepends
+# ATLAS_FUNNEL_BASE_URL, which already ends in /api/v1.
+ATLAS_OPERATOR_CONTACTS_PATH = "/eom-funnel/operator-contacts"
+
+# Atlas constrains sourceChannel to a closed set
+# (atlas_brain/services/eom_crm_mutations.py::EOM_OPERATOR_SOURCE_CHANNELS);
+# this service is the tracker.
+ATLAS_OPERATOR_SOURCE_CHANNEL = "time_tracker"
 
 
 class AtlasFunnelCapabilityUnavailable(Exception):
@@ -4130,6 +4148,46 @@ def _ensure_customer_site_schema() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_eom_office_conversion_handoffs_state
                     ON eom_office_conversion_handoffs(state, updated_at);
+                """
+            )
+            # Slice 0C: the durable half of "Atlas is the only write authority
+            # for customers". A reservation is written and committed BEFORE
+            # Atlas is called, and the local `customers` row is written only
+            # after Atlas confirms -- so an unreachable Atlas can never leave a
+            # canonical customer behind. `id` doubles as the Atlas sourceRef,
+            # which is what makes a replay resolve to the same contact.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eom_customer_atlas_reservations (
+                    id UUID PRIMARY KEY,
+                    idempotency_key UUID NOT NULL UNIQUE,
+                    request_fingerprint VARCHAR(64) NOT NULL,
+                    payload JSONB NOT NULL,
+                    mode VARCHAR(16) NOT NULL DEFAULT 'create'
+                        CHECK (mode IN ('create', 'link_existing')),
+                    customer_id INTEGER REFERENCES customers(id) ON DELETE RESTRICT,
+                    atlas_contact_id UUID,
+                    state VARCHAR(16) NOT NULL DEFAULT 'pending'
+                        CHECK (state IN ('pending', 'finalized')),
+                    requested_by_employee_id INTEGER NOT NULL
+                        REFERENCES employees(id) ON DELETE RESTRICT,
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    finalized_at TIMESTAMPTZ,
+                    CONSTRAINT eom_customer_atlas_reservations_finalized_complete
+                        CHECK (
+                            state <> 'finalized'
+                            OR (
+                                customer_id IS NOT NULL
+                                AND atlas_contact_id IS NOT NULL
+                            )
+                        ),
+                    CONSTRAINT eom_customer_atlas_reservations_link_has_customer
+                        CHECK (mode <> 'link_existing' OR customer_id IS NOT NULL)
+                );
+                CREATE INDEX IF NOT EXISTS idx_eom_customer_atlas_reservations_state
+                    ON eom_customer_atlas_reservations(state, updated_at);
                 """
             )
             cur.execute(
@@ -10957,7 +11015,22 @@ def _active_customer_for_site(cur: Any, customer_id: int) -> Dict[str, Any]:
     return customer
 
 
-def _insert_customer(cur: Any, payload: CustomerCreateRequest) -> int:
+def _insert_customer(
+    cur: Any,
+    payload: CustomerCreateRequest,
+    *,
+    atlas_contact_id: Optional[str] = None,
+) -> int:
+    """Insert one Customer.
+
+    `atlas_contact_id` is passed explicitly by the Slice 0C saga, which learns
+    the canonical contact id from Atlas rather than from the request body. The
+    payload field remains the source for the office estimate-approval path,
+    where the contact already exists in Atlas before the Customer does.
+    """
+    linked_contact_id = atlas_contact_id
+    if linked_contact_id is None and payload.atlasContactId is not None:
+        linked_contact_id = str(payload.atlasContactId)
     cur.execute(
         """
         INSERT INTO customers (
@@ -10975,7 +11048,7 @@ def _insert_customer(cur: Any, payload: CustomerCreateRequest) -> int:
             payload.billingName,
             payload.billingEmail,
             payload.billingAddress,
-            str(payload.atlasContactId) if payload.atlasContactId is not None else None,
+            linked_contact_id,
         ),
     )
     return int(cur.fetchone()["id"])
@@ -11258,6 +11331,573 @@ def _finalized_office_conversion_after_lost_error_race(
     return refreshed
 
 
+# --- Slice 0C: canonical customer creation through Atlas ---------------------
+#
+# Reservation-first saga. The tracker and Atlas are separate databases, so this
+# is deliberately NOT a distributed transaction: the reservation is committed
+# before Atlas is called, and the local `customers` row is written only after
+# Atlas confirms. That ordering is what makes "no local-only canonical
+# customer" structural rather than a flag every reader has to remember to
+# honor.
+#
+# Recovery relies on Atlas's own idempotency receipt rather than local
+# bookkeeping: finalization is one local transaction, so if it fails the
+# reservation simply stays pending, and the retry re-sends the SAME
+# Idempotency-Key, which Atlas answers with the SAME contact. There is no
+# window in which a retry can produce a second contact, and no compensating
+# delete is ever issued against a contact Atlas already created.
+
+
+def _customer_atlas_stored_payload(payload: CustomerCreateRequest) -> Dict[str, Any]:
+    """The canonical stored form of one customer-create request."""
+    return payload.model_dump(mode="json", exclude={"idempotencyKey"})
+
+
+def _customer_atlas_fingerprint(
+    stored_payload: Dict[str, Any],
+    *,
+    mode: str,
+    customer_id: Optional[int],
+) -> str:
+    """Fingerprint everything that defines the operation except its retry key."""
+    canonical = json.dumps(
+        {"mode": mode, "customerId": customer_id, "payload": stored_payload},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _atlas_operator_contact_body(reservation: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the Atlas operator-mutation request for one reservation.
+
+    Only non-empty identity fields are sent. Atlas's operator boundary is
+    create-OR-return: when it matches an existing contact it applies the fields
+    it receives as operator intent, so sending an explicit null would CLEAR a
+    value on a contact this customer merely matched by phone or email. Address
+    and notes are deliberately not mapped -- the CRM's copies come from other
+    sources, the operational address lives on the tracker Site, and overwriting
+    them here would be a silent data loss for no gain in 0C's guarantee.
+    """
+    stored = reservation.get("payload") or {}
+    candidates = {
+        "full_name": stored.get("name"),
+        "email": stored.get("primaryEmail"),
+        "phone": stored.get("primaryPhone"),
+    }
+    body: Dict[str, Any] = {
+        key: value for key, value in candidates.items() if value
+    }
+    body["contact_type"] = "customer"
+    body["source_channel"] = ATLAS_OPERATOR_SOURCE_CHANNEL
+    body["source_ref"] = str(reservation["id"])
+    return body
+
+
+def _serialize_customer_atlas_reservation(row: Dict[str, Any]) -> Dict[str, Any]:
+    payload = row.get("payload") or {}
+    return {
+        "reservationId": str(row["id"]),
+        "idempotencyKey": str(row["idempotency_key"]),
+        "mode": str(row["mode"]),
+        "status": str(row["state"]),
+        "customerId": (
+            int(row["customer_id"]) if row.get("customer_id") is not None else None
+        ),
+        "customerName": payload.get("name"),
+        "atlasContactId": (
+            str(row["atlas_contact_id"])
+            if row.get("atlas_contact_id") is not None
+            else None
+        ),
+        "lastError": row.get("last_error"),
+    }
+
+
+def _list_pending_customer_atlas_reservations(cur: Any) -> List[Dict[str, Any]]:
+    """Pending reservations, read on the caller's cursor.
+
+    Takes a cursor so the customers listing can read both representations
+    back-to-back on one connection, and read THIS one first. Ordering is what
+    matters: finalization inserts the Customer and flips the reservation in one
+    transaction, so reading customers first would let that commit land in the
+    gap and produce a response showing the operation in neither collection.
+    Reading reservations first makes the worst case a row that appears briefly
+    in both, which self-corrects on the next load and never hides work.
+    """
+    cur.execute(
+        """
+        SELECT *
+        FROM eom_customer_atlas_reservations
+        WHERE state = 'pending'
+        ORDER BY updated_at DESC, created_at DESC
+        """
+    )
+    return [
+        _serialize_customer_atlas_reservation(dict(row))
+        for row in cur.fetchall()
+    ]
+
+
+def _finalized_customer_atlas_reservation(
+    reservation_id: str,
+) -> Optional[Dict[str, Any]]:
+    """The saga result for a reservation another attempt already finalized."""
+    reservation = _customer_atlas_reservation(reservation_id)
+    if not reservation or reservation["state"] != "finalized":
+        return None
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            return {
+                "reservation": reservation,
+                "customer": _canonical_customer(
+                    cur, int(reservation["customer_id"])
+                ),
+            }
+
+
+def _finalized_customer_atlas_reservation_for_key(
+    idempotency_key: str,
+    request_fingerprint: str,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a key that already belongs to a completed operation.
+
+    Both answers are given locally, before capability negotiation, because
+    neither needs anything from Atlas and both are true regardless of what
+    Atlas currently serves:
+
+    - the same details on a finalized key are a replay, answered with the
+      Customer that key created, so a capability rollback cannot break the
+      replay guarantee;
+    - different details are invalid key reuse, refused with the same 409 the
+      reservation path raises, so it cannot hide behind deployment state.
+
+    Pending reservations are read too, and only for the mismatch answer: a key
+    is just as invalid to reuse while its first attempt is still unfinished,
+    and the reservation path that would otherwise catch it sits behind
+    capability negotiation. A pending key with matching details falls through
+    to be re-driven normally.
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM eom_customer_atlas_reservations
+                WHERE idempotency_key = %s
+                """,
+                (idempotency_key,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            reservation = dict(row)
+            if not hmac.compare_digest(
+                str(reservation["request_fingerprint"]), request_fingerprint
+            ):
+                _raise_conflict(
+                    "customer_atlas_retry_mismatch",
+                    "This key was already used with different customer details",
+                    {"reservationId": str(reservation["id"])},
+                )
+            if reservation["state"] != "finalized":
+                return None
+            return {
+                "reservation": reservation,
+                "customer": _canonical_customer(
+                    cur, int(reservation["customer_id"])
+                ),
+            }
+
+
+def _customer_atlas_reservation(reservation_id: str) -> Optional[Dict[str, Any]]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM eom_customer_atlas_reservations WHERE id = %s",
+                (reservation_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def _customer_request_from_row(row: Dict[str, Any]) -> CustomerCreateRequest:
+    """Rebuild the create request that describes an existing Customer."""
+    return CustomerCreateRequest(
+        name=str(row["name"]),
+        primaryContactName=row.get("primary_contact_name"),
+        primaryPhone=row.get("primary_phone"),
+        primaryEmail=row.get("primary_email"),
+        billingName=row.get("billing_name"),
+        billingEmail=row.get("billing_email"),
+        billingAddress=row.get("billing_address"),
+    )
+
+
+def _reserve_customer_atlas_creation(
+    payload: Optional[CustomerCreateRequest],
+    admin: Dict[str, Any],
+    *,
+    customer_id: Optional[int] = None,
+) -> tuple[Dict[str, Any], bool]:
+    """Create once or return the canonical local reservation under one lock.
+
+    Validates everything the eventual local insert will validate BEFORE the
+    reservation exists, so a payload that cannot succeed locally never reaches
+    Atlas and never strands an orphan contact.
+
+    For `link_existing` the payload is read from the LOCKED Customer row rather
+    than from a snapshot the caller took earlier. A snapshot would let a
+    concurrent identity edit slip in between the read and the lock, and Atlas
+    would then match or create a contact for the old name/phone/email and link
+    it to the edited Customer.
+    """
+    mode = "link_existing" if customer_id is not None else "create"
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+
+            if mode == "link_existing":
+                customer = _customer_row(cur, int(customer_id), for_update=True)
+                if not customer:
+                    raise HTTPException(status_code=404, detail="Customer not found")
+                if customer.get("atlas_contact_id") is not None:
+                    _raise_conflict(
+                        "customer_already_linked",
+                        "This Customer already has an Atlas contact",
+                        {
+                            "customerId": int(customer_id),
+                            "atlasContactId": str(customer["atlas_contact_id"]),
+                        },
+                    )
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM eom_customer_atlas_reservations
+                    WHERE customer_id = %s AND state = 'pending'
+                    FOR UPDATE
+                    """,
+                    (int(customer_id),),
+                )
+                open_reservation = cur.fetchone()
+                if open_reservation:
+                    _raise_conflict(
+                        "customer_atlas_reservation_open",
+                        "This Customer already has a pending Atlas reservation",
+                        {"reservationId": str(open_reservation["id"])},
+                    )
+                payload = _customer_request_from_row(customer)
+
+            stored_payload = _customer_atlas_stored_payload(payload)
+            fingerprint = _customer_atlas_fingerprint(
+                stored_payload, mode=mode, customer_id=customer_id
+            )
+            # A caller-supplied key is what buys replay protection: the same key
+            # always resolves to the same reservation and therefore the same
+            # Atlas contact.
+            #
+            # When none is supplied we mint a fresh one rather than deriving it
+            # from the payload. A derived key looks safer but is not: two
+            # genuinely distinct customers can share every field (equal names
+            # are normal here -- Edward Jones and Mid Illinois are live
+            # examples), and a derived key would silently merge them into one
+            # Customer. Losing replay protection for a caller that opted out of
+            # it is recoverable and visible; silently merging two real customers
+            # is neither.
+            key = str(payload.idempotencyKey or uuid4())
+            cur.execute(
+                """
+                SELECT *
+                FROM eom_customer_atlas_reservations
+                WHERE idempotency_key = %s
+                FOR UPDATE
+                """,
+                (key,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                row = dict(existing)
+                if not hmac.compare_digest(
+                    str(row["request_fingerprint"]), fingerprint
+                ):
+                    _raise_conflict(
+                        "customer_atlas_retry_mismatch",
+                        "This key was already used with different customer details",
+                        {"reservationId": str(row["id"])},
+                    )
+                return row, False
+
+            if mode == "create" and payload.primarySite is not None:
+                # Pre-flight the address uniqueness the finalizing insert will
+                # enforce. Raising here costs nothing; raising after Atlas has
+                # already created the contact would strand it.
+                _lock_address_and_find_conflicts(cur, payload.primarySite.address)
+
+            cur.execute(
+                """
+                INSERT INTO eom_customer_atlas_reservations (
+                    id, idempotency_key, request_fingerprint, payload, mode,
+                    customer_id, requested_by_employee_id
+                )
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    str(uuid4()),
+                    key,
+                    fingerprint,
+                    json.dumps(stored_payload, sort_keys=True),
+                    mode,
+                    customer_id,
+                    int(admin["id"]),
+                ),
+            )
+            return dict(cur.fetchone()), True
+
+
+def _finalize_customer_atlas_reservation(
+    reservation_id: str,
+    atlas_contact_id: str,
+    payload: CustomerCreateRequest,
+) -> Dict[str, Any]:
+    """Write the local half once Atlas has confirmed the canonical contact.
+
+    One transaction: if any part fails, nothing is written and the reservation
+    stays pending. The retry re-sends the same Idempotency-Key, Atlas returns
+    the same contact, and this runs again -- so a partial failure is forward
+    recoverable against that same contact, never a second one.
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            cur.execute(
+                """
+                SELECT *
+                FROM eom_customer_atlas_reservations
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (reservation_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Customer Atlas reservation disappeared")
+            reservation = dict(row)
+            if reservation["state"] == "finalized":
+                return {
+                    "reservation": reservation,
+                    "customer": _canonical_customer(
+                        cur, int(reservation["customer_id"])
+                    ),
+                }
+
+            if reservation["mode"] == "link_existing":
+                customer_id = int(reservation["customer_id"])
+                cur.execute(
+                    """
+                    UPDATE customers
+                    SET atlas_contact_id = %s, updated_at = NOW()
+                    WHERE id = %s AND atlas_contact_id IS NULL
+                    """,
+                    (atlas_contact_id, customer_id),
+                )
+                if cur.rowcount == 0:
+                    # Someone linked this Customer while we were talking to
+                    # Atlas -- the legacy linkage-backfill endpoint takes the
+                    # same mutation lock and can land in that gap. Finalizing
+                    # anyway would record the reservation against contact A
+                    # while the Customer points at contact B.
+                    current = _customer_row(cur, customer_id, for_update=True)
+                    linked = (
+                        str(current["atlas_contact_id"])
+                        if current and current.get("atlas_contact_id") is not None
+                        else None
+                    )
+                    if linked != atlas_contact_id:
+                        _raise_conflict(
+                            "customer_atlas_link_conflict",
+                            "This Customer was linked to a different Atlas "
+                            "contact while this reconciliation was in flight",
+                            {"customerId": customer_id, "atlasContactId": linked},
+                        )
+            else:
+                customer_id = _insert_customer(
+                    cur, payload, atlas_contact_id=atlas_contact_id
+                )
+                if payload.primarySite is not None:
+                    _insert_site(
+                        cur, customer_id, payload.name, payload.primarySite
+                    )
+
+            cur.execute(
+                """
+                UPDATE eom_customer_atlas_reservations
+                SET state = 'finalized', atlas_contact_id = %s,
+                    customer_id = %s, last_error = NULL,
+                    finalized_at = COALESCE(finalized_at, NOW()), updated_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (atlas_contact_id, customer_id, reservation_id),
+            )
+            finalized = dict(cur.fetchone())
+            return {
+                "reservation": finalized,
+                "customer": _canonical_customer(cur, customer_id),
+            }
+
+
+def _note_customer_atlas_error(reservation_id: str, reason: str) -> bool:
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE eom_customer_atlas_reservations
+                    SET last_error = %s, updated_at = NOW()
+                    WHERE id = %s AND state = 'pending'
+                    """,
+                    (reason[:1000], reservation_id),
+                )
+                return cur.rowcount == 1
+    except Exception:
+        logger.exception("Could not save customer Atlas reservation error")
+        return False
+
+
+def _atlas_contact_id_from_operator_result(result: Dict[str, Any]) -> str:
+    """Read the contact id Atlas assigned, refusing anything else.
+
+    A malformed body is a 502, not a silent link to nothing: the whole point of
+    this slice is that the local row is never written without a real contact.
+    """
+    if not result.get("success"):
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned an unsuccessful result"
+        )
+    contact_id = result.get("contactId")
+    if not isinstance(contact_id, str) or not contact_id.strip():
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned no contact id"
+        )
+    try:
+        return str(UUID(contact_id.strip()))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned an invalid contact id"
+        ) from exc
+
+
+def _run_customer_atlas_reservation(
+    reservation: Dict[str, Any],
+    payload: CustomerCreateRequest,
+    admin: Dict[str, Any],
+) -> tuple[Optional[Dict[str, Any]], Optional[AtlasFunnelRequestError]]:
+    """Call Atlas for one pending reservation and finalize on success."""
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_OPERATOR_CONTACTS_PATH,
+            admin,
+            payload=_atlas_operator_contact_body(reservation),
+            idempotency_key=str(reservation["idempotency_key"]),
+        )
+        atlas_contact_id = _atlas_contact_id_from_operator_result(atlas_result)
+    except AtlasFunnelRequestError as exc:
+        if not _note_customer_atlas_error(str(reservation["id"]), str(exc)):
+            # The conditional update matched nothing, so this reservation is no
+            # longer pending: a concurrent attempt on the same key finalized it
+            # while this one was failing. Reporting our own timeout would tell
+            # the operator to retry a Customer that already exists. Same race,
+            # and same resolution, as the office-conversion saga.
+            finalized = _finalized_customer_atlas_reservation(
+                str(reservation["id"])
+            )
+            if finalized is not None:
+                return finalized, None
+        return None, exc
+    try:
+        return (
+            _finalize_customer_atlas_reservation(
+                str(reservation["id"]), atlas_contact_id, payload
+            ),
+            None,
+        )
+    except HTTPException as exc:
+        # A precise, user-actionable refusal (an address conflict that raced in
+        # after the pre-flight) keeps its own status and message. The
+        # reservation still has to carry the reason, or it would sit in the
+        # pending list with a blank error nobody can act on.
+        _note_customer_atlas_error(str(reservation["id"]), str(exc.detail))
+        raise
+    except Exception as exc:  # local half failed; Atlas already has the contact
+        logger.exception("Customer Atlas reservation could not be finalized")
+        failure = AtlasFunnelRequestError(
+            503,
+            "The Atlas contact was created but this Customer could not be "
+            "saved locally; retry this reservation",
+        )
+        _note_customer_atlas_error(str(reservation["id"]), str(exc))
+        return None, failure
+
+
+def _customer_atlas_capability_refusal(
+    admin: Dict[str, Any],
+) -> Optional[JSONResponse]:
+    """Refuse early only when Atlas AFFIRMS it cannot serve this mutation.
+
+    The distinction matters. A manifest that says the capability is absent is a
+    definite "no": refusing before any local write is correct, and a reservation
+    would be litter for an operation that can never succeed on this deployment.
+
+    A manifest we could not READ is an outage, not a refusal. Aborting there
+    would return 503 with no reservation and lose the operator's entry -- the
+    opposite of the promise that an unreachable Atlas still leaves a visible,
+    retryable record. So fall through and let the mutation attempt create that
+    record.
+    """
+    # A tracker with no Atlas credentials is a deterministic local "no", not an
+    # outage: it will never reach Atlas on any retry, so it must refuse here
+    # rather than bank a reservation that can only fail. Deliberately outside
+    # the catch below -- otherwise its 503 would be mistaken for an unreachable
+    # Atlas and escape later from the mutation call, which raises HTTPException
+    # rather than AtlasFunnelRequestError for this case.
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION, admin
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        return _atlas_capability_unavailable_response(exc)
+    except HTTPException as exc:
+        logger.warning(
+            "Atlas capability manifest unreadable (status=%s); reserving anyway",
+            exc.status_code,
+        )
+    return None
+
+
+def _customer_atlas_pending_response(
+    reservation: Dict[str, Any],
+    exc: AtlasFunnelRequestError,
+    *,
+    created: bool,
+) -> JSONResponse:
+    visible = _serialize_customer_atlas_reservation(dict(reservation))
+    visible["lastError"] = str(exc)
+    visible["status"] = "atlas_pending"
+    return JSONResponse(
+        status_code=202,
+        content=jsonable_encoder(
+            {
+                "success": False,
+                "idempotent": not created,
+                "error": "customer_atlas_pending",
+                "reservation": visible,
+            }
+        ),
+    )
+
+
 def _serialize_working_lead(
     lead: Dict[str, Any],
     marker: Dict[str, Any],
@@ -11471,6 +12111,7 @@ def admin_list_customers(
     active_clause = "" if includeArchived else " WHERE c.active = true"
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            pending_reservations = _list_pending_customer_atlas_reservations(cur)
             cur.execute(
                 f"SELECT {CUSTOMER_SELECT_COLUMNS} FROM customers c"
                 f"{active_clause} ORDER BY lower(c.name), c.id"
@@ -11484,7 +12125,15 @@ def admin_list_customers(
                 for row in rows
             ]
     append_access_log(request, "CUSTOMERS_LISTED", True, f"{len(customers)} customers")
-    return {"success": True, "customers": customers}
+    # `pendingAtlasReservations` is additive: the `customers` shape the deployed
+    # portals read is unchanged. Customer creates that reached Atlas but have
+    # not finalized appear here and nowhere else -- they are deliberately not
+    # Customers yet.
+    return {
+        "success": True,
+        "customers": customers,
+        "pendingAtlasReservations": pending_reservations,
+    }
 
 
 @app.post("/api/admin/customers", status_code=201)
@@ -11492,21 +12141,244 @@ def admin_create_customer(
     payload: CustomerCreateRequest,
     request: Request,
     admin: Dict[str, Any] = Depends(get_current_admin),
-) -> Dict[str, Any]:
-    with db.get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            _lock_customer_site_mutations(cur)
-            customer_id = _insert_customer(cur, payload)
-            if payload.primarySite is not None:
-                _insert_site(cur, customer_id, payload.name, payload.primarySite)
-            customer = _canonical_customer(cur, customer_id)
+) -> JSONResponse:
+    """Create one Customer, through Atlas, or not at all.
+
+    Slice 0C (website #110): Atlas is the only write authority for canonical
+    customers, so this route no longer writes a Customer directly. It reserves
+    the operation durably, asks Atlas for the canonical contact, and writes the
+    local rows only once Atlas has answered. An unreachable Atlas yields a
+    visible, retryable reservation and NO Customer -- never a silent local-only
+    row that the CRM has never heard of.
+    """
+    if payload.atlasContactId is not None:
+        _raise_validation_error(
+            "atlasContactId is assigned by Atlas and cannot be supplied",
+            {"atlasContactId": "system managed"},
+        )
+    # A key whose operation already completed is answered from local state.
+    # This precedes capability negotiation on purpose: the Customer exists, the
+    # replay asks nothing of Atlas, and refusing it because Atlas has since
+    # rolled the capability back would break the documented replay guarantee.
+    if payload.idempotencyKey is not None:
+        completed = _finalized_customer_atlas_reservation_for_key(
+            str(payload.idempotencyKey),
+            _customer_atlas_fingerprint(
+                _customer_atlas_stored_payload(payload),
+                mode="create",
+                customer_id=None,
+            ),
+        )
+        if completed is not None:
+            append_access_log(
+                request,
+                "CUSTOMER_CREATE_REPLAYED",
+                True,
+                f"customer={completed['reservation']['customer_id']} "
+                f"by {admin['name']}",
+            )
+            return JSONResponse(
+                status_code=200,
+                content=jsonable_encoder(
+                    {
+                        "success": True,
+                        "idempotent": True,
+                        "customer": completed["customer"],
+                    }
+                ),
+            )
+
+    # Refused before any local write, so a partially-deployed Atlas cannot
+    # leave a Customer behind.
+    refusal = _customer_atlas_capability_refusal(admin)
+    if refusal is not None:
+        append_access_log(
+            request,
+            "CUSTOMER_CREATE_CAPABILITY_UNAVAILABLE",
+            False,
+            f"capability={ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION}",
+        )
+        return refusal
+
+    reservation, created = _reserve_customer_atlas_creation(payload, admin)
+    if reservation["state"] == "finalized":
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                customer = _canonical_customer(cur, int(reservation["customer_id"]))
+        append_access_log(
+            request,
+            "CUSTOMER_CREATE_REPLAYED",
+            True,
+            f"customer={reservation['customer_id']} by {admin['name']}",
+        )
+        return JSONResponse(
+            status_code=200,
+            content=jsonable_encoder(
+                {"success": True, "idempotent": True, "customer": customer}
+            ),
+        )
+
+    result, failure = _run_customer_atlas_reservation(reservation, payload, admin)
+    if failure is not None:
+        append_access_log(
+            request,
+            "CUSTOMER_CREATE_PENDING",
+            False,
+            f"reservation={reservation['id']} status={failure.status_code}",
+        )
+        return _customer_atlas_pending_response(
+            reservation, failure, created=created
+        )
+
+    customer = result["customer"]
     append_access_log(
         request,
         "CUSTOMER_CREATED",
         True,
-        f"Customer {customer_id} by {admin['name']}",
+        f"Customer {customer['id']} contact={result['reservation']['atlas_contact_id']} "
+        f"by {admin['name']}",
     )
-    return {"success": True, "customer": customer}
+    # A first-time create keeps the exact legacy body. `idempotent` appears only
+    # where it carries information the status code does not -- on a replay or a
+    # recovered retry, which return 200.
+    body: Dict[str, Any] = {"success": True, "customer": customer}
+    if not created:
+        body["idempotent"] = True
+    return JSONResponse(
+        status_code=201 if created else 200,
+        content=jsonable_encoder(body),
+    )
+
+
+@app.post("/api/admin/customers/reservations/{reservation_id}/retry")
+def admin_retry_customer_atlas_reservation(
+    reservation_id: UUID,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Re-drive one pending customer reservation against the same Atlas key.
+
+    Retrying is always safe: the stored Idempotency-Key means Atlas returns the
+    contact it already created rather than a second one.
+    """
+    reservation = _customer_atlas_reservation(str(reservation_id))
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Customer reservation not found")
+
+    if reservation["state"] == "finalized":
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                customer = _canonical_customer(cur, int(reservation["customer_id"]))
+        append_access_log(
+            request,
+            "CUSTOMER_CREATE_RETRY_REPLAYED",
+            True,
+            f"reservation={reservation_id} customer={reservation['customer_id']}",
+        )
+        return JSONResponse(
+            status_code=200,
+            content=jsonable_encoder(
+                {"success": True, "idempotent": True, "customer": customer}
+            ),
+        )
+
+    refusal = _customer_atlas_capability_refusal(admin)
+    if refusal is not None:
+        return refusal
+
+    payload = CustomerCreateRequest(**(reservation["payload"] or {}))
+    result, failure = _run_customer_atlas_reservation(reservation, payload, admin)
+    if failure is not None:
+        append_access_log(
+            request,
+            "CUSTOMER_CREATE_RETRY_PENDING",
+            False,
+            f"reservation={reservation_id} status={failure.status_code}",
+        )
+        return _customer_atlas_pending_response(reservation, failure, created=False)
+
+    customer = result["customer"]
+    append_access_log(
+        request,
+        "CUSTOMER_CREATE_RETRIED",
+        True,
+        f"reservation={reservation_id} customer={customer['id']}",
+    )
+    # `idempotent` describes the operation, not the endpoint: this re-drives a
+    # reservation that already existed, exactly as the create route does when it
+    # finds one, so both must label it the same way.
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder(
+            {"success": True, "idempotent": True, "customer": customer}
+        ),
+    )
+
+
+@app.post("/api/admin/customers/{customer_id}/atlas-contact")
+def admin_link_customer_to_atlas(
+    customer_id: int,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Give an existing unlinked Customer its canonical Atlas contact.
+
+    The reconcile half of Slice 0C: customers created before this slice (and by
+    the legacy Site writers that 0D still has to converge) have no contact. This
+    runs them through the same saga, so the link is created the one canonical
+    way rather than typed in by hand.
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            existing = _customer_row(cur, customer_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if existing.get("atlas_contact_id") is not None:
+        _raise_conflict(
+            "customer_already_linked",
+            "This Customer already has an Atlas contact",
+            {
+                "customerId": customer_id,
+                "atlasContactId": str(existing["atlas_contact_id"]),
+            },
+        )
+
+    refusal = _customer_atlas_capability_refusal(admin)
+    if refusal is not None:
+        return refusal
+
+    # The identity sent to Atlas is built from the row under its lock inside the
+    # reservation, not from the unlocked pre-check above: a concurrent edit
+    # between the two would otherwise link a contact created for stale details.
+    reservation, created = _reserve_customer_atlas_creation(
+        None, admin, customer_id=customer_id
+    )
+    payload = CustomerCreateRequest(**(reservation["payload"] or {}))
+    result, failure = _run_customer_atlas_reservation(reservation, payload, admin)
+    if failure is not None:
+        append_access_log(
+            request,
+            "CUSTOMER_ATLAS_LINK_PENDING",
+            False,
+            f"customer={customer_id} status={failure.status_code}",
+        )
+        return _customer_atlas_pending_response(
+            reservation, failure, created=created
+        )
+
+    customer = result["customer"]
+    append_access_log(
+        request,
+        "CUSTOMER_ATLAS_LINKED",
+        True,
+        f"customer={customer_id} contact={result['reservation']['atlas_contact_id']}",
+    )
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder(
+            {"success": True, "idempotent": not created, "customer": customer}
+        ),
+    )
 
 
 @app.post("/api/admin/funnel/approve-estimate")
@@ -11965,6 +12837,10 @@ def admin_patch_customer(
     if "name" in present and payload.name is None:
         _raise_validation_error("Customer name cannot be cleared", {"name": "required"})
 
+    # `atlasContactId` is deliberately absent: CRM linkage is system-managed
+    # (Slice 0C) and is set only by the reservation saga. Leaving it here would
+    # let an ordinary customer edit silently repoint a Customer at a different
+    # Atlas contact.
     field_map = {
         "name": "name",
         "primaryContactName": "primary_contact_name",
@@ -11973,7 +12849,6 @@ def admin_patch_customer(
         "billingName": "billing_name",
         "billingEmail": "billing_email",
         "billingAddress": "billing_address",
-        "atlasContactId": "atlas_contact_id",
     }
     values = payload.model_dump()
     with db.get_conn() as conn:
@@ -11987,16 +12862,32 @@ def admin_patch_customer(
                 existing,
                 payload.expectedUpdateToken,
             )
+            if "atlasContactId" in present:
+                # Echoing back the stored value is what the deployed portal does
+                # on every edit, so that stays a no-op. Actually CHANGING the
+                # link is refused loudly rather than ignored: a silent drop
+                # would look like a successful edit that did nothing.
+                submitted = values["atlasContactId"]
+                submitted_text = str(submitted) if submitted is not None else None
+                stored = existing.get("atlas_contact_id")
+                stored_text = str(stored) if stored is not None else None
+                if submitted_text != stored_text:
+                    _raise_conflict(
+                        "customer_atlas_link_system_managed",
+                        "The Atlas contact link is managed by Atlas and cannot "
+                        "be edited here",
+                        {
+                            "customerId": customer_id,
+                            "atlasContactId": stored_text,
+                        },
+                    )
             assignments: List[str] = []
             params: List[Any] = []
             for request_field, column in field_map.items():
                 if request_field not in present:
                     continue
                 assignments.append(f"{column} = %s")
-                value = values[request_field]
-                if request_field == "atlasContactId" and value is not None:
-                    value = str(value)
-                params.append(value)
+                params.append(values[request_field])
             if assignments:
                 assignments.append("updated_at = NOW()")
                 params.append(customer_id)
