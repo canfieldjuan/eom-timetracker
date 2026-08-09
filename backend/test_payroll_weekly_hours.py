@@ -1891,8 +1891,112 @@ def test_payroll_timesheet_rejects_corrected_saturday_spillover(client):
         assert manual.json()["error"] == (
             "Corrected clock-out must stay inside the selected payroll week"
         )
+
+        exact_boundary = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["timesheetSourceFingerprint"],
+                "reason": "Supervisor confirmed the Saturday overnight break.",
+                "operations": [
+                    {
+                        "action": "correct_recorded",
+                        "shiftId": shift_id,
+                        "date": saturday.isoformat(),
+                        "clockIn": _local_dt(saturday, 20).isoformat(),
+                        "clockOut": _local_dt(next_week_start, 0).isoformat(),
+                        "breakMinutes": 15,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+        assert exact_boundary.status_code == 200, exact_boundary.text
+        saturday_row = exact_boundary.json()["timesheet"]["employees"][0]["days"][6]
+        assert saturday_row["totalMinutes"] == 225
+        assert saturday_row["shifts"][0]["fieldSupport"]["clockIn"]["correction"] is True
     finally:
         _delete_payroll_verification_weeks([week_start, next_week_start])
+        _delete_employees([value for value in (employee_id, payroll_id) if value])
+
+
+def test_payroll_timesheet_keeps_in_week_overnight_manual_source_editable(client):
+    week_start = date(2026, 7, 19)
+    monday = week_start + timedelta(days=1)
+    payroll_id = None
+    employee_id = None
+    try:
+        payroll_id = _create_employee("Payroll Overnight Manual Mayra", role="payroll")
+        employee_id = _create_employee("Payroll Overnight Manual Alma")
+        payroll_auth = _login(client, "Payroll Overnight Manual Mayra")
+        before = _payroll_timesheet(
+            client,
+            payroll_auth,
+            week_start,
+            employee_id=employee_id,
+        )
+
+        added = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": before["timesheetSourceFingerprint"],
+                "reason": "Employee missed the in-week overnight clock-in.",
+                "operations": [
+                    {
+                        "action": "add_manual",
+                        "clientRowId": "overnight-manual",
+                        "date": monday.isoformat(),
+                        "clockIn": _local_dt(monday, 20).isoformat(),
+                        "clockOut": _local_dt(monday + timedelta(days=1), 1).isoformat(),
+                        "breakMinutes": 0,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+        assert added.status_code == 200, added.text
+        monday_shift = added.json()["timesheet"]["employees"][0]["days"][1]["shifts"][0]
+        tuesday_shift = added.json()["timesheet"]["employees"][0]["days"][2]["shifts"][0]
+        assert monday_shift["fieldSupport"]["clockIn"]["correction"] is True
+        assert monday_shift["fieldSupport"]["clockOut"]["correction"] is True
+        assert tuesday_shift["fieldSupport"]["clockIn"]["correction"] is False
+        manual_shift_id = monday_shift["manualShiftId"]
+
+        edited = client.post(
+            "/api/admin/payroll/timesheet/changes",
+            headers=payroll_auth,
+            json={
+                "requestId": str(uuid4()),
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "expectedTimesheetSourceFingerprint": added.json()["timesheet"][
+                    "timesheetSourceFingerprint"
+                ],
+                "reason": "Supervisor confirmed the overnight manual break.",
+                "operations": [
+                    {
+                        "action": "edit_manual",
+                        "manualShiftId": manual_shift_id,
+                        "date": monday.isoformat(),
+                        "clockIn": _local_dt(monday, 20).isoformat(),
+                        "clockOut": _local_dt(monday + timedelta(days=1), 1).isoformat(),
+                        "breakMinutes": 15,
+                        "locationId": None,
+                    }
+                ],
+            },
+        )
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["timesheet"]["employees"][0]["days"][2]["totalMinutes"] == 45
+    finally:
+        _delete_payroll_verification_weeks([week_start])
         _delete_employees([value for value in (employee_id, payroll_id) if value])
 
 

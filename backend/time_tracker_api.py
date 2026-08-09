@@ -16643,9 +16643,13 @@ def _serialize_payroll_timesheet_shift(
         if source_clock_out is not None
         else segment_count
     )
-    can_correct_shift = source_segment_count == 1 and source_starts_on_segment_date and (
-        source_clock_out is not None
-        or "missing_clock_out" in issue_codes
+    can_correct_shift = (
+        (source_kind == "manual" or source_segment_count == 1)
+        and source_starts_on_segment_date
+        and (
+            source_clock_out is not None
+            or "missing_clock_out" in issue_codes
+        )
     )
     manual_shift_id = (
         str(shift_row["manual_shift_id"])
@@ -18638,7 +18642,8 @@ def _ensure_payroll_shift_correction_dates(
             status_code=400,
             detail="Corrected clock-out must fall on the correction date or the next day",
         )
-    if local_clock_out_date >= week_start + timedelta(days=7):
+    _week_end, _week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
+    if corrected_clock_out > week_end_utc:
         raise HTTPException(
             status_code=400,
             detail="Corrected clock-out must stay inside the selected payroll week",
