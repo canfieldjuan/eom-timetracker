@@ -529,15 +529,39 @@ def test_pending_since_survives_a_retry_that_failed(client, auth):
     )
 
     pending_since = datetime.fromisoformat(entry["pendingSince"].replace("Z", "+00:00"))
-    last_attempt = datetime.fromisoformat(
-        entry["lastAttemptAt"].replace("Z", "+00:00")
-    )
+    updated_at = datetime.fromisoformat(entry["updatedAt"].replace("Z", "+00:00"))
     age_minutes = (datetime.now(timezone.utc) - pending_since).total_seconds() / 60
 
     assert age_minutes > 300, (
         "pendingSince must report creation, not the last failed attempt"
     )
-    assert last_attempt > pending_since, "the retry is more recent than the start"
+    assert updated_at > pending_since, "the retry is more recent than the start"
+
+
+def test_a_never_attempted_reservation_claims_no_attempt(client, auth):
+    """The audit must not invent an attempt that never happened.
+
+    `updated_at` defaults to NOW() at insert and the reservation commits
+    before Atlas is called, so a row that died in that window carries a
+    timestamp having never been attempted. Reporting it as a last-attempt time
+    would tell the operator a call was made when none was.
+    """
+    reservation_id = _pending_reservation(
+        None, minutes_old=200, name=f"{TEST_PREFIX} Untried"
+    )
+
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    entry = next(
+        row
+        for row in body["staleReservations"]
+        if row["reservationId"] == reservation_id
+    )
+
+    assert "lastAttemptAt" not in entry, (
+        "updated_at is 'last touched', not proof an attempt was made"
+    )
+    assert entry["updatedAt"], "the staleness clock's reference must still be reported"
+    assert entry["lastError"] is None, "nothing was attempted, so nothing failed"
 
 
 def test_reservations_sharing_an_updated_at_hash_the_same_way(client, auth):

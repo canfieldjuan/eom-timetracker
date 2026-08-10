@@ -14910,7 +14910,13 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
             # "pendingSince" understates a reservation that has been stuck for
             # hours but was retried a minute ago.
             "pendingSince": to_utc_iso(row["created_at"]) if row.get("created_at") else None,
-            "lastAttemptAt": (
+            # Deliberately "updatedAt" and not "lastAttemptAt": updated_at
+            # defaults to NOW() at insert and the reservation is committed
+            # before Atlas is called, so a row that never got an attempt still
+            # carries a value here. It is the last time the row was touched --
+            # which is what the staleness cutoff measures from -- and claiming
+            # more than that would invent an attempt that never happened.
+            "updatedAt": (
                 to_utc_iso(row["updated_at"]) if row.get("updated_at") else None
             ),
         }
