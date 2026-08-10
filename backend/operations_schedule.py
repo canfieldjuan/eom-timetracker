@@ -362,6 +362,24 @@ def _normalize_weekdays(weekdays: Iterable[int]) -> List[int]:
     return normalized
 
 
+def _validate_service_rule_times(start_time: time, end_time: time) -> None:
+    if (
+        start_time.second
+        or start_time.microsecond
+        or end_time.second
+        or end_time.microsecond
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Service schedule times must be minute-aligned",
+        )
+    if start_time == end_time:
+        raise HTTPException(
+            status_code=422,
+            detail="localEndTime must differ from localStartTime",
+        )
+
+
 def _local_time_text(value: time) -> str:
     return value.replace(microsecond=0).isoformat(timespec="minutes")
 
@@ -507,11 +525,20 @@ def _preview_interval(
     start_time: time,
     end_time: time,
     app_timezone: ZoneInfo,
-) -> Tuple[datetime, datetime]:
+) -> Tuple[datetime, datetime, bool]:
     starts_at = datetime.combine(service_day, start_time, tzinfo=app_timezone)
     end_day = service_day + timedelta(days=1) if end_time <= start_time else service_day
     ends_at = datetime.combine(end_day, end_time, tzinfo=app_timezone)
-    return starts_at.astimezone(timezone.utc), ends_at.astimezone(timezone.utc)
+    starts_utc = starts_at.astimezone(timezone.utc)
+    ends_utc = ends_at.astimezone(timezone.utc)
+    start_roundtrip = starts_utc.astimezone(app_timezone)
+    end_roundtrip = ends_utc.astimezone(app_timezone)
+    valid_wall_time = (
+        start_roundtrip.replace(tzinfo=None) == starts_at.replace(tzinfo=None)
+        and end_roundtrip.replace(tzinfo=None) == ends_at.replace(tzinfo=None)
+        and ends_utc > starts_utc
+    )
+    return starts_utc, ends_utc, valid_wall_time
 
 
 def _apply_native_monthly_allocations(rows: List[Dict[str, Any]]) -> None:
@@ -552,12 +579,20 @@ def _native_preview_rows(
         for rule in rules:
             if not _rule_active_on(rule, service_day):
                 continue
-            starts_at, ends_at = _preview_interval(
+            starts_at, ends_at, valid_service_window = _preview_interval(
                 service_day,
                 rule["local_start_time"],
                 rule["local_end_time"],
                 app_timezone,
             )
+            issues: List[Dict[str, str]] = []
+            if not valid_service_window:
+                issues.append(
+                    _issue(
+                        "invalid_service_window",
+                        "The configured service window does not exist in the local timezone.",
+                    )
+                )
             expected_hours = (
                 float(rule["site_expected_hours"])
                 if rule.get("site_expected_hours") is not None
@@ -566,7 +601,7 @@ def _native_preview_rows(
             rate_cents = _money_cents(rule.get("rate"))
             rate_type = rule.get("rate_type")
             revenue_cents: MoneyCents = None
-            if rate_cents is not None:
+            if valid_service_window and rate_cents is not None:
                 if rate_type == "per_visit":
                     revenue_cents = rate_cents
                 elif rate_type == "hourly" and expected_hours is not None:
@@ -577,7 +612,11 @@ def _native_preview_rows(
                         )
                     )
             labor_cents: MoneyCents = None
-            if expected_hours is not None and avg_hourly_rate is not None:
+            if (
+                valid_service_window
+                and expected_hours is not None
+                and avg_hourly_rate is not None
+            ):
                 labor_cents = int(
                     (
                         avg_hourly_rate
@@ -585,7 +624,6 @@ def _native_preview_rows(
                         * Decimal(100)
                     ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
                 )
-            issues: List[Dict[str, str]] = []
             if expected_hours is None:
                 issues.append(
                     _issue(
@@ -649,7 +687,7 @@ def _native_preview_rows(
                         else None
                     ),
                     "issues": issues,
-                    "_included_in_forecast": True,
+                    "_included_in_forecast": valid_service_window,
                     "_rate_cents": rate_cents,
                     "_revenue_cents": revenue_cents,
                     "_labor_cents": labor_cents,
@@ -5959,6 +5997,7 @@ def build_operations_schedule_router(
         admin: Dict[str, Any] = Depends(get_current_admin),
     ) -> Dict[str, Any]:
         weekdays = _normalize_weekdays(payload.weekdays)
+        _validate_service_rule_times(payload.localStartTime, payload.localEndTime)
         if payload.endsOn is not None and payload.endsOn < payload.startsOn:
             raise HTTPException(
                 status_code=422,
@@ -6081,6 +6120,17 @@ def build_operations_schedule_router(
                         status_code=404,
                         detail="Service schedule rule not found",
                     )
+                cur.execute(
+                    """
+                    SELECT active
+                    FROM locations
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (existing["location_id"],),
+                )
+                site = cur.fetchone()
+                site_active = bool(site and site["active"])
                 starts_on = payload.startsOn or existing["starts_on"]
                 ends_on = payload.endsOn if "endsOn" in supplied_fields else existing.get("ends_on")
                 if ends_on is not None and ends_on < starts_on:
@@ -6088,9 +6138,17 @@ def build_operations_schedule_router(
                         status_code=422,
                         detail="endsOn must be on or after startsOn",
                     )
+                final_start_time = payload.localStartTime or existing["local_start_time"]
+                final_end_time = payload.localEndTime or existing["local_end_time"]
                 activates_rule = payload.active is True
                 final_active = bool(payload.active) if payload.active is not None else bool(existing["active"])
-                if activates_rule and not bool(existing.get("site_active")):
+                if (
+                    final_active
+                    or payload.localStartTime is not None
+                    or payload.localEndTime is not None
+                ):
+                    _validate_service_rule_times(final_start_time, final_end_time)
+                if activates_rule and not site_active:
                     raise HTTPException(
                         status_code=409,
                         detail="Cannot activate a service schedule rule for an archived Site",
@@ -6106,8 +6164,8 @@ def build_operations_schedule_router(
                     shift_bucket=payload.shiftBucket or str(existing["shift_bucket"]),
                     cadence=payload.cadence or str(existing["cadence"]),
                     weekdays=final_weekdays,
-                    local_start_time=payload.localStartTime or existing["local_start_time"],
-                    local_end_time=payload.localEndTime or existing["local_end_time"],
+                    local_start_time=final_start_time,
+                    local_end_time=final_end_time,
                     starts_on=starts_on,
                     ends_on=ends_on,
                     exclude_rule_id=rule_id,

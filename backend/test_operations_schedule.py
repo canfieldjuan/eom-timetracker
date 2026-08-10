@@ -791,6 +791,145 @@ def test_native_site_schedule_rule_create_rejects_duplicate_active_definition(
     assert len(body["jobs"]) == 1
 
 
+def test_native_site_schedule_rule_patch_rejects_duplicate_activation(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Duplicate Activation",
+                site_type="Commercial",
+                rate=180,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+    payload = {
+        "locationId": site_id,
+        "shiftBucket": "evening",
+        "cadence": "weekly",
+        "weekdays": [0],
+        "localStartTime": "18:00",
+        "localEndTime": "20:00",
+        "startsOn": str(service_day),
+        "active": False,
+    }
+    first = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json=payload,
+    )
+    assert first.status_code == 201, first.text
+    second = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json=payload,
+    )
+    assert second.status_code == 201, second.text
+
+    activated = client.patch(
+        f"/api/admin/operations/service-schedule-rules/{first.json()['rule']['id']}",
+        headers=auth,
+        json={"active": True},
+    )
+    assert activated.status_code == 200, activated.text
+    duplicate_activation = client.patch(
+        f"/api/admin/operations/service-schedule-rules/{second.json()['rule']['id']}",
+        headers=auth,
+        json={"active": True},
+    )
+    assert duplicate_activation.status_code == 409, duplicate_activation.text
+
+
+def test_native_site_schedule_rule_rejects_equal_and_subminute_times(client, auth):
+    service_day = date(2026, 7, 20)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Time Validation",
+                site_type="Commercial",
+                rate=180,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+    equal = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "evening",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "09:00",
+            "localEndTime": "09:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert equal.status_code == 422, equal.text
+    subminute = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "evening",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "09:00:30",
+            "localEndTime": "10:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert subminute.status_code == 422, subminute.text
+
+
+def test_native_site_schedule_preview_excludes_nonexistent_dst_window(
+    client,
+    auth,
+):
+    service_day = date(2026, 3, 8)  # Sunday spring-forward in America/Chicago
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native DST Gap",
+                site_type="Commercial",
+                rate=180,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "night",
+            "cadence": "weekly",
+            "weekdays": [6],
+            "localStartTime": "02:00",
+            "localEndTime": "03:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    preview = client.post(
+        "/api/admin/operations/native-schedule-preview",
+        headers=auth,
+        json={"startDate": str(service_day), "endDate": str(service_day)},
+    )
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["summary"]["jobCount"] == 0
+    assert body["summary"]["excludedJobCount"] == 1
+    job = body["jobs"][0]
+    assert job["estRevenue"] is None
+    assert job["estLaborCost"] is None
+    assert {issue["code"] for issue in job["issues"]} >= {"invalid_service_window"}
+
+
 def test_native_site_schedule_rule_patch_rejects_archived_site_reactivation(
     client,
     auth,
