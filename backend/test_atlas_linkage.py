@@ -7,6 +7,7 @@ confirmation-phrase pattern used by the time-data corrections flow.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
@@ -31,6 +32,10 @@ def _clean_test_rows() -> None:
     db.execute(
         "DELETE FROM eom_customer_atlas_reservations WHERE customer_id IN "
         "(SELECT id FROM customers WHERE name LIKE %s)",
+        (f"{TEST_PREFIX}%",),
+    )
+    db.execute(
+        "DELETE FROM eom_customer_atlas_reservations WHERE payload ->> 'name' LIKE %s",
         (f"{TEST_PREFIX}%",),
     )
     db.execute(
@@ -369,3 +374,82 @@ def test_schema_migration_idempotent(client):
         """
     )
     assert column is not None and column["data_type"] == "uuid"
+
+
+# -- stale reservations (slice 0F-T, website #167) ---------------------------
+
+
+def _pending_reservation(customer_id: int | None, *, minutes_old: int, name: str) -> str:
+    reservation_id = str(uuid.uuid4())
+    db.execute(
+        """
+        INSERT INTO eom_customer_atlas_reservations (
+            id, idempotency_key, request_fingerprint, payload, mode,
+            customer_id, requested_by_employee_id, state, updated_at
+        ) VALUES (
+            %s, %s, %s, %s::jsonb, %s, %s, 1, 'pending',
+            NOW() - make_interval(mins => %s)
+        )
+        """,
+        (
+            reservation_id,
+            str(uuid.uuid4()),
+            "f" * 64,
+            json.dumps({"name": name}),
+            "link_existing" if customer_id is not None else "create",
+            customer_id,
+            minutes_old,
+        ),
+    )
+    return reservation_id
+
+
+def test_audit_reports_only_reservations_nobody_came_back_for(client, auth):
+    """A fresh pending reservation is normal; an old one means nobody retried.
+
+    Both directions matter: reporting every pending row would fire on the
+    ordinary retryable case the saga is designed around, and reporting none
+    would hide a customer the operator believes exists.
+    """
+    fresh = _pending_reservation(None, minutes_old=1, name=f"{TEST_PREFIX} Fresh")
+    stale = _pending_reservation(None, minutes_old=180, name=f"{TEST_PREFIX} Stale")
+
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    reported = {row["reservationId"] for row in body["staleReservations"]}
+
+    assert stale in reported, "a reservation pending for hours must surface"
+    assert fresh not in reported, "a just-failed reservation is retryable, not stale"
+    assert body["summary"]["staleReservations"] >= 1
+
+    entry = next(row for row in body["staleReservations"] if row["reservationId"] == stale)
+    assert entry["customerName"] == f"{TEST_PREFIX} Stale"
+    assert entry["pendingSince"]
+
+
+def test_a_finalized_reservation_is_never_stale(client, auth):
+    """Age alone is not the signal -- only work still waiting counts."""
+    # A finalized row must carry both ids: the schema CHECK from slice 0C
+    # refuses to record a completed reservation that links nothing.
+    customer_id = _create_customer("Finalized Reservation", str(uuid.uuid4()))
+    reservation_id = _pending_reservation(
+        customer_id, minutes_old=600, name=f"{TEST_PREFIX} Done"
+    )
+    db.execute(
+        """
+        UPDATE eom_customer_atlas_reservations
+        SET state = 'finalized', atlas_contact_id = %s, finalized_at = NOW()
+        WHERE id = %s
+        """,
+        (str(uuid.uuid4()), reservation_id),
+    )
+
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    reported = {row["reservationId"] for row in body["staleReservations"]}
+    assert reservation_id not in reported
+
+
+def test_stale_reservations_are_clean_by_default(client, auth):
+    """The signal must be silent on a healthy system, or it is noise."""
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert isinstance(body["staleReservations"], list)
+    assert body["summary"]["staleReservations"] == len(body["staleReservations"])
