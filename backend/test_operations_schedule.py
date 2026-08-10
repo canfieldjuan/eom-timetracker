@@ -376,6 +376,15 @@ def _clean_rows() -> None:
                 (f"{TEST_PREFIX}%",),
             )
             cur.execute(
+                """
+                DELETE FROM service_schedule_rules
+                WHERE location_id IN (
+                    SELECT id FROM locations WHERE address LIKE %s
+                )
+                """,
+                (f"{TEST_PREFIX}%",),
+            )
+            cur.execute(
                 "DELETE FROM jobs WHERE customer_name LIKE %s",
                 (f"{TEST_PREFIX}%",),
             )
@@ -472,6 +481,124 @@ def _customer_site(
         ),
     )
     return customer_id, int(cur.fetchone()[0])
+
+
+def test_native_site_schedule_preview_accepts_commercial_morning_without_jobs(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)  # Monday
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Commercial Morning",
+                site_type="Commercial",
+                rate=180,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+
+    before_jobs = db.query_one(
+        "SELECT COUNT(*) AS count FROM jobs WHERE location_id = %s",
+        (site_id,),
+    )["count"]
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "08:30",
+            "localEndTime": "11:30",
+            "startsOn": str(service_day),
+            "notes": "Commercial customer handled by the morning team",
+        },
+    )
+    assert created.status_code == 201, created.text
+    rule = created.json()["rule"]
+    assert rule["locationId"] == site_id
+    assert rule["siteType"] == "Commercial"
+    assert rule["shiftBucket"] == "morning"
+
+    preview = client.post(
+        "/api/admin/operations/native-schedule-preview",
+        headers=auth,
+        json={"startDate": str(service_day), "endDate": str(service_day)},
+    )
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["mode"] == "shadow"
+    assert body["summary"]["jobCount"] == 1
+    assert body["summary"]["knownPlannedHours"] == 3
+    job = body["jobs"][0]
+    assert job["ruleId"] == rule["id"]
+    assert job["locationId"] == site_id
+    assert job["siteType"] == "Commercial"
+    assert job["shiftBucket"] == "morning"
+    assert job["scheduledDate"] == str(service_day)
+    assert job["plannedHours"] == 3
+    assert job["estRevenue"] == 180
+    assert job["estLaborCost"] == 50.25
+    assert job["issues"] == []
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM jobs WHERE location_id = %s",
+        (site_id,),
+    )["count"] == before_jobs
+
+
+def test_native_site_schedule_rule_patch_deactivates_preview(client, auth):
+    service_day = date(2026, 7, 20)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Deactivate",
+                site_type="Residential",
+                rate=125,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "09:00",
+            "localEndTime": "11:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+    rule_id = created.json()["rule"]["id"]
+
+    patched = client.patch(
+        f"/api/admin/operations/service-schedule-rules/{rule_id}",
+        headers=auth,
+        json={"active": False},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["rule"]["active"] is False
+
+    rules = client.get(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+    )
+    assert rules.status_code == 200, rules.text
+    assert rule_id not in {rule["id"] for rule in rules.json()["rules"]}
+
+    preview = client.post(
+        "/api/admin/operations/native-schedule-preview",
+        headers=auth,
+        json={"startDate": str(service_day), "endDate": str(service_day)},
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["jobs"] == []
 
 
 def _job(
