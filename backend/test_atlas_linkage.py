@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -380,15 +381,30 @@ def test_schema_migration_idempotent(client):
 # -- stale reservations (slice 0F-T, website #167) ---------------------------
 
 
-def _pending_reservation(customer_id: int | None, *, minutes_old: int, name: str) -> str:
-    reservation_id = str(uuid.uuid4())
+def _pending_reservation(
+    customer_id: int | None,
+    *,
+    minutes_old: int,
+    name: str,
+    created_minutes_old: int | None = None,
+    reservation_id: str | None = None,
+) -> str:
+    """Seed a pending reservation.
+
+    ``minutes_old`` ages ``updated_at`` (the last attempt, which drives the
+    staleness cutoff); ``created_minutes_old`` ages ``created_at``
+    independently, so a test can tell the two apart. It defaults to the same
+    age, which is what an untouched reservation looks like.
+    """
+    reservation_id = reservation_id or str(uuid.uuid4())
     db.execute(
         """
         INSERT INTO eom_customer_atlas_reservations (
             id, idempotency_key, request_fingerprint, payload, mode,
-            customer_id, requested_by_employee_id, state, updated_at
+            customer_id, requested_by_employee_id, state, created_at, updated_at
         ) VALUES (
             %s, %s, %s, %s::jsonb, %s, %s, 1, 'pending',
+            NOW() - make_interval(mins => %s),
             NOW() - make_interval(mins => %s)
         )
         """,
@@ -399,6 +415,7 @@ def _pending_reservation(customer_id: int | None, *, minutes_old: int, name: str
             json.dumps({"name": name}),
             "link_existing" if customer_id is not None else "create",
             customer_id,
+            minutes_old if created_minutes_old is None else created_minutes_old,
             minutes_old,
         ),
     )
@@ -487,3 +504,90 @@ def test_crossing_the_staleness_cutoff_moves_the_inventory_fingerprint(client, a
         row["reservationId"] for row in after["staleReservations"]
     }
     assert after["inventoryFingerprint"] != before["inventoryFingerprint"]
+
+
+def test_pending_since_survives_a_retry_that_failed(client, auth):
+    """How long the customer has been missing, not when we last tried.
+
+    `_note_customer_atlas_error` advances `updated_at` on every failed retry.
+    Reporting that as `pendingSince` would make a reservation stuck since
+    yesterday look minutes old -- the audit would understate exactly the
+    reservations that have been ignored longest.
+    """
+    reservation_id = _pending_reservation(
+        None,
+        minutes_old=90,
+        created_minutes_old=600,
+        name=f"{TEST_PREFIX} Retried",
+    )
+
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    entry = next(
+        row
+        for row in body["staleReservations"]
+        if row["reservationId"] == reservation_id
+    )
+
+    pending_since = datetime.fromisoformat(entry["pendingSince"].replace("Z", "+00:00"))
+    last_attempt = datetime.fromisoformat(
+        entry["lastAttemptAt"].replace("Z", "+00:00")
+    )
+    age_minutes = (datetime.now(timezone.utc) - pending_since).total_seconds() / 60
+
+    assert age_minutes > 300, (
+        "pendingSince must report creation, not the last failed attempt"
+    )
+    assert last_attempt > pending_since, "the retry is more recent than the start"
+
+
+def test_reservations_sharing_an_updated_at_hash_the_same_way(client, auth):
+    """Unchanged inventory must not churn the fingerprint.
+
+    `updated_at` alone does not order rows: a multi-row update gives several
+    reservations the same value, and PostgreSQL is then free to return them in
+    any order. Since the list order feeds the fingerprint, that would make
+    identical inventory hash differently between polls and report change that
+    did not happen.
+    """
+    shared_age = 240
+    # Ids chosen so id-order and insertion-order disagree, which is what an
+    # unstable sort would expose.
+    first = _pending_reservation(
+        None,
+        minutes_old=shared_age,
+        name=f"{TEST_PREFIX} TieB",
+        reservation_id="ffffffff-0000-4000-8000-000000000002",
+    )
+    second = _pending_reservation(
+        None,
+        minutes_old=shared_age,
+        name=f"{TEST_PREFIX} TieA",
+        reservation_id="ffffffff-0000-4000-8000-000000000001",
+    )
+    # Each INSERT gets its own NOW(), so the rows differ by microseconds and
+    # there is no tie to break. Force the collision a multi-row update would
+    # produce, which is the case the tie-breaker exists for.
+    db.execute(
+        """
+        UPDATE eom_customer_atlas_reservations
+        SET updated_at = NOW() - make_interval(mins => %s)
+        WHERE id IN (%s, %s)
+        """,
+        (shared_age, first, second),
+    )
+
+    fingerprints = set()
+    orders = set()
+    for _ in range(6):
+        body = client.get(AUDIT_PATH, headers=auth).json()
+        fingerprints.add(body["inventoryFingerprint"])
+        orders.add(
+            tuple(
+                row["reservationId"]
+                for row in body["staleReservations"]
+                if row["reservationId"] in {first, second}
+            )
+        )
+
+    assert orders == {(second, first)}, "ties must resolve by id, deterministically"
+    assert len(fingerprints) == 1, "unchanged inventory must hash to one value"

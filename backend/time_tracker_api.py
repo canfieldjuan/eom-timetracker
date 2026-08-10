@@ -14808,6 +14808,11 @@ def admin_apply_time_data_correction(
 # the operator sees it and the retry route exists for exactly that. One still
 # pending an hour later means nobody came back for it, and the customer the
 # operator thought they created does not exist anywhere.
+#
+# Measured from the last attempt, not from creation: a reservation someone
+# retried a minute ago is being worked, however old it is. Creation time is
+# still reported, as pendingSince, because that is how long the customer has
+# actually been missing.
 STALE_CUSTOMER_RESERVATION_MINUTES = 60
 
 
@@ -14850,7 +14855,7 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
         WHERE c.id IS NULL
            OR c.atlas_contact_id IS NULL
            OR c.atlas_contact_id <> h.atlas_contact_id
-        ORDER BY h.customer_id
+        ORDER BY h.customer_id, h.atlas_contact_id
         """
     )
     linked_row = db.query_one(
@@ -14863,7 +14868,7 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
         FROM eom_customer_atlas_reservations
         WHERE state = 'pending'
           AND updated_at < NOW() - make_interval(mins => %s)
-        ORDER BY updated_at
+        ORDER BY updated_at, id
         """,
         (STALE_CUSTOMER_RESERVATION_MINUTES,),
     )
@@ -14899,7 +14904,15 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
             ),
             "customerName": row.get("customer_name"),
             "lastError": row.get("last_error"),
-            "pendingSince": to_utc_iso(row["updated_at"]) if row.get("updated_at") else None,
+            # Two different questions, so two different timestamps. How long the
+            # customer has been missing is created_at, which never moves; a
+            # failed retry advances updated_at, so reporting that as
+            # "pendingSince" understates a reservation that has been stuck for
+            # hours but was retried a minute ago.
+            "pendingSince": to_utc_iso(row["created_at"]) if row.get("created_at") else None,
+            "lastAttemptAt": (
+                to_utc_iso(row["updated_at"]) if row.get("updated_at") else None
+            ),
         }
         for row in stale_reservation_rows
     ]
