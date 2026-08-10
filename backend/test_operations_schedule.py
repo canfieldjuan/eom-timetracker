@@ -590,6 +590,106 @@ def test_native_site_schedule_preview_allocates_monthly_rate_across_full_month(
     assert body["summary"]["estRevenue"] == 100
 
 
+def test_native_site_schedule_preview_allocates_monthly_rate_across_same_month_rules(
+    client,
+    auth,
+):
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Monthly Same Month Rules",
+                site_type="Commercial",
+                rate=400,
+                rate_type="monthly",
+                expected_hours=2,
+            )
+    first_rule = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "evening",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "18:00",
+            "localEndTime": "20:00",
+            "startsOn": "2026-07-06",
+        },
+    )
+    assert first_rule.status_code == 201, first_rule.text
+    later_rule = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "night",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "21:00",
+            "localEndTime": "23:00",
+            "startsOn": "2026-07-27",
+        },
+    )
+    assert later_rule.status_code == 201, later_rule.text
+
+    preview = client.post(
+        "/api/admin/operations/native-schedule-preview",
+        headers=auth,
+        json={"startDate": "2026-07-20", "endDate": "2026-07-20"},
+    )
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["summary"]["jobCount"] == 1
+    assert body["jobs"][0]["scheduledDate"] == "2026-07-20"
+    assert body["jobs"][0]["estRevenue"] == 80
+    assert body["summary"]["estRevenue"] == 80
+
+
+def test_native_site_schedule_preview_reports_partial_employee_rate_coverage(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _employee(cur, "Native Missing Rate", None)
+            _, site_id = _customer_site(
+                cur,
+                "Native Partial Rate Coverage",
+                site_type="Commercial",
+                rate=180,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "08:30",
+            "localEndTime": "11:30",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    preview = client.post(
+        "/api/admin/operations/native-schedule-preview",
+        headers=auth,
+        json={"startDate": str(service_day), "endDate": str(service_day)},
+    )
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert {issue["code"] for issue in body["issues"]} >= {
+        "employees_missing_rates"
+    }
+    assert body["summary"]["estLaborCost"] == 50.25
+
+
 def test_native_site_schedule_rule_patch_deactivates_preview(client, auth):
     service_day = date(2026, 7, 20)
     with db.get_conn() as conn:

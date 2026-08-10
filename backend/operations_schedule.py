@@ -6045,6 +6045,8 @@ def build_operations_schedule_router(
                 status_code=400,
                 detail="Native schedule preview is limited to 121 days",
             )
+        allocation_start = date(payload.startDate.year, payload.startDate.month, 1)
+        allocation_end = _month_end(payload.endDate)
         rules = db.query_all(
             f"""
             SELECT {_service_schedule_rule_columns()}
@@ -6057,7 +6059,7 @@ def build_operations_schedule_router(
               AND (rule.ends_on IS NULL OR rule.ends_on >= %s)
             ORDER BY location.address, rule.local_start_time, rule.id
             """,
-            (payload.endDate, payload.startDate),
+            (allocation_end, allocation_start),
         )
         wage_rows = db.query_all(
             """
@@ -6072,8 +6074,22 @@ def build_operations_schedule_router(
             if row.get("hourly_rate") is not None
         ]
         avg_hourly_rate = sum(wages) / Decimal(len(wages)) if wages else None
-        allocation_start = date(payload.startDate.year, payload.startDate.month, 1)
-        allocation_end = _month_end(payload.endDate)
+        global_issues: List[Dict[str, str]] = []
+        missing_wages = len(wage_rows) - len(wages)
+        if not wages:
+            global_issues.append(
+                _issue(
+                    "missing_average_employee_rate",
+                    "No active employee has a configured hourly rate.",
+                )
+            )
+        elif missing_wages:
+            global_issues.append(
+                _issue(
+                    "employees_missing_rates",
+                    f"{missing_wages} active employee account(s) have no hourly rate.",
+                )
+            )
         allocated_rows = _native_preview_rows(
             [dict(row) for row in rules],
             allocation_start,
@@ -6134,6 +6150,7 @@ def build_operations_schedule_router(
             "startDate": str(payload.startDate),
             "endDate": str(payload.endDate),
             "ruleCount": len(rules),
+            "issues": global_issues,
             "summary": _aggregate_forecast_rows(preview_rows),
             "weeks": weeks,
             "jobs": [_public_forecast_job(row) for row in preview_rows],
