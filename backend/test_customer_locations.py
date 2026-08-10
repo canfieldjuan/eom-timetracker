@@ -1193,8 +1193,18 @@ def test_concurrent_customer_and_primary_site_creates_have_one_winner(
 
 def _seed_historical_site_references(location_id: int, customer_name: str):
     now = datetime.now(timezone.utc)
-    past_start = now - timedelta(days=10)
-    future_start = now + timedelta(days=10)
+    past_start = (now - timedelta(days=10)).replace(
+        hour=15,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    future_start = (now + timedelta(days=10)).replace(
+        hour=15,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
     conn = _raw_conn()
     try:
         with conn.cursor() as cur:

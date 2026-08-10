@@ -36,6 +36,7 @@ UTILIZATION_CATEGORIES = (
     "unclassified",
 )
 OPERATIONS_FORECAST_ALLOWED_WEEKS = {4, 8, 12}
+OPERATIONS_FORECAST_PLANNING_SOURCES = {"calendar", "native"}
 UTILIZATION_REVIEW_KEY_VERSION = "utilization-review.v1"
 UTILIZATION_EVIDENCE_VERSION = "utilization-classifier.v1"
 UTILIZATION_MISSING_DEPARTURE_CORRECTION = "utilization_missing_departure.v1"
@@ -668,6 +669,7 @@ def _native_preview_rows(
                     "scheduledDate": str(service_day),
                     "scheduledStart": _utc_iso(starts_at),
                     "scheduledEnd": _utc_iso(ends_at),
+                    "includedInForecast": valid_service_window,
                     "plannedHours": expected_hours,
                     "estRevenue": _money(revenue_cents),
                     "estLaborCost": _money(labor_cents),
@@ -717,6 +719,140 @@ def _native_preview_rows(
                 else None
             )
     return rows
+
+
+def _load_active_service_schedule_rules(
+    start_date: date,
+    end_date: date,
+) -> List[Dict[str, Any]]:
+    return [
+        dict(row)
+        for row in db.query_all(
+            f"""
+            SELECT {_service_schedule_rule_columns()}
+            FROM service_schedule_rules rule
+            JOIN locations location ON location.id = rule.location_id
+            LEFT JOIN customers customer ON customer.id = location.customer_id
+            WHERE rule.active = true
+              AND location.active = true
+              AND rule.starts_on <= %s
+              AND (rule.ends_on IS NULL OR rule.ends_on >= %s)
+            ORDER BY location.address, rule.local_start_time, rule.id
+            """,
+            (end_date, start_date),
+        )
+    ]
+
+
+def _average_employee_rate_and_issues() -> Tuple[
+    Optional[Decimal],
+    List[Dict[str, str]],
+]:
+    wage_rows = db.query_all(
+        """
+        SELECT hourly_rate
+        FROM employees
+        WHERE active = true AND role = 'employee'
+        """
+    )
+    wages = [
+        Decimal(str(row["hourly_rate"]))
+        for row in wage_rows
+        if row.get("hourly_rate") is not None
+    ]
+    issues: List[Dict[str, str]] = []
+    missing_wages = len(wage_rows) - len(wages)
+    if not wages:
+        issues.append(
+            _issue(
+                "missing_average_employee_rate",
+                "No active employee has a configured hourly rate.",
+            )
+        )
+    elif missing_wages:
+        issues.append(
+            _issue(
+                "employees_missing_rates",
+                f"{missing_wages} active employee account(s) have no hourly rate.",
+            )
+        )
+    return (sum(wages) / Decimal(len(wages)) if wages else None), issues
+
+
+def _native_projection_rows_for_period(
+    start_date: date,
+    end_date: date,
+    *,
+    app_timezone: ZoneInfo,
+    avg_hourly_rate: Optional[Decimal],
+) -> Tuple[List[Dict[str, Any]], int]:
+    allocation_start = date(start_date.year, start_date.month, 1)
+    allocation_end = _month_end(end_date)
+    rules = _load_active_service_schedule_rules(allocation_start, allocation_end)
+    allocated_rows = _native_preview_rows(
+        rules,
+        allocation_start,
+        allocation_end,
+        app_timezone=app_timezone,
+        avg_hourly_rate=avg_hourly_rate,
+    )
+    return [
+        row
+        for row in allocated_rows
+        if start_date <= date.fromisoformat(row["scheduledDate"]) <= end_date
+    ], len(rules)
+
+
+def _forecast_weeks_from_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    first_week: date,
+    weeks_ahead: int,
+) -> List[Dict[str, Any]]:
+    weeks: List[Dict[str, Any]] = []
+    for offset in range(weeks_ahead):
+        week_start = first_week + timedelta(weeks=offset)
+        week_end = week_start + timedelta(days=6)
+        week_rows = [
+            row
+            for row in rows
+            if week_start <= datetime.strptime(row["scheduledDate"], "%Y-%m-%d").date()
+            <= week_end
+        ]
+        by_site_rows: Dict[Optional[int], List[Dict[str, Any]]] = defaultdict(list)
+        for row in week_rows:
+            by_site_rows[row.get("locationId")].append(row)
+        by_site = []
+        for location_id, site_rows in by_site_rows.items():
+            site_summary = _aggregate_forecast_rows(site_rows)
+            first = site_rows[0]
+            by_site.append(
+                {
+                    "locationId": location_id,
+                    "customerId": first.get("customerId"),
+                    "customerName": first.get("customerName"),
+                    "siteAddress": first.get("siteAddress"),
+                    **site_summary,
+                }
+            )
+        summary = _aggregate_forecast_rows(week_rows)
+        weeks.append(
+            {
+                "weekStart": str(week_start),
+                "weekEnd": str(week_end),
+                **summary,
+                "bySite": sorted(
+                    by_site,
+                    key=lambda row: (
+                        str(row.get("customerName") or "").casefold(),
+                        str(row.get("siteAddress") or "").casefold(),
+                        int(row.get("locationId") or 0),
+                    ),
+                ),
+                "jobs": [_public_forecast_job(row) for row in week_rows],
+            }
+        )
+    return weeks
 
 
 def allocate_monthly_cents(
@@ -5806,35 +5942,64 @@ def build_operations_forecast(
     *,
     timezone_name: str = "America/Chicago",
     now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    planning_source: str = "calendar",
 ) -> Dict[str, Any]:
     if weeks_ahead < 1:
         raise ValueError("weeks_ahead must be at least 1")
+    if planning_source not in OPERATIONS_FORECAST_PLANNING_SOURCES:
+        raise ValueError("planning_source must be calendar or native")
 
     app_timezone = ZoneInfo(timezone_name)
     observed_at = now_provider().astimezone(timezone.utc)
     today = observed_at.astimezone(app_timezone).date()
     first_week = _sunday_for(today)
     forecast_end = first_week + timedelta(days=weeks_ahead * 7 - 1)
+
+    avg_hourly_rate, global_issues = _average_employee_rate_and_issues()
+    if planning_source == "native":
+        native_rows, rule_count = _native_projection_rows_for_period(
+            today,
+            forecast_end,
+            app_timezone=app_timezone,
+            avg_hourly_rate=avg_hourly_rate,
+        )
+        forecast_rows = [
+            row
+            for row in native_rows
+            if not (
+                row["scheduledDate"] == str(today)
+                and row.get("scheduledEnd") is not None
+                and datetime.fromisoformat(
+                    row["scheduledEnd"].replace("Z", "+00:00")
+                )
+                <= observed_at
+            )
+        ]
+        weeks = _forecast_weeks_from_rows(
+            forecast_rows,
+            first_week=first_week,
+            weeks_ahead=weeks_ahead,
+        )
+        return {
+            "success": True,
+            "timezone": timezone_name,
+            "observedAt": _utc_iso(observed_at),
+            "asOfDate": str(today),
+            "startDate": str(today),
+            "endDate": str(forecast_end),
+            "weeksAhead": weeks_ahead,
+            "planningSource": "native",
+            "ruleCount": rule_count,
+            "avgLaborRate": _money(_money_cents(avg_hourly_rate)),
+            "issues": global_issues,
+            "summary": _aggregate_forecast_rows(forecast_rows),
+            "weeks": weeks,
+            "forecasts": weeks,
+        }
+
     allocation_start = date(today.year, today.month, 1)
     allocation_end = _month_end(forecast_end)
     allocation_jobs = _load_jobs(allocation_start, allocation_end)
-
-    wage_rows = db.query_all(
-        """
-        SELECT id, hourly_rate
-        FROM employees
-        WHERE active = true AND role = 'employee'
-        ORDER BY id
-        """
-    )
-    configured_wages = [
-        Decimal(str(row["hourly_rate"]))
-        for row in wage_rows
-        if row.get("hourly_rate") is not None
-    ]
-    avg_hourly_rate: Optional[Decimal] = None
-    if configured_wages:
-        avg_hourly_rate = sum(configured_wages) / Decimal(len(configured_wages))
 
     monthly_allocations = monthly_revenue_allocations(
         allocation_jobs,
@@ -5873,66 +6038,11 @@ def build_operations_forecast(
         for job in forecast_jobs
     ]
 
-    weeks: List[Dict[str, Any]] = []
-    for offset in range(weeks_ahead):
-        week_start = first_week + timedelta(weeks=offset)
-        week_end = week_start + timedelta(days=6)
-        week_rows = [
-            row
-            for row in calculated
-            if week_start <= datetime.strptime(row["scheduledDate"], "%Y-%m-%d").date()
-            <= week_end
-        ]
-        by_site_rows: Dict[Optional[int], List[Dict[str, Any]]] = defaultdict(list)
-        for row in week_rows:
-            by_site_rows[row.get("locationId")].append(row)
-        by_site = []
-        for location_id, site_rows in by_site_rows.items():
-            site_summary = _aggregate_forecast_rows(site_rows)
-            first = site_rows[0]
-            by_site.append(
-                {
-                    "locationId": location_id,
-                    "customerId": first.get("customerId"),
-                    "customerName": first.get("customerName"),
-                    "siteAddress": first.get("siteAddress"),
-                    **site_summary,
-                }
-            )
-        summary = _aggregate_forecast_rows(week_rows)
-        weeks.append(
-            {
-                "weekStart": str(week_start),
-                "weekEnd": str(week_end),
-                **summary,
-                "bySite": sorted(
-                    by_site,
-                    key=lambda row: (
-                        str(row.get("customerName") or "").casefold(),
-                        str(row.get("siteAddress") or "").casefold(),
-                        int(row.get("locationId") or 0),
-                    ),
-                ),
-                "jobs": [_public_forecast_job(row) for row in week_rows],
-            }
-        )
-
-    global_issues: List[Dict[str, str]] = []
-    missing_wages = len(wage_rows) - len(configured_wages)
-    if not configured_wages:
-        global_issues.append(
-            _issue(
-                "missing_average_employee_rate",
-                "No active employee has a configured hourly rate.",
-            )
-        )
-    elif missing_wages:
-        global_issues.append(
-            _issue(
-                "employees_missing_rates",
-                f"{missing_wages} active employee account(s) have no hourly rate.",
-            )
-        )
+    weeks = _forecast_weeks_from_rows(
+        calculated,
+        first_week=first_week,
+        weeks_ahead=weeks_ahead,
+    )
     return {
         "success": True,
         "timezone": timezone_name,
@@ -5941,6 +6051,7 @@ def build_operations_forecast(
         "startDate": str(today),
         "endDate": str(forecast_end),
         "weeksAhead": weeks_ahead,
+        "planningSource": "calendar",
         "avgLaborRate": _money(_money_cents(avg_hourly_rate)),
         "issues": global_issues,
         "summary": _aggregate_forecast_rows(calculated),
@@ -6212,111 +6323,29 @@ def build_operations_schedule_router(
                 status_code=400,
                 detail="Native schedule preview is limited to 121 days",
             )
-        allocation_start = date(payload.startDate.year, payload.startDate.month, 1)
-        allocation_end = _month_end(payload.endDate)
-        rules = db.query_all(
-            f"""
-            SELECT {_service_schedule_rule_columns()}
-            FROM service_schedule_rules rule
-            JOIN locations location ON location.id = rule.location_id
-            LEFT JOIN customers customer ON customer.id = location.customer_id
-            WHERE rule.active = true
-              AND location.active = true
-              AND rule.starts_on <= %s
-              AND (rule.ends_on IS NULL OR rule.ends_on >= %s)
-            ORDER BY location.address, rule.local_start_time, rule.id
-            """,
-            (allocation_end, allocation_start),
-        )
-        wage_rows = db.query_all(
-            """
-            SELECT hourly_rate
-            FROM employees
-            WHERE active = true AND role = 'employee'
-            """
-        )
-        wages = [
-            Decimal(str(row["hourly_rate"]))
-            for row in wage_rows
-            if row.get("hourly_rate") is not None
-        ]
-        avg_hourly_rate = sum(wages) / Decimal(len(wages)) if wages else None
-        global_issues: List[Dict[str, str]] = []
-        missing_wages = len(wage_rows) - len(wages)
-        if not wages:
-            global_issues.append(
-                _issue(
-                    "missing_average_employee_rate",
-                    "No active employee has a configured hourly rate.",
-                )
-            )
-        elif missing_wages:
-            global_issues.append(
-                _issue(
-                    "employees_missing_rates",
-                    f"{missing_wages} active employee account(s) have no hourly rate.",
-                )
-            )
-        allocated_rows = _native_preview_rows(
-            [dict(row) for row in rules],
-            allocation_start,
-            allocation_end,
+        avg_hourly_rate, global_issues = _average_employee_rate_and_issues()
+        preview_rows, rule_count = _native_projection_rows_for_period(
+            payload.startDate,
+            payload.endDate,
             app_timezone=app_timezone,
             avg_hourly_rate=avg_hourly_rate,
         )
-        preview_rows = [
-            row
-            for row in allocated_rows
-            if payload.startDate <= date.fromisoformat(row["scheduledDate"]) <= payload.endDate
-        ]
-        weeks: List[Dict[str, Any]] = []
         first_week = _sunday_for(payload.startDate)
         last_week = _sunday_for(payload.endDate)
-        week_start = first_week
-        while week_start <= last_week:
-            week_end = week_start + timedelta(days=6)
-            week_rows = [
-                row
-                for row in preview_rows
-                if week_start
-                <= date.fromisoformat(row["scheduledDate"])
-                <= week_end
-            ]
-            by_site_rows: Dict[Optional[int], List[Dict[str, Any]]] = defaultdict(list)
-            for row in week_rows:
-                by_site_rows[row.get("locationId")].append(row)
-            weeks.append(
-                {
-                    "weekStart": str(week_start),
-                    "weekEnd": str(week_end),
-                    **_aggregate_forecast_rows(week_rows),
-                    "bySite": [
-                        {
-                            "locationId": location_id,
-                            "customerId": site_rows[0].get("customerId"),
-                            "customerName": site_rows[0].get("customerName"),
-                            "siteAddress": site_rows[0].get("siteAddress"),
-                            **_aggregate_forecast_rows(site_rows),
-                        }
-                        for location_id, site_rows in sorted(
-                            by_site_rows.items(),
-                            key=lambda item: (
-                                str(item[1][0].get("customerName") or "").casefold(),
-                                str(item[1][0].get("siteAddress") or "").casefold(),
-                            ),
-                        )
-                    ],
-                    "jobs": [_public_forecast_job(row) for row in week_rows],
-                }
-            )
-            week_start += timedelta(days=7)
+        week_count = ((last_week - first_week).days // 7) + 1
+        weeks = _forecast_weeks_from_rows(
+            preview_rows,
+            first_week=first_week,
+            weeks_ahead=week_count,
+        )
         return {
             "success": True,
             "mode": "shadow",
+            "planningSource": "native",
             "timezone": timezone_name,
             "startDate": str(payload.startDate),
             "endDate": str(payload.endDate),
-            "ruleCount": len(rules),
+            "ruleCount": rule_count,
             "issues": global_issues,
             "summary": _aggregate_forecast_rows(preview_rows),
             "weeks": weeks,
@@ -6926,6 +6955,7 @@ def build_operations_schedule_router(
     @router.get("/api/admin/operations/forecast")
     def operations_forecast(
         weeks_ahead: int = Query(default=4),
+        planning_source: str = Query(default="calendar"),
         _: Dict[str, Any] = Depends(get_current_admin),
     ) -> Dict[str, Any]:
         if weeks_ahead not in OPERATIONS_FORECAST_ALLOWED_WEEKS:
@@ -6933,10 +6963,16 @@ def build_operations_schedule_router(
                 status_code=400,
                 detail="weeks_ahead must be one of: 4, 8, 12",
             )
+        if planning_source not in OPERATIONS_FORECAST_PLANNING_SOURCES:
+            raise HTTPException(
+                status_code=400,
+                detail="planning_source must be calendar or native",
+            )
         return build_operations_forecast(
             weeks_ahead,
             timezone_name=timezone_name,
             now_provider=now_provider,
+            planning_source=planning_source,
         )
 
     return router
