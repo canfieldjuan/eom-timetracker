@@ -14804,6 +14804,13 @@ def admin_apply_time_data_correction(
     }
 
 
+# A reservation pending right after an Atlas failure is normal and retryable:
+# the operator sees it and the retry route exists for exactly that. One still
+# pending an hour later means nobody came back for it, and the customer the
+# operator thought they created does not exist anywhere.
+STALE_CUSTOMER_RESERVATION_MINUTES = 60
+
+
 def build_atlas_linkage_audit() -> Dict[str, Any]:
     """Report Customer <-> Atlas contact linkage integrity without writes."""
     duplicate_rows = db.query_all(
@@ -14849,6 +14856,17 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
     linked_row = db.query_one(
         "SELECT COUNT(*) AS n FROM customers WHERE atlas_contact_id IS NOT NULL"
     )
+    stale_reservation_rows = db.query_all(
+        """
+        SELECT id, mode, customer_id, payload ->> 'name' AS customer_name,
+               last_error, created_at, updated_at
+        FROM eom_customer_atlas_reservations
+        WHERE state = 'pending'
+          AND updated_at < NOW() - make_interval(mins => %s)
+        ORDER BY updated_at
+        """,
+        (STALE_CUSTOMER_RESERVATION_MINUTES,),
+    )
 
     duplicate_groups = [
         {
@@ -14871,6 +14889,19 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
             "createdAt": to_utc_iso(row["created_at"]) if row.get("created_at") else None,
         }
         for row in unlinked_rows
+    ]
+    stale_reservations = [
+        {
+            "reservationId": str(row["id"]),
+            "mode": str(row["mode"]),
+            "customerId": (
+                int(row["customer_id"]) if row.get("customer_id") is not None else None
+            ),
+            "customerName": row.get("customer_name"),
+            "lastError": row.get("last_error"),
+            "pendingSince": to_utc_iso(row["updated_at"]) if row.get("updated_at") else None,
+        }
+        for row in stale_reservation_rows
     ]
     handoff_orphans = [
         {
@@ -14895,11 +14926,16 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
         for row in unlinked_customers
         if row["active"]
     ]
+    # Every defect class the audit reports, not just the ones it started with:
+    # a poller treating this as a change token would otherwise see an unchanged
+    # fingerprint at the moment a reservation crosses the staleness cutoff, and
+    # miss the one signal that says a customer exists in neither database.
     fingerprint_material = json.dumps(
         {
             "duplicateGroups": duplicate_groups,
             "unlinkedCustomers": unlinked_customers,
             "handoffOrphans": handoff_orphans,
+            "staleReservations": stale_reservations,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -14920,10 +14956,12 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
             "unlinkedActiveCustomers": len(mapping_template),
             "linkedCustomers": int(linked_row["n"]) if linked_row else 0,
             "handoffOrphans": len(handoff_orphans),
+            "staleReservations": len(stale_reservations),
         },
         "duplicateGroups": duplicate_groups,
         "unlinkedCustomers": unlinked_customers,
         "handoffOrphans": handoff_orphans,
+        "staleReservations": stale_reservations,
         "mappingTemplate": mapping_template,
     }
 
