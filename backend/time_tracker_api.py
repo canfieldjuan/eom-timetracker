@@ -13625,6 +13625,14 @@ def admin_archive_location(
                 )
                 cur.execute(
                     """
+                    UPDATE service_schedule_rules
+                    SET active = false, updated_at = %s, updated_by = %s
+                    WHERE location_id = %s AND active = true
+                    """,
+                    (archived_at, admin["id"], site_id),
+                )
+                cur.execute(
+                    """
                     UPDATE site_check_in_schedules
                     SET cancelled_at = %s, cancelled_by = %s,
                         cancellation_reason = 'site_archived'

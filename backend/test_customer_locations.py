@@ -1437,6 +1437,21 @@ def test_site_archive_restore_preserves_history_and_retires_future_qr_state(
         (site_id,),
     )["check_in_token_nonce"]
     references = _seed_historical_site_references(site_id, customer["name"])
+    native_rule = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "09:00",
+            "localEndTime": "11:00",
+            "startsOn": "2026-07-20",
+        },
+    )
+    assert native_rule.status_code == 201, native_rule.text
+    native_rule_id = native_rule.json()["rule"]["id"]
 
     archived = client.delete(f"/api/admin/locations/{site_id}", headers=auth)
     assert archived.status_code == 200, archived.text
@@ -1663,6 +1678,10 @@ def test_site_archive_restore_preserves_history_and_retires_future_qr_state(
             (references["rule_id"], references["second_rule_id"]),
         )
     )
+    assert db.query_one(
+        "SELECT active FROM service_schedule_rules WHERE id = %s",
+        (native_rule_id,),
+    )["active"] is False
 
 
 def test_customer_archive_requires_sites_archived_and_restore_order(client, auth):

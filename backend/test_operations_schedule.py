@@ -549,6 +549,47 @@ def test_native_site_schedule_preview_accepts_commercial_morning_without_jobs(
     )["count"] == before_jobs
 
 
+def test_native_site_schedule_preview_allocates_monthly_rate_across_full_month(
+    client,
+    auth,
+):
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Monthly Allocation",
+                site_type="Commercial",
+                rate=400,
+                rate_type="monthly",
+                expected_hours=2,
+            )
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "evening",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "18:00",
+            "localEndTime": "20:00",
+            "startsOn": "2026-07-06",
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    preview = client.post(
+        "/api/admin/operations/native-schedule-preview",
+        headers=auth,
+        json={"startDate": "2026-07-20", "endDate": "2026-07-20"},
+    )
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["summary"]["jobCount"] == 1
+    assert body["jobs"][0]["estRevenue"] == 100
+    assert body["summary"]["estRevenue"] == 100
+
+
 def test_native_site_schedule_rule_patch_deactivates_preview(client, auth):
     service_day = date(2026, 7, 20)
     with db.get_conn() as conn:

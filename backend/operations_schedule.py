@@ -6072,13 +6072,20 @@ def build_operations_schedule_router(
             if row.get("hourly_rate") is not None
         ]
         avg_hourly_rate = sum(wages) / Decimal(len(wages)) if wages else None
-        preview_rows = _native_preview_rows(
+        allocation_start = date(payload.startDate.year, payload.startDate.month, 1)
+        allocation_end = _month_end(payload.endDate)
+        allocated_rows = _native_preview_rows(
             [dict(row) for row in rules],
-            payload.startDate,
-            payload.endDate,
+            allocation_start,
+            allocation_end,
             app_timezone=app_timezone,
             avg_hourly_rate=avg_hourly_rate,
         )
+        preview_rows = [
+            row
+            for row in allocated_rows
+            if payload.startDate <= date.fromisoformat(row["scheduledDate"]) <= payload.endDate
+        ]
         weeks: List[Dict[str, Any]] = []
         first_week = _sunday_for(payload.startDate)
         last_week = _sunday_for(payload.endDate)
