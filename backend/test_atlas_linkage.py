@@ -13,6 +13,7 @@ import uuid
 import pytest
 
 import db
+from time_tracker_api import STALE_CUSTOMER_RESERVATION_MINUTES
 
 TEST_PREFIX = "ZZ-LNK-TEST"
 
@@ -453,3 +454,36 @@ def test_stale_reservations_are_clean_by_default(client, auth):
     body = client.get(AUDIT_PATH, headers=auth).json()
     assert isinstance(body["staleReservations"], list)
     assert body["summary"]["staleReservations"] == len(body["staleReservations"])
+
+
+def test_crossing_the_staleness_cutoff_moves_the_inventory_fingerprint(client, auth):
+    """A poller watching the fingerprint must not miss a reservation going stale.
+
+    Nothing else about the row changes as it ages, so if the fingerprint is
+    built from the older defect classes alone it stays identical across the
+    cutoff -- and the consumer that exists to notice this signal is the one
+    that never sees it.
+    """
+    reservation_id = _pending_reservation(
+        None, minutes_old=1, name=f"{TEST_PREFIX} Ages"
+    )
+    before = client.get(AUDIT_PATH, headers=auth).json()
+    assert reservation_id not in {
+        row["reservationId"] for row in before["staleReservations"]
+    }
+
+    # Age the row past the cutoff without touching anything else about it.
+    db.execute(
+        """
+        UPDATE eom_customer_atlas_reservations
+        SET updated_at = NOW() - make_interval(mins => %s)
+        WHERE id = %s
+        """,
+        (STALE_CUSTOMER_RESERVATION_MINUTES + 30, reservation_id),
+    )
+
+    after = client.get(AUDIT_PATH, headers=auth).json()
+    assert reservation_id in {
+        row["reservationId"] for row in after["staleReservations"]
+    }
+    assert after["inventoryFingerprint"] != before["inventoryFingerprint"]

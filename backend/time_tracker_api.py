@@ -14926,11 +14926,16 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
         for row in unlinked_customers
         if row["active"]
     ]
+    # Every defect class the audit reports, not just the ones it started with:
+    # a poller treating this as a change token would otherwise see an unchanged
+    # fingerprint at the moment a reservation crosses the staleness cutoff, and
+    # miss the one signal that says a customer exists in neither database.
     fingerprint_material = json.dumps(
         {
             "duplicateGroups": duplicate_groups,
             "unlinkedCustomers": unlinked_customers,
             "handoffOrphans": handoff_orphans,
+            "staleReservations": stale_reservations,
         },
         sort_keys=True,
         separators=(",", ":"),
