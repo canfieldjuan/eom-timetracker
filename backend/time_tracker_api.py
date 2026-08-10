@@ -4978,6 +4978,40 @@ def _ensure_schema_migrations() -> None:
         )
     """)
     db.execute("""
+        CREATE TABLE IF NOT EXISTS service_schedule_rules (
+            id               BIGSERIAL PRIMARY KEY,
+            location_id      INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+            shift_bucket     TEXT NOT NULL
+                                 CHECK (shift_bucket IN ('morning', 'evening', 'night')),
+            cadence          TEXT NOT NULL
+                                 CHECK (cadence IN ('weekly', 'biweekly', 'monthly')),
+            weekdays         SMALLINT[] NOT NULL,
+            local_start_time TIME NOT NULL,
+            local_end_time   TIME NOT NULL,
+            starts_on        DATE NOT NULL,
+            ends_on          DATE,
+            notes            TEXT NOT NULL DEFAULT '',
+            active           BOOLEAN NOT NULL DEFAULT true,
+            created_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            updated_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (
+                cardinality(weekdays) BETWEEN 1 AND 7
+                AND weekdays <@ ARRAY[0, 1, 2, 3, 4, 5, 6]::SMALLINT[]
+            ),
+            CHECK (ends_on IS NULL OR ends_on >= starts_on)
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_service_schedule_rules_location
+        ON service_schedule_rules(location_id, active, starts_on, ends_on)
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_service_schedule_rules_window
+        ON service_schedule_rules(active, starts_on, ends_on)
+    """)
+    db.execute("""
         CREATE TABLE IF NOT EXISTS site_check_ins (
             id                        BIGSERIAL PRIMARY KEY,
             employee_id               INTEGER NOT NULL REFERENCES employees(id),
@@ -13588,6 +13622,14 @@ def admin_archive_location(
                     WHERE location_id = %s AND active = true
                     """,
                     (archived_at, site_id),
+                )
+                cur.execute(
+                    """
+                    UPDATE service_schedule_rules
+                    SET active = false, updated_at = %s, updated_by = %s
+                    WHERE location_id = %s AND active = true
+                    """,
+                    (archived_at, admin["id"], site_id),
                 )
                 cur.execute(
                     """
@@ -24501,6 +24543,7 @@ app.include_router(
         get_current_admin=get_current_admin,
         timezone_name=TIMEZONE_NAME,
         timesheet_advisory_lock_id=TIMESHEET_PG_ADVISORY_LOCK_ID,
+        append_access_log=append_access_log,
     )
 )
 

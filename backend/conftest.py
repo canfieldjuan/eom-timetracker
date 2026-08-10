@@ -84,6 +84,7 @@ def _apply_schema(conn):
                 site_qr_action_receipts,
                 site_check_in_reconciliation_reviews, site_check_ins,
                 arrival_policy_revisions,
+                service_schedule_rules,
                 site_check_in_schedule_rules, site_check_in_schedules,
                 schedules, departures, visits,
                 shifts, jobs, locations, customers, employees, settings CASCADE

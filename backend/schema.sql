@@ -284,6 +284,38 @@ CREATE UNIQUE INDEX uq_schedules_employee_legacy_name_week
     ON schedules(employee_id, customer_name, week_start)
     WHERE location_id IS NULL;
 
+-- Native recurring service rules owned by Sites. These rules are a shadow
+-- planning source until a later cutover promotes generated visits into jobs.
+CREATE TABLE service_schedule_rules (
+    id               BIGSERIAL PRIMARY KEY,
+    location_id      INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+    shift_bucket     TEXT NOT NULL
+                         CHECK (shift_bucket IN ('morning', 'evening', 'night')),
+    cadence          TEXT NOT NULL
+                         CHECK (cadence IN ('weekly', 'biweekly', 'monthly')),
+    weekdays         SMALLINT[] NOT NULL,
+    local_start_time TIME NOT NULL,
+    local_end_time   TIME NOT NULL,
+    starts_on        DATE NOT NULL,
+    ends_on          DATE,
+    notes            TEXT NOT NULL DEFAULT '',
+    active           BOOLEAN NOT NULL DEFAULT true,
+    created_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    updated_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (
+        cardinality(weekdays) BETWEEN 1 AND 7
+        AND weekdays <@ ARRAY[0, 1, 2, 3, 4, 5, 6]::SMALLINT[]
+    ),
+    CHECK (ends_on IS NULL OR ends_on >= starts_on)
+);
+
+CREATE INDEX idx_service_schedule_rules_location
+    ON service_schedule_rules(location_id, active, starts_on, ends_on);
+CREATE INDEX idx_service_schedule_rules_window
+    ON service_schedule_rules(active, starts_on, ends_on);
+
 -- Exact employee/site start times used only for QR arrival classification.
 -- The existing schedules table stores weekly hour totals and cannot determine
 -- whether a specific arrival is on time.

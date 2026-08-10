@@ -19,7 +19,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import db
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 import psycopg2.extras
 from pydantic import BaseModel, Field
 
@@ -96,6 +96,39 @@ class ExpectedHoursBaselineDecisionRequest(BaseModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     reason: str = Field(default="", max_length=500)
+
+
+class ServiceScheduleRuleCreateRequest(BaseModel):
+    locationId: int = Field(gt=0)
+    shiftBucket: str = Field(pattern="^(morning|evening|night)$")
+    cadence: str = Field(pattern="^(weekly|biweekly|monthly)$")
+    weekdays: List[int] = Field(min_length=1, max_length=7)
+    localStartTime: time
+    localEndTime: time
+    startsOn: date
+    endsOn: Optional[date] = None
+    notes: str = Field(default="", max_length=500)
+    active: bool = True
+
+
+class ServiceScheduleRuleUpdateRequest(BaseModel):
+    shiftBucket: Optional[str] = Field(
+        default=None,
+        pattern="^(morning|evening|night)$",
+    )
+    cadence: Optional[str] = Field(default=None, pattern="^(weekly|biweekly|monthly)$")
+    weekdays: Optional[List[int]] = Field(default=None, min_length=1, max_length=7)
+    localStartTime: Optional[time] = None
+    localEndTime: Optional[time] = None
+    startsOn: Optional[date] = None
+    endsOn: Optional[date] = None
+    notes: Optional[str] = Field(default=None, max_length=500)
+    active: Optional[bool] = None
+
+
+class NativeSchedulePreviewRequest(BaseModel):
+    startDate: date
+    endDate: date
 
 
 def _utc_iso(value: Optional[datetime]) -> Optional[str]:
@@ -317,6 +350,373 @@ def _month_end(day: date) -> date:
         else date(day.year, day.month + 1, 1)
     )
     return next_month - timedelta(days=1)
+
+
+def _normalize_weekdays(weekdays: Iterable[int]) -> List[int]:
+    normalized = sorted({int(value) for value in weekdays})
+    if not normalized or any(value < 0 or value > 6 for value in normalized):
+        raise HTTPException(
+            status_code=422,
+            detail="weekdays must contain unique Python weekday numbers 0 through 6",
+        )
+    return normalized
+
+
+def _validate_service_rule_times(start_time: time, end_time: time) -> None:
+    if (
+        start_time.second
+        or start_time.microsecond
+        or end_time.second
+        or end_time.microsecond
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Service schedule times must be minute-aligned",
+        )
+    if start_time == end_time:
+        raise HTTPException(
+            status_code=422,
+            detail="localEndTime must differ from localStartTime",
+        )
+
+
+def _local_time_text(value: time) -> str:
+    return value.replace(microsecond=0).isoformat(timespec="minutes")
+
+
+def _serialize_service_schedule_rule(row: Dict[str, Any]) -> Dict[str, Any]:
+    ends_on = row.get("ends_on")
+    return {
+        "id": int(row["id"]),
+        "locationId": int(row["location_id"]),
+        "customerId": (
+            int(row["customer_id"]) if row.get("customer_id") is not None else None
+        ),
+        "customerName": str(row.get("display_customer") or ""),
+        "siteAddress": str(row.get("site_address") or ""),
+        "siteType": row.get("site_type"),
+        "shiftBucket": str(row["shift_bucket"]),
+        "cadence": str(row["cadence"]),
+        "weekdays": [int(value) for value in row["weekdays"]],
+        "localStartTime": _local_time_text(row["local_start_time"]),
+        "localEndTime": _local_time_text(row["local_end_time"]),
+        "startsOn": str(row["starts_on"]),
+        "endsOn": str(ends_on) if ends_on is not None else None,
+        "notes": str(row.get("notes") or ""),
+        "active": bool(row["active"]),
+        "createdAt": _utc_iso(row.get("created_at")),
+        "updatedAt": _utc_iso(row.get("updated_at")),
+    }
+
+
+def _service_schedule_rule_columns() -> str:
+    return """
+        rule.id, rule.location_id, rule.shift_bucket, rule.cadence,
+        rule.weekdays, rule.local_start_time, rule.local_end_time,
+        rule.starts_on, rule.ends_on, rule.notes, rule.active,
+        rule.created_at, rule.updated_at,
+        location.customer_id, location.address AS site_address,
+        location.location_type AS site_type, location.rate,
+        location.rate_type, location.expected_hours AS site_expected_hours,
+        location.active AS site_active,
+        COALESCE(customer.name, location.customer_name, location.address)
+            AS display_customer
+    """
+
+
+def _fetch_service_schedule_rule(
+    cur: Any,
+    rule_id: int,
+    *,
+    lock: bool = False,
+) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        f"""
+        SELECT {_service_schedule_rule_columns()}
+        FROM service_schedule_rules rule
+        JOIN locations location ON location.id = rule.location_id
+        LEFT JOIN customers customer ON customer.id = location.customer_id
+        WHERE rule.id = %s
+        {"FOR UPDATE OF rule" if lock else ""}
+        """,
+        (rule_id,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _find_duplicate_service_schedule_rule(
+    cur: Any,
+    *,
+    location_id: int,
+    shift_bucket: str,
+    cadence: str,
+    weekdays: List[int],
+    local_start_time: time,
+    local_end_time: time,
+    starts_on: date,
+    ends_on: Optional[date],
+    exclude_rule_id: Optional[int] = None,
+) -> Optional[int]:
+    exclude_clause = ""
+    params: List[Any] = [
+        location_id,
+        shift_bucket,
+        cadence,
+        weekdays,
+        local_start_time,
+        local_end_time,
+        starts_on,
+        ends_on,
+    ]
+    if exclude_rule_id is not None:
+        exclude_clause = "AND id <> %s"
+        params.append(exclude_rule_id)
+    cur.execute(
+        f"""
+        SELECT id
+        FROM service_schedule_rules
+        WHERE location_id = %s
+          AND active = true
+          AND shift_bucket = %s
+          AND cadence = %s
+          AND weekdays = %s::smallint[]
+          AND local_start_time = %s
+          AND local_end_time = %s
+          AND starts_on = %s
+          AND ends_on IS NOT DISTINCT FROM %s
+          {exclude_clause}
+        LIMIT 1
+        """,
+        tuple(params),
+    )
+    row = cur.fetchone()
+    return int(row["id"]) if row else None
+
+
+def _rule_active_on(rule: Dict[str, Any], service_day: date) -> bool:
+    starts_on = rule["starts_on"]
+    ends_on = rule.get("ends_on")
+    if service_day < starts_on or (ends_on is not None and service_day > ends_on):
+        return False
+    if service_day.weekday() not in {int(value) for value in rule["weekdays"]}:
+        return False
+    cadence = str(rule["cadence"])
+    if cadence == "weekly":
+        return True
+    if cadence == "biweekly":
+        weeks = (_sunday_for(service_day) - _sunday_for(starts_on)).days // 7
+        return weeks >= 0 and weeks % 2 == 0
+    if cadence == "monthly":
+        month_offset = (
+            (service_day.year - starts_on.year) * 12
+            + service_day.month
+            - starts_on.month
+        )
+        return (
+            month_offset >= 0
+            and (service_day.day - 1) // 7 == (starts_on.day - 1) // 7
+        )
+    return False
+
+
+def _preview_interval(
+    service_day: date,
+    start_time: time,
+    end_time: time,
+    app_timezone: ZoneInfo,
+) -> Tuple[datetime, datetime, bool]:
+    starts_at = datetime.combine(service_day, start_time, tzinfo=app_timezone)
+    end_day = service_day + timedelta(days=1) if end_time <= start_time else service_day
+    ends_at = datetime.combine(end_day, end_time, tzinfo=app_timezone)
+    starts_utc = starts_at.astimezone(timezone.utc)
+    ends_utc = ends_at.astimezone(timezone.utc)
+    start_roundtrip = starts_utc.astimezone(app_timezone)
+    end_roundtrip = ends_utc.astimezone(app_timezone)
+    valid_wall_time = (
+        start_roundtrip.replace(tzinfo=None) == starts_at.replace(tzinfo=None)
+        and end_roundtrip.replace(tzinfo=None) == ends_at.replace(tzinfo=None)
+        and ends_utc > starts_utc
+    )
+    return starts_utc, ends_utc, valid_wall_time
+
+
+def _apply_native_monthly_allocations(rows: List[Dict[str, Any]]) -> None:
+    groups: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row.get("_included_in_forecast") and row.get("rateType") == "monthly":
+            groups[
+                (
+                    int(row["locationId"]),
+                    date.fromisoformat(row["scheduledDate"]).year,
+                    date.fromisoformat(row["scheduledDate"]).month,
+                )
+            ].append(row)
+    for group_rows in groups.values():
+        first = group_rows[0]
+        rate_cents = first.get("_rate_cents")
+        if rate_cents is None:
+            continue
+        allocations = allocate_monthly_cents(
+            int(rate_cents),
+            [int(row["jobId"]) for row in group_rows],
+        )
+        for row in group_rows:
+            row["_revenue_cents"] = allocations.get(int(row["jobId"]))
+
+
+def _native_preview_rows(
+    rules: List[Dict[str, Any]],
+    start_date: date,
+    end_date: date,
+    *,
+    app_timezone: ZoneInfo,
+    avg_hourly_rate: Optional[Decimal],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    service_day = start_date
+    while service_day <= end_date:
+        for rule in rules:
+            if not _rule_active_on(rule, service_day):
+                continue
+            starts_at, ends_at, valid_service_window = _preview_interval(
+                service_day,
+                rule["local_start_time"],
+                rule["local_end_time"],
+                app_timezone,
+            )
+            issues: List[Dict[str, str]] = []
+            if not valid_service_window:
+                issues.append(
+                    _issue(
+                        "invalid_service_window",
+                        "The configured service window does not exist in the local timezone.",
+                    )
+                )
+            expected_hours = (
+                float(rule["site_expected_hours"])
+                if rule.get("site_expected_hours") is not None
+                else None
+            )
+            rate_cents = _money_cents(rule.get("rate"))
+            rate_type = rule.get("rate_type")
+            revenue_cents: MoneyCents = None
+            if valid_service_window and rate_cents is not None:
+                if rate_type == "per_visit":
+                    revenue_cents = rate_cents
+                elif rate_type == "hourly" and expected_hours is not None:
+                    revenue_cents = int(
+                        (Decimal(rate_cents) * Decimal(str(expected_hours))).quantize(
+                            Decimal("1"),
+                            rounding=ROUND_HALF_UP,
+                        )
+                    )
+            labor_cents: MoneyCents = None
+            if (
+                valid_service_window
+                and expected_hours is not None
+                and avg_hourly_rate is not None
+            ):
+                labor_cents = int(
+                    (
+                        avg_hourly_rate
+                        * Decimal(str(expected_hours))
+                        * Decimal(100)
+                    ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                )
+            if expected_hours is None:
+                issues.append(
+                    _issue(
+                        "missing_expected_hours",
+                        "Expected hours are not configured for this Site.",
+                    )
+                )
+            if rate_cents is None:
+                issues.append(
+                    _issue("missing_rate", "A service price is not configured.")
+                )
+            if avg_hourly_rate is None:
+                issues.append(
+                    _issue(
+                        "missing_average_employee_rate",
+                        "No active employee has a configured hourly rate.",
+                    )
+                )
+            row_number = len(rows) + 1
+            net_cents = (
+                revenue_cents - labor_cents
+                if revenue_cents is not None and labor_cents is not None
+                else None
+            )
+            rows.append(
+                {
+                    "jobId": row_number,
+                    "projectionId": f"rule-{int(rule['id'])}:{service_day}",
+                    "ruleId": int(rule["id"]),
+                    "locationId": int(rule["location_id"]),
+                    "customerId": (
+                        int(rule["customer_id"])
+                        if rule.get("customer_id") is not None
+                        else None
+                    ),
+                    "customerName": str(rule.get("display_customer") or ""),
+                    "siteAddress": str(rule.get("site_address") or ""),
+                    "siteType": rule.get("site_type"),
+                    "shiftBucket": str(rule["shift_bucket"]),
+                    "cadence": str(rule["cadence"]),
+                    "rateType": rate_type,
+                    "scheduledDate": str(service_day),
+                    "scheduledStart": _utc_iso(starts_at),
+                    "scheduledEnd": _utc_iso(ends_at),
+                    "plannedHours": expected_hours,
+                    "estRevenue": _money(revenue_cents),
+                    "estLaborCost": _money(labor_cents),
+                    "estNetProfit": _money(net_cents),
+                    "estMarginPct": (
+                        round(net_cents / revenue_cents * 100, 1)
+                        if net_cents is not None
+                        and revenue_cents is not None
+                        and revenue_cents > 0
+                        else None
+                    ),
+                    "estLaborPct": (
+                        round(labor_cents / revenue_cents * 100, 1)
+                        if labor_cents is not None
+                        and revenue_cents is not None
+                        and revenue_cents > 0
+                        else None
+                    ),
+                    "issues": issues,
+                    "_included_in_forecast": valid_service_window,
+                    "_rate_cents": rate_cents,
+                    "_revenue_cents": revenue_cents,
+                    "_labor_cents": labor_cents,
+                }
+            )
+        service_day += timedelta(days=1)
+    _apply_native_monthly_allocations(rows)
+    for row in rows:
+        if row.get("rateType") == "monthly":
+            revenue_cents = row.get("_revenue_cents")
+            labor_cents = row.get("_labor_cents")
+            net_cents = (
+                revenue_cents - labor_cents
+                if revenue_cents is not None and labor_cents is not None
+                else None
+            )
+            row["estRevenue"] = _money(revenue_cents)
+            row["estNetProfit"] = _money(net_cents)
+            row["estMarginPct"] = (
+                round(net_cents / revenue_cents * 100, 1)
+                if net_cents is not None and revenue_cents and revenue_cents > 0
+                else None
+            )
+            row["estLaborPct"] = (
+                round(labor_cents / revenue_cents * 100, 1)
+                if labor_cents is not None and revenue_cents and revenue_cents > 0
+                else None
+            )
+    return rows
 
 
 def allocate_monthly_cents(
@@ -5555,9 +5955,373 @@ def build_operations_schedule_router(
     timezone_name: str = "America/Chicago",
     now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     timesheet_advisory_lock_id: int,
+    append_access_log: Optional[Callable[[Request, str, bool, str], None]] = None,
 ) -> APIRouter:
     router = APIRouter()
     app_timezone = ZoneInfo(timezone_name)
+
+    @router.get("/api/admin/operations/service-schedule-rules")
+    def service_schedule_rules(
+        location_id: Optional[int] = Query(default=None, gt=0),
+        include_inactive: bool = Query(default=False),
+        _: Dict[str, Any] = Depends(get_current_admin),
+    ) -> Dict[str, Any]:
+        clauses = []
+        params: List[Any] = []
+        if location_id is not None:
+            clauses.append("rule.location_id = %s")
+            params.append(location_id)
+        if not include_inactive:
+            clauses.append("rule.active = true")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = db.query_all(
+            f"""
+            SELECT {_service_schedule_rule_columns()}
+            FROM service_schedule_rules rule
+            JOIN locations location ON location.id = rule.location_id
+            LEFT JOIN customers customer ON customer.id = location.customer_id
+            {where}
+            ORDER BY location.address, rule.starts_on, rule.local_start_time, rule.id
+            """,
+            tuple(params),
+        )
+        return {
+            "success": True,
+            "rules": [_serialize_service_schedule_rule(dict(row)) for row in rows],
+        }
+
+    @router.post("/api/admin/operations/service-schedule-rules", status_code=201)
+    def create_service_schedule_rule(
+        payload: ServiceScheduleRuleCreateRequest,
+        request: Request,
+        admin: Dict[str, Any] = Depends(get_current_admin),
+    ) -> Dict[str, Any]:
+        weekdays = _normalize_weekdays(payload.weekdays)
+        _validate_service_rule_times(payload.localStartTime, payload.localEndTime)
+        if payload.endsOn is not None and payload.endsOn < payload.startsOn:
+            raise HTTPException(
+                status_code=422,
+                detail="endsOn must be on or after startsOn",
+            )
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, active
+                    FROM locations
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (payload.locationId,),
+                )
+                site = cur.fetchone()
+                if not site or not bool(site["active"]):
+                    raise HTTPException(status_code=404, detail="Active Site not found")
+                if payload.active and _find_duplicate_service_schedule_rule(
+                    cur,
+                    location_id=payload.locationId,
+                    shift_bucket=payload.shiftBucket,
+                    cadence=payload.cadence,
+                    weekdays=weekdays,
+                    local_start_time=payload.localStartTime,
+                    local_end_time=payload.localEndTime,
+                    starts_on=payload.startsOn,
+                    ends_on=payload.endsOn,
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Active service schedule rule already exists",
+                    )
+                cur.execute(
+                    """
+                    INSERT INTO service_schedule_rules (
+                        location_id, shift_bucket, cadence, weekdays,
+                        local_start_time, local_end_time, starts_on, ends_on,
+                        notes, active, created_by, updated_by
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        payload.locationId,
+                        payload.shiftBucket,
+                        payload.cadence,
+                        weekdays,
+                        payload.localStartTime,
+                        payload.localEndTime,
+                        payload.startsOn,
+                        payload.endsOn,
+                        payload.notes.strip(),
+                        payload.active,
+                        int(admin["id"]),
+                        int(admin["id"]),
+                    ),
+                )
+                rule_id = int(cur.fetchone()["id"])
+                rule = _fetch_service_schedule_rule(cur, rule_id)
+        if append_access_log is not None:
+            append_access_log(
+                request,
+                "SERVICE_SCHEDULE_RULE_CREATED",
+                True,
+                f"Service schedule rule {rule_id} by {admin['name']}",
+            )
+        return {
+            "success": True,
+            "rule": _serialize_service_schedule_rule(rule),
+        }
+
+    @router.patch("/api/admin/operations/service-schedule-rules/{rule_id}")
+    def update_service_schedule_rule(
+        rule_id: int,
+        payload: ServiceScheduleRuleUpdateRequest,
+        request: Request,
+        admin: Dict[str, Any] = Depends(get_current_admin),
+    ) -> Dict[str, Any]:
+        updates: List[str] = []
+        params: List[Any] = []
+        supplied_fields = getattr(payload, "model_fields_set", None)
+        if supplied_fields is None:
+            supplied_fields = getattr(payload, "__fields_set__", set())
+        if payload.shiftBucket is not None:
+            updates.append("shift_bucket = %s")
+            params.append(payload.shiftBucket)
+        if payload.cadence is not None:
+            updates.append("cadence = %s")
+            params.append(payload.cadence)
+        if payload.weekdays is not None:
+            updates.append("weekdays = %s")
+            params.append(_normalize_weekdays(payload.weekdays))
+        if payload.localStartTime is not None:
+            updates.append("local_start_time = %s")
+            params.append(payload.localStartTime)
+        if payload.localEndTime is not None:
+            updates.append("local_end_time = %s")
+            params.append(payload.localEndTime)
+        if payload.startsOn is not None:
+            updates.append("starts_on = %s")
+            params.append(payload.startsOn)
+        if "endsOn" in supplied_fields:
+            updates.append("ends_on = %s")
+            params.append(payload.endsOn)
+        if payload.notes is not None:
+            updates.append("notes = %s")
+            params.append(payload.notes.strip())
+        if payload.active is not None:
+            updates.append("active = %s")
+            params.append(payload.active)
+        if not updates:
+            raise HTTPException(status_code=422, detail="No rule fields supplied")
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                existing = _fetch_service_schedule_rule(cur, rule_id, lock=True)
+                if not existing:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Service schedule rule not found",
+                    )
+                cur.execute(
+                    """
+                    SELECT active
+                    FROM locations
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (existing["location_id"],),
+                )
+                site = cur.fetchone()
+                site_active = bool(site and site["active"])
+                starts_on = payload.startsOn or existing["starts_on"]
+                ends_on = payload.endsOn if "endsOn" in supplied_fields else existing.get("ends_on")
+                if ends_on is not None and ends_on < starts_on:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="endsOn must be on or after startsOn",
+                    )
+                final_start_time = payload.localStartTime or existing["local_start_time"]
+                final_end_time = payload.localEndTime or existing["local_end_time"]
+                activates_rule = payload.active is True
+                final_active = bool(payload.active) if payload.active is not None else bool(existing["active"])
+                if (
+                    final_active
+                    or payload.localStartTime is not None
+                    or payload.localEndTime is not None
+                ):
+                    _validate_service_rule_times(final_start_time, final_end_time)
+                if activates_rule and not site_active:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Cannot activate a service schedule rule for an archived Site",
+                    )
+                final_weekdays = (
+                    _normalize_weekdays(payload.weekdays)
+                    if payload.weekdays is not None
+                    else [int(value) for value in existing["weekdays"]]
+                )
+                if final_active and _find_duplicate_service_schedule_rule(
+                    cur,
+                    location_id=int(existing["location_id"]),
+                    shift_bucket=payload.shiftBucket or str(existing["shift_bucket"]),
+                    cadence=payload.cadence or str(existing["cadence"]),
+                    weekdays=final_weekdays,
+                    local_start_time=final_start_time,
+                    local_end_time=final_end_time,
+                    starts_on=starts_on,
+                    ends_on=ends_on,
+                    exclude_rule_id=rule_id,
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Active service schedule rule already exists",
+                    )
+                updates.extend(["updated_by = %s", "updated_at = NOW()"])
+                params.extend([int(admin["id"]), rule_id])
+                cur.execute(
+                    f"""
+                    UPDATE service_schedule_rules
+                    SET {', '.join(updates)}
+                    WHERE id = %s
+                    """,
+                    tuple(params),
+                )
+                rule = _fetch_service_schedule_rule(cur, rule_id)
+        if append_access_log is not None:
+            append_access_log(
+                request,
+                "SERVICE_SCHEDULE_RULE_UPDATED",
+                True,
+                f"Service schedule rule {rule_id} by {admin['name']}",
+            )
+        return {
+            "success": True,
+            "rule": _serialize_service_schedule_rule(rule),
+        }
+
+    @router.post("/api/admin/operations/native-schedule-preview")
+    def native_schedule_preview(
+        payload: NativeSchedulePreviewRequest,
+        _: Dict[str, Any] = Depends(get_current_admin),
+    ) -> Dict[str, Any]:
+        if payload.endDate < payload.startDate:
+            raise HTTPException(
+                status_code=400,
+                detail="endDate must be on or after startDate",
+            )
+        if (payload.endDate - payload.startDate).days > 120:
+            raise HTTPException(
+                status_code=400,
+                detail="Native schedule preview is limited to 121 days",
+            )
+        allocation_start = date(payload.startDate.year, payload.startDate.month, 1)
+        allocation_end = _month_end(payload.endDate)
+        rules = db.query_all(
+            f"""
+            SELECT {_service_schedule_rule_columns()}
+            FROM service_schedule_rules rule
+            JOIN locations location ON location.id = rule.location_id
+            LEFT JOIN customers customer ON customer.id = location.customer_id
+            WHERE rule.active = true
+              AND location.active = true
+              AND rule.starts_on <= %s
+              AND (rule.ends_on IS NULL OR rule.ends_on >= %s)
+            ORDER BY location.address, rule.local_start_time, rule.id
+            """,
+            (allocation_end, allocation_start),
+        )
+        wage_rows = db.query_all(
+            """
+            SELECT hourly_rate
+            FROM employees
+            WHERE active = true AND role = 'employee'
+            """
+        )
+        wages = [
+            Decimal(str(row["hourly_rate"]))
+            for row in wage_rows
+            if row.get("hourly_rate") is not None
+        ]
+        avg_hourly_rate = sum(wages) / Decimal(len(wages)) if wages else None
+        global_issues: List[Dict[str, str]] = []
+        missing_wages = len(wage_rows) - len(wages)
+        if not wages:
+            global_issues.append(
+                _issue(
+                    "missing_average_employee_rate",
+                    "No active employee has a configured hourly rate.",
+                )
+            )
+        elif missing_wages:
+            global_issues.append(
+                _issue(
+                    "employees_missing_rates",
+                    f"{missing_wages} active employee account(s) have no hourly rate.",
+                )
+            )
+        allocated_rows = _native_preview_rows(
+            [dict(row) for row in rules],
+            allocation_start,
+            allocation_end,
+            app_timezone=app_timezone,
+            avg_hourly_rate=avg_hourly_rate,
+        )
+        preview_rows = [
+            row
+            for row in allocated_rows
+            if payload.startDate <= date.fromisoformat(row["scheduledDate"]) <= payload.endDate
+        ]
+        weeks: List[Dict[str, Any]] = []
+        first_week = _sunday_for(payload.startDate)
+        last_week = _sunday_for(payload.endDate)
+        week_start = first_week
+        while week_start <= last_week:
+            week_end = week_start + timedelta(days=6)
+            week_rows = [
+                row
+                for row in preview_rows
+                if week_start
+                <= date.fromisoformat(row["scheduledDate"])
+                <= week_end
+            ]
+            by_site_rows: Dict[Optional[int], List[Dict[str, Any]]] = defaultdict(list)
+            for row in week_rows:
+                by_site_rows[row.get("locationId")].append(row)
+            weeks.append(
+                {
+                    "weekStart": str(week_start),
+                    "weekEnd": str(week_end),
+                    **_aggregate_forecast_rows(week_rows),
+                    "bySite": [
+                        {
+                            "locationId": location_id,
+                            "customerId": site_rows[0].get("customerId"),
+                            "customerName": site_rows[0].get("customerName"),
+                            "siteAddress": site_rows[0].get("siteAddress"),
+                            **_aggregate_forecast_rows(site_rows),
+                        }
+                        for location_id, site_rows in sorted(
+                            by_site_rows.items(),
+                            key=lambda item: (
+                                str(item[1][0].get("customerName") or "").casefold(),
+                                str(item[1][0].get("siteAddress") or "").casefold(),
+                            ),
+                        )
+                    ],
+                    "jobs": [_public_forecast_job(row) for row in week_rows],
+                }
+            )
+            week_start += timedelta(days=7)
+        return {
+            "success": True,
+            "mode": "shadow",
+            "timezone": timezone_name,
+            "startDate": str(payload.startDate),
+            "endDate": str(payload.endDate),
+            "ruleCount": len(rules),
+            "issues": global_issues,
+            "summary": _aggregate_forecast_rows(preview_rows),
+            "weeks": weeks,
+            "jobs": [_public_forecast_job(row) for row in preview_rows],
+        }
 
     @router.get("/api/admin/operations/schedule")
     def operations_schedule(
