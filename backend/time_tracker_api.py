@@ -24486,6 +24486,7 @@ app.include_router(
         get_current_admin=get_current_admin,
         timezone_name=TIMEZONE_NAME,
         timesheet_advisory_lock_id=TIMESHEET_PG_ADVISORY_LOCK_ID,
+        append_access_log=append_access_log,
     )
 )
 

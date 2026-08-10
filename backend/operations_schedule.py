@@ -19,7 +19,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import db
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 import psycopg2.extras
 from pydantic import BaseModel, Field
 
@@ -425,6 +425,55 @@ def _fetch_service_schedule_rule(
     )
     row = cur.fetchone()
     return dict(row) if row else None
+
+
+def _find_duplicate_service_schedule_rule(
+    cur: Any,
+    *,
+    location_id: int,
+    shift_bucket: str,
+    cadence: str,
+    weekdays: List[int],
+    local_start_time: time,
+    local_end_time: time,
+    starts_on: date,
+    ends_on: Optional[date],
+    exclude_rule_id: Optional[int] = None,
+) -> Optional[int]:
+    exclude_clause = ""
+    params: List[Any] = [
+        location_id,
+        shift_bucket,
+        cadence,
+        weekdays,
+        local_start_time,
+        local_end_time,
+        starts_on,
+        ends_on,
+    ]
+    if exclude_rule_id is not None:
+        exclude_clause = "AND id <> %s"
+        params.append(exclude_rule_id)
+    cur.execute(
+        f"""
+        SELECT id
+        FROM service_schedule_rules
+        WHERE location_id = %s
+          AND active = true
+          AND shift_bucket = %s
+          AND cadence = %s
+          AND weekdays = %s::smallint[]
+          AND local_start_time = %s
+          AND local_end_time = %s
+          AND starts_on = %s
+          AND ends_on IS NOT DISTINCT FROM %s
+          {exclude_clause}
+        LIMIT 1
+        """,
+        tuple(params),
+    )
+    row = cur.fetchone()
+    return int(row["id"]) if row else None
 
 
 def _rule_active_on(rule: Dict[str, Any], service_day: date) -> bool:
@@ -5868,6 +5917,7 @@ def build_operations_schedule_router(
     timezone_name: str = "America/Chicago",
     now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     timesheet_advisory_lock_id: int,
+    append_access_log: Optional[Callable[[Request, str, bool, str], None]] = None,
 ) -> APIRouter:
     router = APIRouter()
     app_timezone = ZoneInfo(timezone_name)
@@ -5905,6 +5955,7 @@ def build_operations_schedule_router(
     @router.post("/api/admin/operations/service-schedule-rules", status_code=201)
     def create_service_schedule_rule(
         payload: ServiceScheduleRuleCreateRequest,
+        request: Request,
         admin: Dict[str, Any] = Depends(get_current_admin),
     ) -> Dict[str, Any]:
         weekdays = _normalize_weekdays(payload.weekdays)
@@ -5920,13 +5971,28 @@ def build_operations_schedule_router(
                     SELECT id, active
                     FROM locations
                     WHERE id = %s
-                    FOR SHARE
+                    FOR UPDATE
                     """,
                     (payload.locationId,),
                 )
                 site = cur.fetchone()
                 if not site or not bool(site["active"]):
                     raise HTTPException(status_code=404, detail="Active Site not found")
+                if payload.active and _find_duplicate_service_schedule_rule(
+                    cur,
+                    location_id=payload.locationId,
+                    shift_bucket=payload.shiftBucket,
+                    cadence=payload.cadence,
+                    weekdays=weekdays,
+                    local_start_time=payload.localStartTime,
+                    local_end_time=payload.localEndTime,
+                    starts_on=payload.startsOn,
+                    ends_on=payload.endsOn,
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Active service schedule rule already exists",
+                    )
                 cur.execute(
                     """
                     INSERT INTO service_schedule_rules (
@@ -5954,6 +6020,13 @@ def build_operations_schedule_router(
                 )
                 rule_id = int(cur.fetchone()["id"])
                 rule = _fetch_service_schedule_rule(cur, rule_id)
+        if append_access_log is not None:
+            append_access_log(
+                request,
+                "SERVICE_SCHEDULE_RULE_CREATED",
+                True,
+                f"Service schedule rule {rule_id} by {admin['name']}",
+            )
         return {
             "success": True,
             "rule": _serialize_service_schedule_rule(rule),
@@ -5963,6 +6036,7 @@ def build_operations_schedule_router(
     def update_service_schedule_rule(
         rule_id: int,
         payload: ServiceScheduleRuleUpdateRequest,
+        request: Request,
         admin: Dict[str, Any] = Depends(get_current_admin),
     ) -> Dict[str, Any]:
         updates: List[str] = []
@@ -6014,6 +6088,34 @@ def build_operations_schedule_router(
                         status_code=422,
                         detail="endsOn must be on or after startsOn",
                     )
+                activates_rule = payload.active is True
+                final_active = bool(payload.active) if payload.active is not None else bool(existing["active"])
+                if activates_rule and not bool(existing.get("site_active")):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Cannot activate a service schedule rule for an archived Site",
+                    )
+                final_weekdays = (
+                    _normalize_weekdays(payload.weekdays)
+                    if payload.weekdays is not None
+                    else [int(value) for value in existing["weekdays"]]
+                )
+                if final_active and _find_duplicate_service_schedule_rule(
+                    cur,
+                    location_id=int(existing["location_id"]),
+                    shift_bucket=payload.shiftBucket or str(existing["shift_bucket"]),
+                    cadence=payload.cadence or str(existing["cadence"]),
+                    weekdays=final_weekdays,
+                    local_start_time=payload.localStartTime or existing["local_start_time"],
+                    local_end_time=payload.localEndTime or existing["local_end_time"],
+                    starts_on=starts_on,
+                    ends_on=ends_on,
+                    exclude_rule_id=rule_id,
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Active service schedule rule already exists",
+                    )
                 updates.extend(["updated_by = %s", "updated_at = NOW()"])
                 params.extend([int(admin["id"]), rule_id])
                 cur.execute(
@@ -6025,6 +6127,13 @@ def build_operations_schedule_router(
                     tuple(params),
                 )
                 rule = _fetch_service_schedule_rule(cur, rule_id)
+        if append_access_log is not None:
+            append_access_log(
+                request,
+                "SERVICE_SCHEDULE_RULE_UPDATED",
+                True,
+                f"Service schedule rule {rule_id} by {admin['name']}",
+            )
         return {
             "success": True,
             "rule": _serialize_service_schedule_rule(rule),

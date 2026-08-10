@@ -742,6 +742,166 @@ def test_native_site_schedule_rule_patch_deactivates_preview(client, auth):
     assert preview.json()["jobs"] == []
 
 
+def test_native_site_schedule_rule_create_rejects_duplicate_active_definition(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Duplicate Rule",
+                site_type="Commercial",
+                rate=180,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+    payload = {
+        "locationId": site_id,
+        "shiftBucket": "evening",
+        "cadence": "weekly",
+        "weekdays": [0],
+        "localStartTime": "18:00",
+        "localEndTime": "20:00",
+        "startsOn": str(service_day),
+    }
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json=payload,
+    )
+    assert created.status_code == 201, created.text
+
+    duplicate = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json=payload,
+    )
+    assert duplicate.status_code == 409, duplicate.text
+
+    preview = client.post(
+        "/api/admin/operations/native-schedule-preview",
+        headers=auth,
+        json={"startDate": str(service_day), "endDate": str(service_day)},
+    )
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["summary"]["jobCount"] == 1
+    assert len(body["jobs"]) == 1
+
+
+def test_native_site_schedule_rule_patch_rejects_archived_site_reactivation(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Archived Reactivation",
+                site_type="Commercial",
+                rate=180,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "evening",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "18:00",
+            "localEndTime": "20:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+    rule_id = created.json()["rule"]["id"]
+    db.execute(
+        """
+        UPDATE locations
+        SET active = false, archived_at = NOW()
+        WHERE id = %s
+        """,
+        (site_id,),
+    )
+    deactivated = client.patch(
+        f"/api/admin/operations/service-schedule-rules/{rule_id}",
+        headers=auth,
+        json={"active": False},
+    )
+    assert deactivated.status_code == 200, deactivated.text
+
+    reactivated = client.patch(
+        f"/api/admin/operations/service-schedule-rules/{rule_id}",
+        headers=auth,
+        json={"active": True},
+    )
+    assert reactivated.status_code == 409, reactivated.text
+    assert db.query_one(
+        "SELECT active FROM service_schedule_rules WHERE id = %s",
+        (rule_id,),
+    ) == {"active": False}
+
+
+def test_native_site_schedule_rule_mutations_are_access_logged(client, auth):
+    service_day = date(2026, 7, 20)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Rule Audit",
+                site_type="Commercial",
+                rate=180,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "08:30",
+            "localEndTime": "11:30",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+    rule_id = created.json()["rule"]["id"]
+    updated = client.patch(
+        f"/api/admin/operations/service-schedule-rules/{rule_id}",
+        headers=auth,
+        json={"notes": "Owner confirmed schedule"},
+    )
+    assert updated.status_code == 200, updated.text
+
+    actions = [
+        row["action"]
+        for row in db.query_all(
+            """
+            SELECT action
+            FROM access_log_entries
+            WHERE action IN (
+                'SERVICE_SCHEDULE_RULE_CREATED',
+                'SERVICE_SCHEDULE_RULE_UPDATED'
+            )
+            ORDER BY id
+            """
+        )
+    ]
+    assert actions == [
+        "SERVICE_SCHEDULE_RULE_CREATED",
+        "SERVICE_SCHEDULE_RULE_UPDATED",
+    ]
+
+
 def _job(
     cur,
     *,
