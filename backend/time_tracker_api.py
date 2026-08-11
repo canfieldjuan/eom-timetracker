@@ -15180,7 +15180,11 @@ def _fetch_known_contacts(
             not isinstance(known_ids, list)
             or not isinstance(checked, int)
             or isinstance(checked, bool)
-            or checked < len(batch)
+            # Equality, not >=. ATLAS #2358 sets checked = len(requested) after
+            # de-duplicating, and `batch` is already distinct, so the two must
+            # match exactly. A HIGHER count means the server saw more ids than
+            # we sent -- the request did not arrive as issued.
+            or checked != len(batch)
             or not {str(value) for value in known_ids} <= requested
         ):
             # A 200 that omits knownContactIds or under-reports the count cannot

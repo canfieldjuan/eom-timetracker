@@ -1597,3 +1597,38 @@ def test_an_unrequested_id_is_an_id_level_fault_for_the_audit_too(
     # Withheld, not falsely clean: the list is empty BECAUSE it degraded.
     assert body["danglingLinks"] == []
     assert dangling_customer  # planted; the point is the status, not the row
+
+
+def test_a_response_reporting_more_checked_than_we_sent_is_rejected(
+    client, auth, monkeypatch
+):
+    """checked must EQUAL the batch size, not merely meet it.
+
+    ATLAS #2358 sets checked = len(requested) after de-duplicating, and the
+    batch we send is already distinct, so a higher count means the server saw
+    ids we did not send -- the request did not arrive as issued. No current
+    code reads `checked` downstream, so this is detection rather than a fix
+    for a live failure path.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Inflated Checked", contact)
+    _set_type(customer, "commercial")
+
+    def _inflated(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {"knownContactIds": submitted,
+                               "checked": len(submitted) + 7,
+                               "limit": 100,
+                               "customerTypes": {v: "residential" for v in submitted}})
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _inflated)
+    assert client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).status_code == 503
+    assert _get_type(customer) == "commercial"
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert body["atlasLinkVerification"]["status"] == "unavailable"
