@@ -491,12 +491,12 @@ def test_a_relink_in_flight_stops_the_mirror_write(client, auth, monkeypatch):
 
 
 def test_an_aba_transition_is_detected(client, auth, monkeypatch):
-    """A value-only compare cannot see an intermediate state.
+    """A value round-trip must not let a stale answer through.
 
-    From unknown: this request sets Atlas commercial and stalls; two others
-    move the row to residential and back to unknown. Comparing values alone
-    matches `unknown` again and writes the stale commercial. updated_at moves
-    on every write, so the compare fails even when the value returns.
+    From unknown: this request sets Atlas commercial and stalls; others move
+    the row to residential and back to unknown, carrying LATER Atlas versions.
+    A value-only compare would match `unknown` again and write the stale
+    commercial. Version ordering refuses it regardless of the value returning.
     """
     contact = str(uuid.uuid4())
     customer = _customer("ABA", contact, "unknown")
@@ -507,18 +507,18 @@ def test_an_aba_transition_is_detected(client, auth, monkeypatch):
             churned["done"] = True
             # Away and back again, landing on the ORIGINAL value.
             db.execute(
-                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
-                "WHERE id = %s",
-                ("residential", customer),
+                "UPDATE customers SET customer_type = %s, "
+                "customer_type_source_at = %s, updated_at = NOW() WHERE id = %s",
+                ("residential", "2026-08-11T12:09:00+00:00", customer),
             )
             db.execute(
-                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
-                "WHERE id = %s",
-                ("unknown", customer),
+                "UPDATE customers SET customer_type = %s, "
+                "customer_type_source_at = %s, updated_at = NOW() WHERE id = %s",
+                ("unknown", "2026-08-11T12:09:30+00:00", customer),
             )
-        # No Atlas version, so ordering has to be inferred locally -- this is
-        # the branch the updated_at compare exists for.
-        return _atlas_echoing("commercial", updated_at=None)(
+        # This request's answer carries an EARLIER version than the churn.
+        return _atlas_echoing("commercial",
+                              updated_at="2026-08-11T12:08:00+00:00")(
             url, headers=headers, json=json, timeout=timeout
         )
 
@@ -670,11 +670,18 @@ def test_a_repeat_of_the_same_atlas_version_is_not_applied_twice(
     assert _type_of(customer) == "commercial"
 
 
-def test_an_atlas_without_a_version_still_applies(client, auth, monkeypatch):
-    """An older Atlas reports no updatedAt; the route must not stop working.
+def test_a_response_without_a_version_is_refused(client, auth, monkeypatch):
+    """No version means the response does not meet the contract.
 
-    No ordering information is not the same as being out of order. The write
-    still applies, and the stored token is left as it was rather than cleared.
+    This reverses an earlier decision to apply anyway on the theory that an
+    older Atlas might omit updatedAt. It cannot: the field entered the response
+    in the same commit that created the operator mutation contract (ATLAS
+    eaade0b0f), and this route already refuses when Atlas does not advertise
+    contact.operator_mutation.
+
+    Falling back to local ordering is not weaker-but-safe, it is wrong -- two
+    answers arriving in the opposite order Atlas applied them are
+    indistinguishable without the authority's version.
     """
     contact = str(uuid.uuid4())
     customer = _customer("No Version", contact, "unknown")
@@ -683,8 +690,8 @@ def test_an_atlas_without_a_version_still_applies(client, auth, monkeypatch):
 
     resp = client.patch(_path(customer), headers=auth,
                         json={"customerType": "commercial"})
-    assert resp.status_code == 200, resp.text
-    assert _type_of(customer) == "commercial"
+    assert resp.status_code == 502, resp.text
+    assert _type_of(customer) == "unknown"
 
 
 def test_siblings_carry_the_atlas_version_too(client, auth, monkeypatch):

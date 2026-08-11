@@ -13275,6 +13275,29 @@ def _apply_customer_type_change(
         )
 
     source_at = _customer_type_source_at_from_operator_result(atlas_result)
+    if source_at is None:
+        # A response with no usable updatedAt does not meet the contract, so it
+        # is refused rather than fallen back on.
+        #
+        # This reverses the round-5 decision to apply anyway on the theory that
+        # an older Atlas might legitimately omit the field. It cannot: updatedAt
+        # entered the response in the SAME commit that created the operator
+        # mutation contract (ATLAS eaade0b0f, #2313), and this route already
+        # refuses when Atlas does not advertise contact.operator_mutation. Any
+        # Atlas that passes that gate reports a version.
+        #
+        # Inferring order locally instead is not a weaker-but-safe fallback, it
+        # is wrong: without the authority's version, two answers that arrive in
+        # the opposite order Atlas applied them cannot be told apart, and the
+        # mirror keeps whichever landed first.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Atlas did not report a version for this contact; nothing was "
+                "changed locally. Re-check the contact in Atlas."
+            ),
+        )
+
     confirmed = _customer_type_from_operator_result(atlas_result)
     if confirmed is None:
         # Atlas did not echo a type it would itself accept, so this cannot be
@@ -13342,48 +13365,36 @@ def _apply_customer_type_change(
             # identity, not ordering -- Atlas answered about the contact this row
             # held, and if the row now points elsewhere the answer is about a
             # different account.
-            if source_at is not None:
-                cur.execute(
-                    "UPDATE customers SET customer_type = %s, "
-                    "customer_type_source_at = %s, updated_at = NOW() "
-                    "WHERE id = %s "
-                    "AND atlas_contact_id IS NOT DISTINCT FROM %s "
-                    "AND (customer_type_source_at IS NULL "
-                    "     OR customer_type_source_at < %s) "
-                    "RETURNING id",
-                    (confirmed, source_at, customer_id, contact_id, source_at),
-                )
-                stale_detail = (
-                    "A newer change to this Customer's type has already been "
-                    "recorded, or its Atlas link moved; Atlas was updated but "
-                    "this answer was not applied locally."
-                )
-            else:
-                # No version from Atlas, so ordering has to be inferred locally.
-                # updated_at is in the compare because comparing values alone
-                # cannot see an ABA transition -- away and back to the value
-                # this request read.
-                cur.execute(
-                    "UPDATE customers SET customer_type = %s, updated_at = NOW() "
-                    "WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s "
-                    "AND atlas_contact_id IS NOT DISTINCT FROM %s "
-                    "AND updated_at IS NOT DISTINCT FROM %s "
-                    "RETURNING id",
-                    (
-                        confirmed,
-                        customer_id,
-                        existing["customer_type"],
-                        contact_id,
-                        existing["updated_at"],
+            # One ordering rule, from the authority. There is no local-ordering
+            # fallback: a response without a version is refused above, because
+            # inferring order locally cannot distinguish two answers that
+            # arrived in the opposite order Atlas applied them.
+            #
+            # The link compare is identity, not ordering -- Atlas answered about
+            # the contact this row held, and if the row now points elsewhere the
+            # answer is about a different account. It is deliberately NOT joined
+            # by a compare on customer_type or updated_at: a strictly newer
+            # Atlas version must supersede a stale local snapshot, or a request
+            # Atlas applied second would lose to one it applied first.
+            cur.execute(
+                "UPDATE customers SET customer_type = %s, "
+                "customer_type_source_at = %s, updated_at = NOW() "
+                "WHERE id = %s "
+                "AND atlas_contact_id IS NOT DISTINCT FROM %s "
+                "AND (customer_type_source_at IS NULL "
+                "     OR customer_type_source_at < %s) "
+                "RETURNING id",
+                (confirmed, source_at, customer_id, contact_id, source_at),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "A newer change to this Customer's type has already "
+                        "been recorded, or its Atlas link moved; Atlas was "
+                        "updated but this answer was not applied locally."
                     ),
                 )
-                stale_detail = (
-                    "This Customer's type changed while the request was in "
-                    "flight; Atlas was updated but the local record was not. "
-                    "Re-check it and try again."
-                )
-            if cur.fetchone() is None:
-                raise HTTPException(status_code=409, detail=stale_detail)
             # One Atlas contact can be held by several customers -- the linkage
             # audit reports exactly these duplicate groups, and there are live
             # ones. They all mirror the SAME account, so leaving the siblings
