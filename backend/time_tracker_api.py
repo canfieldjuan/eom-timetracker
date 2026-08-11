@@ -3371,6 +3371,15 @@ def _atlas_funnel_request(
     return content
 
 
+# GET reads Atlas allows through the funnel credential. Kept as an explicit
+# allow-list, not an open passthrough: a caller that could read any funnel path
+# would turn this EOM-scoped token into a broad read oracle. known-contacts
+# (ATLAS #2352) is id-only link verification, added for the write-boundary audit.
+_ATLAS_FUNNEL_READ_PATHS = frozenset(
+    {"/eom-funnel/leads", "/eom-funnel/known-contacts"}
+)
+
+
 def _atlas_funnel_read(
     path: str,
     admin: Dict[str, Any],
@@ -3379,7 +3388,7 @@ def _atlas_funnel_read(
 ) -> Dict[str, Any]:
     """Read Atlas EOM funnel state without exposing the service credential."""
     _require_atlas_funnel_configuration()
-    if path != "/eom-funnel/leads":
+    if path not in _ATLAS_FUNNEL_READ_PATHS:
         raise RuntimeError("Invalid EOM funnel read path")
     headers = {
         "Authorization": f"Bearer {ATLAS_FUNNEL_SERVICE_TOKEN}",
@@ -15017,9 +15026,85 @@ def admin_apply_time_data_correction(
 # actually been missing.
 STALE_CUSTOMER_RESERVATION_MINUTES = 60
 
+# ATLAS #2352: verify that a stored customers.atlas_contact_id still names a live
+# EOM contact. The endpoint answers id-only and caps one request at 100 ids.
+_KNOWN_CONTACTS_PATH = "/eom-funnel/known-contacts"
+_KNOWN_CONTACTS_BATCH = 100
 
-def build_atlas_linkage_audit() -> Dict[str, Any]:
-    """Report Customer <-> Atlas contact linkage integrity without writes."""
+
+def _verify_atlas_contact_links(
+    admin: Dict[str, Any],
+    linked_rows: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Reconcile linked customers against live Atlas contacts (read-only).
+
+    A non-null atlas_contact_id only proves the tracker once wrote *something*;
+    a bypass or a stale write can leave it pointing at a UUID Atlas never
+    issued, and a NULL check can never see that. This asks Atlas which stored
+    ids still name a live EOM contact and returns the customers whose link
+    resolves to nothing. Being unable to ask -- Atlas unconfigured or
+    unreachable -- is reported as a non-ok status, never as a clean result, so
+    a consumer cannot mistake "could not verify" for "verified clean".
+    """
+    # One id can be held by several customers (a duplicate); verify the distinct
+    # id set once and fan the verdict back out to every customer that holds it.
+    customers_by_contact: Dict[str, List[Dict[str, Any]]] = {}
+    for row in linked_rows:
+        customers_by_contact.setdefault(str(row["atlas_contact_id"]), []).append(row)
+    distinct_ids = list(customers_by_contact)
+
+    if not distinct_ids:
+        return [], {"status": "ok", "checked": 0, "error": None}
+    if not (ATLAS_FUNNEL_BASE_URL and ATLAS_FUNNEL_SERVICE_TOKEN):
+        return [], {
+            "status": "unconfigured",
+            "checked": 0,
+            "error": "Atlas funnel base URL or service token is not configured",
+        }
+
+    known = set()
+    for start in range(0, len(distinct_ids), _KNOWN_CONTACTS_BATCH):
+        batch = distinct_ids[start : start + _KNOWN_CONTACTS_BATCH]
+        try:
+            body = _atlas_funnel_read(
+                _KNOWN_CONTACTS_PATH, admin, params={"contact_id": batch}
+            )
+        except HTTPException as exc:
+            # Fail loud, not clean: a partial answer cannot certify the ids we
+            # never reached, so the whole verdict is withheld and flagged.
+            return [], {
+                "status": "unavailable",
+                "checked": 0,
+                "error": str(exc.detail) if exc.detail else f"HTTP {exc.status_code}",
+            }
+        for value in body.get("knownContactIds") or []:
+            known.add(str(value))
+
+    dangling = [
+        {
+            "customerId": int(row["id"]),
+            "customerName": row["name"],
+            "atlasContactId": contact_id,
+        }
+        for contact_id in distinct_ids
+        if contact_id not in known
+        for row in customers_by_contact[contact_id]
+    ]
+    dangling.sort(key=lambda item: ((item["customerName"] or ""), item["customerId"]))
+    return dangling, {"status": "ok", "checked": len(distinct_ids), "error": None}
+
+
+def build_atlas_linkage_audit(
+    admin: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Report Customer <-> Atlas contact linkage integrity without writes.
+
+    When ``admin`` is supplied the audit also verifies every non-null
+    ``atlas_contact_id`` against live Atlas contacts (ATLAS #2352) and reports
+    ``danglingLinks`` -- links that resolve to no EOM contact. Without an actor
+    that verification is skipped (the funnel read needs the actor headers), and
+    an Atlas outage degrades that one signal rather than failing the audit.
+    """
     duplicate_rows = db.query_all(
         """
         SELECT
@@ -15060,8 +15145,13 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
         ORDER BY h.customer_id, h.atlas_contact_id
         """
     )
-    linked_row = db.query_one(
-        "SELECT COUNT(*) AS n FROM customers WHERE atlas_contact_id IS NOT NULL"
+    linked_rows = db.query_all(
+        """
+        SELECT id, name, atlas_contact_id
+        FROM customers
+        WHERE atlas_contact_id IS NOT NULL
+        ORDER BY name, id
+        """
     )
     stale_reservation_rows = db.query_all(
         """
@@ -15147,16 +15237,32 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
         for row in unlinked_customers
         if row["active"]
     ]
+    # Verify stored links against live Atlas contacts when we have an actor to
+    # authenticate the funnel read; skip (not fail) otherwise. An Atlas outage
+    # degrades this one signal to a non-ok status instead of failing the audit.
+    if admin is not None:
+        dangling_links, atlas_link_verification = _verify_atlas_contact_links(
+            admin, linked_rows
+        )
+    else:
+        dangling_links = []
+        atlas_link_verification = {"status": "skipped", "checked": 0, "error": None}
+
     # Every defect class the audit reports, not just the ones it started with:
     # a poller treating this as a change token would otherwise see an unchanged
     # fingerprint at the moment a reservation crosses the staleness cutoff, and
-    # miss the one signal that says a customer exists in neither database.
+    # miss the one signal that says a customer exists in neither database. The
+    # verification status is in the material too: a shift from "ok" to
+    # "unavailable" means danglingLinks can no longer be trusted, which a
+    # change-token consumer must not sleep through.
     fingerprint_material = json.dumps(
         {
             "duplicateGroups": duplicate_groups,
             "unlinkedCustomers": unlinked_customers,
             "handoffOrphans": handoff_orphans,
             "staleReservations": stale_reservations,
+            "danglingLinks": dangling_links,
+            "atlasLinkVerificationStatus": atlas_link_verification["status"],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -15175,14 +15281,17 @@ def build_atlas_linkage_audit() -> Dict[str, Any]:
             ),
             "unlinkedCustomers": len(unlinked_customers),
             "unlinkedActiveCustomers": len(mapping_template),
-            "linkedCustomers": int(linked_row["n"]) if linked_row else 0,
+            "linkedCustomers": len(linked_rows),
             "handoffOrphans": len(handoff_orphans),
             "staleReservations": len(stale_reservations),
+            "danglingLinks": len(dangling_links),
         },
         "duplicateGroups": duplicate_groups,
         "unlinkedCustomers": unlinked_customers,
         "handoffOrphans": handoff_orphans,
         "staleReservations": stale_reservations,
+        "danglingLinks": dangling_links,
+        "atlasLinkVerification": atlas_link_verification,
         "mappingTemplate": mapping_template,
     }
 
@@ -15340,15 +15449,15 @@ def _build_atlas_linkage_backfill_plan(
 @app.get("/api/admin/audits/atlas-linkage")
 def admin_atlas_linkage_audit(
     request: Request,
-    _: Dict[str, Any] = Depends(get_current_admin),
+    admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    result = build_atlas_linkage_audit()
+    result = build_atlas_linkage_audit(admin)
     append_access_log(
         request,
         "ATLAS_LINKAGE_AUDIT",
         True,
         "duplicates={duplicateGroups} unlinked={unlinkedCustomers} "
-        "orphans={handoffOrphans}".format(**result["summary"]),
+        "orphans={handoffOrphans} dangling={danglingLinks}".format(**result["summary"]),
     )
     return result
 

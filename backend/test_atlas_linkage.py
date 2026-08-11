@@ -140,6 +140,115 @@ def test_audit_surfaces_duplicates_unlinked_and_orphans(client, auth, location_i
     assert summary["handoffOrphans"] >= 1
 
 
+# -- dangling Atlas links (link verification, website #167 / ATLAS #2352) --------
+
+
+class _Resp:
+    def __init__(self, status_code: int, body: dict):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> dict:
+        return self._body
+
+
+def _known_contacts_except(omit_ids):
+    """A requests.get replacement: Atlas knows every submitted id EXCEPT these.
+
+    Patched over the autouse stub for one test, so a planted customer whose
+    atlas_contact_id is in omit_ids reads back as a link Atlas does not resolve.
+    """
+    omit = {str(value) for value in omit_ids}
+
+    def _get(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(value) for value in (params or {}).get("contact_id") or []]
+            known = [value for value in submitted if value not in omit]
+            return _Resp(200, {"knownContactIds": known, "checked": len(submitted), "limit": 100})
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None, "capabilities": []})
+
+    return _get
+
+
+def test_dangling_link_detected_when_atlas_does_not_resolve_the_id(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    good_contact = str(uuid.uuid4())
+    dead_contact = str(uuid.uuid4())
+    good_customer = _create_customer("Link Resolves", good_contact)
+    dangling_customer = _create_customer("Link Dangles", dead_contact)
+    # A NULL-linked customer must NOT be reported here -- that is a different class.
+    null_customer = _create_customer("No Link At All")
+    monkeypatch.setattr(api.requests, "get", _known_contacts_except([dead_contact]))
+
+    before = db.query_one("SELECT COUNT(*) AS n FROM customers")["n"]
+    resp = client.get(AUDIT_PATH, headers=auth)
+    after = db.query_one("SELECT COUNT(*) AS n FROM customers")["n"]
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["databaseReadOnly"] is True
+    assert before == after
+
+    dangling = {row["customerId"]: row for row in body["danglingLinks"]}
+    assert dangling_customer in dangling
+    assert dangling[dangling_customer]["atlasContactId"] == dead_contact
+    assert good_customer not in dangling
+    assert null_customer not in dangling  # a missing link != a dangling link
+    assert body["summary"]["danglingLinks"] >= 1
+    assert body["atlasLinkVerification"]["status"] == "ok"
+    # The NULL-linked customer is still reported by the existing signal.
+    assert null_customer in {row["customerId"] for row in body["unlinkedCustomers"]}
+
+
+def test_dangling_links_clean_when_atlas_resolves_every_link(client, auth):
+    # Default autouse stub: Atlas recognizes every submitted id.
+    linked = _create_customer("All Resolve", str(uuid.uuid4()))
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert linked not in {row["customerId"] for row in body["danglingLinks"]}
+    assert body["summary"]["danglingLinks"] == 0
+    assert body["atlasLinkVerification"]["status"] == "ok"
+
+
+def test_atlas_outage_degrades_verification_without_failing_the_audit(client, auth, monkeypatch):
+    import time_tracker_api as api
+    import requests as _requests
+
+    _create_customer("Linked During Outage", str(uuid.uuid4()))
+    unlinked = _create_customer("Unlinked During Outage")
+
+    def _boom(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            raise _requests.RequestException("atlas unreachable")
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _boom)
+
+    resp = client.get(AUDIT_PATH, headers=auth)
+    assert resp.status_code == 200, resp.text  # the audit itself must not fail
+    body = resp.json()
+    # Fail loud, not clean: verification is flagged and the list is withheld.
+    assert body["atlasLinkVerification"]["status"] == "unavailable"
+    assert body["atlasLinkVerification"]["error"]
+    assert body["danglingLinks"] == []
+    # The database-only signals are unaffected by an Atlas outage.
+    assert unlinked in {row["customerId"] for row in body["unlinkedCustomers"]}
+
+
+def test_a_dangling_link_moves_the_inventory_fingerprint(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    _create_customer("Fingerprint Subject", contact)
+    clean_fp = client.get(AUDIT_PATH, headers=auth).json()["inventoryFingerprint"]
+
+    monkeypatch.setattr(api.requests, "get", _known_contacts_except([contact]))
+    dangling_fp = client.get(AUDIT_PATH, headers=auth).json()["inventoryFingerprint"]
+
+    # A customer going dangling must move the change token, or a poller keyed on
+    # the fingerprint would sleep through a link that resolves to nothing.
+    assert clean_fp != dangling_fp
+
+
 # -- backfill happy path ---------------------------------------------------------
 
 
