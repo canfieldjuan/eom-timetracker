@@ -1094,18 +1094,28 @@ def test_a_malformed_type_map_is_refused_not_read_as_version_skew(
     assert _get_type(customer) == "commercial"
 
 
-def test_the_audit_still_degrades_on_a_malformed_type_map(client, auth, monkeypatch):
-    """The shared fetch is used by the audit too; it must not report clean."""
+def test_a_malformed_type_map_does_not_suppress_the_link_audit(
+    client, auth, monkeypatch
+):
+    """Corrects an earlier claim of mine: type faults must NOT degrade the audit.
+
+    The audit reads ids only. knownContactIds is validated independently, so a
+    malformed customerTypes map says nothing about whether the id verdict is
+    trustworthy. Degrading the audit over it would withhold dangling-link
+    detection that every batch supplied the data for.
+    """
     import time_tracker_api as api
 
-    contact = str(uuid.uuid4())
-    _create_customer("Audit Malformed", contact)
+    dead = str(uuid.uuid4())
+    dangling_customer = _create_customer("Audit Malformed", dead)
 
     def _bad(url, *, headers=None, params=None, timeout=None):
         if "/known-contacts" in str(url):
             submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            # Ids are well-formed and this one resolves to nothing; only the
+            # type map is broken.
             return _Resp(200, {
-                "knownContactIds": submitted,
+                "knownContactIds": [v for v in submitted if v != dead],
                 "checked": len(submitted),
                 "limit": 100,
                 "customerTypes": "nonsense",
@@ -1115,8 +1125,14 @@ def test_the_audit_still_degrades_on_a_malformed_type_map(client, auth, monkeypa
 
     monkeypatch.setattr(api.requests, "get", _bad)
     body = client.get(AUDIT_PATH, headers=auth).json()
-    assert body["atlasLinkVerification"]["status"] == "unavailable"
-    assert body["danglingLinks"] == []
+    assert body["atlasLinkVerification"]["status"] == "ok", (
+        "a type fault must not withhold the id verdict"
+    )
+    assert dangling_customer in {row["customerId"] for row in body["danglingLinks"]}
+
+    # The refresh, which does read types, must still refuse.
+    assert client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).status_code == 503
 
 
 def test_apply_does_not_hold_the_mutation_lock_during_atlas_io(
@@ -1283,3 +1299,122 @@ def test_every_batch_omitting_the_field_is_still_plain_version_skew(
     assert body["summary"]["skippedTypeNotReported"] >= 2
     assert _get_type(a) == "commercial"
     assert _get_type(b) == "residential"
+
+
+# -- review round 3 findings (ATLAS #2357) --------------------------------------
+
+
+def test_a_truncated_type_map_is_refused_not_read_as_skew(client, auth, monkeypatch):
+    """A present map must cover every known id in its own batch.
+
+    Round 2 checked that the field was PRESENT per batch; it did not check the
+    map was COMPLETE. A map omitting one known contact looked like version skew
+    for that contact while the rest were applied -- a partial refresh.
+    """
+    import time_tracker_api as api
+
+    covered = str(uuid.uuid4())
+    omitted = str(uuid.uuid4())
+    a = _create_customer("Covered", covered)
+    b = _create_customer("Omitted", omitted)
+    _set_type(a, "unknown")
+    _set_type(b, "commercial")
+
+    def _truncated(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {
+                "knownContactIds": submitted,
+                "checked": len(submitted),
+                "limit": 100,
+                # Reports a type for only one of the two known ids.
+                "customerTypes": {covered: "residential"},
+            })
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _truncated)
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert resp.status_code == 503, resp.text
+    assert _get_type(a) == "unknown"
+    assert _get_type(b) == "commercial"
+
+
+def test_a_deployment_straddle_still_lets_the_audit_report_dangling_links(
+    client, auth, monkeypatch
+):
+    """Round 2's fix suppressed the audit; the id verdict must survive.
+
+    Mixed customerTypes presence is a type-level fault. Every batch supplied a
+    valid knownContactIds, so the audit -- which never reads types -- must
+    still report dangling links, while the refresh refuses.
+    """
+    import time_tracker_api as api
+
+    alive = str(uuid.uuid4())
+    dead = str(uuid.uuid4())
+    _create_customer("Straddle Alive", alive)
+    dangling_customer = _create_customer("Straddle Dead", dead)
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    seen = []
+
+    def _mixed(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            resolved = [v for v in submitted if v != dead]
+            body = {"knownContactIds": resolved, "checked": len(submitted),
+                    "limit": 100}
+            if len(seen) > 1:
+                body["customerTypes"] = {v: "residential" for v in resolved}
+            return _Resp(200, body)
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _mixed)
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert len(seen) > 1, "test must exercise more than one batch"
+    assert body["atlasLinkVerification"]["status"] == "ok"
+    assert dangling_customer in {row["customerId"] for row in body["danglingLinks"]}
+
+    seen.clear()
+    assert client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).status_code == 503
+
+
+def test_a_type_fault_never_truncates_the_known_id_set(client, auth, monkeypatch):
+    """Recording a type fault must not stop fetching the remaining batches.
+
+    Bailing out of the loop early would leave `known` partial, and a partial
+    `known` makes the audit report ids as dangling that were simply never
+    asked about -- turning a type-level fault into fabricated link failures.
+    """
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    _create_customer("Batch One", first)
+    _create_customer("Batch Two", second)
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    def _first_batch_malformed(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {
+                "knownContactIds": submitted,
+                "checked": len(submitted),
+                "limit": 100,
+                "customerTypes": {v: 99 for v in submitted},
+            })
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _first_batch_malformed)
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert body["atlasLinkVerification"]["status"] == "ok"
+    # Both ids resolved, so NEITHER may be reported dangling.
+    reported = {row["atlasContactId"] for row in body["danglingLinks"]}
+    assert first not in reported and second not in reported, (
+        f"a type fault fabricated dangling links: {reported}"
+    )

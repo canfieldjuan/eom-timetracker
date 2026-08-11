@@ -15093,7 +15093,7 @@ _KNOWN_CONTACTS_BATCH = 100
 def _fetch_known_contacts(
     admin: Dict[str, Any],
     distinct_ids: List[str],
-) -> Tuple[set, Dict[str, str], Dict[str, Any]]:
+) -> Tuple[set, Dict[str, str], Dict[str, Any], Dict[str, Any]]:
     """Ask Atlas which of ``distinct_ids`` name a live EOM contact, and their type.
 
     Shared by the read-only link audit and the customer_type mirror refresh so
@@ -15102,7 +15102,14 @@ def _fetch_known_contacts(
     consumers fail in opposite directions -- the audit would flag every link as
     dangling, the refresh would blank every mirrored type.
 
-    Returns ``(known, types, status)``:
+    This answers TWO questions with TWO confidences, and they must not be
+    conflated. "Which ids resolve" and "what type is each" can fail
+    independently: a malformed or incomplete customerTypes map says nothing
+    about whether knownContactIds is trustworthy, and the link audit consumes
+    only the ids. Collapsing them into one status let a type-level problem
+    suppress dangling-link detection the audit had everything it needed for.
+
+    Returns ``(known, types, status, types_status)``:
 
     - ``known`` -- ids Atlas resolved. An id absent from this set is dangling.
     - ``types`` -- ``{contact_id: customer_type}``, containing ONLY ids Atlas
@@ -15110,21 +15117,27 @@ def _fetch_known_contacts(
       means Atlas is running a build older than ATLAS #2357, which does not
       report the field at all. That is not "Atlas says unknown" and callers must
       not treat it as a value; see _build_customer_type_refresh_plan.
-    - ``status`` -- ok / unconfigured / unavailable. Never report a clean result
-      for a question that could not be asked.
+    - ``status`` -- ID-level: ok / unconfigured / unavailable. Both consumers
+      must respect it. Never report a clean result for a question that could
+      not be asked.
+    - ``types_status`` -- TYPE-level: ok / unavailable, for a malformed,
+      incomplete, or deployment-straddling type map. Only the refresh respects
+      it; the audit ignores it because it never reads ``types``.
     """
+    ok = {"status": "ok", "checked": len(distinct_ids), "error": None}
+
+    def _types_broken(error: str) -> Dict[str, Any]:
+        return {"status": "unavailable", "checked": 0, "error": error}
+
     if not distinct_ids:
-        return set(), {}, {"status": "ok", "checked": 0, "error": None}
+        return set(), {}, {"status": "ok", "checked": 0, "error": None}, ok
     if not (ATLAS_FUNNEL_BASE_URL and ATLAS_FUNNEL_SERVICE_TOKEN):
-        return (
-            set(),
-            {},
-            {
-                "status": "unconfigured",
-                "checked": 0,
-                "error": "Atlas funnel base URL or service token is not configured",
-            },
-        )
+        unconfigured = {
+            "status": "unconfigured",
+            "checked": 0,
+            "error": "Atlas funnel base URL or service token is not configured",
+        }
+        return set(), {}, unconfigured, unconfigured
 
     known = set()
     types: Dict[str, str] = {}
@@ -15136,6 +15149,7 @@ def _fetch_known_contacts(
     # this route exists to refuse. Track presence across every batch instead.
     batches_with_field = 0
     batches_total = 0
+    types_fault: Optional[str] = None
     for start in range(0, len(distinct_ids), _KNOWN_CONTACTS_BATCH):
         batch = distinct_ids[start : start + _KNOWN_CONTACTS_BATCH]
         try:
@@ -15145,17 +15159,12 @@ def _fetch_known_contacts(
         except HTTPException as exc:
             # Fail loud, not clean: a partial answer cannot certify the ids we
             # never reached, so the whole verdict is withheld and flagged.
-            return (
-                set(),
-                {},
-                {
-                    "status": "unavailable",
-                    "checked": 0,
-                    "error": (
-                        str(exc.detail) if exc.detail else f"HTTP {exc.status_code}"
-                    ),
-                },
-            )
+            transport = {
+                "status": "unavailable",
+                "checked": 0,
+                "error": (str(exc.detail) if exc.detail else f"HTTP {exc.status_code}"),
+            }
+            return set(), {}, transport, transport
         known_ids = body.get("knownContactIds")
         checked = body.get("checked")
         if (
@@ -15167,17 +15176,12 @@ def _fetch_known_contacts(
             # A 200 that omits knownContactIds or under-reports the count cannot
             # be trusted: treating a missing set as "known nothing" would flag
             # every id as dangling. Degrade to unavailable, never false-positive.
-            return (
-                set(),
-                {},
-                {
-                    "status": "unavailable",
-                    "checked": 0,
-                    "error": (
-                        "Atlas known-contacts response was incomplete or malformed"
-                    ),
-                },
-            )
+            malformed_ids = {
+                "status": "unavailable",
+                "checked": 0,
+                "error": "Atlas known-contacts response was incomplete or malformed",
+            }
+            return set(), {}, malformed_ids, malformed_ids
         for value in known_ids:
             known.add(str(value))
         # Absent and malformed are DIFFERENT answers and must not collapse.
@@ -15192,46 +15196,50 @@ def _fetch_known_contacts(
         # applied, the malformed ones quietly skipped -- with nothing
         # recording which. Degrade the whole read instead.
         batches_total += 1
+        batch_known = {str(value) for value in known_ids}
         if "customerTypes" in body:
             batches_with_field += 1
             reported = body.get("customerTypes")
+            # A type-level fault must NOT stop the loop. Every remaining batch
+            # still has to be fetched or `known` ends up partial, and a partial
+            # `known` makes the link audit report ids as dangling that were
+            # simply never asked about. Record the fault and keep going.
             if not isinstance(reported, dict) or any(
                 not isinstance(value, str) for value in reported.values()
             ):
-                return (
-                    set(),
-                    {},
-                    {
-                        "status": "unavailable",
-                        "checked": 0,
-                        "error": (
-                            "Atlas known-contacts response reported a malformed "
-                            "customerTypes map"
-                        ),
-                    },
+                types_fault = (
+                    "Atlas known-contacts response reported a malformed "
+                    "customerTypes map"
                 )
-            for key, value in reported.items():
-                if str(key) in known:
-                    types[str(key)] = value
+            elif batch_known - {str(key) for key in reported}:
+                # A present map that does not cover every known id in its own
+                # batch is truncated, not version skew. Treating the gap as
+                # "not reported" would skip those contacts while applying the
+                # rest -- the partial refresh this route refuses.
+                types_fault = (
+                    "Atlas reported customerTypes covering only part of a batch"
+                )
+            else:
+                for key, value in reported.items():
+                    if str(key) in known:
+                        types[str(key)] = value
 
-    if 0 < batches_with_field < batches_total:
+    if types_fault is None and 0 < batches_with_field < batches_total:
         # Some batches reported the field and some did not: the reads straddled
         # an Atlas deployment, so neither "version skew" nor "fully reported"
         # is true and any plan built from this evidence would be partial.
-        return (
-            set(),
-            {},
-            {
-                "status": "unavailable",
-                "checked": 0,
-                "error": (
-                    "Atlas reported customerTypes for only some batches; the "
-                    "reads straddled a deployment"
-                ),
-            },
+        types_fault = (
+            "Atlas reported customerTypes for only some batches; the reads "
+            "straddled a deployment"
         )
 
-    return known, types, {"status": "ok", "checked": len(distinct_ids), "error": None}
+    if types_fault is not None:
+        # The ids were validated independently and every batch was still
+        # fetched, so `known` is complete and the link audit keeps working.
+        # Only the type evidence is withheld.
+        return known, {}, ok, _types_broken(types_fault)
+
+    return known, types, ok, ok
 
 
 def _verify_atlas_contact_links(
@@ -15260,7 +15268,11 @@ def _verify_atlas_contact_links(
         customers_by_contact.setdefault(str(row["atlas_contact_id"]), []).append(row)
     distinct_ids = list(customers_by_contact)
 
-    known, _types, status = _fetch_known_contacts(admin, distinct_ids)
+    # The audit reads ids only, so it deliberately ignores types_status: a
+    # malformed or straddled customerTypes map says nothing about whether
+    # knownContactIds is trustworthy, and suppressing dangling-link detection
+    # over it would withhold a verdict every batch supplied the data for.
+    known, _types, status, _types_status = _fetch_known_contacts(admin, distinct_ids)
     if status["status"] != "ok":
         return [], status
     if not distinct_ids:
@@ -15651,9 +15663,12 @@ def _build_customer_type_refresh_plan(
     only copies, and only when Atlas actually stated a value.
     """
     linked_rows = _read_linked_customers(cursor=cursor, lock_rows=lock_rows)
-    known, types, status = _fetch_known_contacts(
+    known, types, status, types_status = _fetch_known_contacts(
         admin, _distinct_contact_ids(linked_rows)
     )
+    # The refresh reads types, so unlike the audit it must respect BOTH.
+    if status["status"] == "ok" and types_status["status"] != "ok":
+        status = types_status
     if status["status"] != "ok":
         # Refuse the whole plan rather than refreshing the subset we happened to
         # reach: a partial refresh is indistinguishable from a complete one once
@@ -15936,7 +15951,11 @@ def admin_apply_customer_type_refresh(
     # ordinary customer edit queues behind it.
     unlocked_rows = _read_linked_customers()
     asked_ids = _distinct_contact_ids(unlocked_rows)
-    known, types, status = _fetch_known_contacts(current_admin, asked_ids)
+    known, types, status, types_status = _fetch_known_contacts(
+        current_admin, asked_ids
+    )
+    if status["status"] == "ok" and types_status["status"] != "ok":
+        status = types_status
     if status["status"] != "ok":
         raise HTTPException(
             status_code=503,
