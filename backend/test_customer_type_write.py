@@ -12,6 +12,7 @@ prevent: the tracker asserting a classification on its own authority.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import db
 import time_tracker_api as api
@@ -61,18 +62,38 @@ def _path(customer_id):
     return f"/api/admin/customers/{customer_id}/customer-type"
 
 
-def _atlas_echoing(value, *, calls=None, status=200):
-    """Atlas accepts the mutation and echoes a contact carrying `value`."""
+_ATLAS_CLOCK = {"tick": 0}
+
+
+def _next_atlas_stamp():
+    """A monotonically increasing Atlas updated_at, as an ISO string."""
+    _ATLAS_CLOCK["tick"] += 1
+    base = datetime(2026, 8, 11, 12, 0, 0, tzinfo=timezone.utc)
+    return (base + timedelta(seconds=_ATLAS_CLOCK["tick"])).isoformat()
+
+
+def _atlas_echoing(value, *, calls=None, status=200, updated_at="auto"):
+    """Atlas accepts the mutation and echoes a contact carrying `value`.
+
+    updated_at is Atlas's own ordering token. "auto" advances a fake Atlas
+    clock per call; pass an explicit ISO string to model an out-of-order
+    answer, or None to model a build that reports no version at all.
+    """
 
     def _post(url, *, headers=None, json=None, timeout=None):
         if calls is not None:
             calls.append({"url": url, "headers": headers or {}, "json": json or {}})
+        contact = {} if value is None else {"customerType": value}
+        if value is not None:
+            stamp = _next_atlas_stamp() if updated_at == "auto" else updated_at
+            if stamp is not None:
+                contact["updatedAt"] = stamp
         body = {
             "success": True,
             "contactId": (json or {}).get("contact_id"),
             "operation": "contact_updated",
             "idempotent": False,
-            "contact": {} if value is None else {"customerType": value},
+            "contact": contact,
         }
         return _Response(status, body)
 
@@ -586,3 +607,107 @@ def test_the_mirror_write_serializes_on_the_contact(client, auth, monkeypatch):
         assert _type_of(primary) == "commercial"
     finally:
         blocker.close()
+
+
+def test_an_out_of_order_atlas_answer_never_wins(client, auth, monkeypatch):
+    """The winner is Atlas's LAST mutation, not whoever reaches the DB first.
+
+    Two changes can return to this tracker in the opposite order Atlas applied
+    them. Serializing locally only fixes commit order, which can disagree with
+    Atlas order -- so the mirror could hold `commercial` while Atlas holds
+    `residential`. Ordering comes from Atlas's own updated_at.
+    """
+    contact = str(uuid.uuid4())
+    customer = _customer("Out Of Order", contact, "unknown")
+
+    newer = "2026-08-11T12:00:09+00:00"
+    older = "2026-08-11T12:00:04+00:00"
+
+    # B lands first locally, carrying Atlas's LATER timestamp.
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("residential", updated_at=newer))
+    assert client.patch(_path(customer), headers=auth,
+                        json={"customerType": "residential"}).status_code == 200
+    assert _type_of(customer) == "residential"
+
+    # A now arrives late carrying an EARLIER Atlas timestamp. Atlas's final
+    # value is still residential, so this must not overwrite it.
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("commercial", updated_at=older))
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 409, resp.text
+    assert _type_of(customer) == "residential", (
+        "a stale Atlas answer overwrote a newer one"
+    )
+
+
+def test_a_repeat_of_the_same_atlas_version_is_not_applied_twice(
+    client, auth, monkeypatch
+):
+    """Equal is not newer. A replayed answer must not reopen the decision."""
+    contact = str(uuid.uuid4())
+    customer = _customer("Same Version", contact, "unknown")
+    stamp = "2026-08-11T12:00:07+00:00"
+
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("commercial", updated_at=stamp))
+    assert client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"}).status_code == 200
+
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("residential", updated_at=stamp))
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "residential"})
+    assert resp.status_code == 409, resp.text
+    assert _type_of(customer) == "commercial"
+
+
+def test_an_atlas_without_a_version_still_applies(client, auth, monkeypatch):
+    """An older Atlas reports no updatedAt; the route must not stop working.
+
+    No ordering information is not the same as being out of order. The write
+    still applies, and the stored token is left as it was rather than cleared.
+    """
+    contact = str(uuid.uuid4())
+    customer = _customer("No Version", contact, "unknown")
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("commercial", updated_at=None))
+
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 200, resp.text
+    assert _type_of(customer) == "commercial"
+
+
+def test_siblings_carry_the_atlas_version_too(client, auth, monkeypatch):
+    """A duplicate must not look staler than it is.
+
+    If the fan-out left the sibling's token behind, a later out-of-order answer
+    naming that sibling would compare against a stale value and be applied.
+    """
+    shared = str(uuid.uuid4())
+    primary = _customer("Version A", shared, "unknown")
+    twin = _customer("Version B", shared, "unknown")
+    stamp = "2026-08-11T12:00:11+00:00"
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("commercial", updated_at=stamp))
+
+    assert client.patch(_path(primary), headers=auth,
+                        json={"customerType": "commercial"}).status_code == 200
+
+    row = db.query_one(
+        "SELECT customer_type_source_at FROM customers WHERE id = %s", (twin,)
+    )
+    assert row["customer_type_source_at"] is not None, (
+        "the sibling kept no ordering token and would accept a stale answer"
+    )
+
+    # An older answer naming the SIBLING must now be refused.
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("residential",
+                                       updated_at="2026-08-11T12:00:05+00:00"))
+    resp = client.patch(_path(twin), headers=auth,
+                        json={"customerType": "residential"})
+    assert resp.status_code == 409, resp.text
+    assert _type_of(twin) == "commercial"

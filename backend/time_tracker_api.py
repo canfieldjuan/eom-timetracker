@@ -4791,6 +4791,15 @@ def _ensure_schema_migrations() -> None:
         "ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_type "
         "VARCHAR(16) NOT NULL DEFAULT 'unknown'"
     )
+    # Atlas's own updated_at for the contact whose type this row mirrors.
+    # Ordering has to come from the AUTHORITY: two mutations can return to this
+    # tracker in the opposite order Atlas applied them, and local arrival order
+    # would then pick the wrong winner. NULL means "mirrored before this column
+    # existed", which loses to any reported version.
+    db.execute(
+        "ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_type_source_at "
+        "TIMESTAMPTZ"
+    )
     # Rebuilt ONLY when the deployed constraint disagrees with CUSTOMER_TYPES.
     #
     # Two failure modes to avoid at once. Creating it only when absent pins an
@@ -12024,6 +12033,33 @@ def _customer_type_from_operator_result(result: Dict[str, Any]) -> Optional[str]
     return normalized if normalized in CUSTOMER_TYPES else None
 
 
+def _customer_type_source_at_from_operator_result(
+    result: Dict[str, Any],
+) -> Optional[datetime]:
+    """Read Atlas's own updated_at for the contact it just mutated.
+
+    This is the ordering token. Two type changes can return to this tracker in
+    the opposite order Atlas applied them, so picking a winner by local arrival
+    would leave the mirror holding the earlier mutation. Comparing Atlas's own
+    timestamp picks the LAST thing Atlas did.
+
+    None when Atlas reports nothing usable -- an older build, or a malformed
+    value. The caller treats that as "no ordering information" rather than
+    inventing one.
+    """
+    contact = result.get("contact")
+    if not isinstance(contact, dict):
+        return None
+    reported = contact.get("updatedAt")
+    if not isinstance(reported, str) or not reported.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(reported.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 def _atlas_contact_id_from_operator_result(result: Dict[str, Any]) -> str:
     """Read the contact id Atlas assigned, refusing anything else.
 
@@ -13228,6 +13264,7 @@ def _apply_customer_type_change(
             ),
         )
 
+    source_at = _customer_type_source_at_from_operator_result(atlas_result)
     confirmed = _customer_type_from_operator_result(atlas_result)
     if confirmed is None:
         # Atlas did not echo a type it would itself accept, so this cannot be
@@ -13275,14 +13312,38 @@ def _apply_customer_type_change(
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_type_mirror(cur, str(contact_id))
+            # Ordering comes from Atlas, not from who reaches this transaction
+            # first. Two mutations can return here in the opposite order Atlas
+            # applied them -- A sets commercial and stalls, B sets residential
+            # and returns, A resumes first -- and local arrival order would
+            # leave the mirror on commercial while Atlas holds residential.
+            # Refuse anything not strictly newer than what is already mirrored.
+            if source_at is not None:
+                cur.execute(
+                    "SELECT customer_type_source_at FROM customers WHERE id = %s",
+                    (customer_id,),
+                )
+                mirrored_at = (cur.fetchone() or {}).get("customer_type_source_at")
+                if mirrored_at is not None and source_at <= mirrored_at:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "A newer change to this Customer's type has already "
+                            "been recorded; Atlas was updated but this older "
+                            "answer was not applied locally."
+                        ),
+                    )
             cur.execute(
-                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                "UPDATE customers SET customer_type = %s, "
+                "customer_type_source_at = COALESCE(%s, customer_type_source_at), "
+                "updated_at = NOW() "
                 "WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s "
                 "AND atlas_contact_id IS NOT DISTINCT FROM %s "
                 "AND updated_at IS NOT DISTINCT FROM %s "
                 "RETURNING id",
                 (
                     confirmed,
+                    source_at,
                     customer_id,
                     existing["customer_type"],
                     contact_id,
@@ -13308,12 +13369,25 @@ def _apply_customer_type_change(
             # this request won the race for this contact, and these rows are
             # copies of the value it just confirmed rather than independent
             # decisions.
+            # Siblings carry the same source timestamp: they mirror the same
+            # Atlas contact, so leaving their ordering token behind would make
+            # a later out-of-order answer for one of them look newer than it is.
             cur.execute(
-                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                "UPDATE customers SET customer_type = %s, "
+                "customer_type_source_at = COALESCE(%s, customer_type_source_at), "
+                "updated_at = NOW() "
                 "WHERE atlas_contact_id = %s AND id <> %s "
-                "AND customer_type IS DISTINCT FROM %s "
+                "AND (customer_type IS DISTINCT FROM %s "
+                "     OR customer_type_source_at IS DISTINCT FROM %s) "
                 "RETURNING id",
-                (confirmed, contact_id, customer_id, confirmed),
+                (
+                    confirmed,
+                    source_at,
+                    contact_id,
+                    customer_id,
+                    confirmed,
+                    source_at,
+                ),
             )
             siblings = cur.fetchall()
     append_access_log(
