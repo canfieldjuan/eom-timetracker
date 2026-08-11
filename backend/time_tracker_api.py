@@ -13228,11 +13228,22 @@ def _apply_customer_type_change(
     # matching. If a concurrent transition moved the row while this one was
     # waiting on Atlas, no row matches and the caller is told to retry rather
     # than having its late answer overwrite the newer one.
+    # The link is part of the compare, not just the type. Atlas was asked about
+    # the contact this row held at read time, so if the row now points somewhere
+    # else the answer is about a different account and must not be mirrored.
+    #
+    # Not reachable today -- both writers of atlas_contact_id are guarded
+    # `WHERE atlas_contact_id IS NULL`, and this route already 409s on NULL, so
+    # the value cannot move once we have read it. It is in the predicate anyway
+    # because the alternative is a correctness argument that lives in two other
+    # functions: add one relink path without that guard and this silently
+    # mirrors the wrong contact's classification.
     updated = db.query_one(
         "UPDATE customers SET customer_type = %s, updated_at = NOW() "
         "WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s "
+        "AND atlas_contact_id IS NOT DISTINCT FROM %s "
         "RETURNING id",
-        (confirmed, customer_id, existing["customer_type"]),
+        (confirmed, customer_id, existing["customer_type"], contact_id),
     )
     if updated is None:
         raise HTTPException(

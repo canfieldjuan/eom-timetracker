@@ -427,3 +427,38 @@ def test_a_rolled_back_atlas_is_refused_before_the_mutation(
     assert resp.json()["capability"] == "contact.operator_mutation"
     assert calls == [], "no mutation may be attempted once Atlas has refused"
     assert _type_of(customer) == "unknown"
+
+
+def test_a_relink_in_flight_stops_the_mirror_write(client, auth, monkeypatch):
+    """Atlas answered about the contact held at read time.
+
+    If the row is repointed while the request is in flight, mirroring that
+    answer would write one account's classification onto a customer now linked
+    to a different contact. No application path can currently repoint a
+    non-NULL link, so this plants the change directly -- the point is that the
+    guard does not depend on that invariant holding in some other function.
+    """
+    contact = str(uuid.uuid4())
+    other_contact = str(uuid.uuid4())
+    customer = _customer("Relinked", contact, "unknown")
+    moved = {"done": False}
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        if not moved["done"]:
+            moved["done"] = True
+            db.execute(
+                "UPDATE customers SET atlas_contact_id = %s WHERE id = %s",
+                (other_contact, customer),
+            )
+        return _atlas_echoing("commercial")(
+            url, headers=headers, json=json, timeout=timeout
+        )
+
+    monkeypatch.setattr(api.requests, "post", _post)
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert moved["done"], "the test must actually repoint the link"
+    assert resp.status_code == 409, resp.text
+    assert _type_of(customer) == "unknown", (
+        "a type confirmed for the old contact must not land on the new link"
+    )
