@@ -2723,6 +2723,15 @@ class AtlasLinkageBackfillApplyRequest(AtlasLinkageBackfillPlanRequest):
     confirmation: str = Field(min_length=1, max_length=100)
 
 
+class CustomerTypeRefreshPlanRequest(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+
+
+class CustomerTypeRefreshApplyRequest(CustomerTypeRefreshPlanRequest):
+    planToken: str = Field(min_length=64, max_length=64)
+    confirmation: str = Field(min_length=1, max_length=100)
+
+
 class PayrollWeekRequest(BaseModel):
     weekStart: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
 
@@ -5437,6 +5446,25 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_time_data_correction_batches_created "
         "ON time_data_correction_batches(created_at)"
+    )
+    # ATLAS #2357: durable record of each customer_type mirror refresh. The
+    # snapshot holds the exact from/to per customer, so a refresh driven by a
+    # wrong Atlas value can be read back and reversed.
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS customer_type_refresh_batches (
+            id                     BIGSERIAL PRIMARY KEY,
+            plan_token             TEXT NOT NULL UNIQUE,
+            applied_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            applied_by_name        TEXT NOT NULL,
+            reason                 TEXT NOT NULL,
+            snapshot               JSONB NOT NULL,
+            result                 JSONB NOT NULL,
+            created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customer_type_refresh_batches_created "
+        "ON customer_type_refresh_batches(created_at)"
     )
     db.execute("""
         CREATE TABLE IF NOT EXISTS payroll_verification_batches (
@@ -15038,6 +15066,101 @@ STALE_CUSTOMER_RESERVATION_MINUTES = 60
 _KNOWN_CONTACTS_BATCH = 100
 
 
+def _fetch_known_contacts(
+    admin: Dict[str, Any],
+    distinct_ids: List[str],
+) -> Tuple[set, Dict[str, str], Dict[str, Any]]:
+    """Ask Atlas which of ``distinct_ids`` name a live EOM contact, and their type.
+
+    Shared by the read-only link audit and the customer_type mirror refresh so
+    the response-shape hardening below is written once. A second copy of this
+    loop would be a second chance to get "malformed 200" wrong, and the two
+    consumers fail in opposite directions -- the audit would flag every link as
+    dangling, the refresh would blank every mirrored type.
+
+    Returns ``(known, types, status)``:
+
+    - ``known`` -- ids Atlas resolved. An id absent from this set is dangling.
+    - ``types`` -- ``{contact_id: customer_type}``, containing ONLY ids Atlas
+      actually reported a type for. An id present in ``known`` but missing here
+      means Atlas is running a build older than ATLAS #2357, which does not
+      report the field at all. That is not "Atlas says unknown" and callers must
+      not treat it as a value; see _build_customer_type_refresh_plan.
+    - ``status`` -- ok / unconfigured / unavailable. Never report a clean result
+      for a question that could not be asked.
+    """
+    if not distinct_ids:
+        return set(), {}, {"status": "ok", "checked": 0, "error": None}
+    if not (ATLAS_FUNNEL_BASE_URL and ATLAS_FUNNEL_SERVICE_TOKEN):
+        return (
+            set(),
+            {},
+            {
+                "status": "unconfigured",
+                "checked": 0,
+                "error": "Atlas funnel base URL or service token is not configured",
+            },
+        )
+
+    known = set()
+    types: Dict[str, str] = {}
+    for start in range(0, len(distinct_ids), _KNOWN_CONTACTS_BATCH):
+        batch = distinct_ids[start : start + _KNOWN_CONTACTS_BATCH]
+        try:
+            body = _atlas_funnel_read(
+                _KNOWN_CONTACTS_PATH, admin, params={"contact_id": batch}
+            )
+        except HTTPException as exc:
+            # Fail loud, not clean: a partial answer cannot certify the ids we
+            # never reached, so the whole verdict is withheld and flagged.
+            return (
+                set(),
+                {},
+                {
+                    "status": "unavailable",
+                    "checked": 0,
+                    "error": (
+                        str(exc.detail) if exc.detail else f"HTTP {exc.status_code}"
+                    ),
+                },
+            )
+        known_ids = body.get("knownContactIds")
+        checked = body.get("checked")
+        if (
+            not isinstance(known_ids, list)
+            or not isinstance(checked, int)
+            or isinstance(checked, bool)
+            or checked < len(batch)
+        ):
+            # A 200 that omits knownContactIds or under-reports the count cannot
+            # be trusted: treating a missing set as "known nothing" would flag
+            # every id as dangling. Degrade to unavailable, never false-positive.
+            return (
+                set(),
+                {},
+                {
+                    "status": "unavailable",
+                    "checked": 0,
+                    "error": (
+                        "Atlas known-contacts response was incomplete or malformed"
+                    ),
+                },
+            )
+        for value in known_ids:
+            known.add(str(value))
+        # Absent, non-dict, or non-string entries are dropped rather than
+        # defaulted. A missing type is a fact about Atlas's build, not a
+        # classification, and inventing one here would silently overwrite the
+        # mirror with a value Atlas never sent.
+        reported = body.get("customerTypes")
+        if isinstance(reported, dict):
+            for key, value in reported.items():
+                if isinstance(value, str) and str(key) in known:
+                    types[str(key)] = value
+
+    return known, types, {"status": "ok", "checked": len(distinct_ids), "error": None}
+
+
 def _verify_atlas_contact_links(
     admin: Dict[str, Any],
     linked_rows: List[Dict[str, Any]],
@@ -15051,6 +15174,11 @@ def _verify_atlas_contact_links(
     resolves to nothing. Being unable to ask -- Atlas unconfigured or
     unreachable -- is reported as a non-ok status, never as a clean result, so
     a consumer cannot mistake "could not verify" for "verified clean".
+
+    Read-only, and deliberately kept that way: build_atlas_linkage_audit calls
+    this, and an audit that mutates customer rows as a side effect would be a
+    trap for anyone reading the call site. The mirror refresh that DOES write
+    lives in _build_customer_type_refresh_plan and shares only the fetch.
     """
     # One id can be held by several customers (a duplicate); verify the distinct
     # id set once and fan the verdict back out to every customer that holds it.
@@ -15059,48 +15187,11 @@ def _verify_atlas_contact_links(
         customers_by_contact.setdefault(str(row["atlas_contact_id"]), []).append(row)
     distinct_ids = list(customers_by_contact)
 
+    known, _types, status = _fetch_known_contacts(admin, distinct_ids)
+    if status["status"] != "ok":
+        return [], status
     if not distinct_ids:
-        return [], {"status": "ok", "checked": 0, "error": None}
-    if not (ATLAS_FUNNEL_BASE_URL and ATLAS_FUNNEL_SERVICE_TOKEN):
-        return [], {
-            "status": "unconfigured",
-            "checked": 0,
-            "error": "Atlas funnel base URL or service token is not configured",
-        }
-
-    known = set()
-    for start in range(0, len(distinct_ids), _KNOWN_CONTACTS_BATCH):
-        batch = distinct_ids[start : start + _KNOWN_CONTACTS_BATCH]
-        try:
-            body = _atlas_funnel_read(
-                _KNOWN_CONTACTS_PATH, admin, params={"contact_id": batch}
-            )
-        except HTTPException as exc:
-            # Fail loud, not clean: a partial answer cannot certify the ids we
-            # never reached, so the whole verdict is withheld and flagged.
-            return [], {
-                "status": "unavailable",
-                "checked": 0,
-                "error": str(exc.detail) if exc.detail else f"HTTP {exc.status_code}",
-            }
-        known_ids = body.get("knownContactIds")
-        checked = body.get("checked")
-        if (
-            not isinstance(known_ids, list)
-            or not isinstance(checked, int)
-            or isinstance(checked, bool)
-            or checked < len(batch)
-        ):
-            # A 200 that omits knownContactIds or under-reports the count cannot
-            # be trusted: treating a missing set as "known nothing" would flag
-            # every id as dangling. Degrade to unavailable, never false-positive.
-            return [], {
-                "status": "unavailable",
-                "checked": 0,
-                "error": "Atlas known-contacts response was incomplete or malformed",
-            }
-        for value in known_ids:
-            known.add(str(value))
+        return [], status
 
     dangling = [
         {
@@ -15468,6 +15559,124 @@ def _build_atlas_linkage_backfill_plan(
     }
 
 
+def _build_customer_type_refresh_plan(
+    admin: Dict[str, Any],
+    *,
+    cursor: Any = None,
+    lock_rows: bool = False,
+) -> Dict[str, Any]:
+    """Plan a refresh of the customer_type mirror from Atlas (ATLAS #2357).
+
+    The mirror is otherwise populate-on-write-path only: it fills in from the
+    one Atlas call that returns a contact, so office estimate approval, the
+    bulk linkage backfill, and any type changed in Atlas after the local row
+    exists all leave it stranded. Two of those three make no Atlas call that
+    could carry the value, so the correction has to be a read over every linked
+    customer rather than a hook on any one path.
+
+    Atlas is the write authority; the tracker never originates a type. This
+    only copies, and only when Atlas actually stated a value.
+    """
+    sql = (
+        "SELECT id, name, atlas_contact_id, customer_type FROM customers "
+        "WHERE atlas_contact_id IS NOT NULL ORDER BY id"
+    )
+    if cursor is not None:
+        cursor.execute(sql + (" FOR UPDATE" if lock_rows else ""))
+        linked_rows = cursor.fetchall()
+    else:
+        linked_rows = db.query_all(sql)
+
+    by_contact: Dict[str, List[Dict[str, Any]]] = {}
+    for row in linked_rows:
+        by_contact.setdefault(str(row["atlas_contact_id"]), []).append(row)
+    distinct_ids = list(by_contact)
+
+    known, types, status = _fetch_known_contacts(admin, distinct_ids)
+    if status["status"] != "ok":
+        # Refuse the whole plan rather than refreshing the subset we happened to
+        # reach: a partial refresh is indistinguishable from a complete one once
+        # it is applied, and nothing records which rows were never asked about.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Cannot refresh customer types: Atlas link verification is "
+                f"{status['status']} ({status['error']})"
+            ),
+        )
+
+    changes = []
+    skipped_dangling = 0
+    skipped_unreported = 0
+    for contact_id in distinct_ids:
+        if contact_id not in known:
+            # The link does not resolve. That is a linkage defect, reported by
+            # the linkage audit's danglingLinks signal; it says nothing about
+            # classification, so the mirrored type is left exactly as it is.
+            skipped_dangling += len(by_contact[contact_id])
+            continue
+        if contact_id not in types:
+            # Atlas resolved the id but reported no type for it, which means it
+            # predates ATLAS #2357. Absent is NOT "unknown": treating it as a
+            # value would blank every mirrored type the first time this runs
+            # against an Atlas that has not been deployed yet.
+            skipped_unreported += len(by_contact[contact_id])
+            continue
+        reported = types[contact_id]
+        if reported not in CUSTOMER_TYPES:
+            # Refuse a value the local CHECK constraint would reject anyway,
+            # rather than letting the UPDATE fail mid-batch.
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Atlas reported an unsupported customer_type {reported!r} "
+                    f"for contact {contact_id}"
+                ),
+            )
+        for row in by_contact[contact_id]:
+            current = row["customer_type"]
+            if current == reported:
+                continue
+            changes.append(
+                {
+                    "customerId": int(row["id"]),
+                    "customerName": row["name"],
+                    "atlasContactId": contact_id,
+                    "from": current,
+                    "to": reported,
+                }
+            )
+
+    changes.sort(key=lambda item: item["customerId"])
+    snapshot = {
+        "reason": None,
+        "changes": changes,
+        "linkedCustomers": len(linked_rows),
+    }
+    token_material = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    plan_token = hmac.new(
+        JWT_SECRET.encode("utf-8"),
+        token_material.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    count = len(changes)
+    label = "CUSTOMER" if count == 1 else "CUSTOMERS"
+    return {
+        "success": True,
+        "databaseReadOnly": True,
+        "planToken": plan_token,
+        "confirmationPhrase": f"REFRESH {count} {label} FROM ATLAS",
+        "summary": {
+            "customersToUpdate": count,
+            "linkedCustomers": len(linked_rows),
+            "skippedDanglingLinks": skipped_dangling,
+            "skippedTypeNotReported": skipped_unreported,
+        },
+        "changes": changes,
+        "_archiveSnapshot": snapshot,
+    }
+
+
 @app.get("/api/admin/audits/atlas-linkage")
 def admin_atlas_linkage_audit(
     request: Request,
@@ -15586,6 +15795,126 @@ def admin_apply_atlas_linkage_backfill(
         "ATLAS_LINKAGE_BACKFILL_APPLIED",
         True,
         f"batch={batch_id} linked={len(linked_ids)}",
+    )
+    return {
+        "success": True,
+        "batchId": batch_id,
+        "archiveStored": True,
+        **result,
+    }
+
+
+@app.post("/api/admin/corrections/customer-type/preview")
+def admin_customer_type_refresh_preview(
+    payload: CustomerTypeRefreshPlanRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    result = _build_customer_type_refresh_plan(admin)
+    result.pop("_archiveSnapshot", None)
+    append_access_log(
+        request,
+        "CUSTOMER_TYPE_REFRESH_PLAN",
+        True,
+        "update={customersToUpdate} linked={linkedCustomers} "
+        "skipDangling={skippedDanglingLinks} "
+        "skipUnreported={skippedTypeNotReported}".format(**result["summary"]),
+    )
+    return result
+
+
+@app.post("/api/admin/corrections/customer-type/apply")
+def admin_apply_customer_type_refresh(
+    payload: CustomerTypeRefreshApplyRequest,
+    request: Request,
+    current_admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            # Rebuild under lock and re-ask Atlas: the token must match a plan
+            # derived from the state being written, not the one the operator
+            # previewed, or a type that changed in between would be applied
+            # from stale evidence.
+            plan = _build_customer_type_refresh_plan(
+                current_admin, cursor=cur, lock_rows=True
+            )
+            if not hmac.compare_digest(payload.planToken, plan["planToken"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Refresh plan is stale or does not match; preview it again",
+                )
+            if payload.confirmation != plan["confirmationPhrase"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Type the exact confirmation phrase: "
+                        f"{plan['confirmationPhrase']}"
+                    ),
+                )
+
+            snapshot = dict(plan["_archiveSnapshot"])
+            snapshot["reason"] = payload.reason.strip()
+            cur.execute(
+                """
+                INSERT INTO customer_type_refresh_batches (
+                    plan_token,
+                    applied_by_employee_id,
+                    applied_by_name,
+                    reason,
+                    snapshot,
+                    result
+                )
+                VALUES (%s, %s, %s, %s, %s::jsonb, '{}'::jsonb)
+                RETURNING id
+                """,
+                (
+                    plan["planToken"],
+                    int(current_admin["id"]),
+                    current_admin["name"],
+                    payload.reason.strip(),
+                    json.dumps(snapshot, sort_keys=True),
+                ),
+            )
+            batch_id = int(cur.fetchone()["id"])
+
+            updated_ids = []
+            for row in plan["changes"]:
+                # Guarded on the value the plan was built from, so a row that
+                # moved between planning and writing fails loudly instead of
+                # being silently overwritten.
+                cur.execute(
+                    """
+                    UPDATE customers
+                    SET customer_type = %s, updated_at = NOW()
+                    WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s
+                    RETURNING id
+                    """,
+                    (row["to"], row["customerId"], row["from"]),
+                )
+                updated = cur.fetchone()
+                if not updated:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Customer {row['customerId']} changed before the "
+                            "refresh could be applied"
+                        ),
+                    )
+                updated_ids.append(int(updated["id"]))
+
+            result = {"updatedCustomerIds": sorted(updated_ids)}
+            cur.execute(
+                "UPDATE customer_type_refresh_batches SET result = %s::jsonb "
+                "WHERE id = %s",
+                (json.dumps(result, sort_keys=True), batch_id),
+            )
+
+    append_access_log(
+        request,
+        "CUSTOMER_TYPE_REFRESH_APPLIED",
+        True,
+        f"batch={batch_id} updated={len(updated_ids)}",
     )
     return {
         "success": True,

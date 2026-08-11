@@ -786,3 +786,205 @@ def test_the_verified_path_is_the_authorized_path():
     value rather than two that happen to match today.
     """
     assert _KNOWN_CONTACTS_PATH in _ATLAS_FUNNEL_READ_PATHS
+
+
+# -- customer_type mirror refresh (ATLAS #2357) ---------------------------------
+
+TYPE_PREVIEW_PATH = "/api/admin/corrections/customer-type/preview"
+TYPE_APPLY_PATH = "/api/admin/corrections/customer-type/apply"
+TYPE_REASON = "Refresh mirrored customer types from Atlas after backfill"
+
+
+def _atlas_types(types_by_id, *, omit_ids=(), include_field=True):
+    """A requests.get replacement returning known-contacts with customerTypes.
+
+    include_field=False models an Atlas that predates ATLAS #2357 and does not
+    report the field at all -- the deployed state at the time this was written.
+    """
+    omit = {str(value) for value in omit_ids}
+
+    def _get(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            known = [v for v in submitted if v not in omit]
+            body = {"knownContactIds": known, "checked": len(submitted), "limit": 100}
+            if include_field:
+                body["customerTypes"] = {
+                    k: v for k, v in types_by_id.items() if k in known
+                }
+            return _Resp(200, body)
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    return _get
+
+
+def _set_type(customer_id: int, value) -> None:
+    db.execute("UPDATE customers SET customer_type = %s WHERE id = %s",
+               (value, customer_id))
+
+
+def _get_type(customer_id: int):
+    return db.query_one(
+        "SELECT customer_type FROM customers WHERE id = %s", (customer_id,)
+    )["customer_type"]
+
+
+def test_refresh_applies_the_type_atlas_reports(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Type Refresh", contact)
+    _set_type(customer, "unknown")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+
+    plan = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert plan.status_code == 200, plan.text
+    body = plan.json()
+    assert body["databaseReadOnly"] is True
+    assert _get_type(customer) == "unknown", "preview must not write"
+
+    change = next(c for c in body["changes"] if c["customerId"] == customer)
+    assert (change["from"], change["to"]) == ("unknown", "commercial")
+
+    applied = client.post(TYPE_APPLY_PATH, headers=auth, json={
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    })
+    assert applied.status_code == 200, applied.text
+    assert customer in applied.json()["updatedCustomerIds"]
+    assert _get_type(customer) == "commercial"
+
+
+def test_an_atlas_without_the_field_never_blanks_the_mirror(client, auth, monkeypatch):
+    """The version-skew case: Atlas predates #2357 and reports no types at all.
+
+    Absent is not "unknown". If a missing field were read as a value, the first
+    refresh run against today's deployed Atlas would overwrite every mirrored
+    type with unknown -- destroying the very data this feature exists to keep.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Skew Safe", contact)
+    _set_type(customer, "commercial")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({}, include_field=False))
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    assert not [c for c in body["changes"] if c["customerId"] == customer]
+    assert body["summary"]["skippedTypeNotReported"] >= 1
+    assert _get_type(customer) == "commercial"
+
+
+def test_a_dangling_link_never_changes_the_mirrored_type(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    dead = str(uuid.uuid4())
+    customer = _create_customer("Dangles Keeps Type", dead)
+    _set_type(customer, "residential")
+    # Atlas would report a type, but the id does not resolve at all.
+    monkeypatch.setattr(api.requests, "get",
+                        _atlas_types({dead: "commercial"}, omit_ids=[dead]))
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    assert not [c for c in body["changes"] if c["customerId"] == customer]
+    assert body["summary"]["skippedDanglingLinks"] >= 1
+    assert _get_type(customer) == "residential"
+
+
+def test_atlas_reporting_unknown_is_mirrored_faithfully(client, auth, monkeypatch):
+    """Atlas is the authority: a real 'unknown' from Atlas is a value, not a gap."""
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Declassified", contact)
+    _set_type(customer, "commercial")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "unknown"}))
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    change = next(c for c in body["changes"] if c["customerId"] == customer)
+    assert (change["from"], change["to"]) == ("commercial", "unknown")
+
+    client.post(TYPE_APPLY_PATH, headers=auth, json={
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    })
+    assert _get_type(customer) == "unknown"
+
+
+def test_refresh_refuses_entirely_when_atlas_cannot_be_reached(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Outage", contact)
+    _set_type(customer, "commercial")
+
+    def _boom(url, *, headers=None, params=None, timeout=None):
+        raise api.requests.RequestException("connection refused")
+
+    monkeypatch.setattr(api.requests, "get", _boom)
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert resp.status_code == 503, resp.text
+    assert _get_type(customer) == "commercial"
+
+
+def test_refresh_rejects_a_type_atlas_should_never_send(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    _create_customer("Bad Value", contact)
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "enterprise"}))
+
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert resp.status_code == 502, resp.text
+
+
+def test_apply_refuses_a_stale_plan(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Stale Plan", contact)
+    _set_type(customer, "unknown")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+
+    # Atlas changes its mind after the operator previewed.
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "residential"}))
+    resp = client.post(TYPE_APPLY_PATH, headers=auth, json={
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    })
+    assert resp.status_code == 409, resp.text
+    assert _get_type(customer) == "unknown", "a stale plan must write nothing"
+
+
+def test_refresh_requires_admin(client, auth, emp_auth):
+    assert client.post(TYPE_PREVIEW_PATH, json={"reason": TYPE_REASON}).status_code == 401
+    assert client.post(
+        TYPE_PREVIEW_PATH, headers=emp_auth, json={"reason": TYPE_REASON}
+    ).status_code == 403
+    assert client.post(TYPE_APPLY_PATH, json={
+        "reason": TYPE_REASON, "planToken": "a" * 64, "confirmation": "x",
+    }).status_code == 401
+
+
+def test_the_audit_never_writes_while_the_refresh_does(client, auth, monkeypatch):
+    """The audit shares the Atlas fetch with the refresh but must stay read-only."""
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Audit Read Only", contact)
+    _set_type(customer, "unknown")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+
+    audit = client.get(AUDIT_PATH, headers=auth)
+    assert audit.status_code == 200, audit.text
+    assert audit.json()["databaseReadOnly"] is True
+    assert _get_type(customer) == "unknown", "the audit must not refresh the mirror"
