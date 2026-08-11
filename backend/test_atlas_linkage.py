@@ -48,6 +48,10 @@ def _clean_test_rows() -> None:
         "DELETE FROM atlas_linkage_backfill_batches WHERE snapshot::text LIKE %s",
         (f"%{TEST_PREFIX}%",),
     )
+    db.execute(
+        "DELETE FROM customer_type_refresh_batches WHERE snapshot::text LIKE %s",
+        (f"%{TEST_PREFIX}%",),
+    )
     db.execute("DELETE FROM customers WHERE name LIKE %s", (f"{TEST_PREFIX}%",))
 
 
@@ -786,3 +790,845 @@ def test_the_verified_path_is_the_authorized_path():
     value rather than two that happen to match today.
     """
     assert _KNOWN_CONTACTS_PATH in _ATLAS_FUNNEL_READ_PATHS
+
+
+# -- customer_type mirror refresh (ATLAS #2357) ---------------------------------
+
+TYPE_PREVIEW_PATH = "/api/admin/corrections/customer-type/preview"
+TYPE_APPLY_PATH = "/api/admin/corrections/customer-type/apply"
+TYPE_REASON = "Refresh mirrored customer types from Atlas after backfill"
+
+
+def _atlas_types(types_by_id, *, omit_ids=(), include_field=True):
+    """A requests.get replacement returning known-contacts with customerTypes.
+
+    include_field=False models an Atlas that predates ATLAS #2357 and does not
+    report the field at all -- the deployed state at the time this was written.
+    """
+    omit = {str(value) for value in omit_ids}
+
+    def _get(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            known = [v for v in submitted if v not in omit]
+            body = {"knownContactIds": known, "checked": len(submitted), "limit": 100}
+            if include_field:
+                body["customerTypes"] = {
+                    k: v for k, v in types_by_id.items() if k in known
+                }
+            return _Resp(200, body)
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    return _get
+
+
+def _set_type(customer_id: int, value) -> None:
+    db.execute("UPDATE customers SET customer_type = %s WHERE id = %s",
+               (value, customer_id))
+
+
+def _get_type(customer_id: int):
+    return db.query_one(
+        "SELECT customer_type FROM customers WHERE id = %s", (customer_id,)
+    )["customer_type"]
+
+
+def test_refresh_applies_the_type_atlas_reports(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Type Refresh", contact)
+    _set_type(customer, "unknown")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+
+    plan = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert plan.status_code == 200, plan.text
+    body = plan.json()
+    assert body["databaseReadOnly"] is True
+    assert _get_type(customer) == "unknown", "preview must not write"
+
+    change = next(c for c in body["changes"] if c["customerId"] == customer)
+    assert (change["from"], change["to"]) == ("unknown", "commercial")
+
+    applied = client.post(TYPE_APPLY_PATH, headers=auth, json={
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    })
+    assert applied.status_code == 200, applied.text
+    assert customer in applied.json()["updatedCustomerIds"]
+    assert _get_type(customer) == "commercial"
+
+
+def test_an_atlas_without_the_field_never_blanks_the_mirror(client, auth, monkeypatch):
+    """The version-skew case: Atlas predates #2357 and reports no types at all.
+
+    Absent is not "unknown". If a missing field were read as a value, the first
+    refresh run against today's deployed Atlas would overwrite every mirrored
+    type with unknown -- destroying the very data this feature exists to keep.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Skew Safe", contact)
+    _set_type(customer, "commercial")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({}, include_field=False))
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    assert not [c for c in body["changes"] if c["customerId"] == customer]
+    assert body["summary"]["skippedTypeNotReported"] >= 1
+    assert _get_type(customer) == "commercial"
+
+
+def test_a_dangling_link_never_changes_the_mirrored_type(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    dead = str(uuid.uuid4())
+    customer = _create_customer("Dangles Keeps Type", dead)
+    _set_type(customer, "residential")
+    # Atlas would report a type, but the id does not resolve at all.
+    monkeypatch.setattr(api.requests, "get",
+                        _atlas_types({dead: "commercial"}, omit_ids=[dead]))
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    assert not [c for c in body["changes"] if c["customerId"] == customer]
+    assert body["summary"]["skippedDanglingLinks"] >= 1
+    assert _get_type(customer) == "residential"
+
+
+def test_atlas_reporting_unknown_is_mirrored_faithfully(client, auth, monkeypatch):
+    """Atlas is the authority: a real 'unknown' from Atlas is a value, not a gap."""
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Declassified", contact)
+    _set_type(customer, "commercial")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "unknown"}))
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    change = next(c for c in body["changes"] if c["customerId"] == customer)
+    assert (change["from"], change["to"]) == ("commercial", "unknown")
+
+    client.post(TYPE_APPLY_PATH, headers=auth, json={
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    })
+    assert _get_type(customer) == "unknown"
+
+
+def test_refresh_refuses_entirely_when_atlas_cannot_be_reached(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Outage", contact)
+    _set_type(customer, "commercial")
+
+    def _boom(url, *, headers=None, params=None, timeout=None):
+        raise api.requests.RequestException("connection refused")
+
+    monkeypatch.setattr(api.requests, "get", _boom)
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert resp.status_code == 503, resp.text
+    assert _get_type(customer) == "commercial"
+
+
+def test_refresh_rejects_a_type_atlas_should_never_send(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    _create_customer("Bad Value", contact)
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "enterprise"}))
+
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert resp.status_code == 502, resp.text
+
+
+def test_apply_refuses_a_stale_plan(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Stale Plan", contact)
+    _set_type(customer, "unknown")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+
+    # Atlas changes its mind after the operator previewed.
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "residential"}))
+    resp = client.post(TYPE_APPLY_PATH, headers=auth, json={
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    })
+    assert resp.status_code == 409, resp.text
+    assert _get_type(customer) == "unknown", "a stale plan must write nothing"
+
+
+def test_refresh_requires_admin(client, auth, emp_auth):
+    assert client.post(TYPE_PREVIEW_PATH, json={"reason": TYPE_REASON}).status_code == 401
+    assert client.post(
+        TYPE_PREVIEW_PATH, headers=emp_auth, json={"reason": TYPE_REASON}
+    ).status_code == 403
+    assert client.post(TYPE_APPLY_PATH, json={
+        "reason": TYPE_REASON, "planToken": "a" * 64, "confirmation": "x",
+    }).status_code == 401
+
+
+def test_the_audit_never_writes_while_the_refresh_does(client, auth, monkeypatch):
+    """The audit shares the Atlas fetch with the refresh but must stay read-only."""
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Audit Read Only", contact)
+    _set_type(customer, "unknown")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+
+    audit = client.get(AUDIT_PATH, headers=auth)
+    assert audit.status_code == 200, audit.text
+    assert audit.json()["databaseReadOnly"] is True
+    assert _get_type(customer) == "unknown", "the audit must not refresh the mirror"
+
+
+# -- review round 1 findings (ATLAS #2357) --------------------------------------
+
+
+def test_applying_an_empty_plan_is_refused_not_collided(client, auth, monkeypatch):
+    """A no-op refresh must not write a batch row.
+
+    The token is derived from the change list and the linked count, so every
+    no-op plan at a given count hashes identically. Writing one would take the
+    UNIQUE plan_token, and the NEXT no-op apply would surface a raw integrity
+    error. An empty plan is also the expected state until ATLAS #2358 deploys,
+    so this is the first thing an operator would hit.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Nothing To Do", contact)
+    _set_type(customer, "commercial")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    assert body["summary"]["customersToUpdate"] == 0
+
+    payload = {
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    }
+    first = client.post(TYPE_APPLY_PATH, headers=auth, json=payload)
+    assert first.status_code == 409, first.text
+    # The second attempt must behave identically, not hit a UNIQUE violation.
+    second = client.post(TYPE_APPLY_PATH, headers=auth, json=payload)
+    assert second.status_code == 409, second.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS n FROM customer_type_refresh_batches "
+        "WHERE snapshot::text LIKE %s",
+        (f"%{TEST_PREFIX}%",),
+    )["n"] == 0
+
+
+def test_a_whitespace_only_reason_is_rejected(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    _create_customer("Blank Reason", contact)
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": " " * 20})
+    assert resp.status_code == 422, resp.text
+
+
+def test_a_malformed_type_map_is_refused_not_read_as_version_skew(
+    client, auth, monkeypatch
+):
+    """Present-but-broken is not the same answer as absent.
+
+    Silently dropping a malformed map would look exactly like an Atlas that
+    predates #2357, so a broken upstream build would produce a confident
+    partial refresh with nothing recording which contacts were skipped.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Malformed Map", contact)
+    _set_type(customer, "commercial")
+
+    def _bad_container(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {
+                "knownContactIds": submitted,
+                "checked": len(submitted),
+                "limit": 100,
+                "customerTypes": ["not", "a", "map"],
+            })
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _bad_container)
+    assert client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).status_code == 503
+
+    def _bad_entry(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {
+                "knownContactIds": submitted,
+                "checked": len(submitted),
+                "limit": 100,
+                "customerTypes": {submitted[0]: 17} if submitted else {},
+            })
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _bad_entry)
+    assert client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).status_code == 503
+    assert _get_type(customer) == "commercial"
+
+
+def test_a_malformed_type_map_does_not_suppress_the_link_audit(
+    client, auth, monkeypatch
+):
+    """Corrects an earlier claim of mine: type faults must NOT degrade the audit.
+
+    The audit reads ids only. knownContactIds is validated independently, so a
+    malformed customerTypes map says nothing about whether the id verdict is
+    trustworthy. Degrading the audit over it would withhold dangling-link
+    detection that every batch supplied the data for.
+    """
+    import time_tracker_api as api
+
+    dead = str(uuid.uuid4())
+    dangling_customer = _create_customer("Audit Malformed", dead)
+
+    def _bad(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            # Ids are well-formed and this one resolves to nothing; only the
+            # type map is broken.
+            return _Resp(200, {
+                "knownContactIds": [v for v in submitted if v != dead],
+                "checked": len(submitted),
+                "limit": 100,
+                "customerTypes": "nonsense",
+            })
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _bad)
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert body["atlasLinkVerification"]["status"] == "ok", (
+        "a type fault must not withhold the id verdict"
+    )
+    assert dangling_customer in {row["customerId"] for row in body["danglingLinks"]}
+
+    # The refresh, which does read types, must still refuse.
+    assert client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).status_code == 503
+
+
+def test_apply_does_not_hold_the_mutation_lock_during_atlas_io(
+    client, auth, monkeypatch
+):
+    """Atlas must be read before the global customer/site lock is taken.
+
+    Asserted by observing order: the advisory lock call must not have happened
+    when the Atlas request is issued.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Lock Order", contact)
+    _set_type(customer, "unknown")
+
+    events = []
+    real_lock = api._lock_customer_site_mutations
+
+    def _watched_lock(cur):
+        events.append("lock")
+        return real_lock(cur)
+
+    inner = _atlas_types({contact: "commercial"})
+
+    def _watched_get(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            events.append("atlas")
+        return inner(url, headers=headers, params=params, timeout=timeout)
+
+    monkeypatch.setattr(api, "_lock_customer_site_mutations", _watched_lock)
+    monkeypatch.setattr(api.requests, "get", _watched_get)
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    events.clear()
+    applied = client.post(TYPE_APPLY_PATH, headers=auth, json={
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    })
+    assert applied.status_code == 200, applied.text
+    assert "atlas" in events and "lock" in events
+    # Assert on what actually matters: NO Atlas request may be issued once the
+    # lock is held. Comparing first-occurrence indices instead would pass even
+    # when a second fetch runs inside the critical section -- which is exactly
+    # the regression this guards against.
+    after_lock = events[events.index("lock"):]
+    assert "atlas" not in after_lock, (
+        f"no Atlas I/O may happen while the mutation lock is held, got {events}"
+    )
+    assert _get_type(customer) == "commercial"
+
+
+# -- review round 2 findings (ATLAS #2357) --------------------------------------
+
+
+def _refresh_once(client, auth, expect=200):
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    resp = client.post(TYPE_APPLY_PATH, headers=auth, json={
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    })
+    assert resp.status_code == expect, resp.text
+    return resp
+
+
+def test_a_repeated_transition_can_be_applied_again(client, auth, monkeypatch):
+    """The same diff legitimately recurs and must not collide on plan_token.
+
+    commercial -> residential -> commercial -> residential produces an
+    identical snapshot (and therefore an identical token) on the first and
+    third refresh. The empty-plan guard does not cover this: the plan here is
+    non-empty. The batch id is the identity; the token is not unique.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Flip Flop", contact)
+    _set_type(customer, "commercial")
+
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "residential"}))
+    _refresh_once(client, auth)
+    assert _get_type(customer) == "residential"
+
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+    _refresh_once(client, auth)
+    assert _get_type(customer) == "commercial"
+
+    # Third refresh reproduces the first plan exactly.
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "residential"}))
+    _refresh_once(client, auth)
+    assert _get_type(customer) == "residential"
+
+    assert db.query_one(
+        "SELECT COUNT(*) AS n FROM customer_type_refresh_batches "
+        "WHERE snapshot::text LIKE %s",
+        (f"%{TEST_PREFIX}%",),
+    )["n"] == 3
+
+
+def test_batches_straddling_an_atlas_deploy_are_refused(client, auth, monkeypatch):
+    """Version skew is a property of the whole fetch, not of one batch.
+
+    With more than one batch the reads can straddle an Atlas deployment: an
+    early response omits customerTypes, a later one reports it. Judging each
+    batch alone would read the omission as skew and still apply the types the
+    newer batch returned -- a partial refresh.
+    """
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    a = _create_customer("Straddle A", first)
+    b = _create_customer("Straddle B", second)
+    _set_type(a, "commercial")
+    _set_type(b, "commercial")
+    # One id per request, so two linked customers means two batches.
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    seen = []
+
+    def _mixed(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            body = {"knownContactIds": submitted, "checked": len(submitted),
+                    "limit": 100}
+            # Only the second request comes from the upgraded Atlas.
+            if len(seen) > 1:
+                body["customerTypes"] = {v: "residential" for v in submitted}
+            return _Resp(200, body)
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _mixed)
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert len(seen) > 1, "test must exercise more than one batch"
+    assert resp.status_code == 503, resp.text
+    assert _get_type(a) == "commercial"
+    assert _get_type(b) == "commercial"
+
+
+def test_every_batch_omitting_the_field_is_still_plain_version_skew(
+    client, auth, monkeypatch
+):
+    """The mixed-batch guard must not break the supported skew case."""
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    a = _create_customer("Skew Multi A", first)
+    b = _create_customer("Skew Multi B", second)
+    _set_type(a, "commercial")
+    _set_type(b, "residential")
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+    monkeypatch.setattr(api.requests, "get", _atlas_types({}, include_field=False))
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    assert body["summary"]["customersToUpdate"] == 0
+    assert body["summary"]["skippedTypeNotReported"] >= 2
+    assert _get_type(a) == "commercial"
+    assert _get_type(b) == "residential"
+
+
+# -- review round 3 findings (ATLAS #2357) --------------------------------------
+
+
+def test_a_truncated_type_map_is_refused_not_read_as_skew(client, auth, monkeypatch):
+    """A present map must cover every known id in its own batch.
+
+    Round 2 checked that the field was PRESENT per batch; it did not check the
+    map was COMPLETE. A map omitting one known contact looked like version skew
+    for that contact while the rest were applied -- a partial refresh.
+    """
+    import time_tracker_api as api
+
+    covered = str(uuid.uuid4())
+    omitted = str(uuid.uuid4())
+    a = _create_customer("Covered", covered)
+    b = _create_customer("Omitted", omitted)
+    _set_type(a, "unknown")
+    _set_type(b, "commercial")
+
+    def _truncated(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {
+                "knownContactIds": submitted,
+                "checked": len(submitted),
+                "limit": 100,
+                # Reports a type for only one of the two known ids.
+                "customerTypes": {covered: "residential"},
+            })
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _truncated)
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert resp.status_code == 503, resp.text
+    assert _get_type(a) == "unknown"
+    assert _get_type(b) == "commercial"
+
+
+def test_a_deployment_straddle_still_lets_the_audit_report_dangling_links(
+    client, auth, monkeypatch
+):
+    """Round 2's fix suppressed the audit; the id verdict must survive.
+
+    Mixed customerTypes presence is a type-level fault. Every batch supplied a
+    valid knownContactIds, so the audit -- which never reads types -- must
+    still report dangling links, while the refresh refuses.
+    """
+    import time_tracker_api as api
+
+    alive = str(uuid.uuid4())
+    dead = str(uuid.uuid4())
+    _create_customer("Straddle Alive", alive)
+    dangling_customer = _create_customer("Straddle Dead", dead)
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    seen = []
+
+    def _mixed(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            resolved = [v for v in submitted if v != dead]
+            body = {"knownContactIds": resolved, "checked": len(submitted),
+                    "limit": 100}
+            if len(seen) > 1:
+                body["customerTypes"] = {v: "residential" for v in resolved}
+            return _Resp(200, body)
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _mixed)
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert len(seen) > 1, "test must exercise more than one batch"
+    assert body["atlasLinkVerification"]["status"] == "ok"
+    assert dangling_customer in {row["customerId"] for row in body["danglingLinks"]}
+
+    seen.clear()
+    assert client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).status_code == 503
+
+
+def test_a_type_fault_never_truncates_the_known_id_set(client, auth, monkeypatch):
+    """Recording a type fault must not stop fetching the remaining batches.
+
+    Bailing out of the loop early would leave `known` partial, and a partial
+    `known` makes the audit report ids as dangling that were simply never
+    asked about -- turning a type-level fault into fabricated link failures.
+    """
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    _create_customer("Batch One", first)
+    _create_customer("Batch Two", second)
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    def _first_batch_malformed(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {
+                "knownContactIds": submitted,
+                "checked": len(submitted),
+                "limit": 100,
+                "customerTypes": {v: 99 for v in submitted},
+            })
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _first_batch_malformed)
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert body["atlasLinkVerification"]["status"] == "ok"
+    # Both ids resolved, so NEITHER may be reported dangling.
+    reported = {row["atlasContactId"] for row in body["danglingLinks"]}
+    assert first not in reported and second not in reported, (
+        f"a type fault fabricated dangling links: {reported}"
+    )
+
+
+# -- review round 4 finding (ATLAS #2357) ---------------------------------------
+
+
+def test_a_later_batch_cannot_retype_an_earlier_batchs_contact(
+    client, auth, monkeypatch
+):
+    """Cross-batch key bleed: batch B must not be able to change customer A.
+
+    Matching reported keys against the globally accumulated `known` set instead
+    of the batch's own ids let a later response carry an entry for a contact
+    resolved earlier and silently overwrite its type -- which the apply route
+    would then persist. Keys must equal the batch's knownContactIds.
+    """
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    victim = _create_customer("Batch A Victim", first)
+    other = _create_customer("Batch B Other", second)
+    _set_type(victim, "commercial")
+    _set_type(other, "commercial")
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    seen = []
+
+    def _bleeding(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            types = {v: "commercial" for v in submitted}
+            if len(seen) > 1:
+                # The second batch reports a type for the FIRST batch's contact.
+                types[first] = "residential"
+            return _Resp(200, {"knownContactIds": submitted,
+                               "checked": len(submitted), "limit": 100,
+                               "customerTypes": types})
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _bleeding)
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert len(seen) > 1, "test must exercise more than one batch"
+    assert resp.status_code == 503, resp.text
+    assert _get_type(victim) == "commercial", "batch B must not retype customer A"
+    assert _get_type(other) == "commercial"
+
+
+def test_the_audit_survives_a_cross_batch_key_bleed(client, auth, monkeypatch):
+    """The bleed is type-level; the id verdict must still stand."""
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    dead = str(uuid.uuid4())
+    _create_customer("Bleed Alive", first)
+    dangling_customer = _create_customer("Bleed Dead", dead)
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    seen = []
+
+    def _bleeding(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            resolved = [v for v in submitted if v != dead]
+            types = {v: "commercial" for v in resolved}
+            types[first] = "residential"  # may not belong to this batch
+            return _Resp(200, {"knownContactIds": resolved,
+                               "checked": len(submitted), "limit": 100,
+                               "customerTypes": types})
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _bleeding)
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert len(seen) > 1
+    assert body["atlasLinkVerification"]["status"] == "ok"
+    assert dangling_customer in {row["customerId"] for row in body["danglingLinks"]}
+
+
+# -- review round 5 finding (ATLAS #2357) ---------------------------------------
+
+
+def _claims_foreign_id(foreign_id, resolve=True, with_types=True):
+    """Batch responses that name an id the request never submitted."""
+    seen = []
+
+    def _get(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            resolved = list(submitted)
+            if len(seen) > 1 and resolve:
+                resolved.append(foreign_id)  # never requested in THIS batch
+            body = {"knownContactIds": resolved, "checked": len(submitted),
+                    "limit": 100}
+            if with_types:
+                body["customerTypes"] = {v: "residential" for v in resolved}
+            return _Resp(200, body)
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    return _get, seen
+
+
+def test_a_response_naming_an_unrequested_id_is_rejected(client, auth, monkeypatch):
+    """Round 4's equality check validated the response against ITSELF.
+
+    batch_known came from the same response, so a malformed batch B naming
+    batch A's id in both knownContactIds and customerTypes satisfied it and
+    still retyped customer A. The requested batch is the only trustworthy
+    reference.
+    """
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    victim = _create_customer("Foreign A", first)
+    other = _create_customer("Foreign B", second)
+    _set_type(victim, "commercial")
+    _set_type(other, "commercial")
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    getter, seen = _claims_foreign_id(first)
+    monkeypatch.setattr(api.requests, "get", getter)
+
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert len(seen) > 1, "test must exercise more than one batch"
+    assert resp.status_code == 503, resp.text
+    assert _get_type(victim) == "commercial", "batch B must not retype customer A"
+    assert _get_type(other) == "commercial"
+
+
+def test_an_unrequested_id_is_an_id_level_fault_for_the_audit_too(
+    client, auth, monkeypatch
+):
+    """An unrequested id in `known` can MASK a dangling link.
+
+    The audit reports an id as dangling only when it is absent from `known`,
+    so accepting ids the request never submitted lets a malformed response
+    hide a broken link. That makes it an ID-level fault, not a type-level one,
+    and the audit must degrade rather than report a clean verdict.
+    """
+    import time_tracker_api as api
+
+    dead = str(uuid.uuid4())
+    alive = str(uuid.uuid4())
+    dangling_customer = _create_customer("Masked Dead", dead)
+    _create_customer("Masked Alive", alive)
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    seen = []
+
+    def _masking(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            # `dead` never resolves in its OWN batch, but every other batch
+            # claims it -- which would mask the dangling link if accepted.
+            resolved = [v for v in submitted if v != dead]
+            if dead not in submitted:
+                resolved.append(dead)
+            return _Resp(200, {"knownContactIds": resolved,
+                               "checked": len(submitted), "limit": 100})
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _masking)
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    # One request is enough: the very first batch that does not request `dead`
+    # already claims it, and the fetch fails fast rather than continuing.
+    assert len(seen) >= 1
+    assert body["atlasLinkVerification"]["status"] == "unavailable", (
+        "an unrequested id corrupts the id verdict and must not read as clean"
+    )
+    # Withheld, not falsely clean: the list is empty BECAUSE it degraded.
+    assert body["danglingLinks"] == []
+    assert dangling_customer  # planted; the point is the status, not the row
+
+
+def test_a_response_reporting_more_checked_than_we_sent_is_rejected(
+    client, auth, monkeypatch
+):
+    """checked must EQUAL the batch size, not merely meet it.
+
+    ATLAS #2358 sets checked = len(requested) after de-duplicating, and the
+    batch we send is already distinct, so a higher count means the server saw
+    ids we did not send -- the request did not arrive as issued. No current
+    code reads `checked` downstream, so this is detection rather than a fix
+    for a live failure path.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Inflated Checked", contact)
+    _set_type(customer, "commercial")
+
+    def _inflated(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {"knownContactIds": submitted,
+                               "checked": len(submitted) + 7,
+                               "limit": 100,
+                               "customerTypes": {v: "residential" for v in submitted}})
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _inflated)
+    assert client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).status_code == 503
+    assert _get_type(customer) == "commercial"
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert body["atlasLinkVerification"]["status"] == "unavailable"
