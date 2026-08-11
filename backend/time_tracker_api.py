@@ -15077,7 +15077,23 @@ def _verify_atlas_contact_links(
                 "checked": 0,
                 "error": str(exc.detail) if exc.detail else f"HTTP {exc.status_code}",
             }
-        for value in body.get("knownContactIds") or []:
+        known_ids = body.get("knownContactIds")
+        checked = body.get("checked")
+        if (
+            not isinstance(known_ids, list)
+            or not isinstance(checked, int)
+            or isinstance(checked, bool)
+            or checked < len(batch)
+        ):
+            # A 200 that omits knownContactIds or under-reports the count cannot
+            # be trusted: treating a missing set as "known nothing" would flag
+            # every id as dangling. Degrade to unavailable, never false-positive.
+            return [], {
+                "status": "unavailable",
+                "checked": 0,
+                "error": "Atlas known-contacts response was incomplete or malformed",
+            }
+        for value in known_ids:
             known.add(str(value))
 
     dangling = [
@@ -15457,7 +15473,10 @@ def admin_atlas_linkage_audit(
         "ATLAS_LINKAGE_AUDIT",
         True,
         "duplicates={duplicateGroups} unlinked={unlinkedCustomers} "
-        "orphans={handoffOrphans} dangling={danglingLinks}".format(**result["summary"]),
+        "orphans={handoffOrphans} dangling={danglingLinks}".format(**result["summary"])
+        # Record the verification status so a "dangling=0" from an outage or an
+        # unconfigured funnel is never mistaken for a verified-clean audit.
+        + " atlasVerify=" + result["atlasLinkVerification"]["status"],
     )
     return result
 

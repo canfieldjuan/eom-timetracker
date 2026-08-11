@@ -249,6 +249,51 @@ def test_a_dangling_link_moves_the_inventory_fingerprint(client, auth, monkeypat
     assert clean_fp != dangling_fp
 
 
+def test_incomplete_atlas_response_degrades_to_unavailable(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    _create_customer("Incomplete Response Subject", str(uuid.uuid4()))
+
+    def _incomplete(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            # A 200 that omits knownContactIds -- a schema drift or truncation.
+            return _Resp(200, {"checked": 0, "limit": 100})
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _incomplete)
+
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    # A malformed response must NOT flag every link as dangling.
+    assert body["danglingLinks"] == []
+    assert body["summary"]["danglingLinks"] == 0
+    assert body["atlasLinkVerification"]["status"] == "unavailable"
+    assert body["atlasLinkVerification"]["error"]
+
+
+def test_verification_status_is_recorded_in_the_audit_log(client, auth, monkeypatch):
+    import time_tracker_api as api
+    import requests as _requests
+
+    _create_customer("Log Status Subject", str(uuid.uuid4()))
+
+    def _boom(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            raise _requests.RequestException("atlas unreachable")
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _boom)
+
+    client.get(AUDIT_PATH, headers=auth)
+    row = db.query_one(
+        "SELECT reason FROM access_log_entries WHERE action = %s "
+        "ORDER BY logged_at DESC, id DESC LIMIT 1",
+        ("ATLAS_LINKAGE_AUDIT",),
+    )
+    assert row is not None
+    # The durable record must distinguish "could not verify" from a clean audit.
+    assert "atlasVerify=unavailable" in row["reason"]
+
+
 # -- backfill happy path ---------------------------------------------------------
 
 
