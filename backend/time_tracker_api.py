@@ -13244,26 +13244,6 @@ def _apply_customer_type_change(
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_type_mirror(cur, str(contact_id))
-            # Ordering comes from Atlas, not from who reaches this transaction
-            # first. Two mutations can return here in the opposite order Atlas
-            # applied them -- A sets commercial and stalls, B sets residential
-            # and returns, A resumes first -- and local arrival order would
-            # leave the mirror on commercial while Atlas holds residential.
-            # Refuse anything not strictly newer than what is already mirrored.
-            # Two guards, two domains, and they must not overrule each other.
-            #
-            # When Atlas reports a version, IT decides ordering and a strictly
-            # newer answer supersedes whatever is mirrored -- including a local
-            # snapshot this request took before calling. Keeping the local
-            # updated_at compare here would reject a legitimately newer answer:
-            # if A and B snapshot the same state, Atlas applies A then B, and A
-            # mirrors first, B's version is newer but its snapshot is stale, so
-            # B would 409 and leave the mirror on A while Atlas ended at B.
-            #
-            # The contact-link compare stays in both branches. That one is about
-            # identity, not ordering -- Atlas answered about the contact this row
-            # held, and if the row now points elsewhere the answer is about a
-            # different account.
             # Written unconditionally under the per-contact lock, which
             # serializes concurrent changes to this contact so the last
             # committer wins.
