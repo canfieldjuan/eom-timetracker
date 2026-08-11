@@ -4791,11 +4791,21 @@ def _ensure_schema_migrations() -> None:
         "ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_type "
         "VARCHAR(16) NOT NULL DEFAULT 'unknown'"
     )
-    # Atlas's own updated_at for the contact whose type this row mirrors.
+    # Atlas's updated_at as of the last change THIS ROUTE applied -- not, in
+    # general, the version the mirrored value reflects. Be precise about that:
+    # the 0C reservation saga and the #2357 refresh also write customer_type
+    # and do not maintain this column, so after either of them the token is
+    # older than the value beside it.
+    #
     # Ordering has to come from the AUTHORITY: two mutations can return to this
     # tracker in the opposite order Atlas applied them, and local arrival order
-    # would then pick the wrong winner. NULL means "mirrored before this column
-    # existed", which loses to any reported version.
+    # would then pick the wrong winner. NULL loses to any reported version,
+    # which is what makes a freshly created row accept its first real change.
+    #
+    # The residual: after a refresh advances the value without advancing the
+    # token, an answer newer than the token but older than the refresh's own
+    # evidence would still be applied. The refresh cannot fix this today --
+    # known-contacts reports types but no version. Tracked in issue #167.
     db.execute(
         "ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_type_source_at "
         "TIMESTAMPTZ"
