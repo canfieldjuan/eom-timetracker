@@ -529,3 +529,60 @@ def test_every_customer_sharing_the_contact_is_mirrored(client, auth, monkeypatc
     assert _type_of(unrelated) == "residential", (
         "a customer on a different contact must not be touched"
     )
+
+
+def test_the_mirror_write_serializes_on_the_contact(client, auth, monkeypatch):
+    """Two customers of ONE contact must not interleave their mirror writes.
+
+    Without a per-contact lock both requests pass their compare-and-set (they
+    target different rows) and then fan out over each other, leaving one
+    duplicate at each value for a contact that has a single type in Atlas.
+
+    Proven by holding that exact advisory lock from a separate connection and
+    showing the request blocks on it, rather than by racing threads and hoping
+    the interleaving reproduces.
+    """
+    import threading
+    import psycopg2
+
+    shared = str(uuid.uuid4())
+    primary = _customer("Serialized A", shared, "unknown")
+    _customer("Serialized B", shared, "unknown")
+    monkeypatch.setattr(api.requests, "post", _atlas_echoing("commercial"))
+
+    import os
+    blocker = psycopg2.connect(os.environ["DATABASE_URL"], sslmode="disable")
+    blocker.autocommit = False
+    try:
+        with blocker.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+                (api.CUSTOMER_TYPE_MIRROR_LOCK, shared),
+            )
+
+            done = {}
+
+            def _attempt():
+                try:
+                    done["status"] = client.patch(
+                        _path(primary), headers=auth,
+                        json={"customerType": "commercial"},
+                    ).status_code
+                except Exception as exc:  # pragma: no cover - diagnostic
+                    done["status"] = repr(exc)
+
+            worker = threading.Thread(target=_attempt)
+            worker.start()
+            worker.join(timeout=3)
+            assert worker.is_alive(), (
+                "the request did not block on the contact's mirror lock; "
+                f"observed={done}"
+            )
+            assert _type_of(primary) == "unknown", "nothing may be written yet"
+        blocker.rollback()  # releases the advisory lock
+        worker.join(timeout=15)
+        assert not worker.is_alive(), "the request never completed after release"
+        assert done.get("status") == 200, done
+        assert _type_of(primary) == "commercial"
+    finally:
+        blocker.close()

@@ -4111,6 +4111,7 @@ def normalize_site_address(address: str) -> str:
 
 CUSTOMER_SITE_MUTATION_LOCK = "eom_customer_site_mutations_v1"
 FUNNEL_LEAD_TRANSITION_LOCK = "eom_funnel_lead_transition_v1"
+CUSTOMER_TYPE_MIRROR_LOCK = "eom_customer_type_mirror_v1"
 
 
 def _lock_customer_site_mutations(cur: Any) -> None:
@@ -4118,6 +4119,25 @@ def _lock_customer_site_mutations(cur: Any) -> None:
     cur.execute(
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
         (CUSTOMER_SITE_MUTATION_LOCK,),
+    )
+
+
+def _lock_customer_type_mirror(cur: Any, contact_id: str) -> None:
+    """Serialize mirror writes for ONE Atlas contact.
+
+    Keyed on the contact, not the customer, because several customers can hold
+    the same atlas_contact_id and a change to that contact rewrites all of
+    them. Two requests naming different customers of one contact would
+    otherwise both pass their compare-and-set and then fan out over each
+    other, leaving one duplicate at each value for a contact that has a single
+    type in Atlas.
+
+    Taken AFTER the Atlas call, so no HTTP happens inside the critical
+    section -- the lock covers the local read-modify-write only.
+    """
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+        (CUSTOMER_TYPE_MIRROR_LOCK, str(contact_id)),
     )
 
 
@@ -13245,45 +13265,57 @@ def _apply_customer_type_change(
     # customer_type sets updated_at = NOW(), so a moved row fails the compare
     # even when it landed back on the same value. The cost is a spurious 409 if
     # an unrelated field changed in the window, which is the safe direction.
-    updated = db.query_one(
-        "UPDATE customers SET customer_type = %s, updated_at = NOW() "
-        "WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s "
-        "AND atlas_contact_id IS NOT DISTINCT FROM %s "
-        "AND updated_at IS NOT DISTINCT FROM %s "
-        "RETURNING id",
-        (
-            confirmed,
-            customer_id,
-            existing["customer_type"],
-            contact_id,
-            existing["updated_at"],
-        ),
-    )
-    if updated is None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "This Customer's type changed while the request was in flight; "
-                "Atlas was updated but the local record was not. Re-check it "
-                "and try again."
-            ),
-        )
-    # One Atlas contact can be held by several customers -- the linkage audit
-    # reports exactly these duplicate groups, and there are live ones. They all
-    # mirror the SAME account, so leaving the siblings behind would have this
-    # route serve two different types for one Atlas contact. Fan out, as the
-    # #2357 refresh already does for the same reason.
     #
-    # Unguarded on purpose: the compare-and-set above established that this
-    # request won the race for this contact, and these rows are copies of the
-    # value it just confirmed rather than independent decisions.
-    siblings = db.query_all(
-        "UPDATE customers SET customer_type = %s, updated_at = NOW() "
-        "WHERE atlas_contact_id = %s AND id <> %s "
-        "AND customer_type IS DISTINCT FROM %s "
-        "RETURNING id",
-        (confirmed, contact_id, customer_id, confirmed),
-    )
+    # The compare-and-set and the duplicate fan-out are ONE transaction under a
+    # per-contact lock. db.query_one/query_all each open and commit their own
+    # transaction, so as separate statements two requests naming different
+    # customers of the SAME contact could both pass their compare-and-set and
+    # then fan out over each other, leaving one duplicate at each value for a
+    # contact that has a single type in Atlas.
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_type_mirror(cur, str(contact_id))
+            cur.execute(
+                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                "WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s "
+                "AND atlas_contact_id IS NOT DISTINCT FROM %s "
+                "AND updated_at IS NOT DISTINCT FROM %s "
+                "RETURNING id",
+                (
+                    confirmed,
+                    customer_id,
+                    existing["customer_type"],
+                    contact_id,
+                    existing["updated_at"],
+                ),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This Customer's type changed while the request was in "
+                        "flight; Atlas was updated but the local record was "
+                        "not. Re-check it and try again."
+                    ),
+                )
+            # One Atlas contact can be held by several customers -- the linkage
+            # audit reports exactly these duplicate groups, and there are live
+            # ones. They all mirror the SAME account, so leaving the siblings
+            # behind would have this route serve two different types for one
+            # Atlas contact. Fan out, as the #2357 refresh already does.
+            #
+            # Unguarded on purpose: the compare-and-set above established that
+            # this request won the race for this contact, and these rows are
+            # copies of the value it just confirmed rather than independent
+            # decisions.
+            cur.execute(
+                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                "WHERE atlas_contact_id = %s AND id <> %s "
+                "AND customer_type IS DISTINCT FROM %s "
+                "RETURNING id",
+                (confirmed, contact_id, customer_id, confirmed),
+            )
+            siblings = cur.fetchall()
     append_access_log(
         request,
         "CUSTOMER_TYPE_CHANGED",
