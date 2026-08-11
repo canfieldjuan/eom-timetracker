@@ -1418,3 +1418,82 @@ def test_a_type_fault_never_truncates_the_known_id_set(client, auth, monkeypatch
     assert first not in reported and second not in reported, (
         f"a type fault fabricated dangling links: {reported}"
     )
+
+
+# -- review round 4 finding (ATLAS #2357) ---------------------------------------
+
+
+def test_a_later_batch_cannot_retype_an_earlier_batchs_contact(
+    client, auth, monkeypatch
+):
+    """Cross-batch key bleed: batch B must not be able to change customer A.
+
+    Matching reported keys against the globally accumulated `known` set instead
+    of the batch's own ids let a later response carry an entry for a contact
+    resolved earlier and silently overwrite its type -- which the apply route
+    would then persist. Keys must equal the batch's knownContactIds.
+    """
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    victim = _create_customer("Batch A Victim", first)
+    other = _create_customer("Batch B Other", second)
+    _set_type(victim, "commercial")
+    _set_type(other, "commercial")
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    seen = []
+
+    def _bleeding(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            types = {v: "commercial" for v in submitted}
+            if len(seen) > 1:
+                # The second batch reports a type for the FIRST batch's contact.
+                types[first] = "residential"
+            return _Resp(200, {"knownContactIds": submitted,
+                               "checked": len(submitted), "limit": 100,
+                               "customerTypes": types})
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _bleeding)
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert len(seen) > 1, "test must exercise more than one batch"
+    assert resp.status_code == 503, resp.text
+    assert _get_type(victim) == "commercial", "batch B must not retype customer A"
+    assert _get_type(other) == "commercial"
+
+
+def test_the_audit_survives_a_cross_batch_key_bleed(client, auth, monkeypatch):
+    """The bleed is type-level; the id verdict must still stand."""
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    dead = str(uuid.uuid4())
+    _create_customer("Bleed Alive", first)
+    dangling_customer = _create_customer("Bleed Dead", dead)
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    seen = []
+
+    def _bleeding(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            resolved = [v for v in submitted if v != dead]
+            types = {v: "commercial" for v in resolved}
+            types[first] = "residential"  # may not belong to this batch
+            return _Resp(200, {"knownContactIds": resolved,
+                               "checked": len(submitted), "limit": 100,
+                               "customerTypes": types})
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _bleeding)
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert len(seen) > 1
+    assert body["atlasLinkVerification"]["status"] == "ok"
+    assert dangling_customer in {row["customerId"] for row in body["danglingLinks"]}

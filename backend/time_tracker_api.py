@@ -15211,18 +15211,27 @@ def _fetch_known_contacts(
                     "Atlas known-contacts response reported a malformed "
                     "customerTypes map"
                 )
-            elif batch_known - {str(key) for key in reported}:
-                # A present map that does not cover every known id in its own
-                # batch is truncated, not version skew. Treating the gap as
-                # "not reported" would skip those contacts while applying the
-                # rest -- the partial refresh this route refuses.
+            elif {str(key) for key in reported} != batch_known:
+                # EQUALITY, not coverage. ATLAS #2358 builds customerTypes from
+                # exactly the ids it reports in knownContactIds, so anything
+                # else is a malformed response.
+                #
+                # Missing keys would be a truncated map read as version skew --
+                # skipping those contacts while applying the rest.
+                #
+                # EXTRA keys are worse. Matching them against the globally
+                # accumulated `known` instead of this batch's ids let a later
+                # response carry an entry for a contact resolved in an EARLIER
+                # batch, silently overwriting that contact's type -- so a
+                # malformed response for batch B could change a customer in
+                # batch A, and the apply route would persist it.
                 types_fault = (
-                    "Atlas reported customerTypes covering only part of a batch"
+                    "Atlas reported customerTypes whose ids do not match the "
+                    "batch's knownContactIds"
                 )
             else:
                 for key, value in reported.items():
-                    if str(key) in known:
-                        types[str(key)] = value
+                    types[str(key)] = value
 
     if types_fault is None and 0 < batches_with_field < batches_total:
         # Some batches reported the field and some did not: the reads straddled
