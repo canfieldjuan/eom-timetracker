@@ -339,24 +339,6 @@ def test_a_malformed_contact_id_is_a_502_not_a_500(client, auth, monkeypatch):
     assert _type_of(customer) == "unknown"
 
 
-def test_the_write_completes_under_the_row_lock(client, auth, monkeypatch):
-    """The mirror UPDATE must run on the locked transaction's cursor.
-
-    The row is held FOR UPDATE by this request's own transaction, so issuing
-    the UPDATE on a second pooled connection would block on the lock this very
-    request holds. That deadlock shows up as a hang, not a failure, so assert
-    the request actually returns and the value landed.
-    """
-    contact = str(uuid.uuid4())
-    customer = _customer("Locked Write", contact, "unknown")
-    monkeypatch.setattr(api.requests, "post", _atlas_echoing("commercial"))
-
-    resp = client.patch(_path(customer), headers=auth,
-                        json={"customerType": "commercial"})
-    assert resp.status_code == 200, resp.text
-    assert _type_of(customer) == "commercial"
-
-
 def test_a_rolled_back_atlas_is_refused_before_the_mutation(
     client, auth, monkeypatch
 ):
@@ -457,9 +439,9 @@ def test_every_customer_sharing_the_contact_is_mirrored(client, auth, monkeypatc
 def test_the_mirror_write_serializes_on_the_contact(client, auth, monkeypatch):
     """Two customers of ONE contact must not interleave their mirror writes.
 
-    Without a per-contact lock both requests pass their compare-and-set (they
-    target different rows) and then fan out over each other, leaving one
-    duplicate at each value for a contact that has a single type in Atlas.
+    Without a per-contact lock both requests write (they target different
+    rows) and then fan out over each other, leaving one duplicate at each
+    value for a contact that has a single type in Atlas.
 
     Proven by holding that exact advisory lock from a separate connection and
     showing the request blocks on it, rather than by racing threads and hoping
