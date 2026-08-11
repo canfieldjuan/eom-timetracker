@@ -23,6 +23,16 @@ CHICAGO = ZoneInfo("America/Chicago")
 _HASH_CACHE: dict[str, str] = {}
 
 
+class _SeededResponse:
+    def __init__(self, body: dict, status_code: int = 200):
+        self._body = body
+        self.status_code = status_code
+        self.text = json.dumps(body, sort_keys=True)
+
+    def json(self) -> dict:
+        return self._body
+
+
 def _bcrypt_hash(password: str = "payroll1234") -> str:
     if password not in _HASH_CACHE:
         _HASH_CACHE[password] = bcrypt.hashpw(
@@ -171,6 +181,81 @@ def _payroll_timesheet(
     response = client.get(url, headers=auth)
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _insert_legacy_payroll_hour_correction(
+    *,
+    week_start: date,
+    correction_date: date,
+    employee_id: int,
+    corrected_total_minutes: int,
+    reason: str = "Legacy day-total correction seeded for cleanup coverage.",
+    created_by_employee_id: int | None = None,
+    created_by_name: str = "Legacy Payroll Test",
+) -> int:
+    return int(
+        db.execute_returning(
+            """
+            INSERT INTO payroll_hour_corrections (
+                week_start,
+                correction_date,
+                employee_id,
+                corrected_total_minutes,
+                reason,
+                created_by_employee_id,
+                created_by_name
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                week_start,
+                correction_date,
+                employee_id,
+                corrected_total_minutes,
+                reason,
+                created_by_employee_id,
+                created_by_name,
+            ),
+        )
+    )
+
+
+def _seed_legacy_payroll_hour_correction_response(
+    client,
+    auth: dict[str, str],
+    *,
+    week_start: date,
+    employee_id: int,
+    correction_date: date,
+    corrected_total_minutes: int,
+    reason: str,
+    created_by_employee_id: int | None = None,
+    created_by_name: str = "Legacy Payroll Test",
+) -> _SeededResponse:
+    correction_id = _insert_legacy_payroll_hour_correction(
+        week_start=week_start,
+        correction_date=correction_date,
+        employee_id=employee_id,
+        corrected_total_minutes=corrected_total_minutes,
+        reason=reason,
+        created_by_employee_id=created_by_employee_id,
+        created_by_name=created_by_name,
+    )
+    correction_row = next(
+        row
+        for row in time_tracker_api._payroll_correction_rows(week_start)
+        if int(row["id"]) == correction_id
+    )
+    return _SeededResponse(
+        {
+            "success": True,
+            "action": "correct",
+            "idempotent": False,
+            "correction": time_tracker_api._serialize_payroll_correction(correction_row),
+            "weeklyHours": _weekly_hours(client, auth, week_start),
+        }
+    )
 
 
 def _create_timesheet_site(
@@ -975,6 +1060,8 @@ def test_payroll_timesheet_exposes_shift_rows_for_employee_week(client):
         assert body["capabilities"] == {
             "rawShiftRows": True,
             "dayTotalCorrections": True,
+            "dayTotalCorrectionWrites": False,
+            "legacyDayTotalCorrectionCleanup": True,
             "shiftClockCorrections": True,
             "breakMinutesTracked": False,
             "shiftBreakCorrections": True,
@@ -1110,16 +1197,14 @@ def test_payroll_timesheet_keeps_day_total_corrections_out_of_shift_rows(client)
             location_label="Correction Site",
         )
 
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra confirmed the day total but not the location split.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra confirmed the day total but not the location split.",
         )
         assert corrected.status_code == 200, corrected.text
 
@@ -2491,16 +2576,14 @@ def test_recorded_shift_changes_retire_day_totals_on_every_affected_date(client)
             _local_dt(tuesday, 2),
         )
         for correction_day in (monday, tuesday):
-            corrected = client.post(
-                "/api/admin/payroll/weekly-hours/corrections",
-                headers=payroll_auth,
-                json={
-                    "weekStart": week_start.isoformat(),
-                    "employeeId": employee_id,
-                    "date": correction_day.isoformat(),
-                    "correctedTotalMinutes": 180,
-                    "reason": "Legacy total awaiting shift-level review.",
-                },
+            corrected = _seed_legacy_payroll_hour_correction_response(
+                client,
+                payroll_auth,
+                week_start=week_start,
+                employee_id=employee_id,
+                correction_date=correction_day,
+                corrected_total_minutes=180,
+                reason="Legacy total awaiting shift-level review.",
             )
             assert corrected.status_code == 200, corrected.text
         before = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
@@ -2754,16 +2837,15 @@ def test_atomic_timesheet_changes_are_stale_safe_atomic_and_retire_day_total(cli
         employee_id = _create_employee("Payroll Atomic Alma")
         payroll_auth = _login(client, "Payroll Atomic Mayra")
         baseline = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
-        correction = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 60,
-                "reason": "Legacy total before granular evidence arrived.",
-            },
+        correction = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=60,
+            reason="Legacy total before granular evidence arrived.",
+
         )
         assert correction.status_code == 200, correction.text
         with_total = _payroll_timesheet(client, payroll_auth, week_start, employee_id=employee_id)
@@ -3062,16 +3144,14 @@ def test_payroll_timesheet_allocation_labels_and_rate_fingerprint(client):
         # The insert trigger now stamps every insert for a rated employee, so
         # clear this shift's snapshot back to NULL to recreate that state.
         _stamp_shift_snapshots(employee_id, service_day, {site_id: None})
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra corrected total hours for allocation labels.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra corrected total hours for allocation labels.",
         )
         assert corrected.status_code == 200, corrected.text
         correction_id = corrected.json()["correction"]["correctionId"]
@@ -3189,16 +3269,14 @@ def test_payroll_timesheet_marks_stale_correction_allocation_invalid(client):
         )
         assert shift is not None
 
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra corrected total hours before stale allocation.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra corrected total hours before stale allocation.",
         )
         assert corrected.status_code == 200, corrected.text
         correction_id = corrected.json()["correction"]["correctionId"]
@@ -4155,16 +4233,14 @@ def test_payroll_hour_correction_overlays_day_total_without_mutating_shift(clien
         )
         before = _weekly_hours(client, auth, week_start)
 
-        response = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": correction_date.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra confirmed the cleaner worked one extra hour.",
-            },
+        response = _seed_legacy_payroll_hour_correction_response(
+            client,
+            auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=correction_date,
+            corrected_total_minutes=180,
+            reason="Mayra confirmed the cleaner worked one extra hour.",
         )
         assert response.status_code == 200, response.text
         body = response.json()
@@ -4207,7 +4283,49 @@ def test_payroll_hour_correction_overlays_day_total_without_mutating_shift(clien
         _delete_employees([employee_id])
 
 
-def test_payroll_corrections_require_reopen_after_verification_and_supersede(client, auth):
+def test_legacy_payroll_hour_correction_create_remains_compatible_without_mutating_shift(client, auth):
+    week_start = date(2026, 8, 23)
+    correction_date = week_start + timedelta(days=2)
+    employee_id = _create_employee("Payroll Correction Deprecated Worker")
+    _delete_payroll_verification_weeks([week_start])
+    try:
+        shift_id = _create_shift(
+            employee_id,
+            _local_dt(correction_date, 8),
+            _local_dt(correction_date, 10),
+        )
+
+        response = client.post(
+            "/api/admin/payroll/weekly-hours/corrections",
+            headers=auth,
+            json={
+                "weekStart": week_start.isoformat(),
+                "employeeId": employee_id,
+                "date": correction_date.isoformat(),
+                "correctedTotalMinutes": 180,
+                "reason": "Legacy client can still post during staged migration.",
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["success"] is True
+        assert body["action"] == "correct"
+        assert body["correction"]["correctedTotalMinutes"] == 180
+        stored_shift = db.query_one(
+            "SELECT total_hours FROM shifts WHERE id = %s",
+            (shift_id,),
+        )
+        assert stored_shift is not None
+        assert float(stored_shift["total_hours"]) == 2
+        timesheet = _payroll_timesheet(client, auth, week_start, employee_id=employee_id)
+        assert timesheet["capabilities"]["dayTotalCorrectionWrites"] is False
+    finally:
+        _delete_payroll_verification_weeks([week_start])
+        _delete_employees([employee_id])
+
+
+def test_legacy_payroll_correction_create_still_requires_reopen_and_supersedes(client, auth):
     week_start = date(2026, 8, 30)
     correction_date = week_start + timedelta(days=1)
     employee_id = _create_employee("Payroll Correction Reopen Worker")
@@ -4218,16 +4336,14 @@ def test_payroll_corrections_require_reopen_after_verification_and_supersede(cli
             _local_dt(correction_date, 8),
             _local_dt(correction_date, 9),
         )
-        first_correction = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": correction_date.isoformat(),
-                "correctedTotalMinutes": 90,
-                "reason": "Initial correction from Mayra.",
-            },
+        first_correction = _seed_legacy_payroll_hour_correction_response(
+            client,
+            auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=correction_date,
+            corrected_total_minutes=90,
+            reason="Initial legacy correction from Mayra.",
         )
         assert first_correction.status_code == 200, first_correction.text
         weekly = first_correction.json()["weeklyHours"]
@@ -4327,16 +4443,14 @@ def test_void_payroll_correction_restores_shift_total_and_employee_role_is_denie
         )
         assert employee_denied.status_code == 403, employee_denied.text
 
-        created = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": correction_date.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Temporary correction to void.",
-            },
+        created = _seed_legacy_payroll_hour_correction_response(
+            client,
+            auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=correction_date,
+            corrected_total_minutes=180,
+            reason="Temporary legacy correction to void.",
         )
         assert created.status_code == 200, created.text
         correction_id = created.json()["correction"]["correctionId"]
@@ -4497,16 +4611,15 @@ def test_payroll_weekly_hours_pdf_includes_verification_and_corrections_without_
             _local_dt(correction_date, 8),
             _local_dt(correction_date, 10),
         )
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": correction_date.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra confirmed PDF correction.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=correction_date,
+            corrected_total_minutes=180,
+            reason="Mayra confirmed PDF correction.",
+
         )
         assert corrected.status_code == 200, corrected.text
         verified = client.post(
@@ -5404,16 +5517,16 @@ def test_payroll_labor_profitability_discloses_unallocated_hour_corrections(
             service_day=service_day,
         )
 
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra corrected total hours.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra corrected total hours.",
+
+
         )
         assert corrected.status_code == 200, corrected.text
 
@@ -5519,16 +5632,15 @@ def test_payroll_correction_allocation_attaches_site_proof_without_blending_actu
         # stamps rated-employee inserts, so clear it back to NULL to recreate the
         # pre-migration / rate-less-at-clock-in state this test exercises.
         _stamp_shift_snapshots(employee_id, service_day, {site_id: None})
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra corrected total hours.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra corrected total hours.",
+
         )
         assert corrected.status_code == 200, corrected.text
         correction_id = corrected.json()["correction"]["correctionId"]
@@ -5742,16 +5854,15 @@ def test_payroll_correction_on_a_rateless_shift_tracks_the_live_rate(client):
             source_id=source_id,
             service_day=service_day,
         )
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra corrected total hours.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra corrected total hours.",
+
         )
         assert corrected.status_code == 200, corrected.text
         correction_id = corrected.json()["correction"]["correctionId"]
@@ -5849,16 +5960,15 @@ def test_payroll_correction_allocation_rejects_non_candidate_site(client):
             source_id=source_id,
             service_day=service_day,
         )
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra corrected total hours.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra corrected total hours.",
+
         )
         assert corrected.status_code == 200, corrected.text
         correction_id = corrected.json()["correction"]["correctionId"]
@@ -5914,16 +6024,15 @@ def test_payroll_correction_allocation_stale_delta_is_reported_invalid(client):
             source_id=source_id,
             service_day=service_day,
         )
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra corrected total hours.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra corrected total hours.",
+
         )
         assert corrected.status_code == 200, corrected.text
         correction_id = corrected.json()["correction"]["correctionId"]
@@ -6034,16 +6143,15 @@ def test_payroll_correction_allocation_rejects_negative_target_hours(client):
             local_start=_local_dt(service_day, 13),
             local_end=_local_dt(service_day, 17),
         )
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 0,
-                "reason": "Mayra removed a duplicated clocked day.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=0,
+            reason="Mayra removed a duplicated clocked day.",
+
         )
         assert corrected.status_code == 200, corrected.text
         correction_id = corrected.json()["correction"]["correctionId"]
@@ -6100,16 +6208,15 @@ def test_payroll_correction_allocation_stale_target_is_reported_invalid(client):
             source_id=source_id,
             service_day=service_day,
         )
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra corrected total hours.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra corrected total hours.",
+
         )
         assert corrected.status_code == 200, corrected.text
         correction_id = corrected.json()["correction"]["correctionId"]
@@ -6188,16 +6295,15 @@ def test_payroll_correction_allocation_rejects_excluded_profitability_target(cli
             local_start=_local_dt(service_day, 9),
             local_end=_local_dt(service_day, 11),
         )
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra corrected archived-site time.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra corrected archived-site time.",
+
         )
         assert corrected.status_code == 200, corrected.text
         correction_id = corrected.json()["correction"]["correctionId"]
@@ -6373,16 +6479,16 @@ def test_payroll_labor_profitability_includes_ambiguous_unmatched_candidates(
             local_end=_local_dt(service_day, 11),
         )
 
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": service_day.isoformat(),
-                "correctedTotalMinutes": 180,
-                "reason": "Mayra corrected ambiguous site time.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=service_day,
+            corrected_total_minutes=180,
+            reason="Mayra corrected ambiguous site time.",
+
+
         )
         assert corrected.status_code == 200, corrected.text
 
@@ -6549,16 +6655,16 @@ def test_payroll_labor_profitability_does_not_offer_folded_boundary_labor_candid
             qr_local_time=_local_dt(prior_day, 22, 30),
         )
 
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": week_start.isoformat(),
-                "correctedTotalMinutes": 60,
-                "reason": "Mayra corrected Sunday total hours.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=week_start,
+            corrected_total_minutes=60,
+            reason="Mayra corrected Sunday total hours.",
+
+
         )
         assert corrected.status_code == 200, corrected.text
 
@@ -7281,16 +7387,16 @@ def _allocate_correction_at_rate(
         (live_rate_after, employee_id),
     )
 
-    corrected = client.post(
-        "/api/admin/payroll/weekly-hours/corrections",
-        headers=payroll_auth,
-        json={
-            "weekStart": week_start.isoformat(),
-            "employeeId": employee_id,
-            "date": service_day.isoformat(),
-            "correctedTotalMinutes": 180 if not second_site else 300,
-            "reason": "Mayra corrected total hours.",
-        },
+    corrected = _seed_legacy_payroll_hour_correction_response(
+        client,
+        payroll_auth,
+        week_start=week_start,
+        employee_id=employee_id,
+        correction_date=service_day,
+        corrected_total_minutes=180 if not second_site else 300,
+        reason="Mayra corrected total hours.",
+
+
     )
     assert corrected.status_code == 200, corrected.text
     correction_id = corrected.json()["correction"]["correctionId"]
@@ -7400,16 +7506,16 @@ def test_correction_fails_closed_when_that_days_snapshots_disagree(client):
             )
         conn.commit()
 
-    corrected = client.post(
-        "/api/admin/payroll/weekly-hours/corrections",
-        headers=payroll_auth,
-        json={
-            "weekStart": week_start.isoformat(),
-            "employeeId": employee_id,
-            "date": service_day.isoformat(),
-            "correctedTotalMinutes": 300,
-            "reason": "Mayra corrected total hours.",
-        },
+    corrected = _seed_legacy_payroll_hour_correction_response(
+        client,
+        payroll_auth,
+        week_start=week_start,
+        employee_id=employee_id,
+        correction_date=service_day,
+        corrected_total_minutes=300,
+        reason="Mayra corrected total hours.",
+
+
     )
     assert corrected.status_code == 200, corrected.text
     correction_id = corrected.json()["correction"]["correctionId"]
@@ -7491,16 +7597,15 @@ def _allocate_with_mixed_snapshot_shift(client, *, week_start, service_day, live
         "UPDATE employees SET hourly_rate = %s WHERE id = %s",
         (live_rate_after, employee_id),
     )
-    corrected = client.post(
-        "/api/admin/payroll/weekly-hours/corrections",
-        headers=payroll_auth,
-        json={
-            "weekStart": week_start.isoformat(),
-            "employeeId": employee_id,
-            "date": service_day.isoformat(),
-            "correctedTotalMinutes": 300,
-            "reason": "Mayra corrected total hours.",
-        },
+    corrected = _seed_legacy_payroll_hour_correction_response(
+        client,
+        payroll_auth,
+        week_start=week_start,
+        employee_id=employee_id,
+        correction_date=service_day,
+        corrected_total_minutes=300,
+        reason="Mayra corrected total hours.",
+
     )
     assert corrected.status_code == 200, corrected.text
     correction_id = corrected.json()["correction"]["correctionId"]
@@ -7568,14 +7673,14 @@ def test_correction_scope_ignores_an_unrelated_sites_snapshot(client):
     b_id = (_shift_ids(employee_id, service_day, site_b) - before_b).pop()
     db.execute("UPDATE shifts SET hourly_rate_cents = NULL WHERE id = %s", (b_id,))
 
-    corrected = client.post(
-        "/api/admin/payroll/weekly-hours/corrections",
-        headers=payroll_auth,
-        json={
-            "weekStart": week_start.isoformat(), "employeeId": employee_id,
-            "date": service_day.isoformat(), "correctedTotalMinutes": 300,
-            "reason": "Mayra corrected total hours.",
-        },
+    corrected = _seed_legacy_payroll_hour_correction_response(
+        client,
+        payroll_auth,
+        week_start=week_start,
+        employee_id=employee_id,
+        correction_date=service_day,
+        corrected_total_minutes=300,
+        reason="Mayra corrected total hours.",
     )
     assert corrected.status_code == 200, corrected.text
     correction_id = corrected.json()["correction"]["correctionId"]
@@ -7672,16 +7777,15 @@ def test_correction_candidate_splits_daily_labor_by_rate(client):
         _stamp_shift_snapshots(employee_id, monday, {site_id: 2000})
 
         # An unallocated Monday correction surfaces Monday's candidate labor.
-        corrected = client.post(
-            "/api/admin/payroll/weekly-hours/corrections",
-            headers=payroll_auth,
-            json={
-                "weekStart": week_start.isoformat(),
-                "employeeId": employee_id,
-                "date": monday.isoformat(),
-                "correctedTotalMinutes": 120,
-                "reason": "Mayra corrected Monday.",
-            },
+        corrected = _seed_legacy_payroll_hour_correction_response(
+            client,
+            payroll_auth,
+            week_start=week_start,
+            employee_id=employee_id,
+            correction_date=monday,
+            corrected_total_minutes=120,
+            reason="Mayra corrected Monday.",
+
         )
         assert corrected.status_code == 200, corrected.text
 
@@ -7738,16 +7842,16 @@ def test_void_of_a_live_tracked_allocation_serializes_the_live_cost(client):
     # No snapshot on the shift -> the allocation resolves via the live rate.
     _stamp_shift_snapshots(employee_id, service_day, {site_id: None})
 
-    corrected = client.post(
-        "/api/admin/payroll/weekly-hours/corrections",
-        headers=payroll_auth,
-        json={
-            "weekStart": week_start.isoformat(),
-            "employeeId": employee_id,
-            "date": service_day.isoformat(),
-            "correctedTotalMinutes": 180,
-            "reason": "Mayra corrected total hours.",
-        },
+    corrected = _seed_legacy_payroll_hour_correction_response(
+        client,
+        payroll_auth,
+        week_start=week_start,
+        employee_id=employee_id,
+        correction_date=service_day,
+        corrected_total_minutes=180,
+        reason="Mayra corrected total hours.",
+
+
     )
     assert corrected.status_code == 200, corrected.text
     correction_id = corrected.json()["correction"]["correctionId"]

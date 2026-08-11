@@ -18313,6 +18313,8 @@ def _compute_payroll_timesheet(
         "capabilities": {
             "rawShiftRows": True,
             "dayTotalCorrections": True,
+            "dayTotalCorrectionWrites": False,
+            "legacyDayTotalCorrectionCleanup": True,
             "shiftClockCorrections": True,
             "breakMinutesTracked": False,
             "shiftBreakCorrections": True,
@@ -21503,7 +21505,7 @@ def admin_create_payroll_hour_correction(
 
     append_access_log(
         request,
-        "PAYROLL_HOUR_CORRECTION",
+        "PAYROLL_HOUR_CORRECTION_LEGACY",
         True,
         f"week={week_start.isoformat()} employee={payload.employeeId} date={correction_date.isoformat()} idempotent={result['idempotent']}",
     )
