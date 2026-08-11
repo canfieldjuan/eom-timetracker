@@ -14,7 +14,11 @@ from datetime import datetime, timezone
 import pytest
 
 import db
-from time_tracker_api import STALE_CUSTOMER_RESERVATION_MINUTES
+from time_tracker_api import (
+    STALE_CUSTOMER_RESERVATION_MINUTES,
+    _ATLAS_FUNNEL_READ_PATHS,
+    _KNOWN_CONTACTS_PATH,
+)
 
 TEST_PREFIX = "ZZ-LNK-TEST"
 
@@ -769,3 +773,16 @@ def test_reservations_sharing_an_updated_at_hash_the_same_way(client, auth):
 
     assert orders == {(second, first)}, "ties must resolve by id, deterministically"
     assert len(fingerprints) == 1, "unchanged inventory must hash to one value"
+
+
+def test_the_verified_path_is_the_authorized_path():
+    """The path the verifier calls must be the one the allow-list permits.
+
+    These were two copies of the same string. The drift is not cosmetic: an
+    unlisted path raises RuntimeError, which is not an HTTPException and so
+    escapes the degradation path in _verify_atlas_contact_links -- a rename
+    that updated only one copy would turn a degradable outage into a 500 on
+    the whole audit. Asserting the derivation holds is what keeps them one
+    value rather than two that happen to match today.
+    """
+    assert _KNOWN_CONTACTS_PATH in _ATLAS_FUNNEL_READ_PATHS

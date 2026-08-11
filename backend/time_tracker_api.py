@@ -3371,13 +3371,18 @@ def _atlas_funnel_request(
     return content
 
 
+# Defined here rather than beside its caller so the allow-list below can be
+# derived from it. Two copies of one path drift silently, and the drift is not
+# cosmetic: the allow-list rejects an unlisted path with RuntimeError, which is
+# not an HTTPException and so escapes the degradation path in
+# _verify_atlas_contact_links instead of reporting status=unavailable.
+_KNOWN_CONTACTS_PATH = "/eom-funnel/known-contacts"
+
 # GET reads Atlas allows through the funnel credential. Kept as an explicit
 # allow-list, not an open passthrough: a caller that could read any funnel path
 # would turn this EOM-scoped token into a broad read oracle. known-contacts
 # (ATLAS #2352) is id-only link verification, added for the write-boundary audit.
-_ATLAS_FUNNEL_READ_PATHS = frozenset(
-    {"/eom-funnel/leads", "/eom-funnel/known-contacts"}
-)
+_ATLAS_FUNNEL_READ_PATHS = frozenset({"/eom-funnel/leads", _KNOWN_CONTACTS_PATH})
 
 
 def _atlas_funnel_read(
@@ -15028,7 +15033,8 @@ STALE_CUSTOMER_RESERVATION_MINUTES = 60
 
 # ATLAS #2352: verify that a stored customers.atlas_contact_id still names a live
 # EOM contact. The endpoint answers id-only and caps one request at 100 ids.
-_KNOWN_CONTACTS_PATH = "/eom-funnel/known-contacts"
+# _KNOWN_CONTACTS_PATH is defined beside _ATLAS_FUNNEL_READ_PATHS, which derives
+# from it, so the path and its authorization cannot drift apart.
 _KNOWN_CONTACTS_BATCH = 100
 
 
