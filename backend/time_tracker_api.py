@@ -4791,25 +4791,6 @@ def _ensure_schema_migrations() -> None:
         "ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_type "
         "VARCHAR(16) NOT NULL DEFAULT 'unknown'"
     )
-    # Atlas's updated_at as of the last change THIS ROUTE applied -- not, in
-    # general, the version the mirrored value reflects. Be precise about that:
-    # the 0C reservation saga and the #2357 refresh also write customer_type
-    # and do not maintain this column, so after either of them the token is
-    # older than the value beside it.
-    #
-    # Ordering has to come from the AUTHORITY: two mutations can return to this
-    # tracker in the opposite order Atlas applied them, and local arrival order
-    # would then pick the wrong winner. NULL loses to any reported version,
-    # which is what makes a freshly created row accept its first real change.
-    #
-    # The residual: after a refresh advances the value without advancing the
-    # token, an answer newer than the token but older than the refresh's own
-    # evidence would still be applied. The refresh cannot fix this today --
-    # known-contacts reports types but no version. Tracked in issue #167.
-    db.execute(
-        "ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_type_source_at "
-        "TIMESTAMPTZ"
-    )
     # Rebuilt ONLY when the deployed constraint disagrees with CUSTOMER_TYPES.
     #
     # Two failure modes to avoid at once. Creating it only when absent pins an
@@ -11939,44 +11920,7 @@ def _finalize_customer_atlas_reservation(
                     """,
                     (atlas_contact_id, customer_type, customer_id),
                 )
-                # Captured BEFORE the alignment below, which runs its own
-                # statement and would otherwise replace the rowcount the
-                # conflict check depends on.
-                linked_rowcount = cur.rowcount
-                # This reservation carries the type Atlas reported when it was
-                # created, which may be stale by now: the customer-type route
-                # can have changed this contact and fanned out while this was
-                # in flight, and its fan-out could only reach rows ALREADY
-                # linked. Without this the contact ends with two local mirrors
-                # holding different values.
-                #
-                # Provenance decides. A row carrying customer_type_source_at was
-                # written from a known Atlas version; this path has none, so any
-                # existing token beats it and the newly linked row adopts the
-                # group's value rather than overwriting it.
-                cur.execute(
-                    """
-                    UPDATE customers AS target
-                    SET customer_type = source.customer_type,
-                        customer_type_source_at = source.customer_type_source_at,
-                        updated_at = NOW()
-                    FROM (
-                        SELECT customer_type, customer_type_source_at
-                        FROM customers
-                        WHERE atlas_contact_id = %s
-                          AND id <> %s
-                          AND customer_type_source_at IS NOT NULL
-                        ORDER BY customer_type_source_at DESC
-                        LIMIT 1
-                    ) AS source
-                    WHERE target.id = %s
-                      AND target.atlas_contact_id = %s
-                      AND target.customer_type_source_at IS NULL
-                      AND target.customer_type IS DISTINCT FROM source.customer_type
-                    """,
-                    (atlas_contact_id, customer_id, customer_id, atlas_contact_id),
-                )
-                if linked_rowcount == 0:
+                if cur.rowcount == 0:
                     # Someone linked this Customer while we were talking to
                     # Atlas -- the legacy linkage-backfill endpoint takes the
                     # same mutation lock and can land in that gap. Finalizing
@@ -12078,45 +12022,6 @@ def _customer_type_from_operator_result(result: Dict[str, Any]) -> Optional[str]
         return None
     normalized = reported.strip().lower()
     return normalized if normalized in CUSTOMER_TYPES else None
-
-
-def _customer_type_source_at_from_operator_result(
-    result: Dict[str, Any],
-) -> Optional[datetime]:
-    """Read Atlas's own updated_at for the contact it just mutated.
-
-    This is the ordering token. Two type changes can return to this tracker in
-    the opposite order Atlas applied them, so picking a winner by local arrival
-    would leave the mirror holding the earlier mutation. Comparing Atlas's own
-    timestamp picks the LAST thing Atlas did.
-
-    None when Atlas reports nothing usable -- an older build, or a malformed
-    value. The caller treats that as "no ordering information" rather than
-    inventing one.
-    """
-    contact = result.get("contact")
-    if not isinstance(contact, dict):
-        return None
-    reported = contact.get("updatedAt")
-    if not isinstance(reported, str) or not reported.strip():
-        return None
-    try:
-        parsed = datetime.fromisoformat(reported.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    # A full RFC3339 instant, or nothing. datetime.fromisoformat happily parses
-    # a bare date like "9999-12-31", and assigning UTC to it -- as this used to
-    # -- invents an offset the sender never gave. That is not a harmless
-    # default: a far-future token is stored, every later legitimate version
-    # then fails the strict `<` predicate, and the row is stuck at 409 forever.
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        return None
-    # A version implausibly far ahead of this clock is not credible skew, and
-    # the cost of believing one is the same permanent stall. Reject rather than
-    # let a single bad response brick the row.
-    if parsed > datetime.now(timezone.utc) + timedelta(days=1):
-        return None
-    return parsed
 
 
 def _atlas_contact_id_from_operator_result(result: Dict[str, Any]) -> str:
@@ -13240,8 +13145,8 @@ def admin_set_customer_type(
     # applies only if the row still holds the value it was read at, so a
     # concurrent transition makes this one fail loudly instead of clobbering it.
     existing = db.query_one(
-        "SELECT id, name, atlas_contact_id, customer_type, updated_at "
-        "FROM customers WHERE id = %s",
+        "SELECT id, name, atlas_contact_id, customer_type FROM customers "
+        "WHERE id = %s",
         (customer_id,),
     )
     return _apply_customer_type_change(
@@ -13323,30 +13228,6 @@ def _apply_customer_type_change(
             ),
         )
 
-    source_at = _customer_type_source_at_from_operator_result(atlas_result)
-    if source_at is None:
-        # A response with no usable updatedAt does not meet the contract, so it
-        # is refused rather than fallen back on.
-        #
-        # This reverses the round-5 decision to apply anyway on the theory that
-        # an older Atlas might legitimately omit the field. It cannot: updatedAt
-        # entered the response in the SAME commit that created the operator
-        # mutation contract (ATLAS eaade0b0f, #2313), and this route already
-        # refuses when Atlas does not advertise contact.operator_mutation. Any
-        # Atlas that passes that gate reports a version.
-        #
-        # Inferring order locally instead is not a weaker-but-safe fallback, it
-        # is wrong: without the authority's version, two answers that arrive in
-        # the opposite order Atlas applied them cannot be told apart, and the
-        # mirror keeps whichever landed first.
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Atlas did not report a version for this contact; nothing was "
-                "changed locally. Re-check the contact in Atlas."
-            ),
-        )
-
     confirmed = _customer_type_from_operator_result(atlas_result)
     if confirmed is None:
         # Atlas did not echo a type it would itself accept, so this cannot be
@@ -13414,34 +13295,40 @@ def _apply_customer_type_change(
             # identity, not ordering -- Atlas answered about the contact this row
             # held, and if the row now points elsewhere the answer is about a
             # different account.
-            # One ordering rule, from the authority. There is no local-ordering
-            # fallback: a response without a version is refused above, because
-            # inferring order locally cannot distinguish two answers that
-            # arrived in the opposite order Atlas applied them.
+            # Written unconditionally under the per-contact lock, which
+            # serializes concurrent changes to this contact so the last
+            # committer wins.
             #
-            # The link compare is identity, not ordering -- Atlas answered about
-            # the contact this row held, and if the row now points elsewhere the
-            # answer is about a different account. It is deliberately NOT joined
-            # by a compare on customer_type or updated_at: a strictly newer
-            # Atlas version must supersede a stale local snapshot, or a request
-            # Atlas applied second would lose to one it applied first.
+            # This is deliberately eventually-consistent rather than strictly
+            # ordered. An earlier revision compared Atlas's own updated_at to
+            # pick the winner when two answers arrived out of order. It was
+            # removed: the harm it prevented was a transient wrong value that
+            # the ATLAS #2357 refresh reconciles on its next run, while the
+            # machinery itself produced a PERMANENT failure -- one malformed
+            # timestamp became a far-future token that no later version could
+            # beat, freezing the row at 409 forever -- and required reaching
+            # into the 0C finalizer, where it caused further defects.
+            #
+            # Preferring a transient, self-healing wrong value over a permanent
+            # stuck one is the whole trade. Concurrent type changes to one
+            # contact are rare here; a mirror that cannot be corrected is not.
+            #
+            # The contact-link compare stays: it is identity, not ordering.
+            # Atlas answered about the contact this row held, and if the row now
+            # points elsewhere the answer is about a different account.
             cur.execute(
-                "UPDATE customers SET customer_type = %s, "
-                "customer_type_source_at = %s, updated_at = NOW() "
-                "WHERE id = %s "
-                "AND atlas_contact_id IS NOT DISTINCT FROM %s "
-                "AND (customer_type_source_at IS NULL "
-                "     OR customer_type_source_at < %s) "
+                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                "WHERE id = %s AND atlas_contact_id IS NOT DISTINCT FROM %s "
                 "RETURNING id",
-                (confirmed, source_at, customer_id, contact_id, source_at),
+                (confirmed, customer_id, contact_id),
             )
             if cur.fetchone() is None:
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "A newer change to this Customer's type has already "
-                        "been recorded, or its Atlas link moved; Atlas was "
-                        "updated but this answer was not applied locally."
+                        "This Customer's Atlas link changed while the request "
+                        "was in flight; Atlas was updated but the local record "
+                        "was not. Re-check it and try again."
                     ),
                 )
             # One Atlas contact can be held by several customers -- the linkage
@@ -13458,21 +13345,11 @@ def _apply_customer_type_change(
             # Atlas contact, so leaving their ordering token behind would make
             # a later out-of-order answer for one of them look newer than it is.
             cur.execute(
-                "UPDATE customers SET customer_type = %s, "
-                "customer_type_source_at = COALESCE(%s, customer_type_source_at), "
-                "updated_at = NOW() "
+                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
                 "WHERE atlas_contact_id = %s AND id <> %s "
-                "AND (customer_type IS DISTINCT FROM %s "
-                "     OR customer_type_source_at IS DISTINCT FROM %s) "
+                "AND customer_type IS DISTINCT FROM %s "
                 "RETURNING id",
-                (
-                    confirmed,
-                    source_at,
-                    contact_id,
-                    customer_id,
-                    confirmed,
-                    source_at,
-                ),
+                (confirmed, contact_id, customer_id, confirmed),
             )
             siblings = cur.fetchall()
     append_access_log(

@@ -12,7 +12,6 @@ prevent: the tracker asserting a classification on its own authority.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
 
 import db
 import time_tracker_api as api
@@ -62,32 +61,13 @@ def _path(customer_id):
     return f"/api/admin/customers/{customer_id}/customer-type"
 
 
-_ATLAS_CLOCK = {"tick": 0}
-
-
-def _next_atlas_stamp():
-    """A monotonically increasing Atlas updated_at, as an ISO string."""
-    _ATLAS_CLOCK["tick"] += 1
-    base = datetime(2026, 8, 11, 12, 0, 0, tzinfo=timezone.utc)
-    return (base + timedelta(seconds=_ATLAS_CLOCK["tick"])).isoformat()
-
-
-def _atlas_echoing(value, *, calls=None, status=200, updated_at="auto"):
-    """Atlas accepts the mutation and echoes a contact carrying `value`.
-
-    updated_at is Atlas's own ordering token. "auto" advances a fake Atlas
-    clock per call; pass an explicit ISO string to model an out-of-order
-    answer, or None to model a build that reports no version at all.
-    """
+def _atlas_echoing(value, *, calls=None, status=200):
+    """Atlas accepts the mutation and echoes a contact carrying `value`."""
 
     def _post(url, *, headers=None, json=None, timeout=None):
         if calls is not None:
             calls.append({"url": url, "headers": headers or {}, "json": json or {}})
         contact = {} if value is None else {"customerType": value}
-        if value is not None:
-            stamp = _next_atlas_stamp() if updated_at == "auto" else updated_at
-            if stamp is not None:
-                contact["updatedAt"] = stamp
         body = {
             "success": True,
             "contactId": (json or {}).get("contact_id"),
@@ -377,49 +357,6 @@ def test_the_write_completes_under_the_row_lock(client, auth, monkeypatch):
     assert _type_of(customer) == "commercial"
 
 
-def test_a_late_response_cannot_clobber_a_newer_transition(client, auth, monkeypatch):
-    """The lost update, prevented WITHOUT holding a lock across the Atlas call.
-
-    A reads the row, calls Atlas, and while it is waiting B completes a
-    different transition. A must not then write its stale answer over B's.
-    Compare-and-set on the value A read makes A fail loudly instead.
-
-    An earlier revision took the row lock before calling Atlas. That was worse
-    than the bug: an ordinary customer edit takes the GLOBAL advisory lock
-    before waiting on a row, so one blocked same-customer edit would hold the
-    global lock and stall unrelated customers and sites.
-    """
-    contact = str(uuid.uuid4())
-    customer = _customer("Racing", contact, "unknown")
-    interfered = {"done": False}
-
-    def _post(url, *, headers=None, json=None, timeout=None):
-        want = (json or {})["customer_type"]
-        if want == "commercial" and not interfered["done"]:
-            interfered["done"] = True
-            # B lands while A is still waiting on Atlas. It is a REAL
-            # transition carrying Atlas's later version -- a raw DB write would
-            # record no version and would no longer model a competing change.
-            db.execute(
-                "UPDATE customers SET customer_type = %s, "
-                "customer_type_source_at = %s WHERE id = %s",
-                ("residential", "2026-08-11T12:05:00+00:00", customer),
-            )
-        # A's own answer carries an EARLIER Atlas version.
-        return _atlas_echoing(want, updated_at="2026-08-11T12:04:00+00:00")(
-            url, headers=headers, json=json, timeout=timeout
-        )
-
-    monkeypatch.setattr(api.requests, "post", _post)
-    resp = client.patch(_path(customer), headers=auth,
-                        json={"customerType": "commercial"})
-    assert interfered["done"], "the test must actually interleave a change"
-    assert resp.status_code == 409, resp.text
-    assert _type_of(customer) == "residential", (
-        "the newer transition must survive; a late answer must not clobber it"
-    )
-
-
 def test_a_rolled_back_atlas_is_refused_before_the_mutation(
     client, auth, monkeypatch
 ):
@@ -487,48 +424,6 @@ def test_a_relink_in_flight_stops_the_mirror_write(client, auth, monkeypatch):
     assert resp.status_code == 409, resp.text
     assert _type_of(customer) == "unknown", (
         "a type confirmed for the old contact must not land on the new link"
-    )
-
-
-def test_an_aba_transition_is_detected(client, auth, monkeypatch):
-    """A value round-trip must not let a stale answer through.
-
-    From unknown: this request sets Atlas commercial and stalls; others move
-    the row to residential and back to unknown, carrying LATER Atlas versions.
-    A value-only compare would match `unknown` again and write the stale
-    commercial. Version ordering refuses it regardless of the value returning.
-    """
-    contact = str(uuid.uuid4())
-    customer = _customer("ABA", contact, "unknown")
-    churned = {"done": False}
-
-    def _post(url, *, headers=None, json=None, timeout=None):
-        if not churned["done"]:
-            churned["done"] = True
-            # Away and back again, landing on the ORIGINAL value.
-            db.execute(
-                "UPDATE customers SET customer_type = %s, "
-                "customer_type_source_at = %s, updated_at = NOW() WHERE id = %s",
-                ("residential", "2026-08-11T12:09:00+00:00", customer),
-            )
-            db.execute(
-                "UPDATE customers SET customer_type = %s, "
-                "customer_type_source_at = %s, updated_at = NOW() WHERE id = %s",
-                ("unknown", "2026-08-11T12:09:30+00:00", customer),
-            )
-        # This request's answer carries an EARLIER version than the churn.
-        return _atlas_echoing("commercial",
-                              updated_at="2026-08-11T12:08:00+00:00")(
-            url, headers=headers, json=json, timeout=timeout
-        )
-
-    monkeypatch.setattr(api.requests, "post", _post)
-    resp = client.patch(_path(customer), headers=auth,
-                        json={"customerType": "commercial"})
-    assert churned["done"], "the test must actually churn the row"
-    assert resp.status_code == 409, resp.text
-    assert _type_of(customer) == "unknown", (
-        "the stale answer must not land just because the value returned"
     )
 
 
@@ -616,160 +511,12 @@ def test_the_mirror_write_serializes_on_the_contact(client, auth, monkeypatch):
         blocker.close()
 
 
-def test_an_out_of_order_atlas_answer_never_wins(client, auth, monkeypatch):
-    """The winner is Atlas's LAST mutation, not whoever reaches the DB first.
+def test_a_relink_in_flight_still_blocks_the_write(client, auth, monkeypatch):
+    """Identity, not ordering: the link guard is the one compare that remains.
 
-    Two changes can return to this tracker in the opposite order Atlas applied
-    them. Serializing locally only fixes commit order, which can disagree with
-    Atlas order -- so the mirror could hold `commercial` while Atlas holds
-    `residential`. Ordering comes from Atlas's own updated_at.
+    Atlas answered about the contact this row held. If the row now points
+    elsewhere, the answer is about a different account and must not land.
     """
-    contact = str(uuid.uuid4())
-    customer = _customer("Out Of Order", contact, "unknown")
-
-    newer = "2026-08-11T12:00:09+00:00"
-    older = "2026-08-11T12:00:04+00:00"
-
-    # B lands first locally, carrying Atlas's LATER timestamp.
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("residential", updated_at=newer))
-    assert client.patch(_path(customer), headers=auth,
-                        json={"customerType": "residential"}).status_code == 200
-    assert _type_of(customer) == "residential"
-
-    # A now arrives late carrying an EARLIER Atlas timestamp. Atlas's final
-    # value is still residential, so this must not overwrite it.
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("commercial", updated_at=older))
-    resp = client.patch(_path(customer), headers=auth,
-                        json={"customerType": "commercial"})
-    assert resp.status_code == 409, resp.text
-    assert _type_of(customer) == "residential", (
-        "a stale Atlas answer overwrote a newer one"
-    )
-
-
-def test_a_repeat_of_the_same_atlas_version_is_not_applied_twice(
-    client, auth, monkeypatch
-):
-    """Equal is not newer. A replayed answer must not reopen the decision."""
-    contact = str(uuid.uuid4())
-    customer = _customer("Same Version", contact, "unknown")
-    stamp = "2026-08-11T12:00:07+00:00"
-
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("commercial", updated_at=stamp))
-    assert client.patch(_path(customer), headers=auth,
-                        json={"customerType": "commercial"}).status_code == 200
-
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("residential", updated_at=stamp))
-    resp = client.patch(_path(customer), headers=auth,
-                        json={"customerType": "residential"})
-    assert resp.status_code == 409, resp.text
-    assert _type_of(customer) == "commercial"
-
-
-def test_a_response_without_a_version_is_refused(client, auth, monkeypatch):
-    """No version means the response does not meet the contract.
-
-    This reverses an earlier decision to apply anyway on the theory that an
-    older Atlas might omit updatedAt. It cannot: the field entered the response
-    in the same commit that created the operator mutation contract (ATLAS
-    eaade0b0f), and this route already refuses when Atlas does not advertise
-    contact.operator_mutation.
-
-    Falling back to local ordering is not weaker-but-safe, it is wrong -- two
-    answers arriving in the opposite order Atlas applied them are
-    indistinguishable without the authority's version.
-    """
-    contact = str(uuid.uuid4())
-    customer = _customer("No Version", contact, "unknown")
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("commercial", updated_at=None))
-
-    resp = client.patch(_path(customer), headers=auth,
-                        json={"customerType": "commercial"})
-    assert resp.status_code == 502, resp.text
-    assert _type_of(customer) == "unknown"
-
-
-def test_siblings_carry_the_atlas_version_too(client, auth, monkeypatch):
-    """A duplicate must not look staler than it is.
-
-    If the fan-out left the sibling's token behind, a later out-of-order answer
-    naming that sibling would compare against a stale value and be applied.
-    """
-    shared = str(uuid.uuid4())
-    primary = _customer("Version A", shared, "unknown")
-    twin = _customer("Version B", shared, "unknown")
-    stamp = "2026-08-11T12:00:11+00:00"
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("commercial", updated_at=stamp))
-
-    assert client.patch(_path(primary), headers=auth,
-                        json={"customerType": "commercial"}).status_code == 200
-
-    row = db.query_one(
-        "SELECT customer_type_source_at FROM customers WHERE id = %s", (twin,)
-    )
-    assert row["customer_type_source_at"] is not None, (
-        "the sibling kept no ordering token and would accept a stale answer"
-    )
-
-    # An older answer naming the SIBLING must now be refused.
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("residential",
-                                       updated_at="2026-08-11T12:00:05+00:00"))
-    resp = client.patch(_path(twin), headers=auth,
-                        json={"customerType": "residential"})
-    assert resp.status_code == 409, resp.text
-    assert _type_of(twin) == "commercial"
-
-
-def test_a_newer_atlas_version_supersedes_a_stale_local_snapshot(
-    client, auth, monkeypatch
-):
-    """The two guards must not overrule each other.
-
-    A and B snapshot the same state, Atlas applies A then B, A mirrors first.
-    B's Atlas version is newer, so B must win -- but B's pre-call snapshot is
-    now stale. Keeping the local updated_at compare in this branch would 409 B
-    and leave the mirror on A while Atlas ended at B.
-    """
-    contact = str(uuid.uuid4())
-    customer = _customer("Superseded Snapshot", contact, "unknown")
-    landed = {"a": False}
-
-    def _post(url, *, headers=None, json=None, timeout=None):
-        # B has already taken its pre-call snapshot by the time this runs.
-        # A commits DURING B's Atlas call, so B's snapshot goes stale -- the
-        # interleaving the finding describes. Sequential requests would not
-        # reproduce it, because the second would read a fresh snapshot.
-        if not landed["a"]:
-            landed["a"] = True
-            db.execute(
-                "UPDATE customers SET customer_type = %s, "
-                "customer_type_source_at = %s, updated_at = NOW() WHERE id = %s",
-                ("commercial", "2026-08-11T12:00:20+00:00", customer),
-            )
-        return _atlas_echoing("residential",
-                              updated_at="2026-08-11T12:00:21+00:00")(
-            url, headers=headers, json=json, timeout=timeout
-        )
-
-    monkeypatch.setattr(api.requests, "post", _post)
-    resp = client.patch(_path(customer), headers=auth,
-                        json={"customerType": "residential"})
-    assert landed["a"], "the test must actually interleave A's commit"
-    assert resp.status_code == 200, resp.text
-    assert _type_of(customer) == "residential", (
-        "a newer Atlas version was rejected by a stale local snapshot"
-    )
-
-
-def test_a_relink_still_blocks_even_with_a_newer_version(client, auth, monkeypatch):
-    """Identity is not ordering: the link guard survives in the version branch."""
     contact = str(uuid.uuid4())
     other = str(uuid.uuid4())
     customer = _customer("Version Relink", contact, "unknown")
@@ -782,8 +529,7 @@ def test_a_relink_still_blocks_even_with_a_newer_version(client, auth, monkeypat
                 "UPDATE customers SET atlas_contact_id = %s WHERE id = %s",
                 (other, customer),
             )
-        return _atlas_echoing("commercial",
-                              updated_at="2026-08-11T12:00:30+00:00")(
+        return _atlas_echoing("commercial")(
             url, headers=headers, json=json, timeout=timeout
         )
 
@@ -794,64 +540,3 @@ def test_a_relink_still_blocks_even_with_a_newer_version(client, auth, monkeypat
     assert resp.status_code == 409, resp.text
     assert _type_of(customer) == "unknown"
 
-
-def test_a_date_only_version_is_refused_not_assumed_utc(client, auth, monkeypatch):
-    """A bare date is not an instant, and guessing an offset bricks the row.
-
-    datetime.fromisoformat parses "9999-12-31"; assigning UTC to it invents an
-    offset Atlas never sent and stores a far-future ordering token. Every later
-    legitimate version then fails the strict `<` predicate, so the mirror is
-    stuck at 409 permanently -- one malformed response, permanent damage.
-    """
-    contact = str(uuid.uuid4())
-    customer = _customer("Date Only", contact, "unknown")
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("commercial", updated_at="9999-12-31"))
-
-    resp = client.patch(_path(customer), headers=auth,
-                        json={"customerType": "commercial"})
-    assert resp.status_code == 502, resp.text
-    assert _type_of(customer) == "unknown"
-    row = db.query_one(
-        "SELECT customer_type_source_at FROM customers WHERE id = %s", (customer,)
-    )
-    assert row["customer_type_source_at"] is None, "no token may be stored"
-
-    # And the row is NOT stuck: a well-formed version still applies.
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("commercial",
-                                       updated_at="2026-08-11T12:40:00+00:00"))
-    assert client.patch(_path(customer), headers=auth,
-                        json={"customerType": "commercial"}).status_code == 200
-    assert _type_of(customer) == "commercial"
-
-
-def test_a_naive_version_is_refused(client, auth, monkeypatch):
-    """No offset means no instant. Do not assume one."""
-    contact = str(uuid.uuid4())
-    customer = _customer("Naive", contact, "unknown")
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("commercial",
-                                       updated_at="2026-08-11T12:00:00"))
-
-    resp = client.patch(_path(customer), headers=auth,
-                        json={"customerType": "commercial"})
-    assert resp.status_code == 502, resp.text
-    assert _type_of(customer) == "unknown"
-
-
-def test_an_implausibly_future_version_is_refused(client, auth, monkeypatch):
-    """Believing one is the same permanent stall as the date-only case."""
-    contact = str(uuid.uuid4())
-    customer = _customer("Far Future", contact, "unknown")
-    monkeypatch.setattr(api.requests, "post",
-                        _atlas_echoing("commercial",
-                                       updated_at="2999-01-01T00:00:00+00:00"))
-
-    resp = client.patch(_path(customer), headers=auth,
-                        json={"customerType": "commercial"})
-    assert resp.status_code == 502, resp.text
-    row = db.query_one(
-        "SELECT customer_type_source_at FROM customers WHERE id = %s", (customer,)
-    )
-    assert row["customer_type_source_at"] is None
