@@ -61,6 +61,8 @@ def _apply_schema(conn):
     with conn.cursor() as cur:
         cur.execute("""
             DROP TABLE IF EXISTS access_log_entries,
+                visit_evidence_events,
+                home_base_events, home_base_policies, home_bases,
                 planned_visit_audit_events,
                 planned_visit_assignments, planned_service_visits,
                 google_calendar_event_mappings, calendar_import_previews,

@@ -2031,6 +2031,7 @@ def _load_time_evidence(
     Dict[int, List[Dict[str, Any]]],
     Dict[Tuple[int, int], List[datetime]],
     List[Dict[str, Any]],
+    Dict[int, List[Dict[str, Any]]],
 ]:
     linked_job_ids = [int(job_id) for job_id in visible_job_ids]
     shifts = _query_all(
@@ -2192,6 +2193,20 @@ def _load_time_evidence(
         ):
             departures[int(row["shift_id"])].append(row)
 
+    home_base_events: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    if shift_ids:
+        for row in _query_all(
+            """
+            SELECT id, shift_id, action, outcome, exception_reason, recorded_at
+            FROM home_base_events
+            WHERE shift_id = ANY(%s)
+            ORDER BY shift_id, recorded_at, id
+            """,
+            (shift_ids,),
+            cursor=cursor,
+        ):
+            home_base_events[int(row["shift_id"])].append(row)
+
     qr_by_employee_site: Dict[Tuple[int, int], List[datetime]] = defaultdict(list)
     # D2 (issue #126): QR-only presence rows have no shift, so they have no rate
     # snapshot and stay on the live employee rate. They are deliberately out of
@@ -2288,7 +2303,7 @@ def _load_time_evidence(
             row["server_checked_in_at"]
         )
 
-    return shifts, visits, departures, qr_by_employee_site, qr_rows
+    return shifts, visits, departures, qr_by_employee_site, qr_rows, home_base_events
 
 
 def _load_utilization_evidence(
@@ -3822,6 +3837,111 @@ def _apply_shift_break_minutes_to_segments(
     return adjusted
 
 
+def _apply_home_base_dispatch_overhead(
+    segments: List[Dict[str, Any]],
+    *,
+    shift: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    departures: List[Dict[str, Any]],
+    home_base_events: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Split only proven Home Base envelope time out of customer attribution."""
+    if not segments or not home_base_events:
+        return segments
+
+    clock_in = shift["clock_in"]
+    clock_out = shift.get("clock_out")
+    if clock_out is None or clock_out <= clock_in:
+        return segments
+
+    valid_arrivals = sorted(
+        (
+            visit["arrival_time"]
+            for visit in visits
+            if clock_in <= visit["arrival_time"] < clock_out
+        )
+    )
+    valid_departures = sorted(
+        (
+            departure["departure_time"]
+            for departure in departures
+            if clock_in < departure["departure_time"] <= clock_out
+        )
+    )
+    windows: List[Tuple[datetime, datetime, List[str]]] = []
+    start_events = [event for event in home_base_events if event.get("action") == "start"]
+    end_events = [event for event in home_base_events if event.get("action") == "end"]
+    if start_events:
+        first_arrival = valid_arrivals[0] if valid_arrivals else clock_out
+        if first_arrival > clock_in:
+            windows.append(
+                (
+                    clock_in,
+                    first_arrival,
+                    [
+                        f"home_base_start_{event.get('outcome') or 'recorded'}"
+                        for event in start_events
+                    ],
+                )
+            )
+    if end_events:
+        # A newer Home Base end action refuses an active visit.  For historical
+        # evidence, only a known departure can prove where dispatch begins;
+        # otherwise keeping the time unassigned is safer than rewriting a
+        # customer interval as office work.
+        last_departure = valid_departures[-1] if valid_departures else (
+            clock_in if not valid_arrivals else None
+        )
+        if last_departure is not None and clock_out > last_departure:
+            windows.append(
+                (
+                    last_departure,
+                    clock_out,
+                    [
+                        f"home_base_end_{event.get('outcome') or 'recorded'}"
+                        for event in end_events
+                    ],
+                )
+            )
+    if not windows:
+        return segments
+
+    output: List[Dict[str, Any]] = []
+    for segment in segments:
+        boundaries = {segment["start"], segment["end"]}
+        for start, end, _evidence in windows:
+            if segment["start"] < end and segment["end"] > start:
+                boundaries.add(max(segment["start"], start))
+                boundaries.add(min(segment["end"], end))
+        ordered = sorted(boundaries)
+        for start, end in zip(ordered, ordered[1:]):
+            if end <= start:
+                continue
+            matching_windows = [
+                evidence
+                for window_start, window_end, evidence in windows
+                if start >= window_start and end <= window_end
+            ]
+            if not matching_windows:
+                output.append({**segment, "start": start, "end": end})
+                continue
+            evidence = sorted({item for items in matching_windows for item in items})
+            output.append(
+                {
+                    **segment,
+                    "location_id": None,
+                    "location_label": "Dispatch overhead",
+                    "job_id": None,
+                    "start": start,
+                    "end": end,
+                    "evidence": evidence,
+                    "unassigned_gap": False,
+                    "dispatch_overhead": True,
+                }
+            )
+    return output
+
+
 def _closed_shift_segments(
     shift: Dict[str, Any],
     visits: List[Dict[str, Any]],
@@ -3829,6 +3949,7 @@ def _closed_shift_segments(
     qr_by_employee_site: Dict[Tuple[int, int], List[datetime]],
     range_start: datetime,
     range_end: datetime,
+    home_base_events: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     clock_in = shift["clock_in"]
     clock_out = shift["clock_out"]
@@ -3934,7 +4055,13 @@ def _closed_shift_segments(
                 end=upper,
                 base_evidence="unassigned_gap",
             )
-        return output
+        return _apply_home_base_dispatch_overhead(
+            output,
+            shift=shift,
+            visits=visits,
+            departures=departures,
+            home_base_events=home_base_events or [],
+        )
 
     cursor = lower
     used_departures: set[int] = set()
@@ -4030,7 +4157,13 @@ def _closed_shift_segments(
             end=upper,
             base_evidence="unassigned_gap",
         )
-    return [segment for segment in output if segment["end"] > segment["start"]]
+    return _apply_home_base_dispatch_overhead(
+        [segment for segment in output if segment["end"] > segment["start"]],
+        shift=shift,
+        visits=visits,
+        departures=departures,
+        home_base_events=home_base_events or [],
+    )
 
 
 def _open_shift_presence(
@@ -4234,6 +4367,7 @@ def _serialize_unmatched(
         "finalized": finalized,
         "presenceOnly": bool(segment.get("presence_only")),
         "reason": reason,
+        "dispatchOverhead": bool(segment.get("dispatch_overhead")),
         "candidateJobIds": candidate_job_ids,
         "evidence": (
             segment["evidence"]
@@ -4336,7 +4470,14 @@ def _decorate_schedule_jobs(
             for service_date in service_dates:
                 jobs_by_site_date[(int(job["location_id"]), service_date)].append(job)
 
-    shifts, visits, departures, qr_by_employee_site, qr_rows = _load_time_evidence(
+    (
+        shifts,
+        visits,
+        departures,
+        qr_by_employee_site,
+        qr_rows,
+        home_base_events,
+    ) = _load_time_evidence(
         range_start,
         range_end,
         observed_at,
@@ -4402,6 +4543,7 @@ def _decorate_schedule_jobs(
                     qr_by_employee_site,
                     shift_range_start,
                     shift_range_end,
+                    home_base_events.get(shift_id, []),
                 )
             )
     represented_qr_ids = _apply_qr_job_links(
@@ -4426,6 +4568,11 @@ def _decorate_schedule_jobs(
     unmatched: List[Dict[str, Any]] = []
     resolved_segments: List[Dict[str, Any]] = []
     for segment in segments:
+        if segment.get("dispatch_overhead"):
+            unmatched.append(
+                _serialize_unmatched(segment, "dispatch_overhead", [])
+            )
+            continue
         job, reason, candidate_job_ids = _match_segment_to_job(
             segment,
             jobs_by_site_date,
@@ -5638,6 +5785,7 @@ def _daily_profitability_rows(
     profit_jobs: List[Dict[str, Any]],
     unmatched: List[Dict[str, Any]],
     *,
+    dispatch_overhead: Optional[List[Dict[str, Any]]] = None,
     app_timezone: ZoneInfo,
     range_start: datetime,
     range_end: datetime,
@@ -5656,6 +5804,14 @@ def _daily_profitability_rows(
         range_start=range_start,
         range_end=range_end,
     )
+    dispatch_by_day = _daily_unmatched_profitability_rows(
+        week_start,
+        week_end,
+        dispatch_overhead or [],
+        app_timezone=app_timezone,
+        range_start=range_start,
+        range_end=range_end,
+    )
 
     by_day = []
     for offset in range(7):
@@ -5663,6 +5819,7 @@ def _daily_profitability_rows(
         day_text = day.isoformat()
         day_rows = rows_by_day.get(day_text, [])
         unmatched_rows = unmatched_by_day.get(day_text, [])
+        dispatch_rows = dispatch_by_day.get(day_text, [])
         unmatched_actual_hours = round(
             sum(
                 float(row["dailyHours"])
@@ -5686,6 +5843,17 @@ def _daily_profitability_rows(
                 "unmatchedActualHours": unmatched_actual_hours,
                 "unmatchedActualSegmentCount": len(unmatched_rows),
                 "unmatchedActualSegments": unmatched_rows,
+                "dispatchOverheadHours": round(
+                    sum(
+                        float(row["dailyHours"])
+                        for row in dispatch_rows
+                        if row.get("finalized")
+                        and row.get("dailyHours") is not None
+                    ),
+                    2,
+                ),
+                "dispatchOverheadSegmentCount": len(dispatch_rows),
+                "dispatchOverheadSegments": dispatch_rows,
                 "issueCount": _profitability_issue_count(day_rows)
                 + (1 if unmatched_rows else 0),
                 "issues": issues,
@@ -5696,6 +5864,16 @@ def _daily_profitability_rows(
             }
         )
     return by_day
+
+
+def _split_dispatch_overhead(
+    segments: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Keep internal paid dispatch separate from customer-attribution gaps."""
+    return (
+        [segment for segment in segments if segment.get("dispatchOverhead")],
+        [segment for segment in segments if not segment.get("dispatchOverhead")],
+    )
 
 
 def _parse_utc_iso(value: str) -> datetime:
@@ -5783,6 +5961,7 @@ def build_weekly_labor_profitability(
         payroll_week_start=payroll_week_start,
         cursor=cursor,
     )
+    dispatch_overhead, unmatched = _split_dispatch_overhead(unmatched)
     source_jobs = {int(job["id"]): job for job in jobs}
     profit_jobs = [
         _actual_profitability_row(
@@ -5818,6 +5997,11 @@ def build_weekly_labor_profitability(
         for segment in unmatched
         if segment.get("finalized") and segment.get("hours") is not None
     )
+    dispatch_overhead_hours = sum(
+        float(segment["hours"])
+        for segment in dispatch_overhead
+        if segment.get("finalized") and segment.get("hours") is not None
+    )
     correction_candidate_segments = _payroll_correction_candidate_segments(
         profit_jobs,
         decorated_jobs,
@@ -5838,6 +6022,8 @@ def build_weekly_labor_profitability(
             **_aggregate_actual_profitability_rows(profit_jobs),
             "unmatchedActualHours": round(unmatched_actual_hours, 2),
             "unmatchedActualSegmentCount": len(unmatched),
+            "dispatchOverheadHours": round(dispatch_overhead_hours, 2),
+            "dispatchOverheadSegmentCount": len(dispatch_overhead),
         },
         "bySite": _group_profitability_by_site(profit_jobs),
         "byDay": _daily_profitability_rows(
@@ -5845,12 +6031,14 @@ def build_weekly_labor_profitability(
             week_end,
             daily_profit_jobs,
             unmatched,
+            dispatch_overhead=dispatch_overhead,
             app_timezone=app_timezone,
             range_start=range_start,
             range_end=range_end,
         ),
         "jobs": profit_jobs,
         "unmatchedActualSegments": unmatched,
+        "dispatchOverheadSegments": dispatch_overhead,
         "_payrollCorrectionCandidateSegments": correction_candidate_segments,
     }
 
@@ -6653,6 +6841,7 @@ def build_operations_schedule_router(
                 if native_row is not None:
                     job["_nativeProjection"] = native_row
                     _restore_native_schedule_metadata(job)
+            dispatch_overhead, unmatched = _split_dispatch_overhead(unmatched)
             active_jobs = [job for job in schedule_jobs if job["includedInPlan"]]
             known_planned_hours = sum(
                 float(job["plannedHours"])
@@ -6665,6 +6854,11 @@ def build_operations_schedule_router(
             unmatched_actual = sum(
                 float(segment["hours"])
                 for segment in unmatched
+                if segment.get("finalized") and segment.get("hours") is not None
+            )
+            dispatch_overhead_hours = sum(
+                float(segment["hours"])
+                for segment in dispatch_overhead
                 if segment.get("finalized") and segment.get("hours") is not None
             )
             in_progress_workers = {
@@ -6707,12 +6901,15 @@ def build_operations_schedule_router(
                         else None
                     ),
                     "unmatchedActualHours": round(unmatched_actual, 2),
+                    "dispatchOverheadHours": round(dispatch_overhead_hours, 2),
+                    "dispatchOverheadSegmentCount": len(dispatch_overhead),
                     "inProgressWorkerCount": len(in_progress_workers),
                     "issueCount": sum(len(job["issues"]) for job in schedule_jobs)
                     + len(global_issues),
                 },
                 "jobs": schedule_jobs,
                 "unmatchedActualSegments": unmatched,
+                "dispatchOverheadSegments": dispatch_overhead,
             }
         jobs = _load_jobs(
             resolved_start,
@@ -6745,6 +6942,7 @@ def build_operations_schedule_router(
             visible_range_end=range_end,
             expected_hours_learning_by_site=expected_hours_learning_by_site,
         )
+        dispatch_overhead, unmatched = _split_dispatch_overhead(unmatched)
         active_jobs = [job for job in schedule_jobs if job["includedInPlan"]]
         known_planned_hours = sum(
             float(job["plannedHours"])
@@ -6758,6 +6956,11 @@ def build_operations_schedule_router(
         unmatched_actual = sum(
             float(segment["hours"])
             for segment in unmatched
+            if segment.get("finalized") and segment.get("hours") is not None
+        )
+        dispatch_overhead_hours = sum(
+            float(segment["hours"])
+            for segment in dispatch_overhead
             if segment.get("finalized") and segment.get("hours") is not None
         )
         in_progress_workers = {
@@ -6797,11 +7000,14 @@ def build_operations_schedule_router(
                     else None
                 ),
                 "unmatchedActualHours": round(unmatched_actual, 2),
+                "dispatchOverheadHours": round(dispatch_overhead_hours, 2),
+                "dispatchOverheadSegmentCount": len(dispatch_overhead),
                 "inProgressWorkerCount": len(in_progress_workers),
                 "issueCount": sum(len(job["issues"]) for job in schedule_jobs),
             },
             "jobs": schedule_jobs,
             "unmatchedActualSegments": unmatched,
+            "dispatchOverheadSegments": dispatch_overhead,
         }
 
     @router.get("/api/admin/operations/utilization")

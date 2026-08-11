@@ -265,6 +265,7 @@ SITE_CHECK_IN_RECONCILIATION_GAP_DEFAULT_MINUTES = 15
 SITE_CHECK_IN_RECONCILIATION_MAX_DAYS = 31
 ACCESS_LOG_RETENTION_DEFAULT_DAYS = 400
 SITE_CHECK_IN_QR_VERSION = "eom1"
+HOME_BASE_QR_VERSION = "eom-home-base-v1"
 SITE_CHECK_IN_RADIUS_M = SITE_CHECK_IN_RADIUS_DEFAULT_M
 SITE_CHECK_IN_MAX_ACCURACY_M = SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M
 SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS
@@ -331,6 +332,42 @@ def build_site_check_in_qr_svg(check_in_url: str) -> str:
     qr.add_data(check_in_url)
     qr.make(fit=True)
     return qr.make_image().to_string(encoding="unicode")
+
+
+def _home_base_signature(home_base_id: int, nonce: str) -> str:
+    """Sign an internal-base token in a namespace separate from Site QR codes."""
+    message = f"{HOME_BASE_QR_VERSION}.{home_base_id}.{nonce}".encode("utf-8")
+    digest = hmac.new(
+        JWT_SECRET.encode("utf-8"),
+        b"home-base-check-in\0" + message,
+        hashlib.sha256,
+    ).digest()
+    return _base64url_encode(digest)
+
+
+def build_home_base_token(home_base_id: int, nonce: str) -> str:
+    return (
+        f"{HOME_BASE_QR_VERSION}.{home_base_id}.{nonce}."
+        f"{_home_base_signature(home_base_id, nonce)}"
+    )
+
+
+def parse_home_base_token(token: str) -> Tuple[int, str]:
+    parts = str(token or "").strip().split(".")
+    if len(parts) != 4 or parts[0] != HOME_BASE_QR_VERSION:
+        raise ValueError("Invalid or revoked Home Base QR code")
+    try:
+        home_base_id = int(parts[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid or revoked Home Base QR code") from exc
+
+    nonce, signature = parts[2], parts[3]
+    if home_base_id <= 0 or not re.fullmatch(r"[A-Za-z0-9_-]{20,64}", nonce):
+        raise ValueError("Invalid or revoked Home Base QR code")
+    expected = _home_base_signature(home_base_id, nonce)
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("Invalid or revoked Home Base QR code")
+    return home_base_id, nonce
 
 
 def evaluate_site_check_in_geofence(
@@ -839,6 +876,11 @@ def _row_to_visit(row: Dict[str, Any]) -> Dict[str, Any]:
         "id":             int(row["id"]) if row.get("id") is not None else None,
         "arrivalTime": to_utc_iso(row["arrival_time"]) if row.get("arrival_time") else "",
         "location":    row.get("location") or row.get("location_label") or "",
+        "locationId":  (
+            int(row["location_id"])
+            if row.get("location_id") is not None
+            else None
+        ),
         "customer":    row["customer_name"] or "",
         "gps":         row["gps"],
         "gpsMeta":     row.get("gps_meta"),
@@ -861,6 +903,11 @@ def _row_to_departure(row: Dict[str, Any]) -> Dict[str, Any]:
         "id":             int(row["id"]) if row.get("id") is not None else None,
         "departureTime": to_utc_iso(row["departure_time"]) if row.get("departure_time") else "",
         "location":      row.get("location") or row.get("location_label") or "",
+        "locationId":    (
+            int(row["location_id"])
+            if row.get("location_id") is not None
+            else None
+        ),
         "customer":      row["customer_name"] or "",
         "gps":           row["gps"],
         "gpsMeta":       row.get("gps_meta"),
@@ -879,6 +926,7 @@ def _row_to_entry(
         "employeeId":   row["employee_id"],
         "employeeName": row["employee_name"] or "",
         "location":     row.get("location") or row.get("location_label") or "",
+        "internalHomeBase": bool(row.get("internal_home_base")),
         "clockIn":      to_utc_iso(row["clock_in"]) if row.get("clock_in") else "",
         "clockOut":     to_utc_iso(co) if co else None,
         "totalHours":   float(row["total_hours"] or 0),
@@ -965,7 +1013,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
 
     visit_rows = db.query_all(
         """
-        SELECT v.id, v.shift_id, COALESCE(l.address, '') AS location,
+        SELECT v.id, v.shift_id, v.location_id, COALESCE(l.address, '') AS location,
                v.location_label, v.customer_name, v.arrival_time, v.gps, v.gps_meta,
                v.job_id, v.sequence_version, v.site_check_in_id
         FROM visits v
@@ -979,7 +1027,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
 
     departure_rows = db.query_all(
         """
-        SELECT d.id, d.shift_id, d.visit_id, COALESCE(l.address, '') AS location,
+        SELECT d.id, d.shift_id, d.visit_id, d.location_id, COALESCE(l.address, '') AS location,
                d.location_label, d.customer_name, d.departure_time, d.gps, d.gps_meta
         FROM departures d
         LEFT JOIN locations l ON d.location_id = l.id
@@ -999,7 +1047,12 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
                s.notes, s.local_date, s.timezone,
                s.clock_in_gps, s.clock_in_gps_meta,
                s.clock_out_gps, s.clock_out_gps_meta,
-               s.job_id, s.time_category, s.non_productive_type
+               s.job_id, s.time_category, s.non_productive_type,
+               EXISTS (
+                   SELECT 1
+                   FROM home_base_events home_base_event
+                   WHERE home_base_event.shift_id = s.id
+               ) AS internal_home_base
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
         LEFT JOIN locations l ON s.location_id = l.id
@@ -1057,7 +1110,11 @@ def _save_timesheets_to_db(
         }
 
         for entry in timesheet_data.get("entries", []):
-            loc_id = addr_to_id.get(entry.get("location", ""))
+            loc_id = (
+                entry["locationId"]
+                if "locationId" in entry
+                else addr_to_id.get(entry.get("location", ""))
+            )
             is_new = entry["id"] not in pre_shift_ids
 
             if is_new:
@@ -1146,7 +1203,11 @@ def _save_timesheets_to_db(
             # Insert only visits appended since last load
             existing_count = pre_visit_counts.get(entry["id"], 0)
             for visit in entry.get("visits", [])[existing_count:]:
-                v_loc_id = addr_to_id.get(visit.get("location", ""))
+                v_loc_id = (
+                    visit["locationId"]
+                    if "locationId" in visit
+                    else addr_to_id.get(visit.get("location", ""))
+                )
                 cur.execute(
                     """
                     INSERT INTO visits (
@@ -1172,7 +1233,11 @@ def _save_timesheets_to_db(
                 )
                 visit["id"] = int(cur.fetchone()[0])
                 # Auto-link shift to the first registered location visited
-                if v_loc_id:
+                if (
+                    v_loc_id
+                    and not entry.get("internalHomeBase")
+                    and not str(entry.get("location") or "").startswith("Home Base — ")
+                ):
                     cur.execute(
                         "UPDATE shifts SET location_id = %s WHERE id = %s AND location_id IS NULL",
                         (v_loc_id, entry["id"]),
@@ -1180,7 +1245,11 @@ def _save_timesheets_to_db(
 
             existing_departure_count = pre_departure_counts.get(entry["id"], 0)
             for departure in entry.get("departures", [])[existing_departure_count:]:
-                d_loc_id = addr_to_id.get(departure.get("location", ""))
+                d_loc_id = (
+                    departure["locationId"]
+                    if "locationId" in departure
+                    else addr_to_id.get(departure.get("location", ""))
+                )
                 cur.execute(
                     """
                     INSERT INTO departures (
@@ -1369,7 +1438,10 @@ def stale_shift_review_failure(
 
 
 def raise_timesheet_mutation_failure(result: Any) -> None:
-    if isinstance(result, dict) and result.get("code") == STALE_SHIFT_REVIEW_CODE:
+    if isinstance(result, dict) and result.get("code") in {
+        STALE_SHIFT_REVIEW_CODE,
+        "HOME_BASE_REQUIRED",
+    }:
         raise HTTPException(status_code=409, detail=result)
     raise HTTPException(status_code=400, detail=str(result))
 
@@ -2486,7 +2558,86 @@ class ClockInRequest(BaseModel):
     accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
+    homeBaseExceptionReason: str = Field(default="", max_length=500)
     idempotencyKey: Optional[UUID] = None
+
+    @field_validator("homeBaseExceptionReason", mode="before")
+    @classmethod
+    def normalize_home_base_exception_reason(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+
+class VisitRequest(ClockInRequest):
+    """Additive explicit-site evidence for the existing manual-arrival route."""
+
+    locationId: Optional[int] = Field(default=None, gt=0)
+    plannedVisitId: Optional[int] = Field(default=None, gt=0)
+    evidenceMethod: Optional[
+        Literal[
+            "residential_gps",
+            "unplanned_residential",
+            "commercial_qr_fallback",
+        ]
+    ] = None
+    exceptionReason: str = Field(default="", max_length=64)
+    exceptionDetail: str = Field(default="", max_length=500)
+
+    @field_validator("exceptionReason", "exceptionDetail", mode="before")
+    @classmethod
+    def normalize_visit_exception_text(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+    @model_validator(mode="after")
+    def selected_site_evidence_is_complete(self) -> "VisitRequest":
+        selected = self.locationId is not None or self.plannedVisitId is not None
+        if selected and (self.locationId is None or self.evidenceMethod is None):
+            raise ValueError(
+                "locationId and evidenceMethod are required for an explicit Site arrival"
+            )
+        if selected and (
+            self.latitude is None
+            or self.longitude is None
+            or self.accuracy is None
+        ):
+            raise ValueError(
+                "explicit Site evidence requires latitude, longitude, and accuracy"
+            )
+        if not selected and (
+            self.evidenceMethod is not None
+            or self.exceptionReason
+            or self.exceptionDetail
+        ):
+            raise ValueError(
+                "explicit Site evidence requires locationId"
+            )
+        if self.evidenceMethod in {
+            "unplanned_residential",
+            "commercial_qr_fallback",
+        }:
+            expected_reason = (
+                "unplanned_visit"
+                if self.evidenceMethod == "unplanned_residential"
+                else "qr_unavailable"
+            )
+            if self.exceptionReason != expected_reason:
+                raise ValueError(
+                    f"{self.evidenceMethod} requires exceptionReason={expected_reason}"
+                )
+            if len(self.exceptionDetail) < 3:
+                raise ValueError(
+                    "exceptionDetail must explain an exception in at least 3 characters"
+                )
+        elif self.exceptionReason or self.exceptionDetail:
+            raise ValueError(
+                "ordinary residential GPS arrivals cannot include an exception"
+            )
+        return self
+
+
+class VisitCandidatesRequest(BaseModel):
+    latitude: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
+    accuracy: float = Field(ge=0, le=100_000, allow_inf_nan=False)
 
 
 class SiteQrRequest(BaseModel):
@@ -2663,7 +2814,53 @@ class ClockOutRequest(BaseModel):
     accuracy: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
     gpsOverrideReason: str = Field(default="", max_length=MAX_GPS_OVERRIDE_REASON_LEN)
     gpsOverrideDetail: str = Field(default="", max_length=MAX_GPS_OVERRIDE_DETAIL_LEN)
+    homeBaseExceptionReason: str = Field(default="", max_length=500)
     idempotencyKey: Optional[UUID] = None
+
+    @field_validator("homeBaseExceptionReason", mode="before")
+    @classmethod
+    def normalize_home_base_exception_reason(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+
+class HomeBasePutRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=160)
+    address: str = Field(default="", max_length=500)
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+
+    @field_validator("label", "address", mode="before")
+    @classmethod
+    def normalize_home_base_text(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+    @model_validator(mode="after")
+    def home_base_coordinates_are_paired(self) -> "HomeBasePutRequest":
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be provided together")
+        if self.latitude is None:
+            raise ValueError("latitude and longitude are required for Home Base")
+        return self
+
+
+class HomeBaseQrResolveRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+
+
+class HomeBaseActionRequest(HomeBaseQrResolveRequest):
+    action: Literal["start", "end"]
+    latitude: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
+    accuracy: float = Field(ge=0, le=100_000, allow_inf_nan=False)
+    scannedAt: datetime
+    idempotencyKey: UUID
+
+    @field_validator("scannedAt")
+    @classmethod
+    def scanned_at_must_include_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("scannedAt must include a timezone")
+        return value.astimezone(timezone.utc)
 
 
 class DepartRequest(BaseModel):
@@ -4767,6 +4964,199 @@ def _reconcile_unstamped_allocation_costs() -> None:
                 )
 
 
+def _ensure_home_base_schema() -> None:
+    """Create the internal Home Base ledger after calendar crews exist.
+
+    This is intentionally separate from Customer/Site schema setup: the office
+    is paid dispatch evidence, not an unbilled customer location.
+    """
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS home_bases (
+            id                     BIGSERIAL PRIMARY KEY,
+            label                  TEXT NOT NULL
+                                   CHECK (char_length(btrim(label)) BETWEEN 1 AND 160),
+            address                TEXT NOT NULL DEFAULT ''
+                                   CHECK (char_length(address) <= 500),
+            latitude               NUMERIC(10, 7),
+            longitude              NUMERIC(10, 7),
+            active                 BOOLEAN NOT NULL DEFAULT true,
+            check_in_token_nonce   VARCHAR(64),
+            check_in_token_rotated_at TIMESTAMPTZ,
+            created_by             INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (
+                (latitude IS NULL AND longitude IS NULL)
+                OR (latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180)
+            )
+        )
+        """
+    )
+    # The receipt ledger predates Home Base and originally constrained its
+    # action vocabulary to the four ordinary portal buttons.  Expand that
+    # existing constraint before a Home Base scan writes its idempotent receipt;
+    # this is additive (all historical values remain valid).
+    db.execute(
+        """
+        DO $$
+        DECLARE
+            existing_definition TEXT;
+        BEGIN
+            SELECT pg_get_constraintdef(oid)
+              INTO existing_definition
+              FROM pg_constraint
+             WHERE conrelid = 'plain_time_action_receipts'::regclass
+               AND conname = 'plain_time_action_receipts_action_check';
+
+            IF existing_definition IS NULL THEN
+                ALTER TABLE plain_time_action_receipts
+                ADD CONSTRAINT plain_time_action_receipts_action_check
+                CHECK (action IN (
+                    'clock-in', 'arrive', 'depart', 'clock-out',
+                    'home-base-start', 'home-base-end'
+                ));
+            ELSIF position('home-base-start' IN existing_definition) = 0
+               OR position('home-base-end' IN existing_definition) = 0 THEN
+                ALTER TABLE plain_time_action_receipts
+                DROP CONSTRAINT plain_time_action_receipts_action_check;
+                ALTER TABLE plain_time_action_receipts
+                ADD CONSTRAINT plain_time_action_receipts_action_check
+                CHECK (action IN (
+                    'clock-in', 'arrive', 'depart', 'clock-out',
+                    'home-base-start', 'home-base-end'
+                ));
+            END IF;
+        END $$;
+        """
+    )
+    db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_home_bases_one_active
+        ON home_bases ((active)) WHERE active
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS home_base_policies (
+            id             BIGSERIAL PRIMARY KEY,
+            home_base_id   BIGINT NOT NULL REFERENCES home_bases(id) ON DELETE CASCADE,
+            crew_id        BIGINT NOT NULL REFERENCES crews(id) ON DELETE RESTRICT,
+            active         BOOLEAN NOT NULL DEFAULT true,
+            created_by     INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (home_base_id, crew_id)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_home_base_policies_one_active
+        ON home_base_policies ((active)) WHERE active
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS home_base_events (
+            id                 BIGSERIAL PRIMARY KEY,
+            shift_id           INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+            employee_id        INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            home_base_id       BIGINT NOT NULL REFERENCES home_bases(id) ON DELETE RESTRICT,
+            home_base_policy_id BIGINT REFERENCES home_base_policies(id) ON DELETE SET NULL,
+            action             VARCHAR(16) NOT NULL CHECK (action IN ('start', 'end')),
+            outcome            VARCHAR(16) NOT NULL CHECK (outcome IN ('recorded', 'exception')),
+            exception_reason   TEXT NOT NULL DEFAULT '' CHECK (char_length(exception_reason) <= 500),
+            recorded_at        TIMESTAMPTZ NOT NULL,
+            latitude           NUMERIC(10, 7),
+            longitude          NUMERIC(10, 7),
+            accuracy_m         NUMERIC(10, 2),
+            geofence_radius_m  INTEGER,
+            distance_m         NUMERIC(10, 2),
+            geofence_status    VARCHAR(32),
+            idempotency_key    UUID,
+            request_fingerprint VARCHAR(64),
+            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (
+                (outcome = 'recorded' AND exception_reason = '')
+                OR (outcome = 'exception' AND char_length(btrim(exception_reason)) >= 3)
+            ),
+            CHECK (
+                (latitude IS NULL AND longitude IS NULL)
+                OR (latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180)
+            ),
+            UNIQUE (shift_id, action)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_home_base_events_employee_idempotency
+        ON home_base_events(employee_id, idempotency_key)
+        WHERE idempotency_key IS NOT NULL
+        """
+    )
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_home_base_events_review
+        ON home_base_events(outcome, recorded_at DESC)
+        """
+    )
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_home_base_events_shift
+        ON home_base_events(shift_id, recorded_at)
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS visit_evidence_events (
+            id                 BIGSERIAL PRIMARY KEY,
+            visit_id           INTEGER NOT NULL UNIQUE REFERENCES visits(id) ON DELETE CASCADE,
+            shift_id           INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+            employee_id        INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            location_id        INTEGER NOT NULL REFERENCES locations(id) ON DELETE RESTRICT,
+            planned_visit_id   BIGINT REFERENCES planned_service_visits(id) ON DELETE SET NULL,
+            evidence_method    VARCHAR(32) NOT NULL
+                                   CHECK (evidence_method IN (
+                                       'residential_gps',
+                                       'unplanned_residential',
+                                       'commercial_qr_fallback'
+                                   )),
+            exception_reason   VARCHAR(64) NOT NULL DEFAULT '',
+            exception_detail   TEXT NOT NULL DEFAULT ''
+                                   CHECK (char_length(exception_detail) <= 500),
+            geofence_status    VARCHAR(32) NOT NULL,
+            distance_m         NUMERIC(10, 2),
+            accuracy_m         NUMERIC(10, 2),
+            created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (
+                (evidence_method = 'residential_gps'
+                 AND exception_reason = '' AND exception_detail = '')
+                OR (evidence_method = 'unplanned_residential'
+                    AND exception_reason = 'unplanned_visit'
+                    AND char_length(btrim(exception_detail)) >= 3)
+                OR (evidence_method = 'commercial_qr_fallback'
+                    AND exception_reason = 'qr_unavailable'
+                    AND char_length(btrim(exception_detail)) >= 3)
+            )
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_visit_evidence_events_review
+        ON visit_evidence_events(evidence_method, created_at DESC)
+        """
+    )
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_visit_evidence_events_planned_visit
+        ON visit_evidence_events(planned_visit_id, created_at)
+        """
+    )
+
+
 def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
@@ -5909,6 +6299,7 @@ def _ensure_schema_migrations() -> None:
     from calendar_import_store import ensure_schema as ensure_calendar_schema
 
     ensure_calendar_schema()
+    _ensure_home_base_schema()
 
     # One-time rate backfills run LAST, after every CREATE TABLE / ALTER above.
     # The allocation backfill queries payroll_hour_correction_allocations and
@@ -6003,6 +6394,446 @@ def _site_check_in_url(request: Request, token: str) -> str:
     return f"{portal_base}/portal?checkIn={quote(token, safe='')}"
 
 
+def _home_base_check_in_url(request: Request, token: str) -> str:
+    """Build a distinct portal deep-link so Site and office QR flows cannot mix."""
+    portal_base = _require_canonical_portal_base(request)
+    return f"{portal_base}/portal?homeBase={quote(token, safe='')}"
+
+
+def _row_from_cursor(cur: Any) -> Optional[Dict[str, Any]]:
+    row = cur.fetchone()
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return dict(row)
+    # `_save_timesheets_to_db` deliberately uses a lightweight tuple cursor for
+    # its high-volume writes. New evidence callbacks run inside that same
+    # transaction, so normalize a RETURNING row from either cursor shape.
+    columns = [column[0] for column in (cur.description or [])]
+    return dict(zip(columns, row))
+
+
+def _home_base_policy_for_employee(
+    employee_id: int,
+    reference_time: datetime,
+    *,
+    cur: Optional[Any] = None,
+    for_update: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Return the active policy only when effective Morning Crew membership applies."""
+    from calendar_import_store import MORNING_CREW_NAME
+
+    local_day = reference_time.astimezone(APP_TIMEZONE).date()
+    query = """
+        SELECT hb.id AS home_base_id, hb.label, hb.address, hb.latitude, hb.longitude,
+               hb.check_in_token_nonce, hb.check_in_token_rotated_at,
+               policy.id AS policy_id, policy.crew_id, crew.name AS crew_name
+        FROM home_base_policies policy
+        JOIN home_bases hb ON hb.id = policy.home_base_id AND hb.active = true
+        JOIN crews crew ON crew.id = policy.crew_id AND crew.active = true
+        JOIN crew_memberships membership
+          ON membership.crew_id = crew.id
+         AND membership.employee_id = %s
+         AND membership.effective_from <= %s
+         AND (membership.effective_to IS NULL OR membership.effective_to > %s)
+        WHERE policy.active = true
+          AND crew.name = %s
+        ORDER BY policy.id
+        LIMIT 1
+    """ + (" FOR UPDATE OF hb, policy" if for_update else "")
+    params = (int(employee_id), local_day, local_day, MORNING_CREW_NAME)
+    if cur is not None:
+        cur.execute(query, params)
+        return _row_from_cursor(cur)
+    return db.query_one(query, params)
+
+
+def _active_home_base_config(*, cur: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+    query = """
+        SELECT hb.id AS home_base_id, hb.label, hb.address, hb.latitude, hb.longitude,
+               hb.active, hb.check_in_token_nonce, hb.check_in_token_rotated_at,
+               policy.id AS policy_id, policy.crew_id, policy.active AS policy_active,
+               crew.name AS crew_name
+        FROM home_bases hb
+        LEFT JOIN home_base_policies policy
+          ON policy.home_base_id = hb.id AND policy.active = true
+        LEFT JOIN crews crew ON crew.id = policy.crew_id
+        WHERE hb.active = true
+        ORDER BY hb.id
+        LIMIT 1
+    """
+    if cur is not None:
+        cur.execute(query)
+        return _row_from_cursor(cur)
+    return db.query_one(query)
+
+
+def _resolve_home_base_qr(
+    token: str,
+    *,
+    cur: Optional[Any] = None,
+    for_update: bool = False,
+) -> Dict[str, Any]:
+    try:
+        home_base_id, nonce = parse_home_base_token(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    query = """
+        SELECT id AS home_base_id, label, address, latitude, longitude,
+               check_in_token_nonce, check_in_token_rotated_at
+        FROM home_bases
+        WHERE id = %s AND active = true
+    """ + (" FOR UPDATE" if for_update else "")
+    if cur is None:
+        home_base = db.query_one(query, (home_base_id,))
+    else:
+        cur.execute(query, (home_base_id,))
+        home_base = _row_from_cursor(cur)
+    configured_nonce = str(home_base.get("check_in_token_nonce") or "") if home_base else ""
+    if (
+        not home_base
+        or not configured_nonce
+        or not hmac.compare_digest(configured_nonce, nonce)
+    ):
+        raise HTTPException(status_code=404, detail="Invalid or revoked Home Base QR code")
+    return home_base
+
+
+def _public_home_base_policy(policy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not policy:
+        return {"required": False, "homeBase": None}
+    return {
+        "required": True,
+        "homeBase": {
+            "id": int(policy["home_base_id"]),
+            "label": str(policy["label"]),
+            "address": str(policy.get("address") or ""),
+            "crewName": str(policy["crew_name"]),
+        },
+    }
+
+
+def _home_base_exception_reason(payload: Optional[BaseModel]) -> str:
+    return str(getattr(payload, "homeBaseExceptionReason", "") or "").strip()
+
+
+def _home_base_requirement_failure(policy: Dict[str, Any], action: str) -> Dict[str, Any]:
+    return {
+        "code": "HOME_BASE_REQUIRED",
+        "message": (
+            "Scan Home Base or provide a documented exception before "
+            f"{action}."
+        ),
+        "details": {
+            "action": action,
+            **_public_home_base_policy(policy),
+        },
+    }
+
+
+def _validate_home_base_exception(reason: str) -> Optional[str]:
+    if reason and len(reason) < 3:
+        return "Home Base exception reason must be at least 3 characters"
+    return None
+
+
+def _record_home_base_event(
+    cur: Any,
+    *,
+    shift_id: int,
+    employee_id: int,
+    policy: Dict[str, Any],
+    action: str,
+    outcome: str,
+    recorded_at: datetime,
+    exception_reason: str = "",
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    accuracy: Optional[float] = None,
+    geofence: Optional[Dict[str, Any]] = None,
+    idempotency_key: Optional[UUID] = None,
+    request_fingerprint: Optional[str] = None,
+) -> Dict[str, Any]:
+    cur.execute(
+        """
+        INSERT INTO home_base_events (
+            shift_id, employee_id, home_base_id, home_base_policy_id,
+            action, outcome, exception_reason, recorded_at,
+            latitude, longitude, accuracy_m, geofence_radius_m, distance_m,
+            geofence_status, idempotency_key, request_fingerprint
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        RETURNING id
+        """,
+        (
+            int(shift_id),
+            int(employee_id),
+            int(policy["home_base_id"]),
+            int(policy["policy_id"]),
+            action,
+            outcome,
+            exception_reason,
+            recorded_at,
+            latitude,
+            longitude,
+            accuracy,
+            geofence.get("radiusM") if geofence else None,
+            geofence.get("distanceM") if geofence else None,
+            geofence.get("status") if geofence else None,
+            str(idempotency_key) if idempotency_key else None,
+            request_fingerprint,
+        ),
+    )
+    row = _row_from_cursor(cur)
+    if not row:
+        raise RuntimeError("Home Base event was not stored")
+    return {
+        "id": int(row["id"]),
+        "action": action,
+        "outcome": outcome,
+        "recordedAt": to_utc_iso(recorded_at),
+        "exceptionReason": exception_reason,
+    }
+
+
+def _local_workday_bounds(reference_time: datetime) -> Tuple[datetime, datetime]:
+    local_day = reference_time.astimezone(APP_TIMEZONE).date()
+    start = datetime.combine(local_day, clock_time.min, tzinfo=APP_TIMEZONE)
+    end = start + timedelta(days=1)
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def _scheduled_visit_candidates_for_employee(
+    employee_id: int,
+    reference_time: datetime,
+) -> List[Dict[str, Any]]:
+    """Derive the employee's assigned, active customer visits for this workday."""
+    from calendar_import_store import MORNING_CREW_NAME
+
+    range_start, range_end = _local_workday_bounds(reference_time)
+    local_day = reference_time.astimezone(APP_TIMEZONE).date()
+    return db.query_all(
+        """
+        SELECT DISTINCT pv.id AS planned_visit_id, pv.location_id,
+               pv.migrated_job_id AS job_id, pv.approximate_start,
+               pv.approximate_end, l.address, l.customer_name, l.location_type,
+               l.lat, l.lng
+        FROM planned_service_visits pv
+        JOIN locations l ON l.id = pv.location_id AND l.active = true
+        WHERE pv.status = 'planned'
+          AND pv.approximate_start < %s
+          AND pv.approximate_end > %s
+          AND EXISTS (
+              SELECT 1
+              FROM planned_visit_assignments assignment
+              LEFT JOIN crews assigned_crew
+                ON assigned_crew.id = assignment.crew_id
+               AND assigned_crew.active = true
+              LEFT JOIN crew_memberships membership
+                ON membership.crew_id = assigned_crew.id
+               AND membership.employee_id = %s
+               AND membership.effective_from <= %s
+               AND (
+                   membership.effective_to IS NULL
+                   OR membership.effective_to > %s
+               )
+              WHERE assignment.planned_visit_id = pv.id
+                AND assignment.active = true
+                AND (
+                    assignment.employee_id = %s
+                    OR (
+                        membership.employee_id IS NOT NULL
+                        AND (
+                            l.location_type <> 'Residential'
+                            OR assigned_crew.name = %s
+                        )
+                    )
+                )
+          )
+        ORDER BY pv.approximate_start, pv.id
+        """,
+        (
+            range_end,
+            range_start,
+            int(employee_id),
+            local_day,
+            local_day,
+            int(employee_id),
+            MORNING_CREW_NAME,
+        ),
+    )
+
+
+def _eligible_planned_visit(
+    *,
+    employee_id: int,
+    planned_visit_id: int,
+    location_id: int,
+    reference_time: datetime,
+) -> Optional[Dict[str, Any]]:
+    return next(
+        (
+            candidate
+            for candidate in _scheduled_visit_candidates_for_employee(
+                employee_id,
+                reference_time,
+            )
+            if int(candidate["planned_visit_id"]) == int(planned_visit_id)
+            and int(candidate["location_id"]) == int(location_id)
+        ),
+        None,
+    )
+
+
+def _selected_site_gps_meta(
+    site: Dict[str, Any],
+    geofence: Dict[str, Any],
+    payload: VisitRequest,
+    *,
+    planned_visit_id: Optional[int],
+) -> Dict[str, Any]:
+    return {
+        "override": bool(payload.gpsOverrideReason.strip()),
+        "overrideReason": payload.gpsOverrideReason.strip(),
+        "overrideDetail": payload.gpsOverrideDetail.strip(),
+        "matchedLocation": str(site["address"]),
+        "distanceM": geofence.get("distanceM"),
+        "withinRadius": geofence.get("status") == "inside",
+        "accuracyM": geofence.get("accuracyM"),
+        "selectedSite": True,
+        "plannedVisitId": planned_visit_id,
+        "evidenceMethod": payload.evidenceMethod,
+        "exceptionReason": payload.exceptionReason,
+    }
+
+
+def _selected_site_override_error(payload: VisitRequest) -> Optional[str]:
+    reason = payload.gpsOverrideReason.strip()
+    detail = payload.gpsOverrideDetail.strip()
+    if detail and not reason:
+        return "GPS override details require an override reason."
+    return None
+
+
+def _resolve_explicit_visit_site(
+    payload: VisitRequest,
+    employee: Dict[str, Any],
+    reference_time: datetime,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[str]]:
+    """Resolve a selected Site without ever consulting the global nearest pin.
+
+    The final string is a safe mutation failure message rather than an HTTP
+    exception so it follows the existing /timesheet/visit response shape.
+    """
+    if payload.locationId is None:
+        return None, None, None, None
+
+    site: Optional[Dict[str, Any]] = None
+    planned: Optional[Dict[str, Any]] = None
+    method = payload.evidenceMethod
+    assert method is not None
+    if method in {"residential_gps", "commercial_qr_fallback"}:
+        if payload.plannedVisitId is None:
+            return None, None, None, "A scheduled visit must be selected for this arrival"
+        planned = _eligible_planned_visit(
+            employee_id=int(employee["id"]),
+            planned_visit_id=int(payload.plannedVisitId),
+            location_id=int(payload.locationId),
+            reference_time=reference_time,
+        )
+        if not planned:
+            return None, None, None, "That scheduled Site is not assigned to you today"
+        site = planned
+        expected_type = (
+            "Residential" if method == "residential_gps" else "Commercial"
+        )
+        if site.get("location_type") != expected_type:
+            return (
+                None,
+                None,
+                None,
+                f"{method} can only be used for a scheduled {expected_type} Site",
+            )
+    else:
+        if payload.plannedVisitId is not None:
+            return None, None, None, "An unplanned visit cannot use a scheduled visit id"
+        site = db.query_one(
+            """
+            SELECT id AS location_id, address, customer_name, location_type, lat, lng
+            FROM locations
+            WHERE id = %s AND active = true
+            """,
+            (int(payload.locationId),),
+        )
+        if not site or site.get("location_type") != "Residential":
+            return None, None, None, "Unplanned visits require an active Residential Site"
+        # This exception is intentionally bounded to a real, pinned home; an
+        # unpinned arbitrary Residential row can never become an unplanned
+        # visit.
+        if site.get("lat") is None or site.get("lng") is None:
+            return None, None, None, "Unplanned visits require a pinned Residential Site"
+
+    assert site is not None
+    assert payload.latitude is not None and payload.longitude is not None
+    assert payload.accuracy is not None
+    geofence = evaluate_site_check_in_geofence(
+        site_latitude=float(site["lat"]) if site.get("lat") is not None else None,
+        site_longitude=float(site["lng"]) if site.get("lng") is not None else None,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        accuracy=payload.accuracy,
+    )
+    if geofence["status"] != "inside":
+        # Unlike a scheduled Site, an unplanned Residential exception has no
+        # independent scheduling evidence to support an uncertain GPS reading.
+        # Keep this bounded to the pinned Site whose geofence actually contains
+        # the reported position; a generic override must not expand that set.
+        if method == "unplanned_residential":
+            return (
+                None,
+                None,
+                None,
+                "Unplanned visits require GPS confirmation at the selected pinned Residential Site",
+            )
+        override_error = _selected_site_override_error(payload)
+        if override_error:
+            return None, None, None, override_error
+        if not payload.gpsOverrideReason.strip():
+            return (
+                None,
+                None,
+                None,
+                "GPS does not confirm the selected Site. Add a GPS override reason to continue.",
+            )
+    return site, planned, geofence, None
+
+
+def _serialize_visit_candidate(
+    candidate: Dict[str, Any],
+    payload: VisitCandidatesRequest,
+) -> Dict[str, Any]:
+    geofence = evaluate_site_check_in_geofence(
+        site_latitude=(float(candidate["lat"]) if candidate.get("lat") is not None else None),
+        site_longitude=(float(candidate["lng"]) if candidate.get("lng") is not None else None),
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        accuracy=payload.accuracy,
+    )
+    return {
+        "plannedVisitId": int(candidate["planned_visit_id"]),
+        "locationId": int(candidate["location_id"]),
+        "jobId": int(candidate["job_id"]) if candidate.get("job_id") is not None else None,
+        "address": str(candidate["address"]),
+        "customerName": str(candidate.get("customer_name") or ""),
+        "locationType": str(candidate.get("location_type") or ""),
+        "scheduledStart": to_utc_iso(candidate["approximate_start"]),
+        "scheduledEnd": to_utc_iso(candidate["approximate_end"]),
+        "geofence": geofence,
+    }
+
+
 def _resolve_site_check_in_qr(
     token: str,
     *,
@@ -6015,7 +6846,7 @@ def _resolve_site_check_in_qr(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     query = """
-        SELECT id, address, customer_name, lat, lng, check_in_token_nonce,
+        SELECT id, address, customer_name, location_type, lat, lng, check_in_token_nonce,
                check_in_token_rotated_at
         FROM locations
         WHERE id = %s AND active = true
@@ -7476,15 +8307,18 @@ def _insert_site_arrival_evidence(
 def time_tracker_page(
     request: Request,
     check_in: Optional[str] = Query(default=None, alias="checkIn"),
+    home_base: Optional[str] = Query(default=None, alias="homeBase"),
 ) -> Response:
     # Both retired backend entry points belong to the canonical EOM portal
-    # (issue #35). Forward ONLY a non-empty checkIn value: apiBaseUrl and other
+    # (issue #35). Forward only one recognized QR token; apiBaseUrl and other
     # legacy parameters must not ride a printed-QR redirect. 302 + no-store
     # keeps the cutover reversible and prevents phone browsers from caching it.
     portal_base = _require_canonical_portal_base(request)
     destination = f"{portal_base}/portal"
     if check_in:
         destination = f"{destination}?checkIn={quote(check_in, safe='')}"
+    elif home_base:
+        destination = f"{destination}?homeBase={quote(home_base, safe='')}"
     return RedirectResponse(
         destination,
         status_code=302,
@@ -7697,6 +8531,337 @@ def receivables_clear_deposit_batch(
     )
 
 
+def _morning_crew_config() -> Optional[Dict[str, Any]]:
+    from calendar_import_store import MORNING_CREW_NAME
+
+    today = datetime.now(APP_TIMEZONE).date()
+    return db.query_one(
+        """
+        SELECT crew.id, crew.name,
+               ARRAY_REMOVE(ARRAY_AGG(membership.employee_id ORDER BY membership.employee_id), NULL)
+                   AS member_ids
+        FROM crews crew
+        LEFT JOIN crew_memberships membership
+          ON membership.crew_id = crew.id
+         AND membership.effective_from <= %s
+         AND (membership.effective_to IS NULL OR membership.effective_to > %s)
+        WHERE crew.name = %s AND crew.active = true
+        GROUP BY crew.id, crew.name
+        """,
+        (today, today, MORNING_CREW_NAME),
+    )
+
+
+def _serialize_home_base_config(
+    config: Optional[Dict[str, Any]],
+    morning_crew: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "configured": config is not None,
+        "homeBase": (
+            {
+                "id": int(config["home_base_id"]),
+                "label": str(config["label"]),
+                "address": str(config.get("address") or ""),
+                "latitude": (
+                    float(config["latitude"])
+                    if config.get("latitude") is not None
+                    else None
+                ),
+                "longitude": (
+                    float(config["longitude"])
+                    if config.get("longitude") is not None
+                    else None
+                ),
+                "policyId": (
+                    int(config["policy_id"])
+                    if config.get("policy_id") is not None
+                    else None
+                ),
+                "qrConfigured": bool(config.get("check_in_token_nonce")),
+                "qrRotatedAt": (
+                    to_utc_iso(config["check_in_token_rotated_at"])
+                    if config.get("check_in_token_rotated_at")
+                    else None
+                ),
+            }
+            if config
+            else None
+        ),
+        "morningCrew": (
+            {
+                "id": int(morning_crew["id"]),
+                "name": str(morning_crew["name"]),
+                "memberIds": [
+                    int(member_id)
+                    for member_id in (morning_crew.get("member_ids") or [])
+                ],
+            }
+            if morning_crew
+            else None
+        ),
+    }
+
+
+@app.get("/api/admin/home-base")
+def admin_get_home_base(
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    del admin
+    return {
+        "success": True,
+        **_serialize_home_base_config(
+            _active_home_base_config(),
+            _morning_crew_config(),
+        ),
+    }
+
+
+@app.put("/api/admin/home-base")
+def admin_put_home_base(
+    payload: HomeBasePutRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    from calendar_import_store import MORNING_CREW_NAME
+
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("home-base-config",),
+            )
+            cur.execute(
+                "SELECT id, name FROM crews WHERE name = %s AND active = true FOR UPDATE",
+                (MORNING_CREW_NAME,),
+            )
+            crew = _row_from_cursor(cur)
+            if not crew:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Configure the existing Morning Crew before Home Base",
+                )
+            cur.execute(
+                "SELECT id FROM home_bases WHERE active = true FOR UPDATE"
+            )
+            existing = _row_from_cursor(cur)
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE home_bases
+                    SET label = %s, address = %s, latitude = %s, longitude = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING id
+                    """,
+                    (
+                        payload.label,
+                        payload.address,
+                        payload.latitude,
+                        payload.longitude,
+                        int(existing["id"]),
+                    ),
+                )
+                home_base_id = int(_row_from_cursor(cur)["id"])
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO home_bases (
+                        label, address, latitude, longitude, created_by
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        payload.label,
+                        payload.address,
+                        payload.latitude,
+                        payload.longitude,
+                        int(admin["id"]),
+                    ),
+                )
+                home_base_id = int(_row_from_cursor(cur)["id"])
+            cur.execute("UPDATE home_base_policies SET active = false, updated_at = NOW() WHERE active = true")
+            cur.execute(
+                """
+                INSERT INTO home_base_policies (home_base_id, crew_id, active, created_by)
+                VALUES (%s, %s, true, %s)
+                ON CONFLICT (home_base_id, crew_id)
+                DO UPDATE SET active = true, updated_at = NOW()
+                RETURNING id
+                """,
+                (home_base_id, int(crew["id"]), int(admin["id"])),
+            )
+            policy_id = int(_row_from_cursor(cur)["id"])
+
+    append_access_log(
+        request,
+        "HOME_BASE_CONFIGURED",
+        True,
+        f"Admin {admin['name']} Home Base {home_base_id} policy {policy_id}",
+    )
+    return {
+        "success": True,
+        **_serialize_home_base_config(
+            _active_home_base_config(),
+            _morning_crew_config(),
+        ),
+    }
+
+
+@app.post("/api/admin/home-base/check-in-qr")
+def admin_home_base_qr(
+    payload: SiteQrRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    _require_canonical_portal_base(request)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("home-base-qr",))
+            config = _active_home_base_config(cur=cur)
+            if not config or config.get("policy_id") is None:
+                raise HTTPException(status_code=409, detail="Home Base is not configured")
+            nonce = str(config.get("check_in_token_nonce") or "")
+            rotated = False
+            if payload.rotate or not nonce:
+                nonce = secrets.token_urlsafe(18)
+                cur.execute(
+                    """
+                    UPDATE home_bases
+                    SET check_in_token_nonce = %s, check_in_token_rotated_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s AND active = true
+                    RETURNING check_in_token_rotated_at
+                    """,
+                    (nonce, int(config["home_base_id"])),
+                )
+                updated = _row_from_cursor(cur)
+                if not updated:
+                    raise HTTPException(status_code=409, detail="Home Base changed; reload")
+                config["check_in_token_rotated_at"] = updated["check_in_token_rotated_at"]
+                rotated = True
+            token = build_home_base_token(int(config["home_base_id"]), nonce)
+            check_in_url = _home_base_check_in_url(request, token)
+    append_access_log(
+        request,
+        "HOME_BASE_QR_ROTATED" if rotated else "HOME_BASE_QR_LOADED",
+        True,
+        f"Admin {admin['name']} Home Base {config['home_base_id']}",
+    )
+    return {
+        "success": True,
+        "homeBase": {
+            "id": int(config["home_base_id"]),
+            "label": str(config["label"]),
+            "address": str(config.get("address") or ""),
+        },
+        "token": token,
+        "checkInUrl": check_in_url,
+        "qrSvg": build_site_check_in_qr_svg(check_in_url),
+        "rotated": rotated,
+        "rotatedAt": (
+            to_utc_iso(config["check_in_token_rotated_at"])
+            if config.get("check_in_token_rotated_at")
+            else None
+        ),
+    }
+
+
+@app.get("/api/admin/home-base/exceptions")
+def admin_home_base_exceptions(
+    limit: int = Query(default=100, ge=1, le=500),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    del admin
+    rows = db.query_all(
+        """
+        SELECT event.id, event.action, event.exception_reason, event.recorded_at,
+               event.geofence_status, event.distance_m, event.accuracy_m,
+               employee.id AS employee_id, employee.name AS employee_name,
+               base.label AS home_base_label, event.shift_id
+        FROM home_base_events event
+        JOIN employees employee ON employee.id = event.employee_id
+        JOIN home_bases base ON base.id = event.home_base_id
+        WHERE event.outcome = 'exception'
+        ORDER BY event.recorded_at DESC, event.id DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    return {
+        "success": True,
+        "exceptions": [
+            {
+                "id": int(row["id"]),
+                "shiftId": int(row["shift_id"]),
+                "employeeId": int(row["employee_id"]),
+                "employeeName": str(row["employee_name"]),
+                "homeBaseLabel": str(row["home_base_label"]),
+                "action": str(row["action"]),
+                "reason": str(row["exception_reason"]),
+                "recordedAt": to_utc_iso(row["recorded_at"]),
+                "geofenceStatus": row.get("geofence_status"),
+                "distanceM": float(row["distance_m"]) if row.get("distance_m") is not None else None,
+                "accuracyM": float(row["accuracy_m"]) if row.get("accuracy_m") is not None else None,
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/api/admin/visit-evidence-exceptions")
+def admin_visit_evidence_exceptions(
+    limit: int = Query(default=100, ge=1, le=500),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    del admin
+    rows = db.query_all(
+        """
+        SELECT evidence.id, evidence.evidence_method, evidence.exception_reason,
+               evidence.exception_detail, evidence.geofence_status,
+               evidence.distance_m, evidence.accuracy_m, evidence.created_at,
+               employee.id AS employee_id, employee.name AS employee_name,
+               location.id AS location_id, location.address, location.customer_name,
+               evidence.planned_visit_id, evidence.shift_id
+        FROM visit_evidence_events evidence
+        JOIN employees employee ON employee.id = evidence.employee_id
+        JOIN locations location ON location.id = evidence.location_id
+        WHERE evidence.evidence_method <> 'residential_gps'
+           OR evidence.geofence_status <> 'inside'
+        ORDER BY evidence.created_at DESC, evidence.id DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    return {
+        "success": True,
+        "exceptions": [
+            {
+                "id": int(row["id"]),
+                "shiftId": int(row["shift_id"]),
+                "employeeId": int(row["employee_id"]),
+                "employeeName": str(row["employee_name"]),
+                "locationId": int(row["location_id"]),
+                "address": str(row["address"]),
+                "customerName": str(row.get("customer_name") or ""),
+                "plannedVisitId": (
+                    int(row["planned_visit_id"])
+                    if row.get("planned_visit_id") is not None
+                    else None
+                ),
+                "method": str(row["evidence_method"]),
+                "reason": str(row["exception_reason"]),
+                "detail": str(row["exception_detail"]),
+                "geofenceStatus": str(row["geofence_status"]),
+                "distanceM": float(row["distance_m"]) if row.get("distance_m") is not None else None,
+                "accuracyM": float(row["accuracy_m"]) if row.get("accuracy_m") is not None else None,
+                "createdAt": to_utc_iso(row["created_at"]),
+            }
+            for row in rows
+        ],
+    }
+
+
 @app.post("/api/admin/locations/{site_id}/check-in-qr")
 def admin_site_check_in_qr(
     site_id: int,
@@ -7706,7 +8871,7 @@ def admin_site_check_in_qr(
 ) -> Dict[str, Any]:
     site = db.query_one(
         """
-        SELECT id, address, customer_name, active, check_in_token_nonce,
+        SELECT id, address, customer_name, location_type, active, check_in_token_nonce,
                check_in_token_rotated_at
         FROM locations
         WHERE id = %s
@@ -7784,6 +8949,7 @@ def admin_site_check_in_qr(
             "id": int(site["id"]),
             "name": str(site["address"]),
             "customerName": str(site.get("customer_name") or ""),
+            "locationType": str(site.get("location_type") or ""),
         },
         "token": token,
         "checkInUrl": check_in_url,
@@ -8050,11 +9216,22 @@ def _record_explicit_site_action(
                         ),
                     )
                     visit_id = int(cur.fetchone()["id"])
+                    # A Home Base (or documented dispatch-exception) shift is
+                    # internal paid time, not a customer shift.  Its later
+                    # customer visit remains authoritative in ``visits`` but
+                    # must never turn the shift row into a customer-linked
+                    # record, even through the legacy Site-QR action path.
                     cur.execute(
                         """
-                        UPDATE shifts
+                        UPDATE shifts AS shift
                         SET location_id = %s
-                        WHERE id = %s AND location_id IS NULL
+                        WHERE shift.id = %s
+                          AND shift.location_id IS NULL
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM home_base_events AS home_base_event
+                              WHERE home_base_event.shift_id = shift.id
+                          )
                         """,
                         (int(site["id"]), shift_id),
                     )
@@ -8181,7 +9358,14 @@ def _record_explicit_site_action(
             return response
 
 
-PLAIN_TIME_ACTION_NAMES = ("clock-in", "arrive", "depart", "clock-out")
+PLAIN_TIME_ACTION_NAMES = (
+    "clock-in",
+    "arrive",
+    "depart",
+    "clock-out",
+    "home-base-start",
+    "home-base-end",
+)
 PLAIN_TIME_ACTION_RECEIPT_UNIQUE_CONSTRAINT = (
     "plain_time_action_receipts_employee_id_idempotency_key_key"
 )
@@ -8220,10 +9404,14 @@ def _plain_time_action_recorded_at(
     action: str,
     response: Dict[str, Any],
 ) -> datetime:
-    if action in {"clock-in", "clock-out"}:
+    if action in {"clock-in", "clock-out", "home-base-start", "home-base-end"}:
         entry = response.get("entry") if isinstance(response, dict) else None
         if isinstance(entry, dict):
-            key = "clockIn" if action == "clock-in" else "clockOut"
+            key = (
+                "clockIn"
+                if action in {"clock-in", "home-base-start"}
+                else "clockOut"
+            )
             value = entry.get(key)
             if value:
                 try:
@@ -8285,6 +9473,7 @@ def update_timesheets_for_plain_time_action(
     employee: Dict[str, Any],
     mutator: Callable[[Dict[str, Any]], Tuple[bool, Any]],
     response_builder: Callable[[Any, Dict[str, Any]], Dict[str, Any]],
+    after_response_saved: Optional[Callable[[Any, Any, Dict[str, Any]], None]] = None,
 ) -> Tuple[bool, Any]:
     if action not in PLAIN_TIME_ACTION_NAMES:
         raise ValueError(f"Unsupported plain time action: {action}")
@@ -8327,6 +9516,8 @@ def update_timesheets_for_plain_time_action(
 
             def after_save(cur: Any) -> None:
                 response = response_builder(result, timesheet_data)
+                if after_response_saved is not None:
+                    after_response_saved(cur, result, response)
                 if idempotency_key:
                     response = {**response, "replayed": False}
                     cur.execute(
@@ -8402,15 +9593,257 @@ def resolve_site_check_in_qr(
         True,
         f"Employee {employee['name']} site {site['id']}",
     )
+    public_site = {
+        "id": int(site["id"]),
+        "name": str(site["address"]),
+        "customerName": str(site.get("customer_name") or ""),
+    }
+    # This remains absent for legacy, untyped Site QR consumers.  Typed Sites
+    # gain the additive discriminator needed by the new Commercial-only UI.
+    if site.get("location_type"):
+        public_site["locationType"] = str(site["location_type"])
     return {
         "success": True,
-        "site": {
-            "id": int(site["id"]),
-            "name": str(site["address"]),
-            "customerName": str(site.get("customer_name") or ""),
-        },
+        "site": public_site,
         "actionState": _public_site_action_state(action_state),
     }
+
+
+@app.post("/api/timesheet/home-base/resolve")
+def resolve_home_base_qr(
+    payload: HomeBaseQrResolveRequest,
+    request: Request,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    home_base = _resolve_home_base_qr(payload.token)
+    now_utc = utc_now()
+    policy = _home_base_policy_for_employee(int(employee["id"]), now_utc)
+    if not policy or int(policy["home_base_id"]) != int(home_base["home_base_id"]):
+        append_access_log(
+            request,
+            "HOME_BASE_QR_REJECTED",
+            False,
+            f"Employee {employee['name']} is outside the Home Base policy",
+        )
+        raise HTTPException(status_code=403, detail="Home Base is not required for this employee")
+
+    timesheet_data = _load_timesheets_from_db()
+    stale = get_stale_open_entry(timesheet_data["entries"], int(employee["id"]), now_utc)
+    open_entry = get_open_entry(timesheet_data["entries"], int(employee["id"]))
+    if stale:
+        action_state = {
+            "status": "review_required",
+            "recommendedAction": None,
+            "blockReason": STALE_SHIFT_REVIEW_CODE,
+        }
+    elif open_entry:
+        action_state = {
+            "status": "ready",
+            "recommendedAction": "end",
+            "blockReason": (
+                "active_customer_visit"
+                if get_active_visit(open_entry)
+                else None
+            ),
+        }
+    else:
+        action_state = {
+            "status": "ready",
+            "recommendedAction": "start",
+            "blockReason": None,
+        }
+    append_access_log(
+        request,
+        "HOME_BASE_QR_RESOLVED",
+        True,
+        f"Employee {employee['name']} Home Base {home_base['home_base_id']}",
+    )
+    return {
+        "success": True,
+        "homeBase": {
+            "id": int(home_base["home_base_id"]),
+            "label": str(home_base["label"]),
+            "address": str(home_base.get("address") or ""),
+        },
+        "policy": _public_home_base_policy(policy),
+        "actionState": action_state,
+    }
+
+
+@app.get("/api/timesheet/home-base/status")
+def home_base_status(
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Expose only the signed-in employee's current Home Base requirement.
+
+    This is presentation data.  The policy itself is enforced by the clock
+    mutations so a stale or unavailable portal read cannot bypass a configured
+    Morning Crew Home Base requirement.
+    """
+    policy = _home_base_policy_for_employee(int(employee["id"]), utc_now())
+    return {
+        "success": True,
+        **_public_home_base_policy(policy),
+    }
+
+
+@app.post("/api/timesheet/home-base/scan")
+def record_home_base_scan(
+    payload: HomeBaseActionRequest,
+    request: Request,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    home_base = _resolve_home_base_qr(payload.token)
+    now_utc = utc_now()
+    policy = _home_base_policy_for_employee(int(employee["id"]), now_utc)
+    if not policy or int(policy["home_base_id"]) != int(home_base["home_base_id"]):
+        raise HTTPException(status_code=403, detail="Home Base is not required for this employee")
+    geofence = evaluate_site_check_in_geofence(
+        site_latitude=(
+            float(home_base["latitude"])
+            if home_base.get("latitude") is not None
+            else None
+        ),
+        site_longitude=(
+            float(home_base["longitude"])
+            if home_base.get("longitude") is not None
+            else None
+        ),
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        accuracy=payload.accuracy,
+    )
+    if geofence["status"] != "inside":
+        raise HTTPException(
+            status_code=400,
+            detail="GPS does not confirm Home Base. Use a documented exception if you could not scan.",
+        )
+
+    action_name = f"home-base-{payload.action}"
+    replay = _plain_time_action_replay_response(action_name, payload, employee)
+    if replay is not None:
+        return replay
+    if payload.action == "start":
+        enforce_clock_action_hours(request)
+
+    work_date = now_utc.astimezone(APP_TIMEZONE).date().isoformat()
+
+    def home_base_gps_meta() -> Dict[str, Any]:
+        return {
+            "override": False,
+            "overrideReason": "",
+            "overrideDetail": "",
+            "matchedLocation": str(home_base["label"]),
+            "distanceM": geofence.get("distanceM"),
+            "withinRadius": True,
+            "accuracyM": geofence.get("accuracyM"),
+            "homeBase": True,
+        }
+
+    def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], int(employee["id"]), now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
+        open_entry = get_open_entry(timesheet_data["entries"], int(employee["id"]))
+        if payload.action == "start":
+            if open_entry:
+                return False, "Already clocked in"
+            entry_id = int(timesheet_data["nextId"])
+            entry = {
+                "id": entry_id,
+                "employeeId": employee["id"],
+                "employeeName": employee["name"],
+                "location": f"Home Base — {home_base['label']}",
+                # Explicit None prevents the persistence layer from treating a
+                # coincidentally identical customer address as this office.
+                "locationId": None,
+                "internalHomeBase": True,
+                "clockIn": to_utc_iso(now_utc),
+                "clockOut": None,
+                "totalHours": 0,
+                "notes": "",
+                "date": work_date,
+                "timezone": TIMEZONE_NAME,
+                "clockInGps": build_gps_point(
+                    payload.latitude, payload.longitude, payload.accuracy
+                ),
+                "clockInGpsMeta": home_base_gps_meta(),
+                "clockOutGps": None,
+                "clockOutGpsMeta": None,
+                "jobId": None,
+                "timeCategory": "productive",
+                "nonProductiveType": None,
+                "visits": [],
+            }
+            timesheet_data["entries"].append(entry)
+            timesheet_data["nextId"] = entry_id + 1
+            return True, entry
+        if not open_entry:
+            return False, "Not currently clocked in"
+        if get_active_visit(open_entry):
+            return False, "Depart the active customer Site before ending at Home Base"
+        try:
+            clock_in_time = parse_utc_iso(str(open_entry.get("clockIn", "")))
+        except ValueError:
+            return False, "Invalid clock-in timestamp"
+        total_hours = (now_utc - clock_in_time).total_seconds() / 3600
+        if total_hours < 0:
+            return False, "Invalid clock-in timestamp"
+        open_entry["clockOut"] = to_utc_iso(now_utc)
+        open_entry["totalHours"] = round(total_hours, 2)
+        open_entry["clockOutGps"] = build_gps_point(
+            payload.latitude, payload.longitude, payload.accuracy
+        )
+        open_entry["clockOutGpsMeta"] = home_base_gps_meta()
+        return True, open_entry
+
+    def response_builder(result: Any, _timesheet_data: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "success": True,
+            "action": payload.action,
+            "entry": result,
+        }
+
+    def record_event(cur: Any, result: Any, response: Dict[str, Any]) -> None:
+        shift_id = _plain_time_action_shift_id(result, response)
+        if shift_id is None:
+            raise RuntimeError("Home Base action did not return a shift id")
+        response["homeBaseEvent"] = _record_home_base_event(
+            cur,
+            shift_id=shift_id,
+            employee_id=int(employee["id"]),
+            policy=policy,
+            action=payload.action,
+            outcome="recorded",
+            recorded_at=now_utc,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            accuracy=payload.accuracy,
+            geofence=geofence,
+            idempotency_key=payload.idempotencyKey,
+            request_fingerprint=_plain_time_action_request_fingerprint(action_name, payload),
+        )
+
+    ok, result = update_timesheets_for_plain_time_action(
+        action_name,
+        payload,
+        employee,
+        mutator,
+        response_builder,
+        after_response_saved=record_event,
+    )
+    if not ok:
+        append_access_log(request, "HOME_BASE_SCAN_FAILED", False, str(result))
+        raise_timesheet_mutation_failure(result)
+    append_access_log(
+        request,
+        "HOME_BASE_SCAN_RECORDED",
+        True,
+        f"Employee {employee['name']} action {payload.action}",
+    )
+    return result
 
 
 @app.post("/api/timesheet/site-check-in")
@@ -10182,6 +11615,14 @@ def clock_in(
     has_gps = payload.latitude is not None and payload.longitude is not None
     now_utc = utc_now()
     work_date = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
+    home_base_policy = _home_base_policy_for_employee(int(employee["id"]), now_utc)
+    # Enforcement is server-owned.  A client must not be able to bypass a
+    # configured Morning Crew policy merely by omitting a presentation field.
+    home_base_enforced = home_base_policy is not None
+    home_base_exception = _home_base_exception_reason(payload)
+    exception_error = _validate_home_base_exception(home_base_exception)
+    if exception_error:
+        raise HTTPException(status_code=422, detail=exception_error)
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
         stale_open = get_stale_open_entry(
@@ -10193,6 +11634,10 @@ def clock_in(
         if existing_open:
             return False, "Already clocked in"
 
+        if home_base_enforced and not home_base_exception:
+            assert home_base_policy is not None
+            return False, _home_base_requirement_failure(home_base_policy, "clocking in")
+
         override_error = require_gps_override(
             timesheet_data,
             payload.latitude,
@@ -10203,8 +11648,12 @@ def clock_in(
         if override_error:
             return False, override_error
 
-        # Auto-match location from GPS; fall back to provided string or GPS coords
-        if has_gps:
+        # A documented Home Base exception is dispatch evidence, never a
+        # disguised customer Site picked by the generic nearest-pin matcher.
+        if home_base_enforced and home_base_exception:
+            location = "Dispatch exception"
+        # Legacy callers retain their additive-compatible nearest-site behavior.
+        elif has_gps:
             matched = find_nearest_location(payload.latitude, payload.longitude, timesheet_data)
             location = matched or payload.location.strip() or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
         else:
@@ -10216,6 +11665,15 @@ def clock_in(
             "employeeId": employee["id"],
             "employeeName": employee["name"],
             "location": location,
+            # Persist-time auto-linking must never turn a documented internal
+            # dispatch exception into the first customer Site visited later in
+            # the shift.  The durable Home Base event restores this marker on
+            # later loads.
+            **(
+                {"locationId": None, "internalHomeBase": True}
+                if home_base_enforced and home_base_exception
+                else {}
+            ),
             "clockIn": to_utc_iso(now_utc),
             "clockOut": None,
             "totalHours": 0,
@@ -10257,12 +11715,43 @@ def clock_in(
         result["customer"] = _resolve_customer(loc, location_customers)
         return {"success": True, "entry": result}
 
+    def record_home_base_exception(
+        cur: Any,
+        result: Any,
+        response: Dict[str, Any],
+    ) -> None:
+        if not (home_base_enforced and home_base_exception and home_base_policy):
+            return
+        shift_id = _plain_time_action_shift_id(result, response)
+        if shift_id is None:
+            raise RuntimeError("Clock-in did not return a shift id")
+        response["homeBaseEvent"] = _record_home_base_event(
+            cur,
+            shift_id=shift_id,
+            employee_id=int(employee["id"]),
+            policy=home_base_policy,
+            action="start",
+            outcome="exception",
+            recorded_at=now_utc,
+            exception_reason=home_base_exception,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            accuracy=payload.accuracy,
+            idempotency_key=payload.idempotencyKey,
+            request_fingerprint=(
+                _plain_time_action_request_fingerprint("clock-in", payload)
+                if payload.idempotencyKey
+                else None
+            ),
+        )
+
     ok, result = update_timesheets_for_plain_time_action(
         "clock-in",
         payload,
         employee,
         mutator,
         response_builder,
+        after_response_saved=record_home_base_exception,
     )
     if not ok:
         append_access_log(request, "CLOCK_IN_FAILED", False, str(result))
@@ -10281,6 +11770,13 @@ def clock_out(
 ) -> Dict[str, Any]:
     notes = payload.notes.strip() if payload else ""
     now_utc = utc_now()
+    home_base_policy = _home_base_policy_for_employee(int(employee["id"]), now_utc)
+    # See clock_in: Home Base is a policy, not an opt-in browser capability.
+    home_base_enforced = home_base_policy is not None
+    home_base_exception = _home_base_exception_reason(payload)
+    exception_error = _validate_home_base_exception(home_base_exception)
+    if exception_error:
+        raise HTTPException(status_code=422, detail=exception_error)
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
         stale_open = get_stale_open_entry(
@@ -10291,6 +11787,12 @@ def clock_out(
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
         if not open_entry:
             return False, "Not currently clocked in"
+
+        if home_base_enforced and not home_base_exception:
+            assert home_base_policy is not None
+            return False, _home_base_requirement_failure(home_base_policy, "clocking out")
+        if home_base_enforced and home_base_exception and get_active_visit(open_entry):
+            return False, "Depart the active customer Site before recording a Home Base exception"
 
         override_error = require_gps_override(
             timesheet_data,
@@ -10330,12 +11832,43 @@ def clock_out(
 
         return True, open_entry
 
+    def record_home_base_exception(
+        cur: Any,
+        result: Any,
+        response: Dict[str, Any],
+    ) -> None:
+        if not (home_base_enforced and home_base_exception and home_base_policy):
+            return
+        shift_id = _plain_time_action_shift_id(result, response)
+        if shift_id is None:
+            raise RuntimeError("Clock-out did not return a shift id")
+        response["homeBaseEvent"] = _record_home_base_event(
+            cur,
+            shift_id=shift_id,
+            employee_id=int(employee["id"]),
+            policy=home_base_policy,
+            action="end",
+            outcome="exception",
+            recorded_at=now_utc,
+            exception_reason=home_base_exception,
+            latitude=payload.latitude if payload else None,
+            longitude=payload.longitude if payload else None,
+            accuracy=payload.accuracy if payload else None,
+            idempotency_key=payload.idempotencyKey if payload else None,
+            request_fingerprint=(
+                _plain_time_action_request_fingerprint("clock-out", payload)
+                if payload and payload.idempotencyKey
+                else None
+            ),
+        )
+
     ok, result = update_timesheets_for_plain_time_action(
         "clock-out",
         payload,
         employee,
         mutator,
         lambda result, _timesheet_data: {"success": True, "entry": result},
+        after_response_saved=record_home_base_exception,
     )
     if not ok:
         append_access_log(request, "CLOCK_OUT_FAILED", False, str(result))
@@ -10351,9 +11884,83 @@ def clock_out(
     return result
 
 
+@app.post("/api/timesheet/visit-candidates")
+def visit_candidates(
+    payload: VisitCandidatesRequest,
+    request: Request,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Return only today's eligible customer choices; never a global GPS roster."""
+    now_utc = utc_now()
+    scheduled_rows = _scheduled_visit_candidates_for_employee(
+        int(employee["id"]),
+        now_utc,
+    )
+    scheduled = [_serialize_visit_candidate(row, payload) for row in scheduled_rows]
+    scheduled_location_ids = {int(candidate["locationId"]) for candidate in scheduled}
+
+    nearby_rows = db.query_all(
+        """
+        SELECT id AS location_id, address, customer_name, location_type, lat, lng
+        FROM locations
+        WHERE active = true
+          AND location_type = 'Residential'
+          AND lat IS NOT NULL
+          AND lng IS NOT NULL
+        ORDER BY customer_name NULLS LAST, address, id
+        """
+    )
+    nearby_residential: List[Dict[str, Any]] = []
+    for row in nearby_rows:
+        if int(row["location_id"]) in scheduled_location_ids:
+            continue
+        geofence = evaluate_site_check_in_geofence(
+            site_latitude=float(row["lat"]),
+            site_longitude=float(row["lng"]),
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            accuracy=payload.accuracy,
+        )
+        # An unplanned exception remains bounded to a physically confirmed,
+        # pinned home. Overlapping pins are deliberately returned separately so
+        # the worker selects the intended home instead of a nearest heuristic.
+        if geofence["status"] != "inside":
+            continue
+        nearby_residential.append(
+            {
+                "locationId": int(row["location_id"]),
+                "address": str(row["address"]),
+                "customerName": str(row.get("customer_name") or ""),
+                "locationType": "Residential",
+                "geofence": geofence,
+            }
+        )
+
+    append_access_log(
+        request,
+        "VISIT_CANDIDATES_LOADED",
+        True,
+        f"Employee {employee['name']} eligible visits {len(scheduled)}",
+    )
+    return {
+        "success": True,
+        "scheduledResidential": [
+            candidate
+            for candidate in scheduled
+            if candidate["locationType"] == "Residential"
+        ],
+        "scheduledCommercial": [
+            candidate
+            for candidate in scheduled
+            if candidate["locationType"] == "Commercial"
+        ],
+        "nearbyResidential": nearby_residential,
+    }
+
+
 @app.post("/api/timesheet/visit")
 def log_visit(
-    payload: ClockInRequest,
+    payload: VisitRequest,
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
@@ -10364,6 +11971,11 @@ def log_visit(
     enforce_clock_action_hours(request)
     has_gps = payload.latitude is not None and payload.longitude is not None
     now_utc = utc_now()
+    explicit_site, planned_visit, selected_geofence, explicit_error = (
+        _resolve_explicit_visit_site(payload, employee, now_utc)
+    )
+    if explicit_error:
+        raise HTTPException(status_code=400, detail=explicit_error)
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
         stale_open = get_stale_open_entry(
@@ -10375,23 +11987,27 @@ def log_visit(
         if not open_entry:
             return False, "Not currently clocked in"
 
-        override_error = require_gps_override(
-            timesheet_data,
-            payload.latitude,
-            payload.longitude,
-            payload.gpsOverrideReason,
-            payload.gpsOverrideDetail,
-        )
-        if override_error:
-            return False, override_error
+        if explicit_site is None:
+            override_error = require_gps_override(
+                timesheet_data,
+                payload.latitude,
+                payload.longitude,
+                payload.gpsOverrideReason,
+                payload.gpsOverrideDetail,
+            )
+            if override_error:
+                return False, override_error
 
-        if has_gps:
+        if explicit_site is not None:
+            location = str(explicit_site["address"])
+            customer = str(explicit_site.get("customer_name") or "")
+        elif has_gps:
             matched = find_nearest_location(payload.latitude, payload.longitude, timesheet_data)
             location = matched or str(payload.location or "").strip() or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+            customer = timesheet_data.get("location_customers", {}).get(location, "")
         else:
             location = str(payload.location or "").strip() or "Unknown"
-
-        customer = timesheet_data.get("location_customers", {}).get(location, "")
+            customer = timesheet_data.get("location_customers", {}).get(location, "")
 
         # Avoid duplicate: skip if location matches the most recent visit
         active_visit = get_active_visit(open_entry)
@@ -10408,23 +12024,93 @@ def log_visit(
             "gps": build_gps_point(
                 payload.latitude, payload.longitude, payload.accuracy
             ) if has_gps else None,
-            "gpsMeta": build_gps_meta(
-                timesheet_data,
-                payload.latitude,
-                payload.longitude,
-                payload.gpsOverrideReason,
-                payload.gpsOverrideDetail,
-                payload.accuracy,
+            "gpsMeta": (
+                _selected_site_gps_meta(
+                    explicit_site,
+                    selected_geofence or {},
+                    payload,
+                    planned_visit_id=(
+                        int(planned_visit["planned_visit_id"])
+                        if planned_visit is not None
+                        else None
+                    ),
+                )
+                if explicit_site is not None
+                else build_gps_meta(
+                    timesheet_data,
+                    payload.latitude,
+                    payload.longitude,
+                    payload.gpsOverrideReason,
+                    payload.gpsOverrideDetail,
+                    payload.accuracy,
+                )
             ),
             "sequenceVersion": 2,
             "siteCheckInId": None,
+            "jobId": (
+                int(planned_visit["job_id"])
+                if planned_visit is not None and planned_visit.get("job_id") is not None
+                else None
+            ),
         }
+        # The legacy manual-arrival writer still resolves its address through
+        # the existing address map.  Only an explicitly selected Site needs to
+        # bypass that map, which prevents a nearby duplicate address from
+        # changing the selected Site identity.
+        if explicit_site is not None:
+            visit["locationId"] = int(explicit_site["location_id"])
 
         if not isinstance(open_entry.get("visits"), list):
             open_entry["visits"] = []
         open_entry["visits"].append(visit)
 
         return True, {"visit": visit, "entryId": open_entry["id"]}
+
+    def record_explicit_visit_evidence(
+        cur: Any,
+        result: Any,
+        response: Dict[str, Any],
+    ) -> None:
+        if explicit_site is None or result.get("alreadyHere"):
+            return
+        visit = result.get("visit") if isinstance(result, dict) else None
+        shift_id = _plain_time_action_shift_id(result, response)
+        if not isinstance(visit, dict) or visit.get("id") is None or shift_id is None:
+            raise RuntimeError("Explicit Site arrival was not stored")
+        assert selected_geofence is not None
+        cur.execute(
+            """
+            INSERT INTO visit_evidence_events (
+                visit_id, shift_id, employee_id, location_id, planned_visit_id,
+                evidence_method, exception_reason, exception_detail,
+                geofence_status, distance_m, accuracy_m
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                int(visit["id"]),
+                int(shift_id),
+                int(employee["id"]),
+                int(explicit_site["location_id"]),
+                (
+                    int(planned_visit["planned_visit_id"])
+                    if planned_visit is not None
+                    else None
+                ),
+                payload.evidenceMethod,
+                payload.exceptionReason,
+                payload.exceptionDetail,
+                selected_geofence["status"],
+                selected_geofence.get("distanceM"),
+                selected_geofence.get("accuracyM"),
+            ),
+        )
+        row = _row_from_cursor(cur)
+        response["visitEvidence"] = {
+            "id": int(row["id"]) if row else None,
+            "method": payload.evidenceMethod,
+            "exceptionReason": payload.exceptionReason,
+        }
 
     ok, result = update_timesheets_for_plain_time_action(
         "arrive",
@@ -10436,6 +12122,7 @@ def log_visit(
             "alreadyHere": bool(result.get("alreadyHere")),
             **result,
         },
+        after_response_saved=record_explicit_visit_evidence,
     )
     if not ok:
         raise_timesheet_mutation_failure(result)
@@ -10532,6 +12219,8 @@ def depart_location(
                 payload.accuracy if payload else None,
             ),
         }
+        if active_visit.get("locationId") is not None:
+            departure["locationId"] = active_visit["locationId"]
         if payload and payload.latitude is not None and payload.longitude is not None:
             departure["gps"] = build_gps_point(
                 payload.latitude, payload.longitude, payload.accuracy
@@ -24623,6 +26312,67 @@ def _entry_shift_id(entry: Dict[str, Any]) -> Optional[int]:
     return shift_id if shift_id > 0 else None
 
 
+def _analytics_visit_end(
+    entry: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    visit_index: int,
+    clock_out: datetime,
+    *,
+    use_paired_departures: bool = False,
+) -> Optional[datetime]:
+    """Use Home Base departure evidence without changing legacy visit accounting.
+
+    Existing analytics intentionally attributes a normal visit through the next
+    arrival (or clock-out).  Only a shift with Home Base evidence has a proven
+    dispatch boundary: its explicit departure ends customer attribution before
+    the return-to-office interval.  Keeping that distinction here avoids
+    rewriting historical/non-Home-Base customer reports.
+    """
+    visit = visits[visit_index]
+    try:
+        arrival = parse_utc_iso(str(visit["arrivalTime"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if use_paired_departures and int(visit.get("sequenceVersion") or 1) >= 2:
+        visit_id = visit.get("id")
+        if visit_id is None:
+            return arrival
+        paired = []
+        for departure in entry.get("departures") or []:
+            if not isinstance(departure, dict):
+                continue
+            if departure.get("visitId") is None:
+                continue
+            try:
+                same_visit = int(departure["visitId"]) == int(visit_id)
+                departure_at = parse_utc_iso(str(departure["departureTime"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+            if same_visit and arrival <= departure_at <= clock_out:
+                paired.append(departure_at)
+        if paired:
+            return min(paired)
+    if visit_index + 1 < len(visits):
+        try:
+            return parse_utc_iso(str(visits[visit_index + 1]["arrivalTime"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+    return clock_out
+
+
+def _home_base_shift_ids(shift_ids: Iterable[int]) -> set[int]:
+    ids = sorted({int(shift_id) for shift_id in shift_ids if int(shift_id) > 0})
+    if not ids:
+        return set()
+    return {
+        int(row["shift_id"])
+        for row in db.query_all(
+            "SELECT DISTINCT shift_id FROM home_base_events WHERE shift_id = ANY(%s)",
+            (ids,),
+        )
+    }
+
+
 def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     now = utc_now()
     local_now = to_local(now)
@@ -24715,6 +26465,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     # only the fallback for shifts with no snapshot, so a rate edit moves future
     # shifts and leaves worked shifts alone.
     shift_rates = _load_shift_rate_snapshots(period_shift_ids)
+    home_base_period_shift_ids = _home_base_shift_ids(period_shift_ids)
 
     def _effective_rate(shift_id: Optional[int], emp_id: int) -> Optional[float]:
         if shift_id is not None:
@@ -24876,6 +26627,10 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         date_key = entry_date.strftime("%Y-%m-%d")
 
         visits = entry.get("visits") or []
+        if not visits and shift_id in home_base_period_shift_ids:
+            # A Home Base-only shift is paid dispatch overhead, not a customer
+            # with a made-up zero-revenue location label.
+            continue
         if visits:
             # Multi-stop: distribute hours across each visit segment
             try:
@@ -24887,13 +26642,16 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                     v_arrival = parse_utc_iso(str(visit["arrivalTime"]))
                 except (ValueError, KeyError):
                     continue
-                next_time = co_dt
-                if j + 1 < len(visits):
-                    try:
-                        next_time = parse_utc_iso(str(visits[j + 1]["arrivalTime"]))
-                    except (ValueError, KeyError):
-                        pass
-                visit_hours = max((next_time - v_arrival).total_seconds() / 3600, 0.0)
+                visit_end = _analytics_visit_end(
+                    entry,
+                    visits,
+                    j,
+                    co_dt,
+                    use_paired_departures=shift_id in home_base_period_shift_ids,
+                )
+                if visit_end is None:
+                    continue
+                visit_hours = max((visit_end - v_arrival).total_seconds() / 3600, 0.0)
                 v_loc = visit.get("location", "")
                 resolved_location, customer = _resolve_loc(v_loc)
                 _aggregate(
@@ -25343,6 +27101,7 @@ def admin_analytics_customer(
     # Per-shift snapshot wins; the employee map is only the fallback for shifts
     # with no snapshot. Both None still means "no rate" -> silent zero, as today.
     shift_rates = _load_shift_rate_snapshots(customer_shift_ids)
+    home_base_customer_shift_ids = _home_base_shift_ids(customer_shift_ids)
 
     def _calc_revenue(
         resolved_location: str,
@@ -25483,6 +27242,11 @@ def admin_analytics_customer(
         date_key = entry_date.strftime("%Y-%m-%d")
 
         visits = entry.get("visits") or []
+        if not visits and shift_id in home_base_customer_shift_ids:
+            # Keep the customer drilldown aligned with the aggregate analytics:
+            # an internal Home Base-only shift is never a synthetic customer
+            # visit, even if a caller addresses the endpoint with its label.
+            continue
         if visits:
             try:
                 co_dt = parse_utc_iso(str(entry["clockOut"]))
@@ -25493,13 +27257,16 @@ def admin_analytics_customer(
                     v_arrival = parse_utc_iso(str(visit["arrivalTime"]))
                 except (ValueError, KeyError):
                     continue
-                next_time = co_dt
-                if j + 1 < len(visits):
-                    try:
-                        next_time = parse_utc_iso(str(visits[j + 1]["arrivalTime"]))
-                    except (ValueError, KeyError):
-                        pass
-                v_hours = max((next_time - v_arrival).total_seconds() / 3600, 0.0)
+                visit_end = _analytics_visit_end(
+                    entry,
+                    visits,
+                    j,
+                    co_dt,
+                    use_paired_departures=shift_id in home_base_customer_shift_ids,
+                )
+                if visit_end is None:
+                    continue
+                v_hours = max((visit_end - v_arrival).total_seconds() / 3600, 0.0)
                 resolved_location, cust = _resolve_loc(visit.get("location", ""))
                 _record(
                     resolved_location,
