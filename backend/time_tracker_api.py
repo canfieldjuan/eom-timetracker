@@ -4128,9 +4128,8 @@ def _lock_customer_type_mirror(cur: Any, contact_id: str) -> None:
     Keyed on the contact, not the customer, because several customers can hold
     the same atlas_contact_id and a change to that contact rewrites all of
     them. Two requests naming different customers of one contact would
-    otherwise both pass their compare-and-set and then fan out over each
-    other, leaving one duplicate at each value for a contact that has a single
-    type in Atlas.
+    otherwise write and fan out over each other, leaving one duplicate at each
+    value for a contact that has a single type in Atlas.
 
     Taken AFTER the Atlas call, so no HTTP happens inside the critical
     section -- the lock covers the local read-modify-write only.
@@ -13127,23 +13126,16 @@ def admin_set_customer_type(
             {"customerType": f"must be one of {', '.join(CUSTOMER_TYPES)}"},
         )
 
-    # The whole call-and-mirror sequence is serialized on THIS customer's row.
-    # Without it two transitions race: A sets commercial, B sets residential and
-    # mirrors first, then A's delayed response overwrites the mirror with
-    # commercial while Atlas's actual value is residential -- a lost update that
-    # leaves the mirror silently disagreeing with its authority.
+    # Read, call Atlas with NO lock held, then take the per-contact lock for the
+    # local write only. This read is for the contact id and for reporting; it is
+    # not a snapshot the write is checked against.
     #
-    # NO lock is held across the Atlas call. An earlier revision took the row
-    # lock first, and that was wrong for a reason worth recording: an ordinary
-    # customer edit acquires the GLOBAL customer/site advisory lock before it
-    # waits on a row, so one blocked same-customer edit would hold the global
-    # lock while waiting and stall mutations for unrelated customers and sites.
-    # A per-row lock does not stay per-row once something else queues behind it
-    # holding a global one.
-    #
-    # Instead: read, call Atlas unlocked, then compare-and-set. The UPDATE
-    # applies only if the row still holds the value it was read at, so a
-    # concurrent transition makes this one fail loudly instead of clobbering it.
+    # No lock spans the Atlas call, and that is deliberate. An earlier revision
+    # took a row lock first: an ordinary customer edit acquires the GLOBAL
+    # customer/site advisory lock before it waits on a row, so one blocked
+    # same-customer edit would hold that global lock while waiting and stall
+    # mutations for unrelated customers and sites. A per-row lock does not stay
+    # per-row once something else queues behind it holding a global one.
     existing = db.query_one(
         "SELECT id, name, atlas_contact_id, customer_type FROM customers "
         "WHERE id = %s",
@@ -13243,35 +13235,12 @@ def _apply_customer_type_change(
             ),
         )
 
-    # Compare-and-set on the value this request read before calling Atlas.
-    # IS NOT DISTINCT FROM so a NULL reads as a value rather than never
-    # matching. If a concurrent transition moved the row while this one was
-    # waiting on Atlas, no row matches and the caller is told to retry rather
-    # than having its late answer overwrite the newer one.
-    # The link is part of the compare, not just the type. Atlas was asked about
-    # the contact this row held at read time, so if the row now points somewhere
-    # else the answer is about a different account and must not be mirrored.
-    #
-    # Not reachable today -- both writers of atlas_contact_id are guarded
-    # `WHERE atlas_contact_id IS NULL`, and this route already 409s on NULL, so
-    # the value cannot move once we have read it. It is in the predicate anyway
-    # because the alternative is a correctness argument that lives in two other
-    # functions: add one relink path without that guard and this silently
-    # mirrors the wrong contact's classification.
-    # updated_at is in the predicate because comparing VALUES cannot see an ABA
-    # transition. From unknown: this request sets Atlas commercial and stalls,
-    # another sets residential, a third sets unknown again -- a value-only
-    # compare matches `unknown` and writes the stale commercial. Every writer of
-    # customer_type sets updated_at = NOW(), so a moved row fails the compare
-    # even when it landed back on the same value. The cost is a spurious 409 if
-    # an unrelated field changed in the window, which is the safe direction.
-    #
-    # The compare-and-set and the duplicate fan-out are ONE transaction under a
+    # The target write and the duplicate fan-out are ONE transaction under a
     # per-contact lock. db.query_one/query_all each open and commit their own
     # transaction, so as separate statements two requests naming different
-    # customers of the SAME contact could both pass their compare-and-set and
-    # then fan out over each other, leaving one duplicate at each value for a
-    # contact that has a single type in Atlas.
+    # customers of the SAME contact could both write and then fan out over each
+    # other, leaving one duplicate at each value for a contact that has a
+    # single type in Atlas.
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_type_mirror(cur, str(contact_id))
@@ -13337,13 +13306,9 @@ def _apply_customer_type_change(
             # behind would have this route serve two different types for one
             # Atlas contact. Fan out, as the #2357 refresh already does.
             #
-            # Unguarded on purpose: the compare-and-set above established that
-            # this request won the race for this contact, and these rows are
-            # copies of the value it just confirmed rather than independent
-            # decisions.
-            # Siblings carry the same source timestamp: they mirror the same
-            # Atlas contact, so leaving their ordering token behind would make
-            # a later out-of-order answer for one of them look newer than it is.
+            # These rows are copies of the value this request just confirmed
+            # rather than independent decisions, and the per-contact lock above
+            # means no other change to this contact is in the same window.
             cur.execute(
                 "UPDATE customers SET customer_type = %s, updated_at = NOW() "
                 "WHERE atlas_contact_id = %s AND id <> %s "
