@@ -11781,10 +11781,12 @@ def _finalize_customer_atlas_reservation(
                 cur.execute(
                     """
                     UPDATE customers
-                    SET atlas_contact_id = %s, updated_at = NOW()
+                    SET atlas_contact_id = %s,
+                        customer_type = COALESCE(%s, customer_type),
+                        updated_at = NOW()
                     WHERE id = %s AND atlas_contact_id IS NULL
                     """,
-                    (atlas_contact_id, customer_id),
+                    (atlas_contact_id, customer_type, customer_id),
                 )
                 if cur.rowcount == 0:
                     # Someone linked this Customer while we were talking to

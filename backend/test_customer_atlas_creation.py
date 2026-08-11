@@ -1176,3 +1176,52 @@ def test_the_tracker_refuses_to_edit_the_type_but_tolerates_an_echo(client, auth
     assert detail["code"] == "customer_type_system_managed"
     assert detail["details"]["customerType"] == "commercial"
     assert _stored_type(name) == "commercial", "the refusal must not have written"
+
+
+def test_reconciling_an_existing_customer_mirrors_the_type_too(
+    client, auth, monkeypatch
+):
+    """The link_existing branch must mirror, not just link.
+
+    Reconciliation runs the same reservation flow as a create and receives the
+    same Atlas response, but it updates an existing row rather than inserting
+    one. Wiring only the insert leaves every legacy customer reconciled through
+    this supported path sitting at the migration default while Atlas has
+    already said what it is -- and the API then serves that wrong value.
+    """
+    name = _name("Reconcile Mirrors Type")
+    customer_id = _unlinked_customer(name)
+    _atlas_reporting(monkeypatch, {"customerType": "commercial"})
+
+    response = client.post(
+        f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth
+    )
+
+    assert response.status_code == 200, response.text
+    assert _stored_type(name) == "commercial"
+    assert response.json()["customer"]["customerType"] == "commercial"
+
+
+def test_reconciling_against_an_older_atlas_leaves_the_type_alone(
+    client, auth, monkeypatch
+):
+    """No reported type must not clobber a type already mirrored.
+
+    COALESCE, not assignment: an Atlas build that predates ATLAS #2354 reports
+    nothing, and overwriting a known classification with 'unknown' would make
+    reconciliation destructive.
+    """
+    name = _name("Reconcile Keeps Type")
+    customer_id = _unlinked_customer(name)
+    db.execute(
+        "UPDATE customers SET customer_type = 'residential' WHERE id = %s",
+        (customer_id,),
+    )
+    _atlas_reporting(monkeypatch, {})
+
+    response = client.post(
+        f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth
+    )
+
+    assert response.status_code == 200, response.text
+    assert _stored_type(name) == "residential"
