@@ -353,11 +353,15 @@ def test_local_failure_after_atlas_success_recovers_against_the_same_contact(
     real_insert = api._insert_customer
     failures = {"count": 0}
 
-    def _flaky_insert(cur, payload, *, atlas_contact_id=None):
+    def _flaky_insert(cur, payload, **kwargs):
+        # **kwargs on purpose: this fake stands in for the real signature, and
+        # pinning its keywords means a new one silently turns every call into a
+        # TypeError that the saga reports as a local failure -- the test would
+        # then fail for a reason unrelated to what it is checking.
         if failures["count"] == 0:
             failures["count"] += 1
             raise RuntimeError("local insert exploded")
-        return real_insert(cur, payload, atlas_contact_id=atlas_contact_id)
+        return real_insert(cur, payload, **kwargs)
 
     monkeypatch.setattr(api, "_insert_customer", _flaky_insert)
 
@@ -1050,3 +1054,125 @@ def test_key_reuse_on_a_pending_reservation_is_refused_under_rollback(
     assert reused.status_code == 409, reused.text
     assert reused.json()["code"] == "customer_atlas_retry_mismatch"
     assert _reservation_rows(_name("Pending Reuse Other")) == []
+
+
+def _atlas_reporting(monkeypatch, contact: dict) -> None:
+    """Point the Atlas operator stub at a specific contact payload."""
+    from conftest import _FakeAtlasResponse  # type: ignore[attr-defined]
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        assert str(url).endswith(api.ATLAS_OPERATOR_CONTACTS_PATH)
+        key = (headers or {}).get("Idempotency-Key", "")
+        return _FakeAtlasResponse(
+            201,
+            {
+                "success": True,
+                "contactId": fake_atlas_contact_id(key),
+                "operation": "contact_created",
+                "idempotent": False,
+                "contact": contact,
+            },
+        )
+
+    monkeypatch.setattr(api.requests, "post", _post)
+
+
+def _stored_type(name: str) -> str:
+    row = db.query_one(
+        "SELECT customer_type FROM customers WHERE name = %s", (name,)
+    )
+    return row["customer_type"]
+
+
+def test_the_mirror_records_the_type_atlas_reported(client, auth, monkeypatch):
+    """The whole point: the tracker can see what Atlas decided."""
+    name = f"{TEST_PREFIX} Mirror Commercial"
+    _atlas_reporting(monkeypatch, {"customerType": "commercial"})
+
+    response = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 201, response.text
+    assert _stored_type(name) == "commercial"
+    assert response.json()["customer"]["customerType"] == "commercial"
+
+
+def test_an_atlas_that_does_not_serve_the_field_yields_unknown(client, auth, monkeypatch):
+    """Today's production reality, and it must not break a customer create.
+
+    Atlas deploys by hand and lags this tracker. A build predating ATLAS #2354
+    simply omits customerType; recording 'unknown' is true, whereas failing the
+    create would take the CRM down over a field the mirror does not need.
+    """
+    name = f"{TEST_PREFIX} Mirror Absent"
+    _atlas_reporting(monkeypatch, {})
+
+    response = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 201, response.text
+    assert _stored_type(name) == "unknown"
+
+
+def test_a_value_atlas_would_refuse_is_not_mirrored(client, auth, monkeypatch):
+    """The mirror must never hold a classification the source of truth rejects."""
+    name = f"{TEST_PREFIX} Mirror Bogus"
+    _atlas_reporting(monkeypatch, {"customerType": "platinum"})
+
+    response = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 201, response.text
+    assert _stored_type(name) == "unknown"
+
+
+def test_the_tracker_refuses_to_edit_the_type_but_tolerates_an_echo(client, auth, monkeypatch):
+    """System-managed, exactly like the Atlas contact link.
+
+    An echo has to stay a no-op because the deployed portal round-trips the
+    whole record on every edit. A real change is refused loudly rather than
+    dropped: a silent discard would read as a successful edit that did nothing,
+    and billing shape follows from this value.
+    """
+    name = f"{TEST_PREFIX} Mirror Locked"
+    _atlas_reporting(monkeypatch, {"customerType": "commercial"})
+    created = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    ).json()["customer"]
+
+    echo = client.patch(
+        f"/api/admin/customers/{created['id']}",
+        headers=auth,
+        json={
+            "customerType": "commercial",
+            "expectedUpdateToken": created["updateToken"],
+        },
+    )
+    assert echo.status_code == 200, echo.text
+
+    refreshed = client.get(f"/api/admin/customers/{created['id']}", headers=auth).json()
+    changed = client.patch(
+        f"/api/admin/customers/{created['id']}",
+        headers=auth,
+        json={
+            "customerType": "residential",
+            "expectedUpdateToken": refreshed["customer"]["updateToken"],
+        },
+    )
+    assert changed.status_code == 409, changed.text
+    body = changed.json()
+    detail = body.get("detail", body)
+    assert detail["code"] == "customer_type_system_managed"
+    assert detail["details"]["customerType"] == "commercial"
+    assert _stored_type(name) == "commercial", "the refusal must not have written"

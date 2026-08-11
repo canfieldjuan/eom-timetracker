@@ -2372,6 +2372,12 @@ class CustomerUpdateRequest(BaseModel):
     billingEmail: Optional[str] = Field(default=None, max_length=CUSTOMER_EMAIL_MAX_LENGTH)
     billingAddress: Optional[str] = Field(default=None, max_length=SITE_ADDRESS_MAX_LENGTH)
     atlasContactId: Optional[UUID] = None
+    # Accepted so a portal that round-trips the whole record is not rejected by
+    # the model, then refused in the handler if it actually differs from the
+    # mirrored value. Declaring it is what makes that refusal reachable: with
+    # the field absent the request would 422 on an unknown key and the operator
+    # would see a validation error instead of the reason.
+    customerType: Optional[str] = Field(default=None, max_length=16)
 
     @field_validator("name", mode="before")
     @classmethod
@@ -4703,6 +4709,35 @@ def _ensure_schema_migrations() -> None:
     # revision would lack the column. Additive and idempotent.
     db.execute(
         "ALTER TABLE customers ADD COLUMN IF NOT EXISTS atlas_contact_id UUID"
+    )
+    # Read-mirror of the Atlas account type (ATLAS #2354). Atlas is the write
+    # authority; this copy exists so the portal, which reads customers from
+    # here rather than from Atlas, can render the type and adapt billing to it
+    # without a per-row round trip.
+    #
+    # 'unknown' rather than NULL for the same reason Atlas uses it: a customer
+    # whose type has not been established is a distinct state, and every row
+    # that predates this column genuinely is in it. The CHECK keeps the mirror
+    # from holding a value Atlas itself would refuse.
+    db.execute(
+        "ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_type "
+        "VARCHAR(16) NOT NULL DEFAULT 'unknown'"
+    )
+    db.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'chk_customers_customer_type'
+                  AND conrelid = 'customers'::regclass
+            ) THEN
+                ALTER TABLE customers
+                    ADD CONSTRAINT chk_customers_customer_type
+                    CHECK (customer_type IN ('residential', 'commercial', 'unknown'));
+            END IF;
+        END $$;
+        """
     )
     db.execute("""
         CREATE TABLE IF NOT EXISTS atlas_linkage_backfill_batches (
@@ -10701,6 +10736,7 @@ def timesheet_locations(
 CUSTOMER_SELECT_COLUMNS = """
     c.id, c.name, c.primary_contact_name, c.primary_phone, c.primary_email,
     c.billing_name, c.billing_email, c.billing_address, c.atlas_contact_id,
+    c.customer_type,
     c.active, c.created_at, c.updated_at, c.archived_at, c.archived_by
 """
 
@@ -10917,6 +10953,10 @@ def _serialize_customer(row: Dict[str, Any], sites: List[Dict[str, Any]]) -> Dic
             if row.get("atlas_contact_id") is not None
             else None
         ),
+        # Mirrored from Atlas, read-only here. Serialized so the portal can
+        # render the type and adapt billing to it without a per-row round trip
+        # to Atlas; PATCHing it back is refused as system-managed.
+        "customerType": str(row.get("customer_type") or "unknown"),
         "active": bool(row.get("active")),
         "status": _customer_status(row, sites),
         "siteCount": len(sites),
@@ -11054,6 +11094,7 @@ def _insert_customer(
     payload: CustomerCreateRequest,
     *,
     atlas_contact_id: Optional[str] = None,
+    customer_type: Optional[str] = None,
 ) -> int:
     """Insert one Customer.
 
@@ -11061,6 +11102,13 @@ def _insert_customer(
     the canonical contact id from Atlas rather than from the request body. The
     payload field remains the source for the office estimate-approval path,
     where the contact already exists in Atlas before the Customer does.
+
+    `customer_type` is likewise a keyword and never read from the payload:
+    Atlas owns it, this row only mirrors what Atlas reported. A caller with an
+    opinion about the type has to change it in Atlas. None means Atlas did not
+    report one -- an older Atlas that does not serve the field yet, or a create
+    that did not specify it -- and the column default records that honestly as
+    'unknown' rather than inventing a classification.
     """
     linked_contact_id = atlas_contact_id
     if linked_contact_id is None and payload.atlasContactId is not None:
@@ -11069,9 +11117,10 @@ def _insert_customer(
         """
         INSERT INTO customers (
             name, primary_contact_name, primary_phone, primary_email,
-            billing_name, billing_email, billing_address, atlas_contact_id
+            billing_name, billing_email, billing_address, atlas_contact_id,
+            customer_type
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 'unknown'))
         RETURNING id
         """,
         (
@@ -11083,6 +11132,7 @@ def _insert_customer(
             payload.billingEmail,
             payload.billingAddress,
             linked_contact_id,
+            customer_type,
         ),
     )
     return int(cur.fetchone()["id"])
@@ -11693,6 +11743,7 @@ def _finalize_customer_atlas_reservation(
     reservation_id: str,
     atlas_contact_id: str,
     payload: CustomerCreateRequest,
+    customer_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Write the local half once Atlas has confirmed the canonical contact.
 
@@ -11756,7 +11807,10 @@ def _finalize_customer_atlas_reservation(
                         )
             else:
                 customer_id = _insert_customer(
-                    cur, payload, atlas_contact_id=atlas_contact_id
+                    cur,
+                    payload,
+                    atlas_contact_id=atlas_contact_id,
+                    customer_type=customer_type,
                 )
                 if payload.primarySite is not None:
                     _insert_site(
@@ -11797,6 +11851,33 @@ def _note_customer_atlas_error(reservation_id: str, reason: str) -> bool:
     except Exception:
         logger.exception("Could not save customer Atlas reservation error")
         return False
+
+
+# Mirrors ATLAS EOM_CUSTOMER_TYPES and both chk_*_customer_type constraints.
+# Atlas owns the value; this tuple only decides what the mirror will accept
+# back, so a value outside it is dropped rather than stored.
+CUSTOMER_TYPES = ("residential", "commercial", "unknown")
+
+def _customer_type_from_operator_result(result: Dict[str, Any]) -> Optional[str]:
+    """Read the account type Atlas reported, or None when it reported none.
+
+    Absence is not an error. Atlas deploys by hand and routinely lags this
+    tracker, so a build that predates ATLAS #2354 simply omits the field --
+    mirroring None then records 'unknown', which is true, instead of failing a
+    customer create over a field the mirror does not need to function.
+
+    A value Atlas would not itself accept is dropped rather than stored: the
+    mirror must never hold a classification the source of truth would refuse,
+    and the tracker has no business inventing one.
+    """
+    contact = result.get("contact")
+    if not isinstance(contact, dict):
+        return None
+    reported = contact.get("customerType")
+    if not isinstance(reported, str):
+        return None
+    normalized = reported.strip().lower()
+    return normalized if normalized in CUSTOMER_TYPES else None
 
 
 def _atlas_contact_id_from_operator_result(result: Dict[str, Any]) -> str:
@@ -11852,7 +11933,10 @@ def _run_customer_atlas_reservation(
     try:
         return (
             _finalize_customer_atlas_reservation(
-                str(reservation["id"]), atlas_contact_id, payload
+                str(reservation["id"]),
+                atlas_contact_id,
+                payload,
+                _customer_type_from_operator_result(atlas_result),
             ),
             None,
         )
@@ -12913,6 +12997,28 @@ def admin_patch_customer(
                         {
                             "customerId": customer_id,
                             "atlasContactId": stored_text,
+                        },
+                    )
+            if "customerType" in present:
+                # Same rule as the Atlas link above, and for the same reason:
+                # this column is a mirror of Atlas, which is the sole write
+                # authority for it. Echoing the stored value stays a no-op so a
+                # portal that round-trips the whole record keeps working;
+                # CHANGING it here is refused loudly, because a tracker-side
+                # edit would either be silently discarded on the next mirror
+                # refresh or, worse, drive billing from a value Atlas never
+                # agreed to.
+                submitted = values["customerType"]
+                submitted_text = str(submitted).strip().lower() if submitted else None
+                stored_text = str(existing.get("customer_type") or "unknown")
+                if submitted_text != stored_text:
+                    _raise_conflict(
+                        "customer_type_system_managed",
+                        "The customer type is managed by Atlas and cannot be "
+                        "edited here",
+                        {
+                            "customerId": customer_id,
+                            "customerType": stored_text,
                         },
                     )
             assignments: List[str] = []
