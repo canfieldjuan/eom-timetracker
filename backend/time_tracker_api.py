@@ -2726,6 +2726,14 @@ class AtlasLinkageBackfillApplyRequest(AtlasLinkageBackfillPlanRequest):
 class CustomerTypeRefreshPlanRequest(BaseModel):
     reason: str = Field(min_length=10, max_length=500)
 
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: Any) -> Any:
+        # Strip BEFORE length validation. The apply path strips before
+        # persisting, so validating the raw string would let ten spaces satisfy
+        # min_length and store an empty justification in the durable record.
+        return value.strip() if isinstance(value, str) else value
+
 
 class CustomerTypeRefreshApplyRequest(CustomerTypeRefreshPlanRequest):
     planToken: str = Field(min_length=64, max_length=64)
@@ -15148,14 +15156,36 @@ def _fetch_known_contacts(
             )
         for value in known_ids:
             known.add(str(value))
-        # Absent, non-dict, or non-string entries are dropped rather than
-        # defaulted. A missing type is a fact about Atlas's build, not a
-        # classification, and inventing one here would silently overwrite the
-        # mirror with a value Atlas never sent.
-        reported = body.get("customerTypes")
-        if isinstance(reported, dict):
+        # Absent and malformed are DIFFERENT answers and must not collapse.
+        #
+        # Absent is the supported version-skew case: an Atlas older than
+        # ATLAS #2357 does not report the field, and the refresh must treat
+        # that as "no information" and leave the mirror alone.
+        #
+        # Present-but-malformed is an upstream schema error. Dropping it
+        # silently would look identical to version skew, so a broken Atlas
+        # build would yield a confident partial refresh -- some batches
+        # applied, the malformed ones quietly skipped -- with nothing
+        # recording which. Degrade the whole read instead.
+        if "customerTypes" in body:
+            reported = body.get("customerTypes")
+            if not isinstance(reported, dict) or any(
+                not isinstance(value, str) for value in reported.values()
+            ):
+                return (
+                    set(),
+                    {},
+                    {
+                        "status": "unavailable",
+                        "checked": 0,
+                        "error": (
+                            "Atlas known-contacts response reported a malformed "
+                            "customerTypes map"
+                        ),
+                    },
+                )
             for key, value in reported.items():
-                if isinstance(value, str) and str(key) in known:
+                if str(key) in known:
                     types[str(key)] = value
 
     return known, types, {"status": "ok", "checked": len(distinct_ids), "error": None}
@@ -15577,22 +15607,10 @@ def _build_customer_type_refresh_plan(
     Atlas is the write authority; the tracker never originates a type. This
     only copies, and only when Atlas actually stated a value.
     """
-    sql = (
-        "SELECT id, name, atlas_contact_id, customer_type FROM customers "
-        "WHERE atlas_contact_id IS NOT NULL ORDER BY id"
+    linked_rows = _read_linked_customers(cursor=cursor, lock_rows=lock_rows)
+    known, types, status = _fetch_known_contacts(
+        admin, _distinct_contact_ids(linked_rows)
     )
-    if cursor is not None:
-        cursor.execute(sql + (" FOR UPDATE" if lock_rows else ""))
-        linked_rows = cursor.fetchall()
-    else:
-        linked_rows = db.query_all(sql)
-
-    by_contact: Dict[str, List[Dict[str, Any]]] = {}
-    for row in linked_rows:
-        by_contact.setdefault(str(row["atlas_contact_id"]), []).append(row)
-    distinct_ids = list(by_contact)
-
-    known, types, status = _fetch_known_contacts(admin, distinct_ids)
     if status["status"] != "ok":
         # Refuse the whole plan rather than refreshing the subset we happened to
         # reach: a partial refresh is indistinguishable from a complete one once
@@ -15604,6 +15622,46 @@ def _build_customer_type_refresh_plan(
                 f"{status['status']} ({status['error']})"
             ),
         )
+    return _compute_customer_type_refresh_plan(linked_rows, known, types)
+
+
+def _read_linked_customers(
+    *,
+    cursor: Any = None,
+    lock_rows: bool = False,
+) -> List[Dict[str, Any]]:
+    sql = (
+        "SELECT id, name, atlas_contact_id, customer_type FROM customers "
+        "WHERE atlas_contact_id IS NOT NULL ORDER BY id"
+    )
+    if cursor is not None:
+        cursor.execute(sql + (" FOR UPDATE" if lock_rows else ""))
+        return list(cursor.fetchall())
+    return db.query_all(sql)
+
+
+def _distinct_contact_ids(linked_rows: List[Dict[str, Any]]) -> List[str]:
+    seen: Dict[str, None] = {}
+    for row in linked_rows:
+        seen.setdefault(str(row["atlas_contact_id"]), None)
+    return list(seen)
+
+
+def _compute_customer_type_refresh_plan(
+    linked_rows: List[Dict[str, Any]],
+    known: set,
+    types: Dict[str, str],
+) -> Dict[str, Any]:
+    """Derive the plan from already-fetched evidence. Pure: no I/O, no lock.
+
+    Split out so the apply path can do its Atlas reads BEFORE taking the global
+    customer/site mutation lock. Holding that lock across one HTTP call per 100
+    contact ids would stall every ordinary customer edit for the duration.
+    """
+    by_contact: Dict[str, List[Dict[str, Any]]] = {}
+    for row in linked_rows:
+        by_contact.setdefault(str(row["atlas_contact_id"]), []).append(row)
+    distinct_ids = list(by_contact)
 
     changes = []
     skipped_dangling = 0
@@ -15829,16 +15887,52 @@ def admin_apply_customer_type_refresh(
     request: Request,
     current_admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
+    # Atlas I/O happens BEFORE the global customer/site mutation lock is taken.
+    # Rebuilding under the lock would hold it across one HTTP request per 100
+    # contact ids -- each able to burn the full 10s timeout -- while every
+    # ordinary customer edit queues behind it.
+    unlocked_rows = _read_linked_customers()
+    asked_ids = _distinct_contact_ids(unlocked_rows)
+    known, types, status = _fetch_known_contacts(current_admin, asked_ids)
+    if status["status"] != "ok":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Cannot refresh customer types: Atlas link verification is "
+                f"{status['status']} ({status['error']})"
+            ),
+        )
+
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_site_mutations(cur)
-            # Rebuild under lock and re-ask Atlas: the token must match a plan
-            # derived from the state being written, not the one the operator
-            # previewed, or a type that changed in between would be applied
-            # from stale evidence.
-            plan = _build_customer_type_refresh_plan(
-                current_admin, cursor=cur, lock_rows=True
-            )
+            # Re-read under the lock and recompute from it, so the token is
+            # still checked against the state actually being written rather
+            # than the one the operator previewed.
+            locked_rows = _read_linked_customers(cursor=cur, lock_rows=True)
+            unasked = set(_distinct_contact_ids(locked_rows)) - set(asked_ids)
+            if unasked:
+                # A customer was linked to a contact we never asked Atlas about,
+                # so this plan cannot speak for the current row set. Refuse
+                # rather than apply a verdict built from incomplete evidence.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Linked customers changed while planning; preview again"
+                    ),
+                )
+            plan = _compute_customer_type_refresh_plan(locked_rows, known, types)
+            if not plan["changes"]:
+                # Nothing to do. Returning early also avoids writing a batch row
+                # whose plan_token -- derived from an empty change list and the
+                # linked count -- would collide with the previous no-op apply on
+                # the UNIQUE constraint and surface as a raw database error.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "No customer types need refreshing; nothing was applied"
+                    ),
+                )
             if not hmac.compare_digest(payload.planToken, plan["planToken"]):
                 raise HTTPException(
                     status_code=409,

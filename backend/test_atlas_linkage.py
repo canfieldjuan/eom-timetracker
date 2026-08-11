@@ -48,6 +48,10 @@ def _clean_test_rows() -> None:
         "DELETE FROM atlas_linkage_backfill_batches WHERE snapshot::text LIKE %s",
         (f"%{TEST_PREFIX}%",),
     )
+    db.execute(
+        "DELETE FROM customer_type_refresh_batches WHERE snapshot::text LIKE %s",
+        (f"%{TEST_PREFIX}%",),
+    )
     db.execute("DELETE FROM customers WHERE name LIKE %s", (f"{TEST_PREFIX}%",))
 
 
@@ -988,3 +992,180 @@ def test_the_audit_never_writes_while_the_refresh_does(client, auth, monkeypatch
     assert audit.status_code == 200, audit.text
     assert audit.json()["databaseReadOnly"] is True
     assert _get_type(customer) == "unknown", "the audit must not refresh the mirror"
+
+
+# -- review round 1 findings (ATLAS #2357) --------------------------------------
+
+
+def test_applying_an_empty_plan_is_refused_not_collided(client, auth, monkeypatch):
+    """A no-op refresh must not write a batch row.
+
+    The token is derived from the change list and the linked count, so every
+    no-op plan at a given count hashes identically. Writing one would take the
+    UNIQUE plan_token, and the NEXT no-op apply would surface a raw integrity
+    error. An empty plan is also the expected state until ATLAS #2358 deploys,
+    so this is the first thing an operator would hit.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Nothing To Do", contact)
+    _set_type(customer, "commercial")
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    assert body["summary"]["customersToUpdate"] == 0
+
+    payload = {
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    }
+    first = client.post(TYPE_APPLY_PATH, headers=auth, json=payload)
+    assert first.status_code == 409, first.text
+    # The second attempt must behave identically, not hit a UNIQUE violation.
+    second = client.post(TYPE_APPLY_PATH, headers=auth, json=payload)
+    assert second.status_code == 409, second.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS n FROM customer_type_refresh_batches "
+        "WHERE snapshot::text LIKE %s",
+        (f"%{TEST_PREFIX}%",),
+    )["n"] == 0
+
+
+def test_a_whitespace_only_reason_is_rejected(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    _create_customer("Blank Reason", contact)
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": " " * 20})
+    assert resp.status_code == 422, resp.text
+
+
+def test_a_malformed_type_map_is_refused_not_read_as_version_skew(
+    client, auth, monkeypatch
+):
+    """Present-but-broken is not the same answer as absent.
+
+    Silently dropping a malformed map would look exactly like an Atlas that
+    predates #2357, so a broken upstream build would produce a confident
+    partial refresh with nothing recording which contacts were skipped.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Malformed Map", contact)
+    _set_type(customer, "commercial")
+
+    def _bad_container(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {
+                "knownContactIds": submitted,
+                "checked": len(submitted),
+                "limit": 100,
+                "customerTypes": ["not", "a", "map"],
+            })
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _bad_container)
+    assert client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).status_code == 503
+
+    def _bad_entry(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {
+                "knownContactIds": submitted,
+                "checked": len(submitted),
+                "limit": 100,
+                "customerTypes": {submitted[0]: 17} if submitted else {},
+            })
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _bad_entry)
+    assert client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).status_code == 503
+    assert _get_type(customer) == "commercial"
+
+
+def test_the_audit_still_degrades_on_a_malformed_type_map(client, auth, monkeypatch):
+    """The shared fetch is used by the audit too; it must not report clean."""
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    _create_customer("Audit Malformed", contact)
+
+    def _bad(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            return _Resp(200, {
+                "knownContactIds": submitted,
+                "checked": len(submitted),
+                "limit": 100,
+                "customerTypes": "nonsense",
+            })
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _bad)
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    assert body["atlasLinkVerification"]["status"] == "unavailable"
+    assert body["danglingLinks"] == []
+
+
+def test_apply_does_not_hold_the_mutation_lock_during_atlas_io(
+    client, auth, monkeypatch
+):
+    """Atlas must be read before the global customer/site lock is taken.
+
+    Asserted by observing order: the advisory lock call must not have happened
+    when the Atlas request is issued.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Lock Order", contact)
+    _set_type(customer, "unknown")
+
+    events = []
+    real_lock = api._lock_customer_site_mutations
+
+    def _watched_lock(cur):
+        events.append("lock")
+        return real_lock(cur)
+
+    inner = _atlas_types({contact: "commercial"})
+
+    def _watched_get(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            events.append("atlas")
+        return inner(url, headers=headers, params=params, timeout=timeout)
+
+    monkeypatch.setattr(api, "_lock_customer_site_mutations", _watched_lock)
+    monkeypatch.setattr(api.requests, "get", _watched_get)
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    events.clear()
+    applied = client.post(TYPE_APPLY_PATH, headers=auth, json={
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    })
+    assert applied.status_code == 200, applied.text
+    assert "atlas" in events and "lock" in events
+    # Assert on what actually matters: NO Atlas request may be issued once the
+    # lock is held. Comparing first-occurrence indices instead would pass even
+    # when a second fetch runs inside the critical section -- which is exactly
+    # the regression this guards against.
+    after_lock = events[events.index("lock"):]
+    assert "atlas" not in after_lock, (
+        f"no Atlas I/O may happen while the mutation lock is held, got {events}"
+    )
+    assert _get_type(customer) == "commercial"
