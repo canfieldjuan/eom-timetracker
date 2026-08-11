@@ -13092,7 +13092,7 @@ def admin_set_customer_type(
     payload: CustomerTypeChangeRequest,
     request: Request,
     admin: Dict[str, Any] = Depends(get_current_admin),
-) -> Dict[str, Any]:
+) -> Any:
     """Change a customer's type by asking Atlas, then mirroring what it says.
 
     admin_patch_customer refuses customer_type as system-managed, and keeps
@@ -13113,31 +13113,34 @@ def admin_set_customer_type(
     # commercial while Atlas's actual value is residential -- a lost update that
     # leaves the mirror silently disagreeing with its authority.
     #
-    # This does hold a row lock across the Atlas HTTP call, which #163 round 4
-    # rightly objected to for the GLOBAL customer/site lock. The granularity is
-    # what makes it acceptable here: it blocks only concurrent type changes to
-    # the same customer, which is exactly the set that must be serialized.
-    # Edits to every other customer are unaffected.
-    with db.get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            return _apply_customer_type_change(
-                cur, customer_id, requested, request, admin
-            )
+    # NO lock is held across the Atlas call. An earlier revision took the row
+    # lock first, and that was wrong for a reason worth recording: an ordinary
+    # customer edit acquires the GLOBAL customer/site advisory lock before it
+    # waits on a row, so one blocked same-customer edit would hold the global
+    # lock while waiting and stall mutations for unrelated customers and sites.
+    # A per-row lock does not stay per-row once something else queues behind it
+    # holding a global one.
+    #
+    # Instead: read, call Atlas unlocked, then compare-and-set. The UPDATE
+    # applies only if the row still holds the value it was read at, so a
+    # concurrent transition makes this one fail loudly instead of clobbering it.
+    existing = db.query_one(
+        "SELECT id, name, atlas_contact_id, customer_type FROM customers "
+        "WHERE id = %s",
+        (customer_id,),
+    )
+    return _apply_customer_type_change(
+        existing, customer_id, requested, request, admin
+    )
 
 
 def _apply_customer_type_change(
-    cur: Any,
+    existing: Optional[Dict[str, Any]],
     customer_id: int,
     requested: str,
     request: Request,
     admin: Dict[str, Any],
 ) -> Dict[str, Any]:
-    cur.execute(
-        "SELECT id, name, atlas_contact_id, customer_type FROM customers "
-        "WHERE id = %s FOR UPDATE",
-        (customer_id,),
-    )
-    existing = cur.fetchone()
     if existing is None:
         raise HTTPException(status_code=404, detail="Customer not found")
     contact_id = existing["atlas_contact_id"]
@@ -13152,6 +13155,21 @@ def _apply_customer_type_change(
                 "type cannot be set. Link it first."
             ),
         )
+
+    # Refuse before touching Atlas when Atlas AFFIRMS it cannot serve this
+    # mutation, exactly as the customer-create and linkage paths do. An
+    # unreadable manifest is an outage rather than a refusal and falls through,
+    # which is the helper's documented distinction.
+    refusal = _customer_atlas_capability_refusal(admin)
+    if refusal is not None:
+        append_access_log(
+            request,
+            "CUSTOMER_TYPE_CAPABILITY_UNAVAILABLE",
+            False,
+            f"customer={customer_id} "
+            f"capability={ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION}",
+        )
+        return refusal
 
     # A fresh key per request rather than a hash of the intent. A content-derived
     # key would collide across a repeated transition -- residential, back to
@@ -13205,13 +13223,26 @@ def _apply_customer_type_change(
             ),
         )
 
-    # cur, NOT db.execute: this row is held FOR UPDATE by the surrounding
-    # transaction, so a second pooled connection would block on the lock this
-    # very request is holding and deadlock until timeout.
-    cur.execute(
-        "UPDATE customers SET customer_type = %s, updated_at = NOW() WHERE id = %s",
-        (confirmed, customer_id),
+    # Compare-and-set on the value this request read before calling Atlas.
+    # IS NOT DISTINCT FROM so a NULL reads as a value rather than never
+    # matching. If a concurrent transition moved the row while this one was
+    # waiting on Atlas, no row matches and the caller is told to retry rather
+    # than having its late answer overwrite the newer one.
+    updated = db.query_one(
+        "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+        "WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s "
+        "RETURNING id",
+        (confirmed, customer_id, existing["customer_type"]),
     )
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Customer's type changed while the request was in flight; "
+                "Atlas was updated but the local record was not. Re-check it "
+                "and try again."
+            ),
+        )
     append_access_log(
         request,
         "CUSTOMER_TYPE_CHANGED",

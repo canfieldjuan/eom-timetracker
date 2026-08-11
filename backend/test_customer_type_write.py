@@ -356,52 +356,74 @@ def test_the_write_completes_under_the_row_lock(client, auth, monkeypatch):
     assert _type_of(customer) == "commercial"
 
 
-def test_concurrent_transitions_are_serialized_per_customer(client, auth, monkeypatch):
-    """Two transitions on one customer must not interleave call-and-mirror.
+def test_a_late_response_cannot_clobber_a_newer_transition(client, auth, monkeypatch):
+    """The lost update, prevented WITHOUT holding a lock across the Atlas call.
 
-    Without serialization: A asks for commercial, B asks for residential and
-    mirrors first, then A's delayed response overwrites with commercial while
-    Atlas's actual value is residential -- a lost update.
+    A reads the row, calls Atlas, and while it is waiting B completes a
+    different transition. A must not then write its stale answer over B's.
+    Compare-and-set on the value A read makes A fail loudly instead.
 
-    The second request is issued from inside the first one's Atlas call, so it
-    can only proceed if the row lock is NOT held across the sequence.
+    An earlier revision took the row lock before calling Atlas. That was worse
+    than the bug: an ordinary customer edit takes the GLOBAL advisory lock
+    before waiting on a row, so one blocked same-customer edit would hold the
+    global lock and stall unrelated customers and sites.
     """
-    import threading
-
     contact = str(uuid.uuid4())
     customer = _customer("Racing", contact, "unknown")
-    observed = {}
+    interfered = {"done": False}
 
     def _post(url, *, headers=None, json=None, timeout=None):
         want = (json or {})["customer_type"]
-        if want == "commercial" and "second" not in observed:
-            observed["second"] = "started"
-
-            def _competing():
-                # A second client while the first still holds the lock.
-                try:
-                    observed["second_status"] = client.patch(
-                        _path(customer), headers=auth,
-                        json={"customerType": "residential"},
-                    ).status_code
-                except Exception as exc:  # pragma: no cover - diagnostic
-                    observed["second_status"] = repr(exc)
-
-            thread = threading.Thread(target=_competing)
-            thread.start()
-            thread.join(timeout=3)
-            observed["still_running"] = thread.is_alive()
+        if want == "commercial" and not interfered["done"]:
+            interfered["done"] = True
+            # B lands while A is still waiting on Atlas. Written directly so the
+            # test exercises A's staleness check rather than a second HTTP call.
+            db.execute(
+                "UPDATE customers SET customer_type = %s WHERE id = %s",
+                ("residential", customer),
+            )
         return _atlas_echoing(want)(url, headers=headers, json=json, timeout=timeout)
 
     monkeypatch.setattr(api.requests, "post", _post)
     resp = client.patch(_path(customer), headers=auth,
                         json={"customerType": "commercial"})
-    assert resp.status_code == 200, resp.text
-    # The competing writer was blocked while the first held the row: either it
-    # was still waiting when we gave up on it, or it completed only afterwards.
-    assert observed.get("still_running") is True, (
-        "a concurrent transition on the same customer was not serialized; "
-        f"observed={observed}"
+    assert interfered["done"], "the test must actually interleave a change"
+    assert resp.status_code == 409, resp.text
+    assert _type_of(customer) == "residential", (
+        "the newer transition must survive; a late answer must not clobber it"
     )
-    # Final state is whatever Atlas last confirmed for the winner.
-    assert _type_of(customer) in {"commercial", "residential"}
+
+
+def test_a_rolled_back_atlas_is_refused_before_the_mutation(
+    client, auth, monkeypatch
+):
+    """An Atlas that AFFIRMS it lacks the capability is a definite no.
+
+    Both the customer-create and linkage paths gate on this; skipping it here
+    would let a partially-deployed or rolled-back Atlas take an operator
+    mutation it cannot serve. An UNREADABLE manifest is an outage rather than a
+    refusal and must still fall through -- covered by the tests above, which
+    use the default stub.
+    """
+    from conftest import ATLAS_FULL_CAPABILITIES
+
+    contact = str(uuid.uuid4())
+    customer = _customer("No Capability", contact, "unknown")
+    reduced = [
+        value for value in ATLAS_FULL_CAPABILITIES
+        if value != "contact.operator_mutation"
+    ]
+    monkeypatch.setattr(
+        api.requests, "get",
+        lambda url, **_: _Response(200, {"leads": [], "capabilities": reduced}),
+    )
+    calls = []
+    monkeypatch.setattr(api.requests, "post", _atlas_echoing("commercial", calls=calls))
+
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 501, resp.text
+    assert resp.json()["error"] == "atlas_capability_unavailable"
+    assert resp.json()["capability"] == "contact.operator_mutation"
+    assert calls == [], "no mutation may be attempted once Atlas has refused"
+    assert _type_of(customer) == "unknown"
