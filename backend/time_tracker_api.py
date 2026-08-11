@@ -2723,6 +2723,10 @@ class AtlasLinkageBackfillApplyRequest(AtlasLinkageBackfillPlanRequest):
     confirmation: str = Field(min_length=1, max_length=100)
 
 
+class CustomerTypeChangeRequest(BaseModel):
+    customerType: str = Field(min_length=1, max_length=32)
+
+
 class CustomerTypeRefreshPlanRequest(BaseModel):
     reason: str = Field(min_length=10, max_length=500)
 
@@ -4107,6 +4111,7 @@ def normalize_site_address(address: str) -> str:
 
 CUSTOMER_SITE_MUTATION_LOCK = "eom_customer_site_mutations_v1"
 FUNNEL_LEAD_TRANSITION_LOCK = "eom_funnel_lead_transition_v1"
+CUSTOMER_TYPE_MIRROR_LOCK = "eom_customer_type_mirror_v1"
 
 
 def _lock_customer_site_mutations(cur: Any) -> None:
@@ -4114,6 +4119,24 @@ def _lock_customer_site_mutations(cur: Any) -> None:
     cur.execute(
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
         (CUSTOMER_SITE_MUTATION_LOCK,),
+    )
+
+
+def _lock_customer_type_mirror(cur: Any, contact_id: str) -> None:
+    """Serialize mirror writes for ONE Atlas contact.
+
+    Keyed on the contact, not the customer, because several customers can hold
+    the same atlas_contact_id and a change to that contact rewrites all of
+    them. Two requests naming different customers of one contact would
+    otherwise write and fan out over each other, leaving one duplicate at each
+    value for a contact that has a single type in Atlas.
+
+    Taken AFTER the Atlas call, so no HTTP happens inside the critical
+    section -- the lock covers the local read-modify-write only.
+    """
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+        (CUSTOMER_TYPE_MIRROR_LOCK, str(contact_id)),
     )
 
 
@@ -13062,6 +13085,235 @@ def admin_get_customer(
             customer = _canonical_customer(cur, customer_id)
     append_access_log(request, "CUSTOMER_VIEWED", True, f"Customer {customer_id}")
     return {"success": True, "customer": customer}
+
+
+def _atlas_customer_type_body(contact_id: str, customer_type: str) -> Dict[str, Any]:
+    """Build the operator mutation that changes ONE contact's customer_type.
+
+    Deliberately carries no identity fields. Atlas's operator boundary applies
+    whatever fields it receives as operator intent, so including full_name,
+    email or phone here would rewrite those values on the contact as a side
+    effect of a type change -- and sending them as null would clear them. The
+    only field this operation owns is the type.
+    """
+    return {
+        "contact_id": contact_id,
+        "customer_type": customer_type,
+        "contact_type": "customer",
+        "source_channel": ATLAS_OPERATOR_SOURCE_CHANNEL,
+        "source_ref": f"customer-type:{contact_id}",
+    }
+
+
+@app.patch("/api/admin/customers/{customer_id}/customer-type")
+def admin_set_customer_type(
+    customer_id: int,
+    payload: CustomerTypeChangeRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Change a customer's type by asking Atlas, then mirroring what it says.
+
+    admin_patch_customer refuses customer_type as system-managed, and keeps
+    refusing it: Atlas is the sole write authority. This is the one door that
+    changes it, and it changes it THERE -- the local row is only ever updated
+    from Atlas's response, never on the tracker's own say-so.
+    """
+    requested = payload.customerType.strip().lower()
+    if requested not in CUSTOMER_TYPES:
+        _raise_validation_error(
+            "Unsupported customer type",
+            {"customerType": f"must be one of {', '.join(CUSTOMER_TYPES)}"},
+        )
+
+    # Read, call Atlas with NO lock held, then take the per-contact lock for the
+    # local write only. This read is for the contact id and for reporting; it is
+    # not a snapshot the write is checked against.
+    #
+    # No lock spans the Atlas call, and that is deliberate. An earlier revision
+    # took a row lock first: an ordinary customer edit acquires the GLOBAL
+    # customer/site advisory lock before it waits on a row, so one blocked
+    # same-customer edit would hold that global lock while waiting and stall
+    # mutations for unrelated customers and sites. A per-row lock does not stay
+    # per-row once something else queues behind it holding a global one.
+    existing = db.query_one(
+        "SELECT id, name, atlas_contact_id, customer_type FROM customers "
+        "WHERE id = %s",
+        (customer_id,),
+    )
+    return _apply_customer_type_change(
+        existing, customer_id, requested, request, admin
+    )
+
+
+def _apply_customer_type_change(
+    existing: Optional[Dict[str, Any]],
+    customer_id: int,
+    requested: str,
+    request: Request,
+    admin: Dict[str, Any],
+) -> Dict[str, Any]:
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    contact_id = existing["atlas_contact_id"]
+    if not contact_id:
+        # No Atlas contact means no account to classify. Writing the type
+        # locally would create exactly the divergence this slice exists to
+        # prevent: a mirror holding a value its source of truth never agreed to.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Customer is not linked to an Atlas contact yet, so its "
+                "type cannot be set. Link it first."
+            ),
+        )
+
+    # Refuse before touching Atlas when Atlas AFFIRMS it cannot serve this
+    # mutation, exactly as the customer-create and linkage paths do. An
+    # unreadable manifest is an outage rather than a refusal and falls through,
+    # which is the helper's documented distinction.
+    refusal = _customer_atlas_capability_refusal(admin)
+    if refusal is not None:
+        append_access_log(
+            request,
+            "CUSTOMER_TYPE_CAPABILITY_UNAVAILABLE",
+            False,
+            f"customer={customer_id} "
+            f"capability={ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION}",
+        )
+        return refusal
+
+    # A fresh key per request rather than a hash of the intent. A content-derived
+    # key would collide across a repeated transition -- residential, back to
+    # commercial, then residential again would replay the first mutation -- the
+    # same trap that made plan_token unusable as a batch identity in #163.
+    # Replay is safe here without one: this sets an absolute value, not a delta,
+    # so applying it twice lands in the same state.
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_OPERATOR_CONTACTS_PATH,
+            admin,
+            payload=_atlas_customer_type_body(str(contact_id), requested),
+            idempotency_key=str(uuid4()),
+        )
+    except AtlasFunnelRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    # Reuse the existing validator for this boundary rather than reading the
+    # type straight out of the body. _atlas_funnel_request accepts any dict
+    # below HTTP 400, so without this a 2xx carrying success:false -- or naming
+    # a DIFFERENT contact -- would still write a type onto this customer's row.
+    try:
+        echoed_contact_id = _atlas_contact_id_from_operator_result(atlas_result)
+    except AtlasFunnelRequestError as exc:
+        # It raises AtlasFunnelRequestError, which FastAPI would surface as a
+        # 500 rather than the 502 it carries.
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if echoed_contact_id != str(contact_id):
+        # Atlas answered about some other contact. Mirroring that here would
+        # copy one account's classification onto another.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Atlas confirmed a different contact than the one being "
+                "changed; nothing was changed locally."
+            ),
+        )
+
+    confirmed = _customer_type_from_operator_result(atlas_result)
+    if confirmed is None:
+        # Atlas did not echo a type it would itself accept, so this cannot be
+        # mirrored. Do NOT fall back to writing `requested` -- that is the
+        # tracker asserting a classification on its own authority. If Atlas did
+        # apply the change and merely failed to report it, the #2357 refresh
+        # reconciles the mirror later; a wrong local write would not self-heal.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Atlas did not confirm the customer type; nothing was changed "
+                "locally. Re-check the contact in Atlas."
+            ),
+        )
+
+    # The target write and the duplicate fan-out are ONE transaction under a
+    # per-contact lock. db.query_one/query_all each open and commit their own
+    # transaction, so as separate statements two requests naming different
+    # customers of the SAME contact could both write and then fan out over each
+    # other, leaving one duplicate at each value for a contact that has a
+    # single type in Atlas.
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_type_mirror(cur, str(contact_id))
+            # Written unconditionally under the per-contact lock, which
+            # serializes concurrent changes to this contact so the last
+            # committer wins.
+            #
+            # This is deliberately eventually-consistent rather than strictly
+            # ordered. An earlier revision compared Atlas's own updated_at to
+            # pick the winner when two answers arrived out of order. It was
+            # removed: the harm it prevented was a transient wrong value that
+            # the ATLAS #2357 refresh reconciles on its next run, while the
+            # machinery itself produced a PERMANENT failure -- one malformed
+            # timestamp became a far-future token that no later version could
+            # beat, freezing the row at 409 forever -- and required reaching
+            # into the 0C finalizer, where it caused further defects.
+            #
+            # Preferring a transient, self-healing wrong value over a permanent
+            # stuck one is the whole trade. Concurrent type changes to one
+            # contact are rare here; a mirror that cannot be corrected is not.
+            #
+            # The contact-link compare stays: it is identity, not ordering.
+            # Atlas answered about the contact this row held, and if the row now
+            # points elsewhere the answer is about a different account.
+            cur.execute(
+                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                "WHERE id = %s AND atlas_contact_id IS NOT DISTINCT FROM %s "
+                "RETURNING id",
+                (confirmed, customer_id, contact_id),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This Customer's Atlas link changed while the request "
+                        "was in flight; Atlas was updated but the local record "
+                        "was not. Re-check it and try again."
+                    ),
+                )
+            # One Atlas contact can be held by several customers -- the linkage
+            # audit reports exactly these duplicate groups, and there are live
+            # ones. They all mirror the SAME account, so leaving the siblings
+            # behind would have this route serve two different types for one
+            # Atlas contact. Fan out, as the #2357 refresh already does.
+            #
+            # These rows are copies of the value this request just confirmed
+            # rather than independent decisions, and the per-contact lock above
+            # means no other change to this contact is in the same window.
+            cur.execute(
+                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                "WHERE atlas_contact_id = %s AND id <> %s "
+                "AND customer_type IS DISTINCT FROM %s "
+                "RETURNING id",
+                (confirmed, contact_id, customer_id, confirmed),
+            )
+            siblings = cur.fetchall()
+    append_access_log(
+        request,
+        "CUSTOMER_TYPE_CHANGED",
+        True,
+        f"customer={customer_id} contact={contact_id} "
+        f"from={existing['customer_type']} requested={requested} "
+        f"applied={confirmed} siblings={len(siblings)}",
+    )
+    return {
+        "success": True,
+        "customerId": customer_id,
+        "customerType": confirmed,
+        # Surfaced rather than hidden: Atlas is the authority, so if it settled
+        # on something other than what was asked, the caller must see that.
+        "requestedCustomerType": requested,
+        "atlasContactId": str(contact_id),
+    }
 
 
 @app.patch("/api/admin/customers/{customer_id}")
