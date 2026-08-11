@@ -353,11 +353,15 @@ def test_local_failure_after_atlas_success_recovers_against_the_same_contact(
     real_insert = api._insert_customer
     failures = {"count": 0}
 
-    def _flaky_insert(cur, payload, *, atlas_contact_id=None):
+    def _flaky_insert(cur, payload, **kwargs):
+        # **kwargs on purpose: this fake stands in for the real signature, and
+        # pinning its keywords means a new one silently turns every call into a
+        # TypeError that the saga reports as a local failure -- the test would
+        # then fail for a reason unrelated to what it is checking.
         if failures["count"] == 0:
             failures["count"] += 1
             raise RuntimeError("local insert exploded")
-        return real_insert(cur, payload, atlas_contact_id=atlas_contact_id)
+        return real_insert(cur, payload, **kwargs)
 
     monkeypatch.setattr(api, "_insert_customer", _flaky_insert)
 
@@ -1050,3 +1054,334 @@ def test_key_reuse_on_a_pending_reservation_is_refused_under_rollback(
     assert reused.status_code == 409, reused.text
     assert reused.json()["code"] == "customer_atlas_retry_mismatch"
     assert _reservation_rows(_name("Pending Reuse Other")) == []
+
+
+def _atlas_reporting(monkeypatch, contact: dict) -> None:
+    """Point the Atlas operator stub at a specific contact payload."""
+    from conftest import _FakeAtlasResponse  # type: ignore[attr-defined]
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        assert str(url).endswith(api.ATLAS_OPERATOR_CONTACTS_PATH)
+        key = (headers or {}).get("Idempotency-Key", "")
+        return _FakeAtlasResponse(
+            201,
+            {
+                "success": True,
+                "contactId": fake_atlas_contact_id(key),
+                "operation": "contact_created",
+                "idempotent": False,
+                "contact": contact,
+            },
+        )
+
+    monkeypatch.setattr(api.requests, "post", _post)
+
+
+def _stored_type(name: str) -> str:
+    row = db.query_one(
+        "SELECT customer_type FROM customers WHERE name = %s", (name,)
+    )
+    return row["customer_type"]
+
+
+def test_the_mirror_records_the_type_atlas_reported(client, auth, monkeypatch):
+    """The whole point: the tracker can see what Atlas decided."""
+    name = f"{TEST_PREFIX} Mirror Commercial"
+    _atlas_reporting(monkeypatch, {"customerType": "commercial"})
+
+    response = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 201, response.text
+    assert _stored_type(name) == "commercial"
+    assert response.json()["customer"]["customerType"] == "commercial"
+
+
+def test_an_atlas_that_does_not_serve_the_field_yields_unknown(client, auth, monkeypatch):
+    """Today's production reality, and it must not break a customer create.
+
+    Atlas deploys by hand and lags this tracker. A build predating ATLAS #2354
+    simply omits customerType; recording 'unknown' is true, whereas failing the
+    create would take the CRM down over a field the mirror does not need.
+    """
+    name = f"{TEST_PREFIX} Mirror Absent"
+    _atlas_reporting(monkeypatch, {})
+
+    response = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 201, response.text
+    assert _stored_type(name) == "unknown"
+
+
+def test_a_value_atlas_would_refuse_is_not_mirrored(client, auth, monkeypatch):
+    """The mirror must never hold a classification the source of truth rejects."""
+    name = f"{TEST_PREFIX} Mirror Bogus"
+    _atlas_reporting(monkeypatch, {"customerType": "platinum"})
+
+    response = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 201, response.text
+    assert _stored_type(name) == "unknown"
+
+
+def test_the_tracker_refuses_to_edit_the_type_but_tolerates_an_echo(client, auth, monkeypatch):
+    """System-managed, exactly like the Atlas contact link.
+
+    An echo has to stay a no-op because the deployed portal round-trips the
+    whole record on every edit. A real change is refused loudly rather than
+    dropped: a silent discard would read as a successful edit that did nothing,
+    and billing shape follows from this value.
+    """
+    name = f"{TEST_PREFIX} Mirror Locked"
+    _atlas_reporting(monkeypatch, {"customerType": "commercial"})
+    created = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": str(uuid.uuid4())},
+    ).json()["customer"]
+
+    echo = client.patch(
+        f"/api/admin/customers/{created['id']}",
+        headers=auth,
+        json={
+            "customerType": "commercial",
+            "expectedUpdateToken": created["updateToken"],
+        },
+    )
+    assert echo.status_code == 200, echo.text
+
+    refreshed = client.get(f"/api/admin/customers/{created['id']}", headers=auth).json()
+    changed = client.patch(
+        f"/api/admin/customers/{created['id']}",
+        headers=auth,
+        json={
+            "customerType": "residential",
+            "expectedUpdateToken": refreshed["customer"]["updateToken"],
+        },
+    )
+    assert changed.status_code == 409, changed.text
+    body = changed.json()
+    detail = body.get("detail", body)
+    assert detail["code"] == "customer_type_system_managed"
+    assert detail["details"]["customerType"] == "commercial"
+    assert _stored_type(name) == "commercial", "the refusal must not have written"
+
+
+def test_reconciling_an_existing_customer_mirrors_the_type_too(
+    client, auth, monkeypatch
+):
+    """The link_existing branch must mirror, not just link.
+
+    Reconciliation runs the same reservation flow as a create and receives the
+    same Atlas response, but it updates an existing row rather than inserting
+    one. Wiring only the insert leaves every legacy customer reconciled through
+    this supported path sitting at the migration default while Atlas has
+    already said what it is -- and the API then serves that wrong value.
+    """
+    name = _name("Reconcile Mirrors Type")
+    customer_id = _unlinked_customer(name)
+    _atlas_reporting(monkeypatch, {"customerType": "commercial"})
+
+    response = client.post(
+        f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth
+    )
+
+    assert response.status_code == 200, response.text
+    assert _stored_type(name) == "commercial"
+    assert response.json()["customer"]["customerType"] == "commercial"
+
+
+def test_reconciling_against_an_older_atlas_leaves_the_type_alone(
+    client, auth, monkeypatch
+):
+    """No reported type must not clobber a type already mirrored.
+
+    COALESCE, not assignment: an Atlas build that predates ATLAS #2354 reports
+    nothing, and overwriting a known classification with 'unknown' would make
+    reconciliation destructive.
+    """
+    name = _name("Reconcile Keeps Type")
+    customer_id = _unlinked_customer(name)
+    db.execute(
+        "UPDATE customers SET customer_type = 'residential' WHERE id = %s",
+        (customer_id,),
+    )
+    _atlas_reporting(monkeypatch, {})
+
+    response = client.post(
+        f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth
+    )
+
+    assert response.status_code == 200, response.text
+    assert _stored_type(name) == "residential"
+
+
+def test_a_concurrent_link_to_the_same_contact_still_mirrors_the_type(
+    client, auth, monkeypatch
+):
+    """Losing a race must not cost the classification.
+
+    The linkage-backfill endpoint can link the same customer while the Atlas
+    call is in flight; it sets only atlas_contact_id. The finalizer's
+    conditional UPDATE then matches nothing, and because the winner linked the
+    SAME contact there is no conflict to raise -- so without an explicit apply
+    the type Atlas just reported is dropped and the customer keeps 'unknown'
+    purely because of who won.
+    """
+    from conftest import _FakeAtlasResponse  # type: ignore[attr-defined]
+
+    name = _name("Race Keeps Type")
+    customer_id = _unlinked_customer(name)
+
+    def _post_then_link(url, *, headers=None, json=None, timeout=None):
+        assert str(url).endswith(api.ATLAS_OPERATOR_CONTACTS_PATH)
+        key = (headers or {}).get("Idempotency-Key", "")
+        contact_id = fake_atlas_contact_id(key)
+        # The backfill wins the race, linking the SAME contact and setting
+        # only atlas_contact_id -- exactly what that endpoint does.
+        db.execute(
+            "UPDATE customers SET atlas_contact_id = %s WHERE id = %s "
+            "AND atlas_contact_id IS NULL",
+            (contact_id, customer_id),
+        )
+        return _FakeAtlasResponse(
+            201,
+            {
+                "success": True,
+                "contactId": contact_id,
+                "operation": "contact_created",
+                "idempotent": False,
+                "contact": {"customerType": "commercial"},
+            },
+        )
+
+    monkeypatch.setattr(api.requests, "post", _post_then_link)
+
+    response = client.post(
+        f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth
+    )
+
+    assert response.status_code == 200, response.text
+    assert _stored_type(name) == "commercial", (
+        "the reported type must survive losing the link race"
+    )
+
+
+def test_the_check_constraint_is_generated_from_the_tuple():
+    """One tracker-side source, proven at the database.
+
+    The accepted set is written once as CUSTOMER_TYPES and the CHECK is built
+    from it. Asserting the constraint's actual definition -- rather than that
+    the interpolation exists -- is what proves the two cannot drift.
+    """
+    definition = db.query_one(
+        """
+        SELECT pg_get_constraintdef(oid) AS def
+        FROM pg_constraint
+        WHERE conname = 'chk_customers_customer_type'
+          AND conrelid = 'customers'::regclass
+        """
+    )
+    assert definition is not None, "the CHECK must exist"
+    rendered = definition["def"]
+    for value in api.CUSTOMER_TYPES:
+        assert f"'{value}'" in rendered, f"{value} missing from the CHECK"
+    # Exact membership, tested by behaviour rather than by counting casts.
+    # Counting "::text" proved nothing: a constraint that also permitted
+    # 'platinum' would not necessarily add one, so the assertion passed for
+    # constraints it should have rejected.
+    import re as _re
+
+    assert set(_re.findall(r"'([^']*)'", rendered)) == set(api.CUSTOMER_TYPES)
+
+    row = db.query_one(
+        "INSERT INTO customers (name) VALUES (%s) RETURNING id",
+        (f"{TEST_PREFIX} Check Probe",),
+    )
+    with pytest.raises(Exception) as caught:
+        db.execute(
+            "UPDATE customers SET customer_type = 'platinum' WHERE id = %s",
+            (row["id"],),
+        )
+    assert "chk_customers_customer_type" in str(caught.value)
+
+
+def test_the_check_is_rebuilt_when_the_type_set_changes(monkeypatch):
+    """A create-once guard would pin production to the old set.
+
+    CUSTOMER_TYPES is expected to gain a value when Atlas adds one. If the
+    constraint were only created when absent, the deployed CHECK would stay on
+    the old set: the parser would accept the new value and the INSERT would
+    then violate a stale constraint, rejecting local finalization AFTER Atlas
+    had created the contact.
+    """
+    def _definition() -> str:
+        return db.query_one(
+            """
+            SELECT pg_get_constraintdef(oid) AS def
+            FROM pg_constraint
+            WHERE conname = 'chk_customers_customer_type'
+              AND conrelid = 'customers'::regclass
+            """
+        )["def"]
+
+    assert "prospective" not in _definition()
+
+    monkeypatch.setattr(
+        api, "CUSTOMER_TYPES", api.CUSTOMER_TYPES + ("prospective",)
+    )
+    try:
+        api._ensure_schema_migrations()
+        rebuilt = _definition()
+        assert "prospective" in rebuilt, (
+            "the constraint must follow the tuple, not the first deployment"
+        )
+    finally:
+        monkeypatch.undo()
+        api._ensure_schema_migrations()
+
+    assert "prospective" not in _definition(), "and back again when it shrinks"
+
+
+def test_an_unchanged_type_set_issues_no_ddl_at_startup():
+    """A deploy must not take an exclusive lock for nothing.
+
+    Dropping and re-adding the CHECK on every boot revalidates every row under
+    an exclusive table lock, which can block live traffic during a deploy. The
+    bootstrap compares the deployed literals against CUSTOMER_TYPES first and
+    only issues DDL when they actually differ.
+    """
+    before = db.query_one(
+        """
+        SELECT oid, pg_get_constraintdef(oid) AS def
+        FROM pg_constraint
+        WHERE conname = 'chk_customers_customer_type'
+          AND conrelid = 'customers'::regclass
+        """
+    )
+
+    api._ensure_schema_migrations()
+
+    after = db.query_one(
+        """
+        SELECT oid, pg_get_constraintdef(oid) AS def
+        FROM pg_constraint
+        WHERE conname = 'chk_customers_customer_type'
+          AND conrelid = 'customers'::regclass
+        """
+    )
+    # A rebuild would give the constraint a new oid; an untouched one keeps it.
+    assert after["oid"] == before["oid"], (
+        "an unchanged type set must not drop and re-add the constraint"
+    )
