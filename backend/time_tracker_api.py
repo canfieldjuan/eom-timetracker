@@ -13328,47 +13328,62 @@ def _apply_customer_type_change(
             # and returns, A resumes first -- and local arrival order would
             # leave the mirror on commercial while Atlas holds residential.
             # Refuse anything not strictly newer than what is already mirrored.
+            # Two guards, two domains, and they must not overrule each other.
+            #
+            # When Atlas reports a version, IT decides ordering and a strictly
+            # newer answer supersedes whatever is mirrored -- including a local
+            # snapshot this request took before calling. Keeping the local
+            # updated_at compare here would reject a legitimately newer answer:
+            # if A and B snapshot the same state, Atlas applies A then B, and A
+            # mirrors first, B's version is newer but its snapshot is stale, so
+            # B would 409 and leave the mirror on A while Atlas ended at B.
+            #
+            # The contact-link compare stays in both branches. That one is about
+            # identity, not ordering -- Atlas answered about the contact this row
+            # held, and if the row now points elsewhere the answer is about a
+            # different account.
             if source_at is not None:
                 cur.execute(
-                    "SELECT customer_type_source_at FROM customers WHERE id = %s",
-                    (customer_id,),
+                    "UPDATE customers SET customer_type = %s, "
+                    "customer_type_source_at = %s, updated_at = NOW() "
+                    "WHERE id = %s "
+                    "AND atlas_contact_id IS NOT DISTINCT FROM %s "
+                    "AND (customer_type_source_at IS NULL "
+                    "     OR customer_type_source_at < %s) "
+                    "RETURNING id",
+                    (confirmed, source_at, customer_id, contact_id, source_at),
                 )
-                mirrored_at = (cur.fetchone() or {}).get("customer_type_source_at")
-                if mirrored_at is not None and source_at <= mirrored_at:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "A newer change to this Customer's type has already "
-                            "been recorded; Atlas was updated but this older "
-                            "answer was not applied locally."
-                        ),
-                    )
-            cur.execute(
-                "UPDATE customers SET customer_type = %s, "
-                "customer_type_source_at = COALESCE(%s, customer_type_source_at), "
-                "updated_at = NOW() "
-                "WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s "
-                "AND atlas_contact_id IS NOT DISTINCT FROM %s "
-                "AND updated_at IS NOT DISTINCT FROM %s "
-                "RETURNING id",
-                (
-                    confirmed,
-                    source_at,
-                    customer_id,
-                    existing["customer_type"],
-                    contact_id,
-                    existing["updated_at"],
-                ),
-            )
-            if cur.fetchone() is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "This Customer's type changed while the request was in "
-                        "flight; Atlas was updated but the local record was "
-                        "not. Re-check it and try again."
+                stale_detail = (
+                    "A newer change to this Customer's type has already been "
+                    "recorded, or its Atlas link moved; Atlas was updated but "
+                    "this answer was not applied locally."
+                )
+            else:
+                # No version from Atlas, so ordering has to be inferred locally.
+                # updated_at is in the compare because comparing values alone
+                # cannot see an ABA transition -- away and back to the value
+                # this request read.
+                cur.execute(
+                    "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                    "WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s "
+                    "AND atlas_contact_id IS NOT DISTINCT FROM %s "
+                    "AND updated_at IS NOT DISTINCT FROM %s "
+                    "RETURNING id",
+                    (
+                        confirmed,
+                        customer_id,
+                        existing["customer_type"],
+                        contact_id,
+                        existing["updated_at"],
                     ),
                 )
+                stale_detail = (
+                    "This Customer's type changed while the request was in "
+                    "flight; Atlas was updated but the local record was not. "
+                    "Re-check it and try again."
+                )
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=409, detail=stale_detail)
             # One Atlas contact can be held by several customers -- the linkage
             # audit reports exactly these duplicate groups, and there are live
             # ones. They all mirror the SAME account, so leaving the siblings

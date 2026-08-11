@@ -397,13 +397,18 @@ def test_a_late_response_cannot_clobber_a_newer_transition(client, auth, monkeyp
         want = (json or {})["customer_type"]
         if want == "commercial" and not interfered["done"]:
             interfered["done"] = True
-            # B lands while A is still waiting on Atlas. Written directly so the
-            # test exercises A's staleness check rather than a second HTTP call.
+            # B lands while A is still waiting on Atlas. It is a REAL
+            # transition carrying Atlas's later version -- a raw DB write would
+            # record no version and would no longer model a competing change.
             db.execute(
-                "UPDATE customers SET customer_type = %s WHERE id = %s",
-                ("residential", customer),
+                "UPDATE customers SET customer_type = %s, "
+                "customer_type_source_at = %s WHERE id = %s",
+                ("residential", "2026-08-11T12:05:00+00:00", customer),
             )
-        return _atlas_echoing(want)(url, headers=headers, json=json, timeout=timeout)
+        # A's own answer carries an EARLIER Atlas version.
+        return _atlas_echoing(want, updated_at="2026-08-11T12:04:00+00:00")(
+            url, headers=headers, json=json, timeout=timeout
+        )
 
     monkeypatch.setattr(api.requests, "post", _post)
     resp = client.patch(_path(customer), headers=auth,
@@ -511,7 +516,9 @@ def test_an_aba_transition_is_detected(client, auth, monkeypatch):
                 "WHERE id = %s",
                 ("unknown", customer),
             )
-        return _atlas_echoing("commercial")(
+        # No Atlas version, so ordering has to be inferred locally -- this is
+        # the branch the updated_at compare exists for.
+        return _atlas_echoing("commercial", updated_at=None)(
             url, headers=headers, json=json, timeout=timeout
         )
 
@@ -711,3 +718,71 @@ def test_siblings_carry_the_atlas_version_too(client, auth, monkeypatch):
                         json={"customerType": "residential"})
     assert resp.status_code == 409, resp.text
     assert _type_of(twin) == "commercial"
+
+
+def test_a_newer_atlas_version_supersedes_a_stale_local_snapshot(
+    client, auth, monkeypatch
+):
+    """The two guards must not overrule each other.
+
+    A and B snapshot the same state, Atlas applies A then B, A mirrors first.
+    B's Atlas version is newer, so B must win -- but B's pre-call snapshot is
+    now stale. Keeping the local updated_at compare in this branch would 409 B
+    and leave the mirror on A while Atlas ended at B.
+    """
+    contact = str(uuid.uuid4())
+    customer = _customer("Superseded Snapshot", contact, "unknown")
+    landed = {"a": False}
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        # B has already taken its pre-call snapshot by the time this runs.
+        # A commits DURING B's Atlas call, so B's snapshot goes stale -- the
+        # interleaving the finding describes. Sequential requests would not
+        # reproduce it, because the second would read a fresh snapshot.
+        if not landed["a"]:
+            landed["a"] = True
+            db.execute(
+                "UPDATE customers SET customer_type = %s, "
+                "customer_type_source_at = %s, updated_at = NOW() WHERE id = %s",
+                ("commercial", "2026-08-11T12:00:20+00:00", customer),
+            )
+        return _atlas_echoing("residential",
+                              updated_at="2026-08-11T12:00:21+00:00")(
+            url, headers=headers, json=json, timeout=timeout
+        )
+
+    monkeypatch.setattr(api.requests, "post", _post)
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "residential"})
+    assert landed["a"], "the test must actually interleave A's commit"
+    assert resp.status_code == 200, resp.text
+    assert _type_of(customer) == "residential", (
+        "a newer Atlas version was rejected by a stale local snapshot"
+    )
+
+
+def test_a_relink_still_blocks_even_with_a_newer_version(client, auth, monkeypatch):
+    """Identity is not ordering: the link guard survives in the version branch."""
+    contact = str(uuid.uuid4())
+    other = str(uuid.uuid4())
+    customer = _customer("Version Relink", contact, "unknown")
+    moved = {"done": False}
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        if not moved["done"]:
+            moved["done"] = True
+            db.execute(
+                "UPDATE customers SET atlas_contact_id = %s WHERE id = %s",
+                (other, customer),
+            )
+        return _atlas_echoing("commercial",
+                              updated_at="2026-08-11T12:00:30+00:00")(
+            url, headers=headers, json=json, timeout=timeout
+        )
+
+    monkeypatch.setattr(api.requests, "post", _post)
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert moved["done"]
+    assert resp.status_code == 409, resp.text
+    assert _type_of(customer) == "unknown"
