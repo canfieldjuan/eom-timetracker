@@ -720,6 +720,145 @@ def test_native_site_schedule_forecast_uses_site_rules_without_writing_jobs(
     )
 
 
+def test_native_site_schedule_source_uses_site_rules_without_writing_jobs(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)  # Monday
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Agenda Source",
+                site_type="Commercial",
+                rate=225,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+
+    before_jobs = db.query_one(
+        "SELECT COUNT(*) AS count FROM jobs WHERE location_id = %s",
+        (site_id,),
+    )["count"]
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "08:00",
+            "localEndTime": "11:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    native = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": str(service_day),
+            "end_date": str(service_day),
+            "planning_source": "native",
+        },
+    )
+    assert native.status_code == 200, native.text
+    body = native.json()
+    assert body["planningSource"] == "native"
+    assert body["ruleCount"] >= 1
+    assert body["summary"]["jobCount"] == 1
+    assert body["summary"]["plannedHours"] == 3
+    assert body["summary"]["actualHours"] == 0
+    assert body["summary"]["varianceHours"] == -3
+    assert body["summary"]["unmatchedActualHours"] == 0
+    assert "native_actual_matching_not_joined" in {
+        issue["code"] for issue in body["issues"]
+    }
+    assert body["unmatchedActualSegments"] == []
+
+    job = next(row for row in body["jobs"] if row["locationId"] == site_id)
+    assert "id" not in job
+    assert "jobId" not in job
+    assert job["projectionId"] == f"rule-{created.json()['rule']['id']}:{service_day}"
+    assert job["ruleId"] == created.json()["rule"]["id"]
+    assert job["sourceRole"] == "commercial_evening_night"
+    assert job["shiftBucket"] == "morning"
+    assert job["scheduledDate"] == str(service_day)
+    assert job["plannedHours"] == 3
+    assert job["actualHours"] == 0
+    assert job["siteEconomics"]["rate"] == 225
+    assert job["siteEconomics"]["rateType"] == "per_visit"
+    assert job["workers"] == []
+    assert job["issues"] == []
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM jobs WHERE location_id = %s",
+        (site_id,),
+    )["count"] == before_jobs
+
+    default = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(service_day), "end_date": str(service_day)},
+    )
+    assert default.status_code == 200, default.text
+    assert default.json()["planningSource"] == "calendar"
+    assert all(row.get("locationId") != site_id for row in default.json()["jobs"])
+
+
+def test_native_site_schedule_source_includes_prior_day_overnight_overlap(
+    client,
+    auth,
+):
+    monday = date(2026, 7, 20)
+    tuesday = date(2026, 7, 21)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Agenda Overnight",
+                site_type="Commercial",
+                rate=180,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "night",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "23:00",
+            "localEndTime": "01:00",
+            "startsOn": str(monday),
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    native = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": str(tuesday),
+            "end_date": str(tuesday),
+            "planning_source": "native",
+        },
+    )
+    assert native.status_code == 200, native.text
+    body = native.json()
+    job = next(row for row in body["jobs"] if row["locationId"] == site_id)
+    assert job["projectionId"] == f"rule-{created.json()['rule']['id']}:{monday}"
+    assert job["scheduledDate"] == str(monday)
+    assert job["scheduledStart"].endswith("04:00:00Z")
+    assert job["scheduledEnd"].endswith("06:00:00Z")
+    assert job["plannedHours"] == 2
+    assert body["summary"]["plannedHours"] == 2
+
+
 def test_native_site_schedule_forecast_allocates_monthly_rate_across_full_month(
     client,
     auth,
@@ -8175,6 +8314,17 @@ def test_operations_forecast_route_keeps_allowed_horizon_gate(
         == "planning_source must be calendar or native"
     )
     assert calls == [8]
+
+
+def test_operations_schedule_route_rejects_unknown_planning_source(client, auth):
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"planning_source": "legacy"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "planning_source must be calendar or native"
 
 
 def test_forecast_rejects_unsupported_horizon(client, auth):
