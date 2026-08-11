@@ -13107,11 +13107,37 @@ def admin_set_customer_type(
             {"customerType": f"must be one of {', '.join(CUSTOMER_TYPES)}"},
         )
 
-    existing = db.query_one(
+    # The whole call-and-mirror sequence is serialized on THIS customer's row.
+    # Without it two transitions race: A sets commercial, B sets residential and
+    # mirrors first, then A's delayed response overwrites the mirror with
+    # commercial while Atlas's actual value is residential -- a lost update that
+    # leaves the mirror silently disagreeing with its authority.
+    #
+    # This does hold a row lock across the Atlas HTTP call, which #163 round 4
+    # rightly objected to for the GLOBAL customer/site lock. The granularity is
+    # what makes it acceptable here: it blocks only concurrent type changes to
+    # the same customer, which is exactly the set that must be serialized.
+    # Edits to every other customer are unaffected.
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            return _apply_customer_type_change(
+                cur, customer_id, requested, request, admin
+            )
+
+
+def _apply_customer_type_change(
+    cur: Any,
+    customer_id: int,
+    requested: str,
+    request: Request,
+    admin: Dict[str, Any],
+) -> Dict[str, Any]:
+    cur.execute(
         "SELECT id, name, atlas_contact_id, customer_type FROM customers "
-        "WHERE id = %s",
+        "WHERE id = %s FOR UPDATE",
         (customer_id,),
     )
+    existing = cur.fetchone()
     if existing is None:
         raise HTTPException(status_code=404, detail="Customer not found")
     contact_id = existing["atlas_contact_id"]
@@ -13143,6 +13169,27 @@ def admin_set_customer_type(
     except AtlasFunnelRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
+    # Reuse the existing validator for this boundary rather than reading the
+    # type straight out of the body. _atlas_funnel_request accepts any dict
+    # below HTTP 400, so without this a 2xx carrying success:false -- or naming
+    # a DIFFERENT contact -- would still write a type onto this customer's row.
+    try:
+        echoed_contact_id = _atlas_contact_id_from_operator_result(atlas_result)
+    except AtlasFunnelRequestError as exc:
+        # It raises AtlasFunnelRequestError, which FastAPI would surface as a
+        # 500 rather than the 502 it carries.
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if echoed_contact_id != str(contact_id):
+        # Atlas answered about some other contact. Mirroring that here would
+        # copy one account's classification onto another.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Atlas confirmed a different contact than the one being "
+                "changed; nothing was changed locally."
+            ),
+        )
+
     confirmed = _customer_type_from_operator_result(atlas_result)
     if confirmed is None:
         # Atlas did not echo a type it would itself accept, so this cannot be
@@ -13158,7 +13205,10 @@ def admin_set_customer_type(
             ),
         )
 
-    db.execute(
+    # cur, NOT db.execute: this row is held FOR UPDATE by the surrounding
+    # transaction, so a second pooled connection would block on the lock this
+    # very request is holding and deadlock until timeout.
+    cur.execute(
         "UPDATE customers SET customer_type = %s, updated_at = NOW() WHERE id = %s",
         (confirmed, customer_id),
     )

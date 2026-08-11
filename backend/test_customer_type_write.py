@@ -273,3 +273,135 @@ def test_the_generic_patch_still_refuses_the_type(client, auth, monkeypatch):
     detail = resp.json().get("detail", resp.json())
     assert detail["code"] == "customer_type_system_managed"
     assert _type_of(customer) == "commercial"
+
+
+# --- review round 1 findings --------------------------------------------------
+
+
+def test_an_unsuccessful_echo_never_writes(client, auth, monkeypatch):
+    """A 2xx body is not consent. _atlas_funnel_request accepts any dict under
+    HTTP 400, so success:false must be rejected by this route, not assumed away.
+    """
+    contact = str(uuid.uuid4())
+    customer = _customer("Unsuccessful", contact, "unknown")
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        return _Response(200, {
+            "success": False,
+            "contactId": (json or {}).get("contact_id"),
+            "contact": {"customerType": "commercial"},
+        })
+
+    monkeypatch.setattr(api.requests, "post", _post)
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 502, resp.text
+    assert _type_of(customer) == "unknown"
+
+
+def test_an_echo_about_a_different_contact_never_writes(client, auth, monkeypatch):
+    """Mirroring a mismatched echo would copy one account's type onto another."""
+    contact = str(uuid.uuid4())
+    other_contact = str(uuid.uuid4())
+    customer = _customer("Mismatched", contact, "unknown")
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        return _Response(200, {
+            "success": True,
+            "contactId": other_contact,
+            "contact": {"customerType": "commercial"},
+        })
+
+    monkeypatch.setattr(api.requests, "post", _post)
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 502, resp.text
+    assert _type_of(customer) == "unknown"
+
+
+def test_a_malformed_contact_id_is_a_502_not_a_500(client, auth, monkeypatch):
+    """The validator raises AtlasFunnelRequestError; uncaught it would be a 500."""
+    contact = str(uuid.uuid4())
+    customer = _customer("Bad Id", contact, "unknown")
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        return _Response(200, {
+            "success": True,
+            "contactId": "not-a-uuid",
+            "contact": {"customerType": "commercial"},
+        })
+
+    monkeypatch.setattr(api.requests, "post", _post)
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 502, resp.text
+    assert _type_of(customer) == "unknown"
+
+
+def test_the_write_completes_under_the_row_lock(client, auth, monkeypatch):
+    """The mirror UPDATE must run on the locked transaction's cursor.
+
+    The row is held FOR UPDATE by this request's own transaction, so issuing
+    the UPDATE on a second pooled connection would block on the lock this very
+    request holds. That deadlock shows up as a hang, not a failure, so assert
+    the request actually returns and the value landed.
+    """
+    contact = str(uuid.uuid4())
+    customer = _customer("Locked Write", contact, "unknown")
+    monkeypatch.setattr(api.requests, "post", _atlas_echoing("commercial"))
+
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 200, resp.text
+    assert _type_of(customer) == "commercial"
+
+
+def test_concurrent_transitions_are_serialized_per_customer(client, auth, monkeypatch):
+    """Two transitions on one customer must not interleave call-and-mirror.
+
+    Without serialization: A asks for commercial, B asks for residential and
+    mirrors first, then A's delayed response overwrites with commercial while
+    Atlas's actual value is residential -- a lost update.
+
+    The second request is issued from inside the first one's Atlas call, so it
+    can only proceed if the row lock is NOT held across the sequence.
+    """
+    import threading
+
+    contact = str(uuid.uuid4())
+    customer = _customer("Racing", contact, "unknown")
+    observed = {}
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        want = (json or {})["customer_type"]
+        if want == "commercial" and "second" not in observed:
+            observed["second"] = "started"
+
+            def _competing():
+                # A second client while the first still holds the lock.
+                try:
+                    observed["second_status"] = client.patch(
+                        _path(customer), headers=auth,
+                        json={"customerType": "residential"},
+                    ).status_code
+                except Exception as exc:  # pragma: no cover - diagnostic
+                    observed["second_status"] = repr(exc)
+
+            thread = threading.Thread(target=_competing)
+            thread.start()
+            thread.join(timeout=3)
+            observed["still_running"] = thread.is_alive()
+        return _atlas_echoing(want)(url, headers=headers, json=json, timeout=timeout)
+
+    monkeypatch.setattr(api.requests, "post", _post)
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 200, resp.text
+    # The competing writer was blocked while the first held the row: either it
+    # was still waiting when we gave up on it, or it completed only afterwards.
+    assert observed.get("still_running") is True, (
+        "a concurrent transition on the same customer was not serialized; "
+        f"observed={observed}"
+    )
+    # Final state is whatever Atlas last confirmed for the winner.
+    assert _type_of(customer) in {"commercial", "residential"}
