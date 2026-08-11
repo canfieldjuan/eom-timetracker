@@ -793,3 +793,65 @@ def test_a_relink_still_blocks_even_with_a_newer_version(client, auth, monkeypat
     assert moved["done"]
     assert resp.status_code == 409, resp.text
     assert _type_of(customer) == "unknown"
+
+
+def test_a_date_only_version_is_refused_not_assumed_utc(client, auth, monkeypatch):
+    """A bare date is not an instant, and guessing an offset bricks the row.
+
+    datetime.fromisoformat parses "9999-12-31"; assigning UTC to it invents an
+    offset Atlas never sent and stores a far-future ordering token. Every later
+    legitimate version then fails the strict `<` predicate, so the mirror is
+    stuck at 409 permanently -- one malformed response, permanent damage.
+    """
+    contact = str(uuid.uuid4())
+    customer = _customer("Date Only", contact, "unknown")
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("commercial", updated_at="9999-12-31"))
+
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 502, resp.text
+    assert _type_of(customer) == "unknown"
+    row = db.query_one(
+        "SELECT customer_type_source_at FROM customers WHERE id = %s", (customer,)
+    )
+    assert row["customer_type_source_at"] is None, "no token may be stored"
+
+    # And the row is NOT stuck: a well-formed version still applies.
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("commercial",
+                                       updated_at="2026-08-11T12:40:00+00:00"))
+    assert client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"}).status_code == 200
+    assert _type_of(customer) == "commercial"
+
+
+def test_a_naive_version_is_refused(client, auth, monkeypatch):
+    """No offset means no instant. Do not assume one."""
+    contact = str(uuid.uuid4())
+    customer = _customer("Naive", contact, "unknown")
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("commercial",
+                                       updated_at="2026-08-11T12:00:00"))
+
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 502, resp.text
+    assert _type_of(customer) == "unknown"
+
+
+def test_an_implausibly_future_version_is_refused(client, auth, monkeypatch):
+    """Believing one is the same permanent stall as the date-only case."""
+    contact = str(uuid.uuid4())
+    customer = _customer("Far Future", contact, "unknown")
+    monkeypatch.setattr(api.requests, "post",
+                        _atlas_echoing("commercial",
+                                       updated_at="2999-01-01T00:00:00+00:00"))
+
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 502, resp.text
+    row = db.query_one(
+        "SELECT customer_type_source_at FROM customers WHERE id = %s", (customer,)
+    )
+    assert row["customer_type_source_at"] is None

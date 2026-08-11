@@ -11939,7 +11939,44 @@ def _finalize_customer_atlas_reservation(
                     """,
                     (atlas_contact_id, customer_type, customer_id),
                 )
-                if cur.rowcount == 0:
+                # Captured BEFORE the alignment below, which runs its own
+                # statement and would otherwise replace the rowcount the
+                # conflict check depends on.
+                linked_rowcount = cur.rowcount
+                # This reservation carries the type Atlas reported when it was
+                # created, which may be stale by now: the customer-type route
+                # can have changed this contact and fanned out while this was
+                # in flight, and its fan-out could only reach rows ALREADY
+                # linked. Without this the contact ends with two local mirrors
+                # holding different values.
+                #
+                # Provenance decides. A row carrying customer_type_source_at was
+                # written from a known Atlas version; this path has none, so any
+                # existing token beats it and the newly linked row adopts the
+                # group's value rather than overwriting it.
+                cur.execute(
+                    """
+                    UPDATE customers AS target
+                    SET customer_type = source.customer_type,
+                        customer_type_source_at = source.customer_type_source_at,
+                        updated_at = NOW()
+                    FROM (
+                        SELECT customer_type, customer_type_source_at
+                        FROM customers
+                        WHERE atlas_contact_id = %s
+                          AND id <> %s
+                          AND customer_type_source_at IS NOT NULL
+                        ORDER BY customer_type_source_at DESC
+                        LIMIT 1
+                    ) AS source
+                    WHERE target.id = %s
+                      AND target.atlas_contact_id = %s
+                      AND target.customer_type_source_at IS NULL
+                      AND target.customer_type IS DISTINCT FROM source.customer_type
+                    """,
+                    (atlas_contact_id, customer_id, customer_id, atlas_contact_id),
+                )
+                if linked_rowcount == 0:
                     # Someone linked this Customer while we were talking to
                     # Atlas -- the legacy linkage-backfill endpoint takes the
                     # same mutation lock and can land in that gap. Finalizing
@@ -12067,7 +12104,19 @@ def _customer_type_source_at_from_operator_result(
         parsed = datetime.fromisoformat(reported.strip().replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    # A full RFC3339 instant, or nothing. datetime.fromisoformat happily parses
+    # a bare date like "9999-12-31", and assigning UTC to it -- as this used to
+    # -- invents an offset the sender never gave. That is not a harmless
+    # default: a far-future token is stored, every later legitimate version
+    # then fails the strict `<` predicate, and the row is stuck at 409 forever.
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    # A version implausibly far ahead of this clock is not credible skew, and
+    # the cost of believing one is the same permanent stall. Reject rather than
+    # let a single bad response brick the row.
+    if parsed > datetime.now(timezone.utc) + timedelta(days=1):
+        return None
+    return parsed
 
 
 def _atlas_contact_id_from_operator_result(result: Dict[str, Any]) -> str:
