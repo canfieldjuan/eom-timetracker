@@ -1297,8 +1297,24 @@ def test_the_check_constraint_is_generated_from_the_tuple():
     rendered = definition["def"]
     for value in api.CUSTOMER_TYPES:
         assert f"'{value}'" in rendered, f"{value} missing from the CHECK"
-    # And nothing beyond the tuple is admitted.
-    assert rendered.count("::text") <= len(api.CUSTOMER_TYPES) + 1
+    # Exact membership, tested by behaviour rather than by counting casts.
+    # Counting "::text" proved nothing: a constraint that also permitted
+    # 'platinum' would not necessarily add one, so the assertion passed for
+    # constraints it should have rejected.
+    import re as _re
+
+    assert set(_re.findall(r"'([^']*)'", rendered)) == set(api.CUSTOMER_TYPES)
+
+    row = db.query_one(
+        "INSERT INTO customers (name) VALUES (%s) RETURNING id",
+        (f"{TEST_PREFIX} Check Probe",),
+    )
+    with pytest.raises(Exception) as caught:
+        db.execute(
+            "UPDATE customers SET customer_type = 'platinum' WHERE id = %s",
+            (row["id"],),
+        )
+    assert "chk_customers_customer_type" in str(caught.value)
 
 
 def test_the_check_is_rebuilt_when_the_type_set_changes(monkeypatch):
@@ -1336,3 +1352,36 @@ def test_the_check_is_rebuilt_when_the_type_set_changes(monkeypatch):
         api._ensure_schema_migrations()
 
     assert "prospective" not in _definition(), "and back again when it shrinks"
+
+
+def test_an_unchanged_type_set_issues_no_ddl_at_startup():
+    """A deploy must not take an exclusive lock for nothing.
+
+    Dropping and re-adding the CHECK on every boot revalidates every row under
+    an exclusive table lock, which can block live traffic during a deploy. The
+    bootstrap compares the deployed literals against CUSTOMER_TYPES first and
+    only issues DDL when they actually differ.
+    """
+    before = db.query_one(
+        """
+        SELECT oid, pg_get_constraintdef(oid) AS def
+        FROM pg_constraint
+        WHERE conname = 'chk_customers_customer_type'
+          AND conrelid = 'customers'::regclass
+        """
+    )
+
+    api._ensure_schema_migrations()
+
+    after = db.query_one(
+        """
+        SELECT oid, pg_get_constraintdef(oid) AS def
+        FROM pg_constraint
+        WHERE conname = 'chk_customers_customer_type'
+          AND conrelid = 'customers'::regclass
+        """
+    )
+    # A rebuild would give the constraint a new oid; an untouched one keeps it.
+    assert after["oid"] == before["oid"], (
+        "an unchanged type set must not drop and re-add the constraint"
+    )

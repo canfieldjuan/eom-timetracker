@@ -4736,39 +4736,51 @@ def _ensure_schema_migrations() -> None:
         "ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_type "
         "VARCHAR(16) NOT NULL DEFAULT 'unknown'"
     )
-    db.execute(
+    # Rebuilt ONLY when the deployed constraint disagrees with CUSTOMER_TYPES.
+    #
+    # Two failure modes to avoid at once. Creating it only when absent pins an
+    # existing deployment to the old set, so a value added to the tuple would be
+    # accepted by the parser and then violate a stale CHECK -- rejecting local
+    # finalization AFTER Atlas created the contact. Dropping and re-adding on
+    # every boot avoids that but takes an exclusive table lock and revalidates
+    # every row on each deploy, which can block live traffic.
+    #
+    # Comparing first gives both: no DDL and no lock on the overwhelmingly
+    # common path where nothing changed, and a real rebuild exactly when the set
+    # moves. The comparison is on the SET of literals Postgres renders, not on
+    # the string, so its formatting is not load-bearing.
+    deployed = db.query_one(
         """
-        DO $$
-        BEGIN
-            -- Dropped and re-added unconditionally, NOT skipped when the name
-            -- already exists. CUSTOMER_TYPES is expected to gain a value when
-            -- Atlas adds one, and a create-once guard would leave the deployed
-            -- constraint pinned to the old set: the parser would accept the new
-            -- value and the INSERT would then violate a stale CHECK, rejecting
-            -- local finalization AFTER Atlas had already created the contact --
-            -- the one failure this saga exists to prevent.
-            --
-            -- The whole block is one transaction, so no window exists where the
-            -- column is unconstrained. Re-adding validates existing rows, which
-            -- is the point: removing a value that rows still hold must fail
-            -- loudly here rather than silently leave them unenforceable.
-            IF EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conname = 'chk_customers_customer_type'
-                  AND conrelid = 'customers'::regclass
-            ) THEN
-                ALTER TABLE customers
-                    DROP CONSTRAINT chk_customers_customer_type;
-            END IF;
-            ALTER TABLE customers
-                ADD CONSTRAINT chk_customers_customer_type
-                CHECK (customer_type IN (__CUSTOMER_TYPE_VALUES__));
-        END $$;
-        """.replace(
-            "__CUSTOMER_TYPE_VALUES__",
-            ", ".join(f"'{value}'" for value in CUSTOMER_TYPES),
-        )
+        SELECT pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint
+        WHERE conname = 'chk_customers_customer_type'
+          AND conrelid = 'customers'::regclass
+        """
     )
+    expected_values = set(CUSTOMER_TYPES)
+    deployed_values = (
+        set(re.findall(r"'([^']*)'", deployed["definition"])) if deployed else None
+    )
+    if deployed_values != expected_values:
+        values_sql = ", ".join(f"'{value}'" for value in CUSTOMER_TYPES)
+        db.execute(
+            f"""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'chk_customers_customer_type'
+                      AND conrelid = 'customers'::regclass
+                ) THEN
+                    ALTER TABLE customers
+                        DROP CONSTRAINT chk_customers_customer_type;
+                END IF;
+                ALTER TABLE customers
+                    ADD CONSTRAINT chk_customers_customer_type
+                    CHECK (customer_type IN ({values_sql}));
+            END $$;
+            """
+        )
     db.execute("""
         CREATE TABLE IF NOT EXISTS atlas_linkage_backfill_batches (
             id                     BIGSERIAL PRIMARY KEY,
