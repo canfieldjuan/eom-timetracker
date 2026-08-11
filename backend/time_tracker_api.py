@@ -2723,6 +2723,10 @@ class AtlasLinkageBackfillApplyRequest(AtlasLinkageBackfillPlanRequest):
     confirmation: str = Field(min_length=1, max_length=100)
 
 
+class CustomerTypeChangeRequest(BaseModel):
+    customerType: str = Field(min_length=1, max_length=32)
+
+
 class CustomerTypeRefreshPlanRequest(BaseModel):
     reason: str = Field(min_length=10, max_length=500)
 
@@ -13062,6 +13066,119 @@ def admin_get_customer(
             customer = _canonical_customer(cur, customer_id)
     append_access_log(request, "CUSTOMER_VIEWED", True, f"Customer {customer_id}")
     return {"success": True, "customer": customer}
+
+
+def _atlas_customer_type_body(contact_id: str, customer_type: str) -> Dict[str, Any]:
+    """Build the operator mutation that changes ONE contact's customer_type.
+
+    Deliberately carries no identity fields. Atlas's operator boundary applies
+    whatever fields it receives as operator intent, so including full_name,
+    email or phone here would rewrite those values on the contact as a side
+    effect of a type change -- and sending them as null would clear them. The
+    only field this operation owns is the type.
+    """
+    return {
+        "contact_id": contact_id,
+        "customer_type": customer_type,
+        "contact_type": "customer",
+        "source_channel": ATLAS_OPERATOR_SOURCE_CHANNEL,
+        "source_ref": f"customer-type:{contact_id}",
+    }
+
+
+@app.patch("/api/admin/customers/{customer_id}/customer-type")
+def admin_set_customer_type(
+    customer_id: int,
+    payload: CustomerTypeChangeRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Change a customer's type by asking Atlas, then mirroring what it says.
+
+    admin_patch_customer refuses customer_type as system-managed, and keeps
+    refusing it: Atlas is the sole write authority. This is the one door that
+    changes it, and it changes it THERE -- the local row is only ever updated
+    from Atlas's response, never on the tracker's own say-so.
+    """
+    requested = payload.customerType.strip().lower()
+    if requested not in CUSTOMER_TYPES:
+        _raise_validation_error(
+            "Unsupported customer type",
+            {"customerType": f"must be one of {', '.join(CUSTOMER_TYPES)}"},
+        )
+
+    existing = db.query_one(
+        "SELECT id, name, atlas_contact_id, customer_type FROM customers "
+        "WHERE id = %s",
+        (customer_id,),
+    )
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    contact_id = existing["atlas_contact_id"]
+    if not contact_id:
+        # No Atlas contact means no account to classify. Writing the type
+        # locally would create exactly the divergence this slice exists to
+        # prevent: a mirror holding a value its source of truth never agreed to.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This Customer is not linked to an Atlas contact yet, so its "
+                "type cannot be set. Link it first."
+            ),
+        )
+
+    # A fresh key per request rather than a hash of the intent. A content-derived
+    # key would collide across a repeated transition -- residential, back to
+    # commercial, then residential again would replay the first mutation -- the
+    # same trap that made plan_token unusable as a batch identity in #163.
+    # Replay is safe here without one: this sets an absolute value, not a delta,
+    # so applying it twice lands in the same state.
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_OPERATOR_CONTACTS_PATH,
+            admin,
+            payload=_atlas_customer_type_body(str(contact_id), requested),
+            idempotency_key=str(uuid4()),
+        )
+    except AtlasFunnelRequestError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    confirmed = _customer_type_from_operator_result(atlas_result)
+    if confirmed is None:
+        # Atlas did not echo a type it would itself accept, so this cannot be
+        # mirrored. Do NOT fall back to writing `requested` -- that is the
+        # tracker asserting a classification on its own authority. If Atlas did
+        # apply the change and merely failed to report it, the #2357 refresh
+        # reconciles the mirror later; a wrong local write would not self-heal.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Atlas did not confirm the customer type; nothing was changed "
+                "locally. Re-check the contact in Atlas."
+            ),
+        )
+
+    db.execute(
+        "UPDATE customers SET customer_type = %s, updated_at = NOW() WHERE id = %s",
+        (confirmed, customer_id),
+    )
+    append_access_log(
+        request,
+        "CUSTOMER_TYPE_CHANGED",
+        True,
+        f"customer={customer_id} contact={contact_id} "
+        f"from={existing['customer_type']} requested={requested} "
+        f"applied={confirmed}",
+    )
+    return {
+        "success": True,
+        "customerId": customer_id,
+        "customerType": confirmed,
+        # Surfaced rather than hidden: Atlas is the authority, so if it settled
+        # on something other than what was asked, the caller must see that.
+        "requestedCustomerType": requested,
+        "atlasContactId": str(contact_id),
+    }
 
 
 @app.patch("/api/admin/customers/{customer_id}")
