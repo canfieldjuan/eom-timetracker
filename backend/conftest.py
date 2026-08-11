@@ -202,6 +202,19 @@ def stub_atlas_funnel(setup_db, monkeypatch):
     import time_tracker_api as api
 
     def _get(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            # Default: Atlas recognizes every id the tracker submits, so the
+            # linkage audit reports no dangling links. A test that wants a
+            # dangling link overrides api.requests.get to omit the planted id.
+            submitted = list((params or {}).get("contact_id") or [])
+            return _FakeAtlasResponse(
+                200,
+                {
+                    "knownContactIds": [str(value) for value in submitted],
+                    "checked": len(submitted),
+                    "limit": 100,
+                },
+            )
         return _FakeAtlasResponse(
             200,
             {
