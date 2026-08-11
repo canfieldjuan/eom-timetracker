@@ -13125,8 +13125,8 @@ def admin_set_customer_type(
     # applies only if the row still holds the value it was read at, so a
     # concurrent transition makes this one fail loudly instead of clobbering it.
     existing = db.query_one(
-        "SELECT id, name, atlas_contact_id, customer_type FROM customers "
-        "WHERE id = %s",
+        "SELECT id, name, atlas_contact_id, customer_type, updated_at "
+        "FROM customers WHERE id = %s",
         (customer_id,),
     )
     return _apply_customer_type_change(
@@ -13238,12 +13238,26 @@ def _apply_customer_type_change(
     # because the alternative is a correctness argument that lives in two other
     # functions: add one relink path without that guard and this silently
     # mirrors the wrong contact's classification.
+    # updated_at is in the predicate because comparing VALUES cannot see an ABA
+    # transition. From unknown: this request sets Atlas commercial and stalls,
+    # another sets residential, a third sets unknown again -- a value-only
+    # compare matches `unknown` and writes the stale commercial. Every writer of
+    # customer_type sets updated_at = NOW(), so a moved row fails the compare
+    # even when it landed back on the same value. The cost is a spurious 409 if
+    # an unrelated field changed in the window, which is the safe direction.
     updated = db.query_one(
         "UPDATE customers SET customer_type = %s, updated_at = NOW() "
         "WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s "
         "AND atlas_contact_id IS NOT DISTINCT FROM %s "
+        "AND updated_at IS NOT DISTINCT FROM %s "
         "RETURNING id",
-        (confirmed, customer_id, existing["customer_type"], contact_id),
+        (
+            confirmed,
+            customer_id,
+            existing["customer_type"],
+            contact_id,
+            existing["updated_at"],
+        ),
     )
     if updated is None:
         raise HTTPException(
@@ -13254,13 +13268,29 @@ def _apply_customer_type_change(
                 "and try again."
             ),
         )
+    # One Atlas contact can be held by several customers -- the linkage audit
+    # reports exactly these duplicate groups, and there are live ones. They all
+    # mirror the SAME account, so leaving the siblings behind would have this
+    # route serve two different types for one Atlas contact. Fan out, as the
+    # #2357 refresh already does for the same reason.
+    #
+    # Unguarded on purpose: the compare-and-set above established that this
+    # request won the race for this contact, and these rows are copies of the
+    # value it just confirmed rather than independent decisions.
+    siblings = db.query_all(
+        "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+        "WHERE atlas_contact_id = %s AND id <> %s "
+        "AND customer_type IS DISTINCT FROM %s "
+        "RETURNING id",
+        (confirmed, contact_id, customer_id, confirmed),
+    )
     append_access_log(
         request,
         "CUSTOMER_TYPE_CHANGED",
         True,
         f"customer={customer_id} contact={contact_id} "
         f"from={existing['customer_type']} requested={requested} "
-        f"applied={confirmed}",
+        f"applied={confirmed} siblings={len(siblings)}",
     )
     return {
         "success": True,

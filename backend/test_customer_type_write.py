@@ -462,3 +462,70 @@ def test_a_relink_in_flight_stops_the_mirror_write(client, auth, monkeypatch):
     assert _type_of(customer) == "unknown", (
         "a type confirmed for the old contact must not land on the new link"
     )
+
+
+def test_an_aba_transition_is_detected(client, auth, monkeypatch):
+    """A value-only compare cannot see an intermediate state.
+
+    From unknown: this request sets Atlas commercial and stalls; two others
+    move the row to residential and back to unknown. Comparing values alone
+    matches `unknown` again and writes the stale commercial. updated_at moves
+    on every write, so the compare fails even when the value returns.
+    """
+    contact = str(uuid.uuid4())
+    customer = _customer("ABA", contact, "unknown")
+    churned = {"done": False}
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        if not churned["done"]:
+            churned["done"] = True
+            # Away and back again, landing on the ORIGINAL value.
+            db.execute(
+                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                "WHERE id = %s",
+                ("residential", customer),
+            )
+            db.execute(
+                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                "WHERE id = %s",
+                ("unknown", customer),
+            )
+        return _atlas_echoing("commercial")(
+            url, headers=headers, json=json, timeout=timeout
+        )
+
+    monkeypatch.setattr(api.requests, "post", _post)
+    resp = client.patch(_path(customer), headers=auth,
+                        json={"customerType": "commercial"})
+    assert churned["done"], "the test must actually churn the row"
+    assert resp.status_code == 409, resp.text
+    assert _type_of(customer) == "unknown", (
+        "the stale answer must not land just because the value returned"
+    )
+
+
+def test_every_customer_sharing_the_contact_is_mirrored(client, auth, monkeypatch):
+    """Duplicate links mirror ONE account and must not disagree.
+
+    Postgres permits several customers to share an atlas_contact_id, the
+    linkage audit reports those groups, and live ones exist. Updating only the
+    requested row would have this route serve two different types for one Atlas
+    contact.
+    """
+    shared = str(uuid.uuid4())
+    other = str(uuid.uuid4())
+    primary = _customer("Shared A", shared, "unknown")
+    twin = _customer("Shared B", shared, "unknown")
+    unrelated = _customer("Unrelated", other, "residential")
+    monkeypatch.setattr(api.requests, "post", _atlas_echoing("commercial"))
+
+    resp = client.patch(_path(primary), headers=auth,
+                        json={"customerType": "commercial"})
+    assert resp.status_code == 200, resp.text
+    assert _type_of(primary) == "commercial"
+    assert _type_of(twin) == "commercial", (
+        "a customer sharing the contact still showed the old type"
+    )
+    assert _type_of(unrelated) == "residential", (
+        "a customer on a different contact must not be touched"
+    )
