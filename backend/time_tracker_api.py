@@ -4094,6 +4094,19 @@ def _lock_funnel_lead_transition(cur: Any, contact_id: str) -> None:
     )
 
 
+# The set Atlas owns, mirrored here. This tuple is the single tracker-side
+# source: the CHECK constraint below is GENERATED from it, so the literal
+# cannot drift between the filter and the database the way two hand-written
+# copies would.
+#
+# It remains an enumerated copy of an externally owned set -- the tracker
+# cannot import Atlas's definition across the repo boundary. A value Atlas
+# adds later is therefore dropped by the mirror (recorded as 'unknown', never
+# stored wrong) until this tuple is updated, which is the safe direction to
+# fail. Deriving it for real needs Atlas to publish the set, e.g. through the
+# capability manifest; tracked separately.
+CUSTOMER_TYPES = ("residential", "commercial", "unknown")
+
 def _ensure_customer_site_schema() -> None:
     """Install and backfill the Customer/Site model in one transaction."""
     with db.get_conn() as conn:
@@ -4734,10 +4747,13 @@ def _ensure_schema_migrations() -> None:
             ) THEN
                 ALTER TABLE customers
                     ADD CONSTRAINT chk_customers_customer_type
-                    CHECK (customer_type IN ('residential', 'commercial', 'unknown'));
+                    CHECK (customer_type IN (__CUSTOMER_TYPE_VALUES__));
             END IF;
         END $$;
-        """
+        """.replace(
+            "__CUSTOMER_TYPE_VALUES__",
+            ", ".join(f"'{value}'" for value in CUSTOMER_TYPES),
+        )
     )
     db.execute("""
         CREATE TABLE IF NOT EXISTS atlas_linkage_backfill_batches (
@@ -11807,6 +11823,21 @@ def _finalize_customer_atlas_reservation(
                             "contact while this reconciliation was in flight",
                             {"customerId": customer_id, "atlasContactId": linked},
                         )
+                    # The winner linked the SAME contact, so this reservation
+                    # finalizes normally -- but its UPDATE matched nothing, and
+                    # the linkage-backfill endpoint that won sets only
+                    # atlas_contact_id. Without this the type Atlas just
+                    # reported is dropped on the floor and the customer keeps
+                    # 'unknown' purely because of who won a race.
+                    if customer_type is not None:
+                        cur.execute(
+                            """
+                            UPDATE customers
+                            SET customer_type = %s, updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (customer_type, customer_id),
+                        )
             else:
                 customer_id = _insert_customer(
                     cur,
@@ -11854,11 +11885,6 @@ def _note_customer_atlas_error(reservation_id: str, reason: str) -> bool:
         logger.exception("Could not save customer Atlas reservation error")
         return False
 
-
-# Mirrors ATLAS EOM_CUSTOMER_TYPES and both chk_*_customer_type constraints.
-# Atlas owns the value; this tuple only decides what the mirror will accept
-# back, so a value outside it is dropped rather than stored.
-CUSTOMER_TYPES = ("residential", "commercial", "unknown")
 
 def _customer_type_from_operator_result(result: Dict[str, Any]) -> Optional[str]:
     """Read the account type Atlas reported, or None when it reported none.

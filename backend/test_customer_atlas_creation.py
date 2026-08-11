@@ -1225,3 +1225,77 @@ def test_reconciling_against_an_older_atlas_leaves_the_type_alone(
 
     assert response.status_code == 200, response.text
     assert _stored_type(name) == "residential"
+
+
+def test_a_concurrent_link_to_the_same_contact_still_mirrors_the_type(
+    client, auth, monkeypatch
+):
+    """Losing a race must not cost the classification.
+
+    The linkage-backfill endpoint can link the same customer while the Atlas
+    call is in flight; it sets only atlas_contact_id. The finalizer's
+    conditional UPDATE then matches nothing, and because the winner linked the
+    SAME contact there is no conflict to raise -- so without an explicit apply
+    the type Atlas just reported is dropped and the customer keeps 'unknown'
+    purely because of who won.
+    """
+    from conftest import _FakeAtlasResponse  # type: ignore[attr-defined]
+
+    name = _name("Race Keeps Type")
+    customer_id = _unlinked_customer(name)
+
+    def _post_then_link(url, *, headers=None, json=None, timeout=None):
+        assert str(url).endswith(api.ATLAS_OPERATOR_CONTACTS_PATH)
+        key = (headers or {}).get("Idempotency-Key", "")
+        contact_id = fake_atlas_contact_id(key)
+        # The backfill wins the race, linking the SAME contact and setting
+        # only atlas_contact_id -- exactly what that endpoint does.
+        db.execute(
+            "UPDATE customers SET atlas_contact_id = %s WHERE id = %s "
+            "AND atlas_contact_id IS NULL",
+            (contact_id, customer_id),
+        )
+        return _FakeAtlasResponse(
+            201,
+            {
+                "success": True,
+                "contactId": contact_id,
+                "operation": "contact_created",
+                "idempotent": False,
+                "contact": {"customerType": "commercial"},
+            },
+        )
+
+    monkeypatch.setattr(api.requests, "post", _post_then_link)
+
+    response = client.post(
+        f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth
+    )
+
+    assert response.status_code == 200, response.text
+    assert _stored_type(name) == "commercial", (
+        "the reported type must survive losing the link race"
+    )
+
+
+def test_the_check_constraint_is_generated_from_the_tuple():
+    """One tracker-side source, proven at the database.
+
+    The accepted set is written once as CUSTOMER_TYPES and the CHECK is built
+    from it. Asserting the constraint's actual definition -- rather than that
+    the interpolation exists -- is what proves the two cannot drift.
+    """
+    definition = db.query_one(
+        """
+        SELECT pg_get_constraintdef(oid) AS def
+        FROM pg_constraint
+        WHERE conname = 'chk_customers_customer_type'
+          AND conrelid = 'customers'::regclass
+        """
+    )
+    assert definition is not None, "the CHECK must exist"
+    rendered = definition["def"]
+    for value in api.CUSTOMER_TYPES:
+        assert f"'{value}'" in rendered, f"{value} missing from the CHECK"
+    # And nothing beyond the tuple is admitted.
+    assert rendered.count("::text") <= len(api.CUSTOMER_TYPES) + 1
