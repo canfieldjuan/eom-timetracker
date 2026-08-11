@@ -646,6 +646,136 @@ def test_native_site_schedule_preview_allocates_monthly_rate_across_same_month_r
     assert body["summary"]["estRevenue"] == 80
 
 
+def test_native_site_schedule_forecast_uses_site_rules_without_writing_jobs(
+    client,
+    auth,
+):
+    chicago = ZoneInfo("America/Chicago")
+    service_day = datetime.now(chicago).date() + timedelta(days=1)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Forecast Source",
+                site_type="Commercial",
+                rate=210,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+    before_jobs = db.query_one(
+        "SELECT COUNT(*) AS count FROM jobs WHERE location_id = %s",
+        (site_id,),
+    )["count"]
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [service_day.weekday()],
+            "localStartTime": "08:00",
+            "localEndTime": "11:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    native = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4, "planning_source": "native"},
+    )
+    assert native.status_code == 200, native.text
+    body = native.json()
+    assert body["planningSource"] == "native"
+    assert body["ruleCount"] >= 1
+    job = next(
+        row
+        for week in body["weeks"]
+        for row in week["jobs"]
+        if row["locationId"] == site_id
+    )
+    assert job["ruleId"] == created.json()["rule"]["id"]
+    assert job["scheduledDate"] == str(service_day)
+    assert job["plannedHours"] == 3
+    assert job["estRevenue"] == 210
+    assert job["issues"] == []
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM jobs WHERE location_id = %s",
+        (site_id,),
+    )["count"] == before_jobs
+
+    default = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4},
+    )
+    assert default.status_code == 200, default.text
+    assert default.json()["planningSource"] == "calendar"
+    assert all(
+        row.get("locationId") != site_id
+        for week in default.json()["weeks"]
+        for row in week["jobs"]
+    )
+
+
+def test_native_site_schedule_forecast_allocates_monthly_rate_across_full_month(
+    client,
+    auth,
+):
+    chicago = ZoneInfo("America/Chicago")
+    today = datetime.now(chicago).date()
+    year = today.year + (1 if today.month == 12 else 0)
+    month = 1 if today.month == 12 else today.month + 1
+    month_start = date(year, month, 1)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Forecast Monthly",
+                site_type="Commercial",
+                rate=400,
+                rate_type="monthly",
+                expected_hours=2,
+            )
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "evening",
+            "cadence": "weekly",
+            "weekdays": [month_start.weekday()],
+            "localStartTime": "18:00",
+            "localEndTime": "20:00",
+            "startsOn": str(month_start),
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    forecast = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 12, "planning_source": "native"},
+    )
+    assert forecast.status_code == 200, forecast.text
+    matching_jobs = [
+        row
+        for week in forecast.json()["weeks"]
+        for row in week["jobs"]
+        if row["locationId"] == site_id
+    ]
+    assert matching_jobs
+    month_jobs = [
+        row
+        for row in matching_jobs
+        if row["scheduledDate"].startswith(f"{year}-{month:02d}-")
+    ]
+    assert len(month_jobs) >= 4
+    assert round(sum(row["estRevenue"] for row in month_jobs), 2) == 400
+
+
 def test_native_site_schedule_preview_reports_partial_employee_rate_coverage(
     client,
     auth,
@@ -925,6 +1055,7 @@ def test_native_site_schedule_preview_excludes_nonexistent_dst_window(
     assert body["summary"]["jobCount"] == 0
     assert body["summary"]["excludedJobCount"] == 1
     job = body["jobs"][0]
+    assert job["includedInForecast"] is False
     assert job["estRevenue"] is None
     assert job["estLaborCost"] is None
     assert {issue["code"] for issue in job["issues"]} >= {"invalid_service_window"}
@@ -7997,10 +8128,17 @@ def test_operations_forecast_route_keeps_allowed_horizon_gate(
 ):
     calls: list[int] = []
 
-    def fake_builder(weeks_ahead, *, timezone_name, now_provider):
+    def fake_builder(
+        weeks_ahead,
+        *,
+        timezone_name,
+        now_provider,
+        planning_source,
+    ):
         calls.append(weeks_ahead)
         assert timezone_name == "America/Chicago"
         assert now_provider().tzinfo is not None
+        assert planning_source == "calendar"
         return {
             "success": True,
             "weeksAhead": weeks_ahead,
@@ -8020,12 +8158,22 @@ def test_operations_forecast_route_keeps_allowed_horizon_gate(
         headers=auth,
         params={"weeks_ahead": 1},
     )
+    rejected_source = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4, "planning_source": "legacy"},
+    )
 
     assert allowed.status_code == 200, allowed.text
     assert allowed.json()["weeksAhead"] == 8
     assert calls == [8]
     assert rejected.status_code == 400
     assert rejected.json()["error"] == "weeks_ahead must be one of: 4, 8, 12"
+    assert rejected_source.status_code == 400
+    assert (
+        rejected_source.json()["error"]
+        == "planning_source must be calendar or native"
+    )
     assert calls == [8]
 
 
