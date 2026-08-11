@@ -4740,15 +4740,29 @@ def _ensure_schema_migrations() -> None:
         """
         DO $$
         BEGIN
-            IF NOT EXISTS (
+            -- Dropped and re-added unconditionally, NOT skipped when the name
+            -- already exists. CUSTOMER_TYPES is expected to gain a value when
+            -- Atlas adds one, and a create-once guard would leave the deployed
+            -- constraint pinned to the old set: the parser would accept the new
+            -- value and the INSERT would then violate a stale CHECK, rejecting
+            -- local finalization AFTER Atlas had already created the contact --
+            -- the one failure this saga exists to prevent.
+            --
+            -- The whole block is one transaction, so no window exists where the
+            -- column is unconstrained. Re-adding validates existing rows, which
+            -- is the point: removing a value that rows still hold must fail
+            -- loudly here rather than silently leave them unenforceable.
+            IF EXISTS (
                 SELECT 1 FROM pg_constraint
                 WHERE conname = 'chk_customers_customer_type'
                   AND conrelid = 'customers'::regclass
             ) THEN
                 ALTER TABLE customers
-                    ADD CONSTRAINT chk_customers_customer_type
-                    CHECK (customer_type IN (__CUSTOMER_TYPE_VALUES__));
+                    DROP CONSTRAINT chk_customers_customer_type;
             END IF;
+            ALTER TABLE customers
+                ADD CONSTRAINT chk_customers_customer_type
+                CHECK (customer_type IN (__CUSTOMER_TYPE_VALUES__));
         END $$;
         """.replace(
             "__CUSTOMER_TYPE_VALUES__",

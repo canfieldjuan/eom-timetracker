@@ -1299,3 +1299,40 @@ def test_the_check_constraint_is_generated_from_the_tuple():
         assert f"'{value}'" in rendered, f"{value} missing from the CHECK"
     # And nothing beyond the tuple is admitted.
     assert rendered.count("::text") <= len(api.CUSTOMER_TYPES) + 1
+
+
+def test_the_check_is_rebuilt_when_the_type_set_changes(monkeypatch):
+    """A create-once guard would pin production to the old set.
+
+    CUSTOMER_TYPES is expected to gain a value when Atlas adds one. If the
+    constraint were only created when absent, the deployed CHECK would stay on
+    the old set: the parser would accept the new value and the INSERT would
+    then violate a stale constraint, rejecting local finalization AFTER Atlas
+    had created the contact.
+    """
+    def _definition() -> str:
+        return db.query_one(
+            """
+            SELECT pg_get_constraintdef(oid) AS def
+            FROM pg_constraint
+            WHERE conname = 'chk_customers_customer_type'
+              AND conrelid = 'customers'::regclass
+            """
+        )["def"]
+
+    assert "prospective" not in _definition()
+
+    monkeypatch.setattr(
+        api, "CUSTOMER_TYPES", api.CUSTOMER_TYPES + ("prospective",)
+    )
+    try:
+        api._ensure_schema_migrations()
+        rebuilt = _definition()
+        assert "prospective" in rebuilt, (
+            "the constraint must follow the tuple, not the first deployment"
+        )
+    finally:
+        monkeypatch.undo()
+        api._ensure_schema_migrations()
+
+    assert "prospective" not in _definition(), "and back again when it shrinks"
