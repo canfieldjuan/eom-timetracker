@@ -5458,10 +5458,16 @@ def _ensure_schema_migrations() -> None:
     # ATLAS #2357: durable record of each customer_type mirror refresh. The
     # snapshot holds the exact from/to per customer, so a refresh driven by a
     # wrong Atlas value can be read back and reversed.
+    # plan_token is deliberately NOT unique here, unlike the linkage-backfill
+    # table this was modelled on. There the token hashes operator-supplied
+    # mappings; here it hashes a DERIVED diff, and the same diff legitimately
+    # recurs -- a customer moved commercial -> residential -> commercial ->
+    # residential produces the identical token on the first and third refresh.
+    # The batch id is the identity; the token stays for traceability.
     db.execute("""
         CREATE TABLE IF NOT EXISTS customer_type_refresh_batches (
             id                     BIGSERIAL PRIMARY KEY,
-            plan_token             TEXT NOT NULL UNIQUE,
+            plan_token             TEXT NOT NULL,
             applied_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
             applied_by_name        TEXT NOT NULL,
             reason                 TEXT NOT NULL,
@@ -5470,9 +5476,19 @@ def _ensure_schema_migrations() -> None:
             created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+    # Drop the UNIQUE that an earlier build of this table created, so a database
+    # already carrying it stops rejecting a legitimate repeated transition.
+    db.execute(
+        "ALTER TABLE customer_type_refresh_batches "
+        "DROP CONSTRAINT IF EXISTS customer_type_refresh_batches_plan_token_key"
+    )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_customer_type_refresh_batches_created "
         "ON customer_type_refresh_batches(created_at)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_customer_type_refresh_batches_token "
+        "ON customer_type_refresh_batches(plan_token)"
     )
     db.execute("""
         CREATE TABLE IF NOT EXISTS payroll_verification_batches (
@@ -15112,6 +15128,14 @@ def _fetch_known_contacts(
 
     known = set()
     types: Dict[str, str] = {}
+    # Version skew is a property of the whole fetch, not of one batch. Above 100
+    # distinct ids this loop issues several requests, which can straddle an
+    # Atlas deployment: an early batch omits customerTypes while a later one
+    # reports it. Judging each batch alone would accept the omission as skew and
+    # still apply the types the newer batches returned -- the partial refresh
+    # this route exists to refuse. Track presence across every batch instead.
+    batches_with_field = 0
+    batches_total = 0
     for start in range(0, len(distinct_ids), _KNOWN_CONTACTS_BATCH):
         batch = distinct_ids[start : start + _KNOWN_CONTACTS_BATCH]
         try:
@@ -15167,7 +15191,9 @@ def _fetch_known_contacts(
         # build would yield a confident partial refresh -- some batches
         # applied, the malformed ones quietly skipped -- with nothing
         # recording which. Degrade the whole read instead.
+        batches_total += 1
         if "customerTypes" in body:
+            batches_with_field += 1
             reported = body.get("customerTypes")
             if not isinstance(reported, dict) or any(
                 not isinstance(value, str) for value in reported.values()
@@ -15187,6 +15213,23 @@ def _fetch_known_contacts(
             for key, value in reported.items():
                 if str(key) in known:
                     types[str(key)] = value
+
+    if 0 < batches_with_field < batches_total:
+        # Some batches reported the field and some did not: the reads straddled
+        # an Atlas deployment, so neither "version skew" nor "fully reported"
+        # is true and any plan built from this evidence would be partial.
+        return (
+            set(),
+            {},
+            {
+                "status": "unavailable",
+                "checked": 0,
+                "error": (
+                    "Atlas reported customerTypes for only some batches; the "
+                    "reads straddled a deployment"
+                ),
+            },
+        )
 
     return known, types, {"status": "ok", "checked": len(distinct_ids), "error": None}
 

@@ -1169,3 +1169,117 @@ def test_apply_does_not_hold_the_mutation_lock_during_atlas_io(
         f"no Atlas I/O may happen while the mutation lock is held, got {events}"
     )
     assert _get_type(customer) == "commercial"
+
+
+# -- review round 2 findings (ATLAS #2357) --------------------------------------
+
+
+def _refresh_once(client, auth, expect=200):
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    resp = client.post(TYPE_APPLY_PATH, headers=auth, json={
+        "reason": TYPE_REASON,
+        "planToken": body["planToken"],
+        "confirmation": body["confirmationPhrase"],
+    })
+    assert resp.status_code == expect, resp.text
+    return resp
+
+
+def test_a_repeated_transition_can_be_applied_again(client, auth, monkeypatch):
+    """The same diff legitimately recurs and must not collide on plan_token.
+
+    commercial -> residential -> commercial -> residential produces an
+    identical snapshot (and therefore an identical token) on the first and
+    third refresh. The empty-plan guard does not cover this: the plan here is
+    non-empty. The batch id is the identity; the token is not unique.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Flip Flop", contact)
+    _set_type(customer, "commercial")
+
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "residential"}))
+    _refresh_once(client, auth)
+    assert _get_type(customer) == "residential"
+
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+    _refresh_once(client, auth)
+    assert _get_type(customer) == "commercial"
+
+    # Third refresh reproduces the first plan exactly.
+    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "residential"}))
+    _refresh_once(client, auth)
+    assert _get_type(customer) == "residential"
+
+    assert db.query_one(
+        "SELECT COUNT(*) AS n FROM customer_type_refresh_batches "
+        "WHERE snapshot::text LIKE %s",
+        (f"%{TEST_PREFIX}%",),
+    )["n"] == 3
+
+
+def test_batches_straddling_an_atlas_deploy_are_refused(client, auth, monkeypatch):
+    """Version skew is a property of the whole fetch, not of one batch.
+
+    With more than one batch the reads can straddle an Atlas deployment: an
+    early response omits customerTypes, a later one reports it. Judging each
+    batch alone would read the omission as skew and still apply the types the
+    newer batch returned -- a partial refresh.
+    """
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    a = _create_customer("Straddle A", first)
+    b = _create_customer("Straddle B", second)
+    _set_type(a, "commercial")
+    _set_type(b, "commercial")
+    # One id per request, so two linked customers means two batches.
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    seen = []
+
+    def _mixed(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            body = {"knownContactIds": submitted, "checked": len(submitted),
+                    "limit": 100}
+            # Only the second request comes from the upgraded Atlas.
+            if len(seen) > 1:
+                body["customerTypes"] = {v: "residential" for v in submitted}
+            return _Resp(200, body)
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _mixed)
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert len(seen) > 1, "test must exercise more than one batch"
+    assert resp.status_code == 503, resp.text
+    assert _get_type(a) == "commercial"
+    assert _get_type(b) == "commercial"
+
+
+def test_every_batch_omitting_the_field_is_still_plain_version_skew(
+    client, auth, monkeypatch
+):
+    """The mixed-batch guard must not break the supported skew case."""
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    a = _create_customer("Skew Multi A", first)
+    b = _create_customer("Skew Multi B", second)
+    _set_type(a, "commercial")
+    _set_type(b, "residential")
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+    monkeypatch.setattr(api.requests, "get", _atlas_types({}, include_field=False))
+
+    body = client.post(TYPE_PREVIEW_PATH, headers=auth,
+                       json={"reason": TYPE_REASON}).json()
+    assert body["summary"]["customersToUpdate"] == 0
+    assert body["summary"]["skippedTypeNotReported"] >= 2
+    assert _get_type(a) == "commercial"
+    assert _get_type(b) == "residential"
