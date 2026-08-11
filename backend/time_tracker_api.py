@@ -15167,11 +15167,21 @@ def _fetch_known_contacts(
             return set(), {}, transport, transport
         known_ids = body.get("knownContactIds")
         checked = body.get("checked")
+        # `batch` is what WE asked for and is the only trustworthy reference.
+        # Validating the response against its own knownContactIds is circular:
+        # a malformed batch B could name batch A's id in both knownContactIds
+        # and customerTypes, satisfy every self-consistency check, and retype
+        # customer A. It is also an ID-level fault, not merely a type one --
+        # an unrequested id landing in `known` can MASK a dangling link, since
+        # the audit reports an id as dangling only when it is absent from that
+        # set.
+        requested = {str(value) for value in batch}
         if (
             not isinstance(known_ids, list)
             or not isinstance(checked, int)
             or isinstance(checked, bool)
             or checked < len(batch)
+            or not {str(value) for value in known_ids} <= requested
         ):
             # A 200 that omits knownContactIds or under-reports the count cannot
             # be trusted: treating a missing set as "known nothing" would flag
@@ -15179,7 +15189,10 @@ def _fetch_known_contacts(
             malformed_ids = {
                 "status": "unavailable",
                 "checked": 0,
-                "error": "Atlas known-contacts response was incomplete or malformed",
+                "error": (
+                    "Atlas known-contacts response was incomplete, malformed, "
+                    "or named an id outside the requested batch"
+                ),
             }
             return set(), {}, malformed_ids, malformed_ids
         for value in known_ids:

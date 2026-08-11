@@ -1497,3 +1497,103 @@ def test_the_audit_survives_a_cross_batch_key_bleed(client, auth, monkeypatch):
     assert len(seen) > 1
     assert body["atlasLinkVerification"]["status"] == "ok"
     assert dangling_customer in {row["customerId"] for row in body["danglingLinks"]}
+
+
+# -- review round 5 finding (ATLAS #2357) ---------------------------------------
+
+
+def _claims_foreign_id(foreign_id, resolve=True, with_types=True):
+    """Batch responses that name an id the request never submitted."""
+    seen = []
+
+    def _get(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            resolved = list(submitted)
+            if len(seen) > 1 and resolve:
+                resolved.append(foreign_id)  # never requested in THIS batch
+            body = {"knownContactIds": resolved, "checked": len(submitted),
+                    "limit": 100}
+            if with_types:
+                body["customerTypes"] = {v: "residential" for v in resolved}
+            return _Resp(200, body)
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    return _get, seen
+
+
+def test_a_response_naming_an_unrequested_id_is_rejected(client, auth, monkeypatch):
+    """Round 4's equality check validated the response against ITSELF.
+
+    batch_known came from the same response, so a malformed batch B naming
+    batch A's id in both knownContactIds and customerTypes satisfied it and
+    still retyped customer A. The requested batch is the only trustworthy
+    reference.
+    """
+    import time_tracker_api as api
+
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    victim = _create_customer("Foreign A", first)
+    other = _create_customer("Foreign B", second)
+    _set_type(victim, "commercial")
+    _set_type(other, "commercial")
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    getter, seen = _claims_foreign_id(first)
+    monkeypatch.setattr(api.requests, "get", getter)
+
+    resp = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert len(seen) > 1, "test must exercise more than one batch"
+    assert resp.status_code == 503, resp.text
+    assert _get_type(victim) == "commercial", "batch B must not retype customer A"
+    assert _get_type(other) == "commercial"
+
+
+def test_an_unrequested_id_is_an_id_level_fault_for_the_audit_too(
+    client, auth, monkeypatch
+):
+    """An unrequested id in `known` can MASK a dangling link.
+
+    The audit reports an id as dangling only when it is absent from `known`,
+    so accepting ids the request never submitted lets a malformed response
+    hide a broken link. That makes it an ID-level fault, not a type-level one,
+    and the audit must degrade rather than report a clean verdict.
+    """
+    import time_tracker_api as api
+
+    dead = str(uuid.uuid4())
+    alive = str(uuid.uuid4())
+    dangling_customer = _create_customer("Masked Dead", dead)
+    _create_customer("Masked Alive", alive)
+    monkeypatch.setattr(api, "_KNOWN_CONTACTS_BATCH", 1)
+
+    seen = []
+
+    def _masking(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(v) for v in (params or {}).get("contact_id") or []]
+            seen.append(submitted)
+            # `dead` never resolves in its OWN batch, but every other batch
+            # claims it -- which would mask the dangling link if accepted.
+            resolved = [v for v in submitted if v != dead]
+            if dead not in submitted:
+                resolved.append(dead)
+            return _Resp(200, {"knownContactIds": resolved,
+                               "checked": len(submitted), "limit": 100})
+        return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
+                           "nextCursor": None, "capabilities": []})
+
+    monkeypatch.setattr(api.requests, "get", _masking)
+    body = client.get(AUDIT_PATH, headers=auth).json()
+    # One request is enough: the very first batch that does not request `dead`
+    # already claims it, and the fetch fails fast rather than continuing.
+    assert len(seen) >= 1
+    assert body["atlasLinkVerification"]["status"] == "unavailable", (
+        "an unrequested id corrupts the id verdict and must not read as clean"
+    )
+    # Withheld, not falsely clean: the list is empty BECAUSE it degraded.
+    assert body["danglingLinks"] == []
+    assert dangling_customer  # planted; the point is the status, not the row
