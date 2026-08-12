@@ -7,14 +7,15 @@ the business rule that gives each one its meaning:
 
 - A normal GPS arrival finds one globally nearest saved location and records
   that location without considering the worker's assigned plan or the Site
-  type (`backend/time_tracker_api.py:376-413`, `10279-10350`). A nearby
+  type (`backend/time_tracker_api.py:470-507`, `12500-12506`). A nearby
   residential pin can therefore become the recorded customer when the worker
   explicitly taps arrival at a different nearby home.
 - A Site QR token identifies a specific active Site, but QR issuance and action
-  resolution do not distinguish Commercial from Residential (`backend/time_tracker_api.py:7611-7628`, `7831-7962`).
+  resolution do not distinguish Commercial from Residential
+  (`backend/time_tracker_api.py:7149-7175`, `9187-9281`, `9408-9487`).
 - The only persisted Site model is customer-owned and carries service/rate
-  fields; creation requires a Customer (`backend/time_tracker_api.py:2210-2230`,
-  `2406-2408`, `13242-13252`). It cannot truthfully represent paid internal
+  fields; creation requires a Customer (`backend/schema.sql:36-77`,
+  `backend/time_tracker_api.py:15809-15848`). It cannot truthfully represent paid internal
   dispatch work at the office.
 
 The result is a category error: a location matcher or customer Site is being
@@ -63,8 +64,8 @@ work, and makes office time either unmatched or customer-shaped reporting data.
   idempotency, and additive employee/admin responses.
 - `backend/operations_schedule.py` and the legacy analytics path consume
   paired visit/departure and Home Base evidence consistently. Payroll minute
-  calculation remains based on clock intervals (`backend/time_tracker_api.py:16050-16058`,
-  `16199-16231`).
+  calculation remains based on clock intervals (`backend/time_tracker_api.py:19427-19455`,
+  `19734-19754`).
 - Website portal UI presents the employee only the valid action for their
   current context and preserves keyboard, English/Spanish, GPS, retry, and
   stale-session handling.
@@ -80,7 +81,7 @@ work, and makes office time either unmatched or customer-shaped reporting data.
 - Do not make a missing Home Base scan silently pass, and do not block a paid
   shift when a documented exception is allowed.
 - Do not hard-code the 50 m default. Use the deployed configured match/geofence
-  radius (`backend/time_tracker_api.py:258-269`, `2979-2990`).
+  radius (`backend/time_tracker_api.py:258-271`, `3290-3301`).
 - Do not revoke existing QR tokens. New UI/policy restricts normal QR use to
   Commercial Sites while preserving backward-compatible handling of existing
   tokens.

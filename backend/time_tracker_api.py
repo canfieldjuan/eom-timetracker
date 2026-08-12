@@ -6642,7 +6642,9 @@ def _home_base_policy_for_employee(
           AND crew.name = %s
         ORDER BY policy.id
         LIMIT 1
-    """ + (" FOR UPDATE OF hb, policy" if for_update else "")
+    """ + (
+        " FOR UPDATE OF hb, policy, crew, membership" if for_update else ""
+    )
     params = (int(employee_id), local_day, local_day, MORNING_CREW_NAME)
     if cur is not None:
         cur.execute(query, params)
@@ -10191,11 +10193,36 @@ def record_home_base_scan(
         shift_id = _plain_time_action_shift_id(result, response)
         if shift_id is None:
             raise RuntimeError("Home Base action did not return a shift id")
+        event_policy = policy
+        if payload.action == "start":
+            # Crew membership can change independently of the timesheet and
+            # Home Base configuration locks. The write must therefore hold the
+            # effective membership row while it records a new paid Home Base
+            # start, rather than trusting preflight eligibility.
+            current_policy = _home_base_policy_for_employee(
+                int(employee["id"]),
+                now_utc,
+                cur=cur,
+                for_update=True,
+            )
+            if (
+                current_policy is None
+                or int(current_policy["home_base_id"])
+                != int(validated["home_base"]["home_base_id"])
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Home Base membership changed before this scan could be "
+                        "recorded; try again with the current policy."
+                    ),
+                )
+            event_policy = current_policy
         response["homeBaseEvent"] = _record_home_base_event(
             cur,
             shift_id=shift_id,
             employee_id=int(employee["id"]),
-            policy=policy,
+            policy=event_policy,
             action=payload.action,
             outcome="recorded",
             recorded_at=now_utc,
@@ -12114,6 +12141,28 @@ def clock_in(
     ) -> None:
         if not (home_base["enforced"] and home_base_exception and home_base["policy"]):
             return
+        # The mutator runs under the timesheet/config locks, but Morning Crew
+        # membership is maintained by a separate writer. Re-read and lock the
+        # effective membership in this persistence transaction so an exception
+        # cannot start a Home Base shift after that membership has been retired.
+        current_policy = _home_base_policy_for_employee(
+            int(employee["id"]),
+            now_utc,
+            cur=cur,
+            for_update=True,
+        )
+        if (
+            current_policy is None
+            or int(current_policy["home_base_id"])
+            != int(home_base["policy"]["home_base_id"])
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Home Base membership changed before this shift could be "
+                    "recorded; try again with the current policy."
+                ),
+            )
         shift_id = _plain_time_action_shift_id(result, response)
         if shift_id is None:
             raise RuntimeError("Clock-in did not return a shift id")
@@ -12121,7 +12170,7 @@ def clock_in(
             cur,
             shift_id=shift_id,
             employee_id=int(employee["id"]),
-            policy=home_base["policy"],
+            policy=current_policy,
             action="start",
             outcome="exception",
             recorded_at=now_utc,
@@ -12559,6 +12608,31 @@ def log_visit(
         shift_id = _plain_time_action_shift_id(result, response)
         if not isinstance(visit, dict) or visit.get("id") is None or shift_id is None:
             raise RuntimeError("Explicit Site arrival was not stored")
+        # The visible visit, its persisted GPS metadata, and its evidence row
+        # must all describe the same Site configuration. The first metadata
+        # value was built during preflight; replace it with the geofence that
+        # this commit-time cursor just validated before serializing the receipt.
+        current_gps_meta = _selected_site_gps_meta(
+            current_site,
+            current_geofence,
+            payload,
+            planned_visit_id=(
+                int(current_planned_visit["planned_visit_id"])
+                if current_planned_visit is not None
+                else None
+            ),
+        )
+        visit["gpsMeta"] = current_gps_meta
+        cur.execute(
+            """
+            UPDATE visits
+            SET gps_meta = %s
+            WHERE id = %s AND shift_id = %s
+            """,
+            (json.dumps(current_gps_meta), int(visit["id"]), int(shift_id)),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("Explicit Site arrival metadata was not stored")
         cur.execute(
             """
             INSERT INTO visit_evidence_events (

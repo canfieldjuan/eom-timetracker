@@ -2773,6 +2773,143 @@ def _utilization_segment(
     }
 
 
+def _home_base_dispatch_windows(
+    *,
+    shift: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    departures: List[Dict[str, Any]],
+    home_base_events: List[Dict[str, Any]],
+) -> List[Tuple[datetime, datetime, List[str]]]:
+    """Return only the paid envelope intervals proven to be Home Base work.
+
+    A start event proves the interval before the first customer arrival; an end
+    event proves the interval after the last customer departure. Both the
+    utilization and profitability views consume these exact boundaries, so their
+    different segment vocabularies cannot silently classify the same Home Base
+    evidence differently.
+    """
+    if not home_base_events:
+        return []
+
+    clock_in = shift["clock_in"]
+    clock_out = shift.get("clock_out")
+    if clock_out is None or clock_out <= clock_in:
+        return []
+
+    valid_arrivals: List[datetime] = []
+    ordered_visits = sorted(
+        visits,
+        key=lambda visit: (visit["arrival_time"], int(visit.get("id") or 0)),
+    )
+    for index, visit in enumerate(ordered_visits):
+        arrival = visit["arrival_time"]
+        if arrival >= clock_out:
+            continue
+        if arrival >= clock_in:
+            # Preserve the established behavior for an arrival that begins
+            # inside the corrected paid envelope.
+            valid_arrivals.append(arrival)
+            continue
+
+        # A payroll correction can move clock-in into an already-active
+        # customer visit. In that case the segment builder below clamps the
+        # customer interval to corrected clock-in; use that same boundary here
+        # instead of treating the paid customer interval as Home Base overhead.
+        next_arrival = (
+            min(ordered_visits[index + 1]["arrival_time"], clock_out)
+            if index + 1 < len(ordered_visits)
+            else clock_out
+        )
+        matching_departure: Optional[Dict[str, Any]] = None
+        if int(visit.get("sequence_version") or 1) >= 2:
+            matching_departure = next(
+                (
+                    departure
+                    for departure in departures
+                    if departure.get("visit_id") is not None
+                    and int(departure["visit_id"]) == int(visit["id"])
+                ),
+                None,
+            )
+            work_end = (
+                matching_departure["departure_time"]
+                if matching_departure is not None
+                else arrival
+            )
+        else:
+            visit_location_id = visit.get("location_id")
+            if visit_location_id is not None:
+                matching_departure = next(
+                    (
+                        departure
+                        for departure in departures
+                        if departure.get("location_id") == visit_location_id
+                        and arrival <= departure["departure_time"] <= next_arrival
+                    ),
+                    None,
+                )
+            work_end = (
+                matching_departure["departure_time"]
+                if matching_departure is not None
+                else next_arrival
+            )
+        if work_end > clock_in:
+            valid_arrivals.append(clock_in)
+    valid_arrivals.sort()
+    valid_departures = sorted(
+        (
+            departure["departure_time"]
+            for departure in departures
+            if clock_in < departure["departure_time"] <= clock_out
+        )
+    )
+
+    windows: List[Tuple[datetime, datetime, List[str]]] = []
+    start_events = [
+        event for event in home_base_events if event.get("action") == "start"
+    ]
+    end_events = [
+        event for event in home_base_events if event.get("action") == "end"
+    ]
+    if start_events:
+        first_arrival = valid_arrivals[0] if valid_arrivals else clock_out
+        if first_arrival > clock_in:
+            windows.append(
+                (
+                    clock_in,
+                    first_arrival,
+                    [
+                        f"home_base_start_{event.get('outcome') or 'recorded'}"
+                        for event in start_events
+                    ],
+                )
+            )
+    if end_events:
+        # A newer Home Base end action refuses an active visit. For historical
+        # evidence, only a known departure can prove where dispatch begins;
+        # otherwise keeping the time unassigned is safer than rewriting a
+        # customer interval as office work.
+        last_departure = valid_departures[-1] if valid_departures else (
+            # An end-only event proves arrival at Home Base, but it does not
+            # prove that a pre-existing no-visit shift began as dispatch time.
+            # A start event is the durable internal-start boundary required to
+            # classify that whole shift as Home Base overhead.
+            clock_in if start_events and not valid_arrivals else None
+        )
+        if last_departure is not None and clock_out > last_departure:
+            windows.append(
+                (
+                    last_departure,
+                    clock_out,
+                    [
+                        f"home_base_end_{event.get('outcome') or 'recorded'}"
+                        for event in end_events
+                    ],
+                )
+            )
+    return windows
+
+
 def _closed_shift_utilization(
     shift: Dict[str, Any],
     visits: List[Dict[str, Any]],
@@ -2813,63 +2950,51 @@ def _closed_shift_utilization(
             )
         ]
 
-    # A Home Base-only shift has no visit claims by design, so every second of
-    # its envelope would otherwise be reported unclassified -- inflating
-    # unknown labor even though a recorded start AND end prove dispatch work.
-    # Scoped deliberately to that shape: a shift WITH visits keeps its existing
-    # partitioning, which this change is not trying to re-litigate.
-    events = home_base_events or []
-    if not visits:
-        outcomes = {
-            (str(event.get("action") or ""), str(event.get("outcome") or ""))
-            for event in events
-        }
-        proven = {action for action, outcome in outcomes if outcome == "recorded"}
-        if {"start", "end"} <= proven:
-            return [
-                _utilization_segment(
-                    shift,
-                    category="categorized",
-                    category_detail="dispatch",
-                    start_second=_epoch_second(shift["clock_in"]),
-                    end_second=_epoch_second(clock_out),
-                    evidence=["paid_shift", "home_base_start", "home_base_end"],
-                )
-            ], []
-
     time_category = str(shift.get("time_category") or "productive")
     if time_category == "non_productive":
         subtype = str(shift.get("non_productive_type") or "").strip()
         if subtype:
-            return [
-                _utilization_segment(
-                    shift,
-                    category="categorized",
-                    category_detail=subtype,
-                    start_second=shift_start,
-                    end_second=shift_end,
-                    location_id=shift.get("location_id"),
-                    location_label=str(shift.get("location_label") or ""),
-                    job_id=shift.get("job_id"),
-                    evidence=["paid_shift", "shift_category"],
-                )
-            ], []
+            return _apply_home_base_dispatch_utilization(
+                [
+                    _utilization_segment(
+                        shift,
+                        category="categorized",
+                        category_detail=subtype,
+                        start_second=shift_start,
+                        end_second=shift_end,
+                        location_id=shift.get("location_id"),
+                        location_label=str(shift.get("location_label") or ""),
+                        job_id=shift.get("job_id"),
+                        evidence=["paid_shift", "shift_category"],
+                    )
+                ],
+                shift=shift,
+                visits=visits,
+                departures=departures,
+                home_base_events=home_base_events or [],
+            ), []
         issue = _utilization_review_item(
             shift,
             code="missing_non_productive_type",
             message="This non-productive shift has no category subtype.",
             occurred_at=shift["clock_in"],
         )
-        return [
-            _utilization_segment(
-                shift,
-                category="unclassified",
-                start_second=shift_start,
-                end_second=shift_end,
-                evidence=["paid_shift", "shift_category"],
-                review_codes=[issue["code"]],
-            )
-        ], [issue]
+        return _apply_home_base_dispatch_utilization(
+            [
+                _utilization_segment(
+                    shift,
+                    category="unclassified",
+                    start_second=shift_start,
+                    end_second=shift_end,
+                    evidence=["paid_shift", "shift_category"],
+                    review_codes=[issue["code"]],
+                )
+            ],
+            shift=shift,
+            visits=visits,
+            departures=departures,
+            home_base_events=home_base_events or [],
+        ), [issue]
 
     review_items: List[Dict[str, Any]] = []
     visit_by_id = {int(row["id"]): row for row in visits}
@@ -3303,7 +3428,92 @@ def _closed_shift_utilization(
                 review_codes=issue_codes,
             )
         )
-    return output, review_items
+    return _apply_home_base_dispatch_utilization(
+        output,
+        shift=shift,
+        visits=visits,
+        departures=departures,
+        home_base_events=home_base_events or [],
+    ), review_items
+
+
+def _apply_home_base_dispatch_utilization(
+    segments: List[Dict[str, Any]],
+    *,
+    shift: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    departures: List[Dict[str, Any]],
+    home_base_events: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Split proven Home Base windows into utilization's dispatch category."""
+    windows = _home_base_dispatch_windows(
+        shift=shift,
+        visits=visits,
+        departures=departures,
+        home_base_events=home_base_events,
+    )
+    if not segments or not windows:
+        return segments
+
+    normalized_windows = [
+        (_epoch_second(start), _epoch_second(end), evidence)
+        for start, end, evidence in windows
+    ]
+    output: List[Dict[str, Any]] = []
+    for segment in segments:
+        boundaries = {int(segment["start_second"]), int(segment["end_second"])}
+        for start_second, end_second, _evidence in normalized_windows:
+            if (
+                int(segment["start_second"]) < end_second
+                and int(segment["end_second"]) > start_second
+            ):
+                boundaries.add(max(int(segment["start_second"]), start_second))
+                boundaries.add(min(int(segment["end_second"]), end_second))
+        ordered = sorted(boundaries)
+        for start_second, end_second in zip(ordered, ordered[1:]):
+            if end_second <= start_second:
+                continue
+            matching_windows = [
+                evidence
+                for window_start, window_end, evidence in normalized_windows
+                if start_second >= window_start and end_second <= window_end
+            ]
+            if not matching_windows:
+                output.append(
+                    {
+                        **segment,
+                        "start_second": start_second,
+                        "end_second": end_second,
+                    }
+                )
+                continue
+            evidence = sorted(
+                {
+                    *(segment.get("evidence") or []),
+                    *(item for items in matching_windows for item in items),
+                }
+            )
+            output.append(
+                {
+                    **segment,
+                    "category": "categorized",
+                    "category_detail": "dispatch",
+                    "start_second": start_second,
+                    "end_second": end_second,
+                    "location_id": None,
+                    "location_label": "Dispatch overhead",
+                    "job_id": None,
+                    "visit_id": None,
+                    "departure_id": None,
+                    "from_location_id": None,
+                    "to_location_id": None,
+                    "from_job_id": None,
+                    "to_job_id": None,
+                    "evidence": evidence,
+                    "correction_id": None,
+                }
+            )
+    return output
 
 
 def _split_utilization_segment(
@@ -3912,120 +4122,12 @@ def _apply_home_base_dispatch_overhead(
     home_base_events: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """Split only proven Home Base envelope time out of customer attribution."""
-    if not segments or not home_base_events:
-        return segments
-
-    clock_in = shift["clock_in"]
-    clock_out = shift.get("clock_out")
-    if clock_out is None or clock_out <= clock_in:
-        return segments
-
-    valid_arrivals: List[datetime] = []
-    ordered_visits = sorted(
-        visits,
-        key=lambda visit: (visit["arrival_time"], int(visit.get("id") or 0)),
+    windows = _home_base_dispatch_windows(
+        shift=shift,
+        visits=visits,
+        departures=departures,
+        home_base_events=home_base_events,
     )
-    for index, visit in enumerate(ordered_visits):
-        arrival = visit["arrival_time"]
-        if arrival >= clock_out:
-            continue
-        if arrival >= clock_in:
-            # Preserve the established behavior for an arrival that begins
-            # inside the corrected paid envelope.
-            valid_arrivals.append(arrival)
-            continue
-
-        # A payroll correction can move clock-in into an already-active
-        # customer visit.  In that case the segment builder below clamps the
-        # customer interval to corrected clock-in; use that same boundary here
-        # instead of treating the paid customer interval as Home Base overhead.
-        next_arrival = (
-            min(ordered_visits[index + 1]["arrival_time"], clock_out)
-            if index + 1 < len(ordered_visits)
-            else clock_out
-        )
-        matching_departure: Optional[Dict[str, Any]] = None
-        if int(visit.get("sequence_version") or 1) >= 2:
-            matching_departure = next(
-                (
-                    departure
-                    for departure in departures
-                    if departure.get("visit_id") is not None
-                    and int(departure["visit_id"]) == int(visit["id"])
-                ),
-                None,
-            )
-            work_end = (
-                matching_departure["departure_time"]
-                if matching_departure is not None
-                else arrival
-            )
-        else:
-            visit_location_id = visit.get("location_id")
-            if visit_location_id is not None:
-                matching_departure = next(
-                    (
-                        departure
-                        for departure in departures
-                        if departure.get("location_id") == visit_location_id
-                        and arrival <= departure["departure_time"] <= next_arrival
-                    ),
-                    None,
-                )
-            work_end = (
-                matching_departure["departure_time"]
-                if matching_departure is not None
-                else next_arrival
-            )
-        if work_end > clock_in:
-            valid_arrivals.append(clock_in)
-    valid_arrivals.sort()
-    valid_departures = sorted(
-        (
-            departure["departure_time"]
-            for departure in departures
-            if clock_in < departure["departure_time"] <= clock_out
-        )
-    )
-    windows: List[Tuple[datetime, datetime, List[str]]] = []
-    start_events = [event for event in home_base_events if event.get("action") == "start"]
-    end_events = [event for event in home_base_events if event.get("action") == "end"]
-    if start_events:
-        first_arrival = valid_arrivals[0] if valid_arrivals else clock_out
-        if first_arrival > clock_in:
-            windows.append(
-                (
-                    clock_in,
-                    first_arrival,
-                    [
-                        f"home_base_start_{event.get('outcome') or 'recorded'}"
-                        for event in start_events
-                    ],
-                )
-            )
-    if end_events:
-        # A newer Home Base end action refuses an active visit.  For historical
-        # evidence, only a known departure can prove where dispatch begins;
-        # otherwise keeping the time unassigned is safer than rewriting a
-        # customer interval as office work.
-        last_departure = valid_departures[-1] if valid_departures else (
-            # An end-only event proves arrival at Home Base, but it does not
-            # prove that a pre-existing no-visit shift began as dispatch time.
-            # A start event is the durable internal-start boundary required to
-            # classify that whole shift as Home Base overhead.
-            clock_in if start_events and not valid_arrivals else None
-        )
-        if last_departure is not None and clock_out > last_departure:
-            windows.append(
-                (
-                    last_departure,
-                    clock_out,
-                    [
-                        f"home_base_end_{event.get('outcome') or 'recorded'}"
-                        for event in end_events
-                    ],
-                )
-            )
     if not windows:
         return segments
 
@@ -7423,6 +7525,7 @@ def build_operations_schedule_router(
                     visits.get(shift_id, []),
                     departures.get(shift_id, []),
                     reviewed_departures=reviewed_departures_by_shift[shift_id],
+                    home_base_events=home_base_events.get(shift_id, []),
                 )
             else:
                 shift_segments = raw_by_shift[shift_id][0]

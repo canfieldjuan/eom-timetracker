@@ -786,6 +786,103 @@ def test_explicit_visit_revalidates_eligibility_inside_the_persistence_transacti
     ) == {"count": 0}
 
 
+def test_explicit_visit_persists_the_geofence_validated_at_commit(
+    client,
+    monkeypatch,
+):
+    """The response, visit row, and evidence row must agree after a pin move."""
+    employee_id, employee_auth = _create_employee(client, "Commit-time geofence")
+    site_id = _insert_site(
+        "Commit-time geofence",
+        location_type="Residential",
+        latitude=39.45000,
+        longitude=-88.85000,
+    )
+    planned_visit_id = _insert_assigned_planned_visit(
+        employee_id=employee_id,
+        location_id=site_id,
+        suffix="commit-time-geofence",
+    )
+    shift_id = _clock_in(client, employee_auth)
+    original_resolver = time_tracker_api._resolve_explicit_visit_site
+    moved_latitude = 39.45020
+    moved = False
+
+    def resolve_after_pin_move(*args, **kwargs):
+        nonlocal moved
+        if kwargs.get("cur") is not None and not moved:
+            moved = True
+            # The original and moved pins both contain this GPS point, so the
+            # request remains valid and only the recorded geofence can reveal
+            # whether persistence trusted preflight or commit-time evidence.
+            db.execute(
+                "UPDATE locations SET lat = %s WHERE id = %s",
+                (moved_latitude, site_id),
+            )
+        return original_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_resolve_explicit_visit_site",
+        resolve_after_pin_move,
+    )
+    payload = {
+        "locationId": site_id,
+        "plannedVisitId": planned_visit_id,
+        "evidenceMethod": "residential_gps",
+        "latitude": 39.45000,
+        "longitude": -88.85000,
+        "accuracy": 5,
+        "idempotencyKey": str(uuid4()),
+    }
+    arrived = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json=payload,
+    )
+    assert moved, "the test never reached the commit-time Site resolver"
+    assert arrived.status_code == 200, arrived.text
+    visit = arrived.json()["visit"]
+    expected_geofence = time_tracker_api.evaluate_site_check_in_geofence(
+        site_latitude=moved_latitude,
+        site_longitude=-88.85000,
+        latitude=payload["latitude"],
+        longitude=payload["longitude"],
+        accuracy=payload["accuracy"],
+    )
+    assert visit["gpsMeta"]["distanceM"] == expected_geofence["distanceM"]
+    assert visit["gpsMeta"]["withinRadius"] is True
+
+    visit_id = int(visit["id"])
+    stored = db.query_one("SELECT gps_meta FROM visits WHERE id = %s", (visit_id,))
+    assert stored is not None
+    stored_meta = stored["gps_meta"]
+    if isinstance(stored_meta, str):
+        stored_meta = json.loads(stored_meta)
+    assert stored_meta == visit["gpsMeta"]
+    event = db.query_one(
+        """
+        SELECT geofence_status, distance_m, accuracy_m
+        FROM visit_evidence_events
+        WHERE visit_id = %s AND shift_id = %s
+        """,
+        (visit_id, shift_id),
+    )
+    assert event is not None
+    assert event["geofence_status"] == expected_geofence["status"]
+    assert float(event["distance_m"]) == expected_geofence["distanceM"]
+    assert float(event["accuracy_m"]) == expected_geofence["accuracyM"]
+
+    replay = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json=payload,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True
+    assert replay.json()["visit"]["gpsMeta"] == visit["gpsMeta"]
+
+
 def test_residential_candidates_require_direct_assignment_or_effective_morning_crew(client):
     employee_id, employee_auth = _create_employee(client, "Residential crew scope")
     morning_crew_id = _enroll_in_morning_crew(employee_id)
@@ -2486,6 +2583,94 @@ def test_utilization_evidence_carries_home_base_events(client, auth):
     )
 
 
+def test_utilization_classifies_exception_dispatch_windows_without_rewriting_customer_time():
+    """Exception evidence uses the same Home Base boundaries as profitability."""
+    start = datetime(2026, 8, 11, 13, tzinfo=timezone.utc)
+    arrival = start + timedelta(minutes=30)
+    departure = start + timedelta(minutes=90)
+    end = start + timedelta(hours=2)
+    shift = {
+        "id": 994,
+        "employee_id": 44,
+        "employee_name": "Exception dispatch test",
+        "clock_in": start,
+        "clock_out": end,
+        "time_category": "productive",
+    }
+    segments, review_items = operations_schedule._closed_shift_utilization(
+        shift,
+        [
+            {
+                "id": 885,
+                "location_id": 77,
+                "location_label": "Customer Site",
+                "arrival_time": arrival,
+                "sequence_version": 2,
+                "job_id": 501,
+            }
+        ],
+        [
+            {
+                "id": 886,
+                "visit_id": 885,
+                "location_id": 77,
+                "departure_time": departure,
+            }
+        ],
+        home_base_events=[
+            {"action": "start", "outcome": "exception"},
+            {"action": "end", "outcome": "exception"},
+        ],
+    )
+
+    assert review_items == []
+    assert [
+        (
+            segment["category"],
+            segment["category_detail"],
+            segment["start_second"],
+            segment["end_second"],
+            segment["location_id"],
+            segment["job_id"],
+        )
+        for segment in segments
+    ] == [
+        (
+            "categorized",
+            "dispatch",
+            int(start.timestamp()),
+            int(arrival.timestamp()),
+            None,
+            None,
+        ),
+        (
+            "on_site",
+            None,
+            int(arrival.timestamp()),
+            int(departure.timestamp()),
+            77,
+            501,
+        ),
+        (
+            "categorized",
+            "dispatch",
+            int(departure.timestamp()),
+            int(end.timestamp()),
+            None,
+            None,
+        ),
+    ]
+    dispatch_evidence = [
+        segment["evidence"]
+        for segment in segments
+        if segment["category_detail"] == "dispatch"
+    ]
+    assert dispatch_evidence == [
+        ["home_base_start_exception", "paid_shift"],
+        ["home_base_end_exception", "paid_shift"],
+    ]
+
+
 def test_moving_home_base_slightly_records_the_new_coordinates(
     client, auth, monkeypatch,
 ):
@@ -2553,6 +2738,92 @@ def test_moving_home_base_slightly_records_the_new_coordinates(
     assert meta["matchedLocation"] == moved_label, (
         f"the audit trail recorded the pre-move Home Base: {meta}"
     )
+
+
+@pytest.mark.parametrize("path", ("scan", "exception"))
+def test_home_base_start_rechecks_membership_in_the_persistence_transaction(
+    client,
+    auth,
+    monkeypatch,
+    path,
+):
+    """A retirement between preflight and commit must roll back either start path."""
+    employee_id, employee_auth = _create_employee(client, f"Membership race {path}")
+    crew_id = _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+    original_policy_lookup = time_tracker_api._home_base_policy_for_employee
+    membership_retired = False
+
+    def retire_before_locked_policy_read(*args, **kwargs):
+        nonlocal membership_retired
+        if kwargs.get("cur") is not None and not membership_retired:
+            membership_retired = True
+            db.execute(
+                """
+                UPDATE crew_memberships
+                SET effective_to = %s
+                WHERE employee_id = %s
+                  AND crew_id = %s
+                  AND effective_to IS NULL
+                """,
+                (
+                    datetime.now(time_tracker_api.APP_TIMEZONE).date(),
+                    employee_id,
+                    crew_id,
+                ),
+            )
+        return original_policy_lookup(*args, **kwargs)
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_home_base_policy_for_employee",
+        retire_before_locked_policy_read,
+    )
+    if path == "scan":
+        qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
+        assert qr.status_code == 200, qr.text
+        response = client.post(
+            "/api/timesheet/home-base/scan",
+            headers=employee_auth,
+            json={
+                "token": qr.json()["token"],
+                "action": "start",
+                "latitude": BASE_LATITUDE,
+                "longitude": BASE_LONGITUDE,
+                "accuracy": 5,
+                "scannedAt": datetime.now(timezone.utc).isoformat(),
+                "idempotencyKey": str(uuid4()),
+            },
+        )
+    else:
+        response = client.post(
+            "/api/timesheet/clock-in",
+            headers=employee_auth,
+            json={
+                "homeBaseExceptionReason": "Office was inaccessible",
+                "latitude": 0,
+                "longitude": 0,
+                "accuracy": 5,
+                "gpsOverrideReason": "test Home Base exception",
+                "gpsOverrideDetail": "The office scan race is intentional.",
+                "idempotencyKey": str(uuid4()),
+            },
+        )
+
+    assert membership_retired, "the test never reached the locked policy read"
+    assert response.status_code == 409, response.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM plain_time_action_receipts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
 
 
 def test_a_shift_started_under_policy_still_owes_its_end_event(client, auth):
