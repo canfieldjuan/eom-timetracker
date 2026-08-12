@@ -399,6 +399,18 @@ def _clean_rows() -> None:
             )
             cur.execute(
                 """
+                DELETE FROM service_schedule_occurrence_exceptions
+                WHERE rule_id IN (
+                    SELECT rule.id
+                    FROM service_schedule_rules rule
+                    JOIN locations location ON location.id = rule.location_id
+                    WHERE location.address LIKE %s
+                )
+                """,
+                (f"{TEST_PREFIX}%",),
+            )
+            cur.execute(
+                """
                 DELETE FROM service_schedule_rules
                 WHERE location_id IN (
                     SELECT id FROM locations WHERE address LIKE %s
@@ -1001,6 +1013,259 @@ def test_native_site_schedule_source_uses_persisted_occurrence_override(
     assert "projectionId" not in site_jobs[0]
     assert body["summary"]["jobCount"] == 0
     assert body["summary"]["cancelledJobCount"] == 1
+
+
+def test_native_site_schedule_cancelled_occurrence_exception_excludes_plan(
+    client,
+    auth,
+):
+    chicago = ZoneInfo("America/Chicago")
+    today = datetime.now(chicago).date()
+    service_day = today + timedelta(days=(7 - today.weekday()) % 7)
+    if service_day <= today:
+        service_day += timedelta(days=7)
+    next_service_day = service_day + timedelta(days=7)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Agenda Cancel Exception",
+                site_type="Commercial",
+                rate=225,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [service_day.weekday()],
+            "localStartTime": "08:00",
+            "localEndTime": "11:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+    rule_id = created.json()["rule"]["id"]
+
+    cancelled = client.put(
+        (
+            "/api/admin/operations/service-schedule-rules/"
+            f"{rule_id}/occurrence-exceptions/{service_day}"
+        ),
+        headers=auth,
+        json={"action": "cancelled", "reason": "Customer requested a skip"},
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["exception"] == {
+        "id": cancelled.json()["exception"]["id"],
+        "ruleId": rule_id,
+        "serviceDate": str(service_day),
+        "action": "cancelled",
+        "scheduledDate": None,
+        "localStartTime": None,
+        "localEndTime": None,
+        "reason": "Customer requested a skip",
+        "createdAt": cancelled.json()["exception"]["createdAt"],
+        "updatedAt": cancelled.json()["exception"]["updatedAt"],
+    }
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": str(service_day),
+            "end_date": str(next_service_day),
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    site_jobs = [row for row in body["jobs"] if row["locationId"] == site_id]
+    assert [row["scheduledDate"] for row in site_jobs] == [
+        str(service_day),
+        str(next_service_day),
+    ]
+    cancelled_job = site_jobs[0]
+    assert cancelled_job["status"] == "cancelled"
+    assert cancelled_job["includedInPlan"] is False
+    assert cancelled_job["plannedHours"] == 3
+    assert cancelled_job["occurrenceException"]["action"] == "cancelled"
+    assert cancelled_job["occurrenceDate"] == str(service_day)
+    assert site_jobs[1]["status"] == "scheduled"
+    assert site_jobs[1]["includedInPlan"] is True
+    assert site_jobs[1]["occurrenceException"] is None
+    assert body["summary"]["jobCount"] == 1
+    assert body["summary"]["cancelledJobCount"] == 1
+    assert body["summary"]["plannedHours"] == 3
+
+    forecast = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4, "planning_source": "native"},
+    )
+    assert forecast.status_code == 200, forecast.text
+    forecast_jobs = [
+        row
+        for week in forecast.json()["weeks"]
+        for row in week["jobs"]
+        if row["locationId"] == site_id
+    ]
+    forecast_cancelled = next(
+        row for row in forecast_jobs if row["scheduledDate"] == str(service_day)
+    )
+    assert forecast_cancelled["status"] == "cancelled"
+    assert forecast_cancelled["includedInForecast"] is False
+    assert forecast_cancelled["estRevenue"] is None
+    assert forecast_cancelled["estLaborCost"] is None
+
+
+def test_native_site_schedule_rescheduled_occurrence_exception_moves_one_visit(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)  # Monday
+    moved_day = date(2026, 7, 22)  # Wednesday
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Agenda Reschedule Exception",
+                site_type="Residential",
+                rate=150,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "08:00",
+            "localEndTime": "10:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+    rule_id = created.json()["rule"]["id"]
+
+    moved = client.put(
+        (
+            "/api/admin/operations/service-schedule-rules/"
+            f"{rule_id}/occurrence-exceptions/{service_day}"
+        ),
+        headers=auth,
+        json={
+            "action": "rescheduled",
+            "scheduledDate": str(moved_day),
+            "localStartTime": "13:00",
+            "localEndTime": "15:00",
+            "reason": "Customer requested Wednesday",
+        },
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["exception"]["action"] == "rescheduled"
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": str(service_day),
+            "end_date": str(moved_day),
+            "planning_source": "native",
+        },
+    )
+    assert response.status_code == 200, response.text
+    site_jobs = [row for row in response.json()["jobs"] if row["locationId"] == site_id]
+    assert len(site_jobs) == 1
+    job = site_jobs[0]
+    assert job["projectionId"] == f"rule-{rule_id}:{service_day}"
+    assert job["occurrenceDate"] == str(service_day)
+    assert job["scheduledDate"] == str(moved_day)
+    assert job["scheduledStart"].endswith("18:00:00Z")
+    assert job["scheduledEnd"].endswith("20:00:00Z")
+    assert job["occurrenceException"]["scheduledDate"] == str(moved_day)
+    assert job["includedInPlan"] is True
+    assert response.json()["summary"]["jobCount"] == 1
+    assert response.json()["summary"]["plannedHours"] == 2
+
+    restored = client.delete(
+        (
+            "/api/admin/operations/service-schedule-rules/"
+            f"{rule_id}/occurrence-exceptions/{service_day}"
+        ),
+        headers=auth,
+    )
+    assert restored.status_code == 200, restored.text
+
+    restored_schedule = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": str(service_day),
+            "end_date": str(moved_day),
+            "planning_source": "native",
+        },
+    )
+    assert restored_schedule.status_code == 200, restored_schedule.text
+    restored_jobs = [
+        row
+        for row in restored_schedule.json()["jobs"]
+        if row["locationId"] == site_id
+    ]
+    assert len(restored_jobs) == 1
+    assert restored_jobs[0]["scheduledDate"] == str(service_day)
+    assert restored_jobs[0]["occurrenceException"] is None
+
+
+def test_native_site_schedule_occurrence_exception_rejects_non_occurrence(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)  # Monday
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Agenda Exception Invalid Date",
+                site_type="Commercial",
+                rate=225,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "08:00",
+            "localEndTime": "11:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+    invalid = client.put(
+        (
+            "/api/admin/operations/service-schedule-rules/"
+            f"{created.json()['rule']['id']}/occurrence-exceptions/"
+            f"{service_day + timedelta(days=1)}"
+        ),
+        headers=auth,
+        json={"action": "cancelled", "reason": "Not a rule date"},
+    )
+    assert invalid.status_code == 422, invalid.text
+    assert invalid.json()["error"] == "serviceDate is not generated by this rule"
 
 
 def test_native_site_schedule_source_includes_prior_day_overnight_overlap(
