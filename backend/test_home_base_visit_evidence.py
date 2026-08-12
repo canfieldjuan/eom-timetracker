@@ -74,6 +74,7 @@ def _clean_rows() -> None:
             "DELETE FROM planned_service_visits WHERE source_calendar_id LIKE %s",
             (f"{TEST_PREFIX}%",),
         )
+        cur.execute("DELETE FROM jobs WHERE customer_name LIKE %s", (f"{TEST_PREFIX}%",))
         cur.execute("DELETE FROM crews WHERE name LIKE %s", (f"{TEST_PREFIX}%",))
         cur.execute(
             "DELETE FROM google_calendar_connections WHERE google_account_email LIKE %s",
@@ -2001,3 +2002,71 @@ def test_home_base_policy_activated_after_the_preflight_read_still_binds(
         assert open_shifts == {"count": 0}, (
             "a shift persisted with no Home Base evidence"
         )
+
+
+def test_job_totals_include_labor_recorded_only_through_a_visit(client, auth):
+    """A Home Base shift's visit to a job must reach that job's totals.
+
+    A Home Base start creates a shift with no job, and a scheduled arrival
+    puts the planned job on the visit only -- the shift-side auto-link is
+    suppressed for internal Home Base shifts. Deriving job hours solely from
+    `shifts.job_id` therefore drops that labor from hours, cost, margin and
+    variance without any sign that it is missing.
+    """
+    employee_id, employee_auth = _create_employee(client, "Visit labor")
+    site_id = _insert_site(
+        "Visit labor",
+        location_type="Residential",
+        latitude=39.55000,
+        longitude=-88.95000,
+    )
+    db.execute("UPDATE employees SET hourly_rate = 20 WHERE id = %s", (employee_id,))
+    job = db.query_one(
+        """
+        INSERT INTO jobs (customer_name, scheduled_date, revenue)
+        VALUES (%s, CURRENT_DATE, 500) RETURNING id
+        """,
+        (f"{TEST_PREFIX} visit labor",),
+    )
+    job_id = int(job["id"])
+
+    shift_id = _clock_in(client, employee_auth)
+    # The shift itself is NOT linked to the job; only the visit is.
+    db.execute("UPDATE shifts SET job_id = NULL WHERE id = %s", (shift_id,))
+    arrival = datetime.now(timezone.utc) - timedelta(hours=2)
+    visit = db.query_one(
+        """
+        INSERT INTO visits (shift_id, location_id, location_label, arrival_time, job_id)
+        VALUES (%s, %s, %s, %s, %s) RETURNING id
+        """,
+        (shift_id, site_id, "Visit labor", arrival, job_id),
+    )
+    visit_id = int(visit["id"])
+    db.execute(
+        """
+        INSERT INTO departures (shift_id, visit_id, location_id, departure_time)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (shift_id, visit_id, site_id, arrival + timedelta(hours=2)),
+    )
+
+    detail = client.get(f"/api/admin/jobs/{job_id}", headers=auth)
+    assert detail.status_code == 200, detail.text
+    body = detail.json()["job"]
+
+    assert body["totalHours"] == pytest.approx(2.0), (
+        "labor recorded through a visit never reached the job totals"
+    )
+    assert body["totalLaborCost"] == pytest.approx(40.0)
+    rows = [r for r in body["shifts"] if r.get("source") == "visit"]
+    assert len(rows) == 1 and rows[0]["visitId"] == visit_id
+
+    # The other direction: once the shift itself carries the job, the visit
+    # must NOT be counted a second time on top of the whole clock interval.
+    db.execute("UPDATE shifts SET job_id = %s WHERE id = %s", (job_id, shift_id))
+    again = client.get(f"/api/admin/jobs/{job_id}", headers=auth)
+    assert again.status_code == 200, again.text
+    regrouped = again.json()["job"]
+    assert [r for r in regrouped["shifts"] if r.get("source") == "visit"] == [], (
+        "a shift already linked to the job also counted its own visit"
+    )

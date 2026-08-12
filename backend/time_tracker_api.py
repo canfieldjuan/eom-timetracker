@@ -26498,6 +26498,44 @@ def admin_get_job(
         (job_id,),
     )
 
+    # Labor recorded against this job through an explicit VISIT, on a shift
+    # that is not itself linked to the job. A Home Base start creates a shift
+    # with no job, and a scheduled arrival puts the planned job on the visit
+    # only -- the shift-side auto-link is suppressed for internal Home Base
+    # shifts. Without this, every hour worked that way is silently missing
+    # from the job's hours, labor cost, margin and variance.
+    #
+    # The `s.job_id IS DISTINCT FROM v.job_id` predicate is what keeps this
+    # additive: a shift already counted above contributes its whole clock
+    # interval, so also counting its visits to the same job would double-count
+    # the overlapping time.
+    visit_rows = db.query_all(
+        """
+        SELECT v.id AS visit_id, s.id AS shift_id, s.employee_id,
+               e.name AS employee_name,
+               v.arrival_time,
+               paired.departure_time,
+               CASE
+                   WHEN paired.departure_time IS NULL THEN NULL
+                   ELSE GREATEST(
+                       0.0,
+                       EXTRACT(EPOCH FROM (paired.departure_time - v.arrival_time))
+                           / 3600.0
+                   )
+               END AS total_hours,
+               COALESCE(s.hourly_rate_cents::numeric / 100, e.hourly_rate)
+                   AS hourly_rate
+        FROM visits v
+        JOIN shifts s ON s.id = v.shift_id
+        JOIN employees e ON e.id = s.employee_id
+        LEFT JOIN departures paired ON paired.visit_id = v.id
+        WHERE v.job_id = %s
+          AND s.job_id IS DISTINCT FROM v.job_id
+        ORDER BY v.arrival_time
+        """,
+        (job_id,),
+    )
+
     shifts = []
     total_hours = 0.0
     total_labor = 0.0
@@ -26516,6 +26554,32 @@ def admin_get_job(
             "hours": round(h, 2),
             "laborCost": round(lc, 2),
             "notes": sr["notes"] or "",
+            "source": "shift",
+        })
+
+    # An unpaired visit has no closed interval, so it contributes no hours --
+    # the same treatment an open shift gets above.
+    for vr in visit_rows:
+        h = float(vr["total_hours"] or 0)
+        rate = float(vr["hourly_rate"]) if vr["hourly_rate"] is not None else None
+        lc = (rate * h) if rate is not None else 0.0
+        total_hours += h
+        total_labor += lc
+        shifts.append({
+            "shiftId": vr["shift_id"],
+            "visitId": vr["visit_id"],
+            "employeeId": vr["employee_id"],
+            "employeeName": vr["employee_name"],
+            "clockIn": to_utc_iso(vr["arrival_time"]) if vr["arrival_time"] else None,
+            "clockOut": (
+                to_utc_iso(vr["departure_time"]) if vr["departure_time"] else None
+            ),
+            "hours": round(h, 2),
+            "laborCost": round(lc, 2),
+            "notes": "",
+            # Marked so a reader can tell a whole-shift row from one that
+            # covers only the visit interval on a shift doing other work too.
+            "source": "visit",
         })
 
     job = _job_row_to_dict(row)
