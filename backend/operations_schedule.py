@@ -2314,8 +2314,16 @@ def _load_utilization_evidence(
     List[Dict[str, Any]],
     Dict[int, List[Dict[str, Any]]],
     Dict[int, List[Dict[str, Any]]],
+    Dict[int, List[Dict[str, Any]]],
 ]:
-    """Load the immutable event atoms needed for paid-time classification."""
+    """Load the immutable event atoms needed for paid-time classification.
+
+    Home Base events are part of that set. The profitability loader already
+    reads them; this one did not, so a closed Home Base-only shift -- which
+    has no visit claims by design -- had its entire paid envelope reported as
+    `unclassified`, inflating unknown labor even though its start and end
+    events prove dispatch work.
+    """
 
     shifts = db.query_all(
         """
@@ -2362,7 +2370,7 @@ def _load_utilization_evidence(
     visits: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     departures: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     if not shift_ids:
-        return shifts, visits, departures
+        return shifts, visits, departures, defaultdict(list)
 
     for row in db.query_all(
         """
@@ -2407,7 +2415,20 @@ def _load_utilization_evidence(
     ):
         departures[int(row["shift_id"])].append(row)
 
-    return shifts, visits, departures
+    home_base_events: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    if shift_ids:
+        for row in db.query_all(
+            """
+            SELECT id, shift_id, action, outcome, exception_reason, recorded_at
+            FROM home_base_events
+            WHERE shift_id = ANY(%s)
+            ORDER BY shift_id, recorded_at, id
+            """,
+            (shift_ids,),
+        ):
+            home_base_events[int(row["shift_id"])].append(row)
+
+    return shifts, visits, departures, home_base_events
 
 
 def _epoch_second(value: datetime) -> int:
@@ -4323,6 +4344,7 @@ def _open_shift_presence(
 def _apply_open_home_base_dispatch_overhead(
     presence: Dict[str, Any],
     home_base_events: List[Dict[str, Any]],
+    visits: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Classify an open no-Site Home Base interval without inventing a Site.
 
@@ -4330,9 +4352,17 @@ def _apply_open_home_base_dispatch_overhead(
     evidence that the shift began at the internal base.  While no customer Site
     is active, the live interval is paid dispatch work.  An end-only event is
     deliberately insufficient here, matching closed-shift classification.
+
+    Only the INITIAL pre-arrival interval qualifies. After a customer arrival,
+    a no-Site interval is travel between customers, not Home Base overhead --
+    and once the shift closes, that same gap goes unassigned unless an end
+    event proves the return envelope, so calling it dispatch while open would
+    be silently rewritten later. Claiming nothing is the honest live answer.
     """
     start_events = [event for event in home_base_events if event.get("action") == "start"]
     if not start_events or presence.get("location_id") is not None:
+        return presence
+    if visits:
         return presence
     evidence = sorted(
         {
@@ -4636,6 +4666,7 @@ def _decorate_schedule_jobs(
                 presence = _apply_open_home_base_dispatch_overhead(
                     presence,
                     home_base_events.get(shift_id, []),
+                    visits.get(shift_id, []),
                 )
                 presence["start"] = max(presence["start"], shift_range_start)
                 presence["end"] = min(presence["end"], shift_range_end)
@@ -6039,6 +6070,7 @@ def _dispatch_overhead_labor_costs(
     dispatch interval has no rate.
     """
     known_labor_exact_cents = Decimal(0)
+    visible_labor_exact_cents = Decimal(0)
     day_weights: Dict[str, float] = defaultdict(float)
     incomplete_days: set[str] = set()
     represented_days: set[str] = set()
@@ -6086,12 +6118,28 @@ def _dispatch_overhead_labor_costs(
         for local_day, hours_value in visible_day_slices:
             weight = Decimal(str(hours_value)) * Decimal(rate_cents)
             day_weights[local_day.isoformat()] += float(weight)
+            # Cost of the VISIBLE hours only. Daily rows show clipped hours
+            # (see the day-slice call above), so pricing the full interval and
+            # then spreading it across those days charges a day for work it
+            # does not display: a two-hour interval with one hour before the
+            # range boundary showed one hour and was billed two.
+            visible_labor_exact_cents += Decimal(str(hours_value)) * Decimal(
+                rate_cents
+            )
 
     known_labor_cents = int(
         known_labor_exact_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     )
+    # Allocated from the visible total, not the full one. The top-level
+    # knownLaborCents deliberately stays whole-interval -- it is the weekly
+    # figure and is internally consistent -- so byDay can sum to less than it
+    # when an interval crosses the range edge. That gap is the out-of-range
+    # portion, and it is real rather than a rounding artifact.
+    visible_labor_cents = int(
+        visible_labor_exact_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
     allocated_by_day = _allocate_cents_by_weight(
-        known_labor_cents,
+        visible_labor_cents,
         dict(day_weights),
     )
     by_day = {
@@ -7282,7 +7330,7 @@ def build_operations_schedule_router(
             resolved_end,
             app_timezone,
         )
-        shifts, visits, departures = _load_utilization_evidence(
+        shifts, visits, departures, home_base_events = _load_utilization_evidence(
             range_start,
             range_end,
             observed_at,
@@ -7309,6 +7357,16 @@ def build_operations_schedule_router(
                 shift,
                 visits.get(shift_id, []),
                 departures.get(shift_id, []),
+            )
+            # Same treatment the profitability path already applies. The helper
+            # returns the segments untouched when a shift has no Home Base
+            # evidence, so shifts that never scanned are unaffected.
+            raw_segments = _apply_home_base_dispatch_overhead(
+                raw_segments,
+                shift=shift,
+                visits=visits.get(shift_id, []),
+                departures=departures.get(shift_id, []),
+                home_base_events=home_base_events.get(shift_id, []),
             )
             prepared_review_items = _prepare_utilization_review_items(
                 raw_review_items,

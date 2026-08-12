@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bcrypt
 import hashlib
+import json
 import math
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
@@ -1817,7 +1818,15 @@ def test_dispatch_labor_cost_is_separate_in_weekly_profitability(monkeypatch):
     assert tuesday["dispatchOverheadLaborCostComplete"] is True
 
 
-def test_cross_boundary_dispatch_labor_cost_matches_the_full_summary(monkeypatch):
+def test_cross_boundary_dispatch_charges_each_day_only_its_visible_cost(monkeypatch):
+    """A day must be charged for the hours it shows, not the whole interval.
+
+    This test previously asserted the opposite -- that Sunday carried the full
+    $36.50 while displaying 1.0 of the interval's 2.0 hours -- which reads as
+    an $36.50/hr day against an $18.25/hr rate. The weekly summary stays
+    whole-interval, so byDay can sum to less than it when work crosses the
+    range edge; that gap is the out-of-range portion and is real.
+    """
     week_start = date(2026, 8, 9)
     start = datetime(2026, 8, 8, 23, tzinfo=timezone.utc)
     end = start + timedelta(hours=2)
@@ -1860,11 +1869,18 @@ def test_cross_boundary_dispatch_labor_cost_matches_the_full_summary(monkeypatch
         now_provider=lambda: datetime(2026, 8, 10, tzinfo=timezone.utc),
     )
 
+    # The weekly figure is unchanged: the full interval is still two hours at
+    # $18.25.
     assert result["summary"]["dispatchOverheadHours"] == 2.0
     assert result["summary"]["dispatchOverheadLaborCost"] == 36.5
     sunday = next(row for row in result["byDay"] if row["date"] == "2026-08-09")
     assert sunday["dispatchOverheadHours"] == 1.0
-    assert sunday["dispatchOverheadLaborCost"] == 36.5
+    # One visible hour at $18.25 -- NOT the full interval's $36.50.
+    assert sunday["dispatchOverheadLaborCost"] == 18.25
+    assert (
+        sunday["dispatchOverheadLaborCost"]
+        == round(sunday["dispatchOverheadHours"] * 18.25, 2)
+    ), "the day's cost does not correspond to the hours it displays"
 
 
 def test_gps_override_rationale_survives_into_the_exception_review(client, auth):
@@ -2352,3 +2368,222 @@ def test_moving_home_base_after_the_scan_stops_the_clock_action(
         "WHERE employee_id = %s AND clock_out IS NULL",
         (employee_id,),
     ) == {"count": 0}
+
+
+def test_open_dispatch_covers_only_the_interval_before_the_first_arrival():
+    """After a customer arrival, a no-Site gap is travel, not Home Base time.
+
+    Classifying every departure gap as dispatch while the shift is open is a
+    claim that gets silently rewritten once the shift closes: the same gap
+    goes unassigned unless an end event proves the return envelope.
+    """
+    start_events = [{"action": "start", "outcome": "recorded"}]
+    presence = {
+        "location_id": None,
+        "location_label": "",
+        "job_id": None,
+        "evidence": ["paid_shift"],
+        "unassigned_gap": True,
+    }
+
+    # Before any arrival: the start scan is durable evidence of dispatch.
+    initial = operations_schedule._apply_open_home_base_dispatch_overhead(
+        dict(presence), start_events, []
+    )
+    assert initial["dispatch_overhead"] is True
+    assert initial["location_label"] == "Dispatch overhead"
+
+    # After an arrival: the same shape must NOT be claimed as Home Base time.
+    after_customer = operations_schedule._apply_open_home_base_dispatch_overhead(
+        dict(presence), start_events, [{"id": 1, "arrival_time": datetime.now(timezone.utc)}]
+    )
+    assert after_customer.get("dispatch_overhead") is not True, (
+        "travel between customers was reported as Home Base overhead"
+    )
+    assert after_customer["unassigned_gap"] is True
+
+    # An active Site is still never overwritten, in either case.
+    on_site = operations_schedule._apply_open_home_base_dispatch_overhead(
+        {**presence, "location_id": 7}, start_events, []
+    )
+    assert on_site.get("dispatch_overhead") is not True
+
+
+def test_utilization_evidence_carries_home_base_events(client, auth):
+    """The utilization loader must see what the profitability loader sees.
+
+    A closed Home Base-only shift has no visit claims by design, so without
+    this its whole paid envelope is reported `unclassified` -- inflating
+    unknown labor even though start/end events prove dispatch work.
+    """
+    employee_id, employee_auth = _create_employee(client, "Utilization evidence")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+    qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
+    assert qr.status_code == 200, qr.text
+    token = qr.json()["token"]
+
+    scan = {
+        "token": token,
+        "action": "start",
+        "latitude": BASE_LATITUDE,
+        "longitude": BASE_LONGITUDE,
+        "accuracy": 5,
+        "scannedAt": datetime.now(timezone.utc).isoformat(),
+        "idempotencyKey": str(uuid4()),
+    }
+    started = client.post(
+        "/api/timesheet/home-base/scan", headers=employee_auth, json=scan)
+    assert started.status_code == 200, started.text
+    shift_id = int(started.json()["entry"]["id"])
+
+    now = datetime.now(timezone.utc)
+    evidence = operations_schedule._load_utilization_evidence(
+        now - timedelta(days=1), now + timedelta(days=1), now)
+    assert len(evidence) == 4, (
+        "the utilization loader still returns no Home Base evidence")
+    home_base_events = evidence[3]
+    assert home_base_events.get(shift_id), (
+        "the Home Base start event never reached the utilization classifier")
+
+
+def test_moving_home_base_slightly_records_the_new_coordinates(
+    client, auth, monkeypatch,
+):
+    """Acceptance and the audit trail must agree on which configuration.
+
+    When the old and new geofences overlap the action still succeeds -- so the
+    only sign of a mid-flight move is the evidence it stores. Persisting the
+    preflight geofence would record the OLD distance for an action accepted
+    against the NEW coordinates, and nothing downstream would reveal it.
+    """
+    employee_id, employee_auth = _create_employee(client, "Small move")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+    qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
+    assert qr.status_code == 200, qr.text
+    token = qr.json()["token"]
+
+    moved_label = "EOM Office Home Base Annex"
+    original = time_tracker_api._resolve_home_base_qr
+    calls = {"n": 0}
+
+    def nudge_after_preflight(*args, **kwargs):
+        calls["n"] += 1
+        result = original(*args, **kwargs)
+        if calls["n"] == 1:
+            # Small enough that the worker stays inside the new geofence.
+            moved = client.put(
+                "/api/admin/home-base",
+                headers=auth,
+                json={
+                    "label": moved_label,
+                    "address": "101 Dispatch Lane, Effingham",
+                    "latitude": BASE_LATITUDE + 0.0001,
+                    "longitude": BASE_LONGITUDE,
+                },
+            )
+            assert moved.status_code == 200, moved.text
+        return result
+
+    monkeypatch.setattr(
+        time_tracker_api, "_resolve_home_base_qr", nudge_after_preflight)
+
+    response = client.post(
+        "/api/timesheet/home-base/scan",
+        headers=employee_auth,
+        json={
+            "token": token,
+            "action": "start",
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "scannedAt": datetime.now(timezone.utc).isoformat(),
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert calls["n"] >= 2, "the token was resolved only once"
+    assert response.status_code == 200, response.text
+
+    shift_id = int(response.json()["entry"]["id"])
+    stored = db.query_one(
+        "SELECT clock_in_gps_meta FROM shifts WHERE id = %s", (shift_id,))
+    meta = stored["clock_in_gps_meta"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    assert meta["matchedLocation"] == moved_label, (
+        f"the audit trail recorded the pre-move Home Base: {meta}"
+    )
+
+
+def test_a_shift_started_under_policy_still_owes_its_end_event(client, auth):
+    """Current crew membership must not retroactively release an open shift.
+
+    Retiring a membership takes effect on the local date, so the policy lookup
+    drops the employee immediately. A shift already started under Home Base
+    would otherwise close with no end event -- and the return interval after
+    its last customer departure is then never classified as dispatch, because
+    that classification requires an end event to exist.
+    """
+    employee_id, employee_auth = _create_employee(client, "Membership retired")
+    crew_id = _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+    qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
+    assert qr.status_code == 200, qr.text
+
+    started = client.post(
+        "/api/timesheet/home-base/scan",
+        headers=employee_auth,
+        json={
+            "token": qr.json()["token"],
+            "action": "start",
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "scannedAt": datetime.now(timezone.utc).isoformat(),
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    # Admin retires the membership while the shift is open.
+    db.execute(
+        """
+        UPDATE crew_memberships
+        SET effective_to = %s
+        WHERE employee_id = %s AND crew_id = %s AND effective_to IS NULL
+        """,
+        (datetime.now(time_tracker_api.APP_TIMEZONE).date(), employee_id, crew_id),
+    )
+    assert time_tracker_api._home_base_policy_for_employee(
+        employee_id, time_tracker_api.utc_now()) is None, "membership was not actually retired"
+
+    # Everything ELSE about this clock-out must be valid, or the assertion
+    # below passes on an unrelated refusal. Without the override reason the
+    # GPS check rejects it first and the Home Base guard is never reached --
+    # which is exactly how the first version of this test passed against the
+    # unfixed code.
+    refused = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "test teardown",
+            "gpsOverrideDetail": "Ending the shift away from a saved site.",
+        },
+    )
+    assert refused.status_code >= 400, (
+        f"the shift closed with no Home Base end event: {refused.text}"
+    )
+    body = refused.json()
+    detail = body.get("detail") if isinstance(body.get("detail"), dict) else body
+    assert str(detail.get("code") or body.get("code")) == "HOME_BASE_REQUIRED", (
+        f"refused, but not by the Home Base guard: {refused.text}"
+    )
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 1}, "the shift was closed despite owing an end event"

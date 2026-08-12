@@ -6578,6 +6578,43 @@ def _row_from_cursor(cur: Any) -> Optional[Dict[str, Any]]:
     return dict(zip(columns, row))
 
 
+def _shift_recorded_home_base_start(
+    shift_id: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    """True when this shift has a recorded Home Base start event.
+
+    The end requirement must follow the shift's own durable evidence, not the
+    employee's CURRENT policy. Retiring a crew membership takes effect on the
+    local date, and the policy lookup excludes the employee from that moment,
+    so an admin edit made while a shift is open would otherwise let it close
+    with no end event -- and the return interval after the last customer
+    departure is then never classified as dispatch, because that requires an
+    end event to exist.
+    """
+    if shift_id is None:
+        return None
+    # Return the policy the shift STARTED under, not merely a boolean: the
+    # refusal has to name a Home Base, and the current lookup may no longer
+    # return one. Reads through the event so the answer survives the crew
+    # membership edit that caused the problem.
+    return db.query_one(
+        """
+        SELECT hb.id AS home_base_id, hb.label, hb.address,
+               crew.name AS crew_name, event.home_base_policy_id AS policy_id
+        FROM home_base_events event
+        JOIN home_bases hb ON hb.id = event.home_base_id
+        LEFT JOIN home_base_policies policy ON policy.id = event.home_base_policy_id
+        LEFT JOIN crews crew ON crew.id = policy.crew_id
+        WHERE event.shift_id = %s
+          AND event.action = 'start'
+          AND event.outcome = 'recorded'
+        ORDER BY event.id
+        LIMIT 1
+        """,
+        (int(shift_id),),
+    )
+
+
 def _home_base_policy_for_employee(
     employee_id: int,
     reference_time: datetime,
@@ -6673,7 +6710,7 @@ def _public_home_base_policy(policy: Optional[Dict[str, Any]]) -> Dict[str, Any]
             "id": int(policy["home_base_id"]),
             "label": str(policy["label"]),
             "address": str(policy.get("address") or ""),
-            "crewName": str(policy["crew_name"]),
+            "crewName": str(policy.get("crew_name") or ""),
         },
     }
 
@@ -10024,15 +10061,24 @@ def record_home_base_scan(
 
     work_date = now_utc.astimezone(APP_TIMEZONE).date().isoformat()
 
+    # What the WRITE validated against. The mutator re-resolves both under the
+    # lock; acceptance already uses those values, and the audit trail has to
+    # record the same ones. Persisting the preflight pair would store the old
+    # distance and status as evidence for an action accepted against the new
+    # coordinates -- and when the two geofences overlap, nothing downstream
+    # would reveal the mismatch.
+    validated = {"home_base": home_base, "geofence": geofence}
+
     def home_base_gps_meta() -> Dict[str, Any]:
+        current = validated["geofence"]
         return {
             "override": False,
             "overrideReason": "",
             "overrideDetail": "",
-            "matchedLocation": str(home_base["label"]),
-            "distanceM": geofence.get("distanceM"),
+            "matchedLocation": str(validated["home_base"]["label"]),
+            "distanceM": current.get("distanceM"),
             "withinRadius": True,
-            "accuracyM": geofence.get("accuracyM"),
+            "accuracyM": current.get("accuracyM"),
             "homeBase": True,
         }
 
@@ -10073,6 +10119,8 @@ def record_home_base_scan(
                 "Home Base moved; GPS no longer confirms you are there. "
                 "Scan again at the current Home Base."
             )
+        validated["home_base"] = current_home_base
+        validated["geofence"] = current_geofence
 
         stale_open = get_stale_open_entry(
             timesheet_data["entries"], int(employee["id"]), now_utc
@@ -10154,7 +10202,7 @@ def record_home_base_scan(
             latitude=payload.latitude,
             longitude=payload.longitude,
             accuracy=payload.accuracy,
-            geofence=geofence,
+            geofence=validated["geofence"],
             idempotency_key=payload.idempotencyKey,
             request_fingerprint=_plain_time_action_request_fingerprint(action_name, payload),
         )
@@ -12142,6 +12190,15 @@ def clock_out(
         open_entry = get_open_entry(timesheet_data["entries"], employee["id"])
         if not open_entry:
             return False, "Not currently clocked in"
+
+        # A shift that STARTED under the policy owes its end event even if the
+        # employee is no longer covered. Current membership decides whether a
+        # NEW shift is enforced; it must not retroactively release an open one.
+        if not home_base["enforced"]:
+            started_under = _shift_recorded_home_base_start(open_entry.get("id"))
+            if started_under:
+                home_base["enforced"] = True
+                home_base["policy"] = started_under
 
         if home_base["enforced"] and not home_base_exception:
             assert home_base["policy"] is not None
