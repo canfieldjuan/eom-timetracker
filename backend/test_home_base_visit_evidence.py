@@ -2070,3 +2070,125 @@ def test_job_totals_include_labor_recorded_only_through_a_visit(client, auth):
     assert [r for r in regrouped["shifts"] if r.get("source") == "visit"] == [], (
         "a shift already linked to the job also counted its own visit"
     )
+
+
+def test_a_token_rotated_after_validation_cannot_still_buy_paid_time(
+    client, auth, monkeypatch,
+):
+    """The scanned nonce must be re-checked under the write lock.
+
+    A fresh Home Base scan validates the token before entering the serialized
+    timesheet update, and rotation runs under its own lock in its own
+    transaction. A token revoked in that window would otherwise still start a
+    paid shift. This path has no committed receipt to replay, so the recheck
+    has to happen inside the write.
+    """
+    employee_id, employee_auth = _create_employee(client, "QR rotation race")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+
+    qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
+    assert qr.status_code == 200, qr.text
+    token = qr.json()["token"]
+
+    original = time_tracker_api._resolve_home_base_qr
+    calls = {"n": 0}
+
+    def rotate_between_the_two_checks(*args, **kwargs):
+        calls["n"] += 1
+        result = original(*args, **kwargs)
+        if calls["n"] == 1:
+            # Admin rotates immediately after the pre-flight validation.
+            rotated = client.post(
+                "/api/admin/home-base/check-in-qr",
+                headers=auth,
+                json={"rotate": True},
+            )
+            assert rotated.status_code == 200, rotated.text
+            assert rotated.json()["token"] != token, "rotation did not change the token"
+        return result
+
+    monkeypatch.setattr(
+        time_tracker_api, "_resolve_home_base_qr", rotate_between_the_two_checks
+    )
+
+    response = client.post(
+        "/api/timesheet/home-base/scan",
+        headers=employee_auth,
+        json={
+            "token": token,
+            "action": "start",
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "scannedAt": datetime.now(timezone.utc).isoformat(),
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+
+    assert calls["n"] >= 2, (
+        "the token was resolved only once, so the write still trusts the "
+        "pre-flight validation"
+    )
+    assert response.status_code >= 400, (
+        f"a revoked token started a paid shift: {response.text}"
+    )
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 0}
+
+
+def test_the_correction_archive_keeps_why_an_override_was_accepted(client, auth):
+    """Deleting the shift cascade-deletes the evidence row.
+
+    So the before-image is the only surviving record. For an outside or
+    uncertain residential arrival the exception pair is empty by constraint,
+    which makes the GPS override fields the entire rationale -- an archive
+    without them cannot say why the arrival was ever accepted.
+    """
+    employee_id, employee_auth = _create_employee(client, "Archive rationale")
+    site_id = _insert_site(
+        "Archive rationale",
+        location_type="Residential",
+        latitude=39.65000,
+        longitude=-88.75000,
+    )
+    planned_visit_id = _insert_assigned_planned_visit(
+        employee_id=employee_id,
+        location_id=site_id,
+        suffix="archive-rationale",
+    )
+    shift_id = _clock_in(client, employee_auth)
+    arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "plannedVisitId": planned_visit_id,
+            "evidenceMethod": "residential_gps",
+            "latitude": 39.75000,
+            "longitude": -88.75000,
+            "accuracy": 5,
+            "gpsOverrideReason": "gps_drift",
+            "gpsOverrideDetail": "Signal put the phone two streets away.",
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert arrival.status_code == 200, arrival.text
+
+    snapshots = time_tracker_api._correction_shift_snapshots([shift_id])
+    assert len(snapshots) == 1, snapshots
+    before = snapshots[0]
+    events = before["visitEvidenceEvents"]
+    assert events, "the before-image carried no evidence rows"
+    assert events[0]["gpsOverrideReason"] == "gps_drift"
+    assert "two streets away" in events[0]["gpsOverrideDetail"]
+
+    # The signature must cover them, or the archive can be altered without
+    # detection. It denylists a fixed set of keys, so new fields are included
+    # by construction -- this asserts that actually holds.
+    signature = time_tracker_api._correction_metadata_signature(before)
+    assert "gps_drift" in signature
+    assert "two streets away" in signature

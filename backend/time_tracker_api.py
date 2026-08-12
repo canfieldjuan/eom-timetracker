@@ -1518,6 +1518,7 @@ def _shift_has_active_payroll_correction(shift_id: int) -> bool:
 
 
 HOME_BASE_CONFIG_LOCK_KEY = "home-base-config"
+HOME_BASE_QR_LOCK_KEY = "home-base-qr"
 
 
 @contextmanager
@@ -1545,9 +1546,21 @@ def timesheet_postgres_advisory_lock():
                 "SELECT pg_advisory_lock(hashtext(%s))",
                 (HOME_BASE_CONFIG_LOCK_KEY,),
             )
+            # Same reasoning for the QR nonce: a scan is validated before this
+            # lock is held, and rotation runs under its own lock in its own
+            # transaction. Without this, a token revoked after validation but
+            # before the write still buys paid time.
+            lock_cur.execute(
+                "SELECT pg_advisory_lock(hashtext(%s))",
+                (HOME_BASE_QR_LOCK_KEY,),
+            )
             try:
                 yield
             finally:
+                lock_cur.execute(
+                    "SELECT pg_advisory_unlock(hashtext(%s))",
+                    (HOME_BASE_QR_LOCK_KEY,),
+                )
                 lock_cur.execute(
                     "SELECT pg_advisory_unlock(hashtext(%s))",
                     (HOME_BASE_CONFIG_LOCK_KEY,),
@@ -8948,7 +8961,10 @@ def admin_home_base_qr(
     _require_canonical_portal_base(request)
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("home-base-qr",))
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (HOME_BASE_QR_LOCK_KEY,),
+            )
             config = _active_home_base_config(cur=cur)
             if not config or config.get("policy_id") is None:
                 raise HTTPException(status_code=409, detail="Home Base is not configured")
@@ -9992,6 +10008,18 @@ def record_home_base_scan(
         }
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        # Re-validate the scanned token under the write lock. The nonce was
+        # checked before that lock was held, and rotation runs in its own
+        # transaction, so a token revoked in between would still buy paid
+        # time. There is no receipt to replay on this path -- the scan is
+        # fresh -- so the check has to happen here.
+        try:
+            _resolve_home_base_qr(payload.token)
+        except HTTPException:
+            return False, (
+                "Home Base QR code changed; scan the current code again."
+            )
+
         stale_open = get_stale_open_entry(
             timesheet_data["entries"], int(employee["id"]), now_utc
         )
@@ -16595,6 +16623,13 @@ def _correction_shift_snapshots(
             evidence.evidence_method,
             evidence.exception_reason,
             evidence.exception_detail,
+            -- For an outside or uncertain residential arrival these two hold
+            -- the ENTIRE acceptance rationale: the exception pair is empty by
+            -- constraint for that method. The evidence row cascade-deletes
+            -- with the shift, so omitting them here leaves a supposedly
+            -- recoverable archive with no record of why it was accepted.
+            evidence.gps_override_reason,
+            evidence.gps_override_detail,
             evidence.geofence_status,
             evidence.distance_m,
             evidence.accuracy_m,
@@ -16804,6 +16839,8 @@ def _correction_shift_snapshots(
             "evidenceMethod": str(row["evidence_method"]),
             "exceptionReason": str(row.get("exception_reason") or ""),
             "exceptionDetail": str(row.get("exception_detail") or ""),
+            "gpsOverrideReason": str(row.get("gps_override_reason") or ""),
+            "gpsOverrideDetail": str(row.get("gps_override_detail") or ""),
             "geofenceStatus": str(row["geofence_status"]),
             "distanceM": (
                 float(row["distance_m"])
