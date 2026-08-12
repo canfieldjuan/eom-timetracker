@@ -2778,8 +2778,17 @@ def _closed_shift_utilization(
     visits: List[Dict[str, Any]],
     departures: List[Dict[str, Any]],
     reviewed_departures: Optional[Dict[int, Dict[str, Any]]] = None,
+    *,
+    home_base_events: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Partition one closed paid envelope without inferring missing events."""
+    """Partition one closed paid envelope without inferring missing events.
+
+    Home Base evidence is classified in THIS module's vocabulary, not by
+    borrowing the profitability overlay: that helper works in datetimes
+    (`segment["start"]`) while these segments carry epoch ints
+    (`segment["start_second"]`), so handing utilization rows to it raises
+    KeyError as soon as a shift actually has Home Base evidence.
+    """
 
     clock_out = shift.get("clock_out")
     if clock_out is None:
@@ -2803,6 +2812,30 @@ def _closed_shift_utilization(
                 occurred_at=shift["clock_in"],
             )
         ]
+
+    # A Home Base-only shift has no visit claims by design, so every second of
+    # its envelope would otherwise be reported unclassified -- inflating
+    # unknown labor even though a recorded start AND end prove dispatch work.
+    # Scoped deliberately to that shape: a shift WITH visits keeps its existing
+    # partitioning, which this change is not trying to re-litigate.
+    events = home_base_events or []
+    if not visits:
+        outcomes = {
+            (str(event.get("action") or ""), str(event.get("outcome") or ""))
+            for event in events
+        }
+        proven = {action for action, outcome in outcomes if outcome == "recorded"}
+        if {"start", "end"} <= proven:
+            return [
+                _utilization_segment(
+                    shift,
+                    category="categorized",
+                    category_detail="dispatch",
+                    start_second=_epoch_second(shift["clock_in"]),
+                    end_second=_epoch_second(clock_out),
+                    evidence=["paid_shift", "home_base_start", "home_base_end"],
+                )
+            ], []
 
     time_category = str(shift.get("time_category") or "productive")
     if time_category == "non_productive":
@@ -7357,15 +7390,6 @@ def build_operations_schedule_router(
                 shift,
                 visits.get(shift_id, []),
                 departures.get(shift_id, []),
-            )
-            # Same treatment the profitability path already applies. The helper
-            # returns the segments untouched when a shift has no Home Base
-            # evidence, so shifts that never scanned are unaffected.
-            raw_segments = _apply_home_base_dispatch_overhead(
-                raw_segments,
-                shift=shift,
-                visits=visits.get(shift_id, []),
-                departures=departures.get(shift_id, []),
                 home_base_events=home_base_events.get(shift_id, []),
             )
             prepared_review_items = _prepare_utilization_review_items(

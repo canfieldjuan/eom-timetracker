@@ -2437,14 +2437,53 @@ def test_utilization_evidence_carries_home_base_events(client, auth):
     assert started.status_code == 200, started.text
     shift_id = int(started.json()["entry"]["id"])
 
+    # Give the envelope real duration. Both scans land in the same second
+    # otherwise, and a zero-length paid interval is correctly rejected as
+    # invalid before any classification runs.
+    db.execute(
+        "UPDATE shifts SET clock_in = clock_in - INTERVAL '2 hours' WHERE id = %s",
+        (shift_id,),
+    )
+    ended = client.post(
+        "/api/timesheet/home-base/scan",
+        headers=employee_auth,
+        json={**scan, "action": "end", "idempotencyKey": str(uuid4())},
+    )
+    assert ended.status_code == 200, ended.text
+    closed = db.query_one(
+        "SELECT clock_in, clock_out FROM shifts WHERE id = %s", (shift_id,))
+    assert closed["clock_out"] > closed["clock_in"], "the envelope has no duration"
+
     now = datetime.now(timezone.utc)
     evidence = operations_schedule._load_utilization_evidence(
         now - timedelta(days=1), now + timedelta(days=1), now)
     assert len(evidence) == 4, (
         "the utilization loader still returns no Home Base evidence")
-    home_base_events = evidence[3]
-    assert home_base_events.get(shift_id), (
-        "the Home Base start event never reached the utilization classifier")
+    assert evidence[3].get(shift_id), (
+        "the Home Base events never reached the utilization classifier")
+
+    # Call the ENDPOINT, not just the loader. The first version of this fix
+    # reused the profitability overlay, which indexes segment["start"] while
+    # utilization segments carry start_second -- so the endpoint raised
+    # KeyError for exactly this shift while a loader-only test stayed green.
+    report = client.get(
+        "/api/admin/operations/utilization",
+        headers=auth,
+        params={
+            "start": (now - timedelta(days=1)).date().isoformat(),
+            "end": (now + timedelta(days=1)).date().isoformat(),
+        },
+    )
+    assert report.status_code == 200, report.text
+    body = report.json()
+    row = next(
+        (r for r in body.get("rows", []) if int(r.get("employeeId", 0)) == employee_id),
+        None,
+    )
+    assert row is not None, "the Home Base shift is absent from the utilization report"
+    assert (row.get("unclassifiedMinutes") or 0) == 0, (
+        f"a proven Home Base envelope was still reported unclassified: {row}"
+    )
 
 
 def test_moving_home_base_slightly_records_the_new_coordinates(
