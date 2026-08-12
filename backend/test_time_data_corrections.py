@@ -519,6 +519,13 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
                 "evidenceMethod": "residential_gps",
                 "exceptionReason": "",
                 "exceptionDetail": "",
+                # Empty here by construction: this arrival is INSIDE the
+                # geofence, so it was never accepted on a GPS override. The
+                # archive still carries the pair, because for an outside or
+                # uncertain arrival it holds the entire acceptance rationale
+                # and the evidence row cascade-deletes with the shift.
+                "gpsOverrideReason": "",
+                "gpsOverrideDetail": "",
                 "geofenceStatus": "inside",
                 "distanceM": 0.0,
                 "accuracyM": 5.0,
