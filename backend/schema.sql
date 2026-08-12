@@ -523,7 +523,8 @@ CREATE TABLE plain_time_action_receipts (
     action                VARCHAR(16) NOT NULL
                               CHECK (action IN (
                                   'clock-in', 'arrive',
-                                  'depart', 'clock-out'
+                                  'depart', 'clock-out',
+                                  'home-base-start', 'home-base-end'
                               )),
     idempotency_key       UUID NOT NULL,
     request_fingerprint   VARCHAR(64) NOT NULL
@@ -651,6 +652,88 @@ CREATE TABLE crew_memberships (
     UNIQUE (crew_id, employee_id, effective_from)
 );
 
+-- The office is an internal paid-workplace boundary, not a Customer/Site.  It
+-- deliberately has no customer, service, rate, revenue, or job reference.
+-- A partial unique index below keeps the first release to one active office
+-- without coupling it to the customer-location domain.
+CREATE TABLE home_bases (
+    id                     BIGSERIAL PRIMARY KEY,
+    label                  TEXT NOT NULL CHECK (char_length(btrim(label)) BETWEEN 1 AND 160),
+    address                TEXT NOT NULL DEFAULT '' CHECK (char_length(address) <= 500),
+    latitude               NUMERIC(10, 7),
+    longitude              NUMERIC(10, 7),
+    active                 BOOLEAN NOT NULL DEFAULT true,
+    check_in_token_nonce   VARCHAR(64),
+    check_in_token_rotated_at TIMESTAMPTZ,
+    created_by             INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (
+        (latitude IS NULL AND longitude IS NULL)
+        OR (latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180)
+    )
+);
+
+CREATE UNIQUE INDEX uq_home_bases_one_active
+    ON home_bases ((active)) WHERE active;
+
+-- Scope is derived from effective-dated crew membership.  No employee list is
+-- copied here, so Morning Crew changes take effect without a second roster.
+CREATE TABLE home_base_policies (
+    id             BIGSERIAL PRIMARY KEY,
+    home_base_id   BIGINT NOT NULL REFERENCES home_bases(id) ON DELETE CASCADE,
+    crew_id        BIGINT NOT NULL REFERENCES crews(id) ON DELETE RESTRICT,
+    active         BOOLEAN NOT NULL DEFAULT true,
+    created_by     INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (home_base_id, crew_id)
+);
+
+CREATE UNIQUE INDEX uq_home_base_policies_one_active
+    ON home_base_policies ((active)) WHERE active;
+
+-- Append-only Home Base evidence.  A documented exception is still durable
+-- evidence, never an invisible bypass, and the one-event-per-shift/action
+-- uniqueness prevents a scan/retry from creating duplicate dispatch markers.
+CREATE TABLE home_base_events (
+    id                 BIGSERIAL PRIMARY KEY,
+    shift_id           INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+    employee_id        INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    home_base_id       BIGINT NOT NULL REFERENCES home_bases(id) ON DELETE RESTRICT,
+    home_base_policy_id BIGINT REFERENCES home_base_policies(id) ON DELETE SET NULL,
+    action             VARCHAR(16) NOT NULL CHECK (action IN ('start', 'end')),
+    outcome            VARCHAR(16) NOT NULL CHECK (outcome IN ('recorded', 'exception')),
+    exception_reason   TEXT NOT NULL DEFAULT '' CHECK (char_length(exception_reason) <= 500),
+    recorded_at        TIMESTAMPTZ NOT NULL,
+    latitude           NUMERIC(10, 7),
+    longitude          NUMERIC(10, 7),
+    accuracy_m         NUMERIC(10, 2),
+    geofence_radius_m  INTEGER,
+    distance_m         NUMERIC(10, 2),
+    geofence_status    VARCHAR(32),
+    idempotency_key    UUID,
+    request_fingerprint VARCHAR(64),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (
+        (outcome = 'recorded' AND exception_reason = '')
+        OR (outcome = 'exception' AND char_length(btrim(exception_reason)) >= 3)
+    ),
+    CHECK (
+        (latitude IS NULL AND longitude IS NULL)
+        OR (latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180)
+    ),
+    UNIQUE (shift_id, action)
+);
+
+CREATE UNIQUE INDEX uq_home_base_events_employee_idempotency
+    ON home_base_events(employee_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+CREATE INDEX idx_home_base_events_review
+    ON home_base_events(outcome, recorded_at DESC);
+CREATE INDEX idx_home_base_events_shift
+    ON home_base_events(shift_id, recorded_at);
+
 -- A reviewed import is the immutable approval boundary. The source and full
 -- resolved plan fingerprints let approval fail closed if Google changes after
 -- preview, while an applied row makes an exact retry idempotent.
@@ -763,6 +846,48 @@ CREATE UNIQUE INDEX uq_planned_visit_active_crew_assignment
 CREATE UNIQUE INDEX uq_planned_visit_active_employee_assignment
     ON planned_visit_assignments(planned_visit_id, employee_id)
     WHERE active AND employee_id IS NOT NULL;
+
+-- Explicit-selection provenance for the additive GPS and QR-fallback visit
+-- flow. Legacy manual visits stay readable without this row.
+CREATE TABLE visit_evidence_events (
+    id                 BIGSERIAL PRIMARY KEY,
+    visit_id           INTEGER NOT NULL UNIQUE REFERENCES visits(id) ON DELETE CASCADE,
+    shift_id           INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+    employee_id        INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+    location_id        INTEGER NOT NULL REFERENCES locations(id) ON DELETE RESTRICT,
+    planned_visit_id   BIGINT REFERENCES planned_service_visits(id) ON DELETE SET NULL,
+    evidence_method    VARCHAR(32) NOT NULL
+                           CHECK (evidence_method IN (
+                               'residential_gps',
+                               'unplanned_residential',
+                               'commercial_qr_fallback'
+                           )),
+    exception_reason   VARCHAR(64) NOT NULL DEFAULT '',
+    exception_detail   TEXT NOT NULL DEFAULT '' CHECK (char_length(exception_detail) <= 500),
+    gps_override_reason TEXT NOT NULL DEFAULT ''
+                           CHECK (char_length(gps_override_reason) <= 200),
+    gps_override_detail TEXT NOT NULL DEFAULT ''
+                           CHECK (char_length(gps_override_detail) <= 500),
+    geofence_status    VARCHAR(32) NOT NULL,
+    distance_m         NUMERIC(10, 2),
+    accuracy_m         NUMERIC(10, 2),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (
+        (evidence_method = 'residential_gps'
+         AND exception_reason = '' AND exception_detail = '')
+        OR (evidence_method = 'unplanned_residential'
+            AND exception_reason = 'unplanned_visit'
+            AND char_length(btrim(exception_detail)) >= 3)
+        OR (evidence_method = 'commercial_qr_fallback'
+            AND exception_reason = 'qr_unavailable'
+            AND char_length(btrim(exception_detail)) >= 3)
+    )
+);
+
+CREATE INDEX idx_visit_evidence_events_review
+    ON visit_evidence_events(evidence_method, created_at DESC);
+CREATE INDEX idx_visit_evidence_events_planned_visit
+    ON visit_evidence_events(planned_visit_id, created_at);
 
 -- Append-only domain provenance lives in PostgreSQL with the mutation it
 -- describes. It is intentionally separate from the best-effort request log.
@@ -1119,6 +1244,12 @@ CREATE INDEX idx_shifts_clock_out    ON shifts(clock_out);
 CREATE INDEX idx_customers_active    ON customers(active);
 CREATE INDEX idx_locations_active    ON locations(active);
 CREATE INDEX idx_locations_customer_id ON locations(customer_id);
+CREATE INDEX idx_locations_active_residential_coordinates
+    ON locations(lat, lng)
+    WHERE active
+      AND location_type = 'Residential'
+      AND lat IS NOT NULL
+      AND lng IS NOT NULL;
 CREATE UNIQUE INDEX uq_locations_address_key
     ON locations(address_key) WHERE address_key IS NOT NULL;
 CREATE INDEX idx_employees_active    ON employees(active);

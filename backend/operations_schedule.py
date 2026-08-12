@@ -2031,6 +2031,7 @@ def _load_time_evidence(
     Dict[int, List[Dict[str, Any]]],
     Dict[Tuple[int, int], List[datetime]],
     List[Dict[str, Any]],
+    Dict[int, List[Dict[str, Any]]],
 ]:
     linked_job_ids = [int(job_id) for job_id in visible_job_ids]
     shifts = _query_all(
@@ -2192,6 +2193,20 @@ def _load_time_evidence(
         ):
             departures[int(row["shift_id"])].append(row)
 
+    home_base_events: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    if shift_ids:
+        for row in _query_all(
+            """
+            SELECT id, shift_id, action, outcome, exception_reason, recorded_at
+            FROM home_base_events
+            WHERE shift_id = ANY(%s)
+            ORDER BY shift_id, recorded_at, id
+            """,
+            (shift_ids,),
+            cursor=cursor,
+        ):
+            home_base_events[int(row["shift_id"])].append(row)
+
     qr_by_employee_site: Dict[Tuple[int, int], List[datetime]] = defaultdict(list)
     # D2 (issue #126): QR-only presence rows have no shift, so they have no rate
     # snapshot and stay on the live employee rate. They are deliberately out of
@@ -2288,7 +2303,7 @@ def _load_time_evidence(
             row["server_checked_in_at"]
         )
 
-    return shifts, visits, departures, qr_by_employee_site, qr_rows
+    return shifts, visits, departures, qr_by_employee_site, qr_rows, home_base_events
 
 
 def _load_utilization_evidence(
@@ -2299,8 +2314,16 @@ def _load_utilization_evidence(
     List[Dict[str, Any]],
     Dict[int, List[Dict[str, Any]]],
     Dict[int, List[Dict[str, Any]]],
+    Dict[int, List[Dict[str, Any]]],
 ]:
-    """Load the immutable event atoms needed for paid-time classification."""
+    """Load the immutable event atoms needed for paid-time classification.
+
+    Home Base events are part of that set. The profitability loader already
+    reads them; this one did not, so a closed Home Base-only shift -- which
+    has no visit claims by design -- had its entire paid envelope reported as
+    `unclassified`, inflating unknown labor even though its start and end
+    events prove dispatch work.
+    """
 
     shifts = db.query_all(
         """
@@ -2347,7 +2370,7 @@ def _load_utilization_evidence(
     visits: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     departures: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     if not shift_ids:
-        return shifts, visits, departures
+        return shifts, visits, departures, defaultdict(list)
 
     for row in db.query_all(
         """
@@ -2392,7 +2415,20 @@ def _load_utilization_evidence(
     ):
         departures[int(row["shift_id"])].append(row)
 
-    return shifts, visits, departures
+    home_base_events: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    if shift_ids:
+        for row in db.query_all(
+            """
+            SELECT id, shift_id, action, outcome, exception_reason, recorded_at
+            FROM home_base_events
+            WHERE shift_id = ANY(%s)
+            ORDER BY shift_id, recorded_at, id
+            """,
+            (shift_ids,),
+        ):
+            home_base_events[int(row["shift_id"])].append(row)
+
+    return shifts, visits, departures, home_base_events
 
 
 def _epoch_second(value: datetime) -> int:
@@ -2737,13 +2773,159 @@ def _utilization_segment(
     }
 
 
+def _home_base_dispatch_windows(
+    *,
+    shift: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    departures: List[Dict[str, Any]],
+    home_base_events: List[Dict[str, Any]],
+) -> List[Tuple[datetime, datetime, List[str]]]:
+    """Return only the paid envelope intervals proven to be Home Base work.
+
+    A start event proves the interval before the first customer arrival; an end
+    event proves the interval after the last customer departure. Both the
+    utilization and profitability views consume these exact boundaries, so their
+    different segment vocabularies cannot silently classify the same Home Base
+    evidence differently.
+    """
+    if not home_base_events:
+        return []
+
+    clock_in = shift["clock_in"]
+    clock_out = shift.get("clock_out")
+    if clock_out is None or clock_out <= clock_in:
+        return []
+
+    valid_arrivals: List[datetime] = []
+    ordered_visits = sorted(
+        visits,
+        key=lambda visit: (visit["arrival_time"], int(visit.get("id") or 0)),
+    )
+    for index, visit in enumerate(ordered_visits):
+        arrival = visit["arrival_time"]
+        if arrival >= clock_out:
+            continue
+        if arrival >= clock_in:
+            # Preserve the established behavior for an arrival that begins
+            # inside the corrected paid envelope.
+            valid_arrivals.append(arrival)
+            continue
+
+        # A payroll correction can move clock-in into an already-active
+        # customer visit. In that case the segment builder below clamps the
+        # customer interval to corrected clock-in; use that same boundary here
+        # instead of treating the paid customer interval as Home Base overhead.
+        next_arrival = (
+            min(ordered_visits[index + 1]["arrival_time"], clock_out)
+            if index + 1 < len(ordered_visits)
+            else clock_out
+        )
+        matching_departure: Optional[Dict[str, Any]] = None
+        if int(visit.get("sequence_version") or 1) >= 2:
+            matching_departure = next(
+                (
+                    departure
+                    for departure in departures
+                    if departure.get("visit_id") is not None
+                    and int(departure["visit_id"]) == int(visit["id"])
+                ),
+                None,
+            )
+            work_end = (
+                matching_departure["departure_time"]
+                if matching_departure is not None
+                else arrival
+            )
+        else:
+            visit_location_id = visit.get("location_id")
+            if visit_location_id is not None:
+                matching_departure = next(
+                    (
+                        departure
+                        for departure in departures
+                        if departure.get("location_id") == visit_location_id
+                        and arrival <= departure["departure_time"] <= next_arrival
+                    ),
+                    None,
+                )
+            work_end = (
+                matching_departure["departure_time"]
+                if matching_departure is not None
+                else next_arrival
+            )
+        if work_end > clock_in:
+            valid_arrivals.append(clock_in)
+    valid_arrivals.sort()
+    valid_departures = sorted(
+        (
+            departure["departure_time"]
+            for departure in departures
+            if clock_in < departure["departure_time"] <= clock_out
+        )
+    )
+
+    windows: List[Tuple[datetime, datetime, List[str]]] = []
+    start_events = [
+        event for event in home_base_events if event.get("action") == "start"
+    ]
+    end_events = [
+        event for event in home_base_events if event.get("action") == "end"
+    ]
+    if start_events:
+        first_arrival = valid_arrivals[0] if valid_arrivals else clock_out
+        if first_arrival > clock_in:
+            windows.append(
+                (
+                    clock_in,
+                    first_arrival,
+                    [
+                        f"home_base_start_{event.get('outcome') or 'recorded'}"
+                        for event in start_events
+                    ],
+                )
+            )
+    if end_events:
+        # A newer Home Base end action refuses an active visit. For historical
+        # evidence, only a known departure can prove where dispatch begins;
+        # otherwise keeping the time unassigned is safer than rewriting a
+        # customer interval as office work.
+        last_departure = valid_departures[-1] if valid_departures else (
+            # An end-only event proves arrival at Home Base, but it does not
+            # prove that a pre-existing no-visit shift began as dispatch time.
+            # A start event is the durable internal-start boundary required to
+            # classify that whole shift as Home Base overhead.
+            clock_in if start_events and not valid_arrivals else None
+        )
+        if last_departure is not None and clock_out > last_departure:
+            windows.append(
+                (
+                    last_departure,
+                    clock_out,
+                    [
+                        f"home_base_end_{event.get('outcome') or 'recorded'}"
+                        for event in end_events
+                    ],
+                )
+            )
+    return windows
+
+
 def _closed_shift_utilization(
     shift: Dict[str, Any],
     visits: List[Dict[str, Any]],
     departures: List[Dict[str, Any]],
     reviewed_departures: Optional[Dict[int, Dict[str, Any]]] = None,
+    *,
+    home_base_events: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Partition one closed paid envelope without inferring missing events."""
+    """Partition one closed paid envelope without inferring missing events.
+
+    Home Base evidence is classified in THIS module's vocabulary, not by
+    borrowing the profitability overlay: that helper works in datetimes
+    (`segment["start"]`) while these segments carry epoch ints
+    (`segment["start_second"]`), so handing utilization rows to it raises
+    KeyError as soon as a shift actually has Home Base evidence.
+    """
 
     clock_out = shift.get("clock_out")
     if clock_out is None:
@@ -2772,35 +2954,47 @@ def _closed_shift_utilization(
     if time_category == "non_productive":
         subtype = str(shift.get("non_productive_type") or "").strip()
         if subtype:
-            return [
-                _utilization_segment(
-                    shift,
-                    category="categorized",
-                    category_detail=subtype,
-                    start_second=shift_start,
-                    end_second=shift_end,
-                    location_id=shift.get("location_id"),
-                    location_label=str(shift.get("location_label") or ""),
-                    job_id=shift.get("job_id"),
-                    evidence=["paid_shift", "shift_category"],
-                )
-            ], []
+            return _apply_home_base_dispatch_utilization(
+                [
+                    _utilization_segment(
+                        shift,
+                        category="categorized",
+                        category_detail=subtype,
+                        start_second=shift_start,
+                        end_second=shift_end,
+                        location_id=shift.get("location_id"),
+                        location_label=str(shift.get("location_label") or ""),
+                        job_id=shift.get("job_id"),
+                        evidence=["paid_shift", "shift_category"],
+                    )
+                ],
+                shift=shift,
+                visits=visits,
+                departures=departures,
+                home_base_events=home_base_events or [],
+            ), []
         issue = _utilization_review_item(
             shift,
             code="missing_non_productive_type",
             message="This non-productive shift has no category subtype.",
             occurred_at=shift["clock_in"],
         )
-        return [
-            _utilization_segment(
-                shift,
-                category="unclassified",
-                start_second=shift_start,
-                end_second=shift_end,
-                evidence=["paid_shift", "shift_category"],
-                review_codes=[issue["code"]],
-            )
-        ], [issue]
+        return _apply_home_base_dispatch_utilization(
+            [
+                _utilization_segment(
+                    shift,
+                    category="unclassified",
+                    start_second=shift_start,
+                    end_second=shift_end,
+                    evidence=["paid_shift", "shift_category"],
+                    review_codes=[issue["code"]],
+                )
+            ],
+            shift=shift,
+            visits=visits,
+            departures=departures,
+            home_base_events=home_base_events or [],
+        ), [issue]
 
     review_items: List[Dict[str, Any]] = []
     visit_by_id = {int(row["id"]): row for row in visits}
@@ -3234,7 +3428,92 @@ def _closed_shift_utilization(
                 review_codes=issue_codes,
             )
         )
-    return output, review_items
+    return _apply_home_base_dispatch_utilization(
+        output,
+        shift=shift,
+        visits=visits,
+        departures=departures,
+        home_base_events=home_base_events or [],
+    ), review_items
+
+
+def _apply_home_base_dispatch_utilization(
+    segments: List[Dict[str, Any]],
+    *,
+    shift: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    departures: List[Dict[str, Any]],
+    home_base_events: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Split proven Home Base windows into utilization's dispatch category."""
+    windows = _home_base_dispatch_windows(
+        shift=shift,
+        visits=visits,
+        departures=departures,
+        home_base_events=home_base_events,
+    )
+    if not segments or not windows:
+        return segments
+
+    normalized_windows = [
+        (_epoch_second(start), _epoch_second(end), evidence)
+        for start, end, evidence in windows
+    ]
+    output: List[Dict[str, Any]] = []
+    for segment in segments:
+        boundaries = {int(segment["start_second"]), int(segment["end_second"])}
+        for start_second, end_second, _evidence in normalized_windows:
+            if (
+                int(segment["start_second"]) < end_second
+                and int(segment["end_second"]) > start_second
+            ):
+                boundaries.add(max(int(segment["start_second"]), start_second))
+                boundaries.add(min(int(segment["end_second"]), end_second))
+        ordered = sorted(boundaries)
+        for start_second, end_second in zip(ordered, ordered[1:]):
+            if end_second <= start_second:
+                continue
+            matching_windows = [
+                evidence
+                for window_start, window_end, evidence in normalized_windows
+                if start_second >= window_start and end_second <= window_end
+            ]
+            if not matching_windows:
+                output.append(
+                    {
+                        **segment,
+                        "start_second": start_second,
+                        "end_second": end_second,
+                    }
+                )
+                continue
+            evidence = sorted(
+                {
+                    *(segment.get("evidence") or []),
+                    *(item for items in matching_windows for item in items),
+                }
+            )
+            output.append(
+                {
+                    **segment,
+                    "category": "categorized",
+                    "category_detail": "dispatch",
+                    "start_second": start_second,
+                    "end_second": end_second,
+                    "location_id": None,
+                    "location_label": "Dispatch overhead",
+                    "job_id": None,
+                    "visit_id": None,
+                    "departure_id": None,
+                    "from_location_id": None,
+                    "to_location_id": None,
+                    "from_job_id": None,
+                    "to_job_id": None,
+                    "evidence": evidence,
+                    "correction_id": None,
+                }
+            )
+    return output
 
 
 def _split_utilization_segment(
@@ -3776,29 +4055,41 @@ def _apply_shift_break_minutes_to_segments(
         for segment in segments
         if segment["end"] > segment["start"]
     ]
+    if not duration_segments:
+        return segments
+    # A dispatch-overhead segment is proven internal paid work, even though it
+    # deliberately has no customer Site or job.  It remains a valid
+    # reverse-order corrected-break target; an ordinary unallocated gap does
+    # not.  Do not let the explicit internal category weaken the existing
+    # fail-closed rule for ambiguous customer labor.
+    customer_segments = [
+        segment
+        for segment in duration_segments
+        if not segment.get("dispatch_overhead")
+    ]
     located_site_ids = {
         int(segment["location_id"])
-        for segment in duration_segments
+        for segment in customer_segments
         if segment.get("location_id") is not None
     }
     job_ids = {
         int(segment["job_id"])
-        for segment in duration_segments
+        for segment in customer_segments
         if segment.get("job_id") is not None
     }
-    has_unallocated_time = any(
+    has_unallocated_customer_time = any(
         segment.get("location_id") is None
-        for segment in duration_segments
+        for segment in customer_segments
     )
-    has_unallocated_job = any(
+    has_unallocated_customer_job = any(
         segment.get("job_id") is None
-        for segment in duration_segments
+        for segment in customer_segments
     )
     if (
-        has_unallocated_time
-        or len(located_site_ids) != 1
-        or has_unallocated_job
-        or len(job_ids) != 1
+        has_unallocated_customer_time
+        or has_unallocated_customer_job
+        or (customer_segments and len(located_site_ids) != 1)
+        or (customer_segments and len(job_ids) != 1)
     ):
         return segments
 
@@ -3822,6 +4113,60 @@ def _apply_shift_break_minutes_to_segments(
     return adjusted
 
 
+def _apply_home_base_dispatch_overhead(
+    segments: List[Dict[str, Any]],
+    *,
+    shift: Dict[str, Any],
+    visits: List[Dict[str, Any]],
+    departures: List[Dict[str, Any]],
+    home_base_events: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Split only proven Home Base envelope time out of customer attribution."""
+    windows = _home_base_dispatch_windows(
+        shift=shift,
+        visits=visits,
+        departures=departures,
+        home_base_events=home_base_events,
+    )
+    if not windows:
+        return segments
+
+    output: List[Dict[str, Any]] = []
+    for segment in segments:
+        boundaries = {segment["start"], segment["end"]}
+        for start, end, _evidence in windows:
+            if segment["start"] < end and segment["end"] > start:
+                boundaries.add(max(segment["start"], start))
+                boundaries.add(min(segment["end"], end))
+        ordered = sorted(boundaries)
+        for start, end in zip(ordered, ordered[1:]):
+            if end <= start:
+                continue
+            matching_windows = [
+                evidence
+                for window_start, window_end, evidence in windows
+                if start >= window_start and end <= window_end
+            ]
+            if not matching_windows:
+                output.append({**segment, "start": start, "end": end})
+                continue
+            evidence = sorted({item for items in matching_windows for item in items})
+            output.append(
+                {
+                    **segment,
+                    "location_id": None,
+                    "location_label": "Dispatch overhead",
+                    "job_id": None,
+                    "start": start,
+                    "end": end,
+                    "evidence": evidence,
+                    "unassigned_gap": False,
+                    "dispatch_overhead": True,
+                }
+            )
+    return output
+
+
 def _closed_shift_segments(
     shift: Dict[str, Any],
     visits: List[Dict[str, Any]],
@@ -3829,6 +4174,7 @@ def _closed_shift_segments(
     qr_by_employee_site: Dict[Tuple[int, int], List[datetime]],
     range_start: datetime,
     range_end: datetime,
+    home_base_events: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     clock_in = shift["clock_in"]
     clock_out = shift["clock_out"]
@@ -3934,7 +4280,13 @@ def _closed_shift_segments(
                 end=upper,
                 base_evidence="unassigned_gap",
             )
-        return output
+        return _apply_home_base_dispatch_overhead(
+            output,
+            shift=shift,
+            visits=visits,
+            departures=departures,
+            home_base_events=home_base_events or [],
+        )
 
     cursor = lower
     used_departures: set[int] = set()
@@ -4030,7 +4382,13 @@ def _closed_shift_segments(
             end=upper,
             base_evidence="unassigned_gap",
         )
-    return [segment for segment in output if segment["end"] > segment["start"]]
+    return _apply_home_base_dispatch_overhead(
+        [segment for segment in output if segment["end"] > segment["start"]],
+        shift=shift,
+        visits=visits,
+        departures=departures,
+        home_base_events=home_base_events or [],
+    )
 
 
 def _open_shift_presence(
@@ -4115,6 +4473,49 @@ def _open_shift_presence(
         "presence_only": False,
         "evidence": evidence,
         "unassigned_gap": current_site is None,
+    }
+
+
+def _apply_open_home_base_dispatch_overhead(
+    presence: Dict[str, Any],
+    home_base_events: List[Dict[str, Any]],
+    visits: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Classify an open no-Site Home Base interval without inventing a Site.
+
+    A start scan (including its documented-exception counterpart) is durable
+    evidence that the shift began at the internal base.  While no customer Site
+    is active, the live interval is paid dispatch work.  An end-only event is
+    deliberately insufficient here, matching closed-shift classification.
+
+    Only the INITIAL pre-arrival interval qualifies. After a customer arrival,
+    a no-Site interval is travel between customers, not Home Base overhead --
+    and once the shift closes, that same gap goes unassigned unless an end
+    event proves the return envelope, so calling it dispatch while open would
+    be silently rewritten later. Claiming nothing is the honest live answer.
+    """
+    start_events = [event for event in home_base_events if event.get("action") == "start"]
+    if not start_events or presence.get("location_id") is not None:
+        return presence
+    if visits:
+        return presence
+    evidence = sorted(
+        {
+            *(presence.get("evidence") or []),
+            *(
+                f"home_base_start_{event.get('outcome') or 'recorded'}"
+                for event in start_events
+            ),
+        }
+    )
+    return {
+        **presence,
+        "location_id": None,
+        "location_label": "Dispatch overhead",
+        "job_id": None,
+        "evidence": evidence,
+        "unassigned_gap": False,
+        "dispatch_overhead": True,
     }
 
 
@@ -4234,6 +4635,7 @@ def _serialize_unmatched(
         "finalized": finalized,
         "presenceOnly": bool(segment.get("presence_only")),
         "reason": reason,
+        "dispatchOverhead": bool(segment.get("dispatch_overhead")),
         "candidateJobIds": candidate_job_ids,
         "evidence": (
             segment["evidence"]
@@ -4336,7 +4738,14 @@ def _decorate_schedule_jobs(
             for service_date in service_dates:
                 jobs_by_site_date[(int(job["location_id"]), service_date)].append(job)
 
-    shifts, visits, departures, qr_by_employee_site, qr_rows = _load_time_evidence(
+    (
+        shifts,
+        visits,
+        departures,
+        qr_by_employee_site,
+        qr_rows,
+        home_base_events,
+    ) = _load_time_evidence(
         range_start,
         range_end,
         observed_at,
@@ -4389,6 +4798,11 @@ def _decorate_schedule_jobs(
                     qr_by_employee_site,
                     observed_at,
                 )
+                presence = _apply_open_home_base_dispatch_overhead(
+                    presence,
+                    home_base_events.get(shift_id, []),
+                    visits.get(shift_id, []),
+                )
                 presence["start"] = max(presence["start"], shift_range_start)
                 presence["end"] = min(presence["end"], shift_range_end)
                 if presence["end"] > presence["start"]:
@@ -4402,6 +4816,7 @@ def _decorate_schedule_jobs(
                     qr_by_employee_site,
                     shift_range_start,
                     shift_range_end,
+                    home_base_events.get(shift_id, []),
                 )
             )
     represented_qr_ids = _apply_qr_job_links(
@@ -4426,6 +4841,21 @@ def _decorate_schedule_jobs(
     unmatched: List[Dict[str, Any]] = []
     resolved_segments: List[Dict[str, Any]] = []
     for segment in segments:
+        if segment.get("dispatch_overhead"):
+            # Keep dispatch intervals in the same shift-level break allocator.
+            # Otherwise the allocator sees a single customer Site and deducts a
+            # corrected break from customer labor even when the latest interval
+            # is paid dispatch time.
+            resolved_segments.append(
+                {
+                    "segment": dict(segment),
+                    "job": None,
+                    "reason": "dispatch_overhead",
+                    "candidateJobIds": [],
+                    "emitUnmatched": True,
+                }
+            )
+            continue
         job, reason, candidate_job_ids = _match_segment_to_job(
             segment,
             jobs_by_site_date,
@@ -4434,18 +4864,11 @@ def _decorate_schedule_jobs(
             linked_jobs_by_id=linked_jobs_by_id,
         )
         if job is None:
-            resolved_segments.append(
-                {
-                    "segment": dict(segment),
-                    "job": None,
-                    "reason": reason,
-                }
-            )
             shift_id = segment.get("shift_id")
             is_cross_boundary_shift = (
                 shift_id is not None and int(shift_id) in cross_boundary_shift_ids
             )
-            if (
+            emit_unmatched = not (
                 not is_cross_boundary_shift
                 and visible_range_start is not None
                 and visible_range_end is not None
@@ -4453,9 +4876,16 @@ def _decorate_schedule_jobs(
                     segment["end"] <= visible_range_start
                     or segment["start"] >= visible_range_end
                 )
-            ):
-                continue
-            unmatched.append(_serialize_unmatched(segment, reason, candidate_job_ids))
+            )
+            resolved_segments.append(
+                {
+                    "segment": dict(segment),
+                    "job": None,
+                    "reason": reason,
+                    "candidateJobIds": candidate_job_ids,
+                    "emitUnmatched": emit_unmatched,
+                }
+            )
             continue
 
         matched_segment = dict(segment)
@@ -4465,22 +4895,36 @@ def _decorate_schedule_jobs(
                 "segment": matched_segment,
                 "job": job,
                 "reason": reason,
+                "candidateJobIds": candidate_job_ids,
+                "emitUnmatched": False,
             }
         )
 
     for resolved in _apply_resolved_shift_break_minutes(resolved_segments):
         segment = resolved["segment"]
         job = resolved["job"]
-        if job is None:
-            continue
         reason = resolved["reason"]
-        job_id = int(job["id"])
-        employee_id = int(segment["employee_id"])
         segment_shift_id = segment.get("shift_id")
         if segment_shift_id is not None:
-            shift_rate_cents[int(segment_shift_id)] = _money_cents(
-                segment.get("hourly_rate")
-            )
+            normalized_shift_id = int(segment_shift_id)
+            rate_cents = _money_cents(segment.get("hourly_rate"))
+            if (
+                normalized_shift_id not in shift_rate_cents
+                or shift_rate_cents[normalized_shift_id] is None
+            ):
+                shift_rate_cents[normalized_shift_id] = rate_cents
+        if job is None:
+            if bool(resolved.get("emitUnmatched")):
+                unmatched.append(
+                    _serialize_unmatched(
+                        segment,
+                        reason,
+                        list(resolved.get("candidateJobIds") or []),
+                    )
+                )
+            continue
+        job_id = int(job["id"])
+        employee_id = int(segment["employee_id"])
         worker = workers_by_job[job_id].setdefault(
             employee_id,
             {
@@ -5638,6 +6082,8 @@ def _daily_profitability_rows(
     profit_jobs: List[Dict[str, Any]],
     unmatched: List[Dict[str, Any]],
     *,
+    dispatch_overhead: Optional[List[Dict[str, Any]]] = None,
+    dispatch_overhead_labor_by_day: Optional[Dict[str, Dict[str, Any]]] = None,
     app_timezone: ZoneInfo,
     range_start: datetime,
     range_end: datetime,
@@ -5656,6 +6102,14 @@ def _daily_profitability_rows(
         range_start=range_start,
         range_end=range_end,
     )
+    dispatch_by_day = _daily_unmatched_profitability_rows(
+        week_start,
+        week_end,
+        dispatch_overhead or [],
+        app_timezone=app_timezone,
+        range_start=range_start,
+        range_end=range_end,
+    )
 
     by_day = []
     for offset in range(7):
@@ -5663,6 +6117,11 @@ def _daily_profitability_rows(
         day_text = day.isoformat()
         day_rows = rows_by_day.get(day_text, [])
         unmatched_rows = unmatched_by_day.get(day_text, [])
+        dispatch_rows = dispatch_by_day.get(day_text, [])
+        dispatch_labor = (dispatch_overhead_labor_by_day or {}).get(
+            day_text,
+            {"knownLaborCents": 0, "laborCostComplete": True},
+        )
         unmatched_actual_hours = round(
             sum(
                 float(row["dailyHours"])
@@ -5686,6 +6145,28 @@ def _daily_profitability_rows(
                 "unmatchedActualHours": unmatched_actual_hours,
                 "unmatchedActualSegmentCount": len(unmatched_rows),
                 "unmatchedActualSegments": unmatched_rows,
+                "dispatchOverheadHours": round(
+                    sum(
+                        float(row["dailyHours"])
+                        for row in dispatch_rows
+                        if row.get("finalized")
+                        and row.get("dailyHours") is not None
+                    ),
+                    2,
+                ),
+                "dispatchOverheadSegmentCount": len(dispatch_rows),
+                "dispatchOverheadSegments": dispatch_rows,
+                "dispatchOverheadLaborCost": (
+                    _money(int(dispatch_labor["knownLaborCents"]))
+                    if bool(dispatch_labor.get("laborCostComplete"))
+                    else None
+                ),
+                "knownDispatchOverheadLaborCost": _money(
+                    int(dispatch_labor["knownLaborCents"])
+                ),
+                "dispatchOverheadLaborCostComplete": bool(
+                    dispatch_labor.get("laborCostComplete")
+                ),
                 "issueCount": _profitability_issue_count(day_rows)
                 + (1 if unmatched_rows else 0),
                 "issues": issues,
@@ -5696,6 +6177,118 @@ def _daily_profitability_rows(
             }
         )
     return by_day
+
+
+def _split_dispatch_overhead(
+    segments: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Keep internal paid dispatch separate from customer-attribution gaps."""
+    return (
+        [segment for segment in segments if segment.get("dispatchOverhead")],
+        [segment for segment in segments if not segment.get("dispatchOverhead")],
+    )
+
+
+def _dispatch_overhead_labor_costs(
+    segments: List[Dict[str, Any]],
+    *,
+    shift_rate_cents: Dict[int, Optional[int]],
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> Dict[str, Any]:
+    """Price paid dispatch separately without assigning it to a customer Site.
+
+    Customer profitability deliberately excludes dispatch overhead. This helper
+    exposes the same rate-snapshot labor evidence alongside that separate
+    category, including a fail-closed completeness signal when a finalized
+    dispatch interval has no rate.
+    """
+    known_labor_exact_cents = Decimal(0)
+    visible_labor_exact_cents = Decimal(0)
+    day_weights: Dict[str, float] = defaultdict(float)
+    incomplete_days: set[str] = set()
+    represented_days: set[str] = set()
+    incomplete_segment_count = 0
+
+    for segment in segments:
+        if not segment.get("finalized") or not segment.get("intervalEnd"):
+            continue
+        interval_start = _parse_utc_iso(str(segment["intervalStart"]))
+        interval_end = _parse_utc_iso(str(segment["intervalEnd"]))
+        if interval_end <= interval_start:
+            continue
+        # Cross-boundary QR evidence intentionally serializes the complete
+        # interval, and the weekly summary totals those serialized hours.  Use
+        # that same full interval for its labor cost.  The bounded slices below
+        # are only for distributing the already-complete cost onto visible
+        # report days.
+        visible_day_slices = list(
+            _local_interval_day_slices(
+                interval_start,
+                interval_end,
+                range_start=range_start,
+                range_end=range_end,
+                app_timezone=app_timezone,
+            )
+        )
+        day_keys = [
+            local_day.isoformat()
+            for local_day, _hours_value in visible_day_slices
+        ]
+        represented_days.update(day_keys)
+        shift_id = segment.get("shiftId")
+        rate_cents = (
+            shift_rate_cents.get(int(shift_id)) if shift_id is not None else None
+        )
+        if rate_cents is None:
+            incomplete_segment_count += 1
+            incomplete_days.update(day_keys)
+            continue
+        full_hours = (
+            Decimal(str((interval_end - interval_start).total_seconds()))
+            / Decimal(3600)
+        )
+        known_labor_exact_cents += full_hours * Decimal(rate_cents)
+        for local_day, hours_value in visible_day_slices:
+            weight = Decimal(str(hours_value)) * Decimal(rate_cents)
+            day_weights[local_day.isoformat()] += float(weight)
+            # Cost of the VISIBLE hours only. Daily rows show clipped hours
+            # (see the day-slice call above), so pricing the full interval and
+            # then spreading it across those days charges a day for work it
+            # does not display: a two-hour interval with one hour before the
+            # range boundary showed one hour and was billed two.
+            visible_labor_exact_cents += Decimal(str(hours_value)) * Decimal(
+                rate_cents
+            )
+
+    known_labor_cents = int(
+        known_labor_exact_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    # Allocated from the visible total, not the full one. The top-level
+    # knownLaborCents deliberately stays whole-interval -- it is the weekly
+    # figure and is internally consistent -- so byDay can sum to less than it
+    # when an interval crosses the range edge. That gap is the out-of-range
+    # portion, and it is real rather than a rounding artifact.
+    visible_labor_cents = int(
+        visible_labor_exact_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    allocated_by_day = _allocate_cents_by_weight(
+        visible_labor_cents,
+        dict(day_weights),
+    )
+    by_day = {
+        day_key: {
+            "knownLaborCents": int(allocated_by_day.get(day_key, 0)),
+            "laborCostComplete": day_key not in incomplete_days,
+        }
+        for day_key in represented_days
+    }
+    return {
+        "knownLaborCents": known_labor_cents,
+        "laborCostComplete": incomplete_segment_count == 0,
+        "byDay": by_day,
+    }
 
 
 def _parse_utc_iso(value: str) -> datetime:
@@ -5783,6 +6376,14 @@ def build_weekly_labor_profitability(
         payroll_week_start=payroll_week_start,
         cursor=cursor,
     )
+    dispatch_overhead, unmatched = _split_dispatch_overhead(unmatched)
+    dispatch_labor = _dispatch_overhead_labor_costs(
+        dispatch_overhead,
+        shift_rate_cents=shift_rate_cents,
+        app_timezone=app_timezone,
+        range_start=range_start,
+        range_end=range_end,
+    )
     source_jobs = {int(job["id"]): job for job in jobs}
     profit_jobs = [
         _actual_profitability_row(
@@ -5818,6 +6419,11 @@ def build_weekly_labor_profitability(
         for segment in unmatched
         if segment.get("finalized") and segment.get("hours") is not None
     )
+    dispatch_overhead_hours = sum(
+        float(segment["hours"])
+        for segment in dispatch_overhead
+        if segment.get("finalized") and segment.get("hours") is not None
+    )
     correction_candidate_segments = _payroll_correction_candidate_segments(
         profit_jobs,
         decorated_jobs,
@@ -5838,6 +6444,19 @@ def build_weekly_labor_profitability(
             **_aggregate_actual_profitability_rows(profit_jobs),
             "unmatchedActualHours": round(unmatched_actual_hours, 2),
             "unmatchedActualSegmentCount": len(unmatched),
+            "dispatchOverheadHours": round(dispatch_overhead_hours, 2),
+            "dispatchOverheadSegmentCount": len(dispatch_overhead),
+            "dispatchOverheadLaborCost": (
+                _money(int(dispatch_labor["knownLaborCents"]))
+                if bool(dispatch_labor["laborCostComplete"])
+                else None
+            ),
+            "knownDispatchOverheadLaborCost": _money(
+                int(dispatch_labor["knownLaborCents"])
+            ),
+            "dispatchOverheadLaborCostComplete": bool(
+                dispatch_labor["laborCostComplete"]
+            ),
         },
         "bySite": _group_profitability_by_site(profit_jobs),
         "byDay": _daily_profitability_rows(
@@ -5845,12 +6464,15 @@ def build_weekly_labor_profitability(
             week_end,
             daily_profit_jobs,
             unmatched,
+            dispatch_overhead=dispatch_overhead,
+            dispatch_overhead_labor_by_day=dispatch_labor["byDay"],
             app_timezone=app_timezone,
             range_start=range_start,
             range_end=range_end,
         ),
         "jobs": profit_jobs,
         "unmatchedActualSegments": unmatched,
+        "dispatchOverheadSegments": dispatch_overhead,
         "_payrollCorrectionCandidateSegments": correction_candidate_segments,
     }
 
@@ -6653,6 +7275,7 @@ def build_operations_schedule_router(
                 if native_row is not None:
                     job["_nativeProjection"] = native_row
                     _restore_native_schedule_metadata(job)
+            dispatch_overhead, unmatched = _split_dispatch_overhead(unmatched)
             active_jobs = [job for job in schedule_jobs if job["includedInPlan"]]
             known_planned_hours = sum(
                 float(job["plannedHours"])
@@ -6665,6 +7288,11 @@ def build_operations_schedule_router(
             unmatched_actual = sum(
                 float(segment["hours"])
                 for segment in unmatched
+                if segment.get("finalized") and segment.get("hours") is not None
+            )
+            dispatch_overhead_hours = sum(
+                float(segment["hours"])
+                for segment in dispatch_overhead
                 if segment.get("finalized") and segment.get("hours") is not None
             )
             in_progress_workers = {
@@ -6707,12 +7335,15 @@ def build_operations_schedule_router(
                         else None
                     ),
                     "unmatchedActualHours": round(unmatched_actual, 2),
+                    "dispatchOverheadHours": round(dispatch_overhead_hours, 2),
+                    "dispatchOverheadSegmentCount": len(dispatch_overhead),
                     "inProgressWorkerCount": len(in_progress_workers),
                     "issueCount": sum(len(job["issues"]) for job in schedule_jobs)
                     + len(global_issues),
                 },
                 "jobs": schedule_jobs,
                 "unmatchedActualSegments": unmatched,
+                "dispatchOverheadSegments": dispatch_overhead,
             }
         jobs = _load_jobs(
             resolved_start,
@@ -6745,6 +7376,7 @@ def build_operations_schedule_router(
             visible_range_end=range_end,
             expected_hours_learning_by_site=expected_hours_learning_by_site,
         )
+        dispatch_overhead, unmatched = _split_dispatch_overhead(unmatched)
         active_jobs = [job for job in schedule_jobs if job["includedInPlan"]]
         known_planned_hours = sum(
             float(job["plannedHours"])
@@ -6758,6 +7390,11 @@ def build_operations_schedule_router(
         unmatched_actual = sum(
             float(segment["hours"])
             for segment in unmatched
+            if segment.get("finalized") and segment.get("hours") is not None
+        )
+        dispatch_overhead_hours = sum(
+            float(segment["hours"])
+            for segment in dispatch_overhead
             if segment.get("finalized") and segment.get("hours") is not None
         )
         in_progress_workers = {
@@ -6797,11 +7434,14 @@ def build_operations_schedule_router(
                     else None
                 ),
                 "unmatchedActualHours": round(unmatched_actual, 2),
+                "dispatchOverheadHours": round(dispatch_overhead_hours, 2),
+                "dispatchOverheadSegmentCount": len(dispatch_overhead),
                 "inProgressWorkerCount": len(in_progress_workers),
                 "issueCount": sum(len(job["issues"]) for job in schedule_jobs),
             },
             "jobs": schedule_jobs,
             "unmatchedActualSegments": unmatched,
+            "dispatchOverheadSegments": dispatch_overhead,
         }
 
     @router.get("/api/admin/operations/utilization")
@@ -6825,7 +7465,7 @@ def build_operations_schedule_router(
             resolved_end,
             app_timezone,
         )
-        shifts, visits, departures = _load_utilization_evidence(
+        shifts, visits, departures, home_base_events = _load_utilization_evidence(
             range_start,
             range_end,
             observed_at,
@@ -6852,6 +7492,7 @@ def build_operations_schedule_router(
                 shift,
                 visits.get(shift_id, []),
                 departures.get(shift_id, []),
+                home_base_events=home_base_events.get(shift_id, []),
             )
             prepared_review_items = _prepare_utilization_review_items(
                 raw_review_items,
@@ -6884,6 +7525,7 @@ def build_operations_schedule_router(
                     visits.get(shift_id, []),
                     departures.get(shift_id, []),
                     reviewed_departures=reviewed_departures_by_shift[shift_id],
+                    home_base_events=home_base_events.get(shift_id, []),
                 )
             else:
                 shift_segments = raw_by_shift[shift_id][0]

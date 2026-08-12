@@ -298,6 +298,43 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
         duplicate_start,
         duplicate_start + timedelta(hours=2),
     )
+    home_base_id = db.execute_returning(
+        """
+        INSERT INTO home_bases (label, address, active)
+        VALUES ('Correction evidence archive base', '', false)
+        RETURNING id
+        """
+    )
+    home_base_event_id = db.execute_returning(
+        """
+        INSERT INTO home_base_events (
+            shift_id, employee_id, home_base_id, action, outcome, recorded_at
+        ) VALUES (%s, %s, %s, 'start', 'recorded', %s)
+        RETURNING id
+        """,
+        (
+            candidates["duplicates"][0],
+            employee_id,
+            home_base_id,
+            duplicate_start,
+        ),
+    )
+    visit_evidence_id = db.execute_returning(
+        """
+        INSERT INTO visit_evidence_events (
+            visit_id, shift_id, employee_id, location_id,
+            evidence_method, exception_reason, exception_detail,
+            geofence_status, distance_m, accuracy_m
+        ) VALUES (%s, %s, %s, %s, 'residential_gps', '', '', 'inside', 0, 5)
+        RETURNING id
+        """,
+        (
+            qr_events["visitId"],
+            candidates["duplicates"][0],
+            employee_id,
+            location_id,
+        ),
+    )
     correction_week_start = duplicate_start.date() - timedelta(
         days=(duplicate_start.date().weekday() + 1) % 7,
     )
@@ -449,6 +486,60 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
         assert archived_receipts["arrive"]["departureId"] is None
         assert archived_receipts["depart"]["visitId"] == qr_events["visitId"]
         assert archived_receipts["depart"]["departureId"] == qr_events["departureId"]
+        assert archived_qr_shift["homeBaseEvents"] == [
+            {
+                "id": home_base_event_id,
+                "shiftId": candidates["duplicates"][0],
+                "employeeId": employee_id,
+                "homeBaseId": home_base_id,
+                "homeBasePolicyId": None,
+                "action": "start",
+                "outcome": "recorded",
+                "exceptionReason": "",
+                "recordedAt": duplicate_start.isoformat().replace("+00:00", "Z"),
+                "latitude": None,
+                "longitude": None,
+                "accuracyM": None,
+                "geofenceRadiusM": None,
+                "distanceM": None,
+                "geofenceStatus": None,
+                "idempotencyKey": None,
+                "requestFingerprint": None,
+                "createdAt": archived_qr_shift["homeBaseEvents"][0]["createdAt"],
+            }
+        ]
+        assert archived_qr_shift["visitEvidenceEvents"] == [
+            {
+                "id": visit_evidence_id,
+                "visitId": qr_events["visitId"],
+                "shiftId": candidates["duplicates"][0],
+                "employeeId": employee_id,
+                "locationId": location_id,
+                "plannedVisitId": None,
+                "evidenceMethod": "residential_gps",
+                "exceptionReason": "",
+                "exceptionDetail": "",
+                # Empty here by construction: this arrival is INSIDE the
+                # geofence, so it was never accepted on a GPS override. The
+                # archive still carries the pair, because for an outside or
+                # uncertain arrival it holds the entire acceptance rationale
+                # and the evidence row cascade-deletes with the shift.
+                "gpsOverrideReason": "",
+                "gpsOverrideDetail": "",
+                "geofenceStatus": "inside",
+                "distanceM": 0.0,
+                "accuracyM": 5.0,
+                "createdAt": archived_qr_shift["visitEvidenceEvents"][0]["createdAt"],
+            }
+        ]
+        assert db.query_one(
+            "SELECT shift_id FROM home_base_events WHERE id = %s",
+            (home_base_event_id,),
+        ) == {"shift_id": candidates["canonical"]}
+        assert db.query_one(
+            "SELECT id FROM visit_evidence_events WHERE id = %s",
+            (visit_evidence_id,),
+        ) is None
 
         preserved_receipts = db.query_all(
             """
@@ -497,3 +588,4 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
             "DELETE FROM site_qr_action_receipts WHERE id = ANY(%s)",
             (qr_events["receiptIds"],),
         )
+        db.execute("DELETE FROM home_bases WHERE id = %s", (home_base_id,))
