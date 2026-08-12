@@ -6745,6 +6745,28 @@ def _scheduled_visit_candidates_for_employee(
     )
 
 
+def _commercial_fallback_is_within_schedule_window(
+    planned_visit: Dict[str, Any],
+    reference_time: datetime,
+) -> bool:
+    """Keep the Commercial QR exception within the normal service window."""
+    scheduled_start = planned_visit.get("approximate_start")
+    scheduled_end = planned_visit.get("approximate_end")
+    if (
+        not isinstance(scheduled_start, datetime)
+        or not isinstance(scheduled_end, datetime)
+        or scheduled_start.tzinfo is None
+        or scheduled_end.tzinfo is None
+        or scheduled_end <= scheduled_start
+    ):
+        return False
+    window = timedelta(hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS)
+    return (
+        scheduled_start < reference_time + window
+        and scheduled_end > reference_time - window
+    )
+
+
 def _eligible_planned_visit(
     *,
     employee_id: int,
@@ -6834,6 +6856,19 @@ def _resolve_explicit_visit_site(
                 None,
                 None,
                 f"{method} can only be used for a scheduled {expected_type} Site",
+            )
+        if (
+            method == "commercial_qr_fallback"
+            and not _commercial_fallback_is_within_schedule_window(
+                planned,
+                reference_time,
+            )
+        ):
+            return (
+                None,
+                None,
+                None,
+                "That Commercial Site is not scheduled near this time",
             )
     else:
         if payload.plannedVisitId is not None:
@@ -11979,8 +12014,23 @@ def visit_candidates(
         int(employee["id"]),
         now_utc,
     )
-    scheduled = [_serialize_visit_candidate(row, payload) for row in scheduled_rows]
-    scheduled_location_ids = {int(candidate["locationId"]) for candidate in scheduled}
+    scheduled_location_ids = {
+        int(row["location_id"])
+        for row in scheduled_rows
+    }
+    scheduled_residential = [
+        _serialize_visit_candidate(row, payload)
+        for row in scheduled_rows
+        if row.get("location_type") == "Residential"
+    ]
+    scheduled_commercial = [
+        _serialize_visit_candidate(row, payload)
+        for row in scheduled_rows
+        if (
+            row.get("location_type") == "Commercial"
+            and _commercial_fallback_is_within_schedule_window(row, now_utc)
+        )
+    ]
 
     (
         latitude_lower,
@@ -12048,20 +12098,15 @@ def visit_candidates(
         request,
         "VISIT_CANDIDATES_LOADED",
         True,
-        f"Employee {employee['name']} eligible visits {len(scheduled)}",
+        (
+            f"Employee {employee['name']} eligible visits "
+            f"{len(scheduled_residential) + len(scheduled_commercial)}"
+        ),
     )
     return {
         "success": True,
-        "scheduledResidential": [
-            candidate
-            for candidate in scheduled
-            if candidate["locationType"] == "Residential"
-        ],
-        "scheduledCommercial": [
-            candidate
-            for candidate in scheduled
-            if candidate["locationType"] == "Commercial"
-        ],
+        "scheduledResidential": scheduled_residential,
+        "scheduledCommercial": scheduled_commercial,
         "nearbyResidential": nearby_residential,
     }
 
@@ -26473,6 +26518,7 @@ def _analytics_visit_end(
 
 
 def _home_base_shift_ids(shift_ids: Iterable[int]) -> set[int]:
+    """Return start-boundary shifts that are entirely internal without visits."""
     ids = sorted({int(shift_id) for shift_id in shift_ids if int(shift_id) > 0})
     if not ids:
         return set()
@@ -26484,6 +26530,24 @@ def _home_base_shift_ids(shift_ids: Iterable[int]) -> set[int]:
             FROM home_base_events
             WHERE shift_id = ANY(%s)
               AND action = 'start'
+            """,
+            (ids,),
+        )
+    }
+
+
+def _home_base_evidence_shift_ids(shift_ids: Iterable[int]) -> set[int]:
+    """Return shifts with any Home Base evidence for paired visit boundaries."""
+    ids = sorted({int(shift_id) for shift_id in shift_ids if int(shift_id) > 0})
+    if not ids:
+        return set()
+    return {
+        int(row["shift_id"])
+        for row in db.query_all(
+            """
+            SELECT DISTINCT shift_id
+            FROM home_base_events
+            WHERE shift_id = ANY(%s)
             """,
             (ids,),
         )
@@ -26582,7 +26646,10 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
     # only the fallback for shifts with no snapshot, so a rate edit moves future
     # shifts and leaves worked shifts alone.
     shift_rates = _load_shift_rate_snapshots(period_shift_ids)
-    home_base_period_shift_ids = _home_base_shift_ids(period_shift_ids)
+    home_base_start_period_shift_ids = _home_base_shift_ids(period_shift_ids)
+    home_base_evidence_period_shift_ids = _home_base_evidence_shift_ids(
+        period_shift_ids
+    )
 
     def _effective_rate(shift_id: Optional[int], emp_id: int) -> Optional[float]:
         if shift_id is not None:
@@ -26744,7 +26811,7 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
         date_key = entry_date.strftime("%Y-%m-%d")
 
         visits = entry.get("visits") or []
-        if not visits and shift_id in home_base_period_shift_ids:
+        if not visits and shift_id in home_base_start_period_shift_ids:
             # A Home Base-only shift is paid dispatch overhead, not a customer
             # with a made-up zero-revenue location label.
             continue
@@ -26764,7 +26831,9 @@ def _compute_analytics(period: str, date_str: Optional[str]) -> Dict[str, Any]:
                     visits,
                     j,
                     co_dt,
-                    use_paired_departures=shift_id in home_base_period_shift_ids,
+                    use_paired_departures=(
+                        shift_id in home_base_evidence_period_shift_ids
+                    ),
                 )
                 if visit_end is None:
                     continue
@@ -27218,7 +27287,10 @@ def admin_analytics_customer(
     # Per-shift snapshot wins; the employee map is only the fallback for shifts
     # with no snapshot. Both None still means "no rate" -> silent zero, as today.
     shift_rates = _load_shift_rate_snapshots(customer_shift_ids)
-    home_base_customer_shift_ids = _home_base_shift_ids(customer_shift_ids)
+    home_base_start_customer_shift_ids = _home_base_shift_ids(customer_shift_ids)
+    home_base_evidence_customer_shift_ids = _home_base_evidence_shift_ids(
+        customer_shift_ids
+    )
 
     def _calc_revenue(
         resolved_location: str,
@@ -27359,7 +27431,7 @@ def admin_analytics_customer(
         date_key = entry_date.strftime("%Y-%m-%d")
 
         visits = entry.get("visits") or []
-        if not visits and shift_id in home_base_customer_shift_ids:
+        if not visits and shift_id in home_base_start_customer_shift_ids:
             # Keep the customer drilldown aligned with the aggregate analytics:
             # an internal Home Base-only shift is never a synthetic customer
             # visit, even if a caller addresses the endpoint with its label.
@@ -27379,7 +27451,9 @@ def admin_analytics_customer(
                     visits,
                     j,
                     co_dt,
-                    use_paired_departures=shift_id in home_base_customer_shift_ids,
+                    use_paired_departures=(
+                        shift_id in home_base_evidence_customer_shift_ids
+                    ),
                 )
                 if visit_end is None:
                     continue

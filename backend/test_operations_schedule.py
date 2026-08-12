@@ -179,6 +179,28 @@ def test_aggregate_break_minutes_do_not_shorten_same_site_multi_job_segments():
     assert adjusted == segments
 
 
+def test_aggregate_break_minutes_do_not_shorten_an_unallocated_customer_gap():
+    start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    segments = [
+        {
+            "start": start,
+            "end": start + timedelta(hours=1),
+            "location_id": 10,
+            "job_id": 100,
+        },
+        {
+            "start": start + timedelta(hours=1),
+            "end": start + timedelta(hours=2),
+            "location_id": None,
+            "job_id": None,
+        },
+    ]
+
+    adjusted = _apply_shift_break_minutes_to_segments(segments, 30)
+
+    assert adjusted == segments
+
+
 def test_aggregate_break_minutes_still_shorten_single_site_segments():
     start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
     segments = [

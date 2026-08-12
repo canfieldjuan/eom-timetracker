@@ -3791,29 +3791,41 @@ def _apply_shift_break_minutes_to_segments(
         for segment in segments
         if segment["end"] > segment["start"]
     ]
+    if not duration_segments:
+        return segments
+    # A dispatch-overhead segment is proven internal paid work, even though it
+    # deliberately has no customer Site or job.  It remains a valid
+    # reverse-order corrected-break target; an ordinary unallocated gap does
+    # not.  Do not let the explicit internal category weaken the existing
+    # fail-closed rule for ambiguous customer labor.
+    customer_segments = [
+        segment
+        for segment in duration_segments
+        if not segment.get("dispatch_overhead")
+    ]
     located_site_ids = {
         int(segment["location_id"])
-        for segment in duration_segments
+        for segment in customer_segments
         if segment.get("location_id") is not None
     }
     job_ids = {
         int(segment["job_id"])
-        for segment in duration_segments
+        for segment in customer_segments
         if segment.get("job_id") is not None
     }
-    has_unallocated_time = any(
+    has_unallocated_customer_time = any(
         segment.get("location_id") is None
-        for segment in duration_segments
+        for segment in customer_segments
     )
-    has_unallocated_job = any(
+    has_unallocated_customer_job = any(
         segment.get("job_id") is None
-        for segment in duration_segments
+        for segment in customer_segments
     )
     if (
-        has_unallocated_time
-        or len(located_site_ids) != 1
-        or has_unallocated_job
-        or len(job_ids) != 1
+        has_unallocated_customer_time
+        or has_unallocated_customer_job
+        or (customer_segments and len(located_site_ids) != 1)
+        or (customer_segments and len(job_ids) != 1)
     ):
         return segments
 
@@ -5984,7 +5996,14 @@ def _dispatch_overhead_labor_costs(
             continue
         interval_start = _parse_utc_iso(str(segment["intervalStart"]))
         interval_end = _parse_utc_iso(str(segment["intervalEnd"]))
-        day_slices = list(
+        if interval_end <= interval_start:
+            continue
+        # Cross-boundary QR evidence intentionally serializes the complete
+        # interval, and the weekly summary totals those serialized hours.  Use
+        # that same full interval for its labor cost.  The bounded slices below
+        # are only for distributing the already-complete cost onto visible
+        # report days.
+        visible_day_slices = list(
             _local_interval_day_slices(
                 interval_start,
                 interval_end,
@@ -5993,9 +6012,10 @@ def _dispatch_overhead_labor_costs(
                 app_timezone=app_timezone,
             )
         )
-        if not day_slices:
-            continue
-        day_keys = [local_day.isoformat() for local_day, _hours_value in day_slices]
+        day_keys = [
+            local_day.isoformat()
+            for local_day, _hours_value in visible_day_slices
+        ]
         represented_days.update(day_keys)
         shift_id = segment.get("shiftId")
         rate_cents = (
@@ -6005,9 +6025,13 @@ def _dispatch_overhead_labor_costs(
             incomplete_segment_count += 1
             incomplete_days.update(day_keys)
             continue
-        for local_day, hours_value in day_slices:
+        full_hours = (
+            Decimal(str((interval_end - interval_start).total_seconds()))
+            / Decimal(3600)
+        )
+        known_labor_exact_cents += full_hours * Decimal(rate_cents)
+        for local_day, hours_value in visible_day_slices:
             weight = Decimal(str(hours_value)) * Decimal(rate_cents)
-            known_labor_exact_cents += weight
             day_weights[local_day.isoformat()] += float(weight)
 
     known_labor_cents = int(

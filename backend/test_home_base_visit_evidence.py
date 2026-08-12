@@ -865,6 +865,57 @@ def test_commercial_fallback_and_unplanned_residential_are_reasoned_audit_paths(
     assert final_clock_out.status_code == 200, final_clock_out.text
 
 
+def test_commercial_fallback_requires_the_current_service_window(client, monkeypatch):
+    _, employee_auth = _create_employee(client, "Commercial window")
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    scheduled_start = now + timedelta(
+        hours=time_tracker_api.SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS + 1
+    )
+    scheduled = {
+        "planned_visit_id": 8801,
+        "location_id": 7701,
+        "job_id": 6601,
+        "approximate_start": scheduled_start,
+        "approximate_end": scheduled_start + timedelta(hours=1),
+        "address": "Future Commercial Site",
+        "customer_name": "Future Commercial Customer",
+        "location_type": "Commercial",
+        "lat": 39.30000,
+        "lng": -88.70000,
+    }
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_scheduled_visit_candidates_for_employee",
+        lambda *_args, **_kwargs: [scheduled],
+    )
+
+    candidates = client.post(
+        "/api/timesheet/visit-candidates",
+        headers=employee_auth,
+        json={"latitude": 39.30000, "longitude": -88.70000, "accuracy": 5},
+    )
+    assert candidates.status_code == 200, candidates.text
+    assert candidates.json()["scheduledCommercial"] == []
+
+    fallback = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": scheduled["location_id"],
+            "plannedVisitId": scheduled["planned_visit_id"],
+            "evidenceMethod": "commercial_qr_fallback",
+            "exceptionReason": "qr_unavailable",
+            "exceptionDetail": "Printed QR was damaged",
+            "latitude": 39.30000,
+            "longitude": -88.70000,
+            "accuracy": 5,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert fallback.status_code == 400, fallback.text
+    assert "not scheduled near this time" in fallback.text
+
+
 def test_home_base_windows_are_reported_as_dispatch_overhead_not_customer_labor():
     start = datetime(2026, 8, 11, 13, tzinfo=timezone.utc)
     arrival = start + timedelta(minutes=30)
@@ -951,6 +1002,69 @@ def test_home_base_legacy_analytics_stops_customer_time_at_paired_departure():
     ) == end
 
 
+def test_end_only_home_base_evidence_stops_legacy_customer_time_at_paired_departure(monkeypatch):
+    import time_tracker_api as api
+
+    clock_in = datetime(2026, 8, 11, 14, tzinfo=timezone.utc)
+    arrival = clock_in + timedelta(minutes=30)
+    departure = clock_in + timedelta(minutes=90)
+    clock_out = clock_in + timedelta(hours=2)
+    entry = {
+        "id": 992,
+        "employeeId": 44,
+        "employeeName": "Dispatch Test",
+        "clockIn": api.to_utc_iso(clock_in),
+        "clockOut": api.to_utc_iso(clock_out),
+        "totalHours": 2,
+        "location": "Customer Site",
+        "timeCategory": "productive",
+        "visits": [
+            {
+                "id": 881,
+                "location": "Customer Site",
+                "arrivalTime": api.to_utc_iso(arrival),
+                "sequenceVersion": 2,
+                "jobId": None,
+            }
+        ],
+        "departures": [
+            {
+                "visitId": 881,
+                "departureTime": api.to_utc_iso(departure),
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        api,
+        "load_timesheets",
+        lambda: {
+            "entries": [entry],
+            "location_customers": {"Customer Site": "Customer"},
+            "location_rate_types": {},
+            "location_expected_hours": {},
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "load_employees",
+        lambda: {"employees": [{"id": 44, "name": "Dispatch Test", "hourlyRate": 18.25}]},
+    )
+    monkeypatch.setattr(api, "load_settings", lambda: dict(api._SETTINGS_DEFAULTS))
+    monkeypatch.setattr(
+        api,
+        "_analytics_linked_job_revenue_cents",
+        lambda _job_ids: ({}, set(), {}),
+    )
+    monkeypatch.setattr(api, "_load_shift_rate_snapshots", lambda _shift_ids=None: {})
+    monkeypatch.setattr(api, "_home_base_shift_ids", lambda _shift_ids: set())
+    monkeypatch.setattr(api, "_home_base_evidence_shift_ids", lambda _shift_ids: {992})
+
+    result = api._compute_analytics("day", "2026-08-11")
+
+    assert result["summary"]["hours"] == 1.0
+    assert result["byCustomer"][0]["hours"] == 1.0
+
+
 def test_home_base_only_shift_never_appears_in_customer_drilldown(monkeypatch):
     """A direct URL cannot turn the internal Home Base label into a customer."""
     import time_tracker_api as api
@@ -992,6 +1106,7 @@ def test_home_base_only_shift_never_appears_in_customer_drilldown(monkeypatch):
     )
     monkeypatch.setattr(api, "_load_shift_rate_snapshots", lambda _shift_ids=None: {})
     monkeypatch.setattr(api, "_home_base_shift_ids", lambda _shift_ids: {991})
+    monkeypatch.setattr(api, "_home_base_evidence_shift_ids", lambda _shift_ids: {991})
 
     result = api.admin_analytics_customer(home_base_label, request=None, weeks=1)
 
@@ -1193,6 +1308,7 @@ def test_end_only_home_base_evidence_does_not_make_a_shift_internal(client, auth
     )
 
     assert time_tracker_api._home_base_shift_ids([shift_id]) == set()
+    assert time_tracker_api._home_base_evidence_shift_ids([shift_id]) == {shift_id}
     loaded_entry = next(
         entry
         for entry in time_tracker_api._load_timesheets_from_db()["entries"]
@@ -1274,8 +1390,8 @@ def test_open_home_base_presence_requires_a_start_event():
     assert with_start["unassigned_gap"] is False
 
 
-def test_dispatch_segments_block_break_deduction_from_customer_time(monkeypatch):
-    """A paid return-to-base segment is not a customer break."""
+def test_dispatch_segments_receive_reverse_break_deduction_before_customer_time(monkeypatch):
+    """A corrected break consumes paid dispatch before customer labor."""
     start = datetime(2026, 8, 11, 13, tzinfo=timezone.utc)
     arrival = start + timedelta(minutes=30)
     departure = start + timedelta(minutes=90)
@@ -1364,9 +1480,11 @@ def test_dispatch_segments_block_break_deduction_from_customer_time(monkeypatch)
     )
 
     assert jobs[0]["actualHours"] == 1.0
-    assert [segment["reason"] for segment in unmatched] == [
-        "dispatch_overhead",
-        "dispatch_overhead",
+    assert [
+        (segment["reason"], segment["hours"])
+        for segment in unmatched
+    ] == [
+        ("dispatch_overhead", 0.5),
     ]
 
 
@@ -1497,3 +1615,53 @@ def test_dispatch_labor_cost_is_separate_in_weekly_profitability(monkeypatch):
     tuesday = next(row for row in result["byDay"] if row["date"] == "2026-08-11")
     assert tuesday["dispatchOverheadLaborCost"] == 36.5
     assert tuesday["dispatchOverheadLaborCostComplete"] is True
+
+
+def test_cross_boundary_dispatch_labor_cost_matches_the_full_summary(monkeypatch):
+    week_start = date(2026, 8, 9)
+    start = datetime(2026, 8, 8, 23, tzinfo=timezone.utc)
+    end = start + timedelta(hours=2)
+    dispatch_segment = {
+        "shiftId": 702,
+        "employeeId": 22,
+        "employeeName": "Cross-boundary dispatch",
+        "locationId": None,
+        "locationLabel": "Dispatch overhead",
+        "intervalStart": operations_schedule._utc_iso(start),
+        "intervalEnd": operations_schedule._utc_iso(end),
+        "hours": 2.0,
+        "finalized": True,
+        "presenceOnly": False,
+        "reason": "dispatch_overhead",
+        "dispatchOverhead": True,
+        "candidateJobIds": [],
+        "evidence": ["home_base_start_recorded"],
+    }
+    monkeypatch.setattr(operations_schedule, "_load_jobs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        operations_schedule,
+        "monthly_revenue_allocations",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        operations_schedule,
+        "_load_expected_hours_learning_by_site",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        operations_schedule,
+        "_decorate_schedule_jobs",
+        lambda *_args, **_kwargs: ([], [dispatch_segment], {702: 1825}),
+    )
+
+    result = operations_schedule.build_weekly_labor_profitability(
+        week_start,
+        timezone_name="UTC",
+        now_provider=lambda: datetime(2026, 8, 10, tzinfo=timezone.utc),
+    )
+
+    assert result["summary"]["dispatchOverheadHours"] == 2.0
+    assert result["summary"]["dispatchOverheadLaborCost"] == 36.5
+    sunday = next(row for row in result["byDay"] if row["date"] == "2026-08-09")
+    assert sunday["dispatchOverheadHours"] == 1.0
+    assert sunday["dispatchOverheadLaborCost"] == 36.5
