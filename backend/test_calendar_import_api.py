@@ -4874,6 +4874,7 @@ def test_timed_job_changed_to_all_day_is_invalidated_in_canonical_plan(client, a
         params={
             "start_date": str(stored["scheduled_date"]),
             "end_date": str(stored["scheduled_date"]),
+            "planning_source": "calendar",
         },
     )
     assert schedule.status_code == 200, schedule.text
