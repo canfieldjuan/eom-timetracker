@@ -6921,7 +6921,9 @@ def _eligible_planned_visit(
             SELECT pv.id AS planned_visit_id, pv.location_id,
                    pv.migrated_job_id AS job_id, pv.approximate_start,
                    pv.approximate_end, l.address, l.customer_name,
-                   l.location_type, l.lat, l.lng
+                   l.location_type, l.lat, l.lng,
+                   assignment.crew_id AS assignment_crew_id,
+                   membership.id AS membership_id
             FROM planned_service_visits pv
             JOIN locations l ON l.id = pv.location_id AND l.active = true
             JOIN planned_visit_assignments assignment
@@ -6969,7 +6971,51 @@ def _eligible_planned_visit(
                 MORNING_CREW_NAME,
             ),
         )
-        return _row_from_cursor(cur)
+        row = _row_from_cursor(cur)
+        if row is None or row.get("assignment_crew_id") is None:
+            return row
+
+        # A direct assignment has no membership dependency.  A crew assignment
+        # does: lock the exact effective membership (and the crew whose active
+        # state/name defines eligibility) after selecting it.  The outer join
+        # above cannot lock either nullable relation, and an admin membership
+        # replacement otherwise can retire the row between that read and the
+        # evidence insert below.
+        membership_id = row.get("membership_id")
+        if membership_id is None:
+            return None
+        cur.execute(
+            """
+            SELECT membership.id
+            FROM crews assigned_crew
+            JOIN crew_memberships membership
+              ON membership.crew_id = assigned_crew.id
+            WHERE assigned_crew.id = %s
+              AND assigned_crew.active = true
+              AND membership.id = %s
+              AND membership.employee_id = %s
+              AND membership.effective_from <= %s
+              AND (
+                  membership.effective_to IS NULL
+                  OR membership.effective_to > %s
+              )
+              AND (
+                  %s <> 'Residential'
+                  OR assigned_crew.name = %s
+              )
+            FOR SHARE OF assigned_crew, membership
+            """,
+            (
+                int(row["assignment_crew_id"]),
+                int(membership_id),
+                int(employee_id),
+                local_day,
+                local_day,
+                str(row["location_type"]),
+                MORNING_CREW_NAME,
+            ),
+        )
+        return row if cur.fetchone() is not None else None
 
     return next(
         (
@@ -12613,10 +12659,15 @@ def log_visit(
         shift_id = _plain_time_action_shift_id(result, response)
         if not isinstance(visit, dict) or visit.get("id") is None or shift_id is None:
             raise RuntimeError("Explicit Site arrival was not stored")
-        # The visible visit, its persisted GPS metadata, and its evidence row
-        # must all describe the same Site configuration. The first metadata
-        # value was built during preflight; replace it with the geofence that
-        # this commit-time cursor just validated before serializing the receipt.
+        # The visible visit, its persisted identity/GPS metadata, and its
+        # evidence row must all describe the same Site configuration. The first
+        # values were built during preflight; replace them with the Site and
+        # geofence this commit-time cursor just validated before serializing the
+        # receipt.
+        current_location = str(current_site["address"])
+        current_customer = str(current_site.get("customer_name") or "")
+        visit["location"] = current_location
+        visit["customer"] = current_customer
         current_gps_meta = _selected_site_gps_meta(
             current_site,
             current_geofence,
@@ -12631,10 +12682,18 @@ def log_visit(
         cur.execute(
             """
             UPDATE visits
-            SET gps_meta = %s
+            SET location_label = %s,
+                customer_name = %s,
+                gps_meta = %s
             WHERE id = %s AND shift_id = %s
             """,
-            (json.dumps(current_gps_meta), int(visit["id"]), int(shift_id)),
+            (
+                current_location,
+                current_customer or None,
+                json.dumps(current_gps_meta),
+                int(visit["id"]),
+                int(shift_id),
+            ),
         )
         if cur.rowcount != 1:
             raise RuntimeError("Explicit Site arrival metadata was not stored")

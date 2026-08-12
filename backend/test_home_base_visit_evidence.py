@@ -6,6 +6,7 @@ import bcrypt
 import hashlib
 import json
 import math
+import psycopg2
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -786,6 +787,94 @@ def test_explicit_visit_revalidates_eligibility_inside_the_persistence_transacti
     ) == {"count": 0}
 
 
+def test_crew_planned_visit_locks_effective_membership_through_commit(
+    client,
+    monkeypatch,
+):
+    """A crew replacement cannot retire membership during an arrival commit."""
+    employee_id, employee_auth = _create_employee(client, "Crew membership lock")
+    crew_id = _enroll_in_morning_crew(employee_id)
+    site_id = _insert_site(
+        "Crew membership lock",
+        location_type="Residential",
+        latitude=39.45000,
+        longitude=-88.85000,
+    )
+    planned_visit_id = _insert_assigned_planned_visit(
+        employee_id=employee_id,
+        location_id=site_id,
+        suffix="crew-membership-lock",
+        crew_id=crew_id,
+    )
+    _clock_in(client, employee_auth)
+    original_eligible = time_tracker_api._eligible_planned_visit
+    retirement_blocked = False
+
+    def eligible_then_try_retirement(*args, **kwargs):
+        nonlocal retirement_blocked
+        matched = original_eligible(*args, **kwargs)
+        if kwargs.get("cur") is not None:
+            assert matched is not None
+            competing_conn = _raw_conn()
+            try:
+                with competing_conn.cursor() as competing_cur:
+                    competing_cur.execute("SET LOCAL lock_timeout = '100ms'")
+                    with pytest.raises(psycopg2.errors.LockNotAvailable):
+                        competing_cur.execute(
+                            """
+                            UPDATE crew_memberships
+                            SET effective_to = %s
+                            WHERE crew_id = %s
+                              AND employee_id = %s
+                              AND effective_to IS NULL
+                            """,
+                            (date.today(), crew_id, employee_id),
+                        )
+                retirement_blocked = True
+            finally:
+                competing_conn.rollback()
+                competing_conn.close()
+        return matched
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_eligible_planned_visit",
+        eligible_then_try_retirement,
+    )
+    arrived = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "plannedVisitId": planned_visit_id,
+            "evidenceMethod": "residential_gps",
+            "latitude": 39.45000,
+            "longitude": -88.85000,
+            "accuracy": 5,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert retirement_blocked, "the test never reached the locked eligibility read"
+    assert arrived.status_code == 200, arrived.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM visit_evidence_events WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 1}
+
+    # The lock is transactional, not a permanent reservation: membership
+    # maintenance proceeds normally once the arrival transaction commits.
+    db.execute(
+        """
+        UPDATE crew_memberships
+        SET effective_to = %s
+        WHERE crew_id = %s
+          AND employee_id = %s
+          AND effective_to IS NULL
+        """,
+        (date.today(), crew_id, employee_id),
+    )
+
+
 def test_explicit_visit_persists_the_geofence_validated_at_commit(
     client,
     monkeypatch,
@@ -804,27 +893,33 @@ def test_explicit_visit_persists_the_geofence_validated_at_commit(
         suffix="commit-time-geofence",
     )
     shift_id = _clock_in(client, employee_auth)
-    original_resolver = time_tracker_api._resolve_explicit_visit_site
+    original_save = time_tracker_api._save_timesheets_to_db
     moved_latitude = 39.45020
+    moved_address = f"{TEST_PREFIX} Commit-time renamed Site"
+    moved_customer = f"{TEST_PREFIX} Commit-time renamed Customer"
     moved = False
 
-    def resolve_after_pin_move(*args, **kwargs):
+    def save_after_site_move(*args, **kwargs):
         nonlocal moved
-        if kwargs.get("cur") is not None and not moved:
+        if not moved:
             moved = True
-            # The original and moved pins both contain this GPS point, so the
-            # request remains valid and only the recorded geofence can reveal
-            # whether persistence trusted preflight or commit-time evidence.
+            # The Site changes after preflight but before the save transaction
+            # inserts its visit row.  Once that row exists, PostgreSQL's FK lock
+            # rightly serializes a Site identity change behind the arrival.
             db.execute(
-                "UPDATE locations SET lat = %s WHERE id = %s",
-                (moved_latitude, site_id),
+                """
+                UPDATE locations
+                SET address = %s, customer_name = %s, lat = %s
+                WHERE id = %s
+                """,
+                (moved_address, moved_customer, moved_latitude, site_id),
             )
-        return original_resolver(*args, **kwargs)
+        return original_save(*args, **kwargs)
 
     monkeypatch.setattr(
         time_tracker_api,
-        "_resolve_explicit_visit_site",
-        resolve_after_pin_move,
+        "_save_timesheets_to_db",
+        save_after_site_move,
     )
     payload = {
         "locationId": site_id,
@@ -840,7 +935,7 @@ def test_explicit_visit_persists_the_geofence_validated_at_commit(
         headers=employee_auth,
         json=payload,
     )
-    assert moved, "the test never reached the commit-time Site resolver"
+    assert moved, "the test never changed the Site between preflight and commit"
     assert arrived.status_code == 200, arrived.text
     visit = arrived.json()["visit"]
     expected_geofence = time_tracker_api.evaluate_site_check_in_geofence(
@@ -852,10 +947,21 @@ def test_explicit_visit_persists_the_geofence_validated_at_commit(
     )
     assert visit["gpsMeta"]["distanceM"] == expected_geofence["distanceM"]
     assert visit["gpsMeta"]["withinRadius"] is True
+    assert visit["gpsMeta"]["matchedLocation"] == moved_address
+    assert visit["location"] == moved_address
+    assert visit["customer"] == moved_customer
 
     visit_id = int(visit["id"])
-    stored = db.query_one("SELECT gps_meta FROM visits WHERE id = %s", (visit_id,))
+    stored = db.query_one(
+        """
+        SELECT location_label, customer_name, gps_meta
+        FROM visits WHERE id = %s
+        """,
+        (visit_id,),
+    )
     assert stored is not None
+    assert stored["location_label"] == moved_address
+    assert stored["customer_name"] == moved_customer
     stored_meta = stored["gps_meta"]
     if isinstance(stored_meta, str):
         stored_meta = json.loads(stored_meta)
@@ -881,6 +987,8 @@ def test_explicit_visit_persists_the_geofence_validated_at_commit(
     assert replay.status_code == 200, replay.text
     assert replay.json()["replayed"] is True
     assert replay.json()["visit"]["gpsMeta"] == visit["gpsMeta"]
+    assert replay.json()["visit"]["location"] == moved_address
+    assert replay.json()["visit"]["customer"] == moved_customer
 
 
 def test_residential_candidates_require_direct_assignment_or_effective_morning_crew(client):
