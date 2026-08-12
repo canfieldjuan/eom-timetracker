@@ -698,6 +698,8 @@ def test_native_site_schedule_forecast_uses_site_rules_without_writing_jobs(
     )
     assert job["ruleId"] == created.json()["rule"]["id"]
     assert job["scheduledDate"] == str(service_day)
+    assert job["sourceRole"] == "commercial_evening_night"
+    assert "expectedHoursBaseline" in job
     assert job["plannedHours"] == 3
     assert job["estRevenue"] == 210
     assert job["issues"] == []
@@ -712,10 +714,23 @@ def test_native_site_schedule_forecast_uses_site_rules_without_writing_jobs(
         params={"weeks_ahead": 4},
     )
     assert default.status_code == 200, default.text
-    assert default.json()["planningSource"] == "calendar"
+    assert default.json()["planningSource"] == "native"
+    assert any(
+        row.get("locationId") == site_id
+        for week in default.json()["weeks"]
+        for row in week["jobs"]
+    )
+
+    explicit_calendar = client.get(
+        "/api/admin/operations/forecast",
+        headers=auth,
+        params={"weeks_ahead": 4, "planning_source": "calendar"},
+    )
+    assert explicit_calendar.status_code == 200, explicit_calendar.text
+    assert explicit_calendar.json()["planningSource"] == "calendar"
     assert all(
         row.get("locationId") != site_id
-        for week in default.json()["weeks"]
+        for week in explicit_calendar.json()["weeks"]
         for row in week["jobs"]
     )
 
@@ -773,7 +788,7 @@ def test_native_site_schedule_source_uses_site_rules_without_writing_jobs(
     assert body["summary"]["actualHours"] == 0
     assert body["summary"]["varianceHours"] == -3
     assert body["summary"]["unmatchedActualHours"] == 0
-    assert "native_actual_matching_not_joined" in {
+    assert "native_actual_matching_not_joined" not in {
         issue["code"] for issue in body["issues"]
     }
     assert body["unmatchedActualSegments"] == []
@@ -800,11 +815,170 @@ def test_native_site_schedule_source_uses_site_rules_without_writing_jobs(
     default = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={
+            "start_date": str(service_day),
+            "end_date": str(service_day),
+        },
     )
     assert default.status_code == 200, default.text
-    assert default.json()["planningSource"] == "calendar"
-    assert all(row.get("locationId") != site_id for row in default.json()["jobs"])
+    assert default.json()["planningSource"] == "native"
+    assert any(row.get("locationId") == site_id for row in default.json()["jobs"])
+
+    explicit_calendar = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": str(service_day),
+            "end_date": str(service_day),
+            "planning_source": "calendar",
+        },
+    )
+    assert explicit_calendar.status_code == 200, explicit_calendar.text
+    assert explicit_calendar.json()["planningSource"] == "calendar"
+    assert all(
+        row.get("locationId") != site_id for row in explicit_calendar.json()["jobs"]
+    )
+
+
+def test_native_site_schedule_source_reconciles_paid_time_without_writing_jobs(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)  # Monday
+    shift_start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    shift_end = datetime(2026, 7, 20, 16, tzinfo=timezone.utc)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Agenda Actuals",
+                site_type="Commercial",
+                rate=225,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+            employee_id = _employee(cur, "Native Actuals", 20)
+            _shift(
+                cur,
+                employee_id=employee_id,
+                start=shift_start,
+                end=shift_end,
+                service_day=service_day,
+                location_id=site_id,
+                location_label=f"{TEST_PREFIX} Site Native Agenda Actuals",
+            )
+
+    before_jobs = db.query_one(
+        "SELECT COUNT(*) AS count FROM jobs WHERE location_id = %s",
+        (site_id,),
+    )["count"]
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "08:00",
+            "localEndTime": "11:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(service_day), "end_date": str(service_day)},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["planningSource"] == "native"
+    assert body["summary"]["actualHours"] == 3
+    assert body["summary"]["varianceHours"] == 0
+    assert body["summary"]["unmatchedActualHours"] == 0
+    assert body["unmatchedActualSegments"] == []
+    job = next(row for row in body["jobs"] if row["locationId"] == site_id)
+    assert "id" not in job
+    assert job["projectionId"] == f"rule-{created.json()['rule']['id']}:{service_day}"
+    assert job["actualHours"] == 3
+    assert job["actualLaborCost"] == 60
+    assert len(job["workers"]) == 1
+    assert job["workers"][0]["hours"] == 3
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM jobs WHERE location_id = %s",
+        (site_id,),
+    )["count"] == before_jobs
+
+
+def test_native_site_schedule_source_uses_persisted_occurrence_override(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)  # Monday
+    start = datetime(2026, 7, 20, 13, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 20, 16, tzinfo=timezone.utc)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Agenda Cancelled Override",
+                site_type="Commercial",
+                rate=225,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+            source_id = _source(cur, "native_override", "commercial_evening_night")
+            persisted_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Native Agenda Cancelled Override",
+                start=start,
+                end=end,
+                source_seed="native-cancelled-override",
+            )
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = 'cancelled',
+                    cancelled_at = NOW(),
+                    cancellation_reason = 'customer cancelled'
+                WHERE id = %s
+                """,
+                (persisted_job_id,),
+            )
+
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "08:00",
+            "localEndTime": "11:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={"start_date": str(service_day), "end_date": str(service_day)},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    site_jobs = [row for row in body["jobs"] if row["locationId"] == site_id]
+    assert len(site_jobs) == 1
+    assert site_jobs[0]["id"] == persisted_job_id
+    assert site_jobs[0]["status"] == "cancelled"
+    assert "projectionId" not in site_jobs[0]
+    assert body["summary"]["jobCount"] == 0
+    assert body["summary"]["cancelledJobCount"] == 1
 
 
 def test_native_site_schedule_source_includes_prior_day_overnight_overlap(
@@ -1845,7 +2019,11 @@ def _schedule_body(
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(end_day or service_day)},
+        params={
+            "start_date": str(service_day),
+            "end_date": str(end_day or service_day),
+            "planning_source": "calendar",
+        },
     )
     assert response.status_code == 200, response.text
     return response.json()
@@ -3349,7 +3527,11 @@ def test_schedule_segments_multi_stop_and_multi_worker_actuals(client, auth):
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={
+            "start_date": str(service_day),
+            "end_date": str(service_day),
+            "planning_source": "calendar",
+        },
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -3484,7 +3666,11 @@ def test_schedule_open_shift_identifies_worker_without_finalized_hours(client, a
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={
+            "start_date": str(service_day),
+            "end_date": str(service_day),
+            "planning_source": "calendar",
+        },
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -3897,7 +4083,11 @@ def test_job_link_keeps_cross_day_qr_presence_on_the_calendar_job(client, auth):
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={
+            "start_date": str(service_day),
+            "end_date": str(service_day),
+            "planning_source": "calendar",
+        },
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -4175,7 +4365,11 @@ def test_durable_qr_job_link_attaches_existing_paid_site_segment(client, auth):
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={
+            "start_date": str(service_day),
+            "end_date": str(service_day),
+            "planning_source": "calendar",
+        },
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -4416,7 +4610,11 @@ def test_explicit_shift_job_link_wins_when_site_matching_is_ambiguous(client, au
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={
+            "start_date": str(service_day),
+            "end_date": str(service_day),
+            "planning_source": "calendar",
+        },
     )
     assert response.status_code == 200, response.text
     jobs = {row["id"]: row for row in response.json()["jobs"]}
@@ -4629,7 +4827,11 @@ def test_explicit_out_of_range_link_is_not_credited_to_visible_same_site_job(
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={
+            "start_date": str(service_day),
+            "end_date": str(service_day),
+            "planning_source": "calendar",
+        },
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -4964,7 +5166,11 @@ def test_schedule_uses_only_accepted_qr_presence_without_paid_time(
     response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(service_day), "end_date": str(service_day)},
+        params={
+            "start_date": str(service_day),
+            "end_date": str(service_day),
+            "planning_source": "calendar",
+        },
     )
     assert response.status_code == 200, response.text
     job = next(row for row in response.json()["jobs"] if row["id"] == job_id)
@@ -5230,6 +5436,7 @@ def test_saturday_night_job_keeps_post_midnight_actual(client, auth):
         params={
             "start_date": str(next_service_day),
             "end_date": str(next_service_day),
+            "planning_source": "calendar",
         },
     )
     assert response.status_code == 200, response.text
@@ -5311,7 +5518,7 @@ def test_monthly_rate_uses_all_non_cancelled_jobs_as_denominator(client, auth):
     response = client.get(
         "/api/admin/operations/forecast",
         headers=auth,
-        params={"weeks_ahead": 4},
+        params={"weeks_ahead": 4, "planning_source": "calendar"},
     )
     assert response.status_code == 200, response.text
     jobs = {
@@ -5485,7 +5692,7 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
     response = client.get(
         "/api/admin/operations/forecast",
         headers=auth,
-        params={"weeks_ahead": 4},
+        params={"weeks_ahead": 4, "planning_source": "calendar"},
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -5560,6 +5767,7 @@ def test_forecast_uses_jobs_site_economics_and_no_schedule_fallback(client, auth
         params={
             "start_date": str(min(service_dates)),
             "end_date": str(max(service_dates)),
+            "planning_source": "calendar",
         },
     )
     assert schedule_response.status_code == 200, schedule_response.text
@@ -6582,7 +6790,7 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
     forecast_response = client.get(
         "/api/admin/operations/forecast",
         headers=auth,
-        params={"weeks_ahead": 4},
+        params={"weeks_ahead": 4, "planning_source": "calendar"},
     )
     assert forecast_response.status_code == 200, forecast_response.text
     forecast_jobs = {
@@ -6614,7 +6822,11 @@ def test_expected_hours_learning_suggests_median_from_completed_actual_visits(
     schedule_response = client.get(
         "/api/admin/operations/schedule",
         headers=auth,
-        params={"start_date": str(future_day), "end_date": str(future_day)},
+        params={
+            "start_date": str(future_day),
+            "end_date": str(future_day),
+            "planning_source": "calendar",
+        },
     )
     assert schedule_response.status_code == 200, schedule_response.text
     schedule_job = {
@@ -6638,7 +6850,7 @@ def test_expected_hours_baseline_acceptance_promotes_suggestion_to_planned_hours
     forecast_response = client.get(
         "/api/admin/operations/forecast",
         headers=auth,
-        params={"weeks_ahead": 4},
+        params={"weeks_ahead": 4, "planning_source": "calendar"},
     )
     assert forecast_response.status_code == 200, forecast_response.text
     forecast_job = {
@@ -6704,7 +6916,7 @@ def test_expected_hours_baseline_acceptance_promotes_suggestion_to_planned_hours
     refreshed_response = client.get(
         "/api/admin/operations/forecast",
         headers=auth,
-        params={"weeks_ahead": 4},
+        params={"weeks_ahead": 4, "planning_source": "calendar"},
     )
     assert refreshed_response.status_code == 200, refreshed_response.text
     refreshed_job = {
@@ -6753,7 +6965,7 @@ def test_expected_hours_baseline_rejection_is_fingerprint_scoped(client, auth):
     forecast_response = client.get(
         "/api/admin/operations/forecast",
         headers=auth,
-        params={"weeks_ahead": 4},
+        params={"weeks_ahead": 4, "planning_source": "calendar"},
     )
     assert forecast_response.status_code == 200, forecast_response.text
     forecast_job = {
@@ -6813,7 +7025,7 @@ def test_expected_hours_baseline_rejection_is_fingerprint_scoped(client, auth):
     rejected_forecast = client.get(
         "/api/admin/operations/forecast",
         headers=auth,
-        params={"weeks_ahead": 4},
+        params={"weeks_ahead": 4, "planning_source": "calendar"},
     )
     assert rejected_forecast.status_code == 200, rejected_forecast.text
     rejected_job = {
@@ -6839,7 +7051,7 @@ def test_expected_hours_baseline_rejection_is_fingerprint_scoped(client, auth):
     refreshed_response = client.get(
         "/api/admin/operations/forecast",
         headers=auth,
-        params={"weeks_ahead": 4},
+        params={"weeks_ahead": 4, "planning_source": "calendar"},
     )
     assert refreshed_response.status_code == 200, refreshed_response.text
     refreshed_job = {
@@ -8246,6 +8458,7 @@ def test_operations_forecast_builder_allows_future_legacy_one_week_seam(
         1,
         timezone_name="America/Chicago",
         now_provider=lambda: fixed_now,
+        planning_source="calendar",
     )
 
     assert body["success"] is True
@@ -8277,7 +8490,7 @@ def test_operations_forecast_route_keeps_allowed_horizon_gate(
         calls.append(weeks_ahead)
         assert timezone_name == "America/Chicago"
         assert now_provider().tzinfo is not None
-        assert planning_source == "calendar"
+        assert planning_source == "native"
         return {
             "success": True,
             "weeksAhead": weeks_ahead,

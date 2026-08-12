@@ -37,6 +37,7 @@ UTILIZATION_CATEGORIES = (
 )
 OPERATIONS_FORECAST_ALLOWED_WEEKS = {4, 8, 12}
 OPERATIONS_FORECAST_PLANNING_SOURCES = {"calendar", "native"}
+OPERATIONS_DEFAULT_PLANNING_SOURCE = "native"
 UTILIZATION_REVIEW_KEY_VERSION = "utilization-review.v1"
 UTILIZATION_EVIDENCE_VERSION = "utilization-classifier.v1"
 UTILIZATION_MISSING_DEPARTURE_CORRECTION = "utilization_missing_departure.v1"
@@ -669,8 +670,10 @@ def _native_preview_rows(
                     "scheduledDate": str(service_day),
                     "scheduledStart": _utc_iso(starts_at),
                     "scheduledEnd": _utc_iso(ends_at),
+                    "sourceRole": _native_source_role({"siteType": rule.get("site_type")}),
                     "includedInForecast": valid_service_window,
                     "plannedHours": expected_hours,
+                    "expectedHoursBaseline": None,
                     "estRevenue": _money(revenue_cents),
                     "estLaborCost": _money(labor_cents),
                     "estNetProfit": _money(net_cents),
@@ -862,19 +865,125 @@ def _native_source_role(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _native_schedule_execution_status(
-    row: Dict[str, Any],
-    *,
-    observed_at: datetime,
-) -> str:
-    scheduled_end = row.get("scheduledEnd")
-    if scheduled_end is None:
-        return "scheduled"
+def _parse_native_utc(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
     try:
-        ends_at = datetime.fromisoformat(str(scheduled_end).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
-        return "scheduled"
-    return "no_actual" if ends_at <= observed_at else "scheduled"
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _native_projection_job_id(row: Dict[str, Any]) -> int:
+    service_day = date.fromisoformat(str(row["scheduledDate"]))
+    return -(int(row["ruleId"]) * 1_000_000 + service_day.toordinal())
+
+
+def _native_occurrence_key(
+    *,
+    location_id: Any,
+    service_date: date,
+    source_role: Optional[str],
+) -> Optional[Tuple[int, date, str]]:
+    if location_id is None or source_role not in SOURCE_ROLE_SITE_TYPES:
+        return None
+    return (int(location_id), service_date, str(source_role))
+
+
+def _job_native_occurrence_key(
+    job: Dict[str, Any],
+    *,
+    app_timezone: ZoneInfo,
+) -> Optional[Tuple[int, date, str]]:
+    scheduled_start = job.get("scheduled_start")
+    service_date = (
+        scheduled_start.astimezone(app_timezone).date()
+        if scheduled_start is not None
+        else job.get("scheduled_date")
+    )
+    if not isinstance(service_date, date):
+        return None
+    return _native_occurrence_key(
+        location_id=job.get("location_id"),
+        service_date=service_date,
+        source_role=job.get("source_role"),
+    )
+
+
+def _native_row_occurrence_key(row: Dict[str, Any]) -> Optional[Tuple[int, date, str]]:
+    try:
+        service_date = date.fromisoformat(str(row["scheduledDate"]))
+    except ValueError:
+        return None
+    return _native_occurrence_key(
+        location_id=row.get("locationId"),
+        service_date=service_date,
+        source_role=row.get("sourceRole"),
+    )
+
+
+def _native_rows_without_persisted_overrides(
+    rows: List[Dict[str, Any]],
+    jobs: List[Dict[str, Any]],
+    *,
+    app_timezone: ZoneInfo,
+) -> List[Dict[str, Any]]:
+    persisted_keys = {
+        key
+        for key in (
+            _job_native_occurrence_key(job, app_timezone=app_timezone) for job in jobs
+        )
+        if key is not None
+    }
+    return [
+        row for row in rows if _native_row_occurrence_key(row) not in persisted_keys
+    ]
+
+
+def _native_projection_job(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": _native_projection_job_id(row),
+        "location_id": row.get("locationId"),
+        "customer_id": row.get("customerId"),
+        "customer_name": row.get("customerName"),
+        "display_customer": row.get("customerName"),
+        "scheduled_date": date.fromisoformat(str(row["scheduledDate"])),
+        "scheduled_start": _parse_native_utc(row.get("scheduledStart")),
+        "scheduled_end": _parse_native_utc(row.get("scheduledEnd")),
+        "source_role": row.get("sourceRole"),
+        "source_title": "Native Site schedule rule",
+        "status": "scheduled",
+        "source_all_day": False,
+        "site_address": row.get("siteAddress"),
+        "site_type": row.get("siteType"),
+        "rate": _money(row.get("_rate_cents")),
+        "rate_type": row.get("rateType"),
+        "site_expected_hours": row.get("plannedHours"),
+        "site_expected_hours_source": None,
+        "site_expected_hours_learning_decision": None,
+        "site_expected_hours_learning_fingerprint": None,
+        "site_expected_hours_learning_snapshot": None,
+        "site_expected_hours_learning_decided_at": None,
+        "site_target_labor_pct": None,
+        "site_min_margin_pct": None,
+        "site_active": True,
+        "_nativeProjection": row,
+    }
+
+
+def _restore_native_schedule_metadata(job: Dict[str, Any]) -> Dict[str, Any]:
+    native_row = job.pop("_nativeProjection", None)
+    if native_row is None:
+        return job
+    job.pop("id", None)
+    job["projectionId"] = native_row.get("projectionId")
+    job["ruleId"] = native_row.get("ruleId")
+    job["shiftBucket"] = native_row.get("shiftBucket")
+    job["cadence"] = native_row.get("cadence")
+    return job
 
 
 def _native_row_schedule_visible(
@@ -906,53 +1015,6 @@ def _native_row_schedule_visible(
     except ValueError:
         return False
     return resolved_start <= scheduled_date <= resolved_end
-
-
-def _native_schedule_job(row: Dict[str, Any], observed_at: datetime) -> Dict[str, Any]:
-    planned_hours = row.get("plannedHours")
-    actual_hours = 0.0
-    included = bool(row.get("_included_in_forecast", True))
-    variance_hours = (
-        round(actual_hours - float(planned_hours), 2)
-        if planned_hours is not None
-        else None
-    )
-    return {
-        "projectionId": row.get("projectionId"),
-        "ruleId": row.get("ruleId"),
-        "locationId": row.get("locationId"),
-        "customerId": row.get("customerId"),
-        "customerName": row.get("customerName"),
-        "siteAddress": row.get("siteAddress"),
-        "siteType": row.get("siteType"),
-        "shiftBucket": row.get("shiftBucket"),
-        "cadence": row.get("cadence"),
-        "scheduledDate": row.get("scheduledDate"),
-        "scheduledStart": row.get("scheduledStart"),
-        "scheduledEnd": row.get("scheduledEnd"),
-        "sourceRole": _native_source_role(row),
-        "sourceTitle": "Native Site schedule rule",
-        "status": "scheduled",
-        "executionStatus": _native_schedule_execution_status(
-            row,
-            observed_at=observed_at,
-        ),
-        "includedInPlan": included,
-        "plannedHours": planned_hours,
-        "expectedHoursBaseline": None,
-        "actualHours": actual_hours,
-        "varianceHours": variance_hours,
-        "actualLaborCost": None,
-        "knownActualLaborCost": 0.0,
-        "workers": [],
-        "siteEconomics": {
-            "rate": _money(row.get("_rate_cents")),
-            "rateType": row.get("rateType"),
-            "expectedHours": planned_hours,
-            "expectedHoursBaseline": None,
-        },
-        "issues": list(row.get("issues") or []),
-    }
 
 
 def allocate_monthly_cents(
@@ -6057,12 +6119,52 @@ def build_operations_forecast(
 
     avg_hourly_rate, global_issues = _average_employee_rate_and_issues()
     if planning_source == "native":
+        allocation_start = date(today.year, today.month, 1)
+        allocation_end = _month_end(forecast_end)
+        allocation_jobs = _load_jobs(allocation_start, allocation_end)
         native_rows, rule_count = _native_projection_rows_for_period(
             today,
             forecast_end,
             app_timezone=app_timezone,
             avg_hourly_rate=avg_hourly_rate,
         )
+        native_rows = _native_rows_without_persisted_overrides(
+            native_rows,
+            allocation_jobs,
+            app_timezone=app_timezone,
+        )
+        monthly_allocations = monthly_revenue_allocations(
+            allocation_jobs,
+            app_timezone,
+        )
+        forecast_jobs = []
+        for job in allocation_jobs:
+            if not today <= job["scheduled_date"] <= forecast_end or job.get(
+                "status"
+            ) not in {"scheduled", "in_progress"}:
+                continue
+            if (
+                job.get("status") != "in_progress"
+                and job["scheduled_date"] == today
+                and job.get("scheduled_end") is not None
+                and job["scheduled_end"] <= observed_at
+            ):
+                continue
+            forecast_jobs.append(job)
+        expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
+            _expected_hours_learning_site_ids(forecast_jobs),
+            observed_at=observed_at,
+            app_timezone=app_timezone,
+        )
+        persisted_forecast_rows = [
+            _forecast_job_values(
+                job,
+                avg_hourly_rate,
+                monthly_allocations,
+                expected_hours_learning_by_site,
+            )
+            for job in forecast_jobs
+        ]
         forecast_rows = [
             row
             for row in native_rows
@@ -6075,6 +6177,7 @@ def build_operations_forecast(
                 <= observed_at
             )
         ]
+        forecast_rows = [*persisted_forecast_rows, *forecast_rows]
         weeks = _forecast_weeks_from_rows(
             forecast_rows,
             first_week=first_week,
@@ -6456,7 +6559,7 @@ def build_operations_schedule_router(
     def operations_schedule(
         start_date: Optional[date] = Query(default=None),
         end_date: Optional[date] = Query(default=None),
-        planning_source: str = Query(default="calendar"),
+        planning_source: str = Query(default=OPERATIONS_DEFAULT_PLANNING_SOURCE),
         _: Dict[str, Any] = Depends(get_current_admin),
     ) -> Dict[str, Any]:
         if planning_source not in OPERATIONS_FORECAST_PLANNING_SOURCES:
@@ -6481,18 +6584,22 @@ def build_operations_schedule_router(
         )
         if planning_source == "native":
             avg_hourly_rate, global_issues = _average_employee_rate_and_issues()
-            native_issues = [
-                _issue(
-                    "native_actual_matching_not_joined",
-                    "Native Site-rule Schedule rows do not reconcile actual paid time yet.",
-                ),
-                *global_issues,
-            ]
             native_rows, rule_count = _native_projection_rows_for_period(
                 resolved_start - timedelta(days=1),
                 resolved_end,
                 app_timezone=app_timezone,
                 avg_hourly_rate=avg_hourly_rate,
+            )
+            persisted_jobs = _load_jobs(
+                resolved_start - timedelta(days=1),
+                resolved_end,
+                window_start=range_start,
+                window_end=range_end,
+            )
+            native_rows = _native_rows_without_persisted_overrides(
+                native_rows,
+                persisted_jobs,
+                app_timezone=app_timezone,
             )
             visible_native_rows = [
                 row
@@ -6505,18 +6612,47 @@ def build_operations_schedule_router(
                     resolved_end=resolved_end,
                 )
             ]
-            schedule_jobs = [
-                _native_schedule_job(row, observed_at) for row in visible_native_rows
+            transient_native_jobs = [
+                _native_projection_job(row) for row in visible_native_rows
             ]
-            _, unmatched, _ = _decorate_schedule_jobs(
-                [],
-                range_start,
-                range_end,
+            combined_jobs = [*persisted_jobs, *transient_native_jobs]
+            expected_hours_learning_by_site = _load_expected_hours_learning_by_site(
+                _expected_hours_learning_site_ids(combined_jobs),
+                observed_at=observed_at,
+                app_timezone=app_timezone,
+            )
+            scheduled_starts = [
+                job["scheduled_start"]
+                for job in combined_jobs
+                if job.get("scheduled_start") is not None
+            ]
+            scheduled_ends = [
+                job["scheduled_end"]
+                for job in combined_jobs
+                if job.get("scheduled_end") is not None
+            ]
+            evidence_range_start = min([range_start, *scheduled_starts])
+            evidence_range_end = max([range_end, *scheduled_ends])
+            schedule_jobs, unmatched, _ = _decorate_schedule_jobs(
+                combined_jobs,
+                evidence_range_start,
+                evidence_range_end,
                 observed_at,
                 app_timezone,
                 visible_range_start=range_start,
                 visible_range_end=range_end,
+                expected_hours_learning_by_site=expected_hours_learning_by_site,
             )
+            native_by_id = {
+                int(job["id"]): job["_nativeProjection"]
+                for job in transient_native_jobs
+                if job.get("_nativeProjection") is not None
+            }
+            for job in schedule_jobs:
+                native_row = native_by_id.get(int(job["id"]))
+                if native_row is not None:
+                    job["_nativeProjection"] = native_row
+                    _restore_native_schedule_metadata(job)
             active_jobs = [job for job in schedule_jobs if job["includedInPlan"]]
             known_planned_hours = sum(
                 float(job["plannedHours"])
@@ -6532,11 +6668,12 @@ def build_operations_schedule_router(
                 if segment.get("finalized") and segment.get("hours") is not None
             )
             in_progress_workers = {
-                segment["employeeId"]
-                for segment in unmatched
-                if segment.get("finalized") is False
-                and segment.get("employeeId") is not None
+                worker["employeeId"]
+                for job in schedule_jobs
+                for worker in job["workers"]
+                if worker["status"] == "in_progress"
             }
+            finalized_actual = sum(float(job["actualHours"]) for job in schedule_jobs)
             return {
                 "success": True,
                 "timezone": timezone_name,
@@ -6545,13 +6682,17 @@ def build_operations_schedule_router(
                 "endDate": str(resolved_end),
                 "planningSource": "native",
                 "ruleCount": rule_count,
-                "issues": native_issues,
+                "issues": global_issues,
                 "summary": {
                     "jobCount": len(active_jobs),
                     "visibleJobCount": len(schedule_jobs),
-                    "cancelledJobCount": 0,
+                    "cancelledJobCount": sum(
+                        1 for job in schedule_jobs if job["status"] == "cancelled"
+                    ),
                     "excludedJobCount": sum(
-                        1 for job in schedule_jobs if not job["includedInPlan"]
+                        1
+                        for job in schedule_jobs
+                        if job["status"] != "cancelled" and not job["includedInPlan"]
                     ),
                     "plannedHours": _complete_hours(
                         known_planned_hours,
@@ -6559,16 +6700,16 @@ def build_operations_schedule_router(
                     ),
                     "knownPlannedHours": round(known_planned_hours, 2),
                     "plannedHoursComplete": planned_incomplete == 0,
-                    "actualHours": 0.0,
+                    "actualHours": round(finalized_actual, 2),
                     "varianceHours": (
-                        round(0.0 - known_planned_hours, 2)
+                        round(finalized_actual - known_planned_hours, 2)
                         if planned_incomplete == 0
                         else None
                     ),
                     "unmatchedActualHours": round(unmatched_actual, 2),
                     "inProgressWorkerCount": len(in_progress_workers),
                     "issueCount": sum(len(job["issues"]) for job in schedule_jobs)
-                    + len(native_issues),
+                    + len(global_issues),
                 },
                 "jobs": schedule_jobs,
                 "unmatchedActualSegments": unmatched,
@@ -7156,7 +7297,7 @@ def build_operations_schedule_router(
     @router.get("/api/admin/operations/forecast")
     def operations_forecast(
         weeks_ahead: int = Query(default=4),
-        planning_source: str = Query(default="calendar"),
+        planning_source: str = Query(default=OPERATIONS_DEFAULT_PLANNING_SOURCE),
         _: Dict[str, Any] = Depends(get_current_admin),
     ) -> Dict[str, Any]:
         if weeks_ahead not in OPERATIONS_FORECAST_ALLOWED_WEEKS:

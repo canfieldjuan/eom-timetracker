@@ -594,6 +594,7 @@ def test_rate_edit_does_not_restate_labor_on_any_money_surface(
         params={
             "start_date": SERVICE_DAY.isoformat(),
             "end_date": NEXT_SERVICE_DAY.isoformat(),
+            "planning_source": "calendar",
         },
     )
     assert schedule.status_code == 200, schedule.text
@@ -873,6 +874,7 @@ def test_missing_rate_policies_are_unchanged_without_snapshot_or_live_rate(
         params={
             "start_date": SERVICE_DAY.isoformat(),
             "end_date": SERVICE_DAY.isoformat(),
+            "planning_source": "calendar",
         },
     )
     assert schedule.status_code == 200, schedule.text
@@ -935,6 +937,7 @@ def test_operations_fails_closed_when_only_one_of_two_shifts_has_a_rate(
         params={
             "start_date": SERVICE_DAY.isoformat(),
             "end_date": SERVICE_DAY.isoformat(),
+            "planning_source": "calendar",
         },
     )
     assert schedule.status_code == 200, schedule.text
@@ -995,6 +998,7 @@ def test_operations_prices_each_shift_at_its_own_snapshot_rate(client, auth):
         params={
             "start_date": SERVICE_DAY.isoformat(),
             "end_date": SERVICE_DAY.isoformat(),
+            "planning_source": "calendar",
         },
     )
     assert schedule.status_code == 200, schedule.text
@@ -1061,6 +1065,7 @@ def test_qr_only_presence_stays_on_the_live_rate(client, auth):
         params={
             "start_date": SERVICE_DAY.isoformat(),
             "end_date": SERVICE_DAY.isoformat(),
+            "planning_source": "calendar",
         },
     )
     assert schedule.status_code == 200, schedule.text
@@ -1158,6 +1163,7 @@ def test_mixed_rate_labor_rounds_once_not_per_bucket(client, auth):
         params={
             "start_date": SERVICE_DAY.isoformat(),
             "end_date": SERVICE_DAY.isoformat(),
+            "planning_source": "calendar",
         },
     )
     assert schedule.status_code == 200, schedule.text
@@ -1205,6 +1211,7 @@ def test_single_rate_labor_is_unchanged_by_the_bucketing(client, auth):
         params={
             "start_date": SERVICE_DAY.isoformat(),
             "end_date": SERVICE_DAY.isoformat(),
+            "planning_source": "calendar",
         },
     )
     assert schedule.status_code == 200, schedule.text
