@@ -205,6 +205,23 @@ class TestReceivablesProxy:
                 }
             )
 
+    def test_customer_wide_payment_defaults_to_no_allocations(self):
+        import time_tracker_api as api
+
+        payment = api.ReceivablesPaymentRequest.model_validate(
+            {
+                "contact_id": "11111111-1111-1111-1111-111111111111",
+                "payer_name": "Residential customer",
+                "total_amount_cents": 10_000,
+                "payment_method": "check",
+                "received_date": "2026-08-12",
+                "reference": "1001",
+            }
+        )
+
+        assert payment.allocations == []
+        assert payment.model_dump(mode="json")["allocations"] == []
+
     def test_deposit_model_rejects_duplicate_payment_ids(self):
         import time_tracker_api as api
 
@@ -411,6 +428,47 @@ class TestReceivablesProxy:
         assert kwargs["headers"]["Idempotency-Key"] == "browser-payment-1"
         assert kwargs["json"]["total_amount_cents"] == 10_000
 
+    def test_forwards_customer_wide_payment_without_an_invoice_allocation(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse({"id": "unapplied-payment-1"}, status_code=201)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+
+        response = client.post(
+            "/api/admin/receivables/payments",
+            headers={**auth, "Idempotency-Key": "browser-unapplied-payment-1"},
+            json={
+                "contact_id": "11111111-1111-1111-1111-111111111111",
+                "payer_name": "Residential customer",
+                "total_amount_cents": 10_000,
+                "payment_method": "check",
+                "received_date": "2026-08-12",
+                "reference": "1001",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"id": "unapplied-payment-1"}
+        method, url, kwargs = calls[0]
+        assert method == "POST"
+        assert url == "https://atlas.test/api/v1/receivables/payments"
+        assert kwargs["headers"]["Idempotency-Key"] == "browser-unapplied-payment-1"
+        assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert kwargs["json"]["allocations"] == []
+
     def test_upstream_outage_is_retryable_with_durable_operation_identity(
         self, client, auth, monkeypatch
     ):
@@ -474,7 +532,7 @@ class TestReceivablesProxy:
         assert response.status_code == 502
         assert response.json()["error"] == "Receivables service authentication failed"
 
-    def test_ambiguous_retry_reuses_durable_business_key_across_browser_keys(
+    def test_unapplied_payment_ambiguous_retry_reuses_durable_business_key(
         self, client, auth, monkeypatch
     ):
         import time_tracker_api as api
@@ -498,12 +556,6 @@ class TestReceivablesProxy:
             "payment_method": "check",
             "received_date": "2026-07-16",
             "reference": "durable-1001",
-            "allocations": [
-                {
-                    "invoice_id": "22222222-2222-2222-2222-222222222222",
-                    "amount_cents": 10_000,
-                }
-            ],
         }
 
         first = client.post(
