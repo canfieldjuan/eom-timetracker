@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bcrypt
 import hashlib
+import math
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -998,3 +999,501 @@ def test_home_base_only_shift_never_appears_in_customer_drilldown(monkeypatch):
     assert result["summary"]["visits"] == 0
     assert result["summary"]["hours"] == 0
     assert result["byVisit"] == []
+
+
+def test_residential_candidate_bounds_are_conservative_and_indexed():
+    """The coarse lookup may filter candidates, never valid geofence evidence."""
+    edge_distance = float(time_tracker_api.SITE_CHECK_IN_RADIUS_M) * 0.99
+    edge_latitude = math.degrees(edge_distance / 6_371_000)
+    equator_bounds = time_tracker_api._site_check_in_coordinate_bounds(0, 0, 0)
+    assert (
+        time_tracker_api.evaluate_site_check_in_geofence(
+            site_latitude=edge_latitude,
+            site_longitude=0,
+            latitude=0,
+            longitude=0,
+            accuracy=0,
+        )["status"]
+        == "inside"
+    )
+    assert equator_bounds[0] <= edge_latitude <= equator_bounds[1]
+
+    latitude_lower, latitude_upper, longitude_lower, longitude_upper, wraps = (
+        time_tracker_api._site_check_in_coordinate_bounds(
+            39.0,
+            179.9999,
+            5,
+        )
+    )
+
+    assert latitude_lower <= 39.0 <= latitude_upper
+    assert wraps is True
+    assert longitude_lower > longitude_upper
+    # This Site is only about 22 m away across the international date line, so
+    # the SQL envelope must retain it for the authoritative haversine check.
+    assert (
+        time_tracker_api.evaluate_site_check_in_geofence(
+            site_latitude=39.0,
+            site_longitude=-179.9999,
+            latitude=39.0,
+            longitude=179.9999,
+            accuracy=5,
+        )["status"]
+        == "inside"
+    )
+    assert -179.9999 <= longitude_upper
+
+    index = db.query_one(
+        """
+        SELECT indexdef
+        FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND indexname = 'idx_locations_active_residential_coordinates'
+        """
+    )
+    assert index is not None
+    assert "(lat, lng)" in str(index["indexdef"])
+    assert "location_type = 'Residential'" in str(index["indexdef"])
+
+
+def test_customer_label_with_home_base_prefix_still_auto_links_first_visit(client):
+    """Presentation text cannot decide whether an ordinary shift is internal."""
+    employee_id, _ = _create_employee(client, "Customer prefix auto-link")
+    customer_site_id = _insert_site(
+        "Customer Prefix Auto-link Site",
+        location_type="Residential",
+        latitude=39.42,
+        longitude=-88.42,
+    )
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    entry = {
+        "id": -1,
+        "employeeId": employee_id,
+        "employeeName": f"{TEST_PREFIX} Customer prefix auto-link",
+        "location": "Home Base — Customer-facing label",
+        "locationId": None,
+        "internalHomeBase": False,
+        "clockIn": time_tracker_api.to_utc_iso(now),
+        "clockOut": time_tracker_api.to_utc_iso(now + timedelta(hours=1)),
+        "totalHours": 1,
+        "notes": "",
+        "date": now.astimezone(ZoneInfo("America/Chicago")).date().isoformat(),
+        "timezone": "America/Chicago",
+        "clockInGps": None,
+        "clockInGpsMeta": None,
+        "clockOutGps": None,
+        "clockOutGpsMeta": None,
+        "jobId": None,
+        "timeCategory": "productive",
+        "nonProductiveType": None,
+        "visits": [
+            {
+                "locationId": customer_site_id,
+                "location": f"{TEST_PREFIX} Customer Prefix Auto-link Site",
+                "customer": f"{TEST_PREFIX} Customer Customer Prefix Auto-link Site",
+                "arrivalTime": time_tracker_api.to_utc_iso(now + timedelta(minutes=5)),
+                "gps": None,
+                "gpsMeta": None,
+                "sequenceVersion": 2,
+                "siteCheckInId": None,
+                "jobId": None,
+            }
+        ],
+        "departures": [],
+    }
+
+    time_tracker_api._save_timesheets_to_db(
+        {"entries": [entry]},
+        set(),
+        {},
+        {},
+    )
+
+    assert db.query_one(
+        "SELECT location_id FROM shifts WHERE id = %s",
+        (entry["id"],),
+    ) == {"location_id": customer_site_id}
+
+
+def test_renamed_legacy_receipt_constraint_is_replaced_by_home_base_vocabulary():
+    """Deployments may not retain the original generated CHECK name."""
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                ALTER TABLE plain_time_action_receipts
+                DROP CONSTRAINT plain_time_action_receipts_action_check
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE plain_time_action_receipts
+                ADD CONSTRAINT renamed_legacy_receipt_action_check
+                CHECK (action IN ('clock-in', 'arrive', 'depart', 'clock-out'))
+                """
+            )
+
+    time_tracker_api._ensure_home_base_schema()
+
+    constraints = db.query_all(
+        """
+        SELECT conname, pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint
+        WHERE conrelid = 'plain_time_action_receipts'::regclass
+          AND contype = 'c'
+          AND position('action' IN pg_get_constraintdef(oid)) > 0
+        ORDER BY conname
+        """
+    )
+    assert [row["conname"] for row in constraints] == [
+        "plain_time_action_receipts_action_check"
+    ]
+    assert "home-base-start" in str(constraints[0]["definition"])
+    assert "home-base-end" in str(constraints[0]["definition"])
+
+
+def test_end_only_home_base_evidence_does_not_make_a_shift_internal(client, auth):
+    employee_id, _ = _create_employee(client, "End only evidence")
+    _enroll_in_morning_crew(employee_id)
+    config = _configure_home_base(client, auth)
+    home_base = config["homeBase"]
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    shift = db.query_one(
+        """
+        INSERT INTO shifts (
+            employee_id, location_label, clock_in, clock_out, total_hours,
+            local_date, timezone, time_category
+        ) VALUES (%s, %s, %s, %s, 1, %s, 'America/Chicago', 'productive')
+        RETURNING id
+        """,
+        (
+            employee_id,
+            "Legacy customer shift",
+            now - timedelta(hours=1),
+            now,
+            now.astimezone(ZoneInfo("America/Chicago")).date(),
+        ),
+    )
+    assert shift is not None
+    shift_id = int(shift["id"])
+    db.execute(
+        """
+        INSERT INTO home_base_events (
+            shift_id, employee_id, home_base_id, home_base_policy_id,
+            action, outcome, recorded_at
+        ) VALUES (%s, %s, %s, %s, 'end', 'recorded', %s)
+        """,
+        (
+            shift_id,
+            employee_id,
+            int(home_base["id"]),
+            int(home_base["policyId"]),
+            now,
+        ),
+    )
+
+    assert time_tracker_api._home_base_shift_ids([shift_id]) == set()
+    loaded_entry = next(
+        entry
+        for entry in time_tracker_api._load_timesheets_from_db()["entries"]
+        if int(entry["id"]) == shift_id
+    )
+    assert loaded_entry["internalHomeBase"] is False
+
+    unclassified = operations_schedule._closed_shift_segments(
+        {
+            "id": shift_id,
+            "employee_id": employee_id,
+            "employee_name": "End only evidence",
+            "hourly_rate": 18.25,
+            "location_id": 44,
+            "location_label": "Legacy customer shift",
+            "clock_in": now - timedelta(hours=1),
+            "clock_out": now,
+        },
+        [],
+        [],
+        {},
+        now - timedelta(hours=1),
+        now,
+        [{"action": "end", "outcome": "recorded"}],
+    )
+    assert not any(segment.get("dispatch_overhead") for segment in unclassified)
+
+    db.execute(
+        """
+        INSERT INTO home_base_events (
+            shift_id, employee_id, home_base_id, home_base_policy_id,
+            action, outcome, recorded_at
+        ) VALUES (%s, %s, %s, %s, 'start', 'recorded', %s)
+        """,
+        (
+            shift_id,
+            employee_id,
+            int(home_base["id"]),
+            int(home_base["policyId"]),
+            now - timedelta(hours=1),
+        ),
+    )
+    assert time_tracker_api._home_base_shift_ids([shift_id]) == {shift_id}
+
+
+def test_open_home_base_presence_requires_a_start_event():
+    started_at = datetime(2026, 8, 11, 13, tzinfo=timezone.utc)
+    observed_at = started_at + timedelta(hours=1)
+    presence = operations_schedule._open_shift_presence(
+        {
+            "id": 91,
+            "employee_id": 22,
+            "employee_name": "Open dispatch",
+            "hourly_rate": 18.25,
+            "location_id": None,
+            "location_label": "",
+            "job_id": None,
+            "clock_in": started_at,
+        },
+        [],
+        [],
+        {},
+        observed_at,
+    )
+
+    end_only = operations_schedule._apply_open_home_base_dispatch_overhead(
+        dict(presence),
+        [{"action": "end", "outcome": "recorded"}],
+    )
+    assert end_only.get("dispatch_overhead") is not True
+    assert end_only["unassigned_gap"] is True
+
+    with_start = operations_schedule._apply_open_home_base_dispatch_overhead(
+        dict(presence),
+        [{"action": "start", "outcome": "recorded"}],
+    )
+    assert with_start["dispatch_overhead"] is True
+    assert with_start["location_label"] == "Dispatch overhead"
+    assert with_start["unassigned_gap"] is False
+
+
+def test_dispatch_segments_block_break_deduction_from_customer_time(monkeypatch):
+    """A paid return-to-base segment is not a customer break."""
+    start = datetime(2026, 8, 11, 13, tzinfo=timezone.utc)
+    arrival = start + timedelta(minutes=30)
+    departure = start + timedelta(minutes=90)
+    end = start + timedelta(hours=2)
+    job = {
+        "id": 701,
+        "location_id": 77,
+        "customer_id": 3,
+        "display_customer": "Customer",
+        "site_address": "Customer Site",
+        "site_type": "Residential",
+        "scheduled_date": date(2026, 8, 11),
+        "scheduled_start": arrival,
+        "scheduled_end": departure,
+        "source_role": "residential_morning",
+        "source_title": "Customer work",
+        "status": "scheduled",
+        "site_expected_hours": 1,
+        "rate": 100,
+        "rate_type": "per_visit",
+        "site_active": True,
+        "source_all_day": False,
+    }
+    shift = {
+        "id": 700,
+        "employee_id": 22,
+        "employee_name": "Break allocation",
+        "hourly_rate": 18.25,
+        "location_id": None,
+        "location_label": "Home Base — EOM Office Home Base",
+        "job_id": None,
+        "clock_in": start,
+        "clock_out": end,
+        "payroll_break_minutes": 30,
+    }
+    monkeypatch.setattr(
+        operations_schedule,
+        "_load_time_evidence",
+        lambda *_args, **_kwargs: (
+            [shift],
+            {
+                700: [
+                    {
+                        "id": 881,
+                        "location_id": 77,
+                        "location_label": "Customer Site",
+                        "arrival_time": arrival,
+                        "sequence_version": 2,
+                    }
+                ]
+            },
+            {
+                700: [
+                    {
+                        "id": 882,
+                        "visit_id": 881,
+                        "location_id": 77,
+                        "departure_time": departure,
+                    }
+                ]
+            },
+            {},
+            [],
+            {
+                700: [
+                    {"action": "start", "outcome": "recorded"},
+                    {"action": "end", "outcome": "recorded"},
+                ]
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        operations_schedule,
+        "_load_linked_job_metadata",
+        lambda *_args, **_kwargs: {},
+    )
+
+    jobs, unmatched, _rates = operations_schedule._decorate_schedule_jobs(
+        [job],
+        start,
+        end,
+        end + timedelta(minutes=1),
+        ZoneInfo("America/Chicago"),
+        visible_range_start=start,
+        visible_range_end=end,
+    )
+
+    assert jobs[0]["actualHours"] == 1.0
+    assert [segment["reason"] for segment in unmatched] == [
+        "dispatch_overhead",
+        "dispatch_overhead",
+    ]
+
+
+def test_version_two_analytics_without_a_paired_departure_stops_at_arrival():
+    start = datetime(2026, 8, 11, 13, tzinfo=timezone.utc)
+    arrival = start + timedelta(minutes=30)
+    next_arrival = start + timedelta(minutes=90)
+    end = start + timedelta(hours=2)
+    visits = [
+        {
+            "id": 881,
+            "arrivalTime": time_tracker_api.to_utc_iso(arrival),
+            "sequenceVersion": 2,
+        },
+        {
+            "id": 882,
+            "arrivalTime": time_tracker_api.to_utc_iso(next_arrival),
+            "sequenceVersion": 2,
+        },
+    ]
+
+    assert time_tracker_api._analytics_visit_end(
+        {"departures": []},
+        visits,
+        0,
+        end,
+        use_paired_departures=True,
+    ) == arrival
+    assert time_tracker_api._analytics_visit_end(
+        {"departures": []},
+        visits,
+        0,
+        end,
+        use_paired_departures=False,
+    ) == next_arrival
+
+
+def test_home_base_retry_replays_after_qr_rotation(client, auth):
+    employee_id, employee_auth = _create_employee(client, "QR rotation replay")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+    qr = client.post(
+        "/api/admin/home-base/check-in-qr",
+        headers=auth,
+        json={},
+    )
+    assert qr.status_code == 200, qr.text
+    payload = {
+        "token": qr.json()["token"],
+        "action": "start",
+        "latitude": BASE_LATITUDE,
+        "longitude": BASE_LONGITUDE,
+        "accuracy": 5,
+        "scannedAt": datetime.now(timezone.utc).isoformat(),
+        "idempotencyKey": str(uuid4()),
+    }
+    recorded = client.post(
+        "/api/timesheet/home-base/scan",
+        headers=employee_auth,
+        json=payload,
+    )
+    assert recorded.status_code == 200, recorded.text
+
+    rotated = client.post(
+        "/api/admin/home-base/check-in-qr",
+        headers=auth,
+        json={"rotate": True},
+    )
+    assert rotated.status_code == 200, rotated.text
+    assert rotated.json()["token"] != payload["token"]
+
+    replay = client.post(
+        "/api/timesheet/home-base/scan",
+        headers=employee_auth,
+        json=payload,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True
+    assert replay.json()["entry"]["id"] == recorded.json()["entry"]["id"]
+
+
+def test_dispatch_labor_cost_is_separate_in_weekly_profitability(monkeypatch):
+    week_start = date(2026, 8, 9)
+    start = datetime(2026, 8, 11, 14, tzinfo=timezone.utc)
+    end = start + timedelta(hours=2)
+    dispatch_segment = {
+        "shiftId": 701,
+        "employeeId": 22,
+        "employeeName": "Dispatch labor",
+        "locationId": None,
+        "locationLabel": "Dispatch overhead",
+        "intervalStart": operations_schedule._utc_iso(start),
+        "intervalEnd": operations_schedule._utc_iso(end),
+        "hours": 2.0,
+        "finalized": True,
+        "presenceOnly": False,
+        "reason": "dispatch_overhead",
+        "dispatchOverhead": True,
+        "candidateJobIds": [],
+        "evidence": ["home_base_start_recorded"],
+    }
+    monkeypatch.setattr(operations_schedule, "_load_jobs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        operations_schedule,
+        "monthly_revenue_allocations",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        operations_schedule,
+        "_load_expected_hours_learning_by_site",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        operations_schedule,
+        "_decorate_schedule_jobs",
+        lambda *_args, **_kwargs: ([], [dispatch_segment], {701: 1825}),
+    )
+
+    result = operations_schedule.build_weekly_labor_profitability(
+        week_start,
+        now_provider=lambda: end + timedelta(hours=1),
+    )
+
+    assert result["summary"]["dispatchOverheadHours"] == 2.0
+    assert result["summary"]["dispatchOverheadLaborCost"] == 36.5
+    assert result["summary"]["knownDispatchOverheadLaborCost"] == 36.5
+    assert result["summary"]["dispatchOverheadLaborCostComplete"] is True
+    tuesday = next(row for row in result["byDay"] if row["date"] == "2026-08-11")
+    assert tuesday["dispatchOverheadLaborCost"] == 36.5
+    assert tuesday["dispatchOverheadLaborCostComplete"] is True

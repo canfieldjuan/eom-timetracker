@@ -1240,6 +1240,12 @@ CREATE INDEX idx_shifts_clock_out    ON shifts(clock_out);
 CREATE INDEX idx_customers_active    ON customers(active);
 CREATE INDEX idx_locations_active    ON locations(active);
 CREATE INDEX idx_locations_customer_id ON locations(customer_id);
+CREATE INDEX idx_locations_active_residential_coordinates
+    ON locations(lat, lng)
+    WHERE active
+      AND location_type = 'Residential'
+      AND lat IS NOT NULL
+      AND lng IS NOT NULL;
 CREATE UNIQUE INDEX uq_locations_address_key
     ON locations(address_key) WHERE address_key IS NOT NULL;
 CREATE INDEX idx_employees_active    ON employees(active);

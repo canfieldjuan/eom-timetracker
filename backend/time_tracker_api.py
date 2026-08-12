@@ -410,6 +410,63 @@ def evaluate_site_check_in_geofence(
     }
 
 
+def _site_check_in_coordinate_bounds(
+    latitude: float,
+    longitude: float,
+    accuracy: float,
+) -> Tuple[float, float, float, float, bool]:
+    """Return a conservative SQL bounding box for a site-check-in geofence.
+
+    The exact haversine calculation remains authoritative.  This box is only a
+    coarse, indexable superset, so it must include the configured radius plus
+    the reported device accuracy and cope with the international date line.
+    """
+    envelope_m = float(SITE_CHECK_IN_RADIUS_M) + max(float(accuracy), 0.0)
+    # This is intentionally lower than a degree's distance under the same
+    # spherical radius used by ``haversine_m``.  Dividing by the lower value
+    # makes the box a superset instead of allowing a boundary point to fall
+    # just outside a too-tight approximation.
+    conservative_meters_per_degree = 110_000.0
+    latitude_delta = envelope_m / conservative_meters_per_degree
+    latitude_lower = max(-90.0, float(latitude) - latitude_delta)
+    latitude_upper = min(90.0, float(latitude) + latitude_delta)
+
+    # At either latitude edge of the box, one degree of longitude covers less
+    # ground than at the device latitude.  Size the longitude range for the
+    # poleward edge so the rectangle remains a true superset.
+    max_absolute_latitude = max(abs(latitude_lower), abs(latitude_upper))
+    cosine = abs(math.cos(math.radians(max_absolute_latitude)))
+    if cosine < 1e-12:
+        longitude_delta = 180.0
+    else:
+        longitude_delta = min(
+            180.0,
+            envelope_m / (conservative_meters_per_degree * cosine),
+        )
+    if longitude_delta >= 180.0:
+        return latitude_lower, latitude_upper, -180.0, 180.0, False
+
+    longitude_lower = float(longitude) - longitude_delta
+    longitude_upper = float(longitude) + longitude_delta
+    if longitude_lower < -180.0:
+        return (
+            latitude_lower,
+            latitude_upper,
+            longitude_lower + 360.0,
+            longitude_upper,
+            True,
+        )
+    if longitude_upper > 180.0:
+        return (
+            latitude_lower,
+            latitude_upper,
+            longitude_lower,
+            longitude_upper - 360.0,
+            True,
+        )
+    return latitude_lower, latitude_upper, longitude_lower, longitude_upper, False
+
+
 def find_nearest_location_match(
     lat: float,
     lng: float,
@@ -1052,6 +1109,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
                    SELECT 1
                    FROM home_base_events home_base_event
                    WHERE home_base_event.shift_id = s.id
+                     AND home_base_event.action = 'start'
                ) AS internal_home_base
         FROM shifts s
         JOIN employees e ON s.employee_id = e.id
@@ -1236,7 +1294,6 @@ def _save_timesheets_to_db(
                 if (
                     v_loc_id
                     and not entry.get("internalHomeBase")
-                    and not str(entry.get("location") or "").startswith("Home Base — ")
                 ):
                     cur.execute(
                         "UPDATE shifts SET location_id = %s WHERE id = %s AND location_id IS NULL",
@@ -5001,25 +5058,37 @@ def _ensure_home_base_schema() -> None:
         """
         DO $$
         DECLARE
-            existing_definition TEXT;
+            action_constraint_name TEXT;
+            action_constraint_definition TEXT;
+            has_home_base_action_constraint BOOLEAN := FALSE;
         BEGIN
-            SELECT pg_get_constraintdef(oid)
-              INTO existing_definition
-              FROM pg_constraint
-             WHERE conrelid = 'plain_time_action_receipts'::regclass
-               AND conname = 'plain_time_action_receipts_action_check';
+            -- Older deployments can carry the action CHECK under a generated
+            -- or manually renamed constraint.  Match its durable definition,
+            -- rather than assuming one historical constraint name, so the old
+            -- vocabulary cannot remain in force beside the replacement.
+            FOR action_constraint_name, action_constraint_definition IN
+                SELECT conname, pg_get_constraintdef(oid)
+                  FROM pg_constraint
+                 WHERE conrelid = 'plain_time_action_receipts'::regclass
+                   AND contype = 'c'
+                   AND position('action' IN pg_get_constraintdef(oid)) > 0
+                   AND position('clock-in' IN pg_get_constraintdef(oid)) > 0
+                   AND position('arrive' IN pg_get_constraintdef(oid)) > 0
+                   AND position('depart' IN pg_get_constraintdef(oid)) > 0
+                   AND position('clock-out' IN pg_get_constraintdef(oid)) > 0
+            LOOP
+                IF position('home-base-start' IN action_constraint_definition) > 0
+                   AND position('home-base-end' IN action_constraint_definition) > 0 THEN
+                    has_home_base_action_constraint := TRUE;
+                ELSE
+                    EXECUTE format(
+                        'ALTER TABLE plain_time_action_receipts DROP CONSTRAINT %%I',
+                        action_constraint_name
+                    );
+                END IF;
+            END LOOP;
 
-            IF existing_definition IS NULL THEN
-                ALTER TABLE plain_time_action_receipts
-                ADD CONSTRAINT plain_time_action_receipts_action_check
-                CHECK (action IN (
-                    'clock-in', 'arrive', 'depart', 'clock-out',
-                    'home-base-start', 'home-base-end'
-                ));
-            ELSIF position('home-base-start' IN existing_definition) = 0
-               OR position('home-base-end' IN existing_definition) = 0 THEN
-                ALTER TABLE plain_time_action_receipts
-                DROP CONSTRAINT plain_time_action_receipts_action_check;
+            IF NOT has_home_base_action_constraint THEN
                 ALTER TABLE plain_time_action_receipts
                 ADD CONSTRAINT plain_time_action_receipts_action_check
                 CHECK (action IN (
@@ -5028,6 +5097,16 @@ def _ensure_home_base_schema() -> None:
                 ));
             END IF;
         END $$;
+        """
+    )
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_locations_active_residential_coordinates
+        ON locations(lat, lng)
+        WHERE active = true
+          AND location_type = 'Residential'
+          AND lat IS NOT NULL
+          AND lng IS NOT NULL
         """
     )
     db.execute(
@@ -9693,6 +9772,14 @@ def record_home_base_scan(
     request: Request,
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
+    action_name = f"home-base-{payload.action}"
+    # A receipt is the durable outcome of this action.  Replaying it must not
+    # depend on mutable policy or QR state: an admin may rotate the nonce after
+    # a successful scan while a browser is still retrying the same request.
+    replay = _plain_time_action_replay_response(action_name, payload, employee)
+    if replay is not None:
+        return replay
+
     home_base = _resolve_home_base_qr(payload.token)
     now_utc = utc_now()
     policy = _home_base_policy_for_employee(int(employee["id"]), now_utc)
@@ -9719,10 +9806,6 @@ def record_home_base_scan(
             detail="GPS does not confirm Home Base. Use a documented exception if you could not scan.",
         )
 
-    action_name = f"home-base-{payload.action}"
-    replay = _plain_time_action_replay_response(action_name, payload, employee)
-    if replay is not None:
-        return replay
     if payload.action == "start":
         enforce_clock_action_hours(request)
 
@@ -11899,16 +11982,41 @@ def visit_candidates(
     scheduled = [_serialize_visit_candidate(row, payload) for row in scheduled_rows]
     scheduled_location_ids = {int(candidate["locationId"]) for candidate in scheduled}
 
+    (
+        latitude_lower,
+        latitude_upper,
+        longitude_lower,
+        longitude_upper,
+        crosses_date_line,
+    ) = _site_check_in_coordinate_bounds(
+        payload.latitude,
+        payload.longitude,
+        payload.accuracy,
+    )
+    longitude_predicate = (
+        "(lng >= %s OR lng <= %s)"
+        if crosses_date_line
+        else "lng BETWEEN %s AND %s"
+    )
+
     nearby_rows = db.query_all(
-        """
+        f"""
         SELECT id AS location_id, address, customer_name, location_type, lat, lng
         FROM locations
         WHERE active = true
           AND location_type = 'Residential'
           AND lat IS NOT NULL
           AND lng IS NOT NULL
+          AND lat BETWEEN %s AND %s
+          AND {longitude_predicate}
         ORDER BY customer_name NULLS LAST, address, id
-        """
+        """,
+        (
+            latitude_lower,
+            latitude_upper,
+            longitude_lower,
+            longitude_upper,
+        ),
     )
     nearby_residential: List[Dict[str, Any]] = []
     for row in nearby_rows:
@@ -26352,6 +26460,10 @@ def _analytics_visit_end(
                 paired.append(departure_at)
         if paired:
             return min(paired)
+        # Version-2 visits carry an explicit departure identity.  Without a
+        # valid pair, the evidence is incomplete; do not revive legacy
+        # next-arrival/clock-out attribution in only one reporting path.
+        return arrival
     if visit_index + 1 < len(visits):
         try:
             return parse_utc_iso(str(visits[visit_index + 1]["arrivalTime"]))
@@ -26367,7 +26479,12 @@ def _home_base_shift_ids(shift_ids: Iterable[int]) -> set[int]:
     return {
         int(row["shift_id"])
         for row in db.query_all(
-            "SELECT DISTINCT shift_id FROM home_base_events WHERE shift_id = ANY(%s)",
+            """
+            SELECT DISTINCT shift_id
+            FROM home_base_events
+            WHERE shift_id = ANY(%s)
+              AND action = 'start'
+            """,
             (ids,),
         )
     }

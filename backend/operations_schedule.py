@@ -3890,7 +3890,11 @@ def _apply_home_base_dispatch_overhead(
         # otherwise keeping the time unassigned is safer than rewriting a
         # customer interval as office work.
         last_departure = valid_departures[-1] if valid_departures else (
-            clock_in if not valid_arrivals else None
+            # An end-only event proves arrival at Home Base, but it does not
+            # prove that a pre-existing no-visit shift began as dispatch time.
+            # A start event is the durable internal-start boundary required to
+            # classify that whole shift as Home Base overhead.
+            clock_in if start_events and not valid_arrivals else None
         )
         if last_departure is not None and clock_out > last_departure:
             windows.append(
@@ -4251,6 +4255,40 @@ def _open_shift_presence(
     }
 
 
+def _apply_open_home_base_dispatch_overhead(
+    presence: Dict[str, Any],
+    home_base_events: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Classify an open no-Site Home Base interval without inventing a Site.
+
+    A start scan (including its documented-exception counterpart) is durable
+    evidence that the shift began at the internal base.  While no customer Site
+    is active, the live interval is paid dispatch work.  An end-only event is
+    deliberately insufficient here, matching closed-shift classification.
+    """
+    start_events = [event for event in home_base_events if event.get("action") == "start"]
+    if not start_events or presence.get("location_id") is not None:
+        return presence
+    evidence = sorted(
+        {
+            *(presence.get("evidence") or []),
+            *(
+                f"home_base_start_{event.get('outcome') or 'recorded'}"
+                for event in start_events
+            ),
+        }
+    )
+    return {
+        **presence,
+        "location_id": None,
+        "location_label": "Dispatch overhead",
+        "job_id": None,
+        "evidence": evidence,
+        "unassigned_gap": False,
+        "dispatch_overhead": True,
+    }
+
+
 def _segment_candidate_dates(
     segment: Dict[str, Any],
     app_timezone: ZoneInfo,
@@ -4530,6 +4568,10 @@ def _decorate_schedule_jobs(
                     qr_by_employee_site,
                     observed_at,
                 )
+                presence = _apply_open_home_base_dispatch_overhead(
+                    presence,
+                    home_base_events.get(shift_id, []),
+                )
                 presence["start"] = max(presence["start"], shift_range_start)
                 presence["end"] = min(presence["end"], shift_range_end)
                 if presence["end"] > presence["start"]:
@@ -4569,8 +4611,18 @@ def _decorate_schedule_jobs(
     resolved_segments: List[Dict[str, Any]] = []
     for segment in segments:
         if segment.get("dispatch_overhead"):
-            unmatched.append(
-                _serialize_unmatched(segment, "dispatch_overhead", [])
+            # Keep dispatch intervals in the same shift-level break allocator.
+            # Otherwise the allocator sees a single customer Site and deducts a
+            # corrected break from customer labor even when the latest interval
+            # is paid dispatch time.
+            resolved_segments.append(
+                {
+                    "segment": dict(segment),
+                    "job": None,
+                    "reason": "dispatch_overhead",
+                    "candidateJobIds": [],
+                    "emitUnmatched": True,
+                }
             )
             continue
         job, reason, candidate_job_ids = _match_segment_to_job(
@@ -4581,18 +4633,11 @@ def _decorate_schedule_jobs(
             linked_jobs_by_id=linked_jobs_by_id,
         )
         if job is None:
-            resolved_segments.append(
-                {
-                    "segment": dict(segment),
-                    "job": None,
-                    "reason": reason,
-                }
-            )
             shift_id = segment.get("shift_id")
             is_cross_boundary_shift = (
                 shift_id is not None and int(shift_id) in cross_boundary_shift_ids
             )
-            if (
+            emit_unmatched = not (
                 not is_cross_boundary_shift
                 and visible_range_start is not None
                 and visible_range_end is not None
@@ -4600,9 +4645,16 @@ def _decorate_schedule_jobs(
                     segment["end"] <= visible_range_start
                     or segment["start"] >= visible_range_end
                 )
-            ):
-                continue
-            unmatched.append(_serialize_unmatched(segment, reason, candidate_job_ids))
+            )
+            resolved_segments.append(
+                {
+                    "segment": dict(segment),
+                    "job": None,
+                    "reason": reason,
+                    "candidateJobIds": candidate_job_ids,
+                    "emitUnmatched": emit_unmatched,
+                }
+            )
             continue
 
         matched_segment = dict(segment)
@@ -4612,22 +4664,36 @@ def _decorate_schedule_jobs(
                 "segment": matched_segment,
                 "job": job,
                 "reason": reason,
+                "candidateJobIds": candidate_job_ids,
+                "emitUnmatched": False,
             }
         )
 
     for resolved in _apply_resolved_shift_break_minutes(resolved_segments):
         segment = resolved["segment"]
         job = resolved["job"]
-        if job is None:
-            continue
         reason = resolved["reason"]
-        job_id = int(job["id"])
-        employee_id = int(segment["employee_id"])
         segment_shift_id = segment.get("shift_id")
         if segment_shift_id is not None:
-            shift_rate_cents[int(segment_shift_id)] = _money_cents(
-                segment.get("hourly_rate")
-            )
+            normalized_shift_id = int(segment_shift_id)
+            rate_cents = _money_cents(segment.get("hourly_rate"))
+            if (
+                normalized_shift_id not in shift_rate_cents
+                or shift_rate_cents[normalized_shift_id] is None
+            ):
+                shift_rate_cents[normalized_shift_id] = rate_cents
+        if job is None:
+            if bool(resolved.get("emitUnmatched")):
+                unmatched.append(
+                    _serialize_unmatched(
+                        segment,
+                        reason,
+                        list(resolved.get("candidateJobIds") or []),
+                    )
+                )
+            continue
+        job_id = int(job["id"])
+        employee_id = int(segment["employee_id"])
         worker = workers_by_job[job_id].setdefault(
             employee_id,
             {
@@ -5786,6 +5852,7 @@ def _daily_profitability_rows(
     unmatched: List[Dict[str, Any]],
     *,
     dispatch_overhead: Optional[List[Dict[str, Any]]] = None,
+    dispatch_overhead_labor_by_day: Optional[Dict[str, Dict[str, Any]]] = None,
     app_timezone: ZoneInfo,
     range_start: datetime,
     range_end: datetime,
@@ -5820,6 +5887,10 @@ def _daily_profitability_rows(
         day_rows = rows_by_day.get(day_text, [])
         unmatched_rows = unmatched_by_day.get(day_text, [])
         dispatch_rows = dispatch_by_day.get(day_text, [])
+        dispatch_labor = (dispatch_overhead_labor_by_day or {}).get(
+            day_text,
+            {"knownLaborCents": 0, "laborCostComplete": True},
+        )
         unmatched_actual_hours = round(
             sum(
                 float(row["dailyHours"])
@@ -5854,6 +5925,17 @@ def _daily_profitability_rows(
                 ),
                 "dispatchOverheadSegmentCount": len(dispatch_rows),
                 "dispatchOverheadSegments": dispatch_rows,
+                "dispatchOverheadLaborCost": (
+                    _money(int(dispatch_labor["knownLaborCents"]))
+                    if bool(dispatch_labor.get("laborCostComplete"))
+                    else None
+                ),
+                "knownDispatchOverheadLaborCost": _money(
+                    int(dispatch_labor["knownLaborCents"])
+                ),
+                "dispatchOverheadLaborCostComplete": bool(
+                    dispatch_labor.get("laborCostComplete")
+                ),
                 "issueCount": _profitability_issue_count(day_rows)
                 + (1 if unmatched_rows else 0),
                 "issues": issues,
@@ -5874,6 +5956,79 @@ def _split_dispatch_overhead(
         [segment for segment in segments if segment.get("dispatchOverhead")],
         [segment for segment in segments if not segment.get("dispatchOverhead")],
     )
+
+
+def _dispatch_overhead_labor_costs(
+    segments: List[Dict[str, Any]],
+    *,
+    shift_rate_cents: Dict[int, Optional[int]],
+    app_timezone: ZoneInfo,
+    range_start: datetime,
+    range_end: datetime,
+) -> Dict[str, Any]:
+    """Price paid dispatch separately without assigning it to a customer Site.
+
+    Customer profitability deliberately excludes dispatch overhead. This helper
+    exposes the same rate-snapshot labor evidence alongside that separate
+    category, including a fail-closed completeness signal when a finalized
+    dispatch interval has no rate.
+    """
+    known_labor_exact_cents = Decimal(0)
+    day_weights: Dict[str, float] = defaultdict(float)
+    incomplete_days: set[str] = set()
+    represented_days: set[str] = set()
+    incomplete_segment_count = 0
+
+    for segment in segments:
+        if not segment.get("finalized") or not segment.get("intervalEnd"):
+            continue
+        interval_start = _parse_utc_iso(str(segment["intervalStart"]))
+        interval_end = _parse_utc_iso(str(segment["intervalEnd"]))
+        day_slices = list(
+            _local_interval_day_slices(
+                interval_start,
+                interval_end,
+                range_start=range_start,
+                range_end=range_end,
+                app_timezone=app_timezone,
+            )
+        )
+        if not day_slices:
+            continue
+        day_keys = [local_day.isoformat() for local_day, _hours_value in day_slices]
+        represented_days.update(day_keys)
+        shift_id = segment.get("shiftId")
+        rate_cents = (
+            shift_rate_cents.get(int(shift_id)) if shift_id is not None else None
+        )
+        if rate_cents is None:
+            incomplete_segment_count += 1
+            incomplete_days.update(day_keys)
+            continue
+        for local_day, hours_value in day_slices:
+            weight = Decimal(str(hours_value)) * Decimal(rate_cents)
+            known_labor_exact_cents += weight
+            day_weights[local_day.isoformat()] += float(weight)
+
+    known_labor_cents = int(
+        known_labor_exact_cents.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+    allocated_by_day = _allocate_cents_by_weight(
+        known_labor_cents,
+        dict(day_weights),
+    )
+    by_day = {
+        day_key: {
+            "knownLaborCents": int(allocated_by_day.get(day_key, 0)),
+            "laborCostComplete": day_key not in incomplete_days,
+        }
+        for day_key in represented_days
+    }
+    return {
+        "knownLaborCents": known_labor_cents,
+        "laborCostComplete": incomplete_segment_count == 0,
+        "byDay": by_day,
+    }
 
 
 def _parse_utc_iso(value: str) -> datetime:
@@ -5962,6 +6117,13 @@ def build_weekly_labor_profitability(
         cursor=cursor,
     )
     dispatch_overhead, unmatched = _split_dispatch_overhead(unmatched)
+    dispatch_labor = _dispatch_overhead_labor_costs(
+        dispatch_overhead,
+        shift_rate_cents=shift_rate_cents,
+        app_timezone=app_timezone,
+        range_start=range_start,
+        range_end=range_end,
+    )
     source_jobs = {int(job["id"]): job for job in jobs}
     profit_jobs = [
         _actual_profitability_row(
@@ -6024,6 +6186,17 @@ def build_weekly_labor_profitability(
             "unmatchedActualSegmentCount": len(unmatched),
             "dispatchOverheadHours": round(dispatch_overhead_hours, 2),
             "dispatchOverheadSegmentCount": len(dispatch_overhead),
+            "dispatchOverheadLaborCost": (
+                _money(int(dispatch_labor["knownLaborCents"]))
+                if bool(dispatch_labor["laborCostComplete"])
+                else None
+            ),
+            "knownDispatchOverheadLaborCost": _money(
+                int(dispatch_labor["knownLaborCents"])
+            ),
+            "dispatchOverheadLaborCostComplete": bool(
+                dispatch_labor["laborCostComplete"]
+            ),
         },
         "bySite": _group_profitability_by_site(profit_jobs),
         "byDay": _daily_profitability_rows(
@@ -6032,6 +6205,7 @@ def build_weekly_labor_profitability(
             daily_profit_jobs,
             unmatched,
             dispatch_overhead=dispatch_overhead,
+            dispatch_overhead_labor_by_day=dispatch_labor["byDay"],
             app_timezone=app_timezone,
             range_start=range_start,
             range_end=range_end,
