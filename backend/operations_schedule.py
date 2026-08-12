@@ -3866,13 +3866,66 @@ def _apply_home_base_dispatch_overhead(
     if clock_out is None or clock_out <= clock_in:
         return segments
 
-    valid_arrivals = sorted(
-        (
-            visit["arrival_time"]
-            for visit in visits
-            if clock_in <= visit["arrival_time"] < clock_out
-        )
+    valid_arrivals: List[datetime] = []
+    ordered_visits = sorted(
+        visits,
+        key=lambda visit: (visit["arrival_time"], int(visit.get("id") or 0)),
     )
+    for index, visit in enumerate(ordered_visits):
+        arrival = visit["arrival_time"]
+        if arrival >= clock_out:
+            continue
+        if arrival >= clock_in:
+            # Preserve the established behavior for an arrival that begins
+            # inside the corrected paid envelope.
+            valid_arrivals.append(arrival)
+            continue
+
+        # A payroll correction can move clock-in into an already-active
+        # customer visit.  In that case the segment builder below clamps the
+        # customer interval to corrected clock-in; use that same boundary here
+        # instead of treating the paid customer interval as Home Base overhead.
+        next_arrival = (
+            min(ordered_visits[index + 1]["arrival_time"], clock_out)
+            if index + 1 < len(ordered_visits)
+            else clock_out
+        )
+        matching_departure: Optional[Dict[str, Any]] = None
+        if int(visit.get("sequence_version") or 1) >= 2:
+            matching_departure = next(
+                (
+                    departure
+                    for departure in departures
+                    if departure.get("visit_id") is not None
+                    and int(departure["visit_id"]) == int(visit["id"])
+                ),
+                None,
+            )
+            work_end = (
+                matching_departure["departure_time"]
+                if matching_departure is not None
+                else arrival
+            )
+        else:
+            visit_location_id = visit.get("location_id")
+            if visit_location_id is not None:
+                matching_departure = next(
+                    (
+                        departure
+                        for departure in departures
+                        if departure.get("location_id") == visit_location_id
+                        and arrival <= departure["departure_time"] <= next_arrival
+                    ),
+                    None,
+                )
+            work_end = (
+                matching_departure["departure_time"]
+                if matching_departure is not None
+                else next_arrival
+            )
+        if work_end > clock_in:
+            valid_arrivals.append(clock_in)
+    valid_arrivals.sort()
     valid_departures = sorted(
         (
             departure["departure_time"]

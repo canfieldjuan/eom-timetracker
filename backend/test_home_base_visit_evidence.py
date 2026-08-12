@@ -501,6 +501,49 @@ def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
     }
 
 
+def test_home_base_scan_rejects_uncommitted_stale_payload_before_paid_mutation(client, auth):
+    employee_id, employee_auth = _create_employee(client, "Stale scan")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+    qr = client.post(
+        "/api/admin/home-base/check-in-qr",
+        headers=auth,
+        json={},
+    )
+    assert qr.status_code == 200, qr.text
+
+    stale = client.post(
+        "/api/timesheet/home-base/scan",
+        headers=employee_auth,
+        json={
+            "token": qr.json()["token"],
+            "action": "start",
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "scannedAt": (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=time_tracker_api.SITE_CHECK_IN_DEVICE_SKEW_SECONDS + 1)
+            ).isoformat(),
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert stale.status_code == 409, stale.text
+    assert "too old" in stale.json()["error"]
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM plain_time_action_receipts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+
+
 def test_commercial_qr_arrival_does_not_link_a_home_base_shift_to_customer(client, auth):
     """Customer arrival evidence must not relabel the internal base shift."""
     employee_id, employee_auth = _create_employee(client, "Home Base QR boundary")
@@ -643,6 +686,102 @@ def test_residential_selection_persists_the_chosen_scheduled_site_not_nearest(cl
         latitude=39.00009,
         longitude=-88.00000,
     )
+
+
+@pytest.mark.parametrize(
+    "race",
+    [
+        "planned_visit_cancelled",
+        "assignment_retired",
+        "site_deactivated",
+        "service_window_moved",
+    ],
+)
+def test_explicit_visit_revalidates_eligibility_inside_the_persistence_transaction(
+    client,
+    monkeypatch,
+    race,
+):
+    employee_id, employee_auth = _create_employee(client, f"Eligibility race {race}")
+    site_id = _insert_site(
+        f"Eligibility race {race}",
+        location_type="Residential",
+        latitude=39.45000,
+        longitude=-88.85000,
+    )
+    planned_visit_id = _insert_assigned_planned_visit(
+        employee_id=employee_id,
+        location_id=site_id,
+        suffix=f"eligibility-race-{race}",
+    )
+    shift_id = _clock_in(client, employee_auth)
+    original_resolver = time_tracker_api._resolve_explicit_visit_site
+
+    def resolve_and_change_eligibility(*args, **kwargs):
+        if kwargs.get("cur") is not None:
+            if race == "planned_visit_cancelled":
+                db.execute(
+                    """
+                    UPDATE planned_service_visits
+                    SET status = 'cancelled', cancelled_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (planned_visit_id,),
+                )
+            elif race == "assignment_retired":
+                db.execute(
+                    """
+                    UPDATE planned_visit_assignments
+                    SET active = false, retired_at = NOW()
+                    WHERE planned_visit_id = %s AND active = true
+                    """,
+                    (planned_visit_id,),
+                )
+            elif race == "site_deactivated":
+                db.execute(
+                    "UPDATE locations SET active = false WHERE id = %s",
+                    (site_id,),
+                )
+            else:
+                now = datetime.now(timezone.utc)
+                db.execute(
+                    """
+                    UPDATE planned_service_visits
+                    SET approximate_start = %s, approximate_end = %s
+                    WHERE id = %s
+                    """,
+                    (now + timedelta(days=2), now + timedelta(days=2, hours=1), planned_visit_id),
+                )
+        return original_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_resolve_explicit_visit_site",
+        resolve_and_change_eligibility,
+    )
+    rejected = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "plannedVisitId": planned_visit_id,
+            "evidenceMethod": "residential_gps",
+            "latitude": 39.45000,
+            "longitude": -88.85000,
+            "accuracy": 5,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert "changed before this arrival" in rejected.json()["error"]
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM visits WHERE shift_id = %s",
+        (shift_id,),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM visit_evidence_events WHERE shift_id = %s",
+        (shift_id,),
+    ) == {"count": 0}
 
 
 def test_residential_candidates_require_direct_assignment_or_effective_morning_crew(client):
@@ -967,6 +1106,59 @@ def test_home_base_windows_are_reported_as_dispatch_overhead_not_customer_labor(
     ]
     assert [(row["start"], row["end"], row["location_id"]) for row in customer] == [
         (arrival, departure, 77)
+    ]
+
+
+def test_home_base_window_preserves_customer_time_after_corrected_clock_in():
+    corrected_clock_in = datetime(2026, 8, 11, 13, 30, tzinfo=timezone.utc)
+    recorded_arrival = corrected_clock_in - timedelta(minutes=30)
+    departure = corrected_clock_in + timedelta(minutes=60)
+    clock_out = corrected_clock_in + timedelta(minutes=90)
+    segments = operations_schedule._closed_shift_segments(
+        {
+            "id": 993,
+            "employee_id": 44,
+            "employee_name": "Corrected dispatch test",
+            "hourly_rate": 18.25,
+            "payroll_break_minutes": 0,
+            "location_id": None,
+            "location_label": "Home Base — EOM Office Home Base",
+            "job_id": None,
+            "clock_in": corrected_clock_in,
+            "clock_out": clock_out,
+        },
+        [
+            {
+                "id": 883,
+                "location_id": 77,
+                "location_label": "Customer Site",
+                "arrival_time": recorded_arrival,
+                "sequence_version": 2,
+            }
+        ],
+        [
+            {
+                "id": 884,
+                "visit_id": 883,
+                "location_id": 77,
+                "departure_time": departure,
+            }
+        ],
+        {},
+        corrected_clock_in,
+        clock_out,
+        [
+            {"action": "start", "outcome": "recorded"},
+            {"action": "end", "outcome": "recorded"},
+        ],
+    )
+    dispatch = [segment for segment in segments if segment.get("dispatch_overhead")]
+    customer = [segment for segment in segments if not segment.get("dispatch_overhead")]
+    assert [(row["start"], row["end"], row["location_id"]) for row in customer] == [
+        (corrected_clock_in, departure, 77)
+    ]
+    assert [(row["start"], row["end"], row["location_id"]) for row in dispatch] == [
+        (departure, clock_out, None)
     ]
 
 
@@ -1522,7 +1714,7 @@ def test_version_two_analytics_without_a_paired_departure_stops_at_arrival():
     ) == next_arrival
 
 
-def test_home_base_retry_replays_after_qr_rotation(client, auth):
+def test_home_base_retry_replays_after_qr_rotation_and_later_skew(client, auth, monkeypatch):
     employee_id, employee_auth = _create_employee(client, "QR rotation replay")
     _enroll_in_morning_crew(employee_id)
     _configure_home_base(client, auth)
@@ -1556,6 +1748,13 @@ def test_home_base_retry_replays_after_qr_rotation(client, auth):
     assert rotated.status_code == 200, rotated.text
     assert rotated.json()["token"] != payload["token"]
 
+    # The original request has become stale by server time, but the durable
+    # receipt still wins before timestamp validation so a lost response remains
+    # safe to retry exactly once.
+    replay_time = datetime.now(timezone.utc) + timedelta(
+        seconds=time_tracker_api.SITE_CHECK_IN_DEVICE_SKEW_SECONDS + 1
+    )
+    monkeypatch.setattr(time_tracker_api, "utc_now", lambda: replay_time)
     replay = client.post(
         "/api/timesheet/home-base/scan",
         headers=employee_auth,

@@ -6773,7 +6773,75 @@ def _eligible_planned_visit(
     planned_visit_id: int,
     location_id: int,
     reference_time: datetime,
+    cur: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
+    """Return the selected planned visit, locking its eligibility when writing.
+
+    The normal candidate read is intentionally lightweight.  The explicit-arrival
+    write path calls this with its persistence cursor so an assignment, Site, or
+    planned visit cannot change between the last eligibility check and evidence
+    insertion.
+    """
+    if cur is not None:
+        from calendar_import_store import MORNING_CREW_NAME
+
+        range_start, range_end = _local_workday_bounds(reference_time)
+        local_day = reference_time.astimezone(APP_TIMEZONE).date()
+        cur.execute(
+            """
+            SELECT pv.id AS planned_visit_id, pv.location_id,
+                   pv.migrated_job_id AS job_id, pv.approximate_start,
+                   pv.approximate_end, l.address, l.customer_name,
+                   l.location_type, l.lat, l.lng
+            FROM planned_service_visits pv
+            JOIN locations l ON l.id = pv.location_id AND l.active = true
+            JOIN planned_visit_assignments assignment
+              ON assignment.planned_visit_id = pv.id
+             AND assignment.active = true
+            LEFT JOIN crews assigned_crew
+              ON assigned_crew.id = assignment.crew_id
+             AND assigned_crew.active = true
+            LEFT JOIN crew_memberships membership
+              ON membership.crew_id = assigned_crew.id
+             AND membership.employee_id = %s
+             AND membership.effective_from <= %s
+             AND (
+                 membership.effective_to IS NULL
+                 OR membership.effective_to > %s
+             )
+            WHERE pv.id = %s
+              AND pv.location_id = %s
+              AND pv.status = 'planned'
+              AND pv.approximate_start < %s
+              AND pv.approximate_end > %s
+              AND (
+                  assignment.employee_id = %s
+                  OR (
+                      membership.employee_id IS NOT NULL
+                      AND (
+                          l.location_type <> 'Residential'
+                          OR assigned_crew.name = %s
+                      )
+                  )
+              )
+            ORDER BY assignment.id
+            LIMIT 1
+            FOR SHARE OF pv, l, assignment
+            """,
+            (
+                int(employee_id),
+                local_day,
+                local_day,
+                int(planned_visit_id),
+                int(location_id),
+                range_end,
+                range_start,
+                int(employee_id),
+                MORNING_CREW_NAME,
+            ),
+        )
+        return _row_from_cursor(cur)
+
     return next(
         (
             candidate
@@ -6822,6 +6890,8 @@ def _resolve_explicit_visit_site(
     payload: VisitRequest,
     employee: Dict[str, Any],
     reference_time: datetime,
+    *,
+    cur: Optional[Any] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[str]]:
     """Resolve a selected Site without ever consulting the global nearest pin.
 
@@ -6843,6 +6913,7 @@ def _resolve_explicit_visit_site(
             planned_visit_id=int(payload.plannedVisitId),
             location_id=int(payload.locationId),
             reference_time=reference_time,
+            cur=cur,
         )
         if not planned:
             return None, None, None, "That scheduled Site is not assigned to you today"
@@ -6873,14 +6944,16 @@ def _resolve_explicit_visit_site(
     else:
         if payload.plannedVisitId is not None:
             return None, None, None, "An unplanned visit cannot use a scheduled visit id"
-        site = db.query_one(
-            """
+        site_query = """
             SELECT id AS location_id, address, customer_name, location_type, lat, lng
             FROM locations
             WHERE id = %s AND active = true
-            """,
-            (int(payload.locationId),),
-        )
+        """
+        if cur is None:
+            site = db.query_one(site_query, (int(payload.locationId),))
+        else:
+            cur.execute(site_query + " FOR SHARE", (int(payload.locationId),))
+            site = _row_from_cursor(cur)
         if not site or site.get("location_type") != "Residential":
             return None, None, None, "Unplanned visits require an active Residential Site"
         # This exception is intentionally bounded to a real, pinned home; an
@@ -9815,8 +9888,17 @@ def record_home_base_scan(
     if replay is not None:
         return replay
 
-    home_base = _resolve_home_base_qr(payload.token)
     now_utc = utc_now()
+    device_clock_skew_seconds = abs(
+        (now_utc - payload.scannedAt.astimezone(timezone.utc)).total_seconds()
+    )
+    if device_clock_skew_seconds > SITE_CHECK_IN_DEVICE_SKEW_SECONDS:
+        raise HTTPException(
+            status_code=409,
+            detail="Home Base scan is too old; return to Home Base and scan again.",
+        )
+
+    home_base = _resolve_home_base_qr(payload.token)
     policy = _home_base_policy_for_employee(int(employee["id"]), now_utc)
     if not policy or int(policy["home_base_id"]) != int(home_base["home_base_id"]):
         raise HTTPException(status_code=403, detail="Home Base is not required for this employee")
@@ -12226,11 +12308,45 @@ def log_visit(
     ) -> None:
         if explicit_site is None or result.get("alreadyHere"):
             return
+        (
+            current_site,
+            current_planned_visit,
+            current_geofence,
+            current_error,
+        ) = _resolve_explicit_visit_site(
+            payload,
+            employee,
+            utc_now(),
+            cur=cur,
+        )
+        if current_error or current_site is None or current_geofence is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "That Site changed before this arrival could be recorded; "
+                    "choose a current Site and try again."
+                ),
+            )
+        if (
+            int(current_site["location_id"]) != int(explicit_site["location_id"])
+            or bool(current_planned_visit) != bool(planned_visit)
+            or (
+                current_planned_visit is not None
+                and planned_visit is not None
+                and current_planned_visit.get("job_id") != planned_visit.get("job_id")
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "That Site changed before this arrival could be recorded; "
+                    "choose a current Site and try again."
+                ),
+            )
         visit = result.get("visit") if isinstance(result, dict) else None
         shift_id = _plain_time_action_shift_id(result, response)
         if not isinstance(visit, dict) or visit.get("id") is None or shift_id is None:
             raise RuntimeError("Explicit Site arrival was not stored")
-        assert selected_geofence is not None
         cur.execute(
             """
             INSERT INTO visit_evidence_events (
@@ -12246,16 +12362,16 @@ def log_visit(
                 int(employee["id"]),
                 int(explicit_site["location_id"]),
                 (
-                    int(planned_visit["planned_visit_id"])
-                    if planned_visit is not None
+                    int(current_planned_visit["planned_visit_id"])
+                    if current_planned_visit is not None
                     else None
                 ),
                 payload.evidenceMethod,
                 payload.exceptionReason,
                 payload.exceptionDetail,
-                selected_geofence["status"],
-                selected_geofence.get("distanceM"),
-                selected_geofence.get("accuracyM"),
+                current_geofence["status"],
+                current_geofence.get("distanceM"),
+                current_geofence.get("accuracyM"),
             ),
         )
         row = _row_from_cursor(cur)
@@ -16361,6 +16477,57 @@ def _correction_shift_snapshots(
         (ids,),
         cursor,
     )
+    home_base_event_rows = _correction_query_all(
+        """
+        SELECT
+            event.id,
+            event.shift_id,
+            event.employee_id,
+            event.home_base_id,
+            event.home_base_policy_id,
+            event.action,
+            event.outcome,
+            event.exception_reason,
+            event.recorded_at,
+            event.latitude,
+            event.longitude,
+            event.accuracy_m,
+            event.geofence_radius_m,
+            event.distance_m,
+            event.geofence_status,
+            event.idempotency_key,
+            event.request_fingerprint,
+            event.created_at
+        FROM home_base_events event
+        WHERE event.shift_id = ANY(%s)
+        ORDER BY event.shift_id, event.recorded_at, event.id
+        """,
+        (ids,),
+        cursor,
+    )
+    visit_evidence_rows = _correction_query_all(
+        """
+        SELECT
+            evidence.id,
+            evidence.visit_id,
+            evidence.shift_id,
+            evidence.employee_id,
+            evidence.location_id,
+            evidence.planned_visit_id,
+            evidence.evidence_method,
+            evidence.exception_reason,
+            evidence.exception_detail,
+            evidence.geofence_status,
+            evidence.distance_m,
+            evidence.accuracy_m,
+            evidence.created_at
+        FROM visit_evidence_events evidence
+        WHERE evidence.shift_id = ANY(%s)
+        ORDER BY evidence.shift_id, evidence.id
+        """,
+        (ids,),
+        cursor,
+    )
     payroll_shift_correction_rows = _correction_query_all(
         """
         SELECT
@@ -16496,6 +16663,83 @@ def _correction_shift_snapshots(
             "createdAt": to_utc_iso(row["created_at"]),
         })
 
+    home_base_events_by_shift: Dict[int, List[Dict[str, Any]]] = {}
+    for row in home_base_event_rows:
+        home_base_events_by_shift.setdefault(int(row["shift_id"]), []).append({
+            "id": int(row["id"]),
+            "shiftId": int(row["shift_id"]),
+            "employeeId": int(row["employee_id"]),
+            "homeBaseId": int(row["home_base_id"]),
+            "homeBasePolicyId": (
+                int(row["home_base_policy_id"])
+                if row.get("home_base_policy_id") is not None
+                else None
+            ),
+            "action": str(row["action"]),
+            "outcome": str(row["outcome"]),
+            "exceptionReason": str(row.get("exception_reason") or ""),
+            "recordedAt": to_utc_iso(row["recorded_at"]),
+            "latitude": (
+                float(row["latitude"]) if row.get("latitude") is not None else None
+            ),
+            "longitude": (
+                float(row["longitude"]) if row.get("longitude") is not None else None
+            ),
+            "accuracyM": (
+                float(row["accuracy_m"])
+                if row.get("accuracy_m") is not None
+                else None
+            ),
+            "geofenceRadiusM": (
+                int(row["geofence_radius_m"])
+                if row.get("geofence_radius_m") is not None
+                else None
+            ),
+            "distanceM": (
+                float(row["distance_m"])
+                if row.get("distance_m") is not None
+                else None
+            ),
+            "geofenceStatus": row.get("geofence_status"),
+            "idempotencyKey": (
+                str(row["idempotency_key"])
+                if row.get("idempotency_key") is not None
+                else None
+            ),
+            "requestFingerprint": row.get("request_fingerprint"),
+            "createdAt": to_utc_iso(row["created_at"]),
+        })
+
+    visit_evidence_by_shift: Dict[int, List[Dict[str, Any]]] = {}
+    for row in visit_evidence_rows:
+        visit_evidence_by_shift.setdefault(int(row["shift_id"]), []).append({
+            "id": int(row["id"]),
+            "visitId": int(row["visit_id"]),
+            "shiftId": int(row["shift_id"]),
+            "employeeId": int(row["employee_id"]),
+            "locationId": int(row["location_id"]),
+            "plannedVisitId": (
+                int(row["planned_visit_id"])
+                if row.get("planned_visit_id") is not None
+                else None
+            ),
+            "evidenceMethod": str(row["evidence_method"]),
+            "exceptionReason": str(row.get("exception_reason") or ""),
+            "exceptionDetail": str(row.get("exception_detail") or ""),
+            "geofenceStatus": str(row["geofence_status"]),
+            "distanceM": (
+                float(row["distance_m"])
+                if row.get("distance_m") is not None
+                else None
+            ),
+            "accuracyM": (
+                float(row["accuracy_m"])
+                if row.get("accuracy_m") is not None
+                else None
+            ),
+            "createdAt": to_utc_iso(row["created_at"]),
+        })
+
     payroll_corrections_by_shift: Dict[int, List[Dict[str, Any]]] = {}
     for row in payroll_shift_correction_rows:
         payroll_corrections_by_shift.setdefault(int(row["shift_id"]), []).append(
@@ -16581,6 +16825,8 @@ def _correction_shift_snapshots(
             "visits": visits_by_shift.get(shift_id, []),
             "departures": departures_by_shift.get(shift_id, []),
             "siteQrActionReceipts": receipts_by_shift.get(shift_id, []),
+            "homeBaseEvents": home_base_events_by_shift.get(shift_id, []),
+            "visitEvidenceEvents": visit_evidence_by_shift.get(shift_id, []),
             "payrollShiftCorrections": payroll_corrections_by_shift.get(
                 shift_id,
                 [],
@@ -16600,6 +16846,8 @@ def _correction_metadata_signature(snapshot: Dict[str, Any]) -> str:
             "visits",
             "departures",
             "siteQrActionReceipts",
+            "homeBaseEvents",
+            "visitEvidenceEvents",
         }
     }
     comparable["visits"] = [
@@ -16634,12 +16882,30 @@ def _correction_metadata_signature(snapshot: Dict[str, Any]) -> str:
         }
         for row in snapshot.get("siteQrActionReceipts", [])
     ]
+    comparable["homeBaseEvents"] = [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"id", "shiftId", "createdAt"}
+        }
+        for row in snapshot.get("homeBaseEvents", [])
+    ]
+    comparable["visitEvidenceEvents"] = [
+        {
+            key: value
+            for key, value in row.items()
+            if key not in {"id", "visitId", "shiftId", "createdAt"}
+        }
+        for row in snapshot.get("visitEvidenceEvents", [])
+    ]
     return json.dumps(comparable, sort_keys=True, separators=(",", ":"))
 
 
 def _correction_richness_score(snapshot: Dict[str, Any]) -> int:
     score = 10 * (len(snapshot.get("visits", [])) + len(snapshot.get("departures", [])))
     score += 5 * len(snapshot.get("siteQrActionReceipts", []))
+    score += 6 * len(snapshot.get("homeBaseEvents", []))
+    score += 10 * len(snapshot.get("visitEvidenceEvents", []))
     score += 8 if snapshot.get("jobId") is not None else 0
     score += 4 if str(snapshot.get("notes") or "").strip() else 0
     score += 3 if snapshot.get("timeCategory") != "productive" else 0
@@ -17029,6 +17295,74 @@ def _migrate_duplicate_payroll_shift_corrections(
     return sorted(migrated_ids)
 
 
+def _migrate_duplicate_home_base_events(
+    cur: Any,
+    duplicate_resolutions: List[Dict[str, Any]],
+) -> None:
+    """Keep a duplicate's non-conflicting Home Base boundary on its canonical shift.
+
+    The correction batch stores a complete before-image before this helper runs.
+    That archive retains every event and explicit-visit evidence row, including a
+    duplicate Home Base action that cannot move because the canonical shift
+    already has that action.  Moving a Home Base boundary when no conflict
+    exists keeps dispatch classification on the retained shift without merging
+    customer visits (which could otherwise duplicate customer labor).
+    """
+    for resolution in duplicate_resolutions:
+        canonical_shift_id = int(resolution["canonicalShiftId"])
+        duplicate_shift_ids = [
+            int(value)
+            for value in resolution.get("duplicateShiftIds", [])
+        ]
+        if not duplicate_shift_ids:
+            continue
+
+        cur.execute(
+            """
+            SELECT action
+            FROM home_base_events
+            WHERE shift_id = %s
+            FOR UPDATE
+            """,
+            (canonical_shift_id,),
+        )
+        canonical_actions = {str(row["action"]) for row in cur.fetchall()}
+        cur.execute(
+            """
+            SELECT id, action
+            FROM home_base_events
+            WHERE shift_id = ANY(%s)
+            ORDER BY
+                action,
+                CASE outcome WHEN 'recorded' THEN 0 ELSE 1 END,
+                recorded_at,
+                id
+            FOR UPDATE
+            """,
+            (duplicate_shift_ids,),
+        )
+        for row in cur.fetchall():
+            event_id = int(row["id"])
+            action_name = str(row["action"])
+            if action_name in canonical_actions:
+                continue
+            cur.execute(
+                """
+                UPDATE home_base_events
+                SET shift_id = %s
+                WHERE id = %s
+                  AND shift_id = ANY(%s)
+                """,
+                (canonical_shift_id, event_id, duplicate_shift_ids),
+            )
+            if cur.rowcount != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A duplicate Home Base event changed before correction could be applied",
+                )
+            canonical_actions.add(action_name)
+
+
 @app.post("/api/admin/corrections/time-data/apply")
 def admin_apply_time_data_correction(
     payload: TimeDataCorrectionApplyRequest,
@@ -17122,6 +17456,10 @@ def admin_apply_time_data_correction(
                     cur,
                     plan["duplicateResolutions"],
                 )
+            )
+            _migrate_duplicate_home_base_events(
+                cur,
+                plan["duplicateResolutions"],
             )
             deleted_shift_ids = sorted(
                 int(value)
