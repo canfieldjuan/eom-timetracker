@@ -2047,6 +2047,77 @@ def test_gps_override_rationale_survives_into_the_exception_review(client, auth)
     assert "next block over" in row["gpsOverrideDetail"]
 
 
+def test_exception_review_uses_the_immutable_visit_identity_after_site_changes(client, auth):
+    """Site maintenance must not rewrite the identity shown for old evidence."""
+    employee_id, employee_auth = _create_employee(client, "Immutable review identity")
+    suffix = "Immutable review identity"
+    original_address = f"{TEST_PREFIX} {suffix}"
+    original_customer = f"{TEST_PREFIX} Customer {suffix}"
+    site_id = _insert_site(
+        suffix,
+        location_type="Residential",
+        latitude=39.50000,
+        longitude=-88.90000,
+    )
+    planned_visit_id = _insert_assigned_planned_visit(
+        employee_id=employee_id,
+        location_id=site_id,
+        suffix="immutable-review-identity",
+    )
+    shift_id = _clock_in(client, employee_auth)
+
+    arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "plannedVisitId": planned_visit_id,
+            "evidenceMethod": "residential_gps",
+            "latitude": 39.60000,
+            "longitude": -88.90000,
+            "accuracy": 5,
+            "gpsOverrideReason": "gps_drift",
+            "gpsOverrideDetail": "Phone placed the worker on the next block.",
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert arrival.status_code == 200, arrival.text
+    assert db.query_one(
+        """
+        SELECT visit.location_label, visit.customer_name
+        FROM visit_evidence_events evidence
+        JOIN visits visit ON visit.id = evidence.visit_id
+        WHERE evidence.shift_id = %s
+        """,
+        (shift_id,),
+    ) == {
+        "location_label": original_address,
+        "customer_name": original_customer,
+    }
+
+    db.execute(
+        """
+        UPDATE locations
+        SET address = %s, customer_name = %s
+        WHERE id = %s
+        """,
+        (
+            f"{TEST_PREFIX} Reassigned review address",
+            f"{TEST_PREFIX} Reassigned review customer",
+            site_id,
+        ),
+    )
+
+    review = client.get("/api/admin/visit-evidence-exceptions", headers=auth)
+    assert review.status_code == 200, review.text
+    row = next(
+        item for item in review.json()["exceptions"] if int(item["shiftId"]) == shift_id
+    )
+    assert row["locationId"] == site_id
+    assert row["address"] == original_address
+    assert row["customerName"] == original_customer
+
+
 @pytest.mark.parametrize("action", ["clock-in", "clock-out"])
 def test_home_base_policy_activated_after_the_preflight_read_still_binds(
     client, auth, monkeypatch, action,
@@ -2826,7 +2897,10 @@ def test_home_base_start_rechecks_membership_in_the_persistence_transaction(
     ) == {"count": 0}
 
 
-def test_a_shift_started_under_policy_still_owes_its_end_event(client, auth):
+@pytest.mark.parametrize("start_method", ("scan", "exception"))
+def test_a_shift_started_under_policy_still_owes_its_end_event(
+    client, auth, start_method,
+):
     """Current crew membership must not retroactively release an open shift.
 
     Retiring a membership takes effect on the local date, so the policy lookup
@@ -2838,23 +2912,40 @@ def test_a_shift_started_under_policy_still_owes_its_end_event(client, auth):
     employee_id, employee_auth = _create_employee(client, "Membership retired")
     crew_id = _enroll_in_morning_crew(employee_id)
     _configure_home_base(client, auth)
-    qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
-    assert qr.status_code == 200, qr.text
-
-    started = client.post(
-        "/api/timesheet/home-base/scan",
-        headers=employee_auth,
-        json={
-            "token": qr.json()["token"],
-            "action": "start",
-            "latitude": BASE_LATITUDE,
-            "longitude": BASE_LONGITUDE,
-            "accuracy": 5,
-            "scannedAt": datetime.now(timezone.utc).isoformat(),
-            "idempotencyKey": str(uuid4()),
-        },
-    )
+    if start_method == "scan":
+        qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
+        assert qr.status_code == 200, qr.text
+        started = client.post(
+            "/api/timesheet/home-base/scan",
+            headers=employee_auth,
+            json={
+                "token": qr.json()["token"],
+                "action": "start",
+                "latitude": BASE_LATITUDE,
+                "longitude": BASE_LONGITUDE,
+                "accuracy": 5,
+                "scannedAt": datetime.now(timezone.utc).isoformat(),
+                "idempotencyKey": str(uuid4()),
+            },
+        )
+    else:
+        started = client.post(
+            "/api/timesheet/clock-in",
+            headers=employee_auth,
+            json={
+                "homeBaseExceptionReason": "Office was inaccessible",
+                "latitude": 0,
+                "longitude": 0,
+                "accuracy": 5,
+                "gpsOverrideReason": "test dispatch exception",
+                "gpsOverrideDetail": "The Office scan could not be completed.",
+                "idempotencyKey": str(uuid4()),
+            },
+        )
     assert started.status_code == 200, started.text
+    assert started.json()["homeBaseEvent"]["outcome"] == (
+        "recorded" if start_method == "scan" else "exception"
+    )
 
     # Admin retires the membership while the shift is open.
     db.execute(

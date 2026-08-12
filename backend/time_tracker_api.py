@@ -6578,10 +6578,14 @@ def _row_from_cursor(cur: Any) -> Optional[Dict[str, Any]]:
     return dict(zip(columns, row))
 
 
-def _shift_recorded_home_base_start(
+def _shift_home_base_start_evidence(
     shift_id: Optional[int],
 ) -> Optional[Dict[str, Any]]:
-    """True when this shift has a recorded Home Base start event.
+    """Return the Home Base policy when a shift has durable start evidence.
+
+    Both an in-geofence scan and a documented exception establish that the
+    shift started under the policy, so either must keep the end requirement
+    alive if current crew membership changes while the shift is open.
 
     The end requirement must follow the shift's own durable evidence, not the
     employee's CURRENT policy. Retiring a crew membership takes effect on the
@@ -6607,7 +6611,7 @@ def _shift_recorded_home_base_start(
         LEFT JOIN crews crew ON crew.id = policy.crew_id
         WHERE event.shift_id = %s
           AND event.action = 'start'
-          AND event.outcome = 'recorded'
+          AND event.outcome IN ('recorded', 'exception')
         ORDER BY event.id
         LIMIT 1
         """,
@@ -9138,11 +9142,12 @@ def admin_visit_evidence_exceptions(
                evidence.geofence_status,
                evidence.distance_m, evidence.accuracy_m, evidence.created_at,
                employee.id AS employee_id, employee.name AS employee_name,
-               location.id AS location_id, location.address, location.customer_name,
+               evidence.location_id, visit.location_label AS address,
+               visit.customer_name,
                evidence.planned_visit_id, evidence.shift_id
         FROM visit_evidence_events evidence
         JOIN employees employee ON employee.id = evidence.employee_id
-        JOIN locations location ON location.id = evidence.location_id
+        JOIN visits visit ON visit.id = evidence.visit_id
         WHERE evidence.evidence_method <> 'residential_gps'
            OR evidence.geofence_status <> 'inside'
         ORDER BY evidence.created_at DESC, evidence.id DESC
@@ -12244,7 +12249,7 @@ def clock_out(
         # employee is no longer covered. Current membership decides whether a
         # NEW shift is enforced; it must not retroactively release an open one.
         if not home_base["enforced"]:
-            started_under = _shift_recorded_home_base_start(open_entry.get("id"))
+            started_under = _shift_home_base_start_evidence(open_entry.get("id"))
             if started_under:
                 home_base["enforced"] = True
                 home_base["policy"] = started_under
