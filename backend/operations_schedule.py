@@ -2168,7 +2168,7 @@ def _load_time_evidence(
         for row in _query_all(
             """
             SELECT id, shift_id, location_id, location_label, customer_name,
-                   arrival_time, sequence_version, site_check_in_id
+                   arrival_time, sequence_version, site_check_in_id, job_id
             FROM visits
             WHERE shift_id = ANY(%s)
             ORDER BY shift_id, arrival_time, id
@@ -4222,6 +4222,7 @@ def _closed_shift_segments(
         start: datetime,
         end: datetime,
         base_evidence: str,
+        linked_job_id: Optional[int] = None,
     ) -> None:
         if end <= start:
             return
@@ -4229,6 +4230,9 @@ def _closed_shift_segments(
         output.append(
             {
                 **common,
+                "job_id": linked_job_id
+                if linked_job_id is not None
+                else common["job_id"],
                 "location_id": location_id,
                 "location_label": location_label,
                 "start": start,
@@ -4369,6 +4373,7 @@ def _closed_shift_segments(
             start=segment_start,
             end=segment_end,
             base_evidence="visit",
+            linked_job_id=visit.get("job_id"),
         )
         cursor = max(cursor, min(work_end, upper))
         if cursor >= upper:
@@ -4401,6 +4406,7 @@ def _open_shift_presence(
     current_site = shift.get("location_id")
     current_label = str(shift.get("location_label") or "")
     current_since = shift["clock_in"]
+    current_job_id = shift.get("job_id")
     evidence = ["clock_in"]
     current_visit_id: Optional[int] = None
     current_sequence_version = 1
@@ -4415,6 +4421,11 @@ def _open_shift_presence(
             current_site = row.get("location_id")
             current_label = str(row.get("location_label") or "")
             current_since = event_at
+            current_job_id = (
+                row.get("job_id")
+                if row.get("job_id") is not None
+                else shift.get("job_id")
+            )
             evidence = ["clock_in", "visit"]
             current_visit_id = int(row["id"])
             current_sequence_version = int(row.get("sequence_version") or 1)
@@ -4435,6 +4446,7 @@ def _open_shift_presence(
                 current_site = None
                 current_label = ""
                 current_since = event_at
+                current_job_id = shift.get("job_id")
                 evidence = ["clock_in", "departure"]
                 current_visit_id = None
                 current_sequence_version = 1
@@ -4460,7 +4472,7 @@ def _open_shift_presence(
 
     return {
         "shift_id": int(shift["id"]),
-        "job_id": shift.get("job_id"),
+        "job_id": current_job_id,
         "employee_id": int(shift["employee_id"]),
         "employee_name": str(shift["employee_name"]),
         "hourly_rate": shift.get("hourly_rate"),
@@ -4768,6 +4780,13 @@ def _decorate_schedule_jobs(
                 for row in qr_rows
                 if row.get("job_id") is not None
                 and int(row["job_id"]) not in jobs_by_id
+            ]
+            + [
+                int(visit["job_id"])
+                for shift_visits in visits.values()
+                for visit in shift_visits
+                if visit.get("job_id") is not None
+                and int(visit["job_id"]) not in jobs_by_id
             ],
             cursor=cursor,
         )
