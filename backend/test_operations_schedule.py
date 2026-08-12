@@ -4782,6 +4782,219 @@ def test_inapplicable_different_site_shift_link_allows_qr_on_visit_atom(
     assert body["summary"]["unmatchedActualHours"] == 0
 
 
+def test_explicit_visit_job_link_resolves_overlapping_same_site_jobs(client, auth):
+    """A visit-level job link is more specific than the site/date heuristic."""
+    service_day = date(2026, 7, 20)
+    shift_start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    shift_end = shift_start + timedelta(hours=2)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "explicit_visit_profitability",
+                "residential_morning",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "Explicit Visit Profitability",
+                site_type="Residential",
+                rate=125,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+            selected_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Explicit Visit Profitability",
+                start=shift_start,
+                end=shift_end,
+                source_seed="explicit-visit-profitability-selected",
+            )
+            other_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Explicit Visit Profitability",
+                start=shift_start,
+                end=shift_end,
+                source_seed="explicit-visit-profitability-other",
+            )
+            employee_id = _employee(cur, "Explicit Visit Profitability", 18)
+            # Home Base-style shifts deliberately have no shift-level job.
+            shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=shift_start,
+                end=shift_end,
+                service_day=service_day,
+            )
+            visit_id = _visit(
+                cur,
+                shift_id=shift_id,
+                location_id=site_id,
+                at=shift_start,
+                suffix="Explicit Visit Profitability",
+                sequence_version=2,
+                job_id=selected_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=shift_id,
+                visit_id=visit_id,
+                location_id=site_id,
+                at=shift_end,
+                suffix="Explicit Visit Profitability",
+            )
+
+    body = _schedule_body(client, auth, service_day)
+    selected_job = _schedule_job(body, selected_job_id)
+
+    assert selected_job["actualHours"] == 2
+    assert selected_job["actualLaborCost"] == 36
+    assert selected_job["workers"][0]["intervals"] == [
+        {
+            "shiftId": shift_id,
+            "intervalStart": shift_start.isoformat().replace("+00:00", "Z"),
+            "intervalEnd": shift_end.isoformat().replace("+00:00", "Z"),
+            "hours": 2,
+            "finalized": True,
+            "presenceOnly": False,
+            "evidence": ["visit"],
+            "match": "linked_shift",
+        }
+    ]
+    assert _schedule_job(body, other_job_id)["actualHours"] == 0
+    assert _unmatched_for_shift(body, shift_id) == []
+
+
+def test_open_visit_presence_prefers_its_explicit_job_link():
+    start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    shift = {
+        "id": 41,
+        "employee_id": 17,
+        "employee_name": "Explicit visit worker",
+        "hourly_rate": 18,
+        "location_id": 1,
+        "location_label": "Initial Site",
+        "job_id": 101,
+        "clock_in": start,
+    }
+    visit = {
+        "id": 51,
+        "location_id": 2,
+        "location_label": "Explicit Visit Site",
+        "arrival_time": start + timedelta(minutes=15),
+        "sequence_version": 2,
+        "job_id": 202,
+    }
+    active = ops._open_shift_presence(
+        shift,
+        [visit],
+        [],
+        {},
+        start + timedelta(hours=1),
+    )
+
+    assert active["location_id"] == 2
+    assert active["job_id"] == 202
+
+    after_departure = ops._open_shift_presence(
+        shift,
+        [visit],
+        [
+            {
+                "visit_id": 51,
+                "location_id": 2,
+                "departure_time": start + timedelta(minutes=30),
+            }
+        ],
+        {},
+        start + timedelta(hours=1),
+    )
+
+    assert after_departure["location_id"] is None
+    assert after_departure["job_id"] == 101
+
+
+def test_explicit_visit_out_of_range_link_does_not_fallback_to_visible_job(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 20)
+    shift_start = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
+    shift_end = shift_start + timedelta(hours=2)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            source_id = _source(
+                cur,
+                "explicit_visit_outside_range",
+                "residential_morning",
+            )
+            _, site_id = _customer_site(
+                cur,
+                "Explicit Visit Outside Range",
+                site_type="Residential",
+                rate=125,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+            linked_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Explicit Visit Outside Range",
+                start=shift_start - timedelta(days=7),
+                end=shift_end - timedelta(days=7),
+                source_seed="explicit-visit-outside-range-target",
+            )
+            visible_job_id = _job(
+                cur,
+                source_id=source_id,
+                location_id=site_id,
+                customer_name=f"{TEST_PREFIX} Customer Explicit Visit Outside Range",
+                start=shift_start - timedelta(hours=1),
+                end=shift_end + timedelta(hours=1),
+                source_seed="explicit-visit-outside-range-visible",
+            )
+            employee_id = _employee(cur, "Explicit Visit Outside Range", 18)
+            shift_id = _shift(
+                cur,
+                employee_id=employee_id,
+                start=shift_start,
+                end=shift_end,
+                service_day=service_day,
+            )
+            visit_id = _visit(
+                cur,
+                shift_id=shift_id,
+                location_id=site_id,
+                at=shift_start,
+                suffix="Explicit Visit Outside Range",
+                sequence_version=2,
+                job_id=linked_job_id,
+            )
+            _departure(
+                cur,
+                shift_id=shift_id,
+                visit_id=visit_id,
+                location_id=site_id,
+                at=shift_end,
+                suffix="Explicit Visit Outside Range",
+            )
+
+    body = _schedule_body(client, auth, service_day)
+    jobs = {row["id"]: row for row in body["jobs"]}
+
+    assert linked_job_id not in jobs
+    assert jobs[visible_job_id]["actualHours"] == 0
+    unmatched = _unmatched_for_shift(body, shift_id)
+    assert len(unmatched) == 1
+    assert unmatched[0]["reason"] == "linked_job_outside_range"
+    assert unmatched[0]["candidateJobIds"] == [linked_job_id]
+    assert unmatched[0]["hours"] == 2
+
+
 def test_explicit_out_of_range_link_is_not_credited_to_visible_same_site_job(
     client,
     auth,
