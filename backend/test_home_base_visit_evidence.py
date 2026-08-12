@@ -2192,3 +2192,163 @@ def test_the_correction_archive_keeps_why_an_override_was_accepted(client, auth)
     signature = time_tracker_api._correction_metadata_signature(before)
     assert "gps_drift" in signature
     assert "two streets away" in signature
+
+
+def test_a_full_length_override_reason_is_accepted_not_rolled_back(client, auth):
+    """The column must fit the request field that feeds it.
+
+    gps_override_reason was sized to the neighbouring exception_reason (64)
+    rather than to MAX_GPS_OVERRIDE_REASON_LEN (200), so a rationale the API
+    had already validated failed at insertion and rolled back an otherwise
+    valid arrival.
+    """
+    # Check the column itself, not only a round trip. The schema is built once
+    # per session, so a test that merely inserts cannot tell a widened column
+    # from one that was already widened by an earlier run -- reverting the DDL
+    # leaves the live column untouched and the insert still succeeds.
+    column = db.query_one(
+        """
+        SELECT data_type, character_maximum_length
+        FROM information_schema.columns
+        WHERE table_name = 'visit_evidence_events'
+          AND column_name = 'gps_override_reason'
+        """
+    )
+    assert column is not None, "gps_override_reason column is missing"
+    assert (
+        column["data_type"] == "text"
+        or (column["character_maximum_length"] or 0)
+        >= time_tracker_api.MAX_GPS_OVERRIDE_REASON_LEN
+    ), (
+        f"gps_override_reason is {column['data_type']}"
+        f"({column['character_maximum_length']}), too narrow for a "
+        f"{time_tracker_api.MAX_GPS_OVERRIDE_REASON_LEN}-char request field"
+    )
+
+    employee_id, employee_auth = _create_employee(client, "Long reason")
+    site_id = _insert_site(
+        "Long reason",
+        location_type="Residential",
+        latitude=39.85000,
+        longitude=-88.55000,
+    )
+    planned_visit_id = _insert_assigned_planned_visit(
+        employee_id=employee_id,
+        location_id=site_id,
+        suffix="long-reason",
+    )
+    shift_id = _clock_in(client, employee_auth)
+
+    reason = "g" * time_tracker_api.MAX_GPS_OVERRIDE_REASON_LEN
+    arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "plannedVisitId": planned_visit_id,
+            "evidenceMethod": "residential_gps",
+            "latitude": 39.95000,
+            "longitude": -88.55000,
+            "accuracy": 5,
+            "gpsOverrideReason": reason,
+            "gpsOverrideDetail": "d" * 200,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert arrival.status_code == 200, arrival.text
+    stored = db.query_one(
+        "SELECT gps_override_reason FROM visit_evidence_events WHERE shift_id = %s",
+        (shift_id,),
+    )
+    assert stored["gps_override_reason"] == reason
+
+    # The other side: one character past the request limit is refused by the
+    # API, so an oversized value never reaches the insert at all.
+    over = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "plannedVisitId": planned_visit_id,
+            "evidenceMethod": "residential_gps",
+            "latitude": 39.95000,
+            "longitude": -88.55000,
+            "accuracy": 5,
+            "gpsOverrideReason": "g" * (
+                time_tracker_api.MAX_GPS_OVERRIDE_REASON_LEN + 1),
+            "gpsOverrideDetail": "still too long",
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert over.status_code == 422, over.text
+
+
+def test_moving_home_base_after_the_scan_stops_the_clock_action(
+    client, auth, monkeypatch,
+):
+    """Re-checking the token is not enough -- configuration can MOVE the base.
+
+    Changing the coordinates does not rotate the nonce, so a still-valid token
+    can point at a new location. A worker standing where Home Base used to be
+    must not still be able to start paid time.
+    """
+    employee_id, employee_auth = _create_employee(client, "Home base moved")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+
+    qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
+    assert qr.status_code == 200, qr.text
+    token = qr.json()["token"]
+
+    original = time_tracker_api._resolve_home_base_qr
+    calls = {"n": 0}
+
+    def move_between_the_two_lookups(*args, **kwargs):
+        calls["n"] += 1
+        # Resolve FIRST, so the preflight sees the old row and passes its own
+        # geofence check. Moving before that would fail preflight and never
+        # reach the write -- which is not the race being tested.
+        result = original(*args, **kwargs)
+        if calls["n"] == 1:
+            # Admin relocates Home Base -- same nonce, new coordinates.
+            moved = client.put(
+                "/api/admin/home-base",
+                headers=auth,
+                json={
+                    "label": "EOM Office Home Base",
+                    "address": "999 Somewhere Else, Effingham",
+                    "latitude": BASE_LATITUDE + 0.5,
+                    "longitude": BASE_LONGITUDE + 0.5,
+                },
+            )
+            assert moved.status_code == 200, moved.text
+        return result
+
+    monkeypatch.setattr(
+        time_tracker_api, "_resolve_home_base_qr", move_between_the_two_lookups
+    )
+
+    response = client.post(
+        "/api/timesheet/home-base/scan",
+        headers=employee_auth,
+        json={
+            "token": token,
+            "action": "start",
+            # Still standing at the OLD Home Base.
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "scannedAt": datetime.now(timezone.utc).isoformat(),
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+
+    assert calls["n"] >= 2, "the token was resolved only once"
+    assert response.status_code >= 400, (
+        f"a scan at the former Home Base started paid time: {response.text}"
+    )
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 0}

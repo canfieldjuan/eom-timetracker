@@ -5247,7 +5247,13 @@ def _ensure_home_base_schema() -> None:
             -- CHECK below requires them EMPTY for residential_gps. Without
             -- these the review endpoint selects the row and shows a blank
             -- reason, which is the one thing a reviewer needs.
-            gps_override_reason VARCHAR(64) NOT NULL DEFAULT '',
+            -- Sized to the REQUEST field that feeds it
+            -- (MAX_GPS_OVERRIDE_REASON_LEN, default 200), not to the
+            -- neighbouring exception_reason. A 64-char column silently
+            -- rejected a rationale the API had already accepted, rolling back
+            -- an otherwise valid arrival.
+            gps_override_reason TEXT NOT NULL DEFAULT ''
+                                   CHECK (char_length(gps_override_reason) <= 200),
             gps_override_detail TEXT NOT NULL DEFAULT ''
                                    CHECK (char_length(gps_override_detail) <= 500),
             geofence_status    VARCHAR(32) NOT NULL,
@@ -5277,6 +5283,29 @@ def _ensure_home_base_schema() -> None:
         """
         ALTER TABLE visit_evidence_events
             ADD COLUMN IF NOT EXISTS gps_override_detail TEXT NOT NULL DEFAULT ''
+        """
+    )
+    # An install that already took the 64-char version needs widening;
+    # ADD COLUMN IF NOT EXISTS leaves an existing column untouched.
+    db.execute(
+        """
+        ALTER TABLE visit_evidence_events
+            ALTER COLUMN gps_override_reason TYPE TEXT
+        """
+    )
+    db.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'visit_evidence_events_gps_override_reason_len'
+            ) THEN
+                ALTER TABLE visit_evidence_events
+                    ADD CONSTRAINT visit_evidence_events_gps_override_reason_len
+                    CHECK (char_length(gps_override_reason) <= 200);
+            END IF;
+        END $$;
         """
     )
     db.execute(
@@ -10014,10 +10043,35 @@ def record_home_base_scan(
         # time. There is no receipt to replay on this path -- the scan is
         # fresh -- so the check has to happen here.
         try:
-            _resolve_home_base_qr(payload.token)
+            current_home_base = _resolve_home_base_qr(payload.token)
         except HTTPException:
             return False, (
                 "Home Base QR code changed; scan the current code again."
+            )
+        # Re-checking the token is not enough: configuration can MOVE the Home
+        # Base without rotating the nonce, so a still-valid token may now point
+        # at different coordinates. Recompute the geofence from the row this
+        # lookup just returned rather than the one the preflight saw, or a
+        # worker standing at the former location still buys paid time.
+        current_geofence = evaluate_site_check_in_geofence(
+            site_latitude=(
+                float(current_home_base["latitude"])
+                if current_home_base.get("latitude") is not None
+                else None
+            ),
+            site_longitude=(
+                float(current_home_base["longitude"])
+                if current_home_base.get("longitude") is not None
+                else None
+            ),
+            latitude=payload.latitude,
+            longitude=payload.longitude,
+            accuracy=payload.accuracy,
+        )
+        if current_geofence["status"] != "inside":
+            return False, (
+                "Home Base moved; GPS no longer confirms you are there. "
+                "Scan again at the current Home Base."
             )
 
         stale_open = get_stale_open_entry(
