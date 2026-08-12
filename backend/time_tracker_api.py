@@ -3223,7 +3223,13 @@ class ReceivablesPaymentRequest(BaseModel):
     received_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     reference: str = Field(min_length=1, max_length=256)
     notes: Optional[str] = Field(default=None, max_length=2000)
-    allocations: List[ReceivablesAllocationRequest] = Field(min_length=1, max_length=100)
+    # Atlas accepts EOM customer payments before they are allocated to an
+    # invoice. Keep the existing allocation shape when it is supplied, while
+    # defaulting an omitted field to the explicit empty collection the Atlas
+    # EOM provider expects.
+    allocations: List[ReceivablesAllocationRequest] = Field(
+        default_factory=list, max_length=100
+    )
 
     @field_validator("reference")
     @classmethod
