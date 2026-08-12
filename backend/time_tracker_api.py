@@ -1517,18 +1517,41 @@ def _shift_has_active_payroll_correction(shift_id: int) -> bool:
     return row is not None
 
 
+HOME_BASE_CONFIG_LOCK_KEY = "home-base-config"
+
+
 @contextmanager
 def timesheet_postgres_advisory_lock():
-    """Serialize timesheet event writers across backend worker processes."""
+    """Serialize timesheet event writers across backend worker processes.
+
+    This also holds the ``home-base-config`` lock that the Home Base
+    configuration endpoint takes, so a policy cannot be activated partway
+    through a clock-in or clock-out. Enforcement reads the policy and then
+    writes a shift; without this, a policy committing between those two steps
+    would let the shift persist with no Home Base evidence, and nothing
+    downstream would show it was ever required.
+
+    Configuration is a rare admin action, so the added contention is
+    negligible. Ordering is safe: the configuration endpoint takes only the
+    home-base-config lock and never the timesheet one, so there is no cycle.
+    """
     with db.get_conn() as lock_conn:
         with lock_conn.cursor() as lock_cur:
             lock_cur.execute(
                 "SELECT pg_advisory_lock(%s)",
                 (TIMESHEET_PG_ADVISORY_LOCK_ID,),
             )
+            lock_cur.execute(
+                "SELECT pg_advisory_lock(hashtext(%s))",
+                (HOME_BASE_CONFIG_LOCK_KEY,),
+            )
             try:
                 yield
             finally:
+                lock_cur.execute(
+                    "SELECT pg_advisory_unlock(hashtext(%s))",
+                    (HOME_BASE_CONFIG_LOCK_KEY,),
+                )
                 lock_cur.execute(
                     "SELECT pg_advisory_unlock(%s)",
                     (TIMESHEET_PG_ADVISORY_LOCK_ID,),
@@ -5205,6 +5228,15 @@ def _ensure_home_base_schema() -> None:
             exception_reason   VARCHAR(64) NOT NULL DEFAULT '',
             exception_detail   TEXT NOT NULL DEFAULT ''
                                    CHECK (char_length(exception_detail) <= 500),
+            -- A residential GPS arrival that is outside or uncertain is
+            -- accepted on a GPS override, whose rationale lives in its own
+            -- fields: the exception_* columns cannot carry it, because the
+            -- CHECK below requires them EMPTY for residential_gps. Without
+            -- these the review endpoint selects the row and shows a blank
+            -- reason, which is the one thing a reviewer needs.
+            gps_override_reason VARCHAR(64) NOT NULL DEFAULT '',
+            gps_override_detail TEXT NOT NULL DEFAULT ''
+                                   CHECK (char_length(gps_override_detail) <= 500),
             geofence_status    VARCHAR(32) NOT NULL,
             distance_m         NUMERIC(10, 2),
             accuracy_m         NUMERIC(10, 2),
@@ -5220,6 +5252,18 @@ def _ensure_home_base_schema() -> None:
                     AND char_length(btrim(exception_detail)) >= 3)
             )
         )
+        """
+    )
+    db.execute(
+        """
+        ALTER TABLE visit_evidence_events
+            ADD COLUMN IF NOT EXISTS gps_override_reason VARCHAR(64) NOT NULL DEFAULT ''
+        """
+    )
+    db.execute(
+        """
+        ALTER TABLE visit_evidence_events
+            ADD COLUMN IF NOT EXISTS gps_override_detail TEXT NOT NULL DEFAULT ''
         """
     )
     db.execute(
@@ -8816,7 +8860,7 @@ def admin_put_home_base(
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                ("home-base-config",),
+                (HOME_BASE_CONFIG_LOCK_KEY,),
             )
             cur.execute(
                 "SELECT id, name FROM crews WHERE name = %s AND active = true FOR UPDATE",
@@ -9005,7 +9049,9 @@ def admin_visit_evidence_exceptions(
     rows = db.query_all(
         """
         SELECT evidence.id, evidence.evidence_method, evidence.exception_reason,
-               evidence.exception_detail, evidence.geofence_status,
+               evidence.exception_detail,
+               evidence.gps_override_reason, evidence.gps_override_detail,
+               evidence.geofence_status,
                evidence.distance_m, evidence.accuracy_m, evidence.created_at,
                employee.id AS employee_id, employee.name AS employee_name,
                location.id AS location_id, location.address, location.customer_name,
@@ -9039,6 +9085,11 @@ def admin_visit_evidence_exceptions(
                 "method": str(row["evidence_method"]),
                 "reason": str(row["exception_reason"]),
                 "detail": str(row["exception_detail"]),
+                # A residential GPS arrival reaches this list by being outside
+                # or uncertain, never by carrying an exception -- so for those
+                # rows these two carry the entire rationale.
+                "gpsOverrideReason": str(row.get("gps_override_reason") or ""),
+                "gpsOverrideDetail": str(row.get("gps_override_detail") or ""),
                 "geofenceStatus": str(row["geofence_status"]),
                 "distanceM": float(row["distance_m"]) if row.get("distance_m") is not None else None,
                 "accuracyM": float(row["accuracy_m"]) if row.get("accuracy_m") is not None else None,
@@ -11815,16 +11866,27 @@ def clock_in(
     has_gps = payload.latitude is not None and payload.longitude is not None
     now_utc = utc_now()
     work_date = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
-    home_base_policy = _home_base_policy_for_employee(int(employee["id"]), now_utc)
+    # Pre-flight only. The value the guard and every later consumer use is
+    # re-resolved inside the mutator, under the timesheet advisory lock.
+    home_base = {"policy": _home_base_policy_for_employee(int(employee["id"]), now_utc)}
     # Enforcement is server-owned.  A client must not be able to bypass a
     # configured Morning Crew policy merely by omitting a presentation field.
-    home_base_enforced = home_base_policy is not None
+    home_base["enforced"] = home_base["policy"] is not None
     home_base_exception = _home_base_exception_reason(payload)
     exception_error = _validate_home_base_exception(home_base_exception)
     if exception_error:
         raise HTTPException(status_code=422, detail=exception_error)
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        # Authoritative read. The pre-flight value above was taken before the
+        # timesheet advisory lock was held, so a Home Base policy activated in
+        # between would be missed and this shift would persist with no evidence
+        # that Home Base was ever required. That lock now also covers home-base
+        # configuration, so this re-read cannot be overtaken.
+        home_base["policy"] = _home_base_policy_for_employee(
+            int(employee["id"]), now_utc)
+        home_base["enforced"] = home_base["policy"] is not None
+
         stale_open = get_stale_open_entry(
             timesheet_data["entries"], employee["id"], now_utc
         )
@@ -11834,9 +11896,9 @@ def clock_in(
         if existing_open:
             return False, "Already clocked in"
 
-        if home_base_enforced and not home_base_exception:
-            assert home_base_policy is not None
-            return False, _home_base_requirement_failure(home_base_policy, "clocking in")
+        if home_base["enforced"] and not home_base_exception:
+            assert home_base["policy"] is not None
+            return False, _home_base_requirement_failure(home_base["policy"], "clocking in")
 
         override_error = require_gps_override(
             timesheet_data,
@@ -11850,7 +11912,7 @@ def clock_in(
 
         # A documented Home Base exception is dispatch evidence, never a
         # disguised customer Site picked by the generic nearest-pin matcher.
-        if home_base_enforced and home_base_exception:
+        if home_base["enforced"] and home_base_exception:
             location = "Dispatch exception"
         # Legacy callers retain their additive-compatible nearest-site behavior.
         elif has_gps:
@@ -11871,7 +11933,7 @@ def clock_in(
             # later loads.
             **(
                 {"locationId": None, "internalHomeBase": True}
-                if home_base_enforced and home_base_exception
+                if home_base["enforced"] and home_base_exception
                 else {}
             ),
             "clockIn": to_utc_iso(now_utc),
@@ -11920,7 +11982,7 @@ def clock_in(
         result: Any,
         response: Dict[str, Any],
     ) -> None:
-        if not (home_base_enforced and home_base_exception and home_base_policy):
+        if not (home_base["enforced"] and home_base_exception and home_base["policy"]):
             return
         shift_id = _plain_time_action_shift_id(result, response)
         if shift_id is None:
@@ -11929,7 +11991,7 @@ def clock_in(
             cur,
             shift_id=shift_id,
             employee_id=int(employee["id"]),
-            policy=home_base_policy,
+            policy=home_base["policy"],
             action="start",
             outcome="exception",
             recorded_at=now_utc,
@@ -11970,15 +12032,26 @@ def clock_out(
 ) -> Dict[str, Any]:
     notes = payload.notes.strip() if payload else ""
     now_utc = utc_now()
-    home_base_policy = _home_base_policy_for_employee(int(employee["id"]), now_utc)
+    # Pre-flight only. The value the guard and every later consumer use is
+    # re-resolved inside the mutator, under the timesheet advisory lock.
+    home_base = {"policy": _home_base_policy_for_employee(int(employee["id"]), now_utc)}
     # See clock_in: Home Base is a policy, not an opt-in browser capability.
-    home_base_enforced = home_base_policy is not None
+    home_base["enforced"] = home_base["policy"] is not None
     home_base_exception = _home_base_exception_reason(payload)
     exception_error = _validate_home_base_exception(home_base_exception)
     if exception_error:
         raise HTTPException(status_code=422, detail=exception_error)
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        # Authoritative read. The pre-flight value above was taken before the
+        # timesheet advisory lock was held, so a Home Base policy activated in
+        # between would be missed and this shift would persist with no evidence
+        # that Home Base was ever required. That lock now also covers home-base
+        # configuration, so this re-read cannot be overtaken.
+        home_base["policy"] = _home_base_policy_for_employee(
+            int(employee["id"]), now_utc)
+        home_base["enforced"] = home_base["policy"] is not None
+
         stale_open = get_stale_open_entry(
             timesheet_data["entries"], employee["id"], now_utc
         )
@@ -11988,10 +12061,10 @@ def clock_out(
         if not open_entry:
             return False, "Not currently clocked in"
 
-        if home_base_enforced and not home_base_exception:
-            assert home_base_policy is not None
-            return False, _home_base_requirement_failure(home_base_policy, "clocking out")
-        if home_base_enforced and home_base_exception and get_active_visit(open_entry):
+        if home_base["enforced"] and not home_base_exception:
+            assert home_base["policy"] is not None
+            return False, _home_base_requirement_failure(home_base["policy"], "clocking out")
+        if home_base["enforced"] and home_base_exception and get_active_visit(open_entry):
             return False, "Depart the active customer Site before recording a Home Base exception"
 
         override_error = require_gps_override(
@@ -12037,7 +12110,7 @@ def clock_out(
         result: Any,
         response: Dict[str, Any],
     ) -> None:
-        if not (home_base_enforced and home_base_exception and home_base_policy):
+        if not (home_base["enforced"] and home_base_exception and home_base["policy"]):
             return
         shift_id = _plain_time_action_shift_id(result, response)
         if shift_id is None:
@@ -12046,7 +12119,7 @@ def clock_out(
             cur,
             shift_id=shift_id,
             employee_id=int(employee["id"]),
-            policy=home_base_policy,
+            policy=home_base["policy"],
             action="end",
             outcome="exception",
             recorded_at=now_utc,
@@ -12352,8 +12425,9 @@ def log_visit(
             INSERT INTO visit_evidence_events (
                 visit_id, shift_id, employee_id, location_id, planned_visit_id,
                 evidence_method, exception_reason, exception_detail,
+                gps_override_reason, gps_override_detail,
                 geofence_status, distance_m, accuracy_m
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -12369,6 +12443,10 @@ def log_visit(
                 payload.evidenceMethod,
                 payload.exceptionReason,
                 payload.exceptionDetail,
+                # Why an outside/uncertain GPS arrival was accepted. The
+                # exception_* pair cannot hold this for residential_gps.
+                payload.gpsOverrideReason.strip(),
+                payload.gpsOverrideDetail.strip(),
                 current_geofence["status"],
                 current_geofence.get("distanceM"),
                 current_geofence.get("accuracyM"),

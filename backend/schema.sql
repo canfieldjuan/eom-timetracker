@@ -864,6 +864,9 @@ CREATE TABLE visit_evidence_events (
                            )),
     exception_reason   VARCHAR(64) NOT NULL DEFAULT '',
     exception_detail   TEXT NOT NULL DEFAULT '' CHECK (char_length(exception_detail) <= 500),
+    gps_override_reason VARCHAR(64) NOT NULL DEFAULT '',
+    gps_override_detail TEXT NOT NULL DEFAULT ''
+                           CHECK (char_length(gps_override_detail) <= 500),
     geofence_status    VARCHAR(32) NOT NULL,
     distance_m         NUMERIC(10, 2),
     accuracy_m         NUMERIC(10, 2),

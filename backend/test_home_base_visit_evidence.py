@@ -1864,3 +1864,140 @@ def test_cross_boundary_dispatch_labor_cost_matches_the_full_summary(monkeypatch
     sunday = next(row for row in result["byDay"] if row["date"] == "2026-08-09")
     assert sunday["dispatchOverheadHours"] == 1.0
     assert sunday["dispatchOverheadLaborCost"] == 36.5
+
+
+def test_gps_override_rationale_survives_into_the_exception_review(client, auth):
+    """An outside-geofence residential arrival must show WHY it was accepted.
+
+    Such an arrival reaches the review list by its geofence status, never by
+    carrying an exception -- the request shape forbids exceptionReason and
+    exceptionDetail for residential_gps, and the ledger CHECK requires them
+    empty. So if the GPS override fields are not persisted, the reviewer gets
+    a row with a blank rationale, which is the only thing the review is for.
+    """
+    employee_id, employee_auth = _create_employee(client, "Override rationale")
+    site_id = _insert_site(
+        "Override rationale",
+        location_type="Residential",
+        latitude=39.50000,
+        longitude=-88.90000,
+    )
+    planned_visit_id = _insert_assigned_planned_visit(
+        employee_id=employee_id,
+        location_id=site_id,
+        suffix="override-rationale",
+    )
+    shift_id = _clock_in(client, employee_auth)
+
+    arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "plannedVisitId": planned_visit_id,
+            "evidenceMethod": "residential_gps",
+            # Far enough out that this cannot be accepted on geofence alone.
+            "latitude": 39.60000,
+            "longitude": -88.90000,
+            "accuracy": 5,
+            "gpsOverrideReason": "gps_drift",
+            "gpsOverrideDetail": "Phone placed distance at the next block over.",
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert arrival.status_code == 200, arrival.text
+
+    stored = db.query_one(
+        """
+        SELECT gps_override_reason, gps_override_detail, geofence_status
+        FROM visit_evidence_events WHERE shift_id = %s
+        """,
+        (shift_id,),
+    )
+    assert stored is not None, "no evidence row was written"
+    assert stored["geofence_status"] != "inside", (
+        "the arrival was inside the geofence, so this test never exercised an override"
+    )
+    assert stored["gps_override_reason"] == "gps_drift"
+    assert "next block over" in stored["gps_override_detail"]
+
+    review = client.get("/api/admin/visit-evidence-exceptions", headers=auth)
+    assert review.status_code == 200, review.text
+    rows = [r for r in review.json()["exceptions"] if int(r["shiftId"]) == shift_id]
+    assert rows, "the outside-geofence arrival never reached the review list"
+    row = rows[0]
+    # The exception pair is empty by construction for this method -- that is
+    # precisely why the override pair has to carry the reason.
+    assert row["reason"] == "" and row["detail"] == ""
+    assert row["gpsOverrideReason"] == "gps_drift"
+    assert "next block over" in row["gpsOverrideDetail"]
+
+
+@pytest.mark.parametrize("action", ["clock-in", "clock-out"])
+def test_home_base_policy_activated_after_the_preflight_read_still_binds(
+    client, auth, monkeypatch, action,
+):
+    """The guard must use a policy read under the lock, not the pre-flight one.
+
+    Both handlers resolve the policy before entering the serialized timesheet
+    update. A policy committing in that window would leave the captured value
+    False, skip the scan-or-exception guard, and persist a shift carrying no
+    evidence that Home Base was ever required.
+
+    clock-out is covered too: it has the identical read-then-guard shape and
+    was not part of the reported finding.
+    """
+    employee_id, employee_auth = _create_employee(client, f"Policy race {action}")
+    _enroll_in_morning_crew(employee_id)
+    if action == "clock-out":
+        _clock_in(client, employee_auth)
+
+    original = time_tracker_api._home_base_policy_for_employee
+    calls = {"n": 0}
+
+    def activate_between_the_two_reads(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The pre-flight read returns no policy, and the admin configures
+            # Home Base immediately afterwards -- exactly the window.
+            result = original(*args, **kwargs)
+            assert result is None, "the policy was already active; no race to test"
+            _configure_home_base(client, auth)
+            return result
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_home_base_policy_for_employee",
+        activate_between_the_two_reads,
+    )
+
+    response = client.post(
+        f"/api/timesheet/{action}",
+        headers=employee_auth,
+        json={
+            "location": "",
+            "latitude": 39.00009,
+            "longitude": -88.00000,
+            "accuracy": 5,
+            "gpsOverrideReason": "test location setup",
+            "gpsOverrideDetail": "Race test for Home Base policy activation.",
+        },
+    )
+
+    assert calls["n"] >= 2, (
+        "the policy was read only once, so the guard still trusts the pre-flight value"
+    )
+    assert response.status_code >= 400, (
+        f"{action} succeeded despite a Home Base policy active at write time: "
+        f"{response.text}"
+    )
+    if action == "clock-in":
+        open_shifts = db.query_one(
+            "SELECT COUNT(*) AS count FROM shifts "
+            "WHERE employee_id = %s AND clock_out IS NULL",
+            (employee_id,),
+        )
+        assert open_shifts == {"count": 0}, (
+            "a shift persisted with no Home Base evidence"
+        )
