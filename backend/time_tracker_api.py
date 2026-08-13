@@ -8777,6 +8777,40 @@ def receivables_payments(
     )
 
 
+@app.get("/api/admin/receivables/customers/{contact_id}/ledger")
+def receivables_customer_ledger(
+    contact_id: UUID,
+    payment_status: Optional[str] = Query(default=None, max_length=16),
+    payment_method: Optional[str] = Query(default=None, max_length=32),
+    search: Optional[str] = Query(default=None, max_length=256),
+    from_date: Optional[date] = Query(default=None),
+    to_date: Optional[date] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Proxy one bounded canonical-customer ledger page from Atlas.
+
+    ATLAS owns the ledger, balances, pagination snapshot, and filter semantics.
+    This route only preserves the authenticated manager boundary and forwards the
+    server-derived actor with the provider's query contract.
+    """
+    return _atlas_receivables_request(
+        "GET",
+        f"/receivables/customers/{contact_id}/ledger",
+        admin,
+        params={
+            "payment_status": payment_status,
+            "payment_method": payment_method,
+            "search": search,
+            "from_date": from_date.isoformat() if from_date else None,
+            "to_date": to_date.isoformat() if to_date else None,
+            "limit": limit,
+            "offset": offset,
+        },
+    )
+
+
 @app.post("/api/admin/receivables/payments")
 def receivables_create_payment(
     payload: ReceivablesPaymentRequest,

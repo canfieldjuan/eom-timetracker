@@ -386,6 +386,184 @@ class TestReceivablesProxy:
         assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
         assert kwargs["params"]["search"] == "Acme"
 
+    def test_customer_ledger_forwards_bounded_filters_and_continuation(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        contact_id = "11111111-1111-1111-1111-111111111111"
+        ledger = {
+            "customer": {"contact_id": contact_id, "name": "Acme"},
+            "entries": [{"entry_type": "payment", "id": "payment-1"}],
+            "pagination": {"limit": 200, "offset": 10001, "has_more": False},
+        }
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse(ledger)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+
+        response = client.get(
+            f"/api/admin/receivables/customers/{contact_id}/ledger",
+            headers=auth,
+            params={
+                "payment_status": "received",
+                "payment_method": "check",
+                "search": "receipt-1001",
+                "from_date": "2026-08-01",
+                "to_date": "2026-08-31",
+                "limit": 200,
+                "offset": 10001,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == ledger
+        assert GENERATED_RECEIVABLES_TOKEN not in response.text
+        method, url, kwargs = calls[0]
+        assert method == "GET"
+        assert url == f"https://atlas.test/api/v1/receivables/customers/{contact_id}/ledger"
+        assert kwargs["headers"]["Authorization"] == (
+            f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
+        )
+        assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert "Idempotency-Key" not in kwargs["headers"]
+        assert kwargs["json"] is None
+        assert kwargs["params"] == {
+            "payment_status": "received",
+            "payment_method": "check",
+            "search": "receipt-1001",
+            "from_date": "2026-08-01",
+            "to_date": "2026-08-31",
+            "limit": 200,
+            "offset": 10001,
+        }
+
+    def test_customer_ledger_requires_admin_before_an_upstream_read(
+        self, client, emp_auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+
+        response = client.get(
+            "/api/admin/receivables/customers/"
+            "11111111-1111-1111-1111-111111111111/ledger",
+            headers=emp_auth,
+        )
+
+        assert response.status_code == 403
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/admin/receivables/customers/not-a-uuid/ledger",
+            "/api/admin/receivables/customers/"
+            "11111111-1111-1111-1111-111111111111/ledger?limit=201",
+            "/api/admin/receivables/customers/"
+            "11111111-1111-1111-1111-111111111111/ledger?offset=-1",
+            "/api/admin/receivables/customers/"
+            "11111111-1111-1111-1111-111111111111/ledger?from_date=not-a-date",
+        ],
+    )
+    def test_customer_ledger_rejects_invalid_local_path_or_bounds_before_atlas(
+        self, client, auth, monkeypatch, path
+    ):
+        import time_tracker_api as api
+
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+
+        response = client.get(path, headers=auth)
+
+        assert response.status_code == 422
+        assert calls == []
+
+    def test_customer_ledger_preserves_provider_filter_rejection(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse(
+                {"detail": "payment_status cannot be blank"}, status_code=422
+            )
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+
+        response = client.get(
+            "/api/admin/receivables/customers/"
+            "11111111-1111-1111-1111-111111111111/ledger?payment_status=",
+            headers=auth,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["error"] == "payment_status cannot be blank"
+        assert calls[0][2]["params"]["payment_status"] == ""
+
+    def test_customer_ledger_retry_after_upstream_outage_is_a_fresh_read(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+
+        def flaky_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("upstream timeout")
+            return _AtlasResponse({"entries": [], "pagination": {"has_more": False}})
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+
+        path = (
+            "/api/admin/receivables/customers/"
+            "11111111-1111-1111-1111-111111111111/ledger?limit=25&offset=50"
+        )
+        failed = client.get(path, headers=auth)
+        recovered = client.get(path, headers=auth)
+
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "5"
+        assert recovered.status_code == 200
+        assert recovered.json() == {"entries": [], "pagination": {"has_more": False}}
+        assert [call[0] for call in calls] == ["GET", "GET"]
+        assert calls[0][1] == calls[1][1]
+        assert calls[0][2]["params"] == calls[1][2]["params"]
+
     def test_forwards_idempotency_key_and_check_metadata_on_payment_write(
         self, client, auth, monkeypatch
     ):
