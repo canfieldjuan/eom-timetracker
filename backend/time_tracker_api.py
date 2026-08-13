@@ -8883,6 +8883,30 @@ def receivables_customer_ledger(
     )
 
 
+@app.get("/api/admin/receivables/commercial-billing-candidates")
+def receivables_commercial_billing_candidates(
+    billing_period: str = Query(
+        ...,
+        min_length=7,
+        max_length=7,
+        pattern=r"^\d{4}-(0[1-9]|1[0-2])$",
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Proxy the ATLAS-owned, side-effect-free commercial billing preview.
+
+    The tracker preserves the authenticated manager and actor boundary only.
+    ATLAS remains responsible for source evidence, candidate calculation, and
+    all later billing lifecycle work; this endpoint performs no local write.
+    """
+    return _atlas_receivables_request(
+        "GET",
+        "/receivables/commercial-billing-candidates",
+        admin,
+        params={"billing_period": billing_period},
+    )
+
+
 @app.post("/api/admin/receivables/payments")
 def receivables_create_payment(
     payload: ReceivablesPaymentRequest,
