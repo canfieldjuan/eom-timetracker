@@ -1,8 +1,9 @@
 """Canonical Schedule, measured Utilization, and Forecast operations views.
 
-Google Calendar synchronization owns source-linked job planning.  This module
-never mutates jobs or raw time evidence. Its one write appends an
-evidence-bound reviewed-departure overlay to the existing correction ledger.
+Google Calendar synchronization owns retained calendar jobs. Native Site rules
+own generated planning rows. This module never mutates jobs or raw time
+evidence; its writes are scoped to append-only/corrective overlays and
+one-off native occurrence exceptions.
 """
 
 from __future__ import annotations
@@ -126,6 +127,14 @@ class ServiceScheduleRuleUpdateRequest(BaseModel):
     endsOn: Optional[date] = None
     notes: Optional[str] = Field(default=None, max_length=500)
     active: Optional[bool] = None
+
+
+class NativeScheduleOccurrenceExceptionRequest(BaseModel):
+    action: str = Field(pattern="^(cancelled|rescheduled)$")
+    scheduledDate: Optional[date] = None
+    localStartTime: Optional[time] = None
+    localEndTime: Optional[time] = None
+    reason: str = Field(min_length=3, max_length=500)
 
 
 class NativeSchedulePreviewRequest(BaseModel):
@@ -447,6 +456,49 @@ def _fetch_service_schedule_rule(
     return dict(row) if row else None
 
 
+def _serialize_native_occurrence_exception(row: Dict[str, Any]) -> Dict[str, Any]:
+    scheduled_date = row.get("scheduled_date")
+    return {
+        "id": int(row["id"]),
+        "ruleId": int(row["rule_id"]),
+        "serviceDate": str(row["service_date"]),
+        "action": str(row["action"]),
+        "scheduledDate": str(scheduled_date) if scheduled_date is not None else None,
+        "localStartTime": (
+            _local_time_text(row["local_start_time"])
+            if row.get("local_start_time") is not None
+            else None
+        ),
+        "localEndTime": (
+            _local_time_text(row["local_end_time"])
+            if row.get("local_end_time") is not None
+            else None
+        ),
+        "reason": str(row.get("reason") or ""),
+        "createdAt": _utc_iso(row.get("created_at")),
+        "updatedAt": _utc_iso(row.get("updated_at")),
+    }
+
+
+def _fetch_native_occurrence_exception(
+    cur: Any,
+    *,
+    rule_id: int,
+    service_date: date,
+) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        """
+        SELECT id, rule_id, service_date, action, scheduled_date,
+               local_start_time, local_end_time, reason, created_at, updated_at
+        FROM service_schedule_occurrence_exceptions
+        WHERE rule_id = %s AND service_date = %s
+        """,
+        (rule_id, service_date),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
 def _find_duplicate_service_schedule_rule(
     cur: Any,
     *,
@@ -522,6 +574,33 @@ def _rule_active_on(rule: Dict[str, Any], service_day: date) -> bool:
     return False
 
 
+def _load_native_occurrence_exceptions(
+    rule_ids: Iterable[int],
+    start_date: date,
+    end_date: date,
+) -> Dict[Tuple[int, date], Dict[str, Any]]:
+    resolved_rule_ids = sorted({int(rule_id) for rule_id in rule_ids})
+    if not resolved_rule_ids:
+        return {}
+    rows = db.query_all(
+        """
+        SELECT id, rule_id, service_date, action, scheduled_date,
+               local_start_time, local_end_time, reason, created_at, updated_at
+        FROM service_schedule_occurrence_exceptions
+        WHERE rule_id = ANY(%s)
+          AND (
+              service_date BETWEEN %s AND %s
+              OR scheduled_date BETWEEN %s AND %s
+          )
+        """,
+        (resolved_rule_ids, start_date, end_date, start_date, end_date),
+    )
+    return {
+        (int(row["rule_id"]), row["service_date"]): dict(row)
+        for row in rows
+    }
+
+
 def _preview_interval(
     service_day: date,
     start_time: time,
@@ -574,17 +653,57 @@ def _native_preview_rows(
     *,
     app_timezone: ZoneInfo,
     avg_hourly_rate: Optional[Decimal],
+    occurrence_exceptions: Optional[Dict[Tuple[int, date], Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
+    occurrence_exceptions = occurrence_exceptions or {}
     rows: List[Dict[str, Any]] = []
-    service_day = start_date
-    while service_day <= end_date:
+    allocation_service_dates = {
+        start_date + timedelta(days=offset)
+        for offset in range((end_date - start_date).days + 1)
+    }
+    # An exception can move an occurrence into this allocation window from a
+    # source date outside it.  Generate that original occurrence as well; the
+    # caller still filters returned rows by their effective scheduled date.
+    service_dates = allocation_service_dates | {
+        service_date
+        for _, service_date in occurrence_exceptions
+    }
+    for service_day in sorted(service_dates):
         for rule in rules:
-            if not _rule_active_on(rule, service_day):
+            rule_id = int(rule["id"])
+            occurrence_exception = occurrence_exceptions.get((rule_id, service_day))
+            if (
+                service_day not in allocation_service_dates
+                and occurrence_exception is None
+            ) or not _rule_active_on(rule, service_day):
                 continue
+            action = (
+                str(occurrence_exception["action"])
+                if occurrence_exception is not None
+                else None
+            )
+            scheduled_day = (
+                occurrence_exception["scheduled_date"]
+                if action == "rescheduled"
+                and occurrence_exception.get("scheduled_date") is not None
+                else service_day
+            )
+            local_start_time = (
+                occurrence_exception["local_start_time"]
+                if action == "rescheduled"
+                and occurrence_exception.get("local_start_time") is not None
+                else rule["local_start_time"]
+            )
+            local_end_time = (
+                occurrence_exception["local_end_time"]
+                if action == "rescheduled"
+                and occurrence_exception.get("local_end_time") is not None
+                else rule["local_end_time"]
+            )
             starts_at, ends_at, valid_service_window = _preview_interval(
-                service_day,
-                rule["local_start_time"],
-                rule["local_end_time"],
+                scheduled_day,
+                local_start_time,
+                local_end_time,
                 app_timezone,
             )
             issues: List[Dict[str, str]] = []
@@ -644,17 +763,22 @@ def _native_preview_rows(
                         "No active employee has a configured hourly rate.",
                     )
                 )
+            included_in_forecast = valid_service_window and action != "cancelled"
+            forecast_revenue_cents = revenue_cents if included_in_forecast else None
+            forecast_labor_cents = labor_cents if included_in_forecast else None
             row_number = len(rows) + 1
             net_cents = (
-                revenue_cents - labor_cents
-                if revenue_cents is not None and labor_cents is not None
+                forecast_revenue_cents - forecast_labor_cents
+                if forecast_revenue_cents is not None
+                and forecast_labor_cents is not None
                 else None
             )
             rows.append(
                 {
                     "jobId": row_number,
-                    "projectionId": f"rule-{int(rule['id'])}:{service_day}",
-                    "ruleId": int(rule["id"]),
+                    "projectionId": f"rule-{rule_id}:{service_day}",
+                    "ruleId": rule_id,
+                    "occurrenceDate": str(service_day),
                     "locationId": int(rule["location_id"]),
                     "customerId": (
                         int(rule["customer_id"])
@@ -667,38 +791,43 @@ def _native_preview_rows(
                     "shiftBucket": str(rule["shift_bucket"]),
                     "cadence": str(rule["cadence"]),
                     "rateType": rate_type,
-                    "scheduledDate": str(service_day),
+                    "scheduledDate": str(scheduled_day),
                     "scheduledStart": _utc_iso(starts_at),
                     "scheduledEnd": _utc_iso(ends_at),
                     "sourceRole": _native_source_role({"siteType": rule.get("site_type")}),
-                    "includedInForecast": valid_service_window,
+                    "status": "cancelled" if action == "cancelled" else "scheduled",
+                    "includedInForecast": included_in_forecast,
                     "plannedHours": expected_hours,
                     "expectedHoursBaseline": None,
-                    "estRevenue": _money(revenue_cents),
-                    "estLaborCost": _money(labor_cents),
+                    "estRevenue": _money(forecast_revenue_cents),
+                    "estLaborCost": _money(forecast_labor_cents),
                     "estNetProfit": _money(net_cents),
                     "estMarginPct": (
-                        round(net_cents / revenue_cents * 100, 1)
+                        round(net_cents / forecast_revenue_cents * 100, 1)
                         if net_cents is not None
-                        and revenue_cents is not None
-                        and revenue_cents > 0
+                        and forecast_revenue_cents is not None
+                        and forecast_revenue_cents > 0
                         else None
                     ),
                     "estLaborPct": (
-                        round(labor_cents / revenue_cents * 100, 1)
-                        if labor_cents is not None
-                        and revenue_cents is not None
-                        and revenue_cents > 0
+                        round(forecast_labor_cents / forecast_revenue_cents * 100, 1)
+                        if forecast_labor_cents is not None
+                        and forecast_revenue_cents is not None
+                        and forecast_revenue_cents > 0
                         else None
                     ),
                     "issues": issues,
-                    "_included_in_forecast": valid_service_window,
+                    "occurrenceException": (
+                        _serialize_native_occurrence_exception(occurrence_exception)
+                        if occurrence_exception is not None
+                        else None
+                    ),
+                    "_included_in_forecast": included_in_forecast,
                     "_rate_cents": rate_cents,
-                    "_revenue_cents": revenue_cents,
-                    "_labor_cents": labor_cents,
+                    "_revenue_cents": forecast_revenue_cents,
+                    "_labor_cents": forecast_labor_cents,
                 }
             )
-        service_day += timedelta(days=1)
     _apply_native_monthly_allocations(rows)
     for row in rows:
         if row.get("rateType") == "monthly":
@@ -792,12 +921,18 @@ def _native_projection_rows_for_period(
     allocation_start = date(start_date.year, start_date.month, 1)
     allocation_end = _month_end(end_date)
     rules = _load_active_service_schedule_rules(allocation_start, allocation_end)
+    occurrence_exceptions = _load_native_occurrence_exceptions(
+        [int(rule["id"]) for rule in rules],
+        allocation_start,
+        allocation_end,
+    )
     allocated_rows = _native_preview_rows(
         rules,
         allocation_start,
         allocation_end,
         app_timezone=app_timezone,
         avg_hourly_rate=avg_hourly_rate,
+        occurrence_exceptions=occurrence_exceptions,
     )
     return [
         row
@@ -878,8 +1013,8 @@ def _parse_native_utc(value: Any) -> Optional[datetime]:
 
 
 def _native_projection_job_id(row: Dict[str, Any]) -> int:
-    service_day = date.fromisoformat(str(row["scheduledDate"]))
-    return -(int(row["ruleId"]) * 1_000_000 + service_day.toordinal())
+    occurrence_day = date.fromisoformat(str(row["occurrenceDate"]))
+    return -(int(row["ruleId"]) * 1_000_000 + occurrence_day.toordinal())
 
 
 def _native_occurrence_key(
@@ -954,8 +1089,12 @@ def _native_projection_job(row: Dict[str, Any]) -> Dict[str, Any]:
         "scheduled_start": _parse_native_utc(row.get("scheduledStart")),
         "scheduled_end": _parse_native_utc(row.get("scheduledEnd")),
         "source_role": row.get("sourceRole"),
-        "source_title": "Native Site schedule rule",
-        "status": "scheduled",
+        "source_title": (
+            "Native Site schedule rule"
+            if row.get("status") != "cancelled"
+            else "Native Site schedule rule (cancelled)"
+        ),
+        "status": row.get("status") or "scheduled",
         "source_all_day": False,
         "site_address": row.get("siteAddress"),
         "site_type": row.get("siteType"),
@@ -981,8 +1120,10 @@ def _restore_native_schedule_metadata(job: Dict[str, Any]) -> Dict[str, Any]:
     job.pop("id", None)
     job["projectionId"] = native_row.get("projectionId")
     job["ruleId"] = native_row.get("ruleId")
+    job["occurrenceDate"] = native_row.get("occurrenceDate")
     job["shiftBucket"] = native_row.get("shiftBucket")
     job["cadence"] = native_row.get("cadence")
+    job["occurrenceException"] = native_row.get("occurrenceException")
     return job
 
 
@@ -7150,6 +7291,164 @@ def build_operations_schedule_router(
         return {
             "success": True,
             "rule": _serialize_service_schedule_rule(rule),
+        }
+
+    @router.put(
+        "/api/admin/operations/service-schedule-rules/{rule_id}/occurrence-exceptions/{service_date}"
+    )
+    def upsert_native_occurrence_exception(
+        rule_id: int,
+        service_date: date,
+        payload: NativeScheduleOccurrenceExceptionRequest,
+        request: Request,
+        admin: Dict[str, Any] = Depends(get_current_admin),
+    ) -> Dict[str, Any]:
+        reason = payload.reason.strip()
+        if len(reason) < 3:
+            raise HTTPException(
+                status_code=422,
+                detail="reason must contain at least 3 non-space characters",
+            )
+        scheduled_date: Optional[date] = None
+        local_start_time: Optional[time] = None
+        local_end_time: Optional[time] = None
+        if payload.action == "cancelled":
+            supplied_fields = getattr(payload, "model_fields_set", None)
+            if supplied_fields is None:
+                supplied_fields = getattr(payload, "__fields_set__", set())
+            if {"scheduledDate", "localStartTime", "localEndTime"} & set(supplied_fields):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Cancelled occurrences cannot include reschedule fields",
+                )
+        else:
+            if (
+                payload.scheduledDate is None
+                or payload.localStartTime is None
+                or payload.localEndTime is None
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Rescheduled occurrences require scheduledDate, "
+                        "localStartTime, and localEndTime"
+                    ),
+                )
+            _validate_service_rule_times(payload.localStartTime, payload.localEndTime)
+            scheduled_date = payload.scheduledDate
+            local_start_time = payload.localStartTime
+            local_end_time = payload.localEndTime
+
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                rule = _fetch_service_schedule_rule(cur, rule_id, lock=True)
+                if not rule or not bool(rule["active"]) or not bool(rule["site_active"]):
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Active service schedule rule not found",
+                    )
+                if not _rule_active_on(rule, service_date):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="serviceDate is not generated by this rule",
+                    )
+                cur.execute(
+                    """
+                    INSERT INTO service_schedule_occurrence_exceptions (
+                        rule_id, service_date, action, scheduled_date,
+                        local_start_time, local_end_time, reason,
+                        created_by, updated_by
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (rule_id, service_date)
+                    DO UPDATE SET
+                        action = EXCLUDED.action,
+                        scheduled_date = EXCLUDED.scheduled_date,
+                        local_start_time = EXCLUDED.local_start_time,
+                        local_end_time = EXCLUDED.local_end_time,
+                        reason = EXCLUDED.reason,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = NOW()
+                    RETURNING id, rule_id, service_date, action, scheduled_date,
+                              local_start_time, local_end_time, reason,
+                              created_at, updated_at
+                    """,
+                    (
+                        rule_id,
+                        service_date,
+                        payload.action,
+                        scheduled_date,
+                        local_start_time,
+                        local_end_time,
+                        reason,
+                        int(admin["id"]),
+                        int(admin["id"]),
+                    ),
+                )
+                exception = dict(cur.fetchone())
+        if append_access_log is not None:
+            append_access_log(
+                request,
+                "SERVICE_SCHEDULE_OCCURRENCE_EXCEPTION_UPSERTED",
+                True,
+                (
+                    f"Service schedule rule {rule_id} occurrence {service_date} "
+                    f"{payload.action} by {admin['name']}"
+                ),
+            )
+        return {
+            "success": True,
+            "exception": _serialize_native_occurrence_exception(exception),
+        }
+
+    @router.delete(
+        "/api/admin/operations/service-schedule-rules/{rule_id}/occurrence-exceptions/{service_date}"
+    )
+    def delete_native_occurrence_exception(
+        rule_id: int,
+        service_date: date,
+        request: Request,
+        admin: Dict[str, Any] = Depends(get_current_admin),
+    ) -> Dict[str, Any]:
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                rule = _fetch_service_schedule_rule(cur, rule_id, lock=True)
+                if not rule:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Service schedule rule not found",
+                    )
+                exception = _fetch_native_occurrence_exception(
+                    cur,
+                    rule_id=rule_id,
+                    service_date=service_date,
+                )
+                if exception is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Native schedule occurrence exception not found",
+                    )
+                cur.execute(
+                    """
+                    DELETE FROM service_schedule_occurrence_exceptions
+                    WHERE rule_id = %s AND service_date = %s
+                    """,
+                    (rule_id, service_date),
+                )
+        if append_access_log is not None:
+            append_access_log(
+                request,
+                "SERVICE_SCHEDULE_OCCURRENCE_EXCEPTION_DELETED",
+                True,
+                (
+                    f"Service schedule rule {rule_id} occurrence {service_date} "
+                    f"restored by {admin['name']}"
+                ),
+            )
+        return {
+            "success": True,
+            "deleted": True,
+            "exception": _serialize_native_occurrence_exception(exception),
         }
 
     @router.post("/api/admin/operations/native-schedule-preview")

@@ -5767,6 +5767,38 @@ def _ensure_schema_migrations() -> None:
         ON service_schedule_rules(active, starts_on, ends_on)
     """)
     db.execute("""
+        CREATE TABLE IF NOT EXISTS service_schedule_occurrence_exceptions (
+            id               BIGSERIAL PRIMARY KEY,
+            rule_id          BIGINT NOT NULL REFERENCES service_schedule_rules(id) ON DELETE CASCADE,
+            service_date     DATE NOT NULL,
+            action           TEXT NOT NULL CHECK (action IN ('cancelled', 'rescheduled')),
+            scheduled_date   DATE,
+            local_start_time TIME,
+            local_end_time   TIME,
+            reason           TEXT NOT NULL DEFAULT '',
+            created_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            updated_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (rule_id, service_date),
+            CHECK (
+                (action = 'cancelled'
+                    AND scheduled_date IS NULL
+                    AND local_start_time IS NULL
+                    AND local_end_time IS NULL)
+                OR
+                (action = 'rescheduled'
+                    AND scheduled_date IS NOT NULL
+                    AND local_start_time IS NOT NULL
+                    AND local_end_time IS NOT NULL)
+            )
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_service_schedule_occurrence_exceptions_rule_window
+        ON service_schedule_occurrence_exceptions(rule_id, service_date, scheduled_date)
+    """)
+    db.execute("""
         CREATE TABLE IF NOT EXISTS site_check_ins (
             id                        BIGSERIAL PRIMARY KEY,
             employee_id               INTEGER NOT NULL REFERENCES employees(id),

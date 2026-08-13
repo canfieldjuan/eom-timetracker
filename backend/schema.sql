@@ -316,6 +316,39 @@ CREATE INDEX idx_service_schedule_rules_location
 CREATE INDEX idx_service_schedule_rules_window
     ON service_schedule_rules(active, starts_on, ends_on);
 
+-- One-off exceptions for generated native Site schedule occurrences. These
+-- adjust the generated plan without writing operational jobs or changing the
+-- recurring rule itself.
+CREATE TABLE service_schedule_occurrence_exceptions (
+    id               BIGSERIAL PRIMARY KEY,
+    rule_id          BIGINT NOT NULL REFERENCES service_schedule_rules(id) ON DELETE CASCADE,
+    service_date     DATE NOT NULL,
+    action           TEXT NOT NULL CHECK (action IN ('cancelled', 'rescheduled')),
+    scheduled_date   DATE,
+    local_start_time TIME,
+    local_end_time   TIME,
+    reason           TEXT NOT NULL DEFAULT '',
+    created_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    updated_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (rule_id, service_date),
+    CHECK (
+        (action = 'cancelled'
+            AND scheduled_date IS NULL
+            AND local_start_time IS NULL
+            AND local_end_time IS NULL)
+        OR
+        (action = 'rescheduled'
+            AND scheduled_date IS NOT NULL
+            AND local_start_time IS NOT NULL
+            AND local_end_time IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_service_schedule_occurrence_exceptions_rule_window
+    ON service_schedule_occurrence_exceptions(rule_id, service_date, scheduled_date);
+
 -- Exact employee/site start times used only for QR arrival classification.
 -- The existing schedules table stores weekly hour totals and cannot determine
 -- whether a specific arrival is on time.
