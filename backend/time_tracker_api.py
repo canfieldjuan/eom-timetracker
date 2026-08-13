@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import calendar
 import csv
+from dataclasses import dataclass
 import hashlib
 import hmac
 import io
@@ -4479,6 +4480,17 @@ def _lock_funnel_lead_transition(cur: Any, contact_id: str) -> None:
 # fail. Deriving it for real needs Atlas to publish the set, e.g. through the
 # capability manifest; tracked separately.
 CUSTOMER_TYPES = ("residential", "commercial", "unknown")
+# Atlas owns this sequence. Keeping the bound here makes malformed JSON fail
+# before it reaches PostgreSQL's BIGINT conversion at a local mirror write.
+MAX_ATLAS_CUSTOMER_TYPE_REVISION = (2**63) - 1
+
+
+@dataclass(frozen=True)
+class CustomerTypeSourceEvidence:
+    """One Atlas-confirmed customer-type value and its source ordering token."""
+
+    customer_type: str
+    revision: int
 
 def _ensure_customer_site_schema() -> None:
     """Install and backfill the Customer/Site model in one transaction."""
@@ -5373,6 +5385,34 @@ def _ensure_schema_migrations() -> None:
     db.execute(
         "ALTER TABLE customers ADD COLUMN IF NOT EXISTS customer_type "
         "VARCHAR(16) NOT NULL DEFAULT 'unknown'"
+    )
+    # The local type is a cache of Atlas evidence. A nullable watermark keeps
+    # legacy/unproven rows distinguishable from a row whose source order is
+    # known; every non-NULL value is an Atlas BIGINT revision and must be
+    # positive. This is additive so existing rows remain valid.
+    db.execute(
+        "ALTER TABLE customers ADD COLUMN IF NOT EXISTS "
+        "customer_type_source_revision BIGINT"
+    )
+    db.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = 'chk_customers_customer_type_source_revision'
+                  AND conrelid = 'customers'::regclass
+            ) THEN
+                ALTER TABLE customers
+                    ADD CONSTRAINT chk_customers_customer_type_source_revision
+                    CHECK (
+                        customer_type_source_revision IS NULL
+                        OR customer_type_source_revision > 0
+                    );
+            END IF;
+        END $$;
+        """
     )
     # Rebuilt ONLY when the deployed constraint disagrees with CUSTOMER_TYPES.
     #
@@ -13601,7 +13641,6 @@ def _insert_customer(
     payload: CustomerCreateRequest,
     *,
     atlas_contact_id: Optional[str] = None,
-    customer_type: Optional[str] = None,
 ) -> int:
     """Insert one Customer.
 
@@ -13610,12 +13649,10 @@ def _insert_customer(
     payload field remains the source for the office estimate-approval path,
     where the contact already exists in Atlas before the Customer does.
 
-    `customer_type` is likewise a keyword and never read from the payload:
-    Atlas owns it, this row only mirrors what Atlas reported. A caller with an
-    opinion about the type has to change it in Atlas. None means Atlas did not
-    report one -- an older Atlas that does not serve the field yet, or a create
-    that did not specify it -- and the column default records that honestly as
-    'unknown' rather than inventing a classification.
+    This insertion deliberately records the default ``unknown`` type. When a
+    reservation has versioned Atlas evidence, its finalizer applies that
+    evidence only after the local row is linked, so every local copy of the
+    contact is updated under the same source-order fence.
     """
     linked_contact_id = atlas_contact_id
     if linked_contact_id is None and payload.atlasContactId is not None:
@@ -13624,10 +13661,9 @@ def _insert_customer(
         """
         INSERT INTO customers (
             name, primary_contact_name, primary_phone, primary_email,
-            billing_name, billing_email, billing_address, atlas_contact_id,
-            customer_type
+            billing_name, billing_email, billing_address, atlas_contact_id
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 'unknown'))
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -13639,7 +13675,6 @@ def _insert_customer(
             payload.billingEmail,
             payload.billingAddress,
             linked_contact_id,
-            customer_type,
         ),
     )
     return int(cur.fetchone()["id"])
@@ -14250,7 +14285,7 @@ def _finalize_customer_atlas_reservation(
     reservation_id: str,
     atlas_contact_id: str,
     payload: CustomerCreateRequest,
-    customer_type: Optional[str] = None,
+    customer_type_evidence: Optional[CustomerTypeSourceEvidence] = None,
 ) -> Dict[str, Any]:
     """Write the local half once Atlas has confirmed the canonical contact.
 
@@ -14262,6 +14297,11 @@ def _finalize_customer_atlas_reservation(
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_site_mutations(cur)
+            if customer_type_evidence is not None:
+                # This writer and the direct type route can both mirror one
+                # Atlas contact. Serialize their local fan-out before applying
+                # the source watermark below.
+                _lock_customer_type_mirror(cur, atlas_contact_id)
             cur.execute(
                 """
                 SELECT *
@@ -14288,12 +14328,10 @@ def _finalize_customer_atlas_reservation(
                 cur.execute(
                     """
                     UPDATE customers
-                    SET atlas_contact_id = %s,
-                        customer_type = COALESCE(%s, customer_type),
-                        updated_at = NOW()
+                    SET atlas_contact_id = %s, updated_at = NOW()
                     WHERE id = %s AND atlas_contact_id IS NULL
                     """,
-                    (atlas_contact_id, customer_type, customer_id),
+                    (atlas_contact_id, customer_id),
                 )
                 if cur.rowcount == 0:
                     # Someone linked this Customer while we were talking to
@@ -14315,31 +14353,25 @@ def _finalize_customer_atlas_reservation(
                             {"customerId": customer_id, "atlasContactId": linked},
                         )
                     # The winner linked the SAME contact, so this reservation
-                    # finalizes normally -- but its UPDATE matched nothing, and
-                    # the linkage-backfill endpoint that won sets only
-                    # atlas_contact_id. Without this the type Atlas just
-                    # reported is dropped on the floor and the customer keeps
-                    # 'unknown' purely because of who won a race.
-                    if customer_type is not None:
-                        cur.execute(
-                            """
-                            UPDATE customers
-                            SET customer_type = %s, updated_at = NOW()
-                            WHERE id = %s
-                            """,
-                            (customer_type, customer_id),
-                        )
+                    # can still finalize. Versioned type evidence is fanned out
+                    # below after the link has been established.
             else:
                 customer_id = _insert_customer(
                     cur,
                     payload,
                     atlas_contact_id=atlas_contact_id,
-                    customer_type=customer_type,
                 )
                 if payload.primarySite is not None:
                     _insert_site(
                         cur, customer_id, payload.name, payload.primarySite
                     )
+
+            if customer_type_evidence is not None:
+                _apply_customer_type_source_evidence(
+                    cur,
+                    atlas_contact_id,
+                    customer_type_evidence,
+                )
 
             cur.execute(
                 """
@@ -14450,12 +14482,20 @@ def _run_customer_atlas_reservation(
                 return finalized, None
         return None, exc
     try:
+        customer_type_evidence = None
+        if _customer_type_from_operator_result(atlas_result) is not None:
+            # The operator mutation proves identity, but known-contacts is the
+            # provider projection that carries the database-owned ordering
+            # token. Read it before the reservation finalizer takes its lock.
+            customer_type_evidence = _fetch_current_customer_type_evidence(
+                admin, atlas_contact_id
+            )
         return (
             _finalize_customer_atlas_reservation(
                 str(reservation["id"]),
                 atlas_contact_id,
                 payload,
-                _customer_type_from_operator_result(atlas_result),
+                customer_type_evidence,
             ),
             None,
         )
@@ -15488,12 +15528,12 @@ def admin_set_customer_type(
     request: Request,
     admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Any:
-    """Change a customer's type by asking Atlas, then mirroring what it says.
+    """Change a customer's type through Atlas, then mirror ordered evidence.
 
     admin_patch_customer refuses customer_type as system-managed, and keeps
     refusing it: Atlas is the sole write authority. This is the one door that
     changes it, and it changes it THERE -- the local row is only ever updated
-    from Atlas's response, never on the tracker's own say-so.
+    from Atlas's canonical projection, never on the tracker's own say-so.
     """
     requested = payload.customerType.strip().lower()
     if requested not in CUSTOMER_TYPES:
@@ -15611,6 +15651,12 @@ def _apply_customer_type_change(
             ),
         )
 
+    # The operator response proves that Atlas accepted this contact mutation.
+    # Read the provider projection once more for the database-owned revision
+    # that orders this local mirror write. This remains outside every local
+    # mutation lock.
+    source_evidence = _fetch_current_customer_type_evidence(admin, str(contact_id))
+
     # The target write and the duplicate fan-out are ONE transaction under a
     # per-contact lock. db.query_one/query_all each open and commit their own
     # transaction, so as separate statements two requests naming different
@@ -15620,32 +15666,11 @@ def _apply_customer_type_change(
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_type_mirror(cur, str(contact_id))
-            # Written unconditionally under the per-contact lock, which
-            # serializes concurrent changes to this contact so the last
-            # committer wins.
-            #
-            # This is deliberately eventually-consistent rather than strictly
-            # ordered. An earlier revision compared Atlas's own updated_at to
-            # pick the winner when two answers arrived out of order. It was
-            # removed: the harm it prevented was a transient wrong value that
-            # the ATLAS #2357 refresh reconciles on its next run, while the
-            # machinery itself produced a PERMANENT failure -- one malformed
-            # timestamp became a far-future token that no later version could
-            # beat, freezing the row at 409 forever -- and required reaching
-            # into the 0C finalizer, where it caused further defects.
-            #
-            # Preferring a transient, self-healing wrong value over a permanent
-            # stuck one is the whole trade. Concurrent type changes to one
-            # contact are rare here; a mirror that cannot be corrected is not.
-            #
-            # The contact-link compare stays: it is identity, not ordering.
-            # Atlas answered about the contact this row held, and if the row now
-            # points elsewhere the answer is about a different account.
             cur.execute(
-                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
+                "SELECT id FROM customers "
                 "WHERE id = %s AND atlas_contact_id IS NOT DISTINCT FROM %s "
-                "RETURNING id",
-                (confirmed, customer_id, contact_id),
+                "FOR UPDATE",
+                (customer_id, contact_id),
             )
             if cur.fetchone() is None:
                 raise HTTPException(
@@ -15656,35 +15681,23 @@ def _apply_customer_type_change(
                         "was not. Re-check it and try again."
                     ),
                 )
-            # One Atlas contact can be held by several customers -- the linkage
-            # audit reports exactly these duplicate groups, and there are live
-            # ones. They all mirror the SAME account, so leaving the siblings
-            # behind would have this route serve two different types for one
-            # Atlas contact. Fan out, as the #2357 refresh already does.
-            #
-            # These rows are copies of the value this request just confirmed
-            # rather than independent decisions, and the per-contact lock above
-            # means no other change to this contact is in the same window.
-            cur.execute(
-                "UPDATE customers SET customer_type = %s, updated_at = NOW() "
-                "WHERE atlas_contact_id = %s AND id <> %s "
-                "AND customer_type IS DISTINCT FROM %s "
-                "RETURNING id",
-                (confirmed, contact_id, customer_id, confirmed),
+            updated_ids = _apply_customer_type_source_evidence(
+                cur, str(contact_id), source_evidence
             )
-            siblings = cur.fetchall()
+            siblings = [value for value in updated_ids if value != customer_id]
     append_access_log(
         request,
         "CUSTOMER_TYPE_CHANGED",
         True,
         f"customer={customer_id} contact={contact_id} "
         f"from={existing['customer_type']} requested={requested} "
-        f"applied={confirmed} siblings={len(siblings)}",
+        f"confirmed={confirmed} applied={source_evidence.customer_type} "
+        f"sourceRevision={source_evidence.revision} siblings={len(siblings)}",
     )
     return {
         "success": True,
         "customerId": customer_id,
-        "customerType": confirmed,
+        "customerType": source_evidence.customer_type,
         # Surfaced rather than hidden: Atlas is the authority, so if it settled
         # on something other than what was asked, the caller must see that.
         "requestedCustomerType": requested,
@@ -17952,8 +17965,8 @@ _KNOWN_CONTACTS_BATCH = 100
 def _fetch_known_contacts(
     admin: Dict[str, Any],
     distinct_ids: List[str],
-) -> Tuple[set, Dict[str, str], Dict[str, Any], Dict[str, Any]]:
-    """Ask Atlas which of ``distinct_ids`` name a live EOM contact, and their type.
+) -> Tuple[set, Dict[str, str], Dict[str, int], Dict[str, Any], Dict[str, Any]]:
+    """Ask Atlas which ids resolve and return versioned type evidence.
 
     Shared by the read-only link audit and the customer_type mirror refresh so
     the response-shape hardening below is written once. A second copy of this
@@ -17963,25 +17976,23 @@ def _fetch_known_contacts(
 
     This answers TWO questions with TWO confidences, and they must not be
     conflated. "Which ids resolve" and "what type is each" can fail
-    independently: a malformed or incomplete customerTypes map says nothing
+    independently: a malformed or incomplete type-evidence pair says nothing
     about whether knownContactIds is trustworthy, and the link audit consumes
-    only the ids. Collapsing them into one status let a type-level problem
-    suppress dangling-link detection the audit had everything it needed for.
+    only the ids. Collapsing them into one status would suppress dangling-link
+    detection the audit has enough evidence to perform.
 
-    Returns ``(known, types, status, types_status)``:
+    Returns ``(known, types, revisions, status, type_evidence_status)``:
 
     - ``known`` -- ids Atlas resolved. An id absent from this set is dangling.
-    - ``types`` -- ``{contact_id: customer_type}``, containing ONLY ids Atlas
-      actually reported a type for. An id present in ``known`` but missing here
-      means Atlas is running a build older than ATLAS #2357, which does not
-      report the field at all. That is not "Atlas says unknown" and callers must
-      not treat it as a value; see _build_customer_type_refresh_plan.
+    - ``types`` and ``revisions`` -- parallel maps covering exactly the known
+      ids for every batch that publishes either field. A type is usable only
+      with its positive, database-owned revision.
     - ``status`` -- ID-level: ok / unconfigured / unavailable. Both consumers
       must respect it. Never report a clean result for a question that could
       not be asked.
-    - ``types_status`` -- TYPE-level: ok / unavailable, for a malformed,
-      incomplete, or deployment-straddling type map. Only the refresh respects
-      it; the audit ignores it because it never reads ``types``.
+    - ``type_evidence_status`` -- type-level: ok / unavailable, for malformed,
+      incomplete, or deployment-straddling type evidence. Only type mirrors
+      respect it; the audit ignores it because it never reads either map.
     """
     ok = {"status": "ok", "checked": len(distinct_ids), "error": None}
 
@@ -17989,26 +18000,24 @@ def _fetch_known_contacts(
         return {"status": "unavailable", "checked": 0, "error": error}
 
     if not distinct_ids:
-        return set(), {}, {"status": "ok", "checked": 0, "error": None}, ok
+        return set(), {}, {}, {"status": "ok", "checked": 0, "error": None}, ok
     if not (ATLAS_FUNNEL_BASE_URL and ATLAS_FUNNEL_SERVICE_TOKEN):
         unconfigured = {
             "status": "unconfigured",
             "checked": 0,
             "error": "Atlas funnel base URL or service token is not configured",
         }
-        return set(), {}, unconfigured, unconfigured
+        return set(), {}, {}, unconfigured, unconfigured
 
     known = set()
     types: Dict[str, str] = {}
-    # Version skew is a property of the whole fetch, not of one batch. Above 100
-    # distinct ids this loop issues several requests, which can straddle an
-    # Atlas deployment: an early batch omits customerTypes while a later one
-    # reports it. Judging each batch alone would accept the omission as skew and
-    # still apply the types the newer batches returned -- the partial refresh
-    # this route exists to refuse. Track presence across every batch instead.
-    batches_with_field = 0
+    revisions: Dict[str, int] = {}
+    # Version skew is a property of the whole fetch, not of one batch. Above
+    # 100 ids the requests can straddle an Atlas deployment, so evidence must
+    # be present as a complete pair in every batch or absent in every batch.
+    batches_with_evidence = 0
     batches_total = 0
-    types_fault: Optional[str] = None
+    type_evidence_fault: Optional[str] = None
     for start in range(0, len(distinct_ids), _KNOWN_CONTACTS_BATCH):
         batch = distinct_ids[start : start + _KNOWN_CONTACTS_BATCH]
         try:
@@ -18023,13 +18032,13 @@ def _fetch_known_contacts(
                 "checked": 0,
                 "error": (str(exc.detail) if exc.detail else f"HTTP {exc.status_code}"),
             }
-            return set(), {}, transport, transport
+            return set(), {}, {}, transport, transport
         known_ids = body.get("knownContactIds")
         checked = body.get("checked")
         # `batch` is what WE asked for and is the only trustworthy reference.
         # Validating the response against its own knownContactIds is circular:
         # a malformed batch B could name batch A's id in both knownContactIds
-        # and customerTypes, satisfy every self-consistency check, and retype
+        # and type evidence, satisfy every self-consistency check, and retype
         # customer A. It is also an ID-level fault, not merely a type one --
         # an unrequested id landing in `known` can MASK a dangling link, since
         # the audit reports an id as dangling only when it is absent from that
@@ -18057,74 +18066,219 @@ def _fetch_known_contacts(
                     "or named an id outside the requested batch"
                 ),
             }
-            return set(), {}, malformed_ids, malformed_ids
+            return set(), {}, {}, malformed_ids, malformed_ids
         for value in known_ids:
             known.add(str(value))
-        # Absent and malformed are DIFFERENT answers and must not collapse.
-        #
-        # Absent is the supported version-skew case: an Atlas older than
-        # ATLAS #2357 does not report the field, and the refresh must treat
-        # that as "no information" and leave the mirror alone.
-        #
-        # Present-but-malformed is an upstream schema error. Dropping it
-        # silently would look identical to version skew, so a broken Atlas
-        # build would yield a confident partial refresh -- some batches
-        # applied, the malformed ones quietly skipped -- with nothing
-        # recording which. Degrade the whole read instead.
         batches_total += 1
         batch_known = {str(value) for value in known_ids}
-        if "customerTypes" in body:
-            batches_with_field += 1
-            reported = body.get("customerTypes")
-            # A type-level fault must NOT stop the loop. Every remaining batch
-            # still has to be fetched or `known` ends up partial, and a partial
-            # `known` makes the link audit report ids as dangling that were
-            # simply never asked about. Record the fault and keep going.
-            if not isinstance(reported, dict) or any(
-                not isinstance(value, str) for value in reported.values()
-            ):
-                types_fault = (
-                    "Atlas known-contacts response reported a malformed "
-                    "customerTypes map"
-                )
-            elif {str(key) for key in reported} != batch_known:
-                # EQUALITY, not coverage. ATLAS #2358 builds customerTypes from
-                # exactly the ids it reports in knownContactIds, so anything
-                # else is a malformed response.
-                #
-                # Missing keys would be a truncated map read as version skew --
-                # skipping those contacts while applying the rest.
-                #
-                # EXTRA keys are worse. Matching them against the globally
-                # accumulated `known` instead of this batch's ids let a later
-                # response carry an entry for a contact resolved in an EARLIER
-                # batch, silently overwriting that contact's type -- so a
-                # malformed response for batch B could change a customer in
-                # batch A, and the apply route would persist it.
-                types_fault = (
-                    "Atlas reported customerTypes whose ids do not match the "
-                    "batch's knownContactIds"
-                )
-            else:
-                for key, value in reported.items():
-                    types[str(key)] = value
+        has_types = "customerTypes" in body
+        has_revisions = "customerTypeRevisions" in body
+        if has_types != has_revisions:
+            type_evidence_fault = (
+                "Atlas known-contacts response must report customerTypes and "
+                "customerTypeRevisions together"
+            )
+            continue
+        if not has_types:
+            continue
 
-    if types_fault is None and 0 < batches_with_field < batches_total:
-        # Some batches reported the field and some did not: the reads straddled
-        # an Atlas deployment, so neither "version skew" nor "fully reported"
-        # is true and any plan built from this evidence would be partial.
-        types_fault = (
-            "Atlas reported customerTypes for only some batches; the reads "
-            "straddled a deployment"
+        batches_with_evidence += 1
+        reported_types = body.get("customerTypes")
+        reported_revisions = body.get("customerTypeRevisions")
+        # A type-evidence fault must NOT stop the loop. Every remaining batch
+        # still has to be fetched or `known` ends up partial, and a partial
+        # `known` makes the link audit report ids as dangling that were simply
+        # never asked about. Record the fault and keep going.
+        if not isinstance(reported_types, dict) or any(
+            not isinstance(value, str) for value in reported_types.values()
+        ):
+            type_evidence_fault = (
+                "Atlas known-contacts response reported a malformed "
+                "customerTypes map"
+            )
+        elif not isinstance(reported_revisions, dict) or any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 1
+            or value > MAX_ATLAS_CUSTOMER_TYPE_REVISION
+            for value in reported_revisions.values()
+        ):
+            type_evidence_fault = (
+                "Atlas known-contacts response reported a malformed "
+                "customerTypeRevisions map"
+            )
+        elif {str(key) for key in reported_types} != batch_known:
+            type_evidence_fault = (
+                "Atlas reported customerTypes whose ids do not match the "
+                "batch's knownContactIds"
+            )
+        elif {str(key) for key in reported_revisions} != batch_known:
+            type_evidence_fault = (
+                "Atlas reported customerTypeRevisions whose ids do not match "
+                "the batch's knownContactIds"
+            )
+        else:
+            for key, value in reported_types.items():
+                types[str(key)] = value
+            for key, value in reported_revisions.items():
+                revisions[str(key)] = value
+
+    if type_evidence_fault is None and 0 < batches_with_evidence < batches_total:
+        type_evidence_fault = (
+            "Atlas reported customer type evidence for only some batches; the "
+            "reads straddled a deployment"
         )
 
-    if types_fault is not None:
+    if type_evidence_fault is not None:
         # The ids were validated independently and every batch was still
         # fetched, so `known` is complete and the link audit keeps working.
         # Only the type evidence is withheld.
-        return known, {}, ok, _types_broken(types_fault)
+        return known, {}, {}, ok, _types_broken(type_evidence_fault)
 
-    return known, types, ok, ok
+    return known, types, revisions, ok, ok
+
+
+def _fetch_current_customer_type_evidence(
+    admin: Dict[str, Any], contact_id: str
+) -> CustomerTypeSourceEvidence:
+    """Read one current, versioned Atlas type without holding a local lock."""
+    known, types, revisions, status, type_evidence_status = _fetch_known_contacts(
+        admin, [contact_id]
+    )
+    if status["status"] != "ok":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Cannot read current Atlas customer type: "
+                f"{status['status']} ({status['error']})"
+            ),
+        )
+    if type_evidence_status["status"] != "ok":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Cannot read current Atlas customer type revision: "
+                f"{type_evidence_status['error']}"
+            ),
+        )
+    if contact_id not in known:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Atlas did not resolve the contact it just confirmed; "
+                "nothing was changed locally."
+            ),
+        )
+    if contact_id not in types or contact_id not in revisions:
+        # Older providers may omit both maps. That is not a value, and storing
+        # a type without the ordering token would reopen this race.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Atlas did not provide versioned customer-type evidence; "
+                "nothing was changed locally."
+            ),
+        )
+    reported_type = types[contact_id]
+    if reported_type not in CUSTOMER_TYPES:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Atlas reported an unsupported customer_type {reported_type!r} "
+                f"for contact {contact_id}"
+            ),
+        )
+    return CustomerTypeSourceEvidence(
+        customer_type=reported_type,
+        revision=revisions[contact_id],
+    )
+
+
+def _apply_customer_type_source_evidence(
+    cur: Any,
+    atlas_contact_id: str,
+    evidence: CustomerTypeSourceEvidence,
+) -> List[int]:
+    """Mirror one ordered Atlas value to every local copy of its contact.
+
+    Callers hold the per-contact advisory lock. The row locks and the final
+    revision predicate are both intentional: the former makes the existing
+    copies a coherent group, while the latter keeps a concurrently introduced
+    newer watermark from being overwritten before the transaction commits.
+    """
+    cur.execute(
+        """
+        SELECT id, customer_type_source_revision
+        FROM customers
+        WHERE atlas_contact_id = %s
+        FOR UPDATE
+        """,
+        (atlas_contact_id,),
+    )
+    current_rows = [dict(row) for row in cur.fetchall()]
+    newer = [
+        int(row["id"])
+        for row in current_rows
+        if row["customer_type_source_revision"] is not None
+        and int(row["customer_type_source_revision"]) > evidence.revision
+    ]
+    if newer:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Atlas customer-type evidence is older than the local source "
+                f"revision for customer(s) {sorted(newer)}; nothing was changed "
+                "locally. Re-check Atlas and try again."
+            ),
+        )
+
+    cur.execute(
+        """
+        UPDATE customers
+        SET customer_type = %s,
+            customer_type_source_revision = %s,
+            updated_at = NOW()
+        WHERE atlas_contact_id = %s
+          AND COALESCE(customer_type_source_revision, 0) <= %s
+          AND (
+              customer_type IS DISTINCT FROM %s
+              OR customer_type_source_revision IS DISTINCT FROM %s
+          )
+        RETURNING id
+        """,
+        (
+            evidence.customer_type,
+            evidence.revision,
+            atlas_contact_id,
+            evidence.revision,
+            evidence.customer_type,
+            evidence.revision,
+        ),
+    )
+    updated_ids = sorted(int(row["id"]) for row in cur.fetchall())
+
+    # A row linked after the FOR UPDATE scan can only make this transaction
+    # unsafe if it already carries newer source evidence. Detect that case and
+    # let the transaction roll back the partial fan-out above.
+    cur.execute(
+        """
+        SELECT id
+        FROM customers
+        WHERE atlas_contact_id = %s
+          AND COALESCE(customer_type_source_revision, 0) > %s
+        """,
+        (atlas_contact_id, evidence.revision),
+    )
+    newer_after_scan = sorted(int(row["id"]) for row in cur.fetchall())
+    if newer_after_scan:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Atlas customer-type evidence lost a local source-order race "
+                f"for customer(s) {newer_after_scan}; nothing was changed locally."
+            ),
+        )
+    return updated_ids
 
 
 def _verify_atlas_contact_links(
@@ -18157,7 +18311,9 @@ def _verify_atlas_contact_links(
     # malformed or straddled customerTypes map says nothing about whether
     # knownContactIds is trustworthy, and suppressing dangling-link detection
     # over it would withhold a verdict every batch supplied the data for.
-    known, _types, status, _types_status = _fetch_known_contacts(admin, distinct_ids)
+    known, _types, _revisions, status, _type_evidence_status = _fetch_known_contacts(
+        admin, distinct_ids
+    )
     if status["status"] != "ok":
         return [], status
     if not distinct_ids:
@@ -18548,12 +18704,13 @@ def _build_customer_type_refresh_plan(
     only copies, and only when Atlas actually stated a value.
     """
     linked_rows = _read_linked_customers(cursor=cursor, lock_rows=lock_rows)
-    known, types, status, types_status = _fetch_known_contacts(
+    known, types, revisions, status, type_evidence_status = _fetch_known_contacts(
         admin, _distinct_contact_ids(linked_rows)
     )
-    # The refresh reads types, so unlike the audit it must respect BOTH.
-    if status["status"] == "ok" and types_status["status"] != "ok":
-        status = types_status
+    # The refresh reads ordered type evidence, so unlike the audit it must
+    # respect both the id verdict and the type/revision verdict.
+    if status["status"] == "ok" and type_evidence_status["status"] != "ok":
+        status = type_evidence_status
     if status["status"] != "ok":
         # Refuse the whole plan rather than refreshing the subset we happened to
         # reach: a partial refresh is indistinguishable from a complete one once
@@ -18565,7 +18722,7 @@ def _build_customer_type_refresh_plan(
                 f"{status['status']} ({status['error']})"
             ),
         )
-    return _compute_customer_type_refresh_plan(linked_rows, known, types)
+    return _compute_customer_type_refresh_plan(linked_rows, known, types, revisions)
 
 
 def _read_linked_customers(
@@ -18574,7 +18731,8 @@ def _read_linked_customers(
     lock_rows: bool = False,
 ) -> List[Dict[str, Any]]:
     sql = (
-        "SELECT id, name, atlas_contact_id, customer_type FROM customers "
+        "SELECT id, name, atlas_contact_id, customer_type, "
+        "customer_type_source_revision FROM customers "
         "WHERE atlas_contact_id IS NOT NULL ORDER BY id"
     )
     if cursor is not None:
@@ -18594,6 +18752,7 @@ def _compute_customer_type_refresh_plan(
     linked_rows: List[Dict[str, Any]],
     known: set,
     types: Dict[str, str],
+    revisions: Dict[str, int],
 ) -> Dict[str, Any]:
     """Derive the plan from already-fetched evidence. Pure: no I/O, no lock.
 
@@ -18616,14 +18775,14 @@ def _compute_customer_type_refresh_plan(
             # classification, so the mirrored type is left exactly as it is.
             skipped_dangling += len(by_contact[contact_id])
             continue
-        if contact_id not in types:
-            # Atlas resolved the id but reported no type for it, which means it
-            # predates ATLAS #2357. Absent is NOT "unknown": treating it as a
-            # value would blank every mirrored type the first time this runs
-            # against an Atlas that has not been deployed yet.
+        if contact_id not in types or contact_id not in revisions:
+            # Atlas resolved the id but did not report complete versioned type
+            # evidence. Absent is NOT "unknown": treating it as a value would
+            # both blank a mirror and reopen the ordering race.
             skipped_unreported += len(by_contact[contact_id])
             continue
         reported = types[contact_id]
+        reported_revision = revisions[contact_id]
         if reported not in CUSTOMER_TYPES:
             # Refuse a value the local CHECK constraint would reject anyway,
             # rather than letting the UPDATE fail mid-batch.
@@ -18636,7 +18795,24 @@ def _compute_customer_type_refresh_plan(
             )
         for row in by_contact[contact_id]:
             current = row["customer_type"]
-            if current == reported:
+            current_revision = row.get("customer_type_source_revision")
+            if (
+                current_revision is not None
+                and int(current_revision) > reported_revision
+            ):
+                # The fetched response is older than evidence a different
+                # tracker writer already stored. It cannot safely take part in
+                # either preview or apply, even if the type text happens to
+                # match again after a later source transition.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Atlas customer-type evidence is older than the local "
+                        f"source revision for customer {int(row['id'])}; "
+                        "preview again."
+                    ),
+                )
+            if current == reported and current_revision == reported_revision:
                 continue
             changes.append(
                 {
@@ -18645,13 +18821,27 @@ def _compute_customer_type_refresh_plan(
                     "atlasContactId": contact_id,
                     "from": current,
                     "to": reported,
+                    "_fromSourceRevision": current_revision,
+                    "_sourceRevision": reported_revision,
                 }
             )
 
     changes.sort(key=lambda item: item["customerId"])
+    snapshot_changes = [
+        {
+            "customerId": row["customerId"],
+            "customerName": row["customerName"],
+            "atlasContactId": row["atlasContactId"],
+            "from": row["from"],
+            "to": row["to"],
+            "fromSourceRevision": row["_fromSourceRevision"],
+            "sourceRevision": row["_sourceRevision"],
+        }
+        for row in changes
+    ]
     snapshot = {
         "reason": None,
-        "changes": changes,
+        "changes": snapshot_changes,
         "linkedCustomers": len(linked_rows),
     }
     token_material = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
@@ -18673,7 +18863,20 @@ def _compute_customer_type_refresh_plan(
             "skippedDanglingLinks": skipped_dangling,
             "skippedTypeNotReported": skipped_unreported,
         },
-        "changes": changes,
+        # Source revisions stay in the private snapshot/token and local write
+        # guard. The portal's established plan-item response shape remains the
+        # same while the durable record preserves the exact source evidence.
+        "changes": [
+            {
+                "customerId": row["customerId"],
+                "customerName": row["customerName"],
+                "atlasContactId": row["atlasContactId"],
+                "from": row["from"],
+                "to": row["to"],
+            }
+            for row in changes
+        ],
+        "_applyChanges": changes,
         "_archiveSnapshot": snapshot,
     }
 
@@ -18813,6 +19016,7 @@ def admin_customer_type_refresh_preview(
 ) -> Dict[str, Any]:
     result = _build_customer_type_refresh_plan(admin)
     result.pop("_archiveSnapshot", None)
+    result.pop("_applyChanges", None)
     append_access_log(
         request,
         "CUSTOMER_TYPE_REFRESH_PLAN",
@@ -18836,11 +19040,11 @@ def admin_apply_customer_type_refresh(
     # ordinary customer edit queues behind it.
     unlocked_rows = _read_linked_customers()
     asked_ids = _distinct_contact_ids(unlocked_rows)
-    known, types, status, types_status = _fetch_known_contacts(
+    known, types, revisions, status, type_evidence_status = _fetch_known_contacts(
         current_admin, asked_ids
     )
-    if status["status"] == "ok" and types_status["status"] != "ok":
-        status = types_status
+    if status["status"] == "ok" and type_evidence_status["status"] != "ok":
+        status = type_evidence_status
     if status["status"] != "ok":
         raise HTTPException(
             status_code=503,
@@ -18868,8 +19072,10 @@ def admin_apply_customer_type_refresh(
                         "Linked customers changed while planning; preview again"
                     ),
                 )
-            plan = _compute_customer_type_refresh_plan(locked_rows, known, types)
-            if not plan["changes"]:
+            plan = _compute_customer_type_refresh_plan(
+                locked_rows, known, types, revisions
+            )
+            if not plan["_applyChanges"]:
                 # Nothing to do. Returning early also avoids writing a batch row
                 # whose plan_token -- derived from an empty change list and the
                 # linked count -- would collide with the previous no-op apply on
@@ -18920,18 +19126,30 @@ def admin_apply_customer_type_refresh(
             batch_id = int(cur.fetchone()["id"])
 
             updated_ids = []
-            for row in plan["changes"]:
+            for row in plan["_applyChanges"]:
                 # Guarded on the value the plan was built from, so a row that
                 # moved between planning and writing fails loudly instead of
                 # being silently overwritten.
                 cur.execute(
                     """
                     UPDATE customers
-                    SET customer_type = %s, updated_at = NOW()
-                    WHERE id = %s AND customer_type IS NOT DISTINCT FROM %s
+                    SET customer_type = %s,
+                        customer_type_source_revision = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                      AND customer_type IS NOT DISTINCT FROM %s
+                      AND customer_type_source_revision IS NOT DISTINCT FROM %s
+                      AND COALESCE(customer_type_source_revision, 0) <= %s
                     RETURNING id
                     """,
-                    (row["to"], row["customerId"], row["from"]),
+                    (
+                        row["to"],
+                        row["_sourceRevision"],
+                        row["customerId"],
+                        row["from"],
+                        row["_fromSourceRevision"],
+                        row["_sourceRevision"],
+                    ),
                 )
                 updated = cur.fetchone()
                 if not updated:

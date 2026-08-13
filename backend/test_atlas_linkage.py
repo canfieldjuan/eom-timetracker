@@ -799,13 +799,20 @@ TYPE_APPLY_PATH = "/api/admin/corrections/customer-type/apply"
 TYPE_REASON = "Refresh mirrored customer types from Atlas after backfill"
 
 
-def _atlas_types(types_by_id, *, omit_ids=(), include_field=True):
-    """A requests.get replacement returning known-contacts with customerTypes.
+def _atlas_types(
+    types_by_id,
+    *,
+    revisions_by_id=None,
+    omit_ids=(),
+    include_field=True,
+):
+    """A requests.get replacement returning ordered known-contact evidence.
 
     include_field=False models an Atlas that predates ATLAS #2357 and does not
     report the field at all -- the deployed state at the time this was written.
     """
     omit = {str(value) for value in omit_ids}
+    revisions_by_id = revisions_by_id or {}
 
     def _get(url, *, headers=None, params=None, timeout=None):
         if "/known-contacts" in str(url):
@@ -813,8 +820,11 @@ def _atlas_types(types_by_id, *, omit_ids=(), include_field=True):
             known = [v for v in submitted if v not in omit]
             body = {"knownContactIds": known, "checked": len(submitted), "limit": 100}
             if include_field:
-                body["customerTypes"] = {
-                    k: v for k, v in types_by_id.items() if k in known
+                reported_types = {k: v for k, v in types_by_id.items() if k in known}
+                body["customerTypes"] = reported_types
+                body["customerTypeRevisions"] = {
+                    key: revisions_by_id.get(key, index + 1)
+                    for index, key in enumerate(reported_types)
                 }
             return _Resp(200, body)
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
@@ -823,15 +833,31 @@ def _atlas_types(types_by_id, *, omit_ids=(), include_field=True):
     return _get
 
 
-def _set_type(customer_id: int, value) -> None:
-    db.execute("UPDATE customers SET customer_type = %s WHERE id = %s",
-               (value, customer_id))
+def _set_type(customer_id: int, value, *, source_revision=None) -> None:
+    if source_revision is None:
+        db.execute(
+            "UPDATE customers SET customer_type = %s WHERE id = %s",
+            (value, customer_id),
+        )
+        return
+    db.execute(
+        "UPDATE customers SET customer_type = %s, "
+        "customer_type_source_revision = %s WHERE id = %s",
+        (value, source_revision, customer_id),
+    )
 
 
 def _get_type(customer_id: int):
     return db.query_one(
         "SELECT customer_type FROM customers WHERE id = %s", (customer_id,)
     )["customer_type"]
+
+
+def _get_source_revision(customer_id: int):
+    return db.query_one(
+        "SELECT customer_type_source_revision FROM customers WHERE id = %s",
+        (customer_id,),
+    )["customer_type_source_revision"]
 
 
 def test_refresh_applies_the_type_atlas_reports(client, auth, monkeypatch):
@@ -859,6 +885,13 @@ def test_refresh_applies_the_type_atlas_reports(client, auth, monkeypatch):
     assert applied.status_code == 200, applied.text
     assert customer in applied.json()["updatedCustomerIds"]
     assert _get_type(customer) == "commercial"
+    assert _get_source_revision(customer) == 1
+    batch = db.query_one(
+        "SELECT snapshot FROM customer_type_refresh_batches "
+        "WHERE snapshot::text LIKE %s ORDER BY id DESC LIMIT 1",
+        (f"%{TEST_PREFIX}%",),
+    )
+    assert batch["snapshot"]["changes"][0]["sourceRevision"] == 1
 
 
 def test_an_atlas_without_the_field_never_blanks_the_mirror(client, auth, monkeypatch):
@@ -948,6 +981,85 @@ def test_refresh_rejects_a_type_atlas_should_never_send(client, auth, monkeypatc
     assert resp.status_code == 502, resp.text
 
 
+def test_revision_evidence_fault_refuses_refresh_without_suppressing_link_audit(
+    client, auth, monkeypatch
+):
+    """Type ordering evidence is stricter than the id-only link verdict."""
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Revision Evidence Fault", contact)
+    _set_type(customer, "unknown")
+
+    def _missing_revision(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(value) for value in (params or {}).get("contact_id") or []]
+            return _Resp(
+                200,
+                {
+                    "knownContactIds": submitted,
+                    "customerTypes": {value: "commercial" for value in submitted},
+                    "checked": len(submitted),
+                    "limit": 100,
+                },
+            )
+        return _Resp(
+            200,
+            {
+                "leads": [],
+                "cursor": None,
+                "hasMore": False,
+                "nextCursor": None,
+                "capabilities": [],
+            },
+        )
+
+    monkeypatch.setattr(api.requests, "get", _missing_revision)
+    assert (
+        client.post(
+            TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON}
+        ).status_code
+        == 503
+    )
+    audit = client.get(AUDIT_PATH, headers=auth)
+    assert audit.status_code == 200, audit.text
+    assert audit.json()["atlasLinkVerification"]["status"] == "ok"
+    assert _get_type(customer) == "unknown"
+
+    def _nonpositive_revision(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(value) for value in (params or {}).get("contact_id") or []]
+            return _Resp(
+                200,
+                {
+                    "knownContactIds": submitted,
+                    "customerTypes": {value: "commercial" for value in submitted},
+                    "customerTypeRevisions": {value: 0 for value in submitted},
+                    "checked": len(submitted),
+                    "limit": 100,
+                },
+            )
+        return _Resp(
+            200,
+            {
+                "leads": [],
+                "cursor": None,
+                "hasMore": False,
+                "nextCursor": None,
+                "capabilities": [],
+            },
+        )
+
+    monkeypatch.setattr(api.requests, "get", _nonpositive_revision)
+    assert (
+        client.post(
+            TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON}
+        ).status_code
+        == 503
+    )
+    assert _get_type(customer) == "unknown"
+
+
 def test_apply_refuses_a_stale_plan(client, auth, monkeypatch):
     import time_tracker_api as api
 
@@ -967,6 +1079,89 @@ def test_apply_refuses_a_stale_plan(client, auth, monkeypatch):
     })
     assert resp.status_code == 409, resp.text
     assert _get_type(customer) == "unknown", "a stale plan must write nothing"
+
+
+def test_apply_rejects_older_source_evidence_after_a_newer_mirror_write(
+    client, auth, monkeypatch
+):
+    """The #167 interleaving must leave the later local watermark intact.
+
+    The refresh obtains Atlas revision 1, then another tracker writer records
+    revision 2 before the refresh acquires its global lock. The old code only
+    compared `customer_type`, so it could write revision 1's value back over
+    the newer mirror when the text happened to match its planned `from` value.
+    """
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Source Fence", contact)
+    calls = 0
+
+    def _get(url, *, headers=None, params=None, timeout=None):
+        nonlocal calls
+        if "/known-contacts" in str(url):
+            calls += 1
+            if calls == 2:
+                # This runs after apply captured r1 but before it takes the
+                # customer/site lock, matching the failing interleaving.
+                with db.get_conn() as conn:
+                    with conn.cursor(
+                        cursor_factory=api.psycopg2.extras.RealDictCursor
+                    ) as cur:
+                        api._lock_customer_type_mirror(cur, contact)
+                        api._apply_customer_type_source_evidence(
+                            cur,
+                            contact,
+                            api.CustomerTypeSourceEvidence("residential", 2),
+                        )
+            submitted = [str(value) for value in (params or {}).get("contact_id") or []]
+            return _Resp(
+                200,
+                {
+                    "knownContactIds": submitted,
+                    "customerTypes": {value: "commercial" for value in submitted},
+                    "customerTypeRevisions": {value: 1 for value in submitted},
+                    "checked": len(submitted),
+                    "limit": 100,
+                },
+            )
+        return _Resp(
+            200,
+            {
+                "leads": [],
+                "cursor": None,
+                "hasMore": False,
+                "nextCursor": None,
+                "capabilities": [],
+            },
+        )
+
+    monkeypatch.setattr(api.requests, "get", _get)
+    preview = client.post(TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON})
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+
+    applied = client.post(
+        TYPE_APPLY_PATH,
+        headers=auth,
+        json={
+            "reason": TYPE_REASON,
+            "planToken": body["planToken"],
+            "confirmation": body["confirmationPhrase"],
+        },
+    )
+    assert applied.status_code == 409, applied.text
+    assert calls == 2
+    assert _get_type(customer) == "residential"
+    assert _get_source_revision(customer) == 2
+    assert (
+        db.query_one(
+            "SELECT COUNT(*) AS n FROM customer_type_refresh_batches "
+            "WHERE snapshot::text LIKE %s",
+            (f"%{TEST_PREFIX}%",),
+        )["n"]
+        == 0
+    )
 
 
 def test_refresh_requires_admin(client, auth, emp_auth):
@@ -1010,7 +1205,7 @@ def test_applying_an_empty_plan_is_refused_not_collided(client, auth, monkeypatc
 
     contact = str(uuid.uuid4())
     customer = _create_customer("Nothing To Do", contact)
-    _set_type(customer, "commercial")
+    _set_type(customer, "commercial", source_revision=1)
     monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
 
     body = client.post(TYPE_PREVIEW_PATH, headers=auth,
@@ -1068,6 +1263,7 @@ def test_a_malformed_type_map_is_refused_not_read_as_version_skew(
                 "checked": len(submitted),
                 "limit": 100,
                 "customerTypes": ["not", "a", "map"],
+                "customerTypeRevisions": {value: 1 for value in submitted},
             })
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
@@ -1084,6 +1280,7 @@ def test_a_malformed_type_map_is_refused_not_read_as_version_skew(
                 "checked": len(submitted),
                 "limit": 100,
                 "customerTypes": {submitted[0]: 17} if submitted else {},
+                "customerTypeRevisions": {value: 1 for value in submitted},
             })
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
@@ -1114,11 +1311,13 @@ def test_a_malformed_type_map_does_not_suppress_the_link_audit(
             submitted = [str(v) for v in (params or {}).get("contact_id") or []]
             # Ids are well-formed and this one resolves to nothing; only the
             # type map is broken.
+            resolved = [v for v in submitted if v != dead]
             return _Resp(200, {
-                "knownContactIds": [v for v in submitted if v != dead],
+                "knownContactIds": resolved,
                 "checked": len(submitted),
                 "limit": 100,
                 "customerTypes": "nonsense",
+                "customerTypeRevisions": {value: 1 for value in resolved},
             })
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
@@ -1203,12 +1402,11 @@ def _refresh_once(client, auth, expect=200):
 
 
 def test_a_repeated_transition_can_be_applied_again(client, auth, monkeypatch):
-    """The same diff legitimately recurs and must not collide on plan_token.
+    """Repeated values remain valid when Atlas advances source evidence.
 
-    commercial -> residential -> commercial -> residential produces an
-    identical snapshot (and therefore an identical token) on the first and
-    third refresh. The empty-plan guard does not cover this: the plan here is
-    non-empty. The batch id is the identity; the token is not unique.
+    The revision is intentionally part of the snapshot, so each source change
+    has distinct evidence even when the same value recurs. The batch id remains
+    the durable identity and all three ordered transitions must apply.
     """
     import time_tracker_api as api
 
@@ -1216,16 +1414,27 @@ def test_a_repeated_transition_can_be_applied_again(client, auth, monkeypatch):
     customer = _create_customer("Flip Flop", contact)
     _set_type(customer, "commercial")
 
-    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "residential"}))
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        _atlas_types({contact: "residential"}, revisions_by_id={contact: 1}),
+    )
     _refresh_once(client, auth)
     assert _get_type(customer) == "residential"
 
-    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        _atlas_types({contact: "commercial"}, revisions_by_id={contact: 2}),
+    )
     _refresh_once(client, auth)
     assert _get_type(customer) == "commercial"
 
-    # Third refresh reproduces the first plan exactly.
-    monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "residential"}))
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        _atlas_types({contact: "residential"}, revisions_by_id={contact: 3}),
+    )
     _refresh_once(client, auth)
     assert _get_type(customer) == "residential"
 
@@ -1266,6 +1475,7 @@ def test_batches_straddling_an_atlas_deploy_are_refused(client, auth, monkeypatc
             # Only the second request comes from the upgraded Atlas.
             if len(seen) > 1:
                 body["customerTypes"] = {v: "residential" for v in submitted}
+                body["customerTypeRevisions"] = {v: 1 for v in submitted}
             return _Resp(200, body)
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
@@ -1329,6 +1539,7 @@ def test_a_truncated_type_map_is_refused_not_read_as_skew(client, auth, monkeypa
                 "limit": 100,
                 # Reports a type for only one of the two known ids.
                 "customerTypes": {covered: "residential"},
+                "customerTypeRevisions": {covered: 1},
             })
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
@@ -1368,6 +1579,7 @@ def test_a_deployment_straddle_still_lets_the_audit_report_dangling_links(
                     "limit": 100}
             if len(seen) > 1:
                 body["customerTypes"] = {v: "residential" for v in resolved}
+                body["customerTypeRevisions"] = {v: 1 for v in resolved}
             return _Resp(200, body)
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
@@ -1406,6 +1618,7 @@ def test_a_type_fault_never_truncates_the_known_id_set(client, auth, monkeypatch
                 "checked": len(submitted),
                 "limit": 100,
                 "customerTypes": {v: 99 for v in submitted},
+                "customerTypeRevisions": {v: 1 for v in submitted},
             })
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
@@ -1455,7 +1668,8 @@ def test_a_later_batch_cannot_retype_an_earlier_batchs_contact(
                 types[first] = "residential"
             return _Resp(200, {"knownContactIds": submitted,
                                "checked": len(submitted), "limit": 100,
-                               "customerTypes": types})
+                               "customerTypes": types,
+                               "customerTypeRevisions": {v: 1 for v in types}})
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
 
@@ -1488,7 +1702,8 @@ def test_the_audit_survives_a_cross_batch_key_bleed(client, auth, monkeypatch):
             types[first] = "residential"  # may not belong to this batch
             return _Resp(200, {"knownContactIds": resolved,
                                "checked": len(submitted), "limit": 100,
-                               "customerTypes": types})
+                               "customerTypes": types,
+                               "customerTypeRevisions": {v: 1 for v in types}})
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
 
@@ -1517,6 +1732,7 @@ def _claims_foreign_id(foreign_id, resolve=True, with_types=True):
                     "limit": 100}
             if with_types:
                 body["customerTypes"] = {v: "residential" for v in resolved}
+                body["customerTypeRevisions"] = {v: 1 for v in resolved}
             return _Resp(200, body)
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
@@ -1622,7 +1838,8 @@ def test_a_response_reporting_more_checked_than_we_sent_is_rejected(
             return _Resp(200, {"knownContactIds": submitted,
                                "checked": len(submitted) + 7,
                                "limit": 100,
-                               "customerTypes": {v: "residential" for v in submitted}})
+                               "customerTypes": {v: "residential" for v in submitted},
+                               "customerTypeRevisions": {v: 1 for v in submitted}})
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False,
                            "nextCursor": None, "capabilities": []})
 

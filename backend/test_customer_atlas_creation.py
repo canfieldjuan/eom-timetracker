@@ -1057,7 +1057,7 @@ def test_key_reuse_on_a_pending_reservation_is_refused_under_rollback(
 
 
 def _atlas_reporting(monkeypatch, contact: dict) -> None:
-    """Point the Atlas operator stub at a specific contact payload."""
+    """Point the Atlas operator stub at one versioned source contact payload."""
     from conftest import _FakeAtlasResponse  # type: ignore[attr-defined]
 
     def _post(url, *, headers=None, json=None, timeout=None):
@@ -1075,6 +1075,28 @@ def _atlas_reporting(monkeypatch, contact: dict) -> None:
         )
 
     monkeypatch.setattr(api.requests, "post", _post)
+    reported_type = contact.get("customerType")
+    if reported_type in api.CUSTOMER_TYPES:
+        default_get = api.requests.get
+
+        def _get(url, *, headers=None, params=None, timeout=None):
+            if "/known-contacts" in str(url):
+                submitted = [
+                    str(value) for value in (params or {}).get("contact_id") or []
+                ]
+                return _FakeAtlasResponse(
+                    200,
+                    {
+                        "knownContactIds": submitted,
+                        "customerTypes": {value: reported_type for value in submitted},
+                        "customerTypeRevisions": {value: 1 for value in submitted},
+                        "checked": len(submitted),
+                        "limit": 100,
+                    },
+                )
+            return default_get(url, headers=headers, params=params, timeout=timeout)
+
+        monkeypatch.setattr(api.requests, "get", _get)
 
 
 def _stored_type(name: str) -> str:
@@ -1082,6 +1104,14 @@ def _stored_type(name: str) -> str:
         "SELECT customer_type FROM customers WHERE name = %s", (name,)
     )
     return row["customer_type"]
+
+
+def _stored_source_revision(name: str):
+    row = db.query_one(
+        "SELECT customer_type_source_revision FROM customers WHERE name = %s",
+        (name,),
+    )
+    return row["customer_type_source_revision"]
 
 
 def test_the_mirror_records_the_type_atlas_reported(client, auth, monkeypatch):
@@ -1097,6 +1127,7 @@ def test_the_mirror_records_the_type_atlas_reported(client, auth, monkeypatch):
 
     assert response.status_code == 201, response.text
     assert _stored_type(name) == "commercial"
+    assert _stored_source_revision(name) == 1
     assert response.json()["customer"]["customerType"] == "commercial"
 
 
@@ -1267,6 +1298,24 @@ def test_a_concurrent_link_to_the_same_contact_still_mirrors_the_type(
         )
 
     monkeypatch.setattr(api.requests, "post", _post_then_link)
+    default_get = api.requests.get
+
+    def _get_versioned_source(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(value) for value in (params or {}).get("contact_id") or []]
+            return _FakeAtlasResponse(
+                200,
+                {
+                    "knownContactIds": submitted,
+                    "customerTypes": {value: "commercial" for value in submitted},
+                    "customerTypeRevisions": {value: 1 for value in submitted},
+                    "checked": len(submitted),
+                    "limit": 100,
+                },
+            )
+        return default_get(url, headers=headers, params=params, timeout=timeout)
+
+    monkeypatch.setattr(api.requests, "get", _get_versioned_source)
 
     response = client.post(
         f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth
@@ -1276,6 +1325,30 @@ def test_a_concurrent_link_to_the_same_contact_still_mirrors_the_type(
     assert _stored_type(name) == "commercial", (
         "the reported type must survive losing the link race"
     )
+    assert _stored_source_revision(name) == 1
+
+
+def test_customer_type_source_revision_is_nullable_positive_bigint():
+    """The local source-order watermark preserves legacy rows safely."""
+    column = db.query_one(
+        """
+        SELECT data_type, is_nullable
+        FROM information_schema.columns
+        WHERE table_name = 'customers'
+          AND column_name = 'customer_type_source_revision'
+        """
+    )
+    assert column == {"data_type": "bigint", "is_nullable": "YES"}
+    constraint = db.query_one(
+        """
+        SELECT pg_get_constraintdef(oid) AS definition
+        FROM pg_constraint
+        WHERE conname = 'chk_customers_customer_type_source_revision'
+          AND conrelid = 'customers'::regclass
+        """
+    )
+    assert constraint is not None
+    assert "customer_type_source_revision > 0" in constraint["definition"]
 
 
 def test_the_check_constraint_is_generated_from_the_tuple():

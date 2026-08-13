@@ -3,10 +3,10 @@
 The guarantee is negative as much as positive. Atlas is the sole write
 authority for customer_type; admin_patch_customer refuses it and keeps
 refusing it. This route is the one door, and it writes the local mirror ONLY
-from what Atlas echoes back -- never from what the operator asked for. Several
-tests below assert the local value did not move, because a test that only
-checked the happy path would pass against exactly the bug this exists to
-prevent: the tracker asserting a classification on its own authority.
+from Atlas evidence -- never from what the operator asked for. Several tests
+below assert the local value did not move, because a test that only checked the
+happy path would pass against exactly the bug this exists to prevent: the
+tracker asserting a classification on its own authority.
 """
 
 from __future__ import annotations
@@ -42,6 +42,43 @@ class _Response:
         return self._body
 
 
+_ATLAS_TYPE_EVIDENCE: dict[str, tuple[str, int]] = {}
+
+
+@pytest.fixture(autouse=True)
+def versioned_known_contact_source(stub_atlas_funnel, monkeypatch):
+    """Make the post-mutation canonical read track the fake operator result."""
+    _ATLAS_TYPE_EVIDENCE.clear()
+    default_get = api.requests.get
+
+    def _get(url, *, headers=None, params=None, timeout=None):
+        if "/known-contacts" in str(url):
+            submitted = [str(value) for value in (params or {}).get("contact_id") or []]
+            types = {
+                value: _ATLAS_TYPE_EVIDENCE.get(value, ("unknown", 1))[0]
+                for value in submitted
+            }
+            revisions = {
+                value: _ATLAS_TYPE_EVIDENCE.get(value, ("unknown", 1))[1]
+                for value in submitted
+            }
+            return _Response(
+                200,
+                {
+                    "knownContactIds": submitted,
+                    "customerTypes": types,
+                    "customerTypeRevisions": revisions,
+                    "checked": len(submitted),
+                    "limit": 100,
+                },
+            )
+        return default_get(url, headers=headers, params=params, timeout=timeout)
+
+    monkeypatch.setattr(api.requests, "get", _get)
+    yield
+    _ATLAS_TYPE_EVIDENCE.clear()
+
+
 def _customer(suffix, contact_id=None, customer_type="unknown"):
     new_id = db.execute_returning(
         "INSERT INTO customers (name, active, atlas_contact_id, customer_type) "
@@ -57,6 +94,13 @@ def _type_of(customer_id):
     )["customer_type"]
 
 
+def _source_revision_of(customer_id):
+    return db.query_one(
+        "SELECT customer_type_source_revision FROM customers WHERE id = %s",
+        (customer_id,),
+    )["customer_type_source_revision"]
+
+
 def _path(customer_id):
     return f"/api/admin/customers/{customer_id}/customer-type"
 
@@ -67,10 +111,17 @@ def _atlas_echoing(value, *, calls=None, status=200):
     def _post(url, *, headers=None, json=None, timeout=None):
         if calls is not None:
             calls.append({"url": url, "headers": headers or {}, "json": json or {}})
+        contact_id = str((json or {}).get("contact_id") or "")
+        if value in api.CUSTOMER_TYPES and contact_id:
+            previous = _ATLAS_TYPE_EVIDENCE.get(contact_id)
+            _ATLAS_TYPE_EVIDENCE[contact_id] = (
+                value,
+                (previous[1] + 1) if previous is not None else 1,
+            )
         contact = {} if value is None else {"customerType": value}
         body = {
             "success": True,
-            "contactId": (json or {}).get("contact_id"),
+            "contactId": contact_id,
             "operation": "contact_updated",
             "idempotent": False,
             "contact": contact,
@@ -95,6 +146,42 @@ def test_the_type_atlas_confirms_is_what_gets_mirrored(client, auth, monkeypatch
     assert body["customerType"] == "commercial"
     assert body["atlasContactId"] == contact
     assert _type_of(customer) == "commercial"
+    assert _source_revision_of(customer) == 1
+
+
+def test_a_direct_write_never_replaces_a_newer_local_source_revision(
+    client, auth, monkeypatch
+):
+    """The direct writer is one side of the #167 ordering fence."""
+    contact = str(uuid.uuid4())
+    customer = _customer("Newer Local Evidence", contact, "commercial")
+    db.execute(
+        "UPDATE customers SET customer_type_source_revision = 9 WHERE id = %s",
+        (customer,),
+    )
+    # Simulate a delayed canonical-read response. The operator response is
+    # structurally valid, but its evidence is older than the local watermark.
+    _ATLAS_TYPE_EVIDENCE[contact] = ("residential", 1)
+
+    def _post(url, *, headers=None, json=None, timeout=None):
+        return _Response(
+            200,
+            {
+                "success": True,
+                "contactId": (json or {}).get("contact_id"),
+                "operation": "contact_updated",
+                "idempotent": False,
+                "contact": {"customerType": "residential"},
+            },
+        )
+
+    monkeypatch.setattr(api.requests, "post", _post)
+    response = client.patch(
+        _path(customer), headers=auth, json={"customerType": "residential"}
+    )
+    assert response.status_code == 409, response.text
+    assert _type_of(customer) == "commercial"
+    assert _source_revision_of(customer) == 9
 
 
 def test_the_mutation_carries_the_type_and_no_identity_fields(
@@ -521,4 +608,3 @@ def test_a_relink_in_flight_still_blocks_the_write(client, auth, monkeypatch):
     assert moved["done"]
     assert resp.status_code == 409, resp.text
     assert _type_of(customer) == "unknown"
-
