@@ -3221,6 +3221,8 @@ class ReceivablesPaymentRequest(BaseModel):
     total_amount_cents: PositiveCents
     payment_method: str = Field(pattern="^(check|ach|square)$")
     received_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    check_date: Optional[date] = None
+    received_through: Optional[str] = Field(default=None, max_length=128)
     reference: str = Field(min_length=1, max_length=256)
     notes: Optional[str] = Field(default=None, max_length=2000)
     # Atlas accepts EOM customer payments before they are allocated to an
@@ -3240,6 +3242,20 @@ class ReceivablesPaymentRequest(BaseModel):
                 "check number, ACH confirmation, or Square transaction ID is required"
             )
         return normalized
+
+    @field_validator("received_through", mode="before")
+    @classmethod
+    def normalize_received_through(cls, value: Any) -> Any:
+        return _strip_optional_text(value)
+
+    @model_validator(mode="after")
+    def check_metadata_requires_check_payment(self) -> "ReceivablesPaymentRequest":
+        if (
+            self.payment_method != "check"
+            and (self.check_date is not None or self.received_through is not None)
+        ):
+            raise ValueError("Check metadata requires a check payment method")
+        return self
 
 
 class ReceivablesAdjustmentRequest(BaseModel):
@@ -3913,6 +3929,13 @@ def _canonicalize_receivables_payload(
         canonical["payment_ids"] = sorted(
             str(item) for item in payload.get("payment_ids", [])
         )
+    elif operation == "RECEIVABLES_PAYMENT_CREATE":
+        # New optional check metadata must not change the durable fingerprint of
+        # a legacy payment retry that omitted it. Material values remain in the
+        # canonical payload, so they are part of retry conflict detection.
+        for field in ("check_date", "received_through"):
+            if canonical.get(field) is None:
+                canonical.pop(field, None)
     return canonical
 
 
