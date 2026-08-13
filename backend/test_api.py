@@ -386,7 +386,7 @@ class TestReceivablesProxy:
         assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
         assert kwargs["params"]["search"] == "Acme"
 
-    def test_forwards_idempotency_key_on_payment_write(
+    def test_forwards_idempotency_key_and_check_metadata_on_payment_write(
         self, client, auth, monkeypatch
     ):
         import time_tracker_api as api
@@ -413,6 +413,8 @@ class TestReceivablesProxy:
                 "total_amount_cents": 10_000,
                 "payment_method": "check",
                 "received_date": "2026-07-16",
+                "check_date": "2026-07-15",
+                "received_through": "mail",
                 "reference": "1024",
                 "allocations": [
                     {
@@ -427,6 +429,8 @@ class TestReceivablesProxy:
         _method, _url, kwargs = calls[0]
         assert kwargs["headers"]["Idempotency-Key"] == "browser-payment-1"
         assert kwargs["json"]["total_amount_cents"] == 10_000
+        assert kwargs["json"]["check_date"] == "2026-07-15"
+        assert kwargs["json"]["received_through"] == "mail"
 
     def test_forwards_customer_wide_payment_without_an_invoice_allocation(
         self, client, auth, monkeypatch
@@ -468,6 +472,76 @@ class TestReceivablesProxy:
         assert kwargs["headers"]["Idempotency-Key"] == "browser-unapplied-payment-1"
         assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
         assert kwargs["json"]["allocations"] == []
+        assert "check_date" not in kwargs["json"]
+        assert "received_through" not in kwargs["json"]
+
+    def test_payment_model_normalizes_check_metadata_and_rejects_it_for_ach(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        base = {
+            "contact_id": "11111111-1111-1111-1111-111111111111",
+            "payer_name": "Residential customer",
+            "total_amount_cents": 10_000,
+            "payment_method": "check",
+            "received_date": "2026-08-12",
+            "reference": "1001",
+        }
+        payment = api.ReceivablesPaymentRequest.model_validate(
+            {
+                **base,
+                "check_date": "2026-08-11",
+                "received_through": "  employee handoff  ",
+            }
+        )
+
+        assert payment.model_dump(mode="json")["check_date"] == "2026-08-11"
+        assert payment.received_through == "employee handoff"
+        assert api.ReceivablesPaymentRequest.model_validate(
+            {**base, "received_through": "   "}
+        ).received_through is None
+
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+        response = client.post(
+            "/api/admin/receivables/payments",
+            headers={**auth, "Idempotency-Key": "ach-check-metadata"},
+            json={**base, "payment_method": "ach", "received_through": "mail"},
+        )
+
+        assert response.status_code == 422
+        assert "Check metadata requires a check payment method" in response.text
+        assert calls == []
+
+    def test_omitted_check_metadata_preserves_legacy_payment_fingerprint_shape(self):
+        import time_tracker_api as api
+
+        legacy_payload = {
+            "contact_id": "11111111-1111-1111-1111-111111111111",
+            "payer_name": "Residential customer",
+            "total_amount_cents": 10_000,
+            "payment_method": "check",
+            "received_date": "2026-08-12",
+            "reference": "1001",
+            "notes": None,
+            "allocations": [],
+        }
+        payload = api.ReceivablesPaymentRequest.model_validate(
+            {
+                key: value
+                for key, value in legacy_payload.items()
+                if key not in {"notes", "allocations"}
+            }
+        ).model_dump(mode="json")
+
+        assert api._canonicalize_receivables_payload(
+            "RECEIVABLES_PAYMENT_CREATE", payload
+        ) == legacy_payload
 
     def test_upstream_outage_is_retryable_with_durable_operation_identity(
         self, client, auth, monkeypatch
@@ -532,7 +606,7 @@ class TestReceivablesProxy:
         assert response.status_code == 502
         assert response.json()["error"] == "Receivables service authentication failed"
 
-    def test_unapplied_payment_ambiguous_retry_reuses_durable_business_key(
+    def test_check_metadata_ambiguous_retry_reuses_durable_business_key(
         self, client, auth, monkeypatch
     ):
         import time_tracker_api as api
@@ -555,6 +629,8 @@ class TestReceivablesProxy:
             "total_amount_cents": 10_000,
             "payment_method": "check",
             "received_date": "2026-07-16",
+            "check_date": "2026-07-15",
+            "received_through": "mail",
             "reference": "durable-1001",
         }
 
@@ -576,7 +652,7 @@ class TestReceivablesProxy:
         changed_details = client.post(
             "/api/admin/receivables/payments",
             headers={**auth, "Idempotency-Key": "browser-d-key"},
-            json={**body, "notes": "changed after an ambiguous attempt"},
+            json={**body, "received_through": "customer delivery"},
         )
 
         assert first.status_code == 503
