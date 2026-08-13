@@ -710,6 +710,323 @@ class TestReceivablesProxy:
             "billing_period": "2026-03"
         }
 
+    def test_commercial_billing_run_create_forwards_provider_idempotency_and_keeps_no_snapshot(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        provider_result = {
+            "billingRun": {
+                "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "billingPeriod": "2026-03",
+                "state": "draft",
+                "candidates": [],
+            },
+            "replayed": False,
+        }
+        calls = []
+        audits = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse(provider_result, status_code=201)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        response = client.post(
+            "/api/admin/receivables/commercial-billing-runs",
+            headers={**auth, "Idempotency-Key": "billing-run-2026-03-1"},
+            json={"billing_period": "2026-03"},
+        )
+
+        assert response.status_code == 201
+        assert response.json() == provider_result
+        assert GENERATED_RECEIVABLES_TOKEN not in response.text
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        method, url, kwargs = calls[0]
+        assert method == "POST"
+        assert url == "https://atlas.test/api/v1/receivables/commercial-billing-runs"
+        assert kwargs["headers"]["Authorization"] == (
+            f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
+        )
+        assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert kwargs["headers"]["Idempotency-Key"] == "billing-run-2026-03-1"
+        assert kwargs["json"] == {"billing_period": "2026-03"}
+        assert kwargs["params"] is None
+        assert audits == [
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_RUN_CREATE",
+                True,
+                "Billing review run accepted by Atlas for Juan Canfield",
+            )
+        ]
+
+    def test_commercial_billing_run_create_survives_local_audit_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: _AtlasResponse(
+                {"billingRun": {"id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}},
+                status_code=201,
+            ),
+        )
+
+        def unavailable_audit(*_args, **_kwargs):
+            raise OSError("access-log storage unavailable")
+
+        monkeypatch.setattr(api, "append_access_log", unavailable_audit)
+
+        response = client.post(
+            "/api/admin/receivables/commercial-billing-runs",
+            headers={**auth, "Idempotency-Key": "billing-run-audit-failure"},
+            json={"billing_period": "2026-03"},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["billingRun"]["id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+
+    def test_commercial_billing_run_create_rejects_stale_sessions_missing_keys_and_invalid_periods_before_atlas(
+        self, client, auth, emp_auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+
+        unauthenticated = client.post(
+            "/api/admin/receivables/commercial-billing-runs",
+            headers={"Idempotency-Key": "billing-run-2026-03-2"},
+            json={"billing_period": "2026-03"},
+        )
+        employee = client.post(
+            "/api/admin/receivables/commercial-billing-runs",
+            headers={**emp_auth, "Idempotency-Key": "billing-run-2026-03-2"},
+            json={"billing_period": "2026-03"},
+        )
+        expired_token = api.jwt.encode(
+            {"sub": "1", "name": "Juan Canfield", "role": "admin", "exp": 1},
+            api.JWT_SECRET,
+            algorithm=api.JWT_ALGORITHM,
+        )
+        expired = client.post(
+            "/api/admin/receivables/commercial-billing-runs",
+            headers={
+                "Authorization": f"Bearer {expired_token}",
+                "Idempotency-Key": "billing-run-2026-03-2",
+            },
+            json={"billing_period": "2026-03"},
+        )
+        missing_key = client.post(
+            "/api/admin/receivables/commercial-billing-runs",
+            headers=auth,
+            json={"billing_period": "2026-03"},
+        )
+        invalid_period = client.post(
+            "/api/admin/receivables/commercial-billing-runs",
+            headers={**auth, "Idempotency-Key": "billing-run-2026-03-2"},
+            json={"billing_period": "2026-13"},
+        )
+
+        assert unauthenticated.status_code == 401
+        assert employee.status_code == 403
+        assert expired.status_code == 401
+        assert missing_key.status_code == 422
+        assert invalid_period.status_code == 422
+        assert calls == []
+
+    def test_commercial_billing_run_retry_after_ambiguous_transport_failure_reuses_atlas_key(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+        audits = []
+
+        def flaky_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("upstream timeout")
+            return _AtlasResponse(
+                {
+                    "billingRun": {
+                        "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        "billingPeriod": "2026-03",
+                        "state": "draft",
+                        "candidates": [],
+                    },
+                    "replayed": True,
+                },
+                status_code=201,
+            )
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+        headers = {**auth, "Idempotency-Key": "billing-run-2026-03-retry"}
+
+        failed = client.post(
+            "/api/admin/receivables/commercial-billing-runs",
+            headers=headers,
+            json={"billing_period": "2026-03"},
+        )
+        recovered = client.post(
+            "/api/admin/receivables/commercial-billing-runs",
+            headers=headers,
+            json={"billing_period": "2026-03"},
+        )
+
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "5"
+        assert recovered.status_code == 201
+        assert recovered.json()["replayed"] is True
+        assert [call[0] for call in calls] == ["POST", "POST"]
+        assert calls[0][1] == calls[1][1]
+        assert calls[0][2]["headers"]["Idempotency-Key"] == calls[1][2][
+            "headers"
+        ]["Idempotency-Key"] == "billing-run-2026-03-retry"
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert audits[0][0:2] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_RUN_CREATE",
+            False,
+        )
+        assert "Atlas request for Juan Canfield failed (503)" in audits[0][2]
+        assert audits[1] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_RUN_CREATE",
+            True,
+            "Billing review run accepted by Atlas for Juan Canfield",
+        )
+
+    def test_commercial_billing_run_reads_forward_bounded_queries_and_actor(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if url.endswith("/reconciliation"):
+                return _AtlasResponse({"billingRunId": billing_run_id, "changes": []})
+            if url.endswith(billing_run_id):
+                return _AtlasResponse({"id": billing_run_id, "candidates": []})
+            return _AtlasResponse(
+                {"billingRuns": [], "pagination": {"hasMore": False}}
+            )
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+
+        listed = client.get(
+            "/api/admin/receivables/commercial-billing-runs",
+            params={"billing_period": "2026-03", "limit": 25, "offset": 50},
+            headers=auth,
+        )
+        detail = client.get(
+            f"/api/admin/receivables/commercial-billing-runs/{billing_run_id}",
+            headers=auth,
+        )
+        reconciliation = client.get(
+            f"/api/admin/receivables/commercial-billing-runs/{billing_run_id}/reconciliation",
+            headers=auth,
+        )
+
+        assert listed.status_code == detail.status_code == reconciliation.status_code == 200
+        assert listed.json() == {"billingRuns": [], "pagination": {"hasMore": False}}
+        assert detail.json() == {"id": billing_run_id, "candidates": []}
+        assert reconciliation.json() == {"billingRunId": billing_run_id, "changes": []}
+        assert [call[0] for call in calls] == ["GET", "GET", "GET"]
+        assert calls[0][1] == "https://atlas.test/api/v1/receivables/commercial-billing-runs"
+        assert calls[0][2]["params"] == {
+            "billing_period": "2026-03",
+            "limit": 25,
+            "offset": 50,
+        }
+        assert calls[1][1].endswith(f"/commercial-billing-runs/{billing_run_id}")
+        assert calls[2][1].endswith(
+            f"/commercial-billing-runs/{billing_run_id}/reconciliation"
+        )
+        for _method, _url, kwargs in calls:
+            assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+            assert "Idempotency-Key" not in kwargs["headers"]
+            assert kwargs["json"] is None
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/admin/receivables/commercial-billing-runs?billing_period=2026-13",
+            "/api/admin/receivables/commercial-billing-runs?limit=101",
+            "/api/admin/receivables/commercial-billing-runs/not-a-uuid",
+            "/api/admin/receivables/commercial-billing-runs/not-a-uuid/reconciliation",
+        ],
+    )
+    def test_commercial_billing_run_reads_reject_invalid_local_requests_before_atlas(
+        self, client, auth, monkeypatch, path
+    ):
+        import time_tracker_api as api
+
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+
+        response = client.get(path, headers=auth)
+
+        assert response.status_code == 422
+        assert calls == []
+
     def test_forwards_idempotency_key_and_check_metadata_on_payment_write(
         self, client, auth, monkeypatch
     ):
