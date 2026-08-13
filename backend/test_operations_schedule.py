@@ -1225,6 +1225,159 @@ def test_native_site_schedule_rescheduled_occurrence_exception_moves_one_visit(
     assert restored_jobs[0]["occurrenceException"] is None
 
 
+def test_native_site_schedule_rescheduled_occurrences_keep_original_identities(
+    client,
+    auth,
+):
+    first_service_day = date(2026, 7, 20)  # Monday
+    second_service_day = date(2026, 7, 27)  # Monday
+    moved_day = date(2026, 7, 22)  # Wednesday
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Agenda Distinct Reschedule Identities",
+                site_type="Residential",
+                rate=150,
+                rate_type="per_visit",
+                expected_hours=2,
+            )
+
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "morning",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "08:00",
+            "localEndTime": "10:00",
+            "startsOn": str(first_service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+    rule_id = created.json()["rule"]["id"]
+
+    for service_day, start_time, end_time, reason in (
+        (first_service_day, "13:00", "15:00", "Customer requested Wednesday"),
+        (second_service_day, "16:00", "18:00", "Customer requested a later Wednesday"),
+    ):
+        moved = client.put(
+            (
+                "/api/admin/operations/service-schedule-rules/"
+                f"{rule_id}/occurrence-exceptions/{service_day}"
+            ),
+            headers=auth,
+            json={
+                "action": "rescheduled",
+                "scheduledDate": str(moved_day),
+                "localStartTime": start_time,
+                "localEndTime": end_time,
+                "reason": reason,
+            },
+        )
+        assert moved.status_code == 200, moved.text
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": str(first_service_day),
+            "end_date": str(second_service_day),
+            "planning_source": "native",
+        },
+    )
+    assert response.status_code == 200, response.text
+    site_jobs = [
+        row for row in response.json()["jobs"] if row["locationId"] == site_id
+    ]
+    assert {
+        (row["projectionId"], row["occurrenceDate"])
+        for row in site_jobs
+    } == {
+        (f"rule-{rule_id}:{first_service_day}", str(first_service_day)),
+        (f"rule-{rule_id}:{second_service_day}", str(second_service_day)),
+    }
+    assert {
+        row["occurrenceException"]["reason"] for row in site_jobs
+    } == {
+        "Customer requested Wednesday",
+        "Customer requested a later Wednesday",
+    }
+
+
+def test_native_site_schedule_includes_cross_month_rescheduled_source_occurrence(
+    client,
+    auth,
+):
+    service_day = date(2026, 7, 27)  # Monday
+    moved_day = date(2026, 8, 4)  # Tuesday
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            _, site_id = _customer_site(
+                cur,
+                "Native Agenda Cross Month Reschedule",
+                site_type="Commercial",
+                rate=225,
+                rate_type="per_visit",
+                expected_hours=3,
+            )
+
+    created = client.post(
+        "/api/admin/operations/service-schedule-rules",
+        headers=auth,
+        json={
+            "locationId": site_id,
+            "shiftBucket": "evening",
+            "cadence": "weekly",
+            "weekdays": [0],
+            "localStartTime": "18:00",
+            "localEndTime": "21:00",
+            "startsOn": str(service_day),
+        },
+    )
+    assert created.status_code == 201, created.text
+    rule_id = created.json()["rule"]["id"]
+
+    moved = client.put(
+        (
+            "/api/admin/operations/service-schedule-rules/"
+            f"{rule_id}/occurrence-exceptions/{service_day}"
+        ),
+        headers=auth,
+        json={
+            "action": "rescheduled",
+            "scheduledDate": str(moved_day),
+            "localStartTime": "13:00",
+            "localEndTime": "16:00",
+            "reason": "Customer requested an August visit",
+        },
+    )
+    assert moved.status_code == 200, moved.text
+
+    response = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": str(moved_day),
+            "end_date": str(moved_day),
+            "planning_source": "native",
+        },
+    )
+    assert response.status_code == 200, response.text
+    site_jobs = [
+        row for row in response.json()["jobs"] if row["locationId"] == site_id
+    ]
+    assert len(site_jobs) == 1
+    assert site_jobs[0]["projectionId"] == f"rule-{rule_id}:{service_day}"
+    assert site_jobs[0]["occurrenceDate"] == str(service_day)
+    assert site_jobs[0]["scheduledDate"] == str(moved_day)
+    assert site_jobs[0]["occurrenceException"]["reason"] == (
+        "Customer requested an August visit"
+    )
+
+
 def test_native_site_schedule_occurrence_exception_rejects_non_occurrence(
     client,
     auth,

@@ -657,13 +657,26 @@ def _native_preview_rows(
 ) -> List[Dict[str, Any]]:
     occurrence_exceptions = occurrence_exceptions or {}
     rows: List[Dict[str, Any]] = []
-    service_day = start_date
-    while service_day <= end_date:
+    allocation_service_dates = {
+        start_date + timedelta(days=offset)
+        for offset in range((end_date - start_date).days + 1)
+    }
+    # An exception can move an occurrence into this allocation window from a
+    # source date outside it.  Generate that original occurrence as well; the
+    # caller still filters returned rows by their effective scheduled date.
+    service_dates = allocation_service_dates | {
+        service_date
+        for _, service_date in occurrence_exceptions
+    }
+    for service_day in sorted(service_dates):
         for rule in rules:
-            if not _rule_active_on(rule, service_day):
-                continue
             rule_id = int(rule["id"])
             occurrence_exception = occurrence_exceptions.get((rule_id, service_day))
+            if (
+                service_day not in allocation_service_dates
+                and occurrence_exception is None
+            ) or not _rule_active_on(rule, service_day):
+                continue
             action = (
                 str(occurrence_exception["action"])
                 if occurrence_exception is not None
@@ -815,7 +828,6 @@ def _native_preview_rows(
                     "_labor_cents": forecast_labor_cents,
                 }
             )
-        service_day += timedelta(days=1)
     _apply_native_monthly_allocations(rows)
     for row in rows:
         if row.get("rateType") == "monthly":
@@ -1001,8 +1013,8 @@ def _parse_native_utc(value: Any) -> Optional[datetime]:
 
 
 def _native_projection_job_id(row: Dict[str, Any]) -> int:
-    service_day = date.fromisoformat(str(row["scheduledDate"]))
-    return -(int(row["ruleId"]) * 1_000_000 + service_day.toordinal())
+    occurrence_day = date.fromisoformat(str(row["occurrenceDate"]))
+    return -(int(row["ruleId"]) * 1_000_000 + occurrence_day.toordinal())
 
 
 def _native_occurrence_key(
