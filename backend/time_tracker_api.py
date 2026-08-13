@@ -3281,6 +3281,16 @@ class ReceivablesDepositRequest(BaseModel):
         return value
 
 
+class CommercialBillingRunRequest(BaseModel):
+    """The tracker-owned transport contract for an ATLAS billing review run."""
+
+    billing_period: str = Field(
+        min_length=7,
+        max_length=7,
+        pattern=r"^\d{4}-(0[1-9]|1[0-2])$",
+    )
+
+
 VALID_NON_PRODUCTIVE_TYPES = ("drive_time", "waiting", "supply_run", "rework", "lockout", "other")
 
 
@@ -3622,6 +3632,58 @@ def _atlas_receivables_request(
             headers=headers,
         )
     return content
+
+
+def _atlas_receivables_audited_write(
+    request: Request,
+    audit_action: str,
+    success_reason: str,
+    method: str,
+    path: str,
+    admin: Dict[str, Any],
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+    idempotency_key: str,
+) -> Any:
+    """Forward a provider-owned mutation and retain only operator audit evidence.
+
+    ATLAS owns billing-run idempotency and its immutable snapshot.  In
+    particular, this helper deliberately does not use
+    ``receivables_operation_attempts`` or cache an ATLAS response locally: doing
+    so would make the tracker a second billing-run store.  A response-loss retry
+    forwards the same key to ATLAS, which returns its original run.
+    """
+    actor = str(admin.get("name", "")).strip() or "authenticated manager"
+
+    def audit_best_effort(allowed: bool, reason: str) -> None:
+        try:
+            append_access_log(request, audit_action, allowed, reason)
+        except Exception:
+            # A local audit diagnostic failure must not hide an ATLAS outcome.
+            logger.exception(
+                "Could not append receivables audit action=%s allowed=%s",
+                audit_action,
+                allowed,
+            )
+
+    try:
+        result = _atlas_receivables_request(
+            method,
+            path,
+            admin,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else "Atlas rejected request"
+        audit_best_effort(
+            False,
+            f"Atlas request for {actor} failed ({exc.status_code}): {detail}",
+        )
+        raise
+
+    audit_best_effort(True, success_reason)
+    return result
 
 
 class AtlasFunnelRequestError(Exception):
@@ -8904,6 +8966,85 @@ def receivables_commercial_billing_candidates(
         "/receivables/commercial-billing-candidates",
         admin,
         params={"billing_period": billing_period},
+    )
+
+
+@app.post("/api/admin/receivables/commercial-billing-runs", status_code=201)
+def receivables_create_commercial_billing_run(
+    payload: CommercialBillingRunRequest,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Ask ATLAS to retain an immutable review snapshot before approval.
+
+    This is intentionally a transport-and-audit boundary.  It neither
+    recalculates candidates nor retains their snapshot locally, and it cannot
+    create invoices, PDFs, drafts, or delivery side effects.
+    """
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_RUN_CREATE",
+        f"Billing review run accepted by Atlas for {actor}",
+        "POST",
+        "/receivables/commercial-billing-runs",
+        admin,
+        payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.get("/api/admin/receivables/commercial-billing-runs")
+def receivables_commercial_billing_runs(
+    billing_period: Optional[str] = Query(
+        default=None,
+        min_length=7,
+        max_length=7,
+        pattern=r"^\d{4}-(0[1-9]|1[0-2])$",
+    ),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Proxy one bounded ATLAS-owned billing-run summary page."""
+    return _atlas_receivables_request(
+        "GET",
+        "/receivables/commercial-billing-runs",
+        admin,
+        params={
+            "billing_period": billing_period,
+            "limit": limit,
+            "offset": offset,
+        },
+    )
+
+
+@app.get("/api/admin/receivables/commercial-billing-runs/{billing_run_id}/reconciliation")
+def receivables_commercial_billing_run_reconciliation(
+    billing_run_id: UUID,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Read ATLAS's current-vs-snapshot comparison without changing either."""
+    return _atlas_receivables_request(
+        "GET",
+        f"/receivables/commercial-billing-runs/{billing_run_id}/reconciliation",
+        admin,
+    )
+
+
+@app.get("/api/admin/receivables/commercial-billing-runs/{billing_run_id}")
+def receivables_commercial_billing_run(
+    billing_run_id: UUID,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Read one immutable ATLAS-owned billing-run snapshot."""
+    return _atlas_receivables_request(
+        "GET",
+        f"/receivables/commercial-billing-runs/{billing_run_id}",
+        admin,
     )
 
 
