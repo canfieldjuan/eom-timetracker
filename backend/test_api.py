@@ -564,6 +564,152 @@ class TestReceivablesProxy:
         assert calls[0][1] == calls[1][1]
         assert calls[0][2]["params"] == calls[1][2]["params"]
 
+    def test_commercial_billing_candidates_forwards_read_only_preview(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        preview = {
+            "billingPeriod": "2026-03",
+            "candidates": [
+                {
+                    "candidateKey": "commercial-billing:acme:2026-03",
+                    "sourceFingerprint": "candidate-fingerprint",
+                    "blockers": [],
+                }
+            ],
+            "summary": {"candidateCount": 1, "blockedCandidateCount": 0},
+        }
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse(preview)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+
+        response = client.get(
+            "/api/admin/receivables/commercial-billing-candidates",
+            params={"billing_period": "2026-03"},
+            headers=auth,
+        )
+
+        assert response.status_code == 200
+        assert response.json() == preview
+        assert GENERATED_RECEIVABLES_TOKEN not in response.text
+        method, url, kwargs = calls[0]
+        assert method == "GET"
+        assert url == "https://atlas.test/api/v1/receivables/commercial-billing-candidates"
+        assert kwargs["headers"]["Authorization"] == (
+            f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
+        )
+        assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert "Idempotency-Key" not in kwargs["headers"]
+        assert kwargs["json"] is None
+        assert kwargs["params"] == {"billing_period": "2026-03"}
+
+    def test_commercial_billing_candidates_requires_current_admin_session_before_an_upstream_read(
+        self, client, emp_auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+
+        unauthenticated = client.get(
+            "/api/admin/receivables/commercial-billing-candidates?billing_period=2026-03",
+        )
+        employee = client.get(
+            "/api/admin/receivables/commercial-billing-candidates?billing_period=2026-03",
+            headers=emp_auth,
+        )
+
+        assert unauthenticated.status_code == 401
+        assert employee.status_code == 403
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/admin/receivables/commercial-billing-candidates",
+            "/api/admin/receivables/commercial-billing-candidates?billing_period=2026-3",
+            "/api/admin/receivables/commercial-billing-candidates?billing_period=2026-00",
+            "/api/admin/receivables/commercial-billing-candidates?billing_period=2026-13",
+            "/api/admin/receivables/commercial-billing-candidates?billing_period=not-a-month",
+        ],
+    )
+    def test_commercial_billing_candidates_rejects_invalid_period_before_atlas(
+        self, client, auth, monkeypatch, path
+    ):
+        import time_tracker_api as api
+
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+
+        response = client.get(path, headers=auth)
+
+        assert response.status_code == 422
+        assert calls == []
+
+    def test_commercial_billing_candidates_retry_after_upstream_outage_is_a_fresh_read(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        calls = []
+
+        def flaky_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("upstream timeout")
+            return _AtlasResponse(
+                {
+                    "billingPeriod": "2026-03",
+                    "candidates": [],
+                    "summary": {"candidateCount": 0, "blockedCandidateCount": 0},
+                }
+            )
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+
+        path = (
+            "/api/admin/receivables/commercial-billing-candidates"
+            "?billing_period=2026-03"
+        )
+        failed = client.get(path, headers=auth)
+        recovered = client.get(path, headers=auth)
+
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "5"
+        assert recovered.status_code == 200
+        assert recovered.json()["billingPeriod"] == "2026-03"
+        assert [call[0] for call in calls] == ["GET", "GET"]
+        assert calls[0][1] == calls[1][1]
+        assert calls[0][2]["json"] is calls[1][2]["json"] is None
+        assert calls[0][2]["params"] == calls[1][2]["params"] == {
+            "billing_period": "2026-03"
+        }
+
     def test_forwards_idempotency_key_and_check_metadata_on_payment_write(
         self, client, auth, monkeypatch
     ):
