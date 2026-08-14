@@ -39,6 +39,7 @@ import psycopg2.extras
 import requests
 import qrcode
 import qrcode.image.svg
+import arrival_policy_inventory
 import arrival_policies
 import db
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
@@ -11272,6 +11273,25 @@ def admin_retire_appointment_arrival_policy(
         f"Appointment {job_id} revision {revision_id} by {admin['name']}",
     )
     return response
+
+
+@app.get("/api/admin/arrival-policy/legacy-inventory")
+def admin_arrival_policy_legacy_inventory(
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
+            cur.execute("SHOW transaction_read_only")
+            database_read_only = cur.fetchone()[0] == "on"
+        inventory = arrival_policy_inventory.build_inventory(
+            conn,
+            as_of=utc_now(),
+        )
+    return {
+        **inventory,
+        "databaseReadOnly": database_read_only,
+    }
 
 
 def admin_create_site_check_in_schedule(
