@@ -710,6 +710,291 @@ class TestReceivablesProxy:
             "billing_period": "2026-03"
         }
 
+    @pytest.mark.parametrize(
+        "delivery_method",
+        [
+            "gmail_pdf",
+            "manual_square",
+            "no_invoice_residential_receipt",
+        ],
+    )
+    def test_commercial_billing_delivery_preference_model_admits_each_supported_policy(
+        self, delivery_method
+    ):
+        import time_tracker_api as api
+
+        payload = api.CommercialBillingDeliveryPreferenceRequest.model_validate(
+            {"delivery_method": delivery_method}
+        )
+
+        assert payload.delivery_method == delivery_method
+
+    def test_commercial_billing_delivery_preference_proxies_absence_and_change_without_local_state(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        contact_id = "11111111-1111-1111-1111-111111111111"
+        absent_preference = {
+            "contactId": contact_id,
+            "deliveryMethod": None,
+            "createdAt": None,
+            "createdBy": None,
+            "updatedAt": None,
+            "updatedBy": None,
+        }
+        changed_preference = {
+            "contactId": contact_id,
+            "deliveryMethod": "manual_square",
+            "createdAt": "2026-08-14T17:00:00+00:00",
+            "createdBy": "Juan Canfield",
+            "updatedAt": "2026-08-14T17:00:00+00:00",
+            "updatedBy": "Juan Canfield",
+            "changed": True,
+        }
+        calls = []
+        audits = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if method == "GET":
+                return _AtlasResponse(absent_preference)
+            return _AtlasResponse(changed_preference)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        read = client.get(
+            f"/api/admin/receivables/commercial-billing-delivery-preferences/{contact_id}",
+            headers=auth,
+        )
+        updated = client.put(
+            f"/api/admin/receivables/commercial-billing-delivery-preferences/{contact_id}",
+            headers=auth,
+            json={"delivery_method": "manual_square"},
+        )
+
+        assert read.status_code == 200
+        assert read.json() == absent_preference
+        assert updated.status_code == 200
+        assert updated.json() == changed_preference
+        assert GENERATED_RECEIVABLES_TOKEN not in read.text
+        assert GENERATED_RECEIVABLES_TOKEN not in updated.text
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert [call[0] for call in calls] == ["GET", "PUT"]
+        assert calls[0][1] == (
+            "https://atlas.test/api/v1/receivables/"
+            f"commercial-billing-delivery-preferences/{contact_id}"
+        )
+        assert calls[0][2]["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert calls[0][2]["json"] is None
+        assert calls[0][2]["params"] is None
+        assert calls[1][1] == calls[0][1]
+        assert calls[1][2]["headers"]["Authorization"] == (
+            f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
+        )
+        assert calls[1][2]["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert "Idempotency-Key" not in calls[1][2]["headers"]
+        assert calls[1][2]["json"] == {"delivery_method": "manual_square"}
+        assert calls[1][2]["params"] is None
+        assert audits == [
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_DELIVERY_PREFERENCE_SET",
+                True,
+                "Billing delivery preference accepted by Atlas for Juan Canfield",
+            )
+        ]
+
+    def test_commercial_billing_delivery_preference_write_survives_local_audit_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        contact_id = "11111111-1111-1111-1111-111111111111"
+        provider_result = {
+            "contactId": contact_id,
+            "deliveryMethod": "gmail_pdf",
+            "createdAt": "2026-08-14T17:00:00+00:00",
+            "createdBy": "Juan Canfield",
+            "updatedAt": "2026-08-14T17:00:00+00:00",
+            "updatedBy": "Juan Canfield",
+            "changed": True,
+        }
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: _AtlasResponse(provider_result),
+        )
+
+        def unavailable_audit(*_args, **_kwargs):
+            raise OSError("access-log storage unavailable")
+
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            unavailable_audit,
+        )
+
+        response = client.put(
+            f"/api/admin/receivables/commercial-billing-delivery-preferences/{contact_id}",
+            headers=auth,
+            json={"delivery_method": "gmail_pdf"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == provider_result
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+
+    def test_commercial_billing_delivery_preference_rejects_stale_sessions_and_invalid_input_before_atlas(
+        self, client, auth, emp_auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        contact_id = "11111111-1111-1111-1111-111111111111"
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+        expired_token = api.jwt.encode(
+            {"sub": "1", "name": "Juan Canfield", "role": "admin", "exp": 1},
+            api.JWT_SECRET,
+            algorithm=api.JWT_ALGORITHM,
+        )
+
+        unauthenticated = client.get(
+            f"/api/admin/receivables/commercial-billing-delivery-preferences/{contact_id}",
+        )
+        employee = client.put(
+            f"/api/admin/receivables/commercial-billing-delivery-preferences/{contact_id}",
+            headers=emp_auth,
+            json={"delivery_method": "gmail_pdf"},
+        )
+        expired = client.put(
+            f"/api/admin/receivables/commercial-billing-delivery-preferences/{contact_id}",
+            headers={"Authorization": f"Bearer {expired_token}"},
+            json={"delivery_method": "gmail_pdf"},
+        )
+        invalid_contact = client.put(
+            "/api/admin/receivables/commercial-billing-delivery-preferences/not-a-uuid",
+            headers=auth,
+            json={"delivery_method": "gmail_pdf"},
+        )
+        invalid_method = client.put(
+            f"/api/admin/receivables/commercial-billing-delivery-preferences/{contact_id}",
+            headers=auth,
+            json={"delivery_method": "automatic_email"},
+        )
+
+        assert unauthenticated.status_code == 401
+        assert employee.status_code == 403
+        assert expired.status_code == 401
+        assert invalid_contact.status_code == 422
+        assert invalid_method.status_code == 422
+        assert calls == []
+
+    def test_commercial_billing_delivery_preference_retry_after_ambiguous_transport_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        contact_id = "11111111-1111-1111-1111-111111111111"
+        provider_result = {
+            "contactId": contact_id,
+            "deliveryMethod": "manual_square",
+            "createdAt": "2026-08-14T17:00:00+00:00",
+            "createdBy": "Juan Canfield",
+            "updatedAt": "2026-08-14T17:00:00+00:00",
+            "updatedBy": "Juan Canfield",
+            "changed": False,
+        }
+        calls = []
+        audits = []
+
+        def flaky_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("upstream timeout")
+            return _AtlasResponse(provider_result)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+        path = (
+            "/api/admin/receivables/commercial-billing-delivery-preferences/"
+            f"{contact_id}"
+        )
+
+        failed = client.put(
+            path,
+            headers=auth,
+            json={"delivery_method": "manual_square"},
+        )
+        recovered = client.put(
+            path,
+            headers=auth,
+            json={"delivery_method": "manual_square"},
+        )
+
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "5"
+        assert recovered.status_code == 200
+        assert recovered.json() == provider_result
+        assert [call[0] for call in calls] == ["PUT", "PUT"]
+        assert calls[0][1] == calls[1][1]
+        assert calls[0][2]["json"] == calls[1][2]["json"] == {
+            "delivery_method": "manual_square"
+        }
+        assert "Idempotency-Key" not in calls[0][2]["headers"]
+        assert "Idempotency-Key" not in calls[1][2]["headers"]
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert audits[0][0:2] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_DELIVERY_PREFERENCE_SET",
+            False,
+        )
+        assert "Atlas request for Juan Canfield failed (503)" in audits[0][2]
+        assert audits[1] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_DELIVERY_PREFERENCE_SET",
+            True,
+            "Billing delivery preference accepted by Atlas for Juan Canfield",
+        )
+
     def test_commercial_billing_run_create_forwards_provider_idempotency_and_keeps_no_snapshot(
         self, client, auth, monkeypatch
     ):

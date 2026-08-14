@@ -3291,6 +3291,20 @@ class CommercialBillingRunRequest(BaseModel):
     )
 
 
+class CommercialBillingDeliveryPreferenceRequest(BaseModel):
+    """One explicit, reviewed delivery policy for a canonical EOM customer."""
+
+    # CLOSED + ENUMERATED: this is the currently supported provider policy
+    # subset. Unknown or future provider methods fail locally until the portal
+    # has an explicit, reviewed operator workflow for them; the proxy never
+    # infers a delivery channel from customer type or an email address.
+    delivery_method: Literal[
+        "gmail_pdf",
+        "manual_square",
+        "no_invoice_residential_receipt",
+    ]
+
+
 VALID_NON_PRODUCTIVE_TYPES = ("drive_time", "waiting", "supply_run", "rework", "lockout", "other")
 
 
@@ -3643,15 +3657,16 @@ def _atlas_receivables_audited_write(
     admin: Dict[str, Any],
     *,
     payload: Optional[Dict[str, Any]] = None,
-    idempotency_key: str,
+    idempotency_key: Optional[str] = None,
 ) -> Any:
     """Forward a provider-owned mutation and retain only operator audit evidence.
 
-    ATLAS owns billing-run idempotency and its immutable snapshot.  In
-    particular, this helper deliberately does not use
-    ``receivables_operation_attempts`` or cache an ATLAS response locally: doing
-    so would make the tracker a second billing-run store.  A response-loss retry
-    forwards the same key to ATLAS, which returns its original run.
+    ATLAS owns durable billing-run and delivery-policy state. In particular,
+    this helper deliberately does not use ``receivables_operation_attempts`` or
+    cache an ATLAS response locally: doing so would make the tracker a second
+    financial or billing-policy store. A caller forwards an idempotency key only
+    when the provider contract admits one; equal delivery-policy retries remain
+    safely provider-owned without manufacturing a tracker retry record.
     """
     actor = str(admin.get("name", "")).strip() or "authenticated manager"
 
@@ -8966,6 +8981,39 @@ def receivables_commercial_billing_candidates(
         "/receivables/commercial-billing-candidates",
         admin,
         params={"billing_period": billing_period},
+    )
+
+
+@app.get("/api/admin/receivables/commercial-billing-delivery-preferences/{contact_id}")
+def receivables_commercial_billing_delivery_preference(
+    contact_id: UUID,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Read Atlas's explicit policy without deriving a delivery default."""
+    return _atlas_receivables_request(
+        "GET",
+        f"/receivables/commercial-billing-delivery-preferences/{contact_id}",
+        admin,
+    )
+
+
+@app.put("/api/admin/receivables/commercial-billing-delivery-preferences/{contact_id}")
+def receivables_set_commercial_billing_delivery_preference(
+    contact_id: UUID,
+    payload: CommercialBillingDeliveryPreferenceRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Persist one audited, Atlas-owned policy without a delivery side effect."""
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_DELIVERY_PREFERENCE_SET",
+        f"Billing delivery preference accepted by Atlas for {actor}",
+        "PUT",
+        f"/receivables/commercial-billing-delivery-preferences/{contact_id}",
+        admin,
+        payload=payload.model_dump(mode="json"),
     )
 
 
