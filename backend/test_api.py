@@ -2055,10 +2055,25 @@ class TestReceivablesProxy:
         import time_tracker_api as api
 
         billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        delivery_state_result = {
+            "billingRunId": billing_run_id,
+            "items": [
+                {
+                    "candidateKey": "candidate:acme:2026-03",
+                    "deliveryState": "draft_missing",
+                    "recoveryAction": "review_missing_draft",
+                }
+            ],
+            "limit": 25,
+            "offset": 50,
+            "total": 1,
+        }
         calls = []
 
         def fake_request(method, url, **kwargs):
             calls.append((method, url, kwargs))
+            if url.endswith("/gmail-delivery-state"):
+                return _AtlasResponse(delivery_state_result)
             if url.endswith("/reconciliation"):
                 return _AtlasResponse({"billingRunId": billing_run_id, "changes": []})
             if url.endswith(billing_run_id):
@@ -2088,12 +2103,27 @@ class TestReceivablesProxy:
             f"/api/admin/receivables/commercial-billing-runs/{billing_run_id}/reconciliation",
             headers=auth,
         )
+        delivery_state = client.get(
+            (
+                "/api/admin/receivables/commercial-billing-runs/"
+                f"{billing_run_id}/gmail-delivery-state"
+            ),
+            params={"limit": 25, "offset": 50},
+            headers=auth,
+        )
 
-        assert listed.status_code == detail.status_code == reconciliation.status_code == 200
+        assert (
+            listed.status_code
+            == detail.status_code
+            == reconciliation.status_code
+            == delivery_state.status_code
+            == 200
+        )
         assert listed.json() == {"billingRuns": [], "pagination": {"hasMore": False}}
         assert detail.json() == {"id": billing_run_id, "candidates": []}
         assert reconciliation.json() == {"billingRunId": billing_run_id, "changes": []}
-        assert [call[0] for call in calls] == ["GET", "GET", "GET"]
+        assert delivery_state.json() == delivery_state_result
+        assert [call[0] for call in calls] == ["GET", "GET", "GET", "GET"]
         assert calls[0][1] == "https://atlas.test/api/v1/receivables/commercial-billing-runs"
         assert calls[0][2]["params"] == {
             "billing_period": "2026-03",
@@ -2104,6 +2134,10 @@ class TestReceivablesProxy:
         assert calls[2][1].endswith(
             f"/commercial-billing-runs/{billing_run_id}/reconciliation"
         )
+        assert calls[3][1].endswith(
+            f"/commercial-billing-runs/{billing_run_id}/gmail-delivery-state"
+        )
+        assert calls[3][2]["params"] == {"limit": 25, "offset": 50}
         for _method, _url, kwargs in calls:
             assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
             assert "Idempotency-Key" not in kwargs["headers"]
@@ -2116,6 +2150,10 @@ class TestReceivablesProxy:
             "/api/admin/receivables/commercial-billing-runs?limit=101",
             "/api/admin/receivables/commercial-billing-runs/not-a-uuid",
             "/api/admin/receivables/commercial-billing-runs/not-a-uuid/reconciliation",
+            "/api/admin/receivables/commercial-billing-runs/not-a-uuid/gmail-delivery-state",
+            "/api/admin/receivables/commercial-billing-runs/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/gmail-delivery-state?limit=101",
+            "/api/admin/receivables/commercial-billing-runs/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/gmail-delivery-state?offset=-1",
+            "/api/admin/receivables/commercial-billing-runs/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/gmail-delivery-state?offset=9223372036854775808",
         ],
     )
     def test_commercial_billing_run_reads_reject_invalid_local_requests_before_atlas(
@@ -2134,6 +2172,102 @@ class TestReceivablesProxy:
 
         assert response.status_code == 422
         assert calls == []
+
+    def test_commercial_billing_delivery_state_read_rejects_stale_or_non_admin_sessions_before_atlas(
+        self, client, auth, emp_auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        path = (
+            "/api/admin/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/gmail-delivery-state"
+        )
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+        expired_token = api.jwt.encode(
+            {"sub": "1", "name": "Juan Canfield", "role": "admin", "exp": 1},
+            api.JWT_SECRET,
+            algorithm=api.JWT_ALGORITHM,
+        )
+
+        unauthenticated = client.get(path)
+        employee = client.get(path, headers=emp_auth)
+        expired = client.get(path, headers={"Authorization": f"Bearer {expired_token}"})
+        authenticated = client.get(
+            "/api/admin/receivables/commercial-billing-runs/not-a-uuid/gmail-delivery-state",
+            headers=auth,
+        )
+
+        assert unauthenticated.status_code == 401
+        assert employee.status_code == 403
+        assert expired.status_code == 401
+        assert authenticated.status_code == 422
+        assert calls == []
+
+    def test_commercial_billing_delivery_state_read_is_retry_safe_without_local_state(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        provider_result = {
+            "billingRunId": billing_run_id,
+            "items": [],
+            "limit": 50,
+            "offset": 0,
+            "total": 0,
+        }
+        calls = []
+
+        def flaky_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("upstream timeout")
+            return _AtlasResponse(provider_result)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda *_args, **_kwargs: pytest.fail(
+                "a delivery-state read must not create a local audit write"
+            ),
+        )
+        path = (
+            "/api/admin/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/gmail-delivery-state"
+        )
+
+        failed = client.get(path, headers=auth)
+        recovered = client.get(path, headers=auth)
+
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "5"
+        assert recovered.status_code == 200
+        assert recovered.json() == provider_result
+        assert [call[0] for call in calls] == ["GET", "GET"]
+        assert calls[0][1] == calls[1][1] == (
+            "https://atlas.test/api/v1/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/gmail-delivery-state"
+        )
+        for _method, _url, kwargs in calls:
+            assert "Idempotency-Key" not in kwargs["headers"]
+            assert kwargs["json"] is None
+            assert kwargs["params"] == {"limit": 50, "offset": 0}
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
 
     def test_forwards_idempotency_key_and_check_metadata_on_payment_write(
         self, client, auth, monkeypatch

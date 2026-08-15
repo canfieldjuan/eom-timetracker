@@ -3471,6 +3471,10 @@ ATLAS_RECEIVABLES_GENERATED_TOKEN_PREFIX = "eomrx_v1_"
 ATLAS_RECEIVABLES_GENERATED_TOKEN_RANDOM_LENGTH = 43
 ATLAS_RECEIVABLES_TOKEN_RANDOM_PATTERN = r"[A-Za-z0-9_-]+"
 ATLAS_RECEIVABLES_API_PATH_SUFFIX = "/api/v1"
+# PostgreSQL's signed bigint ceiling, matching the deployed ATLAS delivery-state
+# reader. Validate it here so an oversized browser offset never becomes a remote
+# request or a misleading provider-availability failure.
+ATLAS_RECEIVABLES_MAX_DELIVERY_STATE_OFFSET = 9_223_372_036_854_775_807
 ATLAS_FUNNEL_BASE_URL = os.getenv("ATLAS_FUNNEL_BASE_URL", "").strip().rstrip("/")
 ATLAS_FUNNEL_SERVICE_TOKEN = os.getenv("ATLAS_FUNNEL_SERVICE_TOKEN", "").strip()
 ATLAS_FUNNEL_TIMEOUT_SECONDS = max(
@@ -9302,6 +9306,32 @@ def receivables_commercial_billing_run_reconciliation(
         "GET",
         f"/receivables/commercial-billing-runs/{billing_run_id}/reconciliation",
         admin,
+    )
+
+
+@app.get(
+    "/api/admin/receivables/commercial-billing-runs/"
+    "{billing_run_id}/gmail-delivery-state"
+)
+def receivables_commercial_billing_run_gmail_delivery_state(
+    billing_run_id: UUID,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        le=ATLAS_RECEIVABLES_MAX_DELIVERY_STATE_OFFSET,
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Read ATLAS's durable Gmail delivery state without changing it."""
+    return _atlas_receivables_request(
+        "GET",
+        (
+            "/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/gmail-delivery-state"
+        ),
+        admin,
+        params={"limit": limit, "offset": offset},
     )
 
 
