@@ -995,6 +995,366 @@ class TestReceivablesProxy:
             "Billing delivery preference accepted by Atlas for Juan Canfield",
         )
 
+    @pytest.mark.parametrize(
+        "reference",
+        [
+            "SQ-2026-0001",
+            " SQ-2026-TRIMMED ",
+            "S" * 256,
+        ],
+    )
+    def test_manual_square_reference_model_accepts_only_provider_safe_text(self, reference):
+        import time_tracker_api as api
+
+        payload = api.CommercialBillingManualSquareReferenceRequest.model_validate(
+            {"square_invoice_reference": reference}
+        )
+
+        assert payload.square_invoice_reference == reference.strip()
+
+    @pytest.mark.parametrize(
+        "reference",
+        [
+            "",
+            "   ",
+            "S" * 257,
+            "SQ\r2026",
+            "SQ\n2026",
+            "SQ\x002026",
+            2026,
+        ],
+    )
+    def test_manual_square_reference_model_rejects_unsafe_or_coercive_text(self, reference):
+        import time_tracker_api as api
+
+        with pytest.raises(api.ValidationError):
+            api.CommercialBillingManualSquareReferenceRequest.model_validate(
+                {"square_invoice_reference": reference}
+            )
+
+    def test_manual_square_queue_reference_and_sent_actions_proxy_without_local_state(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        approval_id = "11111111-1111-1111-1111-111111111111"
+        queue_result = {
+            "items": [
+                {
+                    "approvalId": approval_id,
+                    "customerName": "Acme Office",
+                    "state": "needs_square_invoice",
+                }
+            ],
+            "limit": 25,
+            "offset": 50,
+            "total": 1,
+        }
+        reference_result = {
+            "manualSquareInvoice": {
+                "approvalId": approval_id,
+                "squareInvoiceReference": "SQ-2026-0001",
+                "state": "reference_recorded",
+            },
+            "replayed": False,
+            "reused": False,
+        }
+        sent_result = {
+            "manualSquareInvoice": {
+                "approvalId": approval_id,
+                "state": "sent_via_square",
+            },
+            "replayed": False,
+            "reused": False,
+        }
+        calls = []
+        audits = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if url.endswith("/manual-square-invoices"):
+                return _AtlasResponse(queue_result)
+            if url.endswith("/manual-square-invoice-reference"):
+                return _AtlasResponse(reference_result, status_code=201)
+            return _AtlasResponse(sent_result)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        queue = client.get(
+            "/api/admin/receivables/commercial-billing/manual-square-invoices",
+            params={"limit": 25, "offset": 50},
+            headers=auth,
+        )
+        recorded = client.post(
+            "/api/admin/receivables/commercial-billing-approvals/"
+            f"{approval_id}/manual-square-invoice-reference",
+            headers={**auth, "Idempotency-Key": "square-reference-2026-0001"},
+            json={"square_invoice_reference": " SQ-2026-0001 "},
+        )
+        sent = client.post(
+            "/api/admin/receivables/commercial-billing-approvals/"
+            f"{approval_id}/manual-square-invoice/mark-sent",
+            headers={**auth, "Idempotency-Key": "square-sent-2026-0001"},
+        )
+
+        assert queue.status_code == 200
+        assert queue.json() == queue_result
+        assert recorded.status_code == 201
+        assert recorded.json() == reference_result
+        assert sent.status_code == 200
+        assert sent.json() == sent_result
+        assert GENERATED_RECEIVABLES_TOKEN not in queue.text
+        assert GENERATED_RECEIVABLES_TOKEN not in recorded.text
+        assert GENERATED_RECEIVABLES_TOKEN not in sent.text
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert [call[0] for call in calls] == ["GET", "POST", "POST"]
+        assert calls[0][1] == (
+            "https://atlas.test/api/v1/receivables/"
+            "commercial-billing/manual-square-invoices"
+        )
+        assert calls[0][2]["params"] == {"limit": 25, "offset": 50}
+        assert calls[0][2]["json"] is None
+        assert "Idempotency-Key" not in calls[0][2]["headers"]
+        assert calls[1][1].endswith(
+            f"commercial-billing-approvals/{approval_id}/"
+            "manual-square-invoice-reference"
+        )
+        assert calls[1][2]["headers"]["Idempotency-Key"] == "square-reference-2026-0001"
+        assert calls[1][2]["json"] == {
+            "square_invoice_reference": "SQ-2026-0001"
+        }
+        assert calls[2][1].endswith(
+            f"commercial-billing-approvals/{approval_id}/"
+            "manual-square-invoice/mark-sent"
+        )
+        assert calls[2][2]["headers"]["Idempotency-Key"] == "square-sent-2026-0001"
+        assert calls[2][2]["json"] is None
+        for _method, _url, kwargs in calls:
+            assert kwargs["headers"]["Authorization"] == (
+                f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
+            )
+            assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert audits == [
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_MANUAL_SQUARE_REFERENCE_RECORD",
+                True,
+                "Manual Square invoice reference accepted by Atlas for Juan Canfield",
+            ),
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_MANUAL_SQUARE_SENT",
+                True,
+                "Manual Square invoice sent status accepted by Atlas for Juan Canfield",
+            ),
+        ]
+
+    def test_manual_square_sent_action_survives_local_audit_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        approval_id = "11111111-1111-1111-1111-111111111111"
+        provider_result = {
+            "manualSquareInvoice": {
+                "approvalId": approval_id,
+                "state": "sent_via_square",
+            },
+            "replayed": False,
+            "reused": False,
+        }
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: _AtlasResponse(provider_result),
+        )
+        def unavailable_audit(*_args, **_kwargs):
+            raise OSError("access-log storage unavailable")
+
+        monkeypatch.setattr(api, "append_access_log", unavailable_audit)
+
+        response = client.post(
+            "/api/admin/receivables/commercial-billing-approvals/"
+            f"{approval_id}/manual-square-invoice/mark-sent",
+            headers={**auth, "Idempotency-Key": "square-sent-audit-failure"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == provider_result
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+
+    def test_manual_square_routes_reject_stale_sessions_and_invalid_input_before_atlas(
+        self, client, auth, emp_auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        approval_id = "11111111-1111-1111-1111-111111111111"
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+        expired_token = api.jwt.encode(
+            {"sub": "1", "name": "Juan Canfield", "role": "admin", "exp": 1},
+            api.JWT_SECRET,
+            algorithm=api.JWT_ALGORITHM,
+        )
+        queue_path = "/api/admin/receivables/commercial-billing/manual-square-invoices"
+        reference_path = (
+            "/api/admin/receivables/commercial-billing-approvals/"
+            f"{approval_id}/manual-square-invoice-reference"
+        )
+        sent_path = (
+            "/api/admin/receivables/commercial-billing-approvals/"
+            f"{approval_id}/manual-square-invoice/mark-sent"
+        )
+
+        unauthenticated = client.get(queue_path)
+        employee = client.post(
+            reference_path,
+            headers={**emp_auth, "Idempotency-Key": "employee-reference"},
+            json={"square_invoice_reference": "SQ-2026-0001"},
+        )
+        expired = client.post(
+            reference_path,
+            headers={
+                "Authorization": f"Bearer {expired_token}",
+                "Idempotency-Key": "expired-reference",
+            },
+            json={"square_invoice_reference": "SQ-2026-0001"},
+        )
+        invalid_query = client.get(queue_path, params={"limit": 101}, headers=auth)
+        invalid_approval = client.post(
+            "/api/admin/receivables/commercial-billing-approvals/not-a-uuid/"
+            "manual-square-invoice-reference",
+            headers={**auth, "Idempotency-Key": "invalid-approval"},
+            json={"square_invoice_reference": "SQ-2026-0001"},
+        )
+        missing_reference_key = client.post(
+            reference_path,
+            headers=auth,
+            json={"square_invoice_reference": "SQ-2026-0001"},
+        )
+        unsafe_reference = client.post(
+            reference_path,
+            headers={**auth, "Idempotency-Key": "unsafe-reference"},
+            json={"square_invoice_reference": "SQ\n2026"},
+        )
+        missing_sent_key = client.post(sent_path, headers=auth)
+
+        assert unauthenticated.status_code == 401
+        assert employee.status_code == 403
+        assert expired.status_code == 401
+        assert invalid_query.status_code == 422
+        assert invalid_approval.status_code == 422
+        assert missing_reference_key.status_code == 422
+        assert unsafe_reference.status_code == 422
+        assert missing_sent_key.status_code == 422
+        assert calls == []
+
+    def test_manual_square_reference_retry_reuses_provider_key_after_ambiguous_transport_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        approval_id = "11111111-1111-1111-1111-111111111111"
+        provider_result = {
+            "manualSquareInvoice": {
+                "approvalId": approval_id,
+                "squareInvoiceReference": "SQ-2026-0001",
+                "state": "reference_recorded",
+            },
+            "replayed": True,
+            "reused": False,
+        }
+        calls = []
+        audits = []
+
+        def flaky_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("upstream timeout")
+            return _AtlasResponse(provider_result, status_code=201)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+        path = (
+            "/api/admin/receivables/commercial-billing-approvals/"
+            f"{approval_id}/manual-square-invoice-reference"
+        )
+        headers = {**auth, "Idempotency-Key": "square-reference-retry"}
+
+        failed = client.post(
+            path,
+            headers=headers,
+            json={"square_invoice_reference": "SQ-2026-0001"},
+        )
+        recovered = client.post(
+            path,
+            headers=headers,
+            json={"square_invoice_reference": "SQ-2026-0001"},
+        )
+
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "5"
+        assert recovered.status_code == 201
+        assert recovered.json() == provider_result
+        assert [call[0] for call in calls] == ["POST", "POST"]
+        assert calls[0][1] == calls[1][1]
+        assert calls[0][2]["headers"]["Idempotency-Key"] == calls[1][2][
+            "headers"
+        ]["Idempotency-Key"] == "square-reference-retry"
+        assert calls[0][2]["json"] == calls[1][2]["json"] == {
+            "square_invoice_reference": "SQ-2026-0001"
+        }
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert audits[0][0:2] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_MANUAL_SQUARE_REFERENCE_RECORD",
+            False,
+        )
+        assert "Atlas request for Juan Canfield failed (503)" in audits[0][2]
+        assert audits[1] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_MANUAL_SQUARE_REFERENCE_RECORD",
+            True,
+            "Manual Square invoice reference accepted by Atlas for Juan Canfield",
+        )
+
     def test_commercial_billing_run_create_forwards_provider_idempotency_and_keeps_no_snapshot(
         self, client, auth, monkeypatch
     ):

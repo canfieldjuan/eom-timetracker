@@ -3305,6 +3305,33 @@ class CommercialBillingDeliveryPreferenceRequest(BaseModel):
     ]
 
 
+class CommercialBillingManualSquareReferenceRequest(BaseModel):
+    """Admission boundary for one external invoice reference owned by ATLAS."""
+
+    square_invoice_reference: str = Field(min_length=1, max_length=256)
+
+    @field_validator("square_invoice_reference", mode="before")
+    @classmethod
+    def normalize_safe_square_invoice_reference(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("square_invoice_reference must be a string")
+        reference = value.strip()
+        # CLOSED + ENUMERATED: this deliberately mirrors the deployed ATLAS
+        # provider boundary.  Unknown control characters are not normalized or
+        # passed through a manager portal audit log.
+        if (
+            not reference
+            or len(reference) > 256
+            or "\r" in reference
+            or "\n" in reference
+            or "\x00" in reference
+        ):
+            raise ValueError(
+                "square_invoice_reference must contain 1 to 256 safe characters"
+            )
+        return reference
+
+
 VALID_NON_PRODUCTIVE_TYPES = ("drive_time", "waiting", "supply_run", "rework", "lockout", "other")
 
 
@@ -8984,6 +9011,21 @@ def receivables_commercial_billing_candidates(
     )
 
 
+@app.get("/api/admin/receivables/commercial-billing/manual-square-invoices")
+def receivables_commercial_billing_manual_square_invoices(
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Read one bounded ATLAS-owned Manual Square delivery-work page."""
+    return _atlas_receivables_request(
+        "GET",
+        "/receivables/commercial-billing/manual-square-invoices",
+        admin,
+        params={"limit": limit, "offset": offset},
+    )
+
+
 @app.get("/api/admin/receivables/commercial-billing-delivery-preferences/{contact_id}")
 def receivables_commercial_billing_delivery_preference(
     contact_id: UUID,
@@ -9014,6 +9056,65 @@ def receivables_set_commercial_billing_delivery_preference(
         f"/receivables/commercial-billing-delivery-preferences/{contact_id}",
         admin,
         payload=payload.model_dump(mode="json"),
+    )
+
+
+@app.post(
+    "/api/admin/receivables/commercial-billing-approvals/"
+    "{approval_id}/manual-square-invoice-reference",
+    status_code=201,
+)
+def receivables_record_commercial_billing_manual_square_invoice_reference(
+    approval_id: UUID,
+    payload: CommercialBillingManualSquareReferenceRequest,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Record a provider-owned Square reference without marking it sent."""
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_MANUAL_SQUARE_REFERENCE_RECORD",
+        f"Manual Square invoice reference accepted by Atlas for {actor}",
+        "POST",
+        (
+            "/receivables/commercial-billing-approvals/"
+            f"{approval_id}/manual-square-invoice-reference"
+        ),
+        admin,
+        payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post(
+    "/api/admin/receivables/commercial-billing-approvals/"
+    "{approval_id}/manual-square-invoice/mark-sent"
+)
+def receivables_mark_commercial_billing_manual_square_invoice_sent(
+    approval_id: UUID,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Explicitly record ATLAS's provider-owned sent-via-Square transition."""
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_MANUAL_SQUARE_SENT",
+        f"Manual Square invoice sent status accepted by Atlas for {actor}",
+        "POST",
+        (
+            "/receivables/commercial-billing-approvals/"
+            f"{approval_id}/manual-square-invoice/mark-sent"
+        ),
+        admin,
+        idempotency_key=idempotency_key,
     )
 
 
