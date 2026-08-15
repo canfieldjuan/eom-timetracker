@@ -892,6 +892,125 @@ def test_admin_legacy_inventory_endpoint_is_admin_only_and_read_only(
     assert after == before
 
 
+def test_admin_legacy_mapping_apply_creates_policy_revisions_idempotently(
+    client,
+    auth,
+    emp_auth,
+    employee_id,
+    location_id,
+):
+    scheduled_start = datetime(2049, 7, 20, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+    recurring = create_recurring_schedule_rule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        weekdays=[0, 2],
+        starts_on="2049-07-19",
+    )
+    job_id = create_canonical_job(
+        location_id,
+        scheduled_start,
+        suffix="arrival-policy-mapping-apply",
+    )
+    inventory = client.get(
+        "/api/admin/arrival-policy/legacy-inventory",
+        headers=auth,
+    ).json()
+    mapping = json.loads(json.dumps(inventory["ownerMappingTemplate"]))
+    mapping["ownerReviewedBy"] = "Juan Canfield"
+    mapping["ownerReviewedAt"] = "2049-07-19T12:00:00Z"
+    for entry in mapping["entries"]:
+        entry["reviewNote"] = "Owner reviewed this legacy policy source"
+        if entry["legacyKey"] == f"exact:{exact['id']}":
+            entry.update(
+                {
+                    "disposition": "map_to_appointment",
+                    "targetJobId": job_id,
+                    "policy": {
+                        "mode": "fixed",
+                        "timezone": "America/Chicago",
+                        "fixedArrival": "07:00",
+                        "graceMinutes": 10,
+                    },
+                }
+            )
+        elif entry["legacyKey"] == f"recurring:{recurring['id']}":
+            entry.update(
+                {
+                    "disposition": "promote_to_site",
+                    "ownerConfirmedSitePromotion": True,
+                    "policy": {
+                        "mode": "window",
+                        "timezone": "America/Chicago",
+                        "windowStart": "06:30",
+                        "windowEnd": "08:30",
+                    },
+                }
+            )
+        else:
+            entry["disposition"] = "needs_review"
+
+    endpoint = "/api/admin/arrival-policy/legacy-mapping/apply"
+    assert client.post(endpoint, json=mapping).status_code == 401
+    assert client.post(endpoint, headers=emp_auth, json=mapping).status_code == 403
+
+    created = client.post(endpoint, headers=auth, json=mapping)
+    assert created.status_code == 200, created.text
+    created_body = created.json()
+    assert created_body["success"] is True
+    assert created_body["inventoryFingerprint"] == inventory["inventoryFingerprint"]
+    assert {row["legacyKey"] for row in created_body["applied"]} == {
+        f"exact:{exact['id']}",
+        f"recurring:{recurring['id']}",
+    }
+    assert {row["status"] for row in created_body["applied"]} == {"created"}
+    assert created_body["skipped"] == []
+
+    rows = db.query_all(
+        """
+        SELECT scope_type, site_id, job_id, version, state, mode,
+               fixed_arrival, grace_minutes, window_start, window_end,
+               created_by_name
+        FROM arrival_policy_revisions
+        ORDER BY scope_type, job_id NULLS FIRST
+        """
+    )
+    assert len(rows) == 2
+    site_row = next(row for row in rows if row["scope_type"] == "site")
+    appointment_row = next(row for row in rows if row["scope_type"] == "appointment")
+    assert site_row["site_id"] == location_id
+    assert site_row["job_id"] is None
+    assert site_row["version"] == 1
+    assert site_row["state"] == "active"
+    assert site_row["mode"] == "window"
+    assert site_row["window_start"].strftime("%H:%M") == "06:30"
+    assert site_row["window_end"].strftime("%H:%M") == "08:30"
+    assert appointment_row["job_id"] == job_id
+    assert appointment_row["version"] == 1
+    assert appointment_row["state"] == "active"
+    assert appointment_row["mode"] == "fixed"
+    assert appointment_row["fixed_arrival"].strftime("%H:%M") == "07:00"
+    assert appointment_row["grace_minutes"] == 10
+
+    repeated = client.post(endpoint, headers=auth, json=mapping)
+    assert repeated.status_code == 200, repeated.text
+    repeated_body = repeated.json()
+    assert {row["status"] for row in repeated_body["applied"]} == {
+        "already_applied"
+    }
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM arrival_policy_revisions"
+    )["count"] == 2
+
+
 def test_admin_legacy_inventory_uses_one_repeatable_read_snapshot():
     import inspect
     import time_tracker_api

@@ -11563,6 +11563,233 @@ def admin_arrival_policy_legacy_inventory(
     }
 
 
+def _arrival_policy_mapping_change_note(entry: Dict[str, Any]) -> str:
+    note = str(entry.get("reviewNote") or "").strip()
+    legacy_key = str(entry.get("legacyKey") or "").strip()
+    change_note = f"Legacy arrival migration {legacy_key}: {note}"
+    return change_note[:500]
+
+
+def _arrival_policy_request_from_mapping(
+    entry: Dict[str, Any],
+) -> ArrivalPolicyPutRequest:
+    policy = entry.get("policy")
+    if not isinstance(policy, dict):
+        raise ValueError("policy is required")
+    return ArrivalPolicyPutRequest(
+        mode=str(policy.get("mode") or ""),
+        timezone=str(policy.get("timezone") or ""),
+        fixedArrival=policy.get("fixedArrival"),
+        graceMinutes=policy.get("graceMinutes"),
+        windowStart=policy.get("windowStart"),
+        windowEnd=policy.get("windowEnd"),
+        notBefore=policy.get("notBefore"),
+        changeNote=_arrival_policy_mapping_change_note(entry),
+    )
+
+
+def _arrival_policy_matches_payload(
+    current: Optional[Dict[str, Any]],
+    payload: ArrivalPolicyPutRequest,
+) -> bool:
+    if current is None or current.get("state") != "active":
+        return False
+    return (
+        current.get("mode") == payload.mode
+        and current.get("timezone") == payload.timezone
+        and current.get("fixed_arrival") == payload.fixedArrival
+        and current.get("grace_minutes") == payload.graceMinutes
+        and current.get("window_start") == payload.windowStart
+        and current.get("window_end") == payload.windowEnd
+        and current.get("not_before") == payload.notBefore
+    )
+
+
+def _apply_arrival_policy_mapping_revision(
+    cur: Any,
+    *,
+    scope_type: str,
+    target_id: int,
+    payload: ArrivalPolicyPutRequest,
+    admin: Dict[str, Any],
+) -> Dict[str, Any]:
+    site_id, job_id = _arrival_policy_scope_target(
+        cur,
+        scope_type=scope_type,
+        target_id=target_id,
+        for_update=True,
+        require_canonical_appointment=scope_type == "appointment",
+    )
+    lock_identity = (
+        f"arrival-policy:{scope_type}:{job_id if job_id is not None else site_id}"
+    )
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_identity,))
+    current = arrival_policies.latest_revision(
+        cur,
+        scope_type=scope_type,
+        site_id=site_id,
+        job_id=job_id,
+        for_update=True,
+    )
+    if _arrival_policy_matches_payload(current, payload):
+        return {
+            "status": "already_applied",
+            "policyRevisionId": int(current["id"]),
+            "siteId": site_id,
+            "jobId": job_id,
+        }
+    if current is not None and current.get("state") == "active":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "arrival_policy_mapping_target_conflict",
+                "message": "Arrival policy target already has a different active policy",
+                "details": {
+                    "scopeType": scope_type,
+                    "siteId": site_id,
+                    "jobId": job_id,
+                },
+            },
+        )
+
+    version = int(current["version"]) + 1 if current is not None else 1
+    created_at = utc_now()
+    update_token = arrival_policies.policy_update_token(
+        scope_type,
+        site_id,
+        job_id,
+        version,
+        created_at,
+    )
+    cur.execute(
+        """
+        INSERT INTO arrival_policy_revisions (
+            scope_type, site_id, job_id, version, state, mode,
+            timezone, fixed_arrival, grace_minutes, window_start,
+            window_end, not_before, update_token, change_note,
+            created_by, created_by_name, created_at
+        )
+        VALUES (
+            %s, %s, %s, %s, 'active', %s,
+            %s, %s, %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s
+        )
+        RETURNING id
+        """,
+        (
+            scope_type,
+            site_id,
+            job_id,
+            version,
+            payload.mode,
+            payload.timezone,
+            payload.fixedArrival,
+            payload.graceMinutes,
+            payload.windowStart,
+            payload.windowEnd,
+            payload.notBefore,
+            update_token,
+            payload.changeNote,
+            int(admin["id"]),
+            str(admin["name"]),
+            created_at,
+        ),
+    )
+    return {
+        "status": "created",
+        "policyRevisionId": int(cur.fetchone()["id"]),
+        "siteId": site_id,
+        "jobId": job_id,
+    }
+
+
+@app.post("/api/admin/arrival-policy/legacy-mapping/apply")
+def admin_apply_arrival_policy_legacy_mapping(
+    mapping: Dict[str, Any],
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            inventory = arrival_policy_inventory.build_inventory(
+                conn,
+                as_of=utc_now(),
+            )
+            errors = arrival_policy_inventory.validate_owner_mapping(
+                inventory,
+                mapping,
+            )
+            if errors:
+                stale = any("inventoryFingerprint" in error for error in errors)
+                raise HTTPException(
+                    status_code=409 if stale else 422,
+                    detail={
+                        "code": "invalid_arrival_policy_legacy_mapping",
+                        "errors": errors,
+                    },
+                )
+            source_rows = {
+                row["legacyKey"]: row
+                for row in [
+                    *inventory.get("activeFutureExactSchedules", []),
+                    *inventory.get("activeOpenRecurringRules", []),
+                ]
+            }
+            applied: List[Dict[str, Any]] = []
+            skipped: List[Dict[str, Any]] = []
+            for entry in sorted(
+                mapping.get("entries", []),
+                key=lambda item: str(item.get("legacyKey") or ""),
+            ):
+                disposition = str(entry.get("disposition") or "")
+                legacy_key = str(entry.get("legacyKey") or "")
+                source = source_rows[legacy_key]
+                if disposition not in {"map_to_appointment", "promote_to_site"}:
+                    skipped.append(
+                        {
+                            "legacyKey": legacy_key,
+                            "disposition": disposition,
+                        }
+                    )
+                    continue
+                if disposition == "map_to_appointment":
+                    scope_type = "appointment"
+                    target_id = int(entry["targetJobId"])
+                else:
+                    scope_type = "site"
+                    target_id = int(source["siteId"])
+                payload = _arrival_policy_request_from_mapping(entry)
+                result = _apply_arrival_policy_mapping_revision(
+                    cur,
+                    scope_type=scope_type,
+                    target_id=target_id,
+                    payload=payload,
+                    admin=admin,
+                )
+                applied.append(
+                    {
+                        "legacyKey": legacy_key,
+                        "disposition": disposition,
+                        "scopeType": scope_type,
+                        **result,
+                    }
+                )
+    append_access_log(
+        request,
+        "ARRIVAL_POLICY_LEGACY_MAPPING_APPLIED",
+        True,
+        f"Admin {admin['name']} applied {len(applied)} legacy arrival policy mappings",
+    )
+    return {
+        "success": True,
+        "inventoryFingerprint": mapping.get("inventoryFingerprint"),
+        "applied": applied,
+        "skipped": skipped,
+    }
+
+
 def admin_create_site_check_in_schedule(
     payload: SiteCheckInScheduleRequest,
     request: Request,
