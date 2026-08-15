@@ -11128,6 +11128,17 @@ def _arrival_policy_scope_target(
                 "details": {"jobId": target_id},
             },
         )
+    if for_update and require_canonical_appointment:
+        cur.execute(
+            """
+            SELECT id
+            FROM locations
+            WHERE id = %s
+            FOR SHARE
+            """,
+            (job["location_id"],),
+        )
+        cur.fetchone()
     if require_canonical_appointment and not bool(
         job.get("is_canonical_appointment")
     ):

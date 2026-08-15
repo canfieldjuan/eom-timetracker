@@ -464,4 +464,10 @@ def validate_owner_mapping(
 def _mapping_time(value: Any) -> Optional[time]:
     if value is None:
         return None
-    return time.fromisoformat(str(value))
+    if isinstance(value, time):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("arrival policy times must use HH:MM syntax")
+    if len(value) != 5 or value[2] != ":":
+        raise ValueError("arrival policy times must use HH:MM syntax")
+    return time.fromisoformat(value)

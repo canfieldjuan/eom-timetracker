@@ -778,8 +778,19 @@ def test_read_only_inventory_requires_explicit_owner_dispositions(
         if entry["legacyKey"] == f"exact:{exact['id']}"
     )["policy"]["fixedArrival"] = "07:00:01"
     assert any(
-        "fixed_arrival must use HH:MM precision" in error
+        "arrival policy times must use HH:MM syntax" in error
         for error in validate_owner_mapping(inventory, seconds_mapping)
+    )
+
+    basic_iso_time_mapping = json.loads(json.dumps(mapping))
+    next(
+        entry
+        for entry in basic_iso_time_mapping["entries"]
+        if entry["legacyKey"] == f"exact:{exact['id']}"
+    )["policy"]["fixedArrival"] = "0700"
+    assert any(
+        "arrival policy times must use HH:MM syntax" in error
+        for error in validate_owner_mapping(inventory, basic_iso_time_mapping)
     )
 
     grace_mapping = json.loads(json.dumps(mapping))
@@ -937,6 +948,43 @@ def test_admin_legacy_inventory_endpoint_is_admin_only_and_read_only(
         ],
     }
     assert after == before
+
+
+def test_canonical_appointment_scope_locks_site_row_before_policy_write():
+    class FakeCursor:
+        def __init__(self):
+            self.sql: list[str] = []
+            self.params: list[tuple] = []
+            self.rows = [
+                {
+                    "id": 17,
+                    "location_id": 23,
+                    "is_canonical_appointment": True,
+                },
+                {"id": 23},
+            ]
+
+        def execute(self, sql, params=()):
+            self.sql.append(sql)
+            self.params.append(tuple(params))
+
+        def fetchone(self):
+            return self.rows.pop(0)
+
+    cur = FakeCursor()
+
+    site_id, job_id = time_tracker_api._arrival_policy_scope_target(
+        cur,
+        scope_type="appointment",
+        target_id=17,
+        for_update=True,
+        require_canonical_appointment=True,
+    )
+
+    assert (site_id, job_id) == (23, 17)
+    assert cur.params[1] == (23,)
+    assert "FROM locations" in cur.sql[1]
+    assert "FOR SHARE" in cur.sql[1]
 
 
 def test_legacy_inventory_fingerprint_ignores_live_history_counts(
