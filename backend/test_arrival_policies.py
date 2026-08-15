@@ -797,3 +797,104 @@ def test_read_only_inventory_requires_explicit_owner_dispositions(
         "duplicates appointment policy target" in error
         for error in validate_owner_mapping(inventory, duplicate_target)
     )
+
+
+def test_admin_legacy_inventory_endpoint_is_admin_only_and_read_only(
+    client,
+    auth,
+    emp_auth,
+    employee_id,
+    location_id,
+):
+    scheduled_start = datetime(2049, 7, 19, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+    recurring = create_recurring_schedule_rule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        weekdays=[0],
+        starts_on="2049-07-19",
+    )
+    job_id = create_canonical_job(
+        location_id,
+        scheduled_start,
+        suffix="arrival-policy-inventory-api",
+    )
+    endpoint = "/api/admin/arrival-policy/legacy-inventory"
+
+    assert client.get(endpoint).status_code == 401
+    assert client.get(endpoint, headers=emp_auth).status_code == 403
+
+    before = {
+        "exact": db.query_one(
+            "SELECT COUNT(*) AS count FROM site_check_in_schedules"
+        )["count"],
+        "recurring": db.query_one(
+            "SELECT COUNT(*) AS count FROM site_check_in_schedule_rules"
+        )["count"],
+        "policies": db.query_one(
+            "SELECT COUNT(*) AS count FROM arrival_policy_revisions"
+        )["count"],
+        "checkIns": db.query_one("SELECT COUNT(*) AS count FROM site_check_ins")[
+            "count"
+        ],
+    }
+
+    response = client.get(endpoint, headers=auth)
+    assert response.status_code == 200, response.text
+    inventory = response.json()
+    assert inventory["databaseReadOnly"] is True
+    assert inventory["schemaVersion"] == 1
+    assert len(inventory["inventoryFingerprint"]) == 64
+    exact_row = next(
+        row
+        for row in inventory["activeFutureExactSchedules"]
+        if row["legacyId"] == exact["id"]
+    )
+    recurring_row = next(
+        row
+        for row in inventory["activeOpenRecurringRules"]
+        if row["legacyId"] == recurring["id"]
+    )
+    assert exact_row["candidateJobIds"] == [job_id]
+    assert exact_row["eligibleAppointmentJobId"] == job_id
+    assert recurring_row["timezoneValid"] is True
+    assert any(
+        entry["legacyKey"] == f"exact:{exact['id']}"
+        for entry in inventory["ownerMappingTemplate"]["entries"]
+    )
+    assert any(
+        entry["legacyKey"] == f"recurring:{recurring['id']}"
+        for entry in inventory["ownerMappingTemplate"]["entries"]
+    )
+
+    after = {
+        "exact": db.query_one(
+            "SELECT COUNT(*) AS count FROM site_check_in_schedules"
+        )["count"],
+        "recurring": db.query_one(
+            "SELECT COUNT(*) AS count FROM site_check_in_schedule_rules"
+        )["count"],
+        "policies": db.query_one(
+            "SELECT COUNT(*) AS count FROM arrival_policy_revisions"
+        )["count"],
+        "checkIns": db.query_one("SELECT COUNT(*) AS count FROM site_check_ins")[
+            "count"
+        ],
+    }
+    assert after == before
+
+
+def test_admin_legacy_inventory_uses_one_repeatable_read_snapshot():
+    import inspect
+    import time_tracker_api
+
+    source = inspect.getsource(time_tracker_api.admin_arrival_policy_legacy_inventory)
+    assert "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY" in source
