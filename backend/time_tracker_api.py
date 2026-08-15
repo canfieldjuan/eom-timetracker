@@ -11794,6 +11794,7 @@ def admin_apply_arrival_policy_legacy_mapping(
     retryable_errors = (
         psycopg2.errors.SerializationFailure,
         psycopg2.errors.UniqueViolation,
+        psycopg2.errors.DeadlockDetected,
     )
     for attempt in range(2):
         try:

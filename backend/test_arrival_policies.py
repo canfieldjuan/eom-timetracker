@@ -793,6 +793,17 @@ def test_read_only_inventory_requires_explicit_owner_dispositions(
         for error in validate_owner_mapping(inventory, grace_mapping)
     )
 
+    fractional_grace_mapping = json.loads(json.dumps(mapping))
+    next(
+        entry
+        for entry in fractional_grace_mapping["entries"]
+        if entry["legacyKey"] == f"exact:{exact['id']}"
+    )["policy"]["graceMinutes"] = 10.5
+    assert any(
+        "grace_minutes must be an integer" in error
+        for error in validate_owner_mapping(inventory, fractional_grace_mapping)
+    )
+
     truthy_site_confirmation = json.loads(json.dumps(mapping))
     recurring_mapping = next(
         entry
@@ -926,6 +937,79 @@ def test_admin_legacy_inventory_endpoint_is_admin_only_and_read_only(
         ],
     }
     assert after == before
+
+
+def test_legacy_inventory_fingerprint_ignores_live_history_counts(
+    client,
+    auth,
+    employee_id,
+    location_id,
+):
+    scheduled_start = datetime(2049, 7, 20, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+
+    conn = _raw_conn()
+    try:
+        before = build_inventory(
+            conn,
+            as_of=datetime(2049, 7, 19, 12, 0, tzinfo=timezone.utc),
+        )
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO site_check_ins (
+                employee_id, location_id, device_scanned_at, latitude, longitude,
+                accuracy_m, geofence_radius_m, distance_m, geofence_status,
+                classification, classification_reason, schedule_id,
+                scheduled_start, grace_minutes, device_clock_skew_seconds,
+                review_status
+            )
+            VALUES (
+                %s, %s, %s, 39.1203, -88.54335,
+                5.0, 100, 0, 'inside',
+                'on_time', 'legacy_exact', %s,
+                %s, 10, 0,
+                'not_required'
+            )
+            """,
+            (
+                employee_id,
+                location_id,
+                scheduled_start,
+                exact["id"],
+                scheduled_start,
+            ),
+        )
+        conn.commit()
+        after = build_inventory(
+            conn,
+            as_of=datetime(2049, 7, 19, 12, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        conn.close()
+
+    before_exact = next(
+        row
+        for row in before["activeFutureExactSchedules"]
+        if row["legacyId"] == exact["id"]
+    )
+    after_exact = next(
+        row
+        for row in after["activeFutureExactSchedules"]
+        if row["legacyId"] == exact["id"]
+    )
+    assert before_exact["historyReferenceCount"] == 0
+    assert after_exact["historyReferenceCount"] == 1
+    assert after["historyReferences"] == [
+        {"legacyKey": f"exact:{exact['id']}", "checkInCount": 1}
+    ]
+    assert before["inventoryFingerprint"] == after["inventoryFingerprint"]
 
 
 def test_admin_legacy_mapping_apply_creates_policy_revisions_idempotently(
@@ -1078,12 +1162,20 @@ def test_admin_legacy_mapping_apply_creates_policy_revisions_idempotently(
     )["count"] == 3
 
 
-def test_admin_legacy_mapping_apply_retries_after_unique_race(
+@pytest.mark.parametrize(
+    "retryable_error",
+    [
+        psycopg2.errors.UniqueViolation,
+        psycopg2.errors.DeadlockDetected,
+    ],
+)
+def test_admin_legacy_mapping_apply_retries_after_database_race(
     client,
     auth,
     employee_id,
     location_id,
     monkeypatch,
+    retryable_error,
 ):
     scheduled_start = datetime(2049, 7, 21, 12, 0, tzinfo=timezone.utc)
     exact = create_arrival_schedule(
@@ -1129,7 +1221,7 @@ def test_admin_legacy_mapping_apply_retries_after_unique_race(
     def fail_once_then_apply(*args, **kwargs):
         if calls["count"] == 0:
             calls["count"] += 1
-            raise psycopg2.errors.UniqueViolation()
+            raise retryable_error()
         return original(*args, **kwargs)
 
     monkeypatch.setattr(

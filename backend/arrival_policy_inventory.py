@@ -54,14 +54,37 @@ def _query_all(conn: Any, sql: str, params: Iterable[Any] = ()) -> List[Dict[str
         return [dict(row) for row in cur.fetchall()]
 
 
+VOLATILE_FINGERPRINT_KEYS = {
+    "asOf",
+    "historyReferenceCount",
+    "historyReferences",
+}
+
+
+def _stable_inventory_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _stable_inventory_value(child)
+            for key, child in value.items()
+            if key not in VOLATILE_FINGERPRINT_KEYS
+        }
+    if isinstance(value, list):
+        return [_stable_inventory_value(child) for child in value]
+    return value
+
+
 def _inventory_fingerprint(payload: Dict[str, Any]) -> str:
-    stable_payload = {
-        key: value
-        for key, value in payload.items()
-        if key != "asOf"
-    }
+    stable_payload = _stable_inventory_value(payload)
     canonical = json.dumps(stable_payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _mapping_grace_minutes(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("grace_minutes must be an integer")
+    return value
 
 
 def build_inventory(
@@ -420,10 +443,8 @@ def validate_owner_mapping(
                         mode=str(policy.get("mode") or ""),
                         timezone_name=str(policy.get("timezone") or ""),
                         fixed_arrival=_mapping_time(policy.get("fixedArrival")),
-                        grace_minutes=(
-                            int(policy["graceMinutes"])
-                            if policy.get("graceMinutes") is not None
-                            else None
+                        grace_minutes=_mapping_grace_minutes(
+                            policy.get("graceMinutes")
                         ),
                         window_start=_mapping_time(policy.get("windowStart")),
                         window_end=_mapping_time(policy.get("windowEnd")),
