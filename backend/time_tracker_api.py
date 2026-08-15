@@ -11281,7 +11281,7 @@ def admin_arrival_policy_legacy_inventory(
 ) -> Dict[str, Any]:
     with db.get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SET TRANSACTION READ ONLY")
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             cur.execute("SHOW transaction_read_only")
             database_read_only = cur.fetchone()[0] == "on"
         inventory = arrival_policy_inventory.build_inventory(

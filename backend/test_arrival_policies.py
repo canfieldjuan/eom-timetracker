@@ -890,3 +890,11 @@ def test_admin_legacy_inventory_endpoint_is_admin_only_and_read_only(
         ],
     }
     assert after == before
+
+
+def test_admin_legacy_inventory_uses_one_repeatable_read_snapshot():
+    import inspect
+    import time_tracker_api
+
+    source = inspect.getsource(time_tracker_api.admin_arrival_policy_legacy_inventory)
+    assert "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY" in source
