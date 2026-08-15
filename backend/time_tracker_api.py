@@ -11567,6 +11567,7 @@ def admin_arrival_policy_legacy_inventory(
         inventory = arrival_policy_inventory.build_inventory(
             conn,
             as_of=utc_now(),
+            schedule_window_hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
         )
     return {
         **inventory,
@@ -11723,9 +11724,11 @@ def _apply_arrival_policy_legacy_mapping_once(
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            cur.execute("LOCK TABLE jobs IN SHARE MODE")
             inventory = arrival_policy_inventory.build_inventory(
                 conn,
                 as_of=utc_now(),
+                schedule_window_hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
             )
             errors = arrival_policy_inventory.validate_owner_mapping(
                 inventory,

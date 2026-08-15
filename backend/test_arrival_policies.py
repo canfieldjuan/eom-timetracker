@@ -755,6 +755,31 @@ def test_read_only_inventory_requires_explicit_owner_dispositions(
             entry["disposition"] = "needs_review"
     assert validate_owner_mapping(inventory, mapping) == []
 
+    distant_job_id = create_canonical_job(
+        location_id,
+        scheduled_start + timedelta(hours=18),
+        suffix="arrival-policy-wide-window-neighbor",
+    )
+    conn = _raw_conn()
+    try:
+        wide_window_inventory = build_inventory(
+            conn,
+            as_of=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
+            schedule_window_hours=24,
+        )
+    finally:
+        conn.close()
+    wide_window_exact_row = next(
+        row
+        for row in wide_window_inventory["activeFutureExactSchedules"]
+        if row["legacyId"] == exact["id"]
+    )
+    assert wide_window_exact_row["candidateJobIds"] == [
+        job_id,
+        distant_job_id,
+    ]
+    assert wide_window_exact_row["eligibleAppointmentJobId"] is None
+
     exact_mapping = next(
         entry
         for entry in mapping["entries"]
@@ -1213,6 +1238,7 @@ def test_admin_legacy_mapping_apply_creates_policy_revisions_idempotently(
 @pytest.mark.parametrize(
     "retryable_error",
     [
+        psycopg2.errors.SerializationFailure,
         psycopg2.errors.UniqueViolation,
         psycopg2.errors.DeadlockDetected,
     ],
@@ -1297,3 +1323,14 @@ def test_admin_legacy_inventory_uses_one_repeatable_read_snapshot():
 
     source = inspect.getsource(time_tracker_api.admin_arrival_policy_legacy_inventory)
     assert "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY" in source
+
+
+def test_admin_legacy_mapping_apply_uses_qr_window_and_locks_jobs():
+    import inspect
+    import time_tracker_api
+
+    source = inspect.getsource(
+        time_tracker_api._apply_arrival_policy_legacy_mapping_once
+    )
+    assert "LOCK TABLE jobs IN SHARE MODE" in source
+    assert "schedule_window_hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS" in source

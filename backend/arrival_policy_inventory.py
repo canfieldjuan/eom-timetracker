@@ -91,9 +91,11 @@ def build_inventory(
     conn: Any,
     *,
     as_of: datetime,
+    schedule_window_hours: int = 12,
 ) -> Dict[str, Any]:
     """Read legacy policy evidence without writing or inferring from employees."""
     as_of_utc = as_of.astimezone(timezone.utc)
+    schedule_window = timedelta(hours=max(1, int(schedule_window_hours)))
     company_today = as_of_utc.astimezone(ZoneInfo("America/Chicago")).date()
     exact_rows = _query_all(
         conn,
@@ -167,8 +169,8 @@ def build_inventory(
         candidates = [
             int(job["id"])
             for job in jobs_by_site.get(int(row["location_id"]), [])
-            if job["scheduled_start"] < start + timedelta(hours=12)
-            and job["scheduled_end"] > start - timedelta(hours=12)
+            if job["scheduled_start"] < start + schedule_window
+            and job["scheduled_end"] > start - schedule_window
         ]
         exact.append(
             {
