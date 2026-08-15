@@ -3291,6 +3291,17 @@ class CommercialBillingRunRequest(BaseModel):
     )
 
 
+class CommercialBillingApprovalRequest(BaseModel):
+    """One explicitly selected immutable billing-run candidate for ATLAS."""
+
+    candidate_key: str = Field(min_length=1, max_length=512)
+    expected_source_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+
 class CommercialBillingDeliveryPreferenceRequest(BaseModel):
     """One explicit, reviewed delivery policy for a canonical EOM customer."""
 
@@ -9142,6 +9153,115 @@ def receivables_create_commercial_billing_run(
         "/receivables/commercial-billing-runs",
         admin,
         payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post(
+    "/api/admin/receivables/commercial-billing-runs/{billing_run_id}/approvals",
+    status_code=201,
+)
+def receivables_approve_commercial_billing_candidate(
+    billing_run_id: UUID,
+    payload: CommercialBillingApprovalRequest,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Approve one selected candidate; ATLAS creates or reuses its draft invoice.
+
+    This route is deliberately a single-candidate command. It cannot approve an
+    entire run implicitly and it forwards the review-time source fingerprint so
+    ATLAS can reject stale evidence before creating or reusing an invoice.
+    """
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_APPROVAL_CREATE",
+        f"Commercial billing candidate approval accepted by Atlas for {actor}",
+        "POST",
+        f"/receivables/commercial-billing-runs/{billing_run_id}/approvals",
+        admin,
+        payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post(
+    "/api/admin/receivables/commercial-billing-approvals/{approval_id}/invoice-pdf",
+    status_code=201,
+)
+def receivables_generate_commercial_billing_invoice_pdf(
+    approval_id: UUID,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Create or reuse ATLAS's immutable invoice PDF after approval only."""
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_INVOICE_PDF_CREATE",
+        f"Commercial billing invoice PDF accepted by Atlas for {actor}",
+        "POST",
+        f"/receivables/commercial-billing-approvals/{approval_id}/invoice-pdf",
+        admin,
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post(
+    "/api/admin/receivables/commercial-billing-approvals/{approval_id}/gmail-draft",
+    status_code=201,
+)
+def receivables_create_commercial_billing_gmail_draft(
+    approval_id: UUID,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Create, recover, or reuse one Gmail draft; this route never sends mail."""
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_GMAIL_DRAFT_CREATE",
+        f"Commercial billing Gmail draft accepted by Atlas for {actor}; no email sent",
+        "POST",
+        f"/receivables/commercial-billing-approvals/{approval_id}/gmail-draft",
+        admin,
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post(
+    "/api/admin/receivables/commercial-billing-approvals/{approval_id}/gmail-draft/reconcile"
+)
+def receivables_reconcile_commercial_billing_gmail_draft_sent_mail(
+    approval_id: UUID,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Ask ATLAS to reconcile Sent mail evidence; this route never sends mail."""
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_GMAIL_SENT_RECONCILE",
+        f"Commercial billing Gmail sent-mail reconciliation accepted by Atlas for {actor}",
+        "POST",
+        (
+            "/receivables/commercial-billing-approvals/"
+            f"{approval_id}/gmail-draft/reconcile"
+        ),
+        admin,
         idempotency_key=idempotency_key,
     )
 

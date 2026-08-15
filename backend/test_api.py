@@ -1586,6 +1586,469 @@ class TestReceivablesProxy:
             "Billing review run accepted by Atlas for Juan Canfield",
         )
 
+    def test_commercial_billing_approval_model_requires_exact_source_fingerprint(self):
+        import time_tracker_api as api
+
+        payload = api.CommercialBillingApprovalRequest.model_validate(
+            {
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": "a" * 64,
+            }
+        )
+
+        assert payload.candidate_key == "candidate:acme:2026-03"
+        assert payload.expected_source_fingerprint == "a" * 64
+
+        for invalid in ("A" * 64, "a" * 63, "a" * 65, "not-a-fingerprint"):
+            with pytest.raises(api.ValidationError):
+                api.CommercialBillingApprovalRequest.model_validate(
+                    {
+                        "candidate_key": "candidate:acme:2026-03",
+                        "expected_source_fingerprint": invalid,
+                    }
+                )
+
+    def test_commercial_billing_approval_pdf_gmail_draft_and_reconcile_proxy_without_local_state(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        approval_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        source_fingerprint = "a" * 64
+        approval_result = {
+            "approval": {
+                "id": approval_id,
+                "billingRunId": billing_run_id,
+                "state": "approved",
+                "invoiceId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            },
+            "replayed": False,
+        }
+        pdf_result = {
+            "artifact": {
+                "approvalId": approval_id,
+                "id": "artifact-1",
+                "state": "ready",
+            },
+            "reused": False,
+        }
+        draft_result = {
+            "draft": {
+                "approvalId": approval_id,
+                "id": "draft-record-1",
+                "state": "draft_present",
+            },
+            "reused": False,
+        }
+        reconcile_result = {
+            "outcome": "draft_missing",
+            "reconciliation": {
+                "approvalId": approval_id,
+                "state": "draft_missing",
+                "recoveryAction": "review_missing_draft",
+            },
+            "replayed": False,
+            "reused": False,
+        }
+        calls = []
+        audits = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if url.endswith("/approvals"):
+                return _AtlasResponse(approval_result, status_code=201)
+            if url.endswith("/invoice-pdf"):
+                return _AtlasResponse(pdf_result, status_code=201)
+            if url.endswith("/gmail-draft/reconcile"):
+                return _AtlasResponse(reconcile_result)
+            if url.endswith("/gmail-draft"):
+                return _AtlasResponse(draft_result, status_code=201)
+            raise AssertionError(f"unexpected Atlas path: {url}")
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        approval = client.post(
+            f"/api/admin/receivables/commercial-billing-runs/{billing_run_id}/approvals",
+            headers={**auth, "Idempotency-Key": "approve-acme-2026-03"},
+            json={
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": source_fingerprint,
+            },
+        )
+        pdf = client.post(
+            f"/api/admin/receivables/commercial-billing-approvals/{approval_id}/invoice-pdf",
+            headers={**auth, "Idempotency-Key": "pdf-acme-2026-03"},
+        )
+        draft = client.post(
+            f"/api/admin/receivables/commercial-billing-approvals/{approval_id}/gmail-draft",
+            headers={**auth, "Idempotency-Key": "draft-acme-2026-03"},
+        )
+        reconciled = client.post(
+            (
+                "/api/admin/receivables/commercial-billing-approvals/"
+                f"{approval_id}/gmail-draft/reconcile"
+            ),
+            headers={**auth, "Idempotency-Key": "reconcile-acme-2026-03"},
+        )
+
+        assert approval.status_code == pdf.status_code == draft.status_code == 201
+        assert reconciled.status_code == 200
+        assert approval.json() == approval_result
+        assert pdf.json() == pdf_result
+        assert draft.json() == draft_result
+        assert reconciled.json() == reconcile_result
+        assert GENERATED_RECEIVABLES_TOKEN not in draft.text
+        assert "pdf_bytes" not in pdf.text
+        assert reconciled.json()["outcome"] == "draft_missing"
+        assert reconciled.json()["reconciliation"]["recoveryAction"] == (
+            "review_missing_draft"
+        )
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert [call[0] for call in calls] == ["POST", "POST", "POST", "POST"]
+        assert calls[0][1].endswith(
+            f"/commercial-billing-runs/{billing_run_id}/approvals"
+        )
+        assert calls[0][2]["json"] == {
+            "candidate_key": "candidate:acme:2026-03",
+            "expected_source_fingerprint": source_fingerprint,
+        }
+        assert calls[1][1].endswith(
+            f"/commercial-billing-approvals/{approval_id}/invoice-pdf"
+        )
+        assert calls[2][1].endswith(
+            f"/commercial-billing-approvals/{approval_id}/gmail-draft"
+        )
+        assert calls[3][1].endswith(
+            f"/commercial-billing-approvals/{approval_id}/gmail-draft/reconcile"
+        )
+        assert calls[1][2]["json"] is calls[2][2]["json"] is calls[3][2]["json"] is None
+        for _method, _url, kwargs in calls:
+            assert kwargs["headers"]["Authorization"] == (
+                f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
+            )
+            assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+            assert kwargs["params"] is None
+        assert [call[2]["headers"]["Idempotency-Key"] for call in calls] == [
+            "approve-acme-2026-03",
+            "pdf-acme-2026-03",
+            "draft-acme-2026-03",
+            "reconcile-acme-2026-03",
+        ]
+        assert audits == [
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_APPROVAL_CREATE",
+                True,
+                "Commercial billing candidate approval accepted by Atlas for Juan Canfield",
+            ),
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_INVOICE_PDF_CREATE",
+                True,
+                "Commercial billing invoice PDF accepted by Atlas for Juan Canfield",
+            ),
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_GMAIL_DRAFT_CREATE",
+                True,
+                "Commercial billing Gmail draft accepted by Atlas for Juan Canfield; no email sent",
+            ),
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_GMAIL_SENT_RECONCILE",
+                True,
+                "Commercial billing Gmail sent-mail reconciliation accepted by Atlas for Juan Canfield",
+            ),
+        ]
+
+    def test_commercial_billing_gmail_draft_survives_local_audit_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        approval_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        provider_result = {
+            "draft": {
+                "approvalId": approval_id,
+                "id": "draft-record-1",
+                "state": "draft_present",
+            }
+        }
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: _AtlasResponse(provider_result, status_code=201),
+        )
+
+        def unavailable_audit(*_args, **_kwargs):
+            raise OSError("access-log storage unavailable")
+
+        monkeypatch.setattr(api, "append_access_log", unavailable_audit)
+
+        response = client.post(
+            f"/api/admin/receivables/commercial-billing-approvals/{approval_id}/gmail-draft",
+            headers={**auth, "Idempotency-Key": "draft-audit-failure"},
+        )
+
+        assert response.status_code == 201
+        assert response.json() == provider_result
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+
+    def test_commercial_billing_approval_preserves_atlas_stale_conflict_without_local_state(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        calls = []
+        audits = []
+
+        def stale_provider(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse(
+                {
+                    "detail": {
+                        "code": "commercial_billing_approval_stale",
+                        "message": "Candidate source evidence changed; regenerate it",
+                    }
+                },
+                status_code=409,
+            )
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", stale_provider)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        response = client.post(
+            f"/api/admin/receivables/commercial-billing-runs/{billing_run_id}/approvals",
+            headers={**auth, "Idempotency-Key": "stale-approval-2026-03"},
+            json={
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": "a" * 64,
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"] == "Candidate source evidence changed; regenerate it"
+        assert len(calls) == 1
+        assert calls[0][2]["headers"]["Idempotency-Key"] == "stale-approval-2026-03"
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert audits == [
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_APPROVAL_CREATE",
+                False,
+                (
+                    "Atlas request for Juan Canfield failed (409): Candidate source "
+                    "evidence changed; regenerate it"
+                ),
+            )
+        ]
+
+    def test_commercial_billing_gmail_commands_reject_stale_sessions_and_invalid_input_before_atlas(
+        self, client, auth, emp_auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        approval_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+        expired_token = api.jwt.encode(
+            {"sub": "1", "name": "Juan Canfield", "role": "admin", "exp": 1},
+            api.JWT_SECRET,
+            algorithm=api.JWT_ALGORITHM,
+        )
+        approval_path = (
+            "/api/admin/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/approvals"
+        )
+        draft_path = (
+            "/api/admin/receivables/commercial-billing-approvals/"
+            f"{approval_id}/gmail-draft"
+        )
+        reconcile_path = f"{draft_path}/reconcile"
+
+        unauthenticated = client.post(
+            approval_path,
+            headers={"Idempotency-Key": "unauthenticated-approval"},
+            json={
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": "a" * 64,
+            },
+        )
+        employee = client.post(
+            approval_path,
+            headers={**emp_auth, "Idempotency-Key": "employee-approval"},
+            json={
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": "a" * 64,
+            },
+        )
+        expired = client.post(
+            approval_path,
+            headers={
+                "Authorization": f"Bearer {expired_token}",
+                "Idempotency-Key": "expired-approval",
+            },
+            json={
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": "a" * 64,
+            },
+        )
+        invalid_run = client.post(
+            "/api/admin/receivables/commercial-billing-runs/not-a-uuid/approvals",
+            headers={**auth, "Idempotency-Key": "invalid-run"},
+            json={
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": "a" * 64,
+            },
+        )
+        stale_fingerprint = client.post(
+            approval_path,
+            headers={**auth, "Idempotency-Key": "stale-fingerprint"},
+            json={
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": "not-a-fingerprint",
+            },
+        )
+        missing_approval_key = client.post(
+            approval_path,
+            headers=auth,
+            json={
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": "a" * 64,
+            },
+        )
+        invalid_approval = client.post(
+            "/api/admin/receivables/commercial-billing-approvals/not-a-uuid/gmail-draft",
+            headers={**auth, "Idempotency-Key": "invalid-approval"},
+        )
+        missing_pdf_key = client.post(
+            f"/api/admin/receivables/commercial-billing-approvals/{approval_id}/invoice-pdf",
+            headers=auth,
+        )
+        missing_draft_key = client.post(draft_path, headers=auth)
+        missing_reconcile_key = client.post(reconcile_path, headers=auth)
+
+        assert unauthenticated.status_code == 401
+        assert employee.status_code == 403
+        assert expired.status_code == 401
+        assert invalid_run.status_code == 422
+        assert stale_fingerprint.status_code == 422
+        assert missing_approval_key.status_code == 422
+        assert invalid_approval.status_code == 422
+        assert missing_pdf_key.status_code == 422
+        assert missing_draft_key.status_code == 422
+        assert missing_reconcile_key.status_code == 422
+        assert calls == []
+
+    def test_commercial_billing_gmail_draft_retry_reuses_provider_key_after_ambiguous_transport_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        approval_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        provider_result = {
+            "draft": {
+                "approvalId": approval_id,
+                "id": "draft-record-1",
+                "state": "draft_present",
+            },
+            "replayed": True,
+        }
+        calls = []
+        audits = []
+
+        def flaky_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("upstream timeout")
+            return _AtlasResponse(provider_result, status_code=201)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+        path = (
+            "/api/admin/receivables/commercial-billing-approvals/"
+            f"{approval_id}/gmail-draft"
+        )
+        headers = {**auth, "Idempotency-Key": "gmail-draft-retry"}
+
+        failed = client.post(path, headers=headers)
+        recovered = client.post(path, headers=headers)
+
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "5"
+        assert recovered.status_code == 201
+        assert recovered.json() == provider_result
+        assert [call[0] for call in calls] == ["POST", "POST"]
+        assert calls[0][1] == calls[1][1]
+        assert calls[0][2]["headers"]["Idempotency-Key"] == calls[1][2][
+            "headers"
+        ]["Idempotency-Key"] == "gmail-draft-retry"
+        assert calls[0][2]["json"] is calls[1][2]["json"] is None
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert audits[0][0:2] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_GMAIL_DRAFT_CREATE",
+            False,
+        )
+        assert "Atlas request for Juan Canfield failed (503)" in audits[0][2]
+        assert audits[1] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_GMAIL_DRAFT_CREATE",
+            True,
+            "Commercial billing Gmail draft accepted by Atlas for Juan Canfield; no email sent",
+        )
+
     def test_commercial_billing_run_reads_forward_bounded_queries_and_actor(
         self, client, auth, monkeypatch
     ):
