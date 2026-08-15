@@ -412,6 +412,8 @@ def validate_policy_values(
         "window_end": window_end,
         "not_before": not_before,
     }
+    if grace_minutes is not None and not 0 <= grace_minutes <= 120:
+        raise ValueError("grace_minutes must be between 0 and 120")
     for field_name in (
         "fixed_arrival",
         "window_start",

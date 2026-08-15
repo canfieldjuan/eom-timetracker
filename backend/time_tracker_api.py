@@ -11638,16 +11638,17 @@ def _apply_arrival_policy_mapping_revision(
             "siteId": site_id,
             "jobId": job_id,
         }
-    if current is not None and current.get("state") == "active":
+    if current is not None:
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "arrival_policy_mapping_target_conflict",
-                "message": "Arrival policy target already has a different active policy",
+                "message": "Arrival policy target already has a different current policy",
                 "details": {
                     "scopeType": scope_type,
                     "siteId": site_id,
                     "jobId": job_id,
+                    "currentState": current.get("state"),
                 },
             },
         )
@@ -11704,11 +11705,9 @@ def _apply_arrival_policy_mapping_revision(
     }
 
 
-@app.post("/api/admin/arrival-policy/legacy-mapping/apply")
-def admin_apply_arrival_policy_legacy_mapping(
+def _apply_arrival_policy_legacy_mapping_once(
     mapping: Dict[str, Any],
-    request: Request,
-    admin: Dict[str, Any] = Depends(get_current_admin),
+    admin: Dict[str, Any],
 ) -> Dict[str, Any]:
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -11727,6 +11726,8 @@ def admin_apply_arrival_policy_legacy_mapping(
                     status_code=409 if stale else 422,
                     detail={
                         "code": "invalid_arrival_policy_legacy_mapping",
+                        "message": "Arrival policy legacy mapping is invalid",
+                        "details": {"errors": errors},
                         "errors": errors,
                     },
                 )
@@ -11776,18 +11777,47 @@ def admin_apply_arrival_policy_legacy_mapping(
                         **result,
                     }
                 )
-    append_access_log(
-        request,
-        "ARRIVAL_POLICY_LEGACY_MAPPING_APPLIED",
-        True,
-        f"Admin {admin['name']} applied {len(applied)} legacy arrival policy mappings",
-    )
     return {
         "success": True,
         "inventoryFingerprint": mapping.get("inventoryFingerprint"),
         "applied": applied,
         "skipped": skipped,
     }
+
+
+@app.post("/api/admin/arrival-policy/legacy-mapping/apply")
+def admin_apply_arrival_policy_legacy_mapping(
+    mapping: Dict[str, Any],
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    retryable_errors = (
+        psycopg2.errors.SerializationFailure,
+        psycopg2.errors.UniqueViolation,
+    )
+    for attempt in range(2):
+        try:
+            response = _apply_arrival_policy_legacy_mapping_once(mapping, admin)
+            break
+        except retryable_errors:
+            if attempt == 0:
+                continue
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "arrival_policy_mapping_retry_conflict",
+                    "message": "Arrival policy mapping changed while applying; reload and retry",
+                },
+            )
+    else:
+        raise RuntimeError("arrival policy mapping retry loop did not return")
+    append_access_log(
+        request,
+        "ARRIVAL_POLICY_LEGACY_MAPPING_APPLIED",
+        True,
+        f"Admin {admin['name']} applied {len(response['applied'])} legacy arrival policy mappings",
+    )
+    return response
 
 
 def admin_create_site_check_in_schedule(

@@ -391,8 +391,9 @@ def validate_owner_mapping(
                     )
                 else:
                     seen_policy_targets[target] = key
-        if disposition == "promote_to_site" and not bool(
-            entry.get("ownerConfirmedSitePromotion")
+        if (
+            disposition == "promote_to_site"
+            and entry.get("ownerConfirmedSitePromotion") is not True
         ):
             errors.append(
                 f"{prefix}.ownerConfirmedSitePromotion must be true"

@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, time, timedelta, timezone
 
+import psycopg2
 import pytest
 
 import arrival_policies
 import db
+import time_tracker_api
 from arrival_policy_inventory import build_inventory, validate_owner_mapping
 from conftest import _raw_conn
 from test_site_check_in import (
@@ -780,6 +782,40 @@ def test_read_only_inventory_requires_explicit_owner_dispositions(
         for error in validate_owner_mapping(inventory, seconds_mapping)
     )
 
+    grace_mapping = json.loads(json.dumps(mapping))
+    next(
+        entry
+        for entry in grace_mapping["entries"]
+        if entry["legacyKey"] == f"exact:{exact['id']}"
+    )["policy"]["graceMinutes"] = 121
+    assert any(
+        "grace_minutes must be between 0 and 120" in error
+        for error in validate_owner_mapping(inventory, grace_mapping)
+    )
+
+    truthy_site_confirmation = json.loads(json.dumps(mapping))
+    recurring_mapping = next(
+        entry
+        for entry in truthy_site_confirmation["entries"]
+        if entry["legacyKey"] == f"recurring:{recurring['id']}"
+    )
+    recurring_mapping.update(
+        {
+            "disposition": "promote_to_site",
+            "ownerConfirmedSitePromotion": "false",
+            "policy": {
+                "mode": "window",
+                "timezone": "America/Chicago",
+                "windowStart": "06:30",
+                "windowEnd": "08:30",
+            },
+        }
+    )
+    assert any(
+        "ownerConfirmedSitePromotion must be true" in error
+        for error in validate_owner_mapping(inventory, truthy_site_confirmation)
+    )
+
     duplicate_target = json.loads(json.dumps(mapping))
     second_exact_mapping = next(
         entry
@@ -962,6 +998,16 @@ def test_admin_legacy_mapping_apply_creates_policy_revisions_idempotently(
     assert client.post(endpoint, json=mapping).status_code == 401
     assert client.post(endpoint, headers=emp_auth, json=mapping).status_code == 403
 
+    invalid = json.loads(json.dumps(mapping))
+    invalid["inventoryFingerprint"] = "0" * 64
+    rejected = client.post(endpoint, headers=auth, json=invalid)
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["code"] == "invalid_arrival_policy_legacy_mapping"
+    assert any(
+        "inventoryFingerprint" in error
+        for error in rejected.json()["details"]["errors"]
+    )
+
     created = client.post(endpoint, headers=auth, json=mapping)
     assert created.status_code == 200, created.text
     created_body = created.json()
@@ -1009,6 +1055,100 @@ def test_admin_legacy_mapping_apply_creates_policy_revisions_idempotently(
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM arrival_policy_revisions"
     )["count"] == 2
+
+    site_policy = client.get(
+        f"/api/admin/locations/{location_id}/arrival-policy",
+        headers=auth,
+    ).json()["policy"]
+    retired = client.post(
+        f"/api/admin/locations/{location_id}/arrival-policy/retire",
+        headers=auth,
+        json={
+            "expectedUpdateToken": site_policy["updateToken"],
+            "changeNote": "Owner retired the migrated Site policy",
+        },
+    )
+    assert retired.status_code == 200, retired.text
+    stale_retry = client.post(endpoint, headers=auth, json=mapping)
+    assert stale_retry.status_code == 409, stale_retry.text
+    assert stale_retry.json()["code"] == "arrival_policy_mapping_target_conflict"
+    assert stale_retry.json()["details"]["currentState"] == "retired"
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM arrival_policy_revisions"
+    )["count"] == 3
+
+
+def test_admin_legacy_mapping_apply_retries_after_unique_race(
+    client,
+    auth,
+    employee_id,
+    location_id,
+    monkeypatch,
+):
+    scheduled_start = datetime(2049, 7, 21, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+    job_id = create_canonical_job(
+        location_id,
+        scheduled_start,
+        suffix="arrival-policy-mapping-retry",
+    )
+    inventory = client.get(
+        "/api/admin/arrival-policy/legacy-inventory",
+        headers=auth,
+    ).json()
+    mapping = json.loads(json.dumps(inventory["ownerMappingTemplate"]))
+    mapping["ownerReviewedBy"] = "Juan Canfield"
+    mapping["ownerReviewedAt"] = "2049-07-21T12:00:00Z"
+    for entry in mapping["entries"]:
+        entry["reviewNote"] = "Owner reviewed this legacy policy source"
+        if entry["legacyKey"] == f"exact:{exact['id']}":
+            entry.update(
+                {
+                    "disposition": "map_to_appointment",
+                    "targetJobId": job_id,
+                    "policy": {
+                        "mode": "fixed",
+                        "timezone": "America/Chicago",
+                        "fixedArrival": "07:00",
+                        "graceMinutes": 10,
+                    },
+                }
+            )
+        else:
+            entry["disposition"] = "needs_review"
+
+    original = time_tracker_api._apply_arrival_policy_mapping_revision
+    calls = {"count": 0}
+
+    def fail_once_then_apply(*args, **kwargs):
+        if calls["count"] == 0:
+            calls["count"] += 1
+            raise psycopg2.errors.UniqueViolation()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_apply_arrival_policy_mapping_revision",
+        fail_once_then_apply,
+    )
+
+    response = client.post(
+        "/api/admin/arrival-policy/legacy-mapping/apply",
+        headers=auth,
+        json=mapping,
+    )
+    assert response.status_code == 200, response.text
+    assert calls["count"] == 1
+    assert response.json()["applied"][0]["status"] == "created"
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM arrival_policy_revisions"
+    )["count"] == 1
 
 
 def test_admin_legacy_inventory_uses_one_repeatable_read_snapshot():
