@@ -9245,6 +9245,38 @@ def receivables_create_commercial_billing_gmail_draft(
 
 
 @app.post(
+    "/api/admin/receivables/commercial-billing-approvals/"
+    "{approval_id}/gmail-draft/replace-missing",
+    status_code=201,
+)
+def receivables_replace_commercial_billing_missing_gmail_draft(
+    approval_id: UUID,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Replace only a reconciliation-proven missing draft; never send email."""
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_GMAIL_DRAFT_REPLACE_MISSING",
+        (
+            "Commercial billing missing Gmail draft replacement accepted by Atlas "
+            f"for {actor}; no email sent"
+        ),
+        "POST",
+        (
+            "/receivables/commercial-billing-approvals/"
+            f"{approval_id}/gmail-draft/replace-missing"
+        ),
+        admin,
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post(
     "/api/admin/receivables/commercial-billing-approvals/{approval_id}/gmail-draft/reconcile"
 )
 def receivables_reconcile_commercial_billing_gmail_draft_sent_mail(
