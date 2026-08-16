@@ -14306,7 +14306,7 @@ SITE_SELECT_COLUMNS = """
     l.access_instructions, l.service_preferences, l.pet_notes,
     l.service_start_date, l.check_in_token_nonce, l.active, l.created_at,
     l.updated_at, l.archived_at, l.archived_by,
-    c.name AS canonical_customer_name
+    c.name AS canonical_customer_name, c.customer_type AS customer_type
 """
 
 
@@ -14400,6 +14400,11 @@ def _serialize_site(row: Dict[str, Any]) -> Dict[str, Any]:
         "customerName": str(
             row.get("canonical_customer_name") or row.get("customer_name") or ""
         ),
+        # A Site's customer type belongs to its parent Customer. Derive it at
+        # read time so a mirrored Atlas update is visible everywhere a
+        # canonical Site is returned without introducing a second Site-level
+        # type to keep in sync.
+        "customerType": str(row.get("customer_type") or "unknown"),
         "address": str(row["address"]),
         "locationType": row.get("location_type"),
         "rate": float(row["rate"]) if row.get("rate") is not None else None,
