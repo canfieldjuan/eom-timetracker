@@ -780,6 +780,36 @@ def test_read_only_inventory_requires_explicit_owner_dispositions(
     ]
     assert wide_window_exact_row["eligibleAppointmentJobId"] is None
 
+    recently_started = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc),
+    )
+    conn = _raw_conn()
+    try:
+        lookback_inventory = build_inventory(
+            conn,
+            as_of=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
+            schedule_window_hours=3,
+        )
+        narrow_inventory = build_inventory(
+            conn,
+            as_of=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
+            schedule_window_hours=1,
+        )
+    finally:
+        conn.close()
+    assert any(
+        row["legacyId"] == recently_started["id"]
+        for row in lookback_inventory["activeFutureExactSchedules"]
+    )
+    assert all(
+        row["legacyId"] != recently_started["id"]
+        for row in narrow_inventory["activeFutureExactSchedules"]
+    )
+
     exact_mapping = next(
         entry
         for entry in mapping["entries"]
@@ -1334,3 +1364,12 @@ def test_admin_legacy_mapping_apply_uses_qr_window_and_locks_jobs():
     )
     assert "LOCK TABLE jobs IN SHARE MODE" in source
     assert "schedule_window_hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS" in source
+
+
+def test_inventory_cli_preflight_uses_configured_qr_window():
+    import inspect
+    import inventory_arrival_policies
+
+    source = inspect.getsource(inventory_arrival_policies.main)
+    assert "_configured_schedule_window_hours()" in source
+    assert "schedule_window_hours=schedule_window_hours" in source

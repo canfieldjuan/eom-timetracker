@@ -96,6 +96,7 @@ def build_inventory(
     """Read legacy policy evidence without writing or inferring from employees."""
     as_of_utc = as_of.astimezone(timezone.utc)
     schedule_window = timedelta(hours=max(1, int(schedule_window_hours)))
+    exact_cutoff = as_of_utc - schedule_window
     company_today = as_of_utc.astimezone(ZoneInfo("America/Chicago")).date()
     exact_rows = _query_all(
         conn,
@@ -113,7 +114,7 @@ def build_inventory(
         GROUP BY sc.id, e.name, l.address
         ORDER BY sc.scheduled_start, sc.id
         """,
-        (as_of_utc,),
+        (exact_cutoff,),
     )
     recurring_rows = _query_all(
         conn,

@@ -15,6 +15,22 @@ import psycopg2
 from arrival_policy_inventory import build_inventory, validate_owner_mapping
 
 
+SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS = 12
+
+
+def _configured_schedule_window_hours() -> int:
+    raw = os.environ.get(
+        "SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS",
+        str(SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS),
+    )
+    try:
+        return max(1, int(raw))
+    except ValueError as exc:
+        raise ValueError(
+            "SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS must be an integer"
+        ) from exc
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -37,6 +53,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Validate an owner-completed mapping against the live inventory",
     )
+    parser.add_argument(
+        "--schedule-window-hours",
+        type=int,
+        default=None,
+        help=(
+            "QR schedule matching window in hours "
+            "(defaults to SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS or 12)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -45,10 +70,23 @@ def main() -> int:
     if not args.db_url:
         print("DATABASE_URL or --db-url is required", file=sys.stderr)
         return 2
+    try:
+        schedule_window_hours = (
+            max(1, args.schedule_window_hours)
+            if args.schedule_window_hours is not None
+            else _configured_schedule_window_hours()
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     conn = psycopg2.connect(args.db_url)
     try:
         conn.set_session(readonly=True, autocommit=False)
-        inventory = build_inventory(conn, as_of=datetime.now(timezone.utc))
+        inventory = build_inventory(
+            conn,
+            as_of=datetime.now(timezone.utc),
+            schedule_window_hours=schedule_window_hours,
+        )
         conn.rollback()
     finally:
         conn.close()
