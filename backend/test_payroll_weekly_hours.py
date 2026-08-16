@@ -4092,7 +4092,7 @@ def test_payroll_verification_blocks_issue_weeks_and_employee_role(client, auth,
 
 
 def test_payroll_verification_reports_stale_and_requires_reverify_before_finalize(client, auth):
-    week_start = date(2026, 8, 16)
+    week_start = date(2026, 12, 6)
     employee_id = _create_employee("Payroll Verification Stale Worker")
     _delete_payroll_verification_weeks([week_start])
     try:

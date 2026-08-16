@@ -319,18 +319,14 @@ def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
     policy_body = policy_status.json()
     assert policy_body == {
         "success": True,
-        "required": True,
-        "homeBase": {
-            "id": policy_body["homeBase"]["id"],
-            "label": "EOM Office Home Base",
-            "address": "100 Dispatch Lane, Effingham",
-            "crewName": "Morning Crew",
-        },
+        "required": False,
+        "homeBase": None,
     }
 
-    # The policy is enforced by the server, not an opt-in browser field.  This
-    # remains true if an old/cached portal never fetched Home Base status.
-    blocked = client.post(
+    # Morning Crew membership no longer creates a standing paid-time blocker.
+    # Away-from-office time actions use the normal GPS/override path unless the
+    # worker is actually inside the configured Home Base geofence.
+    away_start = client.post(
         "/api/timesheet/clock-in",
         headers=employee_auth,
         json={
@@ -340,10 +336,56 @@ def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
             "accuracy": 5,
             "gpsOverrideReason": "test legacy compatibility",
             "gpsOverrideDetail": "Test GPS is intentionally outside customer Sites.",
+            "idempotencyKey": str(uuid4()),
         },
     )
-    assert blocked.status_code == 409, blocked.text
-    assert blocked.json()["code"] == "HOME_BASE_REQUIRED"
+    assert away_start.status_code == 200, away_start.text
+    assert "homeBaseEvent" not in away_start.json()
+    away_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": 0,
+            "longitude": 0,
+            "accuracy": 5,
+            "gpsOverrideReason": "test legacy compatibility",
+            "gpsOverrideDetail": "Test GPS is intentionally outside customer Sites.",
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert away_end.status_code == 200, away_end.text
+
+    gps_start = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert gps_start.status_code == 200, gps_start.text
+    gps_shift_id = int(gps_start.json()["entry"]["id"])
+    assert gps_start.json()["entry"]["location"] == "Home Base — EOM Office Home Base"
+    assert gps_start.json()["homeBaseEvent"]["outcome"] == "recorded"
+    gps_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert gps_end.status_code == 200, gps_end.text
+    assert gps_end.json()["homeBaseEvent"]["action"] == "end"
+    assert gps_end.json()["homeBaseEvent"]["outcome"] == "recorded"
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE shift_id = %s",
+        (gps_shift_id,),
+    ) == {"count": 2}
 
     qr = client.post(
         "/api/admin/home-base/check-in-qr",
@@ -480,8 +522,9 @@ def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
     )
     assert out_of_scope.status_code == 200, out_of_scope.text
 
-    # Membership is evaluated at the current local workday, rather than being
-    # a permanent employee flag or an arbitrary crew association.
+    # The old membership presentation endpoint remains non-blocking even after
+    # the crew assignment is retired; Home Base evidence is derived from GPS or
+    # an explicit exception on the paid-time action itself.
     with db.get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -2227,43 +2270,15 @@ def test_exception_review_uses_the_immutable_visit_identity_after_site_changes(c
 
 
 @pytest.mark.parametrize("action", ["clock-in", "clock-out"])
-def test_home_base_policy_activated_after_the_preflight_read_still_binds(
-    client, auth, monkeypatch, action,
+def test_active_home_base_does_not_blanket_block_away_time_actions(
+    client, auth, action,
 ):
-    """The guard must use a policy read under the lock, not the pre-flight one.
-
-    Both handlers resolve the policy before entering the serialized timesheet
-    update. A policy committing in that window would leave the captured value
-    False, skip the scan-or-exception guard, and persist a shift carrying no
-    evidence that Home Base was ever required.
-
-    clock-out is covered too: it has the identical read-then-guard shape and
-    was not part of the reported finding.
-    """
-    employee_id, employee_auth = _create_employee(client, f"Policy race {action}")
+    """Home Base GPS evidence is action-scoped, not a Morning Crew day gate."""
+    employee_id, employee_auth = _create_employee(client, f"Active base {action}")
     _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
     if action == "clock-out":
         _clock_in(client, employee_auth)
-
-    original = time_tracker_api._home_base_policy_for_employee
-    calls = {"n": 0}
-
-    def activate_between_the_two_reads(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            # The pre-flight read returns no policy, and the admin configures
-            # Home Base immediately afterwards -- exactly the window.
-            result = original(*args, **kwargs)
-            assert result is None, "the policy was already active; no race to test"
-            _configure_home_base(client, auth)
-            return result
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(
-        time_tracker_api,
-        "_home_base_policy_for_employee",
-        activate_between_the_two_reads,
-    )
 
     response = client.post(
         f"/api/timesheet/{action}",
@@ -2278,22 +2293,15 @@ def test_home_base_policy_activated_after_the_preflight_read_still_binds(
         },
     )
 
-    assert calls["n"] >= 2, (
-        "the policy was read only once, so the guard still trusts the pre-flight value"
-    )
-    assert response.status_code >= 400, (
-        f"{action} succeeded despite a Home Base policy active at write time: "
-        f"{response.text}"
-    )
+    assert response.status_code == 200, response.text
+    assert "homeBaseEvent" not in response.json()
     if action == "clock-in":
         open_shifts = db.query_one(
             "SELECT COUNT(*) AS count FROM shifts "
             "WHERE employee_id = %s AND clock_out IS NULL",
             (employee_id,),
         )
-        assert open_shifts == {"count": 0}, (
-            "a shift persisted with no Home Base evidence"
-        )
+        assert open_shifts == {"count": 1}
 
 
 def test_job_totals_include_labor_recorded_only_through_a_visit(client, auth):
@@ -2920,44 +2928,16 @@ def test_moving_home_base_slightly_records_the_new_coordinates(
 
 
 @pytest.mark.parametrize("path", ("scan", "exception"))
-def test_home_base_start_rechecks_membership_in_the_persistence_transaction(
+def test_home_base_start_does_not_require_employee_morning_crew_membership(
     client,
     auth,
-    monkeypatch,
     path,
 ):
-    """A retirement between preflight and commit must roll back either start path."""
-    employee_id, employee_auth = _create_employee(client, f"Membership race {path}")
-    crew_id = _enroll_in_morning_crew(employee_id)
+    """Home Base starts are proven by office GPS or an exception, not membership."""
+    employee_id, employee_auth = _create_employee(client, f"No membership {path}")
+    crew_seed_id, _seed_auth = _create_employee(client, f"Crew seed {path}")
+    _enroll_in_morning_crew(crew_seed_id)
     _configure_home_base(client, auth)
-    original_policy_lookup = time_tracker_api._home_base_policy_for_employee
-    membership_retired = False
-
-    def retire_before_locked_policy_read(*args, **kwargs):
-        nonlocal membership_retired
-        if kwargs.get("cur") is not None and not membership_retired:
-            membership_retired = True
-            db.execute(
-                """
-                UPDATE crew_memberships
-                SET effective_to = %s
-                WHERE employee_id = %s
-                  AND crew_id = %s
-                  AND effective_to IS NULL
-                """,
-                (
-                    datetime.now(time_tracker_api.APP_TIMEZONE).date(),
-                    employee_id,
-                    crew_id,
-                ),
-            )
-        return original_policy_lookup(*args, **kwargs)
-
-    monkeypatch.setattr(
-        time_tracker_api,
-        "_home_base_policy_for_employee",
-        retire_before_locked_policy_read,
-    )
     if path == "scan":
         qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
         assert qr.status_code == 200, qr.text
@@ -2989,36 +2969,27 @@ def test_home_base_start_rechecks_membership_in_the_persistence_transaction(
             },
         )
 
-    assert membership_retired, "the test never reached the locked policy read"
-    assert response.status_code == 409, response.text
+    assert response.status_code == 200, response.text
+    assert response.json()["homeBaseEvent"]["outcome"] == (
+        "recorded" if path == "scan" else "exception"
+    )
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
         (employee_id,),
-    ) == {"count": 0}
+    ) == {"count": 1}
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM home_base_events WHERE employee_id = %s",
         (employee_id,),
-    ) == {"count": 0}
-    assert db.query_one(
-        "SELECT COUNT(*) AS count FROM plain_time_action_receipts WHERE employee_id = %s",
-        (employee_id,),
-    ) == {"count": 0}
+    ) == {"count": 1}
 
 
 @pytest.mark.parametrize("start_method", ("scan", "exception"))
-def test_a_shift_started_under_policy_still_owes_its_end_event(
+def test_a_shift_started_with_home_base_evidence_still_owes_its_end_event(
     client, auth, start_method,
 ):
-    """Current crew membership must not retroactively release an open shift.
-
-    Retiring a membership takes effect on the local date, so the policy lookup
-    drops the employee immediately. A shift already started under Home Base
-    would otherwise close with no end event -- and the return interval after
-    its last customer departure is then never classified as dispatch, because
-    that classification requires an end event to exist.
-    """
-    employee_id, employee_auth = _create_employee(client, "Membership retired")
-    crew_id = _enroll_in_morning_crew(employee_id)
+    """A Home Base-started shift cannot close away without end evidence."""
+    employee_id, employee_auth = _create_employee(client, "End evidence owed")
+    _enroll_in_morning_crew(employee_id)
     _configure_home_base(client, auth)
     if start_method == "scan":
         qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
@@ -3055,18 +3026,6 @@ def test_a_shift_started_under_policy_still_owes_its_end_event(
         "recorded" if start_method == "scan" else "exception"
     )
 
-    # Admin retires the membership while the shift is open.
-    db.execute(
-        """
-        UPDATE crew_memberships
-        SET effective_to = %s
-        WHERE employee_id = %s AND crew_id = %s AND effective_to IS NULL
-        """,
-        (datetime.now(time_tracker_api.APP_TIMEZONE).date(), employee_id, crew_id),
-    )
-    assert time_tracker_api._home_base_policy_for_employee(
-        employee_id, time_tracker_api.utc_now()) is None, "membership was not actually retired"
-
     # Everything ELSE about this clock-out must be valid, or the assertion
     # below passes on an unrelated refusal. Without the override reason the
     # GPS check rejects it first and the Home Base guard is never reached --
@@ -3076,8 +3035,8 @@ def test_a_shift_started_under_policy_still_owes_its_end_event(
         "/api/timesheet/clock-out",
         headers=employee_auth,
         json={
-            "latitude": BASE_LATITUDE,
-            "longitude": BASE_LONGITUDE,
+            "latitude": 0,
+            "longitude": 0,
             "accuracy": 5,
             "gpsOverrideReason": "test teardown",
             "gpsOverrideDetail": "Ending the shift away from a saved site.",
