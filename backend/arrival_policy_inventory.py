@@ -79,6 +79,80 @@ def _current_policy_rows(conn: Any) -> List[Dict[str, Any]]:
     )
 
 
+def _readiness_mapping_errors(
+    inventory: Dict[str, Any],
+    mapping: Dict[str, Any],
+) -> List[str]:
+    """Validate current active keys while tolerating reviewed rows aged out."""
+    source_keys = {
+        row["legacyKey"]
+        for row in [
+            *inventory.get("activeFutureExactSchedules", []),
+            *inventory.get("activeOpenRecurringRules", []),
+        ]
+    }
+    filtered_mapping = {
+        **mapping,
+        "inventoryFingerprint": inventory.get("inventoryFingerprint"),
+        "entries": [
+            entry
+            for entry in mapping.get("entries", [])
+            if isinstance(entry, dict) and entry.get("legacyKey") in source_keys
+        ],
+    }
+    return validate_owner_mapping(inventory, filtered_mapping)
+
+
+def _rule_inventory_date(row: Dict[str, Any], as_of_utc: datetime) -> date:
+    try:
+        rule_zone = ZoneInfo(str(row["timezone"]))
+    except (ZoneInfoNotFoundError, ValueError):
+        rule_zone = ZoneInfo("America/Chicago")
+    return as_of_utc.astimezone(rule_zone).date()
+
+
+def _runtime_job_window_candidate_ids(
+    conn: Any,
+    *,
+    site_id: int,
+    scheduled_start: datetime,
+    schedule_window_hours: int,
+) -> List[int]:
+    window = timedelta(hours=max(1, int(schedule_window_hours)) * 2)
+    rows = _query_all(
+        conn,
+        """
+        SELECT j.id
+        FROM jobs j
+        JOIN google_calendar_sources source ON source.id = j.calendar_source_id
+        JOIN locations site ON site.id = j.location_id
+        WHERE j.location_id = %s
+          AND j.status != 'cancelled'
+          AND site.active = true
+          AND (
+              (source.role = 'residential_morning'
+               AND site.location_type = 'Residential')
+              OR
+              (source.role = 'commercial_evening_night'
+               AND site.location_type = 'Commercial')
+          )
+          AND j.source_all_day = false
+          AND j.scheduled_start IS NOT NULL
+          AND j.scheduled_end IS NOT NULL
+          AND j.scheduled_end > j.scheduled_start
+          AND j.scheduled_start < %s
+          AND j.scheduled_end > %s
+        ORDER BY j.source_key, j.id
+        """,
+        (
+            site_id,
+            scheduled_start + window,
+            scheduled_start - window,
+        ),
+    )
+    return [int(row["id"]) for row in rows]
+
+
 VOLATILE_FINGERPRINT_KEYS = {
     "asOf",
     "historyReferenceCount",
@@ -122,7 +196,6 @@ def build_inventory(
     as_of_utc = as_of.astimezone(timezone.utc)
     schedule_window = timedelta(hours=max(1, int(schedule_window_hours)))
     exact_cutoff = as_of_utc - schedule_window
-    company_today = as_of_utc.astimezone(ZoneInfo("America/Chicago")).date()
     exact_rows = _query_all(
         conn,
         """
@@ -155,11 +228,9 @@ def build_inventory(
         LEFT JOIN locations l ON l.id = sr.location_id
         LEFT JOIN site_check_ins ci ON ci.schedule_rule_id = sr.id
         WHERE sr.active = true
-          AND sr.ends_on >= %s
         GROUP BY sr.id, e.name, l.address
         ORDER BY sr.location_id, sr.local_start_time, sr.id
         """,
-        (company_today,),
     )
     jobs = _query_all(
         conn,
@@ -216,25 +287,31 @@ def build_inventory(
             }
         )
 
-    recurring: List[Dict[str, Any]] = [
-        {
-            "legacyKey": f"recurring:{int(row['id'])}",
-            "legacyId": int(row["id"]),
-            "employeeId": int(row["employee_id"]),
-            "employeeName": str(row.get("employee_name") or ""),
-            "siteId": int(row["location_id"]),
-            "siteName": str(row.get("site_name") or ""),
-            "weekdays": [int(day) for day in row["weekdays"]],
-            "localStart": _time_text(row["local_start_time"]),
-            "timezone": str(row["timezone"]),
-            "timezoneValid": _valid_timezone(row["timezone"]),
-            "startsOn": _date_text(row["starts_on"]),
-            "endsOn": _date_text(row.get("ends_on")),
-            "graceMinutes": int(row["grace_minutes"]),
-            "historyReferenceCount": int(row["history_reference_count"]),
-        }
-        for row in recurring_rows
-    ]
+    recurring: List[Dict[str, Any]] = []
+    for row in recurring_rows:
+        rule_today = _rule_inventory_date(row, as_of_utc)
+        if row["ends_on"] is not None and row["ends_on"] < rule_today - timedelta(
+            days=1
+        ):
+            continue
+        recurring.append(
+            {
+                "legacyKey": f"recurring:{int(row['id'])}",
+                "legacyId": int(row["id"]),
+                "employeeId": int(row["employee_id"]),
+                "employeeName": str(row.get("employee_name") or ""),
+                "siteId": int(row["location_id"]),
+                "siteName": str(row.get("site_name") or ""),
+                "weekdays": [int(day) for day in row["weekdays"]],
+                "localStart": _time_text(row["local_start_time"]),
+                "timezone": str(row["timezone"]),
+                "timezoneValid": _valid_timezone(row["timezone"]),
+                "startsOn": _date_text(row["starts_on"]),
+                "endsOn": _date_text(row.get("ends_on")),
+                "graceMinutes": int(row["grace_minutes"]),
+                "historyReferenceCount": int(row["history_reference_count"]),
+            }
+        )
 
     exact_conflicts: List[Dict[str, Any]] = []
     by_exact_site_start: Dict[tuple[int, str], List[str]] = {}
@@ -397,7 +474,7 @@ def build_cutover_readiness(
     mapping_errors: List[str] = []
     dispositions: Dict[str, str] = {}
     if owner_mapping is not None:
-        mapping_errors = validate_owner_mapping(inventory, owner_mapping)
+        mapping_errors = _readiness_mapping_errors(inventory, owner_mapping)
         if not mapping_errors:
             dispositions = {
                 str(entry.get("legacyKey")): str(entry.get("disposition"))
@@ -448,6 +525,9 @@ def build_cutover_readiness(
                     "eligibleAppointmentJobId": source.get(
                         "eligibleAppointmentJobId"
                     ),
+                    "runtimeCandidateJobIds": list(
+                        source.get("runtimeCandidateJobIds") or []
+                    ),
                 }
             )
         else:
@@ -471,14 +551,21 @@ def build_cutover_readiness(
                 }
             )
 
-    def replacement_for_exact(source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def replacement_for_exact(
+        source: Dict[str, Any],
+        *,
+        runtime_candidate_job_ids: List[int],
+    ) -> Optional[Dict[str, Any]]:
         job_id = source.get("eligibleAppointmentJobId")
         appointment_policy = (
             current_appointment_policies.get(int(job_id))
             if job_id is not None
             else None
         )
-        if appointment_policy is not None:
+        if (
+            appointment_policy is not None
+            and runtime_candidate_job_ids == [int(job_id)]
+        ):
             return {
                 "authority": "appointment",
                 "policyRevisionId": int(appointment_policy["id"]),
@@ -525,7 +612,23 @@ def build_cutover_readiness(
         return "owner_mapping_does_not_retire_or_replace_legacy_row"
 
     for source in inventory.get("activeFutureExactSchedules", []):
-        replacement = replacement_for_exact(source)
+        scheduled_start = datetime.fromisoformat(
+            str(source["scheduledStart"]).replace("Z", "+00:00")
+        )
+        runtime_candidate_job_ids = _runtime_job_window_candidate_ids(
+            conn,
+            site_id=int(source["siteId"]),
+            scheduled_start=scheduled_start,
+            schedule_window_hours=schedule_window_hours,
+        )
+        source = {
+            **source,
+            "runtimeCandidateJobIds": runtime_candidate_job_ids,
+        }
+        replacement = replacement_for_exact(
+            source,
+            runtime_candidate_job_ids=runtime_candidate_job_ids,
+        )
         add_legacy_row(
             source,
             legacy_type="exact",

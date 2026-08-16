@@ -1334,6 +1334,157 @@ def test_cutover_readiness_uses_latest_appointment_revision_by_job(
     assert row["blocksCutover"] is True
 
 
+def test_cutover_readiness_keeps_timezone_boundary_recurring_rule(
+    client,
+    auth,
+    employee_id,
+    location_id,
+):
+    recurring = create_recurring_schedule_rule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        weekdays=[5],
+        starts_on="2049-07-01",
+        ends_on="2049-07-23",
+    )
+    db.execute(
+        """
+        UPDATE site_check_in_schedule_rules
+        SET timezone = 'Pacific/Honolulu'
+        WHERE id = %s
+        """,
+        (recurring["id"],),
+    )
+
+    conn = _raw_conn()
+    try:
+        report = build_cutover_readiness(
+            conn,
+            as_of=datetime(2049, 7, 24, 8, 30, tzinfo=timezone.utc),
+        )
+    finally:
+        conn.close()
+
+    assert report["readyForLegacyFallbackRemoval"] is False
+    assert {row["legacyKey"] for row in report["legacyRows"]} == {
+        f"recurring:{recurring['id']}"
+    }
+    assert report["blockers"] == [
+        {
+            "legacyKey": f"recurring:{recurring['id']}",
+            "legacyType": "recurring",
+            "siteId": location_id,
+            "reason": "missing_replacement_policy_or_owner_mapping",
+        }
+    ]
+
+
+def test_cutover_readiness_accepts_reviewed_mapping_after_row_ages_out(
+    client,
+    auth,
+    employee_id,
+    location_id,
+):
+    scheduled_start = datetime(2049, 7, 24, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+
+    conn = _raw_conn()
+    try:
+        inventory = build_inventory(
+            conn,
+            as_of=datetime(2049, 7, 23, 12, 0, tzinfo=timezone.utc),
+        )
+        mapping = json.loads(json.dumps(inventory["ownerMappingTemplate"]))
+        mapping["ownerReviewedBy"] = "Juan Canfield"
+        mapping["ownerReviewedAt"] = "2049-07-23T12:00:00Z"
+        for entry in mapping["entries"]:
+            entry["reviewNote"] = "Owner retained this legacy row for history only"
+            entry["disposition"] = "retain_history_only"
+
+        report = build_cutover_readiness(
+            conn,
+            as_of=datetime(2049, 7, 25, 1, 0, tzinfo=timezone.utc),
+            owner_mapping=mapping,
+        )
+    finally:
+        conn.close()
+
+    assert any(
+        entry["legacyKey"] == f"exact:{exact['id']}"
+        for entry in mapping["entries"]
+    )
+    assert report["mappingValidationErrors"] == []
+    assert report["readyForLegacyFallbackRemoval"] is True
+    assert report["summary"]["legacyRows"] == 0
+    assert report["blockers"] == []
+
+
+def test_cutover_readiness_requires_appointment_to_cover_full_exact_window(
+    client,
+    auth,
+    employee_id,
+    location_id,
+):
+    scheduled_start = datetime(2049, 7, 26, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+    job_id = create_canonical_job(
+        location_id,
+        scheduled_start,
+        suffix="arrival-policy-cutover-window-primary",
+    )
+    competing_job_id = create_canonical_job(
+        location_id,
+        scheduled_start + timedelta(hours=20),
+        suffix="arrival-policy-cutover-window-competing",
+    )
+    appointment_policy = client.put(
+        f"/api/admin/jobs/{job_id}/arrival-policy",
+        headers=auth,
+        json={
+            "mode": "fixed",
+            "timezone": "America/Chicago",
+            "fixedArrival": "07:00",
+            "graceMinutes": 10,
+            "changeNote": "Owner approved appointment policy for cutover",
+        },
+    )
+    assert appointment_policy.status_code == 200, appointment_policy.text
+
+    conn = _raw_conn()
+    try:
+        report = build_cutover_readiness(
+            conn,
+            as_of=datetime(2049, 7, 25, 12, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        conn.close()
+
+    row = next(
+        row
+        for row in report["legacyRows"]
+        if row["legacyKey"] == f"exact:{exact['id']}"
+    )
+    assert row["candidateJobIds"] == [job_id]
+    assert set(row["runtimeCandidateJobIds"]) == {job_id, competing_job_id}
+    assert row["currentlyCoveredByPolicy"] is False
+    assert row["replacement"] is None
+    assert row["blocksCutover"] is True
+
+
 def test_canonical_appointment_scope_locks_site_row_before_policy_write():
     class FakeCursor:
         def __init__(self):
