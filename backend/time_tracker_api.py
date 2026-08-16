@@ -4787,26 +4787,6 @@ def _ensure_customer_site_schema() -> None:
                 """
             )
             sites = [dict(row) for row in cur.fetchall()]
-            for site in sites:
-                if site.get("customer_id") is not None:
-                    continue
-                customer_name = str(site.get("customer_name") or "").strip()
-                if not customer_name:
-                    continue
-                cur.execute(
-                    "INSERT INTO customers (name) VALUES (%s) RETURNING id",
-                    (customer_name,),
-                )
-                customer_id = int(cur.fetchone()["id"])
-                cur.execute(
-                    """
-                    UPDATE locations
-                    SET customer_id = %s, customer_name = %s, updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (customer_id, customer_name, site["id"]),
-                )
-
             keys_by_site = {
                 int(site["id"]): normalize_site_address(str(site["address"]))
                 for site in sites
@@ -16980,31 +16960,26 @@ def admin_create_location(
     request: Request,
     admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    if payload.customerId is None and payload.customerName is None:
+    if payload.customerId is None:
         _raise_validation_error(
-            "A Customer is required",
-            {"customerId": "customerId or customerName is required"},
+            "Create a Customer before creating a Site",
+            {"customerId": "customerId is required; this Site route cannot create a Customer"},
         )
 
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_site_mutations(cur)
-            if payload.customerId is not None:
-                customer_row = _active_customer_for_site(cur, payload.customerId)
-                customer_id = payload.customerId
-                customer_name = str(customer_row["name"])
-                if (
-                    payload.customerName is not None
-                    and payload.customerName != customer_name
-                ):
-                    _raise_validation_error(
-                        "customerId and customerName identify different Customers",
-                        {"customerName": "must match the selected Customer"},
-                    )
-            else:
-                new_customer = CustomerCreateRequest(name=payload.customerName)
-                customer_id = _insert_customer(cur, new_customer)
-                customer_name = str(payload.customerName)
+            customer_id = int(payload.customerId)
+            customer_row = _active_customer_for_site(cur, customer_id)
+            customer_name = str(customer_row["name"])
+            if (
+                payload.customerName is not None
+                and payload.customerName != customer_name
+            ):
+                _raise_validation_error(
+                    "customerId and customerName identify different Customers",
+                    {"customerName": "must match the selected Customer"},
+                )
             site_id = _insert_site(cur, customer_id, customer_name, payload)
             location = _canonical_site(cur, site_id)
     append_access_log(
@@ -17127,11 +17102,14 @@ def admin_update_locations(
                     customer_id: Optional[int] = None
                     customer_name = values.get("customerName") if "customerName" in present else None
                     if customer_name:
-                        cur.execute(
-                            "INSERT INTO customers (name) VALUES (%s) RETURNING id",
-                            (customer_name,),
+                        _raise_validation_error(
+                            "Create a Customer before assigning it to a legacy Site",
+                            {
+                                f"locations.{index}.customerName": (
+                                    "this legacy Site route cannot create a Customer"
+                                )
+                            },
                         )
-                        customer_id = int(cur.fetchone()["id"])
                     lat = values.get("lat") if "lat" in present else None
                     lng = values.get("lng") if "lng" in present else None
                     if (lat is None) != (lng is None):
@@ -17179,19 +17157,13 @@ def admin_update_locations(
                     customer_name = str(values["customerName"])
                     customer_id = existing.get("customer_id")
                     if customer_id is None:
-                        cur.execute(
-                            "INSERT INTO customers (name) VALUES (%s) RETURNING id",
-                            (customer_name,),
-                        )
-                        customer_id = int(cur.fetchone()["id"])
-                        cur.execute(
-                            """
-                            UPDATE locations
-                            SET customer_id = %s, customer_name = %s,
-                                updated_at = NOW()
-                            WHERE id = %s
-                            """,
-                            (customer_id, customer_name, site_id),
+                        _raise_validation_error(
+                            "Create a Customer before assigning it to a legacy Site",
+                            {
+                                f"locations.{index}.customerName": (
+                                    "this legacy Site route cannot create a Customer"
+                                )
+                            },
                         )
                     else:
                         cur.execute(

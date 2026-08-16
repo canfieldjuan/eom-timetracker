@@ -113,18 +113,30 @@ def _seed(conn):
             """,
             ("Juan Canfield", admin_hash, "Catalina Gomez", emp_hash),
         )
+        # The shared live-flow Site is explicitly linked to its Customer, not
+        # a legacy name-only Site. The fixture remains a local legacy Customer
+        # so Atlas-linkage tests control their own linked-contact inventory.
+        cur.execute(
+            """
+            INSERT INTO customers (name)
+            VALUES ('Test Customer')
+            RETURNING id
+            """
+        )
+        test_customer_id = cur.fetchone()[0]
         cur.execute(
             """
             INSERT INTO locations (
-                address, customer_name, lat, lng,
+                customer_id, address, customer_name, lat, lng,
                 rate, rate_type, expected_hours
             )
             VALUES (
-                '123 Main St, Effingham', 'Test Customer', 39.1203, -88.54335,
+                %s, '123 Main St, Effingham', 'Test Customer', 39.1203, -88.54335,
                 150.00, 'per_visit', 3.0
             )
             ON CONFLICT (address) DO NOTHING
             """,
+            (test_customer_id,),
         )
     conn.commit()
 

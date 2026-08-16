@@ -150,7 +150,6 @@ def test_legacy_put_accepts_aliases_and_current_aliases_take_precedence(client, 
         rate=100.0,
         rateType="per_visit",
     )
-    legacy_address = f"{TEST_PREFIX} 101 Legacy Alias Road, Effingham, IL 62401"
     string_address = f"{TEST_PREFIX} 102 String Only Road, Effingham, IL 62401"
     ignored_legacy_address = f"{TEST_PREFIX} 999 Must Not Exist, Effingham, IL"
     current_customer_name = f"{TEST_PREFIX} Customer Current Alias Wins"
@@ -170,13 +169,6 @@ def test_legacy_put_accepts_aliases_and_current_aliases_take_precedence(client, 
                     "rate": 125.0,
                     "rateType": "hourly",
                 },
-                {
-                    "name": legacy_address,
-                    "customer": f"{TEST_PREFIX} Customer Legacy Alias",
-                    "type": "Residential",
-                    "rate": 135.0,
-                    "rateType": "per_visit",
-                },
                 string_address,
             ]
         },
@@ -185,7 +177,6 @@ def test_legacy_put_accepts_aliases_and_current_aliases_take_precedence(client, 
     body = response.json()
     assert body["success"] is True
     assert existing["address"] in body["locations"]
-    assert legacy_address in body["locations"]
     assert string_address in body["locations"]
     assert body["location_customers"][existing["address"]] == current_customer_name
     assert body["location_types"][existing["address"]] == "Commercial"
@@ -202,22 +193,6 @@ def test_legacy_put_accepts_aliases_and_current_aliases_take_precedence(client, 
         (ignored_legacy_address,),
     ) is None
 
-    legacy_row = db.query_one(
-        """
-        SELECT l.*, c.name AS canonical_customer_name
-        FROM locations l
-        LEFT JOIN customers c ON c.id = l.customer_id
-        WHERE l.address = %s
-        """,
-        (legacy_address,),
-    )
-    assert legacy_row["canonical_customer_name"] == (
-        f"{TEST_PREFIX} Customer Legacy Alias"
-    )
-    assert legacy_row["customer_name"] == legacy_row["canonical_customer_name"]
-    assert legacy_row["location_type"] == "Residential"
-    assert legacy_row["customer_id"] is not None
-
     string_row = db.query_one(
         "SELECT * FROM locations WHERE address = %s",
         (string_address,),
@@ -226,6 +201,72 @@ def test_legacy_put_accepts_aliases_and_current_aliases_take_precedence(client, 
     assert string_row["customer_id"] is None
     assert string_row["customer_name"] is None
     assert string_row["location_type"] is None
+
+
+def test_legacy_put_refuses_implicit_customer_creation(client, auth):
+    import db
+
+    named_new_address = f"{TEST_PREFIX} 103 Named New Site, Effingham, IL 62401"
+    named_new_customer = f"{TEST_PREFIX} Customer Named New Site"
+    audit_before = client.get("/api/admin/audits/atlas-linkage", headers=auth)
+    assert audit_before.status_code == 200, audit_before.text
+    unlinked_before = {
+        row["customerId"] for row in audit_before.json()["unlinkedCustomers"]
+    }
+    new_site = client.put(
+        "/api/admin/locations",
+        headers=auth,
+        json={
+            "locations": [{
+                "name": named_new_address,
+                "customer": named_new_customer,
+                "type": "Residential",
+            }]
+        },
+    )
+    assert new_site.status_code == 422, new_site.text
+    assert new_site.json()["code"] == "validation_error"
+    assert "locations.0.customerName" in new_site.json()["details"]["fields"]
+    assert db.query_one("SELECT id FROM customers WHERE name = %s", (named_new_customer,)) is None
+    assert db.query_one("SELECT id FROM locations WHERE address = %s", (named_new_address,)) is None
+
+    unassigned_address = f"{TEST_PREFIX} 104 Unassigned Site, Effingham, IL 62401"
+    unassigned = client.put(
+        "/api/admin/locations",
+        headers=auth,
+        json={"locations": [unassigned_address]},
+    )
+    assert unassigned.status_code == 200, unassigned.text
+    before = db.query_one(
+        "SELECT customer_id, customer_name FROM locations WHERE address = %s",
+        (unassigned_address,),
+    )
+    assert before == {"customer_id": None, "customer_name": None}
+
+    named_existing_customer = f"{TEST_PREFIX} Customer Adopt Unassigned"
+    adopt = client.put(
+        "/api/admin/locations",
+        headers=auth,
+        json={"locations": [{
+            "address": unassigned_address,
+            "customerName": named_existing_customer,
+        }]},
+    )
+    assert adopt.status_code == 422, adopt.text
+    assert adopt.json()["code"] == "validation_error"
+    assert "locations.0.customerName" in adopt.json()["details"]["fields"]
+    assert db.query_one(
+        "SELECT id FROM customers WHERE name = %s", (named_existing_customer,)
+    ) is None
+    assert db.query_one(
+        "SELECT customer_id, customer_name FROM locations WHERE address = %s",
+        (unassigned_address,),
+    ) == before
+    audit_after = client.get("/api/admin/audits/atlas-linkage", headers=auth)
+    assert audit_after.status_code == 200, audit_after.text
+    assert {
+        row["customerId"] for row in audit_after.json()["unlinkedCustomers"]
+    } == unlinked_before
 
 
 def test_legacy_put_preserves_omitted_rows_and_fields_but_honors_explicit_null(
