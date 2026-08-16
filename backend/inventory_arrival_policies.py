@@ -101,13 +101,12 @@ def main() -> int:
         return 2
     conn = psycopg2.connect(args.db_url)
     try:
-        conn.set_session(readonly=True, autocommit=False)
-        as_of = datetime.now(timezone.utc)
-        inventory = build_inventory(
-            conn,
-            as_of=as_of,
-            schedule_window_hours=schedule_window_hours,
+        conn.set_session(
+            readonly=True,
+            autocommit=False,
+            isolation_level="REPEATABLE READ",
         )
+        as_of = datetime.now(timezone.utc)
         if args.cutover_readiness:
             mapping = (
                 json.loads(args.mapping.read_text(encoding="utf-8"))
@@ -121,7 +120,18 @@ def main() -> int:
                 owner_mapping=mapping,
             )
         else:
+            inventory = build_inventory(
+                conn,
+                as_of=as_of,
+                schedule_window_hours=schedule_window_hours,
+            )
             rendered_payload = inventory
+        if args.validate_mapping:
+            inventory = build_inventory(
+                conn,
+                as_of=as_of,
+                schedule_window_hours=schedule_window_hours,
+            )
         conn.rollback()
     finally:
         conn.close()

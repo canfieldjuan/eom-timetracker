@@ -58,10 +58,23 @@ def _current_policy_rows(conn: Any) -> List[Dict[str, Any]]:
     return _query_all(
         conn,
         """
-        SELECT DISTINCT ON (scope_type, site_id, job_id)
-               id, scope_type, site_id, job_id, version, state, mode
-        FROM arrival_policy_revisions
-        ORDER BY scope_type, site_id, job_id, version DESC, id DESC
+        WITH site AS (
+            SELECT DISTINCT ON (site_id)
+                   id, scope_type, site_id, job_id, version, state, mode
+            FROM arrival_policy_revisions
+            WHERE scope_type = 'site'
+            ORDER BY site_id, version DESC, id DESC
+        ),
+        appointment AS (
+            SELECT DISTINCT ON (job_id)
+                   id, scope_type, site_id, job_id, version, state, mode
+            FROM arrival_policy_revisions
+            WHERE scope_type = 'appointment'
+            ORDER BY job_id, version DESC, id DESC
+        )
+        SELECT * FROM site
+        UNION ALL
+        SELECT * FROM appointment
         """,
     )
 
@@ -459,6 +472,20 @@ def build_cutover_readiness(
             )
 
     def replacement_for_exact(source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        job_id = source.get("eligibleAppointmentJobId")
+        appointment_policy = (
+            current_appointment_policies.get(int(job_id))
+            if job_id is not None
+            else None
+        )
+        if appointment_policy is not None:
+            return {
+                "authority": "appointment",
+                "policyRevisionId": int(appointment_policy["id"]),
+                "siteId": int(appointment_policy["site_id"]),
+                "jobId": int(appointment_policy["job_id"]),
+                "mode": appointment_policy.get("mode"),
+            }
         site_policy = current_site_policies.get(int(source["siteId"]))
         if site_policy is not None:
             return {
@@ -467,21 +494,7 @@ def build_cutover_readiness(
                 "siteId": int(site_policy["site_id"]),
                 "mode": site_policy.get("mode"),
             }
-        job_id = source.get("eligibleAppointmentJobId")
-        appointment_policy = (
-            current_appointment_policies.get(int(job_id))
-            if job_id is not None
-            else None
-        )
-        if appointment_policy is None:
-            return None
-        return {
-            "authority": "appointment",
-            "policyRevisionId": int(appointment_policy["id"]),
-            "siteId": int(appointment_policy["site_id"]),
-            "jobId": int(appointment_policy["job_id"]),
-            "mode": appointment_policy.get("mode"),
-        }
+        return None
 
     def replacement_for_recurring(source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         site_policy = current_site_policies.get(int(source["siteId"]))
@@ -499,16 +512,16 @@ def build_cutover_readiness(
         replacement: Optional[Dict[str, Any]],
         owner_disposition: Optional[str],
     ) -> Optional[str]:
+        if owner_mapping is not None and mapping_errors:
+            return "owner_mapping_invalid"
+        if owner_mapping is not None and owner_disposition == "needs_review":
+            return "owner_marked_needs_review"
         if replacement is not None:
             return None
         if owner_mapping is None:
             return "missing_replacement_policy_or_owner_mapping"
-        if mapping_errors:
-            return "owner_mapping_invalid"
         if owner_disposition == "retain_history_only":
             return None
-        if owner_disposition == "needs_review":
-            return "owner_marked_needs_review"
         return "owner_mapping_does_not_retire_or_replace_legacy_row"
 
     for source in inventory.get("activeFutureExactSchedules", []):
@@ -537,18 +550,19 @@ def build_cutover_readiness(
     legacy_history = _query_all(
         conn,
         """
-        SELECT arrival_policy_snapshot->>'classifiedBy' AS classified_by,
-               COUNT(*) AS count
+        SELECT
+            COUNT(*) FILTER (
+                WHERE schedule_id IS NOT NULL
+                   OR arrival_policy_snapshot->>'classifiedBy' = 'legacy_exact'
+            ) AS legacy_exact_count,
+            COUNT(*) FILTER (
+                WHERE schedule_rule_id IS NOT NULL
+                   OR arrival_policy_snapshot->>'classifiedBy' = 'legacy_recurring'
+            ) AS legacy_recurring_count
         FROM site_check_ins
-        WHERE arrival_policy_snapshot->>'classifiedBy'
-              IN ('legacy_exact', 'legacy_recurring')
-        GROUP BY arrival_policy_snapshot->>'classifiedBy'
-        ORDER BY classified_by
         """,
     )
-    history_counts = {
-        str(row["classified_by"]): int(row["count"]) for row in legacy_history
-    }
+    history_counts = legacy_history[0] if legacy_history else {}
     covered_count = sum(1 for row in legacy_rows if row["currentlyCoveredByPolicy"])
     retained_count = sum(
         1
@@ -569,10 +583,11 @@ def build_cutover_readiness(
             "coveredByPolicy": covered_count,
             "ownerRetainHistoryOnly": retained_count,
             "blockingRows": len(blockers),
-            "historicalLegacyExactCheckIns": history_counts.get("legacy_exact", 0),
-            "historicalLegacyRecurringCheckIns": history_counts.get(
-                "legacy_recurring",
-                0,
+            "historicalLegacyExactCheckIns": int(
+                history_counts.get("legacy_exact_count") or 0
+            ),
+            "historicalLegacyRecurringCheckIns": int(
+                history_counts.get("legacy_recurring_count") or 0
             ),
         },
         "legacyRows": legacy_rows,
