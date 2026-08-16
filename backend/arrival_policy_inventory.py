@@ -54,6 +54,18 @@ def _query_all(conn: Any, sql: str, params: Iterable[Any] = ()) -> List[Dict[str
         return [dict(row) for row in cur.fetchall()]
 
 
+def _current_policy_rows(conn: Any) -> List[Dict[str, Any]]:
+    return _query_all(
+        conn,
+        """
+        SELECT DISTINCT ON (scope_type, site_id, job_id)
+               id, scope_type, site_id, job_id, version, state, mode
+        FROM arrival_policy_revisions
+        ORDER BY scope_type, site_id, job_id, version DESC, id DESC
+        """,
+    )
+
+
 VOLATILE_FINGERPRINT_KEYS = {
     "asOf",
     "historyReferenceCount",
@@ -354,6 +366,220 @@ def build_inventory(
             "entries": mapping_entries,
         },
     }
+
+
+def build_cutover_readiness(
+    conn: Any,
+    *,
+    as_of: datetime,
+    schedule_window_hours: int = 12,
+    owner_mapping: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Report whether legacy schedule fallback can be removed without guessing."""
+    inventory = build_inventory(
+        conn,
+        as_of=as_of,
+        schedule_window_hours=schedule_window_hours,
+    )
+    mapping_errors: List[str] = []
+    dispositions: Dict[str, str] = {}
+    if owner_mapping is not None:
+        mapping_errors = validate_owner_mapping(inventory, owner_mapping)
+        if not mapping_errors:
+            dispositions = {
+                str(entry.get("legacyKey")): str(entry.get("disposition"))
+                for entry in owner_mapping.get("entries", [])
+                if isinstance(entry, dict)
+            }
+
+    current_site_policies: Dict[int, Dict[str, Any]] = {}
+    current_appointment_policies: Dict[int, Dict[str, Any]] = {}
+    for row in _current_policy_rows(conn):
+        if row["state"] != "active":
+            continue
+        if row["scope_type"] == "site":
+            current_site_policies[int(row["site_id"])] = row
+        elif row.get("job_id") is not None:
+            current_appointment_policies[int(row["job_id"])] = row
+
+    legacy_rows: List[Dict[str, Any]] = []
+    blockers: List[Dict[str, Any]] = []
+
+    def add_legacy_row(
+        source: Dict[str, Any],
+        *,
+        legacy_type: str,
+        replacement: Optional[Dict[str, Any]],
+        block_reason: Optional[str],
+    ) -> None:
+        key = str(source["legacyKey"])
+        owner_disposition = dispositions.get(key)
+        row = {
+            "legacyKey": key,
+            "legacyType": legacy_type,
+            "siteId": int(source["siteId"]),
+            "siteName": str(source.get("siteName") or ""),
+            "employeeId": int(source["employeeId"]),
+            "employeeName": str(source.get("employeeName") or ""),
+            "ownerDisposition": owner_disposition,
+            "currentlyCoveredByPolicy": replacement is not None,
+            "replacement": replacement,
+            "blocksCutover": block_reason is not None,
+            "blockReason": block_reason,
+        }
+        if legacy_type == "exact":
+            row.update(
+                {
+                    "scheduledStart": source["scheduledStart"],
+                    "candidateJobIds": list(source.get("candidateJobIds") or []),
+                    "eligibleAppointmentJobId": source.get(
+                        "eligibleAppointmentJobId"
+                    ),
+                }
+            )
+        else:
+            row.update(
+                {
+                    "weekdays": list(source.get("weekdays") or []),
+                    "localStart": source.get("localStart"),
+                    "timezone": source.get("timezone"),
+                    "startsOn": source.get("startsOn"),
+                    "endsOn": source.get("endsOn"),
+                }
+            )
+        legacy_rows.append(row)
+        if block_reason is not None:
+            blockers.append(
+                {
+                    "legacyKey": key,
+                    "legacyType": legacy_type,
+                    "siteId": int(source["siteId"]),
+                    "reason": block_reason,
+                }
+            )
+
+    def replacement_for_exact(source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        site_policy = current_site_policies.get(int(source["siteId"]))
+        if site_policy is not None:
+            return {
+                "authority": "site",
+                "policyRevisionId": int(site_policy["id"]),
+                "siteId": int(site_policy["site_id"]),
+                "mode": site_policy.get("mode"),
+            }
+        job_id = source.get("eligibleAppointmentJobId")
+        appointment_policy = (
+            current_appointment_policies.get(int(job_id))
+            if job_id is not None
+            else None
+        )
+        if appointment_policy is None:
+            return None
+        return {
+            "authority": "appointment",
+            "policyRevisionId": int(appointment_policy["id"]),
+            "siteId": int(appointment_policy["site_id"]),
+            "jobId": int(appointment_policy["job_id"]),
+            "mode": appointment_policy.get("mode"),
+        }
+
+    def replacement_for_recurring(source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        site_policy = current_site_policies.get(int(source["siteId"]))
+        if site_policy is None:
+            return None
+        return {
+            "authority": "site",
+            "policyRevisionId": int(site_policy["id"]),
+            "siteId": int(site_policy["site_id"]),
+            "mode": site_policy.get("mode"),
+        }
+
+    def block_reason(
+        *,
+        replacement: Optional[Dict[str, Any]],
+        owner_disposition: Optional[str],
+    ) -> Optional[str]:
+        if replacement is not None:
+            return None
+        if owner_mapping is None:
+            return "missing_replacement_policy_or_owner_mapping"
+        if mapping_errors:
+            return "owner_mapping_invalid"
+        if owner_disposition == "retain_history_only":
+            return None
+        if owner_disposition == "needs_review":
+            return "owner_marked_needs_review"
+        return "owner_mapping_does_not_retire_or_replace_legacy_row"
+
+    for source in inventory.get("activeFutureExactSchedules", []):
+        replacement = replacement_for_exact(source)
+        add_legacy_row(
+            source,
+            legacy_type="exact",
+            replacement=replacement,
+            block_reason=block_reason(
+                replacement=replacement,
+                owner_disposition=dispositions.get(str(source["legacyKey"])),
+            ),
+        )
+    for source in inventory.get("activeOpenRecurringRules", []):
+        replacement = replacement_for_recurring(source)
+        add_legacy_row(
+            source,
+            legacy_type="recurring",
+            replacement=replacement,
+            block_reason=block_reason(
+                replacement=replacement,
+                owner_disposition=dispositions.get(str(source["legacyKey"])),
+            ),
+        )
+
+    legacy_history = _query_all(
+        conn,
+        """
+        SELECT arrival_policy_snapshot->>'classifiedBy' AS classified_by,
+               COUNT(*) AS count
+        FROM site_check_ins
+        WHERE arrival_policy_snapshot->>'classifiedBy'
+              IN ('legacy_exact', 'legacy_recurring')
+        GROUP BY arrival_policy_snapshot->>'classifiedBy'
+        ORDER BY classified_by
+        """,
+    )
+    history_counts = {
+        str(row["classified_by"]): int(row["count"]) for row in legacy_history
+    }
+    covered_count = sum(1 for row in legacy_rows if row["currentlyCoveredByPolicy"])
+    retained_count = sum(
+        1
+        for row in legacy_rows
+        if row.get("ownerDisposition") == "retain_history_only"
+        and not row["blocksCutover"]
+    )
+    return {
+        "schemaVersion": 1,
+        "asOf": inventory["asOf"],
+        "inventoryFingerprint": inventory["inventoryFingerprint"],
+        "scheduleWindowHours": max(1, int(schedule_window_hours)),
+        "readyForLegacyFallbackRemoval": not blockers and not mapping_errors,
+        "mappingProvided": owner_mapping is not None,
+        "mappingValidationErrors": mapping_errors,
+        "summary": {
+            "legacyRows": len(legacy_rows),
+            "coveredByPolicy": covered_count,
+            "ownerRetainHistoryOnly": retained_count,
+            "blockingRows": len(blockers),
+            "historicalLegacyExactCheckIns": history_counts.get("legacy_exact", 0),
+            "historicalLegacyRecurringCheckIns": history_counts.get(
+                "legacy_recurring",
+                0,
+            ),
+        },
+        "legacyRows": legacy_rows,
+        "blockers": blockers,
+    }
+
+
 def validate_owner_mapping(
     inventory: Dict[str, Any],
     mapping: Dict[str, Any],

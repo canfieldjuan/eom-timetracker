@@ -102,9 +102,29 @@ before returning a conflict response.
 
 1. Obtain and preserve the completed owner-reviewed mapping file.
 2. Apply the owner-reviewed mapping through the admin endpoint.
-3. Run parity verification across every policy mode, conflicts, legacy history,
+3. Run cutover readiness verification:
+
+   ```bash
+   python inventory_arrival_policies.py \
+     --cutover-readiness \
+     --mapping owner-reviewed-arrival-policy-mapping.json
+   ```
+
+   Admins can also inspect the database-only report at:
+
+   ```http
+   GET /api/admin/arrival-policy/cutover-readiness
+   Authorization: Bearer <admin token>
+   ```
+
+   The database-only endpoint proves which active legacy exact/recurring rows
+   are already covered by Site or appointment policies. The CLI can additionally
+   annotate `retain_history_only` / `needs_review` dispositions from the
+   preserved owner mapping file; those dispositions are not stored by the apply
+   endpoint.
+4. Run parity verification across every policy mode, conflicts, legacy history,
    and duplicate check-in retries.
-4. Only after parity is accepted, remove the legacy employee-schedule fallback.
+5. Only after parity is accepted, remove the legacy employee-schedule fallback.
    A Site with no policy then becomes implicit flexible.
 
 Legacy tables remain available for history throughout the migration.

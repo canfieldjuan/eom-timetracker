@@ -12,7 +12,11 @@ from pathlib import Path
 
 import psycopg2
 
-from arrival_policy_inventory import build_inventory, validate_owner_mapping
+from arrival_policy_inventory import (
+    build_cutover_readiness,
+    build_inventory,
+    validate_owner_mapping,
+)
 
 
 SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS = 12
@@ -54,6 +58,22 @@ def parse_args() -> argparse.Namespace:
         help="Validate an owner-completed mapping against the live inventory",
     )
     parser.add_argument(
+        "--cutover-readiness",
+        action="store_true",
+        help=(
+            "Report whether legacy exact/recurring schedule fallback can be "
+            "removed without changing unreviewed active rows"
+        ),
+    )
+    parser.add_argument(
+        "--mapping",
+        type=Path,
+        help=(
+            "Owner-reviewed mapping file to annotate cutover readiness. "
+            "This does not apply the mapping or write to PostgreSQL."
+        ),
+    )
+    parser.add_argument(
         "--schedule-window-hours",
         type=int,
         default=None,
@@ -82,11 +102,26 @@ def main() -> int:
     conn = psycopg2.connect(args.db_url)
     try:
         conn.set_session(readonly=True, autocommit=False)
+        as_of = datetime.now(timezone.utc)
         inventory = build_inventory(
             conn,
-            as_of=datetime.now(timezone.utc),
+            as_of=as_of,
             schedule_window_hours=schedule_window_hours,
         )
+        if args.cutover_readiness:
+            mapping = (
+                json.loads(args.mapping.read_text(encoding="utf-8"))
+                if args.mapping
+                else None
+            )
+            rendered_payload = build_cutover_readiness(
+                conn,
+                as_of=as_of,
+                schedule_window_hours=schedule_window_hours,
+                owner_mapping=mapping,
+            )
+        else:
+            rendered_payload = inventory
         conn.rollback()
     finally:
         conn.close()
@@ -101,7 +136,7 @@ def main() -> int:
         print("Owner mapping is complete and matches the current inventory.")
         return 0
 
-    rendered = json.dumps(inventory, indent=2, sort_keys=True) + "\n"
+    rendered = json.dumps(rendered_payload, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.write_text(rendered, encoding="utf-8")
     else:
