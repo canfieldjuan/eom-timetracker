@@ -2524,6 +2524,54 @@ class FunnelLeadStartEstimateRequest(BaseModel):
     )
 
 
+_FUNNEL_BOOKING_RFC3339_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+    r"(?:[Zz]|[+-]\d{2}:\d{2})?$"
+)
+
+
+def _parse_funnel_booking_datetime(value: str) -> datetime:
+    normalized = f"{value[:-1]}+00:00" if value.endswith(("Z", "z")) else value
+    return datetime.fromisoformat(normalized)
+
+
+class FunnelLeadBookingRequest(BaseModel):
+    """One bounded office booking request for an Atlas lead.
+
+    The browser chooses only the appointment window. Atlas retains ownership of
+    the configured Calendar, lifecycle transition, and first-clean draft.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scheduledStart: str = Field(min_length=20, max_length=64)
+    scheduledEnd: str = Field(min_length=20, max_length=64)
+    idempotencyKey: UUID = Field(...)
+
+    @field_validator("scheduledStart", "scheduledEnd", mode="before")
+    @classmethod
+    def validate_rfc3339_datetime(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not _FUNNEL_BOOKING_RFC3339_PATTERN.fullmatch(
+            value
+        ):
+            raise ValueError("must be an RFC 3339 date-time string")
+        try:
+            parsed = _parse_funnel_booking_datetime(value)
+        except ValueError as exc:
+            raise ValueError("must be an RFC 3339 date-time string") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("must include a timezone")
+        return value
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "FunnelLeadBookingRequest":
+        if _parse_funnel_booking_datetime(self.scheduledEnd) <= _parse_funnel_booking_datetime(
+            self.scheduledStart
+        ):
+            raise ValueError("scheduledEnd must be after scheduledStart")
+        return self
+
+
 class FunnelContactCreateRequest(BaseModel):
     """One manual CRM contact request from the authenticated office portal.
 
@@ -3938,11 +3986,16 @@ def _atlas_funnel_read(
 ATLAS_FUNNEL_CAPABILITY_LEAD_LOST = "lead.lost"
 ATLAS_FUNNEL_CAPABILITY_LEAD_REOPEN = "lead.reopen"
 ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION = "contact.operator_mutation"
+ATLAS_FUNNEL_CAPABILITY_LEAD_ESTIMATE_BOOKING = "lead.estimate_booking"
+ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
+ATLAS_FUNNEL_VISIBLE_LEAD_STAGES = frozenset({"new", "estimate_booked", "won"})
 
 # The Atlas operator-mutation boundary this service writes customers through.
 # `_atlas_funnel_request` requires the "/eom-funnel/" prefix and prepends
 # ATLAS_FUNNEL_BASE_URL, which already ends in /api/v1.
 ATLAS_OPERATOR_CONTACTS_PATH = "/eom-funnel/operator-contacts"
+ATLAS_ESTIMATE_BOOKINGS_PATH = "/eom-funnel/leads/{contact_id}/estimate-bookings"
+ATLAS_FIRST_CLEAN_BOOKINGS_PATH = "/eom-funnel/leads/{contact_id}/first-clean-bookings"
 
 # Atlas constrains sourceChannel to a closed set
 # (atlas_brain/services/eom_crm_mutations.py::EOM_OPERATOR_SOURCE_CHANNELS);
@@ -3992,6 +4045,11 @@ def _extract_atlas_funnel_capabilities(
     )
 
 
+def _atlas_funnel_visible_lead_stage(value: Any) -> Optional[str]:
+    stage = _strip_optional_atlas_text(value)
+    return stage if stage in ATLAS_FUNNEL_VISIBLE_LEAD_STAGES else None
+
+
 def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]:
     leads = content.get("leads")
     if not isinstance(leads, list):
@@ -4021,17 +4079,22 @@ def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]
             raise HTTPException(
                 status_code=502, detail="EOM lead review service returned an invalid response"
             )
-        parsed.append(
-            {
-                "contactId": contact_id,
-                "fullName": full_name,
-                "email": _strip_optional_atlas_text(item.get("email")),
-                "phone": _strip_optional_atlas_text(item.get("phone")),
-                "address": _strip_optional_atlas_text(item.get("address")),
-                "source": _strip_optional_atlas_text(item.get("source")),
-                "createdAt": created_at,
-            }
-        )
+        visible_lead = {
+            "contactId": contact_id,
+            "fullName": full_name,
+            "email": _strip_optional_atlas_text(item.get("email")),
+            "phone": _strip_optional_atlas_text(item.get("phone")),
+            "address": _strip_optional_atlas_text(item.get("address")),
+            "source": _strip_optional_atlas_text(item.get("source")),
+            "createdAt": created_at,
+        }
+        # Older Atlas deployments did not return this additive field. Keep the
+        # existing response shape in that state; only an enumerated stage is
+        # relevant to the booking controls downstream.
+        visible_stage = _atlas_funnel_visible_lead_stage(item.get("leadStage"))
+        if visible_stage:
+            visible_lead["leadStage"] = visible_stage
+        parsed.append(visible_lead)
     return {
         "leads": parsed,
         "cursor": cursor,
@@ -16302,6 +16365,19 @@ def admin_list_funnel_review(
             and ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION
             in lead_page["capabilities"]
         ),
+        # These are tracker deployment proofs, not aliases for the Atlas
+        # manifest. Website may deploy before this tracker has the matching
+        # proxy routes, so a missing field on an older tracker must stay false.
+        "estimateBookingAvailable": (
+            lead_page["capabilities"] is not None
+            and ATLAS_FUNNEL_CAPABILITY_LEAD_ESTIMATE_BOOKING
+            in lead_page["capabilities"]
+        ),
+        "firstCleanBookingAvailable": (
+            lead_page["capabilities"] is not None
+            and ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING
+            in lead_page["capabilities"]
+        ),
     }
 
 
@@ -16402,6 +16478,164 @@ def _validate_atlas_funnel_contact_create_result(
             "contactType": contact_type,
         },
     }
+
+
+def _atlas_funnel_booking_body(payload: FunnelLeadBookingRequest) -> Dict[str, Any]:
+    """Map the portal booking window to the exact Atlas booking contract."""
+    return {
+        "scheduled_start": payload.scheduledStart,
+        "scheduled_end": payload.scheduledEnd,
+    }
+
+
+def _validate_atlas_funnel_booking_result(
+    atlas_result: Dict[str, Any],
+    *,
+    contact_id: str,
+    expected_stage: str,
+    expected_status: str,
+    requires_onboarding_draft: bool,
+) -> Dict[str, Any]:
+    """Return the closed browser receipt for one completed Atlas booking."""
+    try:
+        returned_contact_id = str(UUID(str(atlas_result.get("contact_id", ""))))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise AtlasFunnelRequestError(
+            502, "EOM booking service returned an invalid contact id"
+        ) from exc
+    calendar_event_id = _strip_optional_atlas_text(atlas_result.get("calendar_event_id"))
+    expected_calendar_event_id = _strip_optional_atlas_text(
+        atlas_result.get("expected_calendar_event_id")
+    )
+    idempotent = atlas_result.get("idempotent")
+    if (
+        atlas_result.get("success") is not True
+        or returned_contact_id != contact_id
+        or atlas_result.get("lead_stage") != expected_stage
+        or atlas_result.get("status") != expected_status
+        or not isinstance(idempotent, bool)
+        or not calendar_event_id
+        or calendar_event_id != expected_calendar_event_id
+    ):
+        raise AtlasFunnelRequestError(
+            502, "EOM booking service returned a mismatched response"
+        )
+    visible: Dict[str, Any] = {
+        "success": True,
+        "contactId": returned_contact_id,
+        "leadStage": expected_stage,
+        "status": expected_status,
+        "idempotent": idempotent,
+    }
+    if requires_onboarding_draft:
+        try:
+            onboarding_draft_id = str(UUID(str(atlas_result.get("onboarding_draft_id", ""))))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise AtlasFunnelRequestError(
+                502, "EOM booking service returned an invalid onboarding draft id"
+            ) from exc
+        visible["onboardingDraftId"] = onboarding_draft_id
+    return visible
+
+
+def _submit_atlas_funnel_booking(
+    *,
+    contact_id: str,
+    payload: FunnelLeadBookingRequest,
+    request: Request,
+    admin: Dict[str, Any],
+    capability: str,
+    atlas_path: str,
+    expected_stage: str,
+    expected_status: str,
+    requires_onboarding_draft: bool,
+    audit_prefix: str,
+) -> JSONResponse:
+    """Submit one capability-gated booking without creating tracker records."""
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(capability, admin)
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            f"{audit_prefix}_CAPABILITY_UNAVAILABLE",
+            False,
+            f"capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    try:
+        atlas_result = _atlas_funnel_request(
+            atlas_path.format(contact_id=contact_id),
+            admin,
+            payload=_atlas_funnel_booking_body(payload),
+            idempotency_key=str(payload.idempotencyKey),
+        )
+        visible = _validate_atlas_funnel_booking_result(
+            atlas_result,
+            contact_id=contact_id,
+            expected_stage=expected_stage,
+            expected_status=expected_status,
+            requires_onboarding_draft=requires_onboarding_draft,
+        )
+    except AtlasFunnelRequestError as exc:
+        append_access_log(request, f"{audit_prefix}_FAILED", False, f"status={exc.status_code}")
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    append_access_log(
+        request,
+        f"{audit_prefix}_SUBMITTED",
+        True,
+        f"contact={visible['contactId']} idempotent={visible['idempotent']}",
+    )
+    return JSONResponse(
+        status_code=200 if visible["idempotent"] else 201,
+        content=jsonable_encoder(visible),
+    )
+
+
+@app.post("/api/admin/funnel/leads/{contact_id}/estimate-bookings")
+def admin_create_funnel_estimate_booking(
+    contact_id: UUID,
+    payload: FunnelLeadBookingRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Book an Atlas estimate as the authenticated office operator."""
+    return _submit_atlas_funnel_booking(
+        contact_id=str(contact_id),
+        payload=payload,
+        request=request,
+        admin=admin,
+        capability=ATLAS_FUNNEL_CAPABILITY_LEAD_ESTIMATE_BOOKING,
+        atlas_path=ATLAS_ESTIMATE_BOOKINGS_PATH,
+        expected_stage="estimate_booked",
+        expected_status="estimate_booked",
+        requires_onboarding_draft=False,
+        audit_prefix="EOM_FUNNEL_ESTIMATE_BOOKING",
+    )
+
+
+@app.post("/api/admin/funnel/leads/{contact_id}/first-clean-bookings")
+def admin_create_funnel_first_clean_booking(
+    contact_id: UUID,
+    payload: FunnelLeadBookingRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Book an Atlas first clean and receive its queued-draft receipt."""
+    return _submit_atlas_funnel_booking(
+        contact_id=str(contact_id),
+        payload=payload,
+        request=request,
+        admin=admin,
+        capability=ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING,
+        atlas_path=ATLAS_FIRST_CLEAN_BOOKINGS_PATH,
+        expected_stage="won",
+        expected_status="first_clean_booked",
+        requires_onboarding_draft=True,
+        audit_prefix="EOM_FUNNEL_FIRST_CLEAN_BOOKING",
+    )
 
 
 @app.post("/api/admin/funnel/contacts")
