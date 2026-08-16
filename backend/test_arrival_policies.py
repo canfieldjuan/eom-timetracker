@@ -1034,7 +1034,7 @@ def test_cutover_readiness_reports_policy_covered_legacy_rows(
     )
     job_id = create_canonical_job(
         location_id,
-        scheduled_start,
+        scheduled_start - timedelta(minutes=1),
         suffix="arrival-policy-cutover-covered",
     )
     created_policy = client.put(
@@ -1427,6 +1427,65 @@ def test_cutover_readiness_accepts_reviewed_mapping_after_row_ages_out(
     assert report["blockers"] == []
 
 
+def test_cutover_readiness_rejects_stale_mapping_for_still_active_row(
+    client,
+    auth,
+    employee_id,
+    location_id,
+):
+    scheduled_start = datetime(2049, 7, 24, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+
+    conn = _raw_conn()
+    try:
+        inventory = build_inventory(
+            conn,
+            as_of=datetime(2049, 7, 23, 12, 0, tzinfo=timezone.utc),
+        )
+        mapping = json.loads(json.dumps(inventory["ownerMappingTemplate"]))
+        mapping["ownerReviewedBy"] = "Juan Canfield"
+        mapping["ownerReviewedAt"] = "2049-07-23T12:00:00Z"
+        for entry in mapping["entries"]:
+            entry["reviewNote"] = "Owner retained this legacy row for history only"
+            entry["disposition"] = "retain_history_only"
+
+        db.execute(
+            """
+            UPDATE site_check_in_schedules
+            SET grace_minutes = grace_minutes + 1
+            WHERE id = %s
+            """,
+            (exact["id"],),
+        )
+        report = build_cutover_readiness(
+            conn,
+            as_of=datetime(2049, 7, 23, 12, 5, tzinfo=timezone.utc),
+            owner_mapping=mapping,
+        )
+    finally:
+        conn.close()
+
+    assert report["readyForLegacyFallbackRemoval"] is False
+    assert report["mappingValidationErrors"] == [
+        "mapping.entries[0].sourceFingerprint does not match "
+        "current active inventory row"
+    ]
+    assert report["blockers"] == [
+        {
+            "legacyKey": f"exact:{exact['id']}",
+            "legacyType": "exact",
+            "siteId": location_id,
+            "reason": "owner_mapping_invalid",
+        }
+    ]
+
+
 def test_cutover_readiness_requires_appointment_to_cover_full_exact_window(
     client,
     auth,
@@ -1480,6 +1539,61 @@ def test_cutover_readiness_requires_appointment_to_cover_full_exact_window(
     )
     assert row["candidateJobIds"] == [job_id]
     assert set(row["runtimeCandidateJobIds"]) == {job_id, competing_job_id}
+    assert row["fullWindowAppointmentJobId"] is None
+    assert row["currentlyCoveredByPolicy"] is False
+    assert row["replacement"] is None
+    assert row["blocksCutover"] is True
+
+
+def test_cutover_readiness_rejects_edge_only_appointment_coverage(
+    client,
+    auth,
+    employee_id,
+    location_id,
+):
+    scheduled_start = datetime(2049, 7, 27, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+    job_id = create_canonical_job(
+        location_id,
+        scheduled_start,
+        suffix="arrival-policy-cutover-window-edge",
+    )
+    appointment_policy = client.put(
+        f"/api/admin/jobs/{job_id}/arrival-policy",
+        headers=auth,
+        json={
+            "mode": "fixed",
+            "timezone": "America/Chicago",
+            "fixedArrival": "07:00",
+            "graceMinutes": 10,
+            "changeNote": "Owner approved appointment policy for cutover",
+        },
+    )
+    assert appointment_policy.status_code == 200, appointment_policy.text
+
+    conn = _raw_conn()
+    try:
+        report = build_cutover_readiness(
+            conn,
+            as_of=datetime(2049, 7, 26, 12, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        conn.close()
+
+    row = next(
+        row
+        for row in report["legacyRows"]
+        if row["legacyKey"] == f"exact:{exact['id']}"
+    )
+    assert row["candidateJobIds"] == [job_id]
+    assert row["runtimeCandidateJobIds"] == [job_id]
+    assert row["fullWindowAppointmentJobId"] is None
     assert row["currentlyCoveredByPolicy"] is False
     assert row["replacement"] is None
     assert row["blocksCutover"] is True

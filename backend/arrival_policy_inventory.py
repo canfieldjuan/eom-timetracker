@@ -79,78 +79,12 @@ def _current_policy_rows(conn: Any) -> List[Dict[str, Any]]:
     )
 
 
-def _readiness_mapping_errors(
-    inventory: Dict[str, Any],
-    mapping: Dict[str, Any],
-) -> List[str]:
-    """Validate current active keys while tolerating reviewed rows aged out."""
-    source_keys = {
-        row["legacyKey"]
-        for row in [
-            *inventory.get("activeFutureExactSchedules", []),
-            *inventory.get("activeOpenRecurringRules", []),
-        ]
-    }
-    filtered_mapping = {
-        **mapping,
-        "inventoryFingerprint": inventory.get("inventoryFingerprint"),
-        "entries": [
-            entry
-            for entry in mapping.get("entries", [])
-            if isinstance(entry, dict) and entry.get("legacyKey") in source_keys
-        ],
-    }
-    return validate_owner_mapping(inventory, filtered_mapping)
-
-
 def _rule_inventory_date(row: Dict[str, Any], as_of_utc: datetime) -> date:
     try:
         rule_zone = ZoneInfo(str(row["timezone"]))
     except (ZoneInfoNotFoundError, ValueError):
         rule_zone = ZoneInfo("America/Chicago")
     return as_of_utc.astimezone(rule_zone).date()
-
-
-def _runtime_job_window_candidate_ids(
-    conn: Any,
-    *,
-    site_id: int,
-    scheduled_start: datetime,
-    schedule_window_hours: int,
-) -> List[int]:
-    window = timedelta(hours=max(1, int(schedule_window_hours)) * 2)
-    rows = _query_all(
-        conn,
-        """
-        SELECT j.id
-        FROM jobs j
-        JOIN google_calendar_sources source ON source.id = j.calendar_source_id
-        JOIN locations site ON site.id = j.location_id
-        WHERE j.location_id = %s
-          AND j.status != 'cancelled'
-          AND site.active = true
-          AND (
-              (source.role = 'residential_morning'
-               AND site.location_type = 'Residential')
-              OR
-              (source.role = 'commercial_evening_night'
-               AND site.location_type = 'Commercial')
-          )
-          AND j.source_all_day = false
-          AND j.scheduled_start IS NOT NULL
-          AND j.scheduled_end IS NOT NULL
-          AND j.scheduled_end > j.scheduled_start
-          AND j.scheduled_start < %s
-          AND j.scheduled_end > %s
-        ORDER BY j.source_key, j.id
-        """,
-        (
-            site_id,
-            scheduled_start + window,
-            scheduled_start - window,
-        ),
-    )
-    return [int(row["id"]) for row in rows]
 
 
 VOLATILE_FINGERPRINT_KEYS = {
@@ -176,6 +110,72 @@ def _inventory_fingerprint(payload: Dict[str, Any]) -> str:
     stable_payload = _stable_inventory_value(payload)
     canonical = json.dumps(stable_payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _legacy_row_fingerprint(row: Dict[str, Any]) -> str:
+    return _inventory_fingerprint({"legacyRow": row})
+
+
+def _runtime_candidate_jobs(
+    jobs_by_site: Dict[int, List[Dict[str, Any]]],
+    *,
+    site_id: int,
+    scheduled_start: datetime,
+    schedule_window: timedelta,
+) -> List[Dict[str, Any]]:
+    runtime_window = schedule_window * 2
+    return [
+        job
+        for job in jobs_by_site.get(site_id, [])
+        if job["scheduled_start"] < scheduled_start + runtime_window
+        and job["scheduled_end"] > scheduled_start - runtime_window
+    ]
+
+
+def _job_covers_entire_exact_window(
+    job: Dict[str, Any],
+    *,
+    scheduled_start: datetime,
+) -> bool:
+    return job["scheduled_start"] < scheduled_start < job["scheduled_end"]
+
+
+def _readiness_mapping_errors(
+    inventory: Dict[str, Any],
+    mapping: Dict[str, Any],
+) -> List[str]:
+    """Validate active keys while tolerating reviewed rows that aged out."""
+    source_rows = {
+        row["legacyKey"]: row
+        for row in [
+            *inventory.get("activeFutureExactSchedules", []),
+            *inventory.get("activeOpenRecurringRules", []),
+        ]
+    }
+    active_entries = []
+    freshness_errors = []
+    mapping_fingerprint = mapping.get("inventoryFingerprint")
+    for index, entry in enumerate(mapping.get("entries", [])):
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("legacyKey") or "")
+        source = source_rows.get(key)
+        if source is None:
+            continue
+        active_entries.append(entry)
+        if mapping_fingerprint == inventory.get("inventoryFingerprint"):
+            continue
+        if entry.get("sourceFingerprint") != _legacy_row_fingerprint(source):
+            freshness_errors.append(
+                f"mapping.entries[{index}].sourceFingerprint does not match "
+                "current active inventory row"
+            )
+    filtered_mapping = {
+        **mapping,
+        "inventoryFingerprint": inventory.get("inventoryFingerprint"),
+        "entries": active_entries,
+    }
+    return [*freshness_errors, *validate_owner_mapping(inventory, filtered_mapping)]
 
 
 def _mapping_grace_minutes(value: Any) -> Optional[int]:
@@ -263,27 +263,48 @@ def build_inventory(
     exact: List[Dict[str, Any]] = []
     for row in exact_rows:
         start = row["scheduled_start"]
-        candidates = [
-            int(job["id"])
-            for job in jobs_by_site.get(int(row["location_id"]), [])
+        site_id = int(row["location_id"])
+        central_candidates = [
+            job
+            for job in jobs_by_site.get(site_id, [])
             if job["scheduled_start"] < start + schedule_window
             and job["scheduled_end"] > start - schedule_window
         ]
+        runtime_candidates = _runtime_candidate_jobs(
+            jobs_by_site,
+            site_id=site_id,
+            scheduled_start=start,
+            schedule_window=schedule_window,
+        )
+        candidate_ids = [int(job["id"]) for job in central_candidates]
+        runtime_candidate_ids = [int(job["id"]) for job in runtime_candidates]
+        eligible_job_id = candidate_ids[0] if len(candidate_ids) == 1 else None
+        runtime_job = runtime_candidates[0] if len(runtime_candidates) == 1 else None
+        full_window_job_id = (
+            eligible_job_id
+            if runtime_job is not None
+            and runtime_candidate_ids == [eligible_job_id]
+            and _job_covers_entire_exact_window(
+                runtime_job,
+                scheduled_start=start,
+            )
+            else None
+        )
         exact.append(
             {
                 "legacyKey": f"exact:{int(row['id'])}",
                 "legacyId": int(row["id"]),
                 "employeeId": int(row["employee_id"]),
                 "employeeName": str(row.get("employee_name") or ""),
-                "siteId": int(row["location_id"]),
+                "siteId": site_id,
                 "siteName": str(row.get("site_name") or ""),
                 "scheduledStart": _utc_text(start),
                 "graceMinutes": int(row["grace_minutes"]),
                 "historyReferenceCount": int(row["history_reference_count"]),
-                "candidateJobIds": candidates,
-                "eligibleAppointmentJobId": (
-                    candidates[0] if len(candidates) == 1 else None
-                ),
+                "candidateJobIds": candidate_ids,
+                "eligibleAppointmentJobId": eligible_job_id,
+                "runtimeCandidateJobIds": runtime_candidate_ids,
+                "fullWindowAppointmentJobId": full_window_job_id,
             }
         )
 
@@ -438,6 +459,7 @@ def build_inventory(
         mapping_entries.append(
             {
                 "legacyKey": row["legacyKey"],
+                "sourceFingerprint": _legacy_row_fingerprint(row),
                 "disposition": None,
                 "targetJobId": None,
                 "policy": None,
@@ -528,6 +550,9 @@ def build_cutover_readiness(
                     "runtimeCandidateJobIds": list(
                         source.get("runtimeCandidateJobIds") or []
                     ),
+                    "fullWindowAppointmentJobId": source.get(
+                        "fullWindowAppointmentJobId"
+                    ),
                 }
             )
         else:
@@ -553,19 +578,14 @@ def build_cutover_readiness(
 
     def replacement_for_exact(
         source: Dict[str, Any],
-        *,
-        runtime_candidate_job_ids: List[int],
     ) -> Optional[Dict[str, Any]]:
-        job_id = source.get("eligibleAppointmentJobId")
+        job_id = source.get("fullWindowAppointmentJobId")
         appointment_policy = (
             current_appointment_policies.get(int(job_id))
             if job_id is not None
             else None
         )
-        if (
-            appointment_policy is not None
-            and runtime_candidate_job_ids == [int(job_id)]
-        ):
+        if appointment_policy is not None:
             return {
                 "authority": "appointment",
                 "policyRevisionId": int(appointment_policy["id"]),
@@ -612,23 +632,7 @@ def build_cutover_readiness(
         return "owner_mapping_does_not_retire_or_replace_legacy_row"
 
     for source in inventory.get("activeFutureExactSchedules", []):
-        scheduled_start = datetime.fromisoformat(
-            str(source["scheduledStart"]).replace("Z", "+00:00")
-        )
-        runtime_candidate_job_ids = _runtime_job_window_candidate_ids(
-            conn,
-            site_id=int(source["siteId"]),
-            scheduled_start=scheduled_start,
-            schedule_window_hours=schedule_window_hours,
-        )
-        source = {
-            **source,
-            "runtimeCandidateJobIds": runtime_candidate_job_ids,
-        }
-        replacement = replacement_for_exact(
-            source,
-            runtime_candidate_job_ids=runtime_candidate_job_ids,
-        )
+        replacement = replacement_for_exact(source)
         add_legacy_row(
             source,
             legacy_type="exact",
