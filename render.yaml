@@ -8,6 +8,15 @@ services:
     envVars:
       - key: JWT_SECRET
         generateValue: true
+      # Was the code default (12h, unset). Raised so a login covers a full
+      # shift without a mid-shift forced logout; QR office check-in is meant
+      # to absorb daily re-auth on top of this, not replace an even longer
+      # TTL -- see the login-QR design discussion before extending this
+      # further, since a leaked token has no revocation path except a
+      # password reset (which signs out every session on the account, not
+      # just the leaked one).
+      - key: TOKEN_TTL_HOURS
+        value: "8"
       - key: TIMEZONE
         value: America/Chicago
       - key: ENV
