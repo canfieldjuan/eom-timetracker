@@ -6840,6 +6840,45 @@ def _shift_home_base_start_evidence(
     )
 
 
+def _employee_open_shift_home_base_start_evidence(
+    employee_id: int,
+    reference_time: datetime,
+) -> Optional[Dict[str, Any]]:
+    cutoff = reference_time - timedelta(hours=MAX_ACTIVE_SHIFT_HOURS)
+    return db.query_one(
+        """
+        WITH open_shift AS (
+            SELECT s.id
+            FROM shifts s
+            WHERE s.employee_id = %s
+              AND s.clock_out IS NULL
+              AND s.clock_in >= %s
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM payroll_shift_corrections correction
+                  WHERE correction.shift_id = s.id
+                    AND correction.status = 'active'
+              )
+            ORDER BY s.clock_in DESC, s.id DESC
+            LIMIT 1
+        )
+        SELECT hb.id AS home_base_id, hb.label, hb.address,
+               crew.name AS crew_name, event.home_base_policy_id AS policy_id
+        FROM open_shift s
+        JOIN home_base_events event
+          ON event.shift_id = s.id
+         AND event.action = 'start'
+         AND event.outcome IN ('recorded', 'exception')
+        JOIN home_bases hb ON hb.id = event.home_base_id
+        LEFT JOIN home_base_policies policy ON policy.id = event.home_base_policy_id
+        LEFT JOIN crews crew ON crew.id = policy.crew_id
+        ORDER BY event.id
+        LIMIT 1
+        """,
+        (int(employee_id), cutoff),
+    )
+
+
 def _home_base_policy_for_employee(
     employee_id: int,
     reference_time: datetime,
@@ -10798,15 +10837,15 @@ def home_base_status(
     actions record Home Base only when GPS proves the configured office
     geofence, or when the employee supplies a documented exception.
     """
-    timesheet_data = _load_timesheets_from_db()
-    open_entry = get_open_entry(timesheet_data["entries"], int(employee["id"]))
-    if open_entry:
-        started_under = _shift_home_base_start_evidence(open_entry.get("id"))
-        if started_under:
-            return {
-                "success": True,
-                **_public_home_base_policy(started_under),
-            }
+    started_under = _employee_open_shift_home_base_start_evidence(
+        int(employee["id"]),
+        utc_now(),
+    )
+    if started_under:
+        return {
+            "success": True,
+            **_public_home_base_policy(started_under),
+        }
     return {
         "success": True,
         **_public_home_base_policy(None),

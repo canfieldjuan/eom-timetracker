@@ -641,6 +641,41 @@ def test_gps_confirmed_home_base_clock_out_rejects_active_customer_visit(client,
     assert ended.json()["homeBaseEvent"]["action"] == "end"
 
 
+def test_home_base_status_uses_filtered_open_shift_lookup(client, auth, monkeypatch):
+    employee_id, employee_auth = _create_employee(client, "Home Base status lookup")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    def fail_full_history_load():
+        raise AssertionError("home-base status loaded full timesheet history")
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_load_timesheets_from_db",
+        fail_full_history_load,
+    )
+    status = client.get(
+        "/api/timesheet/home-base/status",
+        headers=employee_auth,
+    )
+
+    assert status.status_code == 200, status.text
+    body = status.json()
+    assert body["required"] is True
+    assert body["homeBase"]["label"] == "EOM Office Home Base"
+
+
 def test_home_base_scan_rejects_uncommitted_stale_payload_before_paid_mutation(client, auth):
     employee_id, employee_auth = _create_employee(client, "Stale scan")
     _enroll_in_morning_crew(employee_id)
