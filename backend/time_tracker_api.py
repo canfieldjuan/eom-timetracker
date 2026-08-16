@@ -9401,6 +9401,37 @@ def receivables_create_payment(
     )
 
 
+@app.post("/api/admin/receivables/payments/{payment_id}/receipt-delivery")
+def receivables_dispatch_residential_payment_receipt(
+    payment_id: UUID,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Explicitly ask ATLAS to dispatch or recover one residential receipt.
+
+    ATLAS owns the receipt outbox, Gmail identity, and idempotent recovery
+    state. This route neither changes a payment nor retries a potentially
+    ambiguous mail operation on its own; it forwards the manager-selected
+    operation key to ATLAS and returns that provider's durable delivery state.
+    """
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_RESIDENTIAL_PAYMENT_RECEIPT_DELIVERY",
+        (
+            "Residential payment receipt delivery operation accepted by Atlas "
+            f"for {actor}; payment unchanged"
+        ),
+        "POST",
+        f"/receivables/payments/{payment_id}/receipt-delivery",
+        admin,
+        idempotency_key=idempotency_key,
+    )
+
+
 @app.put("/api/admin/receivables/payments/{payment_id}/allocations")
 def receivables_adjust_payment(
     payment_id: UUID,

@@ -2541,6 +2541,215 @@ class TestReceivablesProxy:
         assert "check_date" not in kwargs["json"]
         assert "received_through" not in kwargs["json"]
 
+    def test_residential_payment_receipt_delivery_proxies_durable_status_without_local_state(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        payment_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        provider_result = {
+            "payment_id": payment_id,
+            "receipt_delivery": {
+                "receipt_number": "EOM-R-2026-0001",
+                "recipient_email": "customer@example.test",
+                "status": "pending",
+                "skip_reason": None,
+                "sent_at": None,
+                "recovery_required_at": "2026-08-15T20:00:00+00:00",
+            },
+            "operation": {
+                "state": "completed",
+                "outcome": "recovery_required",
+                "requested_at": "2026-08-15T20:00:00+00:00",
+                "completed_at": "2026-08-15T20:00:01+00:00",
+            },
+            "replayed": False,
+            "reused": False,
+        }
+        calls = []
+        audits = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse(provider_result)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        response = client.post(
+            f"/api/admin/receivables/payments/{payment_id}/receipt-delivery",
+            headers={**auth, "Idempotency-Key": "residential-receipt-1001"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == provider_result
+        assert GENERATED_RECEIVABLES_TOKEN not in response.text
+        assert len(calls) == 1
+        method, url, kwargs = calls[0]
+        assert method == "POST"
+        assert url == (
+            "https://atlas.test/api/v1/receivables/payments/"
+            f"{payment_id}/receipt-delivery"
+        )
+        assert kwargs["headers"]["Authorization"] == (
+            f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
+        )
+        assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert kwargs["headers"]["Idempotency-Key"] == "residential-receipt-1001"
+        assert kwargs["json"] is None
+        assert kwargs["params"] is None
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        ) == {"n": 0}
+        assert audits == [
+            (
+                "RECEIVABLES_RESIDENTIAL_PAYMENT_RECEIPT_DELIVERY",
+                True,
+                "Residential payment receipt delivery operation accepted by Atlas "
+                "for Juan Canfield; payment unchanged",
+            )
+        ]
+
+    def test_residential_payment_receipt_delivery_rejects_stale_or_invalid_requests_before_atlas(
+        self, client, auth, emp_auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        payment_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        path = f"/api/admin/receivables/payments/{payment_id}/receipt-delivery"
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+        expired_token = api.jwt.encode(
+            {"sub": "1", "name": "Juan Canfield", "role": "admin", "exp": 1},
+            api.JWT_SECRET,
+            algorithm=api.JWT_ALGORITHM,
+        )
+
+        unauthenticated = client.post(
+            path, headers={"Idempotency-Key": "receipt-unauthenticated"}
+        )
+        employee = client.post(
+            path,
+            headers={**emp_auth, "Idempotency-Key": "receipt-employee"},
+        )
+        expired = client.post(
+            path,
+            headers={
+                "Authorization": f"Bearer {expired_token}",
+                "Idempotency-Key": "receipt-expired",
+            },
+        )
+        missing_key = client.post(path, headers=auth)
+        invalid_payment = client.post(
+            "/api/admin/receivables/payments/not-a-uuid/receipt-delivery",
+            headers={**auth, "Idempotency-Key": "receipt-invalid-payment"},
+        )
+
+        assert unauthenticated.status_code == 401
+        assert employee.status_code == 403
+        assert expired.status_code == 401
+        assert missing_key.status_code == 422
+        assert invalid_payment.status_code == 422
+        assert calls == []
+
+    def test_residential_payment_receipt_delivery_retry_preserves_provider_key_after_ambiguous_transport_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        payment_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        provider_result = {
+            "payment_id": payment_id,
+            "receipt_delivery": {
+                "receipt_number": "EOM-R-2026-0001",
+                "recipient_email": "customer@example.test",
+                "status": "sent",
+                "skip_reason": None,
+                "sent_at": "2026-08-15T20:00:01+00:00",
+                "recovery_required_at": None,
+            },
+            "operation": {
+                "state": "completed",
+                "outcome": "sent",
+                "requested_at": "2026-08-15T20:00:00+00:00",
+                "completed_at": "2026-08-15T20:00:01+00:00",
+            },
+            "replayed": True,
+            "reused": False,
+        }
+        calls = []
+        audits = []
+
+        def flaky_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("response lost after dispatch")
+            return _AtlasResponse(provider_result)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+        path = f"/api/admin/receivables/payments/{payment_id}/receipt-delivery"
+        headers = {**auth, "Idempotency-Key": "residential-receipt-retry"}
+
+        failed = client.post(path, headers=headers)
+        recovered = client.post(path, headers=headers)
+
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "5"
+        assert recovered.status_code == 200
+        assert recovered.json() == provider_result
+        assert [call[0] for call in calls] == ["POST", "POST"]
+        assert calls[0][1] == calls[1][1] == (
+            "https://atlas.test/api/v1/receivables/payments/"
+            f"{payment_id}/receipt-delivery"
+        )
+        assert calls[0][2]["headers"]["Idempotency-Key"] == calls[1][2][
+            "headers"
+        ]["Idempotency-Key"] == "residential-receipt-retry"
+        assert calls[0][2]["json"] is calls[1][2]["json"] is None
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        ) == {"n": 0}
+        assert audits[0][0:2] == (
+            "RECEIVABLES_RESIDENTIAL_PAYMENT_RECEIPT_DELIVERY",
+            False,
+        )
+        assert "Atlas request for Juan Canfield failed (503)" in audits[0][2]
+        assert audits[1] == (
+            "RECEIVABLES_RESIDENTIAL_PAYMENT_RECEIPT_DELIVERY",
+            True,
+            "Residential payment receipt delivery operation accepted by Atlas "
+            "for Juan Canfield; payment unchanged",
+        )
+
     def test_payment_model_normalizes_check_metadata_and_rejects_it_for_ach(
         self, client, auth, monkeypatch
     ):
