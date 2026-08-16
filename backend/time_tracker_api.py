@@ -11698,6 +11698,26 @@ def admin_arrival_policy_legacy_inventory(
     }
 
 
+@app.get("/api/admin/arrival-policy/cutover-readiness")
+def admin_arrival_policy_cutover_readiness(
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            cur.execute("SHOW transaction_read_only")
+            database_read_only = cur.fetchone()[0] == "on"
+        report = arrival_policy_inventory.build_cutover_readiness(
+            conn,
+            as_of=utc_now(),
+            schedule_window_hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
+        )
+    return {
+        **report,
+        "databaseReadOnly": database_read_only,
+    }
+
+
 def _arrival_policy_mapping_change_note(entry: Dict[str, Any]) -> str:
     note = str(entry.get("reviewNote") or "").strip()
     legacy_key = str(entry.get("legacyKey") or "").strip()

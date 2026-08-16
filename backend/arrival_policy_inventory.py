@@ -54,6 +54,39 @@ def _query_all(conn: Any, sql: str, params: Iterable[Any] = ()) -> List[Dict[str
         return [dict(row) for row in cur.fetchall()]
 
 
+def _current_policy_rows(conn: Any) -> List[Dict[str, Any]]:
+    return _query_all(
+        conn,
+        """
+        WITH site AS (
+            SELECT DISTINCT ON (site_id)
+                   id, scope_type, site_id, job_id, version, state, mode
+            FROM arrival_policy_revisions
+            WHERE scope_type = 'site'
+            ORDER BY site_id, version DESC, id DESC
+        ),
+        appointment AS (
+            SELECT DISTINCT ON (job_id)
+                   id, scope_type, site_id, job_id, version, state, mode
+            FROM arrival_policy_revisions
+            WHERE scope_type = 'appointment'
+            ORDER BY job_id, version DESC, id DESC
+        )
+        SELECT * FROM site
+        UNION ALL
+        SELECT * FROM appointment
+        """,
+    )
+
+
+def _rule_inventory_date(row: Dict[str, Any], as_of_utc: datetime) -> date:
+    try:
+        rule_zone = ZoneInfo(str(row["timezone"]))
+    except (ZoneInfoNotFoundError, ValueError):
+        rule_zone = ZoneInfo("America/Chicago")
+    return as_of_utc.astimezone(rule_zone).date()
+
+
 VOLATILE_FINGERPRINT_KEYS = {
     "asOf",
     "historyReferenceCount",
@@ -79,6 +112,72 @@ def _inventory_fingerprint(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _legacy_row_fingerprint(row: Dict[str, Any]) -> str:
+    return _inventory_fingerprint({"legacyRow": row})
+
+
+def _runtime_candidate_jobs(
+    jobs_by_site: Dict[int, List[Dict[str, Any]]],
+    *,
+    site_id: int,
+    scheduled_start: datetime,
+    schedule_window: timedelta,
+) -> List[Dict[str, Any]]:
+    runtime_window = schedule_window * 2
+    return [
+        job
+        for job in jobs_by_site.get(site_id, [])
+        if job["scheduled_start"] < scheduled_start + runtime_window
+        and job["scheduled_end"] > scheduled_start - runtime_window
+    ]
+
+
+def _job_covers_entire_exact_window(
+    job: Dict[str, Any],
+    *,
+    scheduled_start: datetime,
+) -> bool:
+    return job["scheduled_start"] < scheduled_start < job["scheduled_end"]
+
+
+def _readiness_mapping_errors(
+    inventory: Dict[str, Any],
+    mapping: Dict[str, Any],
+) -> List[str]:
+    """Validate active keys while tolerating reviewed rows that aged out."""
+    source_rows = {
+        row["legacyKey"]: row
+        for row in [
+            *inventory.get("activeFutureExactSchedules", []),
+            *inventory.get("activeOpenRecurringRules", []),
+        ]
+    }
+    active_entries = []
+    freshness_errors = []
+    mapping_fingerprint = mapping.get("inventoryFingerprint")
+    for index, entry in enumerate(mapping.get("entries", [])):
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("legacyKey") or "")
+        source = source_rows.get(key)
+        if source is None:
+            continue
+        active_entries.append(entry)
+        if mapping_fingerprint == inventory.get("inventoryFingerprint"):
+            continue
+        if entry.get("sourceFingerprint") != _legacy_row_fingerprint(source):
+            freshness_errors.append(
+                f"mapping.entries[{index}].sourceFingerprint does not match "
+                "current active inventory row"
+            )
+    filtered_mapping = {
+        **mapping,
+        "inventoryFingerprint": inventory.get("inventoryFingerprint"),
+        "entries": active_entries,
+    }
+    return [*freshness_errors, *validate_owner_mapping(inventory, filtered_mapping)]
+
+
 def _mapping_grace_minutes(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -97,7 +196,6 @@ def build_inventory(
     as_of_utc = as_of.astimezone(timezone.utc)
     schedule_window = timedelta(hours=max(1, int(schedule_window_hours)))
     exact_cutoff = as_of_utc - schedule_window
-    company_today = as_of_utc.astimezone(ZoneInfo("America/Chicago")).date()
     exact_rows = _query_all(
         conn,
         """
@@ -130,11 +228,9 @@ def build_inventory(
         LEFT JOIN locations l ON l.id = sr.location_id
         LEFT JOIN site_check_ins ci ON ci.schedule_rule_id = sr.id
         WHERE sr.active = true
-          AND sr.ends_on >= %s
         GROUP BY sr.id, e.name, l.address
         ORDER BY sr.location_id, sr.local_start_time, sr.id
         """,
-        (company_today,),
     )
     jobs = _query_all(
         conn,
@@ -167,49 +263,76 @@ def build_inventory(
     exact: List[Dict[str, Any]] = []
     for row in exact_rows:
         start = row["scheduled_start"]
-        candidates = [
-            int(job["id"])
-            for job in jobs_by_site.get(int(row["location_id"]), [])
+        site_id = int(row["location_id"])
+        central_candidates = [
+            job
+            for job in jobs_by_site.get(site_id, [])
             if job["scheduled_start"] < start + schedule_window
             and job["scheduled_end"] > start - schedule_window
         ]
+        runtime_candidates = _runtime_candidate_jobs(
+            jobs_by_site,
+            site_id=site_id,
+            scheduled_start=start,
+            schedule_window=schedule_window,
+        )
+        candidate_ids = [int(job["id"]) for job in central_candidates]
+        runtime_candidate_ids = [int(job["id"]) for job in runtime_candidates]
+        eligible_job_id = candidate_ids[0] if len(candidate_ids) == 1 else None
+        runtime_job = runtime_candidates[0] if len(runtime_candidates) == 1 else None
+        full_window_job_id = (
+            eligible_job_id
+            if runtime_job is not None
+            and runtime_candidate_ids == [eligible_job_id]
+            and _job_covers_entire_exact_window(
+                runtime_job,
+                scheduled_start=start,
+            )
+            else None
+        )
         exact.append(
             {
                 "legacyKey": f"exact:{int(row['id'])}",
                 "legacyId": int(row["id"]),
                 "employeeId": int(row["employee_id"]),
                 "employeeName": str(row.get("employee_name") or ""),
-                "siteId": int(row["location_id"]),
+                "siteId": site_id,
                 "siteName": str(row.get("site_name") or ""),
                 "scheduledStart": _utc_text(start),
                 "graceMinutes": int(row["grace_minutes"]),
                 "historyReferenceCount": int(row["history_reference_count"]),
-                "candidateJobIds": candidates,
-                "eligibleAppointmentJobId": (
-                    candidates[0] if len(candidates) == 1 else None
-                ),
+                "candidateJobIds": candidate_ids,
+                "eligibleAppointmentJobId": eligible_job_id,
+                "runtimeCandidateJobIds": runtime_candidate_ids,
+                "fullWindowAppointmentJobId": full_window_job_id,
             }
         )
 
-    recurring: List[Dict[str, Any]] = [
-        {
-            "legacyKey": f"recurring:{int(row['id'])}",
-            "legacyId": int(row["id"]),
-            "employeeId": int(row["employee_id"]),
-            "employeeName": str(row.get("employee_name") or ""),
-            "siteId": int(row["location_id"]),
-            "siteName": str(row.get("site_name") or ""),
-            "weekdays": [int(day) for day in row["weekdays"]],
-            "localStart": _time_text(row["local_start_time"]),
-            "timezone": str(row["timezone"]),
-            "timezoneValid": _valid_timezone(row["timezone"]),
-            "startsOn": _date_text(row["starts_on"]),
-            "endsOn": _date_text(row.get("ends_on")),
-            "graceMinutes": int(row["grace_minutes"]),
-            "historyReferenceCount": int(row["history_reference_count"]),
-        }
-        for row in recurring_rows
-    ]
+    recurring: List[Dict[str, Any]] = []
+    for row in recurring_rows:
+        rule_today = _rule_inventory_date(row, as_of_utc)
+        if row["ends_on"] is not None and row["ends_on"] < rule_today - timedelta(
+            days=1
+        ):
+            continue
+        recurring.append(
+            {
+                "legacyKey": f"recurring:{int(row['id'])}",
+                "legacyId": int(row["id"]),
+                "employeeId": int(row["employee_id"]),
+                "employeeName": str(row.get("employee_name") or ""),
+                "siteId": int(row["location_id"]),
+                "siteName": str(row.get("site_name") or ""),
+                "weekdays": [int(day) for day in row["weekdays"]],
+                "localStart": _time_text(row["local_start_time"]),
+                "timezone": str(row["timezone"]),
+                "timezoneValid": _valid_timezone(row["timezone"]),
+                "startsOn": _date_text(row["starts_on"]),
+                "endsOn": _date_text(row.get("ends_on")),
+                "graceMinutes": int(row["grace_minutes"]),
+                "historyReferenceCount": int(row["history_reference_count"]),
+            }
+        )
 
     exact_conflicts: List[Dict[str, Any]] = []
     by_exact_site_start: Dict[tuple[int, str], List[str]] = {}
@@ -336,6 +459,7 @@ def build_inventory(
         mapping_entries.append(
             {
                 "legacyKey": row["legacyKey"],
+                "sourceFingerprint": _legacy_row_fingerprint(row),
                 "disposition": None,
                 "targetJobId": None,
                 "policy": None,
@@ -354,6 +478,230 @@ def build_inventory(
             "entries": mapping_entries,
         },
     }
+
+
+def build_cutover_readiness(
+    conn: Any,
+    *,
+    as_of: datetime,
+    schedule_window_hours: int = 12,
+    owner_mapping: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Report whether legacy schedule fallback can be removed without guessing."""
+    inventory = build_inventory(
+        conn,
+        as_of=as_of,
+        schedule_window_hours=schedule_window_hours,
+    )
+    mapping_errors: List[str] = []
+    dispositions: Dict[str, str] = {}
+    if owner_mapping is not None:
+        mapping_errors = _readiness_mapping_errors(inventory, owner_mapping)
+        if not mapping_errors:
+            dispositions = {
+                str(entry.get("legacyKey")): str(entry.get("disposition"))
+                for entry in owner_mapping.get("entries", [])
+                if isinstance(entry, dict)
+            }
+
+    current_site_policies: Dict[int, Dict[str, Any]] = {}
+    current_appointment_policies: Dict[int, Dict[str, Any]] = {}
+    for row in _current_policy_rows(conn):
+        if row["state"] != "active":
+            continue
+        if row["scope_type"] == "site":
+            current_site_policies[int(row["site_id"])] = row
+        elif row.get("job_id") is not None:
+            current_appointment_policies[int(row["job_id"])] = row
+
+    legacy_rows: List[Dict[str, Any]] = []
+    blockers: List[Dict[str, Any]] = []
+
+    def add_legacy_row(
+        source: Dict[str, Any],
+        *,
+        legacy_type: str,
+        replacement: Optional[Dict[str, Any]],
+        block_reason: Optional[str],
+    ) -> None:
+        key = str(source["legacyKey"])
+        owner_disposition = dispositions.get(key)
+        row = {
+            "legacyKey": key,
+            "legacyType": legacy_type,
+            "siteId": int(source["siteId"]),
+            "siteName": str(source.get("siteName") or ""),
+            "employeeId": int(source["employeeId"]),
+            "employeeName": str(source.get("employeeName") or ""),
+            "ownerDisposition": owner_disposition,
+            "currentlyCoveredByPolicy": replacement is not None,
+            "replacement": replacement,
+            "blocksCutover": block_reason is not None,
+            "blockReason": block_reason,
+        }
+        if legacy_type == "exact":
+            row.update(
+                {
+                    "scheduledStart": source["scheduledStart"],
+                    "candidateJobIds": list(source.get("candidateJobIds") or []),
+                    "eligibleAppointmentJobId": source.get(
+                        "eligibleAppointmentJobId"
+                    ),
+                    "runtimeCandidateJobIds": list(
+                        source.get("runtimeCandidateJobIds") or []
+                    ),
+                    "fullWindowAppointmentJobId": source.get(
+                        "fullWindowAppointmentJobId"
+                    ),
+                }
+            )
+        else:
+            row.update(
+                {
+                    "weekdays": list(source.get("weekdays") or []),
+                    "localStart": source.get("localStart"),
+                    "timezone": source.get("timezone"),
+                    "startsOn": source.get("startsOn"),
+                    "endsOn": source.get("endsOn"),
+                }
+            )
+        legacy_rows.append(row)
+        if block_reason is not None:
+            blockers.append(
+                {
+                    "legacyKey": key,
+                    "legacyType": legacy_type,
+                    "siteId": int(source["siteId"]),
+                    "reason": block_reason,
+                }
+            )
+
+    def replacement_for_exact(
+        source: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        job_id = source.get("fullWindowAppointmentJobId")
+        appointment_policy = (
+            current_appointment_policies.get(int(job_id))
+            if job_id is not None
+            else None
+        )
+        if appointment_policy is not None:
+            return {
+                "authority": "appointment",
+                "policyRevisionId": int(appointment_policy["id"]),
+                "siteId": int(appointment_policy["site_id"]),
+                "jobId": int(appointment_policy["job_id"]),
+                "mode": appointment_policy.get("mode"),
+            }
+        site_policy = current_site_policies.get(int(source["siteId"]))
+        if site_policy is not None:
+            return {
+                "authority": "site",
+                "policyRevisionId": int(site_policy["id"]),
+                "siteId": int(site_policy["site_id"]),
+                "mode": site_policy.get("mode"),
+            }
+        return None
+
+    def replacement_for_recurring(source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        site_policy = current_site_policies.get(int(source["siteId"]))
+        if site_policy is None:
+            return None
+        return {
+            "authority": "site",
+            "policyRevisionId": int(site_policy["id"]),
+            "siteId": int(site_policy["site_id"]),
+            "mode": site_policy.get("mode"),
+        }
+
+    def block_reason(
+        *,
+        replacement: Optional[Dict[str, Any]],
+        owner_disposition: Optional[str],
+    ) -> Optional[str]:
+        if owner_mapping is not None and mapping_errors:
+            return "owner_mapping_invalid"
+        if owner_mapping is not None and owner_disposition == "needs_review":
+            return "owner_marked_needs_review"
+        if replacement is not None:
+            return None
+        if owner_mapping is None:
+            return "missing_replacement_policy_or_owner_mapping"
+        if owner_disposition == "retain_history_only":
+            return None
+        return "owner_mapping_does_not_retire_or_replace_legacy_row"
+
+    for source in inventory.get("activeFutureExactSchedules", []):
+        replacement = replacement_for_exact(source)
+        add_legacy_row(
+            source,
+            legacy_type="exact",
+            replacement=replacement,
+            block_reason=block_reason(
+                replacement=replacement,
+                owner_disposition=dispositions.get(str(source["legacyKey"])),
+            ),
+        )
+    for source in inventory.get("activeOpenRecurringRules", []):
+        replacement = replacement_for_recurring(source)
+        add_legacy_row(
+            source,
+            legacy_type="recurring",
+            replacement=replacement,
+            block_reason=block_reason(
+                replacement=replacement,
+                owner_disposition=dispositions.get(str(source["legacyKey"])),
+            ),
+        )
+
+    legacy_history = _query_all(
+        conn,
+        """
+        SELECT
+            COUNT(*) FILTER (
+                WHERE schedule_id IS NOT NULL
+                   OR arrival_policy_snapshot->>'classifiedBy' = 'legacy_exact'
+            ) AS legacy_exact_count,
+            COUNT(*) FILTER (
+                WHERE schedule_rule_id IS NOT NULL
+                   OR arrival_policy_snapshot->>'classifiedBy' = 'legacy_recurring'
+            ) AS legacy_recurring_count
+        FROM site_check_ins
+        """,
+    )
+    history_counts = legacy_history[0] if legacy_history else {}
+    covered_count = sum(1 for row in legacy_rows if row["currentlyCoveredByPolicy"])
+    retained_count = sum(
+        1
+        for row in legacy_rows
+        if row.get("ownerDisposition") == "retain_history_only"
+        and not row["blocksCutover"]
+    )
+    return {
+        "schemaVersion": 1,
+        "asOf": inventory["asOf"],
+        "inventoryFingerprint": inventory["inventoryFingerprint"],
+        "scheduleWindowHours": max(1, int(schedule_window_hours)),
+        "readyForLegacyFallbackRemoval": not blockers and not mapping_errors,
+        "mappingProvided": owner_mapping is not None,
+        "mappingValidationErrors": mapping_errors,
+        "summary": {
+            "legacyRows": len(legacy_rows),
+            "coveredByPolicy": covered_count,
+            "ownerRetainHistoryOnly": retained_count,
+            "blockingRows": len(blockers),
+            "historicalLegacyExactCheckIns": int(
+                history_counts.get("legacy_exact_count") or 0
+            ),
+            "historicalLegacyRecurringCheckIns": int(
+                history_counts.get("legacy_recurring_count") or 0
+            ),
+        },
+        "legacyRows": legacy_rows,
+        "blockers": blockers,
+    }
+
+
 def validate_owner_mapping(
     inventory: Dict[str, Any],
     mapping: Dict[str, Any],
