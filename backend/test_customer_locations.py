@@ -261,6 +261,52 @@ def test_site_coordinate_pair_and_service_date_errors_name_actionable_fields(
     assert "serviceStartDate" in bad_date.json()["details"]["fields"]
 
 
+def test_standalone_site_create_requires_an_existing_customer(client, auth):
+    import db
+
+    implicit_name = f"{TEST_PREFIX} Customer Standalone Must Not Exist"
+    implicit_address = f"{TEST_PREFIX} 53 Standalone Must Not Exist Way"
+    audit_before = client.get("/api/admin/audits/atlas-linkage", headers=auth)
+    assert audit_before.status_code == 200, audit_before.text
+    unlinked_before = {
+        row["customerId"] for row in audit_before.json()["unlinkedCustomers"]
+    }
+    refused = client.post(
+        "/api/admin/locations",
+        headers=auth,
+        json={
+            "customerName": implicit_name,
+            "address": implicit_address,
+            "locationType": "Commercial",
+        },
+    )
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["code"] == "validation_error"
+    assert "customerId" in refused.json()["details"]["fields"]
+    assert db.query_one("SELECT id FROM customers WHERE name = %s", (implicit_name,)) is None
+    assert db.query_one("SELECT id FROM locations WHERE address = %s", (implicit_address,)) is None
+
+    customer = _create_customer(client, auth, "Standalone Existing Customer")
+    created = client.post(
+        "/api/admin/locations",
+        headers=auth,
+        json={
+            "customerId": customer["id"],
+            "customerName": customer["name"],
+            "address": f"{TEST_PREFIX} 54 Standalone Existing Customer Way",
+            "locationType": "Commercial",
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["location"]["customerId"] == customer["id"]
+
+    audit_after = client.get("/api/admin/audits/atlas-linkage", headers=auth)
+    assert audit_after.status_code == 200, audit_after.text
+    assert {
+        row["customerId"] for row in audit_after.json()["unlinkedCustomers"]
+    } == unlinked_before
+
+
 def test_customer_patch_distinguishes_omission_from_explicit_null(client, auth):
     customer = _create_customer(
         client,
@@ -1097,7 +1143,7 @@ def test_active_and_archived_duplicate_addresses_return_actionable_conflicts(
         "300 Duplicate Avenue, Unit B",
     )
     duplicate_payload = {
-        "customerName": f"{TEST_PREFIX} Duplicate Attempt",
+        "customerId": owner["id"],
         "address": " issue 19 api 300 DUPLICATE AVENUE , UNIT B , EFFINGHAM, IL 62401 ",
         "locationType": "Commercial",
     }
@@ -1128,14 +1174,6 @@ def test_active_and_archived_duplicate_addresses_return_actionable_conflicts(
     assert archived_duplicate.json()["details"]["customerId"] == owner["id"]
     assert archived_duplicate.json()["details"]["siteId"] == site["id"]
     assert archived_duplicate.json()["details"]["canRestore"] is True
-
-    import db
-
-    assert db.query_one(
-        "SELECT id FROM customers WHERE name = %s",
-        (duplicate_payload["customerName"],),
-    ) is None
-
 
 def test_concurrent_customer_and_primary_site_creates_have_one_winner(
     client,

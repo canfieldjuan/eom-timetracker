@@ -67,11 +67,11 @@ def _legacy_location_snapshot():
         conn.close()
 
 
-def test_customer_site_backfill_is_idempotent_and_never_merges_equal_names(
+def test_customer_site_schema_keeps_named_legacy_sites_unassigned_without_creating_customers(
     client,
     auth,
 ):
-    """Each named legacy Site owns a Customer; address collisions remain intact."""
+    """Schema startup preserves legacy Site names without manufacturing Customers."""
     import time_tracker_api as api
 
     collision_a = f"{TEST_ADDRESS_PREFIX} 900 Test Lane, Suite 2, Effingham, IL"
@@ -176,7 +176,7 @@ def test_customer_site_backfill_is_idempotent_and_never_merges_equal_names(
     after_first_run = _legacy_location_snapshot()
     assert after_first_run == before
 
-    linked_after_first_run = api.db.query_all(
+    sites_after_first_run = api.db.query_all(
         """
         SELECT l.id AS location_id, l.address, l.customer_name, l.customer_id,
                l.address_key, c.name AS canonical_customer_name
@@ -187,26 +187,14 @@ def test_customer_site_backfill_is_idempotent_and_never_merges_equal_names(
         """,
         (f"{TEST_ADDRESS_PREFIX}%",),
     )
-    by_address = {row["address"]: row for row in linked_after_first_run}
+    by_address = {row["address"]: row for row in sites_after_first_run}
 
     named_rows = [
-        row for row in linked_after_first_run if str(row["customer_name"] or "").strip()
+        row for row in sites_after_first_run if str(row["customer_name"] or "").strip()
     ]
     assert len(named_rows) == 4
-    assert all(row["customer_id"] is not None for row in named_rows)
-    assert len({row["customer_id"] for row in named_rows}) == len(named_rows)
-
-    same_name_rows = [
-        row
-        for row in named_rows
-        if str(row["customer_name"]).strip()
-        == f"{TEST_CUSTOMER_PREFIX} Same Name"
-    ]
-    assert len(same_name_rows) == 2
-    assert same_name_rows[0]["customer_id"] != same_name_rows[1]["customer_id"]
-    assert {
-        row["canonical_customer_name"] for row in same_name_rows
-    } == {f"{TEST_CUSTOMER_PREFIX} Same Name"}
+    assert all(row["customer_id"] is None for row in named_rows)
+    assert all(row["canonical_customer_name"] is None for row in named_rows)
 
     blank_row = by_address[
         f"{TEST_ADDRESS_PREFIX} 103 Blank Customer, Effingham, IL"
@@ -217,23 +205,24 @@ def test_customer_site_backfill_is_idempotent_and_never_merges_equal_names(
     assert by_address[collision_b]["address_key"] is None
     collision_free_rows = [
         row
-        for row in linked_after_first_run
+        for row in sites_after_first_run
         if row["address"] not in {collision_a, collision_b}
     ]
     assert all(row["address_key"] is not None for row in collision_free_rows)
 
     first_mapping = {
         row["location_id"]: (row["customer_id"], row["address_key"])
-        for row in linked_after_first_run
+        for row in sites_after_first_run
     }
     customer_count = api.db.query_one(
         "SELECT COUNT(*) AS count FROM customers WHERE name LIKE %s",
         (f"{TEST_CUSTOMER_PREFIX}%",),
     )["count"]
+    assert customer_count == 0
 
     api._ensure_schema_migrations()
 
-    linked_after_second_run = api.db.query_all(
+    sites_after_second_run = api.db.query_all(
         """
         SELECT id AS location_id, customer_id, address_key
         FROM locations
@@ -244,7 +233,7 @@ def test_customer_site_backfill_is_idempotent_and_never_merges_equal_names(
     )
     assert {
         row["location_id"]: (row["customer_id"], row["address_key"])
-        for row in linked_after_second_run
+        for row in sites_after_second_run
     } == first_mapping
     assert api.db.query_one(
         "SELECT COUNT(*) AS count FROM customers WHERE name LIKE %s",
@@ -273,8 +262,13 @@ def test_customer_site_backfill_is_idempotent_and_never_merges_equal_names(
         headers=auth,
     )
     assert listed.status_code == 200, listed.text
-    listed_ids = {row["id"] for row in listed.json()["locations"]}
-    assert {row["location_id"] for row in linked_after_first_run} <= listed_ids
+    listed_by_id = {row["id"]: row for row in listed.json()["locations"]}
+    assert {row["location_id"] for row in sites_after_first_run} <= set(listed_by_id)
+    for row in named_rows:
+        listed_row = listed_by_id[row["location_id"]]
+        assert listed_row["customerId"] is None
+        assert listed_row["customerName"] == row["customer_name"]
+        assert "unlinked_customer" in listed_row["migrationReview"]
 
     collision_attempt_name = f"{TEST_CUSTOMER_PREFIX} Collision Attempt"
     collision_attempt = client.post(
@@ -442,12 +436,13 @@ def test_customer_site_and_schedule_migrations_upgrade_the_legacy_shape(
             row for row in rows if str(row["customer_name"] or "").strip()
         ]
         assert len(named_rows) == 5
-        assert len({row["customer_id"] for row in named_rows}) == 5
-        assert all(row["canonical_name"] == row["customer_name"].strip() for row in named_rows)
+        assert all(row["customer_id"] is None for row in named_rows)
+        assert all(row["canonical_name"] is None for row in named_rows)
+        assert api.db.query_one("SELECT COUNT(*) AS count FROM customers") == {"count": 0}
         assert by_address[f"{TEST_ADDRESS_PREFIX} 903 Legacy Blank"]["customer_id"] is None
         assert by_address[collision_a]["address_key"] is None
         assert by_address[collision_b]["address_key"] is None
-        assert by_address[f"{TEST_ADDRESS_PREFIX} 904 Legacy Long"]["canonical_name"] == long_name
+        assert by_address[f"{TEST_ADDRESS_PREFIX} 904 Legacy Long"]["customer_name"] == long_name
 
         columns = {
             row["column_name"]: row["data_type"]
@@ -530,9 +525,21 @@ def test_customer_site_and_schedule_migrations_upgrade_the_legacy_shape(
         assert "idx_schedules_site_week" not in schedule_indexes
 
         same_name_sites = [
-            row for row in rows if row["canonical_name"] == same_name
+            row for row in rows if row["customer_name"] == same_name
         ]
         assert len(same_name_sites) == 2
+        # Schema initialization must not invent this Customer relationship.
+        # Give the Sites an explicit relationship only for the independent
+        # schedule-identity assertions below.
+        for site in same_name_sites:
+            same_name_customer_id = api.db.execute_returning(
+                "INSERT INTO customers (name) VALUES (%s) RETURNING id",
+                (same_name,),
+            )
+            api.db.execute(
+                "UPDATE locations SET customer_id = %s WHERE id = %s",
+                (same_name_customer_id, site["id"]),
+            )
         api.db.execute(
             "UPDATE schedules SET location_id = %s WHERE id = %s",
             (same_name_sites[0]["id"], legacy_schedule_id),
