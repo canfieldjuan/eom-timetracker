@@ -49,7 +49,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from hours_report_pdf import build_hours_report_pdf
 from payroll_weekly_hours_pdf import build_payroll_weekly_hours_pdf
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 _data_dir_env = os.environ.get("DATA_DIR", "")
@@ -2522,6 +2522,37 @@ class FunnelLeadStartEstimateRequest(BaseModel):
         max_length=64,
         pattern="^[0-9a-f]{64}$",
     )
+
+
+class FunnelContactCreateRequest(BaseModel):
+    """One manual CRM contact request from the authenticated office portal.
+
+    This is deliberately not the tracker Customer-create model. A contact made
+    from the Leads page belongs to Atlas first; it does not imply a billable
+    operational Customer, Site, or any local mirror row.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    contactType: Literal["lead", "customer"]
+    fullName: str = Field(min_length=1, max_length=256)
+    email: Optional[str] = Field(default=None, max_length=256)
+    phone: Optional[str] = Field(default=None, max_length=64)
+    idempotencyKey: UUID = Field(...)
+
+    @field_validator("fullName", mode="before")
+    @classmethod
+    def normalize_full_name(cls, value: Any) -> Any:
+        return _strip_required_text(value)
+
+    @field_validator("email", "phone", mode="before")
+    @classmethod
+    def normalize_optional_contact_fields(cls, value: Any) -> Any:
+        # The Atlas operator boundary is the validation authority. Stripping
+        # here has one narrower purpose: blank browser fields must be omitted
+        # from the forwarded mutation rather than become an explicit clear on
+        # an Atlas contact matched by the other supplied identity field.
+        return _strip_optional_text(value)
 
 
 class CustomerUpdateRequest(BaseModel):
@@ -16262,7 +16293,177 @@ def admin_list_funnel_review(
         # enable", per Atlas #2308.
         "capabilities": sorted(lead_page["capabilities"] or ()),
         "capabilitiesDeclared": lead_page["capabilities"] is not None,
+        # Unlike the Atlas manifest above, this is a tracker deployment proof:
+        # an older tracker can relay Atlas's contact capability yet has no
+        # /funnel/contacts proxy. Its absent field must therefore fail closed
+        # in the Website until this route is actually deployed.
+        "contactCreationAvailable": (
+            lead_page["capabilities"] is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION
+            in lead_page["capabilities"]
+        ),
     }
+
+
+def _portal_contact_source_ref(idempotency_key: UUID) -> str:
+    """The browser operation identity recorded by Atlas as provenance."""
+    return f"portal-contact:{idempotency_key}"
+
+
+def _atlas_funnel_contact_create_body(
+    payload: FunnelContactCreateRequest,
+) -> Dict[str, Any]:
+    """Build the exact, narrow Atlas operator-contact create request.
+
+    Atlas may resolve this request to an existing contact by the supplied phone
+    or email and applies received fields as authenticated operator intent. For
+    that reason optional blank fields are deliberately absent, not null.
+    """
+    candidates = {
+        "full_name": payload.fullName,
+        "email": payload.email,
+        "phone": payload.phone,
+    }
+    body = {key: value for key, value in candidates.items() if value}
+    body.update(
+        {
+            "contact_type": payload.contactType,
+            "source_channel": ATLAS_OPERATOR_SOURCE_CHANNEL,
+            "source_ref": _portal_contact_source_ref(payload.idempotencyKey),
+        }
+    )
+    return body
+
+
+def _validate_atlas_funnel_contact_create_result(
+    atlas_result: Dict[str, Any],
+    *,
+    requested_contact_type: str,
+) -> Dict[str, Any]:
+    """Return the closed browser projection of an Atlas contact mutation.
+
+    Do not relay the complete upstream object. The page only needs identity,
+    the requested kind, and the outcome needed to say whether Atlas created,
+    updated, or replayed the canonical contact.
+    """
+    if atlas_result.get("success") is not True:
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned an unsuccessful result"
+        )
+    try:
+        contact_id = str(UUID(str(atlas_result.get("contactId", ""))))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned an invalid contact id"
+        ) from exc
+    operation = atlas_result.get("operation")
+    if operation not in {"contact_created", "contact_updated"}:
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned an invalid contact operation"
+        )
+    idempotent = atlas_result.get("idempotent")
+    if not isinstance(idempotent, bool):
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned an invalid idempotency result"
+        )
+    contact = atlas_result.get("contact")
+    if not isinstance(contact, dict):
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned an invalid contact"
+        )
+    full_name = contact.get("fullName")
+    contact_type = contact.get("contactType")
+    if (
+        not isinstance(full_name, str)
+        or not full_name.strip()
+        or contact_type != requested_contact_type
+    ):
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned a mismatched contact"
+        )
+    returned_contact_id = contact.get("contactId")
+    if returned_contact_id is not None:
+        try:
+            if str(UUID(str(returned_contact_id))) != contact_id:
+                raise AtlasFunnelRequestError(
+                    502, "EOM contact service returned a mismatched contact"
+                )
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise AtlasFunnelRequestError(
+                502, "EOM contact service returned an invalid contact id"
+            ) from exc
+    return {
+        "success": True,
+        "idempotent": idempotent,
+        "operation": operation,
+        "contact": {
+            "contactId": contact_id,
+            "fullName": full_name.strip(),
+            "contactType": contact_type,
+        },
+    }
+
+
+@app.post("/api/admin/funnel/contacts")
+def admin_create_funnel_contact(
+    payload: FunnelContactCreateRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Create one canonical Atlas CRM contact from the Leads page.
+
+    The browser is deliberately not an Atlas client: the tracker owns the
+    service credential, supplies the authenticated actor, and rejects a
+    partially deployed Atlas before a write. Unlike Customer creation, there
+    is no tracker-local companion resource or retry reservation here. Atlas's
+    idempotency receipt is the sole record because Atlas is the only resource
+    this endpoint creates.
+    """
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION, admin
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_CONTACT_CREATE_CAPABILITY_UNAVAILABLE",
+            False,
+            f"capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_OPERATOR_CONTACTS_PATH,
+            admin,
+            payload=_atlas_funnel_contact_create_body(payload),
+            idempotency_key=str(payload.idempotencyKey),
+        )
+        visible = _validate_atlas_funnel_contact_create_result(
+            atlas_result,
+            requested_contact_type=payload.contactType,
+        )
+    except AtlasFunnelRequestError as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_CONTACT_CREATE_FAILED",
+            False,
+            f"status={exc.status_code}",
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    append_access_log(
+        request,
+        "EOM_FUNNEL_CONTACT_SUBMITTED",
+        True,
+        f"contact={visible['contact']['contactId']} operation={visible['operation']} "
+        f"idempotent={visible['idempotent']}",
+    )
+    return JSONResponse(
+        status_code=200 if visible["idempotent"] else 201,
+        content=jsonable_encoder(visible),
+    )
 
 
 @app.post("/api/admin/funnel/handoffs/{contact_id}/retry")
