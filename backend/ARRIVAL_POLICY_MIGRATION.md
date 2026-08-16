@@ -60,14 +60,48 @@ python inventory_arrival_policies.py \
   --validate-mapping owner-reviewed-arrival-policy-mapping.json
 ```
 
-Validation does not apply the mapping. This repository intentionally has no
-production mapping-apply command at this stage.
+Validation does not apply the mapping. It is the required preflight before the
+production apply endpoint below.
+
+## Production apply endpoint
+
+After owner review is complete, an authenticated admin may apply the completed
+mapping through the time-tracker API:
+
+```http
+POST /api/admin/arrival-policy/legacy-mapping/apply
+Content-Type: application/json
+Authorization: Bearer <admin token>
+```
+
+Use the exact JSON produced by `ownerMappingTemplate` plus the owner review
+fields and dispositions. The endpoint rebuilds the live inventory, validates
+the submitted `inventoryFingerprint`, rejects incomplete or stale mappings, and
+then appends new arrival-policy revisions for `map_to_appointment` and
+`promote_to_site` entries. `retain_history_only` and `needs_review` entries are
+reported as skipped and do not write a policy.
+
+Expected operator flow:
+
+1. Generate and preserve a fresh inventory.
+2. Complete every owner mapping entry.
+3. Validate the completed file with `--validate-mapping`.
+4. Submit the same JSON body to the admin endpoint.
+5. If the endpoint returns `invalid_arrival_policy_legacy_mapping`, reload a
+   fresh inventory, review the listed conflicts, and resubmit only after owner
+   review is still correct.
+6. If the endpoint returns `arrival_policy_mapping_target_conflict`, inspect the
+   existing current policy for that target before deciding whether a separate
+   policy edit is required.
+
+The apply endpoint is idempotent for an unchanged current policy. It retries
+transaction serialization, uniqueness, and advisory-lock deadlock races once
+before returning a conflict response.
 
 ## Remaining owner-gated stages
 
 1. Obtain and preserve the completed owner-reviewed mapping file.
-2. Add and review an idempotent additive apply path keyed by the inventory
-   fingerprint.
+2. Apply the owner-reviewed mapping through the admin endpoint.
 3. Run parity verification across every policy mode, conflicts, legacy history,
    and duplicate check-in retries.
 4. Only after parity is accepted, remove the legacy employee-schedule fallback.

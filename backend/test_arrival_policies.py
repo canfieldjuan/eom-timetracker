@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, time, timedelta, timezone
 
+import psycopg2
 import pytest
 
 import arrival_policies
 import db
+import time_tracker_api
 from arrival_policy_inventory import build_inventory, validate_owner_mapping
 from conftest import _raw_conn
 from test_site_check_in import (
@@ -753,6 +755,61 @@ def test_read_only_inventory_requires_explicit_owner_dispositions(
             entry["disposition"] = "needs_review"
     assert validate_owner_mapping(inventory, mapping) == []
 
+    distant_job_id = create_canonical_job(
+        location_id,
+        scheduled_start + timedelta(hours=18),
+        suffix="arrival-policy-wide-window-neighbor",
+    )
+    conn = _raw_conn()
+    try:
+        wide_window_inventory = build_inventory(
+            conn,
+            as_of=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
+            schedule_window_hours=24,
+        )
+    finally:
+        conn.close()
+    wide_window_exact_row = next(
+        row
+        for row in wide_window_inventory["activeFutureExactSchedules"]
+        if row["legacyId"] == exact["id"]
+    )
+    assert wide_window_exact_row["candidateJobIds"] == [
+        job_id,
+        distant_job_id,
+    ]
+    assert wide_window_exact_row["eligibleAppointmentJobId"] is None
+
+    recently_started = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        datetime(2026, 7, 19, 10, 0, tzinfo=timezone.utc),
+    )
+    conn = _raw_conn()
+    try:
+        lookback_inventory = build_inventory(
+            conn,
+            as_of=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
+            schedule_window_hours=3,
+        )
+        narrow_inventory = build_inventory(
+            conn,
+            as_of=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
+            schedule_window_hours=1,
+        )
+    finally:
+        conn.close()
+    assert any(
+        row["legacyId"] == recently_started["id"]
+        for row in lookback_inventory["activeFutureExactSchedules"]
+    )
+    assert all(
+        row["legacyId"] != recently_started["id"]
+        for row in narrow_inventory["activeFutureExactSchedules"]
+    )
+
     exact_mapping = next(
         entry
         for entry in mapping["entries"]
@@ -776,8 +833,64 @@ def test_read_only_inventory_requires_explicit_owner_dispositions(
         if entry["legacyKey"] == f"exact:{exact['id']}"
     )["policy"]["fixedArrival"] = "07:00:01"
     assert any(
-        "fixed_arrival must use HH:MM precision" in error
+        "arrival policy times must use HH:MM syntax" in error
         for error in validate_owner_mapping(inventory, seconds_mapping)
+    )
+
+    basic_iso_time_mapping = json.loads(json.dumps(mapping))
+    next(
+        entry
+        for entry in basic_iso_time_mapping["entries"]
+        if entry["legacyKey"] == f"exact:{exact['id']}"
+    )["policy"]["fixedArrival"] = "0700"
+    assert any(
+        "arrival policy times must use HH:MM syntax" in error
+        for error in validate_owner_mapping(inventory, basic_iso_time_mapping)
+    )
+
+    grace_mapping = json.loads(json.dumps(mapping))
+    next(
+        entry
+        for entry in grace_mapping["entries"]
+        if entry["legacyKey"] == f"exact:{exact['id']}"
+    )["policy"]["graceMinutes"] = 121
+    assert any(
+        "grace_minutes must be between 0 and 120" in error
+        for error in validate_owner_mapping(inventory, grace_mapping)
+    )
+
+    fractional_grace_mapping = json.loads(json.dumps(mapping))
+    next(
+        entry
+        for entry in fractional_grace_mapping["entries"]
+        if entry["legacyKey"] == f"exact:{exact['id']}"
+    )["policy"]["graceMinutes"] = 10.5
+    assert any(
+        "grace_minutes must be an integer" in error
+        for error in validate_owner_mapping(inventory, fractional_grace_mapping)
+    )
+
+    truthy_site_confirmation = json.loads(json.dumps(mapping))
+    recurring_mapping = next(
+        entry
+        for entry in truthy_site_confirmation["entries"]
+        if entry["legacyKey"] == f"recurring:{recurring['id']}"
+    )
+    recurring_mapping.update(
+        {
+            "disposition": "promote_to_site",
+            "ownerConfirmedSitePromotion": "false",
+            "policy": {
+                "mode": "window",
+                "timezone": "America/Chicago",
+                "windowStart": "06:30",
+                "windowEnd": "08:30",
+            },
+        }
+    )
+    assert any(
+        "ownerConfirmedSitePromotion must be true" in error
+        for error in validate_owner_mapping(inventory, truthy_site_confirmation)
     )
 
     duplicate_target = json.loads(json.dumps(mapping))
@@ -892,9 +1005,371 @@ def test_admin_legacy_inventory_endpoint_is_admin_only_and_read_only(
     assert after == before
 
 
+def test_canonical_appointment_scope_locks_site_row_before_policy_write():
+    class FakeCursor:
+        def __init__(self):
+            self.sql: list[str] = []
+            self.params: list[tuple] = []
+            self.rows = [
+                {
+                    "id": 17,
+                    "location_id": 23,
+                    "is_canonical_appointment": True,
+                },
+                {"id": 23},
+            ]
+
+        def execute(self, sql, params=()):
+            self.sql.append(sql)
+            self.params.append(tuple(params))
+
+        def fetchone(self):
+            return self.rows.pop(0)
+
+    cur = FakeCursor()
+
+    site_id, job_id = time_tracker_api._arrival_policy_scope_target(
+        cur,
+        scope_type="appointment",
+        target_id=17,
+        for_update=True,
+        require_canonical_appointment=True,
+    )
+
+    assert (site_id, job_id) == (23, 17)
+    assert cur.params[1] == (23,)
+    assert "FROM locations" in cur.sql[1]
+    assert "FOR SHARE" in cur.sql[1]
+
+
+def test_legacy_inventory_fingerprint_ignores_live_history_counts(
+    client,
+    auth,
+    employee_id,
+    location_id,
+):
+    scheduled_start = datetime(2049, 7, 20, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+
+    conn = _raw_conn()
+    try:
+        before = build_inventory(
+            conn,
+            as_of=datetime(2049, 7, 19, 12, 0, tzinfo=timezone.utc),
+        )
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO site_check_ins (
+                employee_id, location_id, device_scanned_at, latitude, longitude,
+                accuracy_m, geofence_radius_m, distance_m, geofence_status,
+                classification, classification_reason, schedule_id,
+                scheduled_start, grace_minutes, device_clock_skew_seconds,
+                review_status
+            )
+            VALUES (
+                %s, %s, %s, 39.1203, -88.54335,
+                5.0, 100, 0, 'inside',
+                'on_time', 'legacy_exact', %s,
+                %s, 10, 0,
+                'not_required'
+            )
+            """,
+            (
+                employee_id,
+                location_id,
+                scheduled_start,
+                exact["id"],
+                scheduled_start,
+            ),
+        )
+        conn.commit()
+        after = build_inventory(
+            conn,
+            as_of=datetime(2049, 7, 19, 12, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        conn.close()
+
+    before_exact = next(
+        row
+        for row in before["activeFutureExactSchedules"]
+        if row["legacyId"] == exact["id"]
+    )
+    after_exact = next(
+        row
+        for row in after["activeFutureExactSchedules"]
+        if row["legacyId"] == exact["id"]
+    )
+    assert before_exact["historyReferenceCount"] == 0
+    assert after_exact["historyReferenceCount"] == 1
+    assert after["historyReferences"] == [
+        {"legacyKey": f"exact:{exact['id']}", "checkInCount": 1}
+    ]
+    assert before["inventoryFingerprint"] == after["inventoryFingerprint"]
+
+
+def test_admin_legacy_mapping_apply_creates_policy_revisions_idempotently(
+    client,
+    auth,
+    emp_auth,
+    employee_id,
+    location_id,
+):
+    scheduled_start = datetime(2049, 7, 20, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+    recurring = create_recurring_schedule_rule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        weekdays=[0, 2],
+        starts_on="2049-07-19",
+    )
+    job_id = create_canonical_job(
+        location_id,
+        scheduled_start,
+        suffix="arrival-policy-mapping-apply",
+    )
+    inventory = client.get(
+        "/api/admin/arrival-policy/legacy-inventory",
+        headers=auth,
+    ).json()
+    mapping = json.loads(json.dumps(inventory["ownerMappingTemplate"]))
+    mapping["ownerReviewedBy"] = "Juan Canfield"
+    mapping["ownerReviewedAt"] = "2049-07-19T12:00:00Z"
+    for entry in mapping["entries"]:
+        entry["reviewNote"] = "Owner reviewed this legacy policy source"
+        if entry["legacyKey"] == f"exact:{exact['id']}":
+            entry.update(
+                {
+                    "disposition": "map_to_appointment",
+                    "targetJobId": job_id,
+                    "policy": {
+                        "mode": "fixed",
+                        "timezone": "America/Chicago",
+                        "fixedArrival": "07:00",
+                        "graceMinutes": 10,
+                    },
+                }
+            )
+        elif entry["legacyKey"] == f"recurring:{recurring['id']}":
+            entry.update(
+                {
+                    "disposition": "promote_to_site",
+                    "ownerConfirmedSitePromotion": True,
+                    "policy": {
+                        "mode": "window",
+                        "timezone": "America/Chicago",
+                        "windowStart": "06:30",
+                        "windowEnd": "08:30",
+                    },
+                }
+            )
+        else:
+            entry["disposition"] = "needs_review"
+
+    endpoint = "/api/admin/arrival-policy/legacy-mapping/apply"
+    assert client.post(endpoint, json=mapping).status_code == 401
+    assert client.post(endpoint, headers=emp_auth, json=mapping).status_code == 403
+
+    invalid = json.loads(json.dumps(mapping))
+    invalid["inventoryFingerprint"] = "0" * 64
+    rejected = client.post(endpoint, headers=auth, json=invalid)
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["code"] == "invalid_arrival_policy_legacy_mapping"
+    assert any(
+        "inventoryFingerprint" in error
+        for error in rejected.json()["details"]["errors"]
+    )
+
+    created = client.post(endpoint, headers=auth, json=mapping)
+    assert created.status_code == 200, created.text
+    created_body = created.json()
+    assert created_body["success"] is True
+    assert created_body["inventoryFingerprint"] == inventory["inventoryFingerprint"]
+    assert {row["legacyKey"] for row in created_body["applied"]} == {
+        f"exact:{exact['id']}",
+        f"recurring:{recurring['id']}",
+    }
+    assert {row["status"] for row in created_body["applied"]} == {"created"}
+    assert created_body["skipped"] == []
+
+    rows = db.query_all(
+        """
+        SELECT scope_type, site_id, job_id, version, state, mode,
+               fixed_arrival, grace_minutes, window_start, window_end,
+               created_by_name
+        FROM arrival_policy_revisions
+        ORDER BY scope_type, job_id NULLS FIRST
+        """
+    )
+    assert len(rows) == 2
+    site_row = next(row for row in rows if row["scope_type"] == "site")
+    appointment_row = next(row for row in rows if row["scope_type"] == "appointment")
+    assert site_row["site_id"] == location_id
+    assert site_row["job_id"] is None
+    assert site_row["version"] == 1
+    assert site_row["state"] == "active"
+    assert site_row["mode"] == "window"
+    assert site_row["window_start"].strftime("%H:%M") == "06:30"
+    assert site_row["window_end"].strftime("%H:%M") == "08:30"
+    assert appointment_row["job_id"] == job_id
+    assert appointment_row["version"] == 1
+    assert appointment_row["state"] == "active"
+    assert appointment_row["mode"] == "fixed"
+    assert appointment_row["fixed_arrival"].strftime("%H:%M") == "07:00"
+    assert appointment_row["grace_minutes"] == 10
+
+    repeated = client.post(endpoint, headers=auth, json=mapping)
+    assert repeated.status_code == 200, repeated.text
+    repeated_body = repeated.json()
+    assert {row["status"] for row in repeated_body["applied"]} == {
+        "already_applied"
+    }
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM arrival_policy_revisions"
+    )["count"] == 2
+
+    site_policy = client.get(
+        f"/api/admin/locations/{location_id}/arrival-policy",
+        headers=auth,
+    ).json()["policy"]
+    retired = client.post(
+        f"/api/admin/locations/{location_id}/arrival-policy/retire",
+        headers=auth,
+        json={
+            "expectedUpdateToken": site_policy["updateToken"],
+            "changeNote": "Owner retired the migrated Site policy",
+        },
+    )
+    assert retired.status_code == 200, retired.text
+    stale_retry = client.post(endpoint, headers=auth, json=mapping)
+    assert stale_retry.status_code == 409, stale_retry.text
+    assert stale_retry.json()["code"] == "arrival_policy_mapping_target_conflict"
+    assert stale_retry.json()["details"]["currentState"] == "retired"
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM arrival_policy_revisions"
+    )["count"] == 3
+
+
+@pytest.mark.parametrize(
+    "retryable_error",
+    [
+        psycopg2.errors.SerializationFailure,
+        psycopg2.errors.UniqueViolation,
+        psycopg2.errors.DeadlockDetected,
+    ],
+)
+def test_admin_legacy_mapping_apply_retries_after_database_race(
+    client,
+    auth,
+    employee_id,
+    location_id,
+    monkeypatch,
+    retryable_error,
+):
+    scheduled_start = datetime(2049, 7, 21, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+    job_id = create_canonical_job(
+        location_id,
+        scheduled_start,
+        suffix="arrival-policy-mapping-retry",
+    )
+    inventory = client.get(
+        "/api/admin/arrival-policy/legacy-inventory",
+        headers=auth,
+    ).json()
+    mapping = json.loads(json.dumps(inventory["ownerMappingTemplate"]))
+    mapping["ownerReviewedBy"] = "Juan Canfield"
+    mapping["ownerReviewedAt"] = "2049-07-21T12:00:00Z"
+    for entry in mapping["entries"]:
+        entry["reviewNote"] = "Owner reviewed this legacy policy source"
+        if entry["legacyKey"] == f"exact:{exact['id']}":
+            entry.update(
+                {
+                    "disposition": "map_to_appointment",
+                    "targetJobId": job_id,
+                    "policy": {
+                        "mode": "fixed",
+                        "timezone": "America/Chicago",
+                        "fixedArrival": "07:00",
+                        "graceMinutes": 10,
+                    },
+                }
+            )
+        else:
+            entry["disposition"] = "needs_review"
+
+    original = time_tracker_api._apply_arrival_policy_mapping_revision
+    calls = {"count": 0}
+
+    def fail_once_then_apply(*args, **kwargs):
+        if calls["count"] == 0:
+            calls["count"] += 1
+            raise retryable_error()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        time_tracker_api,
+        "_apply_arrival_policy_mapping_revision",
+        fail_once_then_apply,
+    )
+
+    response = client.post(
+        "/api/admin/arrival-policy/legacy-mapping/apply",
+        headers=auth,
+        json=mapping,
+    )
+    assert response.status_code == 200, response.text
+    assert calls["count"] == 1
+    assert response.json()["applied"][0]["status"] == "created"
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM arrival_policy_revisions"
+    )["count"] == 1
+
+
 def test_admin_legacy_inventory_uses_one_repeatable_read_snapshot():
     import inspect
     import time_tracker_api
 
     source = inspect.getsource(time_tracker_api.admin_arrival_policy_legacy_inventory)
     assert "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY" in source
+
+
+def test_admin_legacy_mapping_apply_uses_qr_window_and_locks_jobs():
+    import inspect
+    import time_tracker_api
+
+    source = inspect.getsource(
+        time_tracker_api._apply_arrival_policy_legacy_mapping_once
+    )
+    assert "LOCK TABLE jobs IN SHARE MODE" in source
+    assert "schedule_window_hours=SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS" in source
+
+
+def test_inventory_cli_preflight_uses_configured_qr_window():
+    import inspect
+    import inventory_arrival_policies
+
+    source = inspect.getsource(inventory_arrival_policies.main)
+    assert "_configured_schedule_window_hours()" in source
+    assert "schedule_window_hours=schedule_window_hours" in source
