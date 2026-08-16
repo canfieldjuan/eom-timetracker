@@ -6905,7 +6905,8 @@ def _home_base_geofence_from_payload(
         return None
     latitude = getattr(payload, "latitude", None)
     longitude = getattr(payload, "longitude", None)
-    if latitude is None or longitude is None:
+    accuracy = getattr(payload, "accuracy", None)
+    if latitude is None or longitude is None or accuracy is None:
         return None
     return evaluate_site_check_in_geofence(
         site_latitude=(
@@ -6920,7 +6921,7 @@ def _home_base_geofence_from_payload(
         ),
         latitude=latitude,
         longitude=longitude,
-        accuracy=getattr(payload, "accuracy", None),
+        accuracy=accuracy,
     )
 
 
@@ -10797,7 +10798,15 @@ def home_base_status(
     actions record Home Base only when GPS proves the configured office
     geofence, or when the employee supplies a documented exception.
     """
-    del employee
+    timesheet_data = _load_timesheets_from_db()
+    open_entry = get_open_entry(timesheet_data["entries"], int(employee["id"]))
+    if open_entry:
+        started_under = _shift_home_base_start_evidence(open_entry.get("id"))
+        if started_under:
+            return {
+                "success": True,
+                **_public_home_base_policy(started_under),
+            }
     return {
         "success": True,
         **_public_home_base_policy(None),
@@ -13368,11 +13377,10 @@ def clock_out(
                 "clocking out",
             )
         if (
-            (home_base["started_under"] or home_base_exception)
-            and home_base_exception
+            (home_base["confirmed"] or home_base_exception)
             and get_active_visit(open_entry)
         ):
-            return False, "Depart the active customer Site before recording a Home Base exception"
+            return False, "Depart the active customer Site before ending at Home Base"
 
         if not home_base["confirmed"]:
             override_error = require_gps_override(

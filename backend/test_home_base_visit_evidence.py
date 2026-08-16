@@ -333,7 +333,6 @@ def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
             "location": "Legacy entry",
             "latitude": 0,
             "longitude": 0,
-            "accuracy": 5,
             "gpsOverrideReason": "test legacy compatibility",
             "gpsOverrideDetail": "Test GPS is intentionally outside customer Sites.",
             "idempotencyKey": str(uuid4()),
@@ -347,7 +346,6 @@ def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
         json={
             "latitude": 0,
             "longitude": 0,
-            "accuracy": 5,
             "gpsOverrideReason": "test legacy compatibility",
             "gpsOverrideDetail": "Test GPS is intentionally outside customer Sites.",
             "idempotencyKey": str(uuid4()),
@@ -369,6 +367,13 @@ def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
     gps_shift_id = int(gps_start.json()["entry"]["id"])
     assert gps_start.json()["entry"]["location"] == "Home Base — EOM Office Home Base"
     assert gps_start.json()["homeBaseEvent"]["outcome"] == "recorded"
+    open_home_base_status = client.get(
+        "/api/timesheet/home-base/status",
+        headers=employee_auth,
+    )
+    assert open_home_base_status.status_code == 200, open_home_base_status.text
+    assert open_home_base_status.json()["required"] is True
+    assert open_home_base_status.json()["homeBase"]["label"] == "EOM Office Home Base"
     gps_end = client.post(
         "/api/timesheet/clock-out",
         headers=employee_auth,
@@ -386,6 +391,12 @@ def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
         "SELECT COUNT(*) AS count FROM home_base_events WHERE shift_id = %s",
         (gps_shift_id,),
     ) == {"count": 2}
+    closed_home_base_status = client.get(
+        "/api/timesheet/home-base/status",
+        headers=employee_auth,
+    )
+    assert closed_home_base_status.status_code == 200, closed_home_base_status.text
+    assert closed_home_base_status.json()["required"] is False
 
     qr = client.post(
         "/api/admin/home-base/check-in-qr",
@@ -545,6 +556,89 @@ def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
         "required": False,
         "homeBase": None,
     }
+
+
+def test_gps_confirmed_home_base_clock_out_rejects_active_customer_visit(client, auth):
+    employee_id, employee_auth = _create_employee(client, "Home Base active visit")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert started.status_code == 200, started.text
+    site_id = _insert_site(
+        "Active visit before Home Base end",
+        location_type="Residential",
+        latitude=39.36000,
+        longitude=-88.76000,
+    )
+    planned_visit_id = _insert_assigned_planned_visit(
+        employee_id=employee_id,
+        location_id=site_id,
+        suffix="active-visit-before-home-base-end",
+    )
+    arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "plannedVisitId": planned_visit_id,
+            "evidenceMethod": "residential_gps",
+            "latitude": 39.36000,
+            "longitude": -88.76000,
+            "accuracy": 5,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert arrival.status_code == 200, arrival.text
+
+    refused = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert refused.status_code >= 400, refused.text
+    assert "Depart the active customer Site" in refused.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 1}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM departures WHERE shift_id = %s",
+        (int(started.json()["entry"]["id"]),),
+    ) == {"count": 0}
+
+    depart = client.post(
+        "/api/timesheet/depart",
+        headers=employee_auth,
+        json={"latitude": 39.36000, "longitude": -88.76000, "accuracy": 5},
+    )
+    assert depart.status_code == 200, depart.text
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+            "accuracy": 5,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["homeBaseEvent"]["action"] == "end"
 
 
 def test_home_base_scan_rejects_uncommitted_stale_payload_before_paid_mutation(client, auth):
