@@ -375,6 +375,59 @@ def test_customer_patch_distinguishes_omission_from_explicit_null(client, auth):
     assert _customer_row(customer_id)["name"] == before["name"]
 
 
+def test_site_customer_type_is_derived_from_its_parent_without_replacing_location_type(
+    client, auth
+):
+    customer = _create_customer(client, auth, "Derived Customer Type")
+    site = _create_site(
+        client,
+        auth,
+        customer["id"],
+        "55 Derived Type Way",
+        locationType="Commercial",
+    )
+
+    # This models the local mirror receiving newer Atlas evidence. The Site has
+    # no type copy to update: canonical reads must derive it from its parent.
+    import db
+
+    db.execute(
+        "UPDATE customers SET customer_type = 'residential' WHERE id = %s",
+        (customer["id"],),
+    )
+    customer_after_residential = client.get(
+        f"/api/admin/customers/{customer['id']}", headers=auth
+    )
+    assert customer_after_residential.status_code == 200, customer_after_residential.text
+    nested_site = customer_after_residential.json()["customer"]["sites"][0]
+    assert nested_site["customerType"] == "residential"
+    assert nested_site["locationType"] == "Commercial"
+
+    locations_after_residential = client.get("/api/admin/locations", headers=auth)
+    assert locations_after_residential.status_code == 200, locations_after_residential.text
+    listed_site = next(
+        location
+        for location in locations_after_residential.json()["locations"]
+        if location["id"] == site["id"]
+    )
+    assert listed_site["customerType"] == "residential"
+    assert listed_site["locationType"] == "Commercial"
+
+    db.execute(
+        "UPDATE customers SET customer_type = 'commercial' WHERE id = %s",
+        (customer["id"],),
+    )
+    customer_after_commercial = client.get(
+        f"/api/admin/customers/{customer['id']}", headers=auth
+    )
+    assert customer_after_commercial.status_code == 200, customer_after_commercial.text
+    assert (
+        customer_after_commercial.json()["customer"]["sites"][0]["customerType"]
+        == "commercial"
+    )
+    assert _location_row(site["id"])["location_type"] == "Commercial"
+
+
 def test_customer_patch_rejects_a_stale_update_token_without_writing(client, auth):
     customer = _create_customer(
         client,
