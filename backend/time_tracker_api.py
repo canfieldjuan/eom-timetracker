@@ -2572,6 +2572,101 @@ class FunnelLeadBookingRequest(BaseModel):
         return self
 
 
+class AtlasFunnelOnboardingDraftItem(BaseModel):
+    """One pending Atlas onboarding draft safe to show in the office queue.
+
+    The tracker deliberately validates and re-projects this read instead of
+    passing an Atlas response through to the browser. Only ``pending`` is
+    admitted in this slice; the other lifecycle states have separate recovery
+    semantics and are not queue actions here.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    draftId: UUID
+    contactId: UUID
+    fullName: str = Field(min_length=1, max_length=256)
+    recipientEmail: Optional[str] = Field(default=None, max_length=254)
+    blocker: Optional[str] = Field(default=None, max_length=32)
+    subject: str = Field(min_length=1, max_length=500)
+    body: str = Field(min_length=1, max_length=20_000)
+    status: Literal["pending"]
+    createdAt: datetime
+
+    @field_validator("fullName", "subject", "body", mode="before")
+    @classmethod
+    def require_display_text(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be non-blank text")
+        return value
+
+    @field_validator("recipientEmail", "blocker", mode="before")
+    @classmethod
+    def require_optional_display_text(cls, value: Any) -> Any:
+        if value is not None and not isinstance(value, str):
+            raise ValueError("must be text or null")
+        return value
+
+    @field_validator("createdAt", mode="before")
+    @classmethod
+    def require_created_at_string(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be an ISO date-time string")
+        return value
+
+
+class AtlasFunnelOnboardingDraftPage(BaseModel):
+    """Closed pending-draft page received from the existing Atlas queue."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    drafts: list[AtlasFunnelOnboardingDraftItem]
+    status: Literal["pending"]
+    limit: int = Field(ge=1, le=200)
+    cursor: Optional[str] = Field(default=None, min_length=16, max_length=512)
+    hasMore: bool
+    nextCursor: Optional[str] = Field(default=None, min_length=16, max_length=512)
+
+    @field_validator("hasMore", mode="before")
+    @classmethod
+    def require_boolean_has_more(cls, value: Any) -> Any:
+        if not isinstance(value, bool):
+            raise ValueError("must be a boolean")
+        return value
+
+    @model_validator(mode="after")
+    def require_next_cursor_when_more(self) -> "AtlasFunnelOnboardingDraftPage":
+        if self.hasMore and not self.nextCursor:
+            raise ValueError("nextCursor is required when hasMore is true")
+        return self
+
+
+class AtlasFunnelOnboardingDraftSentReceipt(BaseModel):
+    """The only approve-and-send receipt the browser may rely on."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    success: Literal[True]
+    draft_id: UUID
+    status: Literal["sent"]
+    sent_at: datetime
+    idempotent: bool
+
+    @field_validator("sent_at", mode="before")
+    @classmethod
+    def require_sent_at_string(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be an ISO date-time string")
+        return value
+
+    @field_validator("idempotent", mode="before")
+    @classmethod
+    def require_boolean_idempotent(cls, value: Any) -> Any:
+        if not isinstance(value, bool):
+            raise ValueError("must be a boolean")
+        return value
+
+
 class FunnelContactCreateRequest(BaseModel):
     """One manual CRM contact request from the authenticated office portal.
 
@@ -3910,12 +4005,17 @@ def _atlas_funnel_request(
 # not an HTTPException and so escapes the degradation path in
 # _verify_atlas_contact_links instead of reporting status=unavailable.
 _KNOWN_CONTACTS_PATH = "/eom-funnel/known-contacts"
+_ATLAS_ONBOARDING_DRAFTS_PATH = "/eom-funnel/onboarding-drafts"
 
 # GET reads Atlas allows through the funnel credential. Kept as an explicit
 # allow-list, not an open passthrough: a caller that could read any funnel path
 # would turn this EOM-scoped token into a broad read oracle. known-contacts
-# (ATLAS #2352) is id-only link verification, added for the write-boundary audit.
-_ATLAS_FUNNEL_READ_PATHS = frozenset({"/eom-funnel/leads", _KNOWN_CONTACTS_PATH})
+# (ATLAS #2352) is id-only link verification, added for the write-boundary
+# audit. The pending onboarding projection is the only additional office queue
+# read admitted by this slice; all other funnel paths still fail closed.
+_ATLAS_FUNNEL_READ_PATHS = frozenset(
+    {"/eom-funnel/leads", _KNOWN_CONTACTS_PATH, _ATLAS_ONBOARDING_DRAFTS_PATH}
+)
 
 
 def _atlas_funnel_read(
@@ -3988,6 +4088,12 @@ ATLAS_FUNNEL_CAPABILITY_LEAD_REOPEN = "lead.reopen"
 ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION = "contact.operator_mutation"
 ATLAS_FUNNEL_CAPABILITY_LEAD_ESTIMATE_BOOKING = "lead.estimate_booking"
 ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
+# CLOSED / ENUMERATED: these two names are the exact existing Atlas
+# ``_CAPABILITY_ROUTES`` members required by the pending-draft bridge. Atlas
+# remains the canonical manifest; an absent or malformed advertised set disables
+# both tracker controls rather than treating a route name as proof of support.
+ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_LIST = "onboarding.draft.list"
+ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND = "onboarding.draft.approve_send"
 ATLAS_FUNNEL_VISIBLE_LEAD_STAGES = frozenset({"new", "estimate_booked", "won"})
 
 # The Atlas operator-mutation boundary this service writes customers through.
@@ -3996,6 +4102,9 @@ ATLAS_FUNNEL_VISIBLE_LEAD_STAGES = frozenset({"new", "estimate_booked", "won"})
 ATLAS_OPERATOR_CONTACTS_PATH = "/eom-funnel/operator-contacts"
 ATLAS_ESTIMATE_BOOKINGS_PATH = "/eom-funnel/leads/{contact_id}/estimate-bookings"
 ATLAS_FIRST_CLEAN_BOOKINGS_PATH = "/eom-funnel/leads/{contact_id}/first-clean-bookings"
+ATLAS_ONBOARDING_DRAFT_APPROVE_SEND_PATH = (
+    f"{_ATLAS_ONBOARDING_DRAFTS_PATH}/{{draft_id}}/approve-send"
+)
 
 # Atlas constrains sourceChannel to a closed set
 # (atlas_brain/services/eom_crm_mutations.py::EOM_OPERATOR_SOURCE_CHANNELS);
@@ -4101,6 +4210,41 @@ def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]
         "hasMore": has_more,
         "nextCursor": next_cursor,
         "capabilities": _extract_atlas_funnel_capabilities(content),
+    }
+
+
+def _parse_atlas_onboarding_draft_page(content: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and close the pending-draft projection before browser use."""
+    try:
+        page = AtlasFunnelOnboardingDraftPage.model_validate(content)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="EOM onboarding draft service returned an invalid response",
+        ) from exc
+    return page.model_dump(mode="json")
+
+
+def _validate_atlas_onboarding_draft_sent_receipt(
+    atlas_result: Dict[str, Any], *, draft_id: str
+) -> Dict[str, Any]:
+    """Return a closed sent/replayed receipt for the requested draft only."""
+    try:
+        receipt = AtlasFunnelOnboardingDraftSentReceipt.model_validate(atlas_result)
+    except ValidationError as exc:
+        raise AtlasFunnelRequestError(
+            502, "EOM onboarding draft service returned an invalid sent receipt"
+        ) from exc
+    if str(receipt.draft_id) != draft_id:
+        raise AtlasFunnelRequestError(
+            502, "EOM onboarding draft service returned a mismatched sent receipt"
+        )
+    return {
+        "success": True,
+        "draftId": str(receipt.draft_id),
+        "status": "sent",
+        "sentAt": receipt.sent_at.isoformat(),
+        "idempotent": receipt.idempotent,
     }
 
 
@@ -16378,7 +16522,125 @@ def admin_list_funnel_review(
             and ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING
             in lead_page["capabilities"]
         ),
+        # The pending-draft queue has its own pair of tracker routes. Keep the
+        # proofs separate so a Website that deploys ahead of either route does
+        # not turn an Atlas capability into a broken queue read or send button.
+        "onboardingDraftListAvailable": (
+            lead_page["capabilities"] is not None
+            and ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_LIST
+            in lead_page["capabilities"]
+        ),
+        "onboardingDraftApproveSendAvailable": (
+            lead_page["capabilities"] is not None
+            and ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND
+            in lead_page["capabilities"]
+        ),
     }
+
+
+@app.get("/api/admin/funnel/onboarding-drafts")
+def admin_list_funnel_onboarding_drafts(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    cursor: Optional[str] = Query(default=None, min_length=16, max_length=512),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Relay only the pending Atlas onboarding-draft review queue.
+
+    This is a normal admin read: office staff may inspect what Juan will
+    approve, but no lifecycle or delivery operation occurs here. Status is
+    intentionally fixed to ``pending``; sent/revoked history and stuck-send
+    reconciliation are separate workflows, not an open Atlas read proxy.
+    """
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_LIST, admin
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_ONBOARDING_DRAFT_LIST_CAPABILITY_UNAVAILABLE",
+            False,
+            f"capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    params: Dict[str, Any] = {"status": "pending", "limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    content = _atlas_funnel_read(_ATLAS_ONBOARDING_DRAFTS_PATH, admin, params=params)
+    page = _parse_atlas_onboarding_draft_page(content)
+    if page["limit"] != limit or page["cursor"] != cursor:
+        raise HTTPException(
+            status_code=502,
+            detail="EOM onboarding draft service returned an invalid response",
+        )
+    append_access_log(
+        request,
+        "EOM_FUNNEL_ONBOARDING_DRAFTS_LISTED",
+        True,
+        f"drafts={len(page['drafts'])} has_more={page['hasMore']}",
+    )
+    return {"success": True, **page}
+
+
+@app.post("/api/admin/funnel/onboarding-drafts/{draft_id}/approve-send")
+def admin_approve_funnel_onboarding_draft(
+    draft_id: UUID,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Let only the configured office approver invoke Atlas's send command."""
+    _require_juan_funnel_approver(admin, action="approve and send onboarding emails")
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND, admin
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_ONBOARDING_DRAFT_APPROVE_SEND_CAPABILITY_UNAVAILABLE",
+            False,
+            f"draft={draft_id} capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    draft_id_text = str(draft_id)
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_ONBOARDING_DRAFT_APPROVE_SEND_PATH.format(draft_id=draft_id_text),
+            admin,
+            payload={},
+            # Atlas's draft-id state machine is the delivery idempotency
+            # mechanism. This stable transport header is only for the shared
+            # tracker-to-Atlas request helper; the browser supplies no action
+            # key or mutable send payload.
+            idempotency_key=f"eom-onboarding-draft:{draft_id_text}",
+        )
+        visible = _validate_atlas_onboarding_draft_sent_receipt(
+            atlas_result, draft_id=draft_id_text
+        )
+    except AtlasFunnelRequestError as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_ONBOARDING_DRAFT_APPROVE_SEND_FAILED",
+            False,
+            f"draft={draft_id_text} status={exc.status_code}",
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    append_access_log(
+        request,
+        "EOM_FUNNEL_ONBOARDING_DRAFT_APPROVE_SEND_SUBMITTED",
+        True,
+        f"draft={draft_id_text} idempotent={visible['idempotent']}",
+    )
+    return JSONResponse(
+        status_code=200 if visible["idempotent"] else 201,
+        content=jsonable_encoder(visible),
+    )
 
 
 def _portal_contact_source_ref(idempotency_key: UUID) -> str:
