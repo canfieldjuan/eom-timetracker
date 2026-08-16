@@ -6840,6 +6840,45 @@ def _shift_home_base_start_evidence(
     )
 
 
+def _employee_open_shift_home_base_start_evidence(
+    employee_id: int,
+    reference_time: datetime,
+) -> Optional[Dict[str, Any]]:
+    cutoff = reference_time - timedelta(hours=MAX_ACTIVE_SHIFT_HOURS)
+    return db.query_one(
+        """
+        WITH open_shift AS (
+            SELECT s.id
+            FROM shifts s
+            WHERE s.employee_id = %s
+              AND s.clock_out IS NULL
+              AND s.clock_in >= %s
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM payroll_shift_corrections correction
+                  WHERE correction.shift_id = s.id
+                    AND correction.status = 'active'
+              )
+            ORDER BY s.clock_in DESC, s.id DESC
+            LIMIT 1
+        )
+        SELECT hb.id AS home_base_id, hb.label, hb.address,
+               crew.name AS crew_name, event.home_base_policy_id AS policy_id
+        FROM open_shift s
+        JOIN home_base_events event
+          ON event.shift_id = s.id
+         AND event.action = 'start'
+         AND event.outcome IN ('recorded', 'exception')
+        JOIN home_bases hb ON hb.id = event.home_base_id
+        LEFT JOIN home_base_policies policy ON policy.id = event.home_base_policy_id
+        LEFT JOIN crews crew ON crew.id = policy.crew_id
+        ORDER BY event.id
+        LIMIT 1
+        """,
+        (int(employee_id), cutoff),
+    )
+
+
 def _home_base_policy_for_employee(
     employee_id: int,
     reference_time: datetime,
@@ -6895,6 +6934,54 @@ def _active_home_base_config(*, cur: Optional[Any] = None) -> Optional[Dict[str,
         cur.execute(query)
         return _row_from_cursor(cur)
     return db.query_one(query)
+
+
+def _home_base_geofence_from_payload(
+    policy: Optional[Dict[str, Any]],
+    payload: Optional[BaseModel],
+) -> Optional[Dict[str, Any]]:
+    if not policy or payload is None:
+        return None
+    latitude = getattr(payload, "latitude", None)
+    longitude = getattr(payload, "longitude", None)
+    accuracy = getattr(payload, "accuracy", None)
+    if latitude is None or longitude is None or accuracy is None:
+        return None
+    return evaluate_site_check_in_geofence(
+        site_latitude=(
+            float(policy["latitude"])
+            if policy.get("latitude") is not None
+            else None
+        ),
+        site_longitude=(
+            float(policy["longitude"])
+            if policy.get("longitude") is not None
+            else None
+        ),
+        latitude=latitude,
+        longitude=longitude,
+        accuracy=accuracy,
+    )
+
+
+def _home_base_gps_confirmed(geofence: Optional[Dict[str, Any]]) -> bool:
+    return bool(geofence and geofence.get("status") == "inside")
+
+
+def _home_base_gps_meta(
+    policy: Dict[str, Any],
+    geofence: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "override": False,
+        "overrideReason": "",
+        "overrideDetail": "",
+        "matchedLocation": str(policy["label"]),
+        "distanceM": geofence.get("distanceM"),
+        "withinRadius": True,
+        "accuracyM": geofence.get("accuracyM"),
+        "homeBase": True,
+    }
 
 
 def _resolve_home_base_qr(
@@ -7000,7 +7087,11 @@ def _record_home_base_event(
             int(shift_id),
             int(employee_id),
             int(policy["home_base_id"]),
-            int(policy["policy_id"]),
+            (
+                int(policy["policy_id"])
+                if policy.get("policy_id") is not None
+                else None
+            ),
             action,
             outcome,
             exception_reason,
@@ -10682,17 +10773,17 @@ def resolve_home_base_qr(
     employee: Dict[str, Any] = Depends(get_current_employee),
 ) -> Dict[str, Any]:
     home_base = _resolve_home_base_qr(payload.token)
-    now_utc = utc_now()
-    policy = _home_base_policy_for_employee(int(employee["id"]), now_utc)
+    policy = _active_home_base_config()
     if not policy or int(policy["home_base_id"]) != int(home_base["home_base_id"]):
         append_access_log(
             request,
             "HOME_BASE_QR_REJECTED",
             False,
-            f"Employee {employee['name']} is outside the Home Base policy",
+            f"Employee {employee['name']} resolved inactive Home Base {home_base['home_base_id']}",
         )
-        raise HTTPException(status_code=403, detail="Home Base is not required for this employee")
+        raise HTTPException(status_code=403, detail="Home Base is not active")
 
+    now_utc = utc_now()
     timesheet_data = _load_timesheets_from_db()
     stale = get_stale_open_entry(timesheet_data["entries"], int(employee["id"]), now_utc)
     open_entry = get_open_entry(timesheet_data["entries"], int(employee["id"]))
@@ -10742,14 +10833,22 @@ def home_base_status(
 ) -> Dict[str, Any]:
     """Expose only the signed-in employee's current Home Base requirement.
 
-    This is presentation data.  The policy itself is enforced by the clock
-    mutations so a stale or unavailable portal read cannot bypass a configured
-    Morning Crew Home Base requirement.
+    Home Base is no longer a standing Morning Crew requirement. Paid-time
+    actions record Home Base only when GPS proves the configured office
+    geofence, or when the employee supplies a documented exception.
     """
-    policy = _home_base_policy_for_employee(int(employee["id"]), utc_now())
+    started_under = _employee_open_shift_home_base_start_evidence(
+        int(employee["id"]),
+        utc_now(),
+    )
+    if started_under:
+        return {
+            "success": True,
+            **_public_home_base_policy(started_under),
+        }
     return {
         "success": True,
-        **_public_home_base_policy(policy),
+        **_public_home_base_policy(None),
     }
 
 
@@ -10778,9 +10877,9 @@ def record_home_base_scan(
         )
 
     home_base = _resolve_home_base_qr(payload.token)
-    policy = _home_base_policy_for_employee(int(employee["id"]), now_utc)
+    policy = _active_home_base_config()
     if not policy or int(policy["home_base_id"]) != int(home_base["home_base_id"]):
-        raise HTTPException(status_code=403, detail="Home Base is not required for this employee")
+        raise HTTPException(status_code=403, detail="Home Base is not active")
     geofence = evaluate_site_check_in_geofence(
         site_latitude=(
             float(home_base["latitude"])
@@ -10939,16 +11038,10 @@ def record_home_base_scan(
             raise RuntimeError("Home Base action did not return a shift id")
         event_policy = policy
         if payload.action == "start":
-            # Crew membership can change independently of the timesheet and
-            # Home Base configuration locks. The write must therefore hold the
-            # effective membership row while it records a new paid Home Base
-            # start, rather than trusting preflight eligibility.
-            current_policy = _home_base_policy_for_employee(
-                int(employee["id"]),
-                now_utc,
-                cur=cur,
-                for_update=True,
-            )
+            # Home Base configuration can change independently of the QR
+            # preflight. Re-read the active config before recording the event so
+            # the paid shift and audit event agree on the active Home Base.
+            current_policy = _active_home_base_config(cur=cur)
             if (
                 current_policy is None
                 or int(current_policy["home_base_id"])
@@ -10957,8 +11050,8 @@ def record_home_base_scan(
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        "Home Base membership changed before this scan could be "
-                        "recorded; try again with the current policy."
+                        "Home Base configuration changed before this scan could be "
+                        "recorded; try again with the current configuration."
                     ),
                 )
             event_policy = current_policy
@@ -13080,24 +13173,26 @@ def clock_in(
     work_date = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
     # Pre-flight only. The value the guard and every later consumer use is
     # re-resolved inside the mutator, under the timesheet advisory lock.
-    home_base = {"policy": _home_base_policy_for_employee(int(employee["id"]), now_utc)}
-    # Enforcement is server-owned.  A client must not be able to bypass a
-    # configured Morning Crew policy merely by omitting a presentation field.
-    home_base["enforced"] = home_base["policy"] is not None
+    home_base = {
+        "policy": _active_home_base_config(),
+        "geofence": None,
+        "confirmed": False,
+    }
     home_base_exception = _home_base_exception_reason(payload)
     exception_error = _validate_home_base_exception(home_base_exception)
     if exception_error:
         raise HTTPException(status_code=422, detail=exception_error)
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        # Authoritative read. The pre-flight value above was taken before the
-        # timesheet advisory lock was held, so a Home Base policy activated in
-        # between would be missed and this shift would persist with no evidence
-        # that Home Base was ever required. That lock now also covers home-base
-        # configuration, so this re-read cannot be overtaken.
-        home_base["policy"] = _home_base_policy_for_employee(
-            int(employee["id"]), now_utc)
-        home_base["enforced"] = home_base["policy"] is not None
+        # Authoritative read. Home Base evidence is tied to the configured
+        # office geofence, not crew membership. A Morning Crew assignment by
+        # itself must not block a normal customer-site clock action.
+        home_base["policy"] = _active_home_base_config()
+        home_base["geofence"] = _home_base_geofence_from_payload(
+            home_base["policy"],
+            payload,
+        )
+        home_base["confirmed"] = _home_base_gps_confirmed(home_base["geofence"])
 
         stale_open = get_stale_open_entry(
             timesheet_data["entries"], employee["id"], now_utc
@@ -13108,23 +13203,23 @@ def clock_in(
         if existing_open:
             return False, "Already clocked in"
 
-        if home_base["enforced"] and not home_base_exception:
-            assert home_base["policy"] is not None
-            return False, _home_base_requirement_failure(home_base["policy"], "clocking in")
+        if not home_base["confirmed"]:
+            override_error = require_gps_override(
+                timesheet_data,
+                payload.latitude,
+                payload.longitude,
+                payload.gpsOverrideReason,
+                payload.gpsOverrideDetail,
+            )
+            if override_error:
+                return False, override_error
 
-        override_error = require_gps_override(
-            timesheet_data,
-            payload.latitude,
-            payload.longitude,
-            payload.gpsOverrideReason,
-            payload.gpsOverrideDetail,
-        )
-        if override_error:
-            return False, override_error
-
-        # A documented Home Base exception is dispatch evidence, never a
-        # disguised customer Site picked by the generic nearest-pin matcher.
-        if home_base["enforced"] and home_base_exception:
+        # GPS-confirmed Home Base and documented Home Base exceptions are
+        # dispatch evidence, never customer Sites picked by the generic nearest
+        # pin matcher.
+        if home_base["confirmed"] and home_base["policy"]:
+            location = f"Home Base — {home_base['policy']['label']}"
+        elif home_base["policy"] and home_base_exception:
             location = "Dispatch exception"
         # Legacy callers retain their additive-compatible nearest-site behavior.
         elif has_gps:
@@ -13145,7 +13240,10 @@ def clock_in(
             # later loads.
             **(
                 {"locationId": None, "internalHomeBase": True}
-                if home_base["enforced"] and home_base_exception
+                if (
+                    (home_base["confirmed"] and home_base["policy"])
+                    or (home_base["policy"] and home_base_exception)
+                )
                 else {}
             ),
             "clockIn": to_utc_iso(now_utc),
@@ -13168,14 +13266,20 @@ def clock_in(
             entry["clockInGps"] = build_gps_point(
                 payload.latitude, payload.longitude, payload.accuracy
             )
-        entry["clockInGpsMeta"] = build_gps_meta(
-            timesheet_data,
-            payload.latitude,
-            payload.longitude,
-            payload.gpsOverrideReason,
-            payload.gpsOverrideDetail,
-            payload.accuracy,
-        )
+        if home_base["confirmed"] and home_base["policy"] and home_base["geofence"]:
+            entry["clockInGpsMeta"] = _home_base_gps_meta(
+                home_base["policy"],
+                home_base["geofence"],
+            )
+        else:
+            entry["clockInGpsMeta"] = build_gps_meta(
+                timesheet_data,
+                payload.latitude,
+                payload.longitude,
+                payload.gpsOverrideReason,
+                payload.gpsOverrideDetail,
+                payload.accuracy,
+            )
         timesheet_data["entries"].append(entry)
         timesheet_data["nextId"] = entry_id + 1
         return True, entry
@@ -13189,23 +13293,21 @@ def clock_in(
         result["customer"] = _resolve_customer(loc, location_customers)
         return {"success": True, "entry": result}
 
-    def record_home_base_exception(
+    def record_home_base_event(
         cur: Any,
         result: Any,
         response: Dict[str, Any],
     ) -> None:
-        if not (home_base["enforced"] and home_base_exception and home_base["policy"]):
-            return
-        # The mutator runs under the timesheet/config locks, but Morning Crew
-        # membership is maintained by a separate writer. Re-read and lock the
-        # effective membership in this persistence transaction so an exception
-        # cannot start a Home Base shift after that membership has been retired.
-        current_policy = _home_base_policy_for_employee(
-            int(employee["id"]),
-            now_utc,
-            cur=cur,
-            for_update=True,
+        outcome = (
+            "recorded"
+            if home_base["confirmed"] and home_base["geofence"]
+            else "exception"
+            if home_base_exception
+            else ""
         )
+        if not (home_base["policy"] and outcome):
+            return
+        current_policy = _active_home_base_config(cur=cur)
         if (
             current_policy is None
             or int(current_policy["home_base_id"])
@@ -13214,7 +13316,7 @@ def clock_in(
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "Home Base membership changed before this shift could be "
+                    "Home Base configuration changed before this shift could be "
                     "recorded; try again with the current policy."
                 ),
             )
@@ -13227,12 +13329,13 @@ def clock_in(
             employee_id=int(employee["id"]),
             policy=current_policy,
             action="start",
-            outcome="exception",
+            outcome=outcome,
             recorded_at=now_utc,
-            exception_reason=home_base_exception,
+            exception_reason=home_base_exception if outcome == "exception" else "",
             latitude=payload.latitude,
             longitude=payload.longitude,
             accuracy=payload.accuracy,
+            geofence=home_base["geofence"] if outcome == "recorded" else None,
             idempotency_key=payload.idempotencyKey,
             request_fingerprint=(
                 _plain_time_action_request_fingerprint("clock-in", payload)
@@ -13247,7 +13350,7 @@ def clock_in(
         employee,
         mutator,
         response_builder,
-        after_response_saved=record_home_base_exception,
+        after_response_saved=record_home_base_event,
     )
     if not ok:
         append_access_log(request, "CLOCK_IN_FAILED", False, str(result))
@@ -13268,23 +13371,27 @@ def clock_out(
     now_utc = utc_now()
     # Pre-flight only. The value the guard and every later consumer use is
     # re-resolved inside the mutator, under the timesheet advisory lock.
-    home_base = {"policy": _home_base_policy_for_employee(int(employee["id"]), now_utc)}
-    # See clock_in: Home Base is a policy, not an opt-in browser capability.
-    home_base["enforced"] = home_base["policy"] is not None
+    home_base = {
+        "policy": _active_home_base_config(),
+        "geofence": None,
+        "confirmed": False,
+        "started_under": None,
+    }
     home_base_exception = _home_base_exception_reason(payload)
     exception_error = _validate_home_base_exception(home_base_exception)
     if exception_error:
         raise HTTPException(status_code=422, detail=exception_error)
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
-        # Authoritative read. The pre-flight value above was taken before the
-        # timesheet advisory lock was held, so a Home Base policy activated in
-        # between would be missed and this shift would persist with no evidence
-        # that Home Base was ever required. That lock now also covers home-base
-        # configuration, so this re-read cannot be overtaken.
-        home_base["policy"] = _home_base_policy_for_employee(
-            int(employee["id"]), now_utc)
-        home_base["enforced"] = home_base["policy"] is not None
+        # Authoritative read. Current Home Base evidence is tied to the
+        # configured office geofence, while a shift that already started with
+        # Home Base evidence still owes an end event.
+        home_base["policy"] = _active_home_base_config()
+        home_base["geofence"] = _home_base_geofence_from_payload(
+            home_base["policy"],
+            payload,
+        )
+        home_base["confirmed"] = _home_base_gps_confirmed(home_base["geofence"])
 
         stale_open = get_stale_open_entry(
             timesheet_data["entries"], employee["id"], now_utc
@@ -13295,30 +13402,35 @@ def clock_out(
         if not open_entry:
             return False, "Not currently clocked in"
 
-        # A shift that STARTED under the policy owes its end event even if the
-        # employee is no longer covered. Current membership decides whether a
-        # NEW shift is enforced; it must not retroactively release an open one.
-        if not home_base["enforced"]:
-            started_under = _shift_home_base_start_evidence(open_entry.get("id"))
-            if started_under:
-                home_base["enforced"] = True
-                home_base["policy"] = started_under
+        # A shift that STARTED under Home Base evidence owes its end event even
+        # if the employee is no longer covered by any crew. Current GPS at Home
+        # Base satisfies that; otherwise an exception is required.
+        home_base["started_under"] = _shift_home_base_start_evidence(open_entry.get("id"))
+        if (
+            home_base["started_under"]
+            and not home_base["confirmed"]
+            and not home_base_exception
+        ):
+            return False, _home_base_requirement_failure(
+                home_base["started_under"],
+                "clocking out",
+            )
+        if (
+            (home_base["confirmed"] or home_base_exception)
+            and get_active_visit(open_entry)
+        ):
+            return False, "Depart the active customer Site before ending at Home Base"
 
-        if home_base["enforced"] and not home_base_exception:
-            assert home_base["policy"] is not None
-            return False, _home_base_requirement_failure(home_base["policy"], "clocking out")
-        if home_base["enforced"] and home_base_exception and get_active_visit(open_entry):
-            return False, "Depart the active customer Site before recording a Home Base exception"
-
-        override_error = require_gps_override(
-            timesheet_data,
-            payload.latitude if payload else None,
-            payload.longitude if payload else None,
-            payload.gpsOverrideReason if payload else "",
-            payload.gpsOverrideDetail if payload else "",
-        )
-        if override_error:
-            return False, override_error
+        if not home_base["confirmed"]:
+            override_error = require_gps_override(
+                timesheet_data,
+                payload.latitude if payload else None,
+                payload.longitude if payload else None,
+                payload.gpsOverrideReason if payload else "",
+                payload.gpsOverrideDetail if payload else "",
+            )
+            if override_error:
+                return False, override_error
 
         try:
             clock_in_time = parse_utc_iso(str(open_entry.get("clockIn", "")))
@@ -13337,23 +13449,37 @@ def clock_out(
             open_entry["clockOutGps"] = build_gps_point(
                 payload.latitude, payload.longitude, payload.accuracy
             )
-        open_entry["clockOutGpsMeta"] = build_gps_meta(
-            timesheet_data,
-            payload.latitude if payload else None,
-            payload.longitude if payload else None,
-            payload.gpsOverrideReason if payload else "",
-            payload.gpsOverrideDetail if payload else "",
-            payload.accuracy if payload else None,
-        )
+        if home_base["confirmed"] and home_base["policy"] and home_base["geofence"]:
+            open_entry["clockOutGpsMeta"] = _home_base_gps_meta(
+                home_base["policy"],
+                home_base["geofence"],
+            )
+        else:
+            open_entry["clockOutGpsMeta"] = build_gps_meta(
+                timesheet_data,
+                payload.latitude if payload else None,
+                payload.longitude if payload else None,
+                payload.gpsOverrideReason if payload else "",
+                payload.gpsOverrideDetail if payload else "",
+                payload.accuracy if payload else None,
+            )
 
         return True, open_entry
 
-    def record_home_base_exception(
+    def record_home_base_event(
         cur: Any,
         result: Any,
         response: Dict[str, Any],
     ) -> None:
-        if not (home_base["enforced"] and home_base_exception and home_base["policy"]):
+        outcome = (
+            "recorded"
+            if home_base["confirmed"] and home_base["geofence"]
+            else "exception"
+            if home_base_exception
+            else ""
+        )
+        event_policy = home_base["policy"] or home_base["started_under"]
+        if not (event_policy and outcome):
             return
         shift_id = _plain_time_action_shift_id(result, response)
         if shift_id is None:
@@ -13362,14 +13488,15 @@ def clock_out(
             cur,
             shift_id=shift_id,
             employee_id=int(employee["id"]),
-            policy=home_base["policy"],
+            policy=event_policy,
             action="end",
-            outcome="exception",
+            outcome=outcome,
             recorded_at=now_utc,
-            exception_reason=home_base_exception,
+            exception_reason=home_base_exception if outcome == "exception" else "",
             latitude=payload.latitude if payload else None,
             longitude=payload.longitude if payload else None,
             accuracy=payload.accuracy if payload else None,
+            geofence=home_base["geofence"] if outcome == "recorded" else None,
             idempotency_key=payload.idempotencyKey if payload else None,
             request_fingerprint=(
                 _plain_time_action_request_fingerprint("clock-out", payload)
@@ -13384,7 +13511,7 @@ def clock_out(
         employee,
         mutator,
         lambda result, _timesheet_data: {"success": True, "entry": result},
-        after_response_saved=record_home_base_exception,
+        after_response_saved=record_home_base_event,
     )
     if not ok:
         append_access_log(request, "CLOCK_OUT_FAILED", False, str(result))
