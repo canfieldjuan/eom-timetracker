@@ -42,7 +42,7 @@ import qrcode.image.svg
 import arrival_policy_inventory
 import arrival_policies
 import db
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Path as FastAPIPath, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -3475,6 +3475,28 @@ class CommercialBillingApprovalRequest(BaseModel):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
+
+
+class CommercialBillingCandidateReviewDecisionRequest(BaseModel):
+    """One explicit, append-only include or exclude decision for ATLAS."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_source_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    # CLOSED + ENUMERATED: ATLAS currently accepts only these two review
+    # decisions. Unknown or future decisions fail at the tracker boundary until
+    # the portal has an explicit, reviewed operator workflow for them.
+    decision: Literal["included", "excluded"]
+    reason: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason_before_length_validation(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
 
 
 class CommercialBillingDeliveryPreferenceRequest(BaseModel):
@@ -9465,6 +9487,46 @@ def receivables_create_commercial_billing_run(
         f"Billing review run accepted by Atlas for {actor}",
         "POST",
         "/receivables/commercial-billing-runs",
+        admin,
+        payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.put(
+    "/api/admin/receivables/commercial-billing-runs/"
+    "{billing_run_id}/candidates/{candidate_key}/review-decision"
+)
+def receivables_set_commercial_billing_candidate_review_decision(
+    billing_run_id: UUID,
+    candidate_key: Annotated[str, FastAPIPath(min_length=1, max_length=512)],
+    payload: CommercialBillingCandidateReviewDecisionRequest,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Append one reviewed decision without creating invoices or delivery work.
+
+    ATLAS owns the immutable review-decision history and checks the candidate's
+    source fingerprint before accepting it. The tracker forwards only the
+    authenticated actor and operation key; it deliberately retains no billing
+    state or retry cache of its own.
+    """
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_CANDIDATE_REVIEW_DECISION_SET",
+        (
+            "Commercial billing candidate review decision accepted by Atlas for "
+            f"{actor}; no invoice or delivery work created"
+        ),
+        "PUT",
+        (
+            f"/receivables/commercial-billing-runs/{billing_run_id}/candidates/"
+            f"{quote(candidate_key, safe='')}/review-decision"
+        ),
         admin,
         payload=payload.model_dump(mode="json"),
         idempotency_key=idempotency_key,

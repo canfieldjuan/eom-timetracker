@@ -1586,6 +1586,426 @@ class TestReceivablesProxy:
             "Billing review run accepted by Atlas for Juan Canfield",
         )
 
+    def test_commercial_billing_review_decision_model_is_closed_and_normalizes_reason(self):
+        import time_tracker_api as api
+
+        payload = api.CommercialBillingCandidateReviewDecisionRequest.model_validate(
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "decision": "excluded",
+                "reason": " Customer is resolving a service question. ",
+            }
+        )
+
+        assert payload.model_dump(mode="json") == {
+            "expected_source_fingerprint": "a" * 64,
+            "decision": "excluded",
+            "reason": "Customer is resolving a service question.",
+        }
+        for invalid in (
+            {
+                "expected_source_fingerprint": "A" * 64,
+                "decision": "excluded",
+                "reason": "Customer is resolving a service question.",
+            },
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "decision": "deferred",
+                "reason": "Customer is resolving a service question.",
+            },
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "decision": "included",
+                "reason": "   ",
+            },
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "decision": "included",
+                "reason": "Include after review.",
+                "unexpected": True,
+            },
+        ):
+            with pytest.raises(api.ValidationError):
+                api.CommercialBillingCandidateReviewDecisionRequest.model_validate(
+                    invalid
+                )
+
+    def test_commercial_billing_review_decision_forwards_audited_provider_command_without_local_state(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        candidate_key = "candidate:acme:2026-03"
+        source_fingerprint = "a" * 64
+        provider_result = {
+            "reviewDecision": {
+                "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "billingRunId": billing_run_id,
+                "candidateKey": candidate_key,
+                "sourceFingerprint": source_fingerprint,
+                "decision": "excluded",
+                "reason": "Customer is resolving a service question.",
+                "revision": 1,
+                "decidedBy": "Juan Canfield",
+                "isExplicit": True,
+            },
+            "replayed": False,
+        }
+        calls = []
+        audits = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse(provider_result)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        response = client.put(
+            (
+                "/api/admin/receivables/commercial-billing-runs/"
+                f"{billing_run_id}/candidates/{candidate_key}/review-decision"
+            ),
+            headers={**auth, "Idempotency-Key": "review-exclude-acme-2026-03"},
+            json={
+                "expected_source_fingerprint": source_fingerprint,
+                "decision": "excluded",
+                "reason": " Customer is resolving a service question. ",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == provider_result
+        assert GENERATED_RECEIVABLES_TOKEN not in response.text
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert len(calls) == 1
+        method, url, kwargs = calls[0]
+        assert method == "PUT"
+        assert url == (
+            "https://atlas.test/api/v1/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/candidates/candidate%3Aacme%3A2026-03/review-decision"
+        )
+        assert kwargs["headers"]["Authorization"] == (
+            f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
+        )
+        assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert kwargs["headers"]["Idempotency-Key"] == "review-exclude-acme-2026-03"
+        assert kwargs["json"] == {
+            "expected_source_fingerprint": source_fingerprint,
+            "decision": "excluded",
+            "reason": "Customer is resolving a service question.",
+        }
+        assert kwargs["params"] is None
+        assert audits == [
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_CANDIDATE_REVIEW_DECISION_SET",
+                True,
+                (
+                    "Commercial billing candidate review decision accepted by Atlas "
+                    "for Juan Canfield; no invoice or delivery work created"
+                ),
+            )
+        ]
+
+    def test_commercial_billing_review_decision_survives_local_audit_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: _AtlasResponse(
+                {"reviewDecision": {"id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}}
+            ),
+        )
+
+        def unavailable_audit(*_args, **_kwargs):
+            raise OSError("access-log storage unavailable")
+
+        monkeypatch.setattr(api, "append_access_log", unavailable_audit)
+
+        response = client.put(
+            (
+                "/api/admin/receivables/commercial-billing-runs/"
+                f"{billing_run_id}/candidates/candidate:acme:2026-03/review-decision"
+            ),
+            headers={**auth, "Idempotency-Key": "review-audit-failure"},
+            json={
+                "expected_source_fingerprint": "a" * 64,
+                "decision": "included",
+                "reason": "Reviewed and included.",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["reviewDecision"]["id"] == (
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        )
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+
+    def test_commercial_billing_review_decision_preserves_atlas_stale_conflict_without_local_state(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        calls = []
+        audits = []
+
+        def stale_provider(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse(
+                {
+                    "detail": {
+                        "code": "commercial_billing_review_decision_stale",
+                        "message": "Candidate source evidence changed; regenerate it",
+                    }
+                },
+                status_code=409,
+            )
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", stale_provider)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        response = client.put(
+            (
+                "/api/admin/receivables/commercial-billing-runs/"
+                f"{billing_run_id}/candidates/candidate:acme:2026-03/review-decision"
+            ),
+            headers={**auth, "Idempotency-Key": "stale-review-2026-03"},
+            json={
+                "expected_source_fingerprint": "a" * 64,
+                "decision": "excluded",
+                "reason": "Exclude stale candidate.",
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"] == "Candidate source evidence changed; regenerate it"
+        assert len(calls) == 1
+        assert calls[0][0] == "PUT"
+        assert calls[0][2]["headers"]["Idempotency-Key"] == "stale-review-2026-03"
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert audits == [
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_CANDIDATE_REVIEW_DECISION_SET",
+                False,
+                (
+                    "Atlas request for Juan Canfield failed (409): Candidate source "
+                    "evidence changed; regenerate it"
+                ),
+            )
+        ]
+
+    def test_commercial_billing_review_decision_retry_reuses_provider_key_after_ambiguous_transport_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        provider_result = {
+            "reviewDecision": {
+                "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "billingRunId": billing_run_id,
+                "candidateKey": "candidate:acme:2026-03",
+                "decision": "excluded",
+            },
+            "replayed": True,
+        }
+        calls = []
+        audits = []
+
+        def flaky_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("upstream timeout")
+            return _AtlasResponse(provider_result)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+        headers = {**auth, "Idempotency-Key": "review-exclude-retry"}
+        payload = {
+            "expected_source_fingerprint": "a" * 64,
+            "decision": "excluded",
+            "reason": "Customer is resolving a service question.",
+        }
+        path = (
+            "/api/admin/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/candidates/candidate:acme:2026-03/review-decision"
+        )
+
+        failed = client.put(path, headers=headers, json=payload)
+        recovered = client.put(path, headers=headers, json=payload)
+
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "5"
+        assert recovered.status_code == 200
+        assert recovered.json() == provider_result
+        assert [call[0] for call in calls] == ["PUT", "PUT"]
+        assert calls[0][1] == calls[1][1]
+        assert calls[0][2]["headers"]["Idempotency-Key"] == calls[1][2][
+            "headers"
+        ]["Idempotency-Key"] == "review-exclude-retry"
+        assert calls[0][2]["json"] == calls[1][2]["json"] == payload
+        assert db.query_one(
+            "SELECT COUNT(*) AS n FROM receivables_operation_attempts"
+        )["n"] == 0
+        assert audits[0][0:2] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_CANDIDATE_REVIEW_DECISION_SET",
+            False,
+        )
+        assert "Atlas request for Juan Canfield failed (503)" in audits[0][2]
+        assert audits[1] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_CANDIDATE_REVIEW_DECISION_SET",
+            True,
+            (
+                "Commercial billing candidate review decision accepted by Atlas "
+                "for Juan Canfield; no invoice or delivery work created"
+            ),
+        )
+
+    def test_commercial_billing_review_decision_rejects_stale_sessions_and_invalid_requests_before_atlas(
+        self, client, auth, emp_auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        path = (
+            "/api/admin/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/candidates/candidate:acme:2026-03/review-decision"
+        )
+        payload = {
+            "expected_source_fingerprint": "a" * 64,
+            "decision": "included",
+            "reason": "Reviewed and included.",
+        }
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+        expired_token = api.jwt.encode(
+            {"sub": "1", "name": "Juan Canfield", "role": "admin", "exp": 1},
+            api.JWT_SECRET,
+            algorithm=api.JWT_ALGORITHM,
+        )
+
+        unauthenticated = client.put(
+            path,
+            headers={"Idempotency-Key": "unauthenticated-review"},
+            json=payload,
+        )
+        employee = client.put(
+            path,
+            headers={**emp_auth, "Idempotency-Key": "employee-review"},
+            json=payload,
+        )
+        expired = client.put(
+            path,
+            headers={
+                "Authorization": f"Bearer {expired_token}",
+                "Idempotency-Key": "expired-review",
+            },
+            json=payload,
+        )
+        missing_key = client.put(path, headers=auth, json=payload)
+        invalid_fingerprint = client.put(
+            path,
+            headers={**auth, "Idempotency-Key": "invalid-review-fingerprint"},
+            json={**payload, "expected_source_fingerprint": "not-a-fingerprint"},
+        )
+        invalid_decision = client.put(
+            path,
+            headers={**auth, "Idempotency-Key": "invalid-review-decision"},
+            json={**payload, "decision": "deferred"},
+        )
+        blank_reason = client.put(
+            path,
+            headers={**auth, "Idempotency-Key": "blank-review-reason"},
+            json={**payload, "reason": "   "},
+        )
+        unexpected_field = client.put(
+            path,
+            headers={**auth, "Idempotency-Key": "extra-review-field"},
+            json={**payload, "unexpected": True},
+        )
+        invalid_run = client.put(
+            "/api/admin/receivables/commercial-billing-runs/not-a-uuid/"
+            "candidates/candidate:acme:2026-03/review-decision",
+            headers={**auth, "Idempotency-Key": "invalid-review-run"},
+            json=payload,
+        )
+        oversized_candidate = client.put(
+            "/api/admin/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/candidates/{'a' * 513}/review-decision",
+            headers={**auth, "Idempotency-Key": "oversized-review-candidate"},
+            json=payload,
+        )
+
+        assert unauthenticated.status_code == 401
+        assert employee.status_code == 403
+        assert expired.status_code == 401
+        assert missing_key.status_code == 422
+        assert invalid_fingerprint.status_code == 422
+        assert invalid_decision.status_code == 422
+        assert blank_reason.status_code == 422
+        assert unexpected_field.status_code == 422
+        assert invalid_run.status_code == 422
+        assert oversized_candidate.status_code == 422
+        assert calls == []
+
     def test_commercial_billing_approval_model_requires_exact_source_fingerprint(self):
         import time_tracker_api as api
 
