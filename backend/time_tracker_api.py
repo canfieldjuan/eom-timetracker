@@ -3474,6 +3474,8 @@ class CommercialBillingApprovalRequest(BaseModel):
     exact review identity that was explicitly included.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     candidate_key: str = Field(min_length=1, max_length=512)
     expected_source_fingerprint: str = Field(
         min_length=64,

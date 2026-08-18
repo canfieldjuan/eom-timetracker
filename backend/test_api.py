@@ -2602,6 +2602,15 @@ class TestReceivablesProxy:
             "expected_source_fingerprint": "a" * 64,
         }
 
+        with pytest.raises(api.ValidationError):
+            api.CommercialBillingApprovalRequest.model_validate(
+                {
+                    "candidate_key": "candidate:acme:2026-03",
+                    "expected_source_fingerprint": "a" * 64,
+                    "expected_review_fingerprnit": "b" * 64,
+                }
+            )
+
         for invalid in ("A" * 64, "a" * 63, "a" * 65, "not-a-fingerprint"):
             with pytest.raises(api.ValidationError):
                 api.CommercialBillingApprovalRequest.model_validate(
@@ -3051,6 +3060,15 @@ class TestReceivablesProxy:
                 "expected_source_fingerprint": "not-a-fingerprint",
             },
         )
+        unexpected_approval_field = client.post(
+            approval_path,
+            headers={**auth, "Idempotency-Key": "unexpected-approval-field"},
+            json={
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": "a" * 64,
+                "expected_review_fingerprnit": "b" * 64,
+            },
+        )
         missing_approval_key = client.post(
             approval_path,
             headers=auth,
@@ -3095,6 +3113,7 @@ class TestReceivablesProxy:
         assert expired.status_code == 401
         assert invalid_run.status_code == 422
         assert stale_fingerprint.status_code == 422
+        assert unexpected_approval_field.status_code == 422
         assert missing_approval_key.status_code == 422
         assert invalid_approval.status_code == 422
         assert invalid_replacement.status_code == 422
