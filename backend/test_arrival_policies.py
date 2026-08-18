@@ -611,14 +611,6 @@ def test_appointment_precedence_and_duplicate_snapshot_are_immutable(
     assert appointment.status_code == 200, appointment.text
     first_revision = appointment.json()["policy"]
 
-    def fail_legacy_schedule_lookup(*_args, **_kwargs):
-        pytest.fail("active arrival policy must bypass legacy schedule lookup")
-
-    monkeypatch.setattr(
-        time_tracker_api,
-        "_matching_site_check_in_schedule",
-        fail_legacy_schedule_lookup,
-    )
     token = create_site_qr(client, auth, location_id)["token"]
     monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
     payload = site_check_in_payload(

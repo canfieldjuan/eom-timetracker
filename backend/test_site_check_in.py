@@ -1359,7 +1359,7 @@ class TestSiteCheckInDecision:
         )
         assert current.status_code == 200, current.text
 
-    def test_server_timestamp_and_exact_schedule_produce_on_time(
+    def test_server_timestamp_and_legacy_exact_schedule_uses_implicit_flexible(
         self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
         before = datetime.now(timezone.utc)
@@ -1394,9 +1394,13 @@ class TestSiteCheckInDecision:
         assert before - timedelta(seconds=1) <= official <= after
         assert check_in["deviceScannedAt"] == device_scan.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         assert check_in["classification"] == "on_time"
-        assert check_in["classificationReason"] == "within_grace_period"
+        assert check_in["classificationReason"] == "verified_scheduled_site"
         assert check_in["reviewStatus"] == "not_required"
-        assert check_in["arrivalPolicySnapshot"]["classifiedBy"] == "legacy_exact"
+        assert check_in["scheduleId"] is None
+        assert check_in["scheduleRuleId"] is None
+        assert check_in["scheduledStart"] is None
+        assert check_in["graceMinutes"] is None
+        assert check_in["arrivalPolicySnapshot"]["classifiedBy"] == "implicit_flexible"
         conn = _raw_conn()
         with conn.cursor() as cur:
             cur.execute(
@@ -1406,7 +1410,7 @@ class TestSiteCheckInDecision:
             assert cur.fetchone()[0] == job_id
         conn.close()
 
-    def test_after_grace_period_is_late(
+    def test_legacy_exact_schedule_after_grace_no_longer_marks_late(
         self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
         create_canonical_job(
@@ -1428,8 +1432,13 @@ class TestSiteCheckInDecision:
             json=site_check_in_payload(employee_id, location_id, site_qr_token),
         )
         assert response.status_code == 200, response.text
-        assert response.json()["checkIn"]["classification"] == "late"
-        assert response.json()["checkIn"]["classificationReason"] == "after_grace_period"
+        check_in = response.json()["checkIn"]
+        assert check_in["classification"] == "on_time"
+        assert check_in["classificationReason"] == "verified_scheduled_site"
+        assert check_in["scheduleId"] is None
+        assert check_in["scheduledStart"] is None
+        assert check_in["graceMinutes"] is None
+        assert check_in["arrivalPolicySnapshot"]["classifiedBy"] == "implicit_flexible"
 
     @pytest.mark.parametrize(
         ("overrides", "geofence_status", "reason"),
@@ -2045,7 +2054,7 @@ class TestSiteCheckInDecision:
 
 
 class TestRecurringSiteCheckInSchedules:
-    def test_weekday_rule_computes_chicago_occurrence_and_classifies_on_time(
+    def test_legacy_recurring_rule_no_longer_sets_punctuality_schedule(
         self,
         client,
         auth,
@@ -2055,7 +2064,7 @@ class TestRecurringSiteCheckInSchedules:
         site_qr_token,
         monkeypatch,
     ):
-        rule = create_recurring_schedule_rule(
+        create_recurring_schedule_rule(
             client,
             auth,
             employee_id,
@@ -2084,15 +2093,17 @@ class TestRecurringSiteCheckInSchedules:
         assert response.status_code == 200, response.text
         check_in = response.json()["checkIn"]
         assert check_in["classification"] == "on_time"
+        assert check_in["classificationReason"] == "verified_scheduled_site"
         assert check_in["scheduleId"] is None
-        assert check_in["scheduleRuleId"] == rule["id"]
-        assert check_in["scheduledStart"] == "2026-07-20T12:00:00Z"
+        assert check_in["scheduleRuleId"] is None
+        assert check_in["scheduledStart"] is None
+        assert check_in["graceMinutes"] is None
         assert (
             check_in["arrivalPolicySnapshot"]["classifiedBy"]
-            == "legacy_recurring"
+            == "implicit_flexible"
         )
 
-    def test_rule_respects_grace_weekdays_and_exact_schedule_override(
+    def test_legacy_recurring_and_exact_rows_do_not_override_implicit_flexible(
         self,
         client,
         auth,
@@ -2127,7 +2138,11 @@ class TestRecurringSiteCheckInSchedules:
             ),
         )
         assert late.status_code == 200, late.text
-        assert late.json()["checkIn"]["classification"] == "late"
+        late_check_in = late.json()["checkIn"]
+        assert late_check_in["classification"] == "on_time"
+        assert late_check_in["classificationReason"] == "verified_scheduled_site"
+        assert late_check_in["scheduleRuleId"] is None
+        assert late_check_in["arrivalPolicySnapshot"]["classifiedBy"] == "implicit_flexible"
 
         conn = _raw_conn()
         with conn.cursor() as cur:
@@ -2135,7 +2150,7 @@ class TestRecurringSiteCheckInSchedules:
         conn.commit()
         conn.close()
 
-        exact = create_arrival_schedule(
+        create_arrival_schedule(
             client,
             auth,
             employee_id,
@@ -2155,8 +2170,11 @@ class TestRecurringSiteCheckInSchedules:
         assert overridden.status_code == 200, overridden.text
         check_in = overridden.json()["checkIn"]
         assert check_in["classification"] == "on_time"
-        assert check_in["scheduleId"] == exact["id"]
+        assert check_in["classificationReason"] == "verified_scheduled_site"
+        assert check_in["scheduleId"] is None
         assert check_in["scheduleRuleId"] is None
+        assert check_in["scheduledStart"] is None
+        assert check_in["graceMinutes"] is None
 
         conn = _raw_conn()
         with conn.cursor() as cur:
