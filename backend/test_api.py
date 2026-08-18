@@ -1592,6 +1592,7 @@ class TestReceivablesProxy:
         payload = api.CommercialBillingCandidateReviewDecisionRequest.model_validate(
             {
                 "expected_source_fingerprint": "a" * 64,
+                "expected_review_fingerprint": "b" * 64,
                 "decision": "excluded",
                 "reason": " Customer is resolving a service question. ",
             }
@@ -1599,6 +1600,7 @@ class TestReceivablesProxy:
 
         assert payload.model_dump(mode="json") == {
             "expected_source_fingerprint": "a" * 64,
+            "expected_review_fingerprint": "b" * 64,
             "decision": "excluded",
             "reason": "Customer is resolving a service question.",
         }
@@ -1607,6 +1609,12 @@ class TestReceivablesProxy:
                 "expected_source_fingerprint": "A" * 64,
                 "decision": "excluded",
                 "reason": "Customer is resolving a service question.",
+            },
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "expected_review_fingerprint": "B" * 64,
+                "decision": "included",
+                "reason": "Include after review.",
             },
             {
                 "expected_source_fingerprint": "a" * 64,
@@ -1638,6 +1646,7 @@ class TestReceivablesProxy:
         billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         candidate_key = "candidate:acme:2026-03"
         source_fingerprint = "a" * 64
+        review_fingerprint = "b" * 64
         provider_result = {
             "reviewDecision": {
                 "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
@@ -1682,6 +1691,7 @@ class TestReceivablesProxy:
             headers={**auth, "Idempotency-Key": "review-exclude-acme-2026-03"},
             json={
                 "expected_source_fingerprint": source_fingerprint,
+                "expected_review_fingerprint": review_fingerprint,
                 "decision": "excluded",
                 "reason": " Customer is resolving a service question. ",
             },
@@ -1707,6 +1717,7 @@ class TestReceivablesProxy:
         assert kwargs["headers"]["Idempotency-Key"] == "review-exclude-acme-2026-03"
         assert kwargs["json"] == {
             "expected_source_fingerprint": source_fingerprint,
+            "expected_review_fingerprint": review_fingerprint,
             "decision": "excluded",
             "reason": "Customer is resolving a service question.",
         }
@@ -2566,18 +2577,30 @@ class TestReceivablesProxy:
         assert oversized_candidate.status_code == 422
         assert calls == []
 
-    def test_commercial_billing_approval_model_requires_exact_source_fingerprint(self):
+    def test_commercial_billing_approval_model_requires_exact_source_and_optional_review_fingerprint(self):
         import time_tracker_api as api
 
         payload = api.CommercialBillingApprovalRequest.model_validate(
             {
                 "candidate_key": "candidate:acme:2026-03",
                 "expected_source_fingerprint": "a" * 64,
+                "expected_review_fingerprint": "b" * 64,
             }
         )
 
         assert payload.candidate_key == "candidate:acme:2026-03"
         assert payload.expected_source_fingerprint == "a" * 64
+        assert payload.expected_review_fingerprint == "b" * 64
+        legacy_payload = api.CommercialBillingApprovalRequest.model_validate(
+            {
+                "candidate_key": "candidate:acme:2026-03",
+                "expected_source_fingerprint": "a" * 64,
+            }
+        )
+        assert legacy_payload.model_dump(mode="json", exclude_none=True) == {
+            "candidate_key": "candidate:acme:2026-03",
+            "expected_source_fingerprint": "a" * 64,
+        }
 
         for invalid in ("A" * 64, "a" * 63, "a" * 65, "not-a-fingerprint"):
             with pytest.raises(api.ValidationError):
@@ -2585,6 +2608,14 @@ class TestReceivablesProxy:
                     {
                         "candidate_key": "candidate:acme:2026-03",
                         "expected_source_fingerprint": invalid,
+                    }
+                )
+            with pytest.raises(api.ValidationError):
+                api.CommercialBillingApprovalRequest.model_validate(
+                    {
+                        "candidate_key": "candidate:acme:2026-03",
+                        "expected_source_fingerprint": "a" * 64,
+                        "expected_review_fingerprint": invalid,
                     }
                 )
 
@@ -2596,6 +2627,7 @@ class TestReceivablesProxy:
         billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
         approval_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
         source_fingerprint = "a" * 64
+        review_fingerprint = "b" * 64
         approval_result = {
             "approval": {
                 "id": approval_id,
@@ -2678,6 +2710,7 @@ class TestReceivablesProxy:
             json={
                 "candidate_key": "candidate:acme:2026-03",
                 "expected_source_fingerprint": source_fingerprint,
+                "expected_review_fingerprint": review_fingerprint,
             },
         )
         pdf = client.post(
@@ -2727,6 +2760,7 @@ class TestReceivablesProxy:
         assert calls[0][2]["json"] == {
             "candidate_key": "candidate:acme:2026-03",
             "expected_source_fingerprint": source_fingerprint,
+            "expected_review_fingerprint": review_fingerprint,
         }
         assert calls[1][1].endswith(
             f"/commercial-billing-approvals/{approval_id}/invoice-pdf"
@@ -2922,6 +2956,10 @@ class TestReceivablesProxy:
         assert response.status_code == 409
         assert response.json()["error"] == "Candidate source evidence changed; regenerate it"
         assert len(calls) == 1
+        assert calls[0][2]["json"] == {
+            "candidate_key": "candidate:acme:2026-03",
+            "expected_source_fingerprint": "a" * 64,
+        }
         assert calls[0][2]["headers"]["Idempotency-Key"] == "stale-approval-2026-03"
         assert db.query_one(
             "SELECT COUNT(*) AS n FROM receivables_operation_attempts"

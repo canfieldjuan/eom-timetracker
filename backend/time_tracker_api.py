@@ -3467,7 +3467,12 @@ class CommercialBillingRunRequest(BaseModel):
 
 
 class CommercialBillingApprovalRequest(BaseModel):
-    """One explicitly selected immutable billing-run candidate for ATLAS."""
+    """One explicitly selected immutable billing-run candidate for ATLAS.
+
+    ``expected_review_fingerprint`` is additive: old, unoverridden review
+    callers can omit it, while an effective candidate revision must carry the
+    exact review identity that was explicitly included.
+    """
 
     candidate_key: str = Field(min_length=1, max_length=512)
     expected_source_fingerprint: str = Field(
@@ -3475,14 +3480,31 @@ class CommercialBillingApprovalRequest(BaseModel):
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
+    expected_review_fingerprint: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
 
 
 class CommercialBillingCandidateReviewDecisionRequest(BaseModel):
-    """One explicit, append-only include or exclude decision for ATLAS."""
+    """One explicit, append-only include or exclude decision for ATLAS.
+
+    The optional review fingerprint is the provider-owned concurrency fence for
+    a revised effective candidate. Omitting it preserves the original source
+    snapshot behavior for old callers.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     expected_source_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    expected_review_fingerprint: Optional[str] = Field(
+        default=None,
         min_length=64,
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
@@ -9593,10 +9615,10 @@ def receivables_set_commercial_billing_candidate_review_decision(
 ) -> Any:
     """Append one reviewed decision without creating invoices or delivery work.
 
-    ATLAS owns the immutable review-decision history and checks the candidate's
-    source fingerprint before accepting it. The tracker forwards only the
-    authenticated actor and operation key; it deliberately retains no billing
-    state or retry cache of its own.
+    ATLAS owns the immutable review-decision history and fences both the source
+    and, when supplied, effective review identity before accepting it. The
+    tracker forwards only the authenticated actor and operation key; it
+    deliberately retains no billing state or retry cache of its own.
     """
     actor = str(admin["name"])
     return _atlas_receivables_audited_write(
@@ -9612,7 +9634,10 @@ def receivables_set_commercial_billing_candidate_review_decision(
             f"{quote(candidate_key, safe='')}/review-decision"
         ),
         admin,
-        payload=payload.model_dump(mode="json"),
+        # Preserve the exact legacy body when the additive review fence is not
+        # supplied; newer callers forward it unchanged so a decision cannot
+        # attach to a later effective candidate revision.
+        payload=payload.model_dump(mode="json", exclude_none=True),
         idempotency_key=idempotency_key,
     )
 
@@ -9673,8 +9698,9 @@ def receivables_approve_commercial_billing_candidate(
     """Approve one selected candidate; ATLAS creates or reuses its draft invoice.
 
     This route is deliberately a single-candidate command. It cannot approve an
-    entire run implicitly and it forwards the review-time source fingerprint so
-    ATLAS can reject stale evidence before creating or reusing an invoice.
+    entire run implicitly and it forwards both review-time identities when the
+    caller has one, so ATLAS can reject a revised effective candidate before
+    creating or reusing an invoice.
     """
     actor = str(admin["name"])
     return _atlas_receivables_audited_write(
@@ -9684,7 +9710,7 @@ def receivables_approve_commercial_billing_candidate(
         "POST",
         f"/receivables/commercial-billing-runs/{billing_run_id}/approvals",
         admin,
-        payload=payload.model_dump(mode="json"),
+        payload=payload.model_dump(mode="json", exclude_none=True),
         idempotency_key=idempotency_key,
     )
 
