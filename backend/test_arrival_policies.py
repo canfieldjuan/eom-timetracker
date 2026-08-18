@@ -633,6 +633,8 @@ def test_appointment_precedence_and_duplicate_snapshot_are_immutable(
     assert evidence["arrivalPolicySnapshot"]["classifiedBy"] == "arrival_policy"
     assert evidence["scheduleId"] == legacy_exact["id"]
     assert evidence["scheduleRuleId"] is None
+    assert evidence["scheduledStart"] == "2026-07-20T13:00:00Z"
+    assert evidence["graceMinutes"] == 10
     assert "updateToken" not in evidence["arrivalPolicySnapshot"]
     assert "changeNote" not in evidence["arrivalPolicySnapshot"]
 
@@ -1176,6 +1178,131 @@ def test_cutover_readiness_requires_policy_or_owner_retention(
     assert {row["reason"] for row in needs_review_report["blockers"]} == {
         "owner_marked_needs_review"
     }
+
+
+def test_applied_retain_history_only_disposition_stops_runtime_legacy_review(
+    client,
+    auth,
+    emp_auth,
+    employee_id,
+    location_id,
+    monkeypatch,
+):
+    import time_tracker_api
+
+    official_time = datetime(2049, 7, 23, 12, 5, tzinfo=timezone.utc)
+    scheduled_start = datetime(2049, 7, 23, 12, 0, tzinfo=timezone.utc)
+    exact = create_arrival_schedule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        scheduled_start,
+    )
+    recurring = create_recurring_schedule_rule(
+        client,
+        auth,
+        employee_id,
+        location_id,
+        weekdays=[4],
+        starts_on="2049-07-23",
+    )
+    create_canonical_job(
+        location_id,
+        scheduled_start,
+        suffix="arrival-policy-retained-runtime",
+    )
+    token = create_site_qr(client, auth, location_id)["token"]
+
+    monkeypatch.setattr(time_tracker_api, "utc_now", lambda: official_time)
+    conn = _raw_conn()
+    try:
+        inventory = build_inventory(
+            conn,
+            as_of=datetime(2049, 7, 22, 12, 0, tzinfo=timezone.utc),
+        )
+    finally:
+        conn.close()
+    mapping = json.loads(json.dumps(inventory["ownerMappingTemplate"]))
+    mapping["ownerReviewedBy"] = "Juan Canfield"
+    mapping["ownerReviewedAt"] = "2049-07-22T12:00:00Z"
+    for entry in mapping["entries"]:
+        entry["reviewNote"] = "Owner retained this legacy row for history only"
+        entry["disposition"] = "retain_history_only"
+
+    applied = client.post(
+        "/api/admin/arrival-policy/legacy-mapping/apply",
+        headers=auth,
+        json=mapping,
+    )
+    assert applied.status_code == 200, applied.text
+    body = applied.json()
+    assert body["skipped"] == []
+    assert {row["legacyKey"] for row in body["applied"]} == {
+        f"exact:{exact['id']}",
+        f"recurring:{recurring['id']}",
+    }
+    assert {row["status"] for row in body["applied"]} == {
+        "retained_history_only"
+    }
+
+    conn = _raw_conn()
+    try:
+        retained_report = build_cutover_readiness(
+            conn,
+            as_of=datetime(2049, 7, 22, 12, 0, tzinfo=timezone.utc),
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT owner_disposition, owner_disposition_note
+                FROM site_check_in_schedules
+                WHERE id = %s
+                """,
+                (exact["id"],),
+            )
+            exact_row = cur.fetchone()
+            cur.execute(
+                """
+                SELECT owner_disposition, owner_disposition_note
+                FROM site_check_in_schedule_rules
+                WHERE id = %s
+                """,
+                (recurring["id"],),
+            )
+            recurring_row = cur.fetchone()
+    finally:
+        conn.close()
+    assert retained_report["readyForLegacyFallbackRemoval"] is True
+    assert retained_report["summary"]["ownerRetainHistoryOnly"] == 2
+    assert exact_row == (
+        "retain_history_only",
+        "Owner retained this legacy row for history only",
+    )
+    assert recurring_row == (
+        "retain_history_only",
+        "Owner retained this legacy row for history only",
+    )
+
+    response = client.post(
+        "/api/timesheet/site-check-in",
+        headers=emp_auth,
+        json=site_check_in_payload(
+            employee_id,
+            location_id,
+            token,
+            scanned_at=official_time,
+        ),
+    )
+    assert response.status_code == 200, response.text
+    check_in = response.json()["checkIn"]
+    assert check_in["classification"] == "on_time"
+    assert check_in["classificationReason"] == "verified_scheduled_site"
+    assert check_in["reviewStatus"] == "not_required"
+    assert check_in["scheduleId"] is None
+    assert check_in["scheduleRuleId"] is None
+    assert check_in["scheduledStart"] is None
+    assert check_in["graceMinutes"] is None
 
 
 def test_cutover_readiness_counts_pre_snapshot_legacy_check_ins(

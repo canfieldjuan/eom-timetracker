@@ -6152,6 +6152,10 @@ def _ensure_schema_migrations() -> None:
             ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES employees(id) ON DELETE SET NULL;
         ALTER TABLE site_check_in_schedules
             ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+        ALTER TABLE site_check_in_schedules
+            ADD COLUMN IF NOT EXISTS owner_disposition VARCHAR(32);
+        ALTER TABLE site_check_in_schedules
+            ADD COLUMN IF NOT EXISTS owner_disposition_note TEXT NOT NULL DEFAULT '';
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS site_check_in_schedule_rules (
@@ -6179,6 +6183,12 @@ def _ensure_schema_migrations() -> None:
                 timezone, starts_on, ends_on
             )
         )
+    """)
+    db.execute("""
+        ALTER TABLE site_check_in_schedule_rules
+            ADD COLUMN IF NOT EXISTS owner_disposition VARCHAR(32);
+        ALTER TABLE site_check_in_schedule_rules
+            ADD COLUMN IF NOT EXISTS owner_disposition_note TEXT NOT NULL DEFAULT '';
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS service_schedule_rules (
@@ -8993,6 +9003,7 @@ def _matching_site_check_in_schedule_reference(
         WHERE employee_id = %s
           AND location_id = %s
           AND cancelled_at IS NULL
+          AND owner_disposition IS DISTINCT FROM 'retain_history_only'
           AND scheduled_start BETWEEN
               %s - (%s * INTERVAL '1 hour')
               AND %s + (%s * INTERVAL '1 hour')
@@ -9025,6 +9036,7 @@ def _matching_site_check_in_schedule_reference(
         WHERE employee_id = %s
           AND location_id = %s
           AND active = true
+          AND owner_disposition IS DISTINCT FROM 'retain_history_only'
         ORDER BY id
         """
     if cur is None:
@@ -11603,6 +11615,11 @@ def record_site_check_in(
                 official_time,
                 device_clock_skew_seconds,
             )
+            evidence_scheduled_start = policy_scheduled_start
+            evidence_grace_minutes = policy_grace_minutes
+            if legacy_schedule_reference:
+                evidence_scheduled_start = legacy_schedule_reference["scheduled_start"]
+                evidence_grace_minutes = int(legacy_schedule_reference["grace_minutes"])
             cur.execute(
                 """
                 INSERT INTO site_check_ins (
@@ -11650,8 +11667,8 @@ def record_site_check_in(
                     ),
                     int(policy["id"]) if policy else None,
                     psycopg2.extras.Json(policy_snapshot),
-                    policy_scheduled_start,
-                    policy_grace_minutes,
+                    evidence_scheduled_start,
+                    evidence_grace_minutes,
                     device_clock_skew_seconds,
                     review_status,
                 ),
@@ -12408,6 +12425,37 @@ def _apply_arrival_policy_legacy_mapping_once(
                 disposition = str(entry.get("disposition") or "")
                 legacy_key = str(entry.get("legacyKey") or "")
                 source = source_rows[legacy_key]
+                if disposition == "retain_history_only":
+                    note = str(entry.get("reviewNote") or "").strip()
+                    if str(source["legacyKey"]).startswith("exact:"):
+                        cur.execute(
+                            """
+                            UPDATE site_check_in_schedules
+                            SET owner_disposition = 'retain_history_only',
+                                owner_disposition_note = %s
+                            WHERE id = %s
+                            """,
+                            (note, int(source["legacyId"])),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE site_check_in_schedule_rules
+                            SET owner_disposition = 'retain_history_only',
+                                owner_disposition_note = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (note, int(source["legacyId"])),
+                        )
+                    applied.append(
+                        {
+                            "legacyKey": legacy_key,
+                            "disposition": disposition,
+                            "status": "retained_history_only",
+                        }
+                    )
+                    continue
                 if disposition not in {"map_to_appointment", "promote_to_site"}:
                     skipped.append(
                         {

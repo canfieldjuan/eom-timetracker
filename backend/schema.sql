@@ -364,6 +364,8 @@ CREATE TABLE site_check_in_schedules (
     cancelled_at    TIMESTAMPTZ,
     cancelled_by    INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     cancellation_reason TEXT,
+    owner_disposition VARCHAR(32),
+    owner_disposition_note TEXT NOT NULL DEFAULT '',
     UNIQUE (employee_id, location_id, scheduled_start)
 );
 
@@ -385,6 +387,8 @@ CREATE TABLE site_check_in_schedule_rules (
     created_by       INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    owner_disposition VARCHAR(32),
+    owner_disposition_note TEXT NOT NULL DEFAULT '',
     CHECK (
         cardinality(weekdays) BETWEEN 1 AND 7
         AND weekdays <@ ARRAY[0, 1, 2, 3, 4, 5, 6]::SMALLINT[]
