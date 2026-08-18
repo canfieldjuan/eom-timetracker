@@ -8980,10 +8980,109 @@ def _matching_canonical_site_job(
     return None, "no_scheduled_job"
 
 
+def _matching_site_check_in_schedule_reference(
+    employee_id: int,
+    site_id: int,
+    checked_in_at: datetime,
+    *,
+    cur: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    exact_sql = """
+        SELECT id, scheduled_start, grace_minutes
+        FROM site_check_in_schedules
+        WHERE employee_id = %s
+          AND location_id = %s
+          AND cancelled_at IS NULL
+          AND scheduled_start BETWEEN
+              %s - (%s * INTERVAL '1 hour')
+              AND %s + (%s * INTERVAL '1 hour')
+        ORDER BY ABS(EXTRACT(EPOCH FROM (scheduled_start - %s))), id
+        LIMIT 1
+        """
+    exact_params = (
+        employee_id,
+        site_id,
+        checked_in_at,
+        SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
+        checked_in_at,
+        SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS,
+        checked_in_at,
+    )
+    if cur is None:
+        exact_schedule = db.query_one(exact_sql, exact_params)
+    else:
+        cur.execute(exact_sql, exact_params)
+        exact_row = cur.fetchone()
+        exact_schedule = dict(exact_row) if exact_row else None
+    if exact_schedule:
+        exact_schedule["schedule_rule_id"] = None
+        return exact_schedule
+
+    rules_sql = """
+        SELECT id, weekdays, local_start_time, timezone, starts_on, ends_on,
+               grace_minutes
+        FROM site_check_in_schedule_rules
+        WHERE employee_id = %s
+          AND location_id = %s
+          AND active = true
+        ORDER BY id
+        """
+    if cur is None:
+        rules = db.query_all(rules_sql, (employee_id, site_id))
+    else:
+        cur.execute(rules_sql, (employee_id, site_id))
+        rules = [dict(row) for row in cur.fetchall()]
+    candidates: List[Tuple[float, int, datetime, int]] = []
+    for rule in rules:
+        try:
+            rule_zone = ZoneInfo(str(rule["timezone"]))
+        except (KeyError, ValueError):
+            logger.warning(
+                "Ignoring site check-in rule %s with invalid timezone",
+                rule.get("id"),
+            )
+            continue
+        local_date = checked_in_at.astimezone(rule_zone).date()
+        weekdays = {int(day) for day in rule["weekdays"]}
+        for day_offset in (-1, 0, 1):
+            candidate_date = local_date + timedelta(days=day_offset)
+            if candidate_date.weekday() not in weekdays:
+                continue
+            if candidate_date < rule["starts_on"] or candidate_date > rule["ends_on"]:
+                continue
+            local_start = datetime.combine(
+                candidate_date,
+                rule["local_start_time"],
+                tzinfo=rule_zone,
+            )
+            scheduled_start = local_start.astimezone(timezone.utc)
+            distance_seconds = abs((scheduled_start - checked_in_at).total_seconds())
+            if distance_seconds <= SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS * 3600:
+                candidates.append(
+                    (
+                        distance_seconds,
+                        int(rule["id"]),
+                        scheduled_start,
+                        int(rule["grace_minutes"]),
+                    )
+                )
+
+    if not candidates:
+        return None
+    _, rule_id, scheduled_start, grace_minutes = min(candidates)
+    return {
+        "id": None,
+        "schedule_rule_id": rule_id,
+        "scheduled_start": scheduled_start,
+        "grace_minutes": grace_minutes,
+    }
+
+
 def _classify_site_check_in(
     geofence: Dict[str, Any],
     job: Optional[Dict[str, Any]],
     job_match_reason: str,
+    legacy_schedule_reference: Optional[Dict[str, Any]],
     policy: Optional[Dict[str, Any]],
     site_id: int,
     checked_in_at: datetime,
@@ -9005,6 +9104,15 @@ def _classify_site_check_in(
             "authority": "implicit_flexible_during_migration",
             "classifiedBy": "implicit_flexible",
         }
+        if legacy_schedule_reference:
+            snapshot["legacyScheduleReference"] = {
+                "scheduleId": legacy_schedule_reference.get("id"),
+                "scheduleRuleId": legacy_schedule_reference.get("schedule_rule_id"),
+                "scheduledStart": to_utc_iso(
+                    legacy_schedule_reference["scheduled_start"]
+                ),
+                "graceMinutes": int(legacy_schedule_reference["grace_minutes"]),
+            }
     geofence_reason = {
         "site_unpinned": "site_missing_location_pin",
         "low_accuracy": "location_accuracy_too_low",
@@ -9026,6 +9134,16 @@ def _classify_site_check_in(
             site_id=site_id,
             job=job,
             checked_in_at=checked_in_at,
+        )
+
+    if legacy_schedule_reference:
+        return (
+            "needs_review",
+            "legacy_arrival_policy_cutover_pending",
+            "pending",
+            snapshot,
+            legacy_schedule_reference["scheduled_start"],
+            int(legacy_schedule_reference["grace_minutes"]),
         )
 
     return (
@@ -9057,6 +9175,12 @@ def _insert_site_arrival_evidence(
         site_id=int(site["id"]),
         job_id=int(job["id"]) if job else None,
     )
+    legacy_schedule_reference = _matching_site_check_in_schedule_reference(
+        int(employee["id"]),
+        int(site["id"]),
+        official_time,
+        cur=cur,
+    )
     device_clock_skew_seconds = abs(
         (
             official_time - payload.scannedAt.astimezone(timezone.utc)
@@ -9073,6 +9197,7 @@ def _insert_site_arrival_evidence(
         geofence,
         job,
         job_match_reason,
+        legacy_schedule_reference,
         policy,
         int(site["id"]),
         official_time,
@@ -9111,8 +9236,12 @@ def _insert_site_arrival_evidence(
             geofence["status"],
             classification,
             reason,
-            None,
-            None,
+            legacy_schedule_reference.get("id") if legacy_schedule_reference else None,
+            (
+                legacy_schedule_reference.get("schedule_rule_id")
+                if legacy_schedule_reference
+                else None
+            ),
             int(policy["id"]) if policy else None,
             psycopg2.extras.Json(policy_snapshot),
             policy_scheduled_start,
@@ -11446,6 +11575,12 @@ def record_site_check_in(
                 site_id=int(site["id"]),
                 job_id=int(job["id"]) if job else None,
             )
+            legacy_schedule_reference = _matching_site_check_in_schedule_reference(
+                int(employee["id"]),
+                int(site["id"]),
+                official_time,
+                cur=cur,
+            )
             device_clock_skew_seconds = abs(
                 (
                     official_time - payload.scannedAt.astimezone(timezone.utc)
@@ -11462,6 +11597,7 @@ def record_site_check_in(
                 geofence,
                 job,
                 job_match_reason,
+                legacy_schedule_reference,
                 policy,
                 int(site["id"]),
                 official_time,
@@ -11502,8 +11638,16 @@ def record_site_check_in(
                     geofence["status"],
                     classification,
                     reason,
-                    None,
-                    None,
+                    (
+                        legacy_schedule_reference.get("id")
+                        if legacy_schedule_reference
+                        else None
+                    ),
+                    (
+                        legacy_schedule_reference.get("schedule_rule_id")
+                        if legacy_schedule_reference
+                        else None
+                    ),
                     int(policy["id"]) if policy else None,
                     psycopg2.extras.Json(policy_snapshot),
                     policy_scheduled_start,

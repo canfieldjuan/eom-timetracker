@@ -1359,7 +1359,7 @@ class TestSiteCheckInDecision:
         )
         assert current.status_code == 200, current.text
 
-    def test_server_timestamp_and_legacy_exact_schedule_uses_implicit_flexible(
+    def test_server_timestamp_and_legacy_exact_schedule_requires_cutover_review(
         self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
         before = datetime.now(timezone.utc)
@@ -1368,7 +1368,7 @@ class TestSiteCheckInDecision:
             before - timedelta(hours=1),
             suffix="exact-on-time",
         )
-        create_arrival_schedule(
+        legacy_exact = create_arrival_schedule(
             client,
             auth,
             employee_id,
@@ -1393,14 +1393,23 @@ class TestSiteCheckInDecision:
         official = datetime.fromisoformat(check_in["serverCheckedInAt"].replace("Z", "+00:00"))
         assert before - timedelta(seconds=1) <= official <= after
         assert check_in["deviceScannedAt"] == device_scan.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        assert check_in["classification"] == "on_time"
-        assert check_in["classificationReason"] == "verified_scheduled_site"
-        assert check_in["reviewStatus"] == "not_required"
-        assert check_in["scheduleId"] is None
+        assert check_in["classification"] == "needs_review"
+        assert (
+            check_in["classificationReason"]
+            == "legacy_arrival_policy_cutover_pending"
+        )
+        assert check_in["reviewStatus"] == "pending"
+        assert check_in["scheduleId"] == legacy_exact["id"]
         assert check_in["scheduleRuleId"] is None
-        assert check_in["scheduledStart"] is None
-        assert check_in["graceMinutes"] is None
+        assert check_in["scheduledStart"] == (
+            before + timedelta(minutes=5)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        assert check_in["graceMinutes"] == 10
         assert check_in["arrivalPolicySnapshot"]["classifiedBy"] == "implicit_flexible"
+        assert (
+            check_in["arrivalPolicySnapshot"]["legacyScheduleReference"]["scheduleId"]
+            == legacy_exact["id"]
+        )
         conn = _raw_conn()
         with conn.cursor() as cur:
             cur.execute(
@@ -1410,7 +1419,7 @@ class TestSiteCheckInDecision:
             assert cur.fetchone()[0] == job_id
         conn.close()
 
-    def test_legacy_exact_schedule_after_grace_no_longer_marks_late(
+    def test_legacy_exact_schedule_after_grace_requires_cutover_review(
         self, client, auth, emp_auth, employee_id, location_id, site_qr_token
     ):
         create_canonical_job(
@@ -1418,7 +1427,7 @@ class TestSiteCheckInDecision:
             datetime.now(timezone.utc) - timedelta(hours=1),
             suffix="exact-late",
         )
-        create_arrival_schedule(
+        legacy_exact = create_arrival_schedule(
             client,
             auth,
             employee_id,
@@ -1433,11 +1442,15 @@ class TestSiteCheckInDecision:
         )
         assert response.status_code == 200, response.text
         check_in = response.json()["checkIn"]
-        assert check_in["classification"] == "on_time"
-        assert check_in["classificationReason"] == "verified_scheduled_site"
-        assert check_in["scheduleId"] is None
-        assert check_in["scheduledStart"] is None
-        assert check_in["graceMinutes"] is None
+        assert check_in["classification"] == "needs_review"
+        assert (
+            check_in["classificationReason"]
+            == "legacy_arrival_policy_cutover_pending"
+        )
+        assert check_in["reviewStatus"] == "pending"
+        assert check_in["scheduleId"] == legacy_exact["id"]
+        assert check_in["scheduledStart"] is not None
+        assert check_in["graceMinutes"] == 5
         assert check_in["arrivalPolicySnapshot"]["classifiedBy"] == "implicit_flexible"
 
     @pytest.mark.parametrize(
@@ -2054,7 +2067,7 @@ class TestSiteCheckInDecision:
 
 
 class TestRecurringSiteCheckInSchedules:
-    def test_legacy_recurring_rule_no_longer_sets_punctuality_schedule(
+    def test_legacy_recurring_rule_requires_cutover_review_without_policy(
         self,
         client,
         auth,
@@ -2064,7 +2077,7 @@ class TestRecurringSiteCheckInSchedules:
         site_qr_token,
         monkeypatch,
     ):
-        create_recurring_schedule_rule(
+        rule = create_recurring_schedule_rule(
             client,
             auth,
             employee_id,
@@ -2092,18 +2105,28 @@ class TestRecurringSiteCheckInSchedules:
         )
         assert response.status_code == 200, response.text
         check_in = response.json()["checkIn"]
-        assert check_in["classification"] == "on_time"
-        assert check_in["classificationReason"] == "verified_scheduled_site"
+        assert check_in["classification"] == "needs_review"
+        assert (
+            check_in["classificationReason"]
+            == "legacy_arrival_policy_cutover_pending"
+        )
+        assert check_in["reviewStatus"] == "pending"
         assert check_in["scheduleId"] is None
-        assert check_in["scheduleRuleId"] is None
-        assert check_in["scheduledStart"] is None
-        assert check_in["graceMinutes"] is None
+        assert check_in["scheduleRuleId"] == rule["id"]
+        assert check_in["scheduledStart"] == "2026-07-20T12:00:00Z"
+        assert check_in["graceMinutes"] == 10
         assert (
             check_in["arrivalPolicySnapshot"]["classifiedBy"]
             == "implicit_flexible"
         )
+        assert (
+            check_in["arrivalPolicySnapshot"]["legacyScheduleReference"][
+                "scheduleRuleId"
+            ]
+            == rule["id"]
+        )
 
-    def test_legacy_recurring_and_exact_rows_do_not_override_implicit_flexible(
+    def test_legacy_recurring_and_exact_rows_require_review_without_policy(
         self,
         client,
         auth,
@@ -2113,7 +2136,7 @@ class TestRecurringSiteCheckInSchedules:
         site_qr_token,
         monkeypatch,
     ):
-        create_recurring_schedule_rule(
+        rule = create_recurring_schedule_rule(
             client,
             auth,
             employee_id,
@@ -2139,9 +2162,12 @@ class TestRecurringSiteCheckInSchedules:
         )
         assert late.status_code == 200, late.text
         late_check_in = late.json()["checkIn"]
-        assert late_check_in["classification"] == "on_time"
-        assert late_check_in["classificationReason"] == "verified_scheduled_site"
-        assert late_check_in["scheduleRuleId"] is None
+        assert late_check_in["classification"] == "needs_review"
+        assert (
+            late_check_in["classificationReason"]
+            == "legacy_arrival_policy_cutover_pending"
+        )
+        assert late_check_in["scheduleRuleId"] == rule["id"]
         assert late_check_in["arrivalPolicySnapshot"]["classifiedBy"] == "implicit_flexible"
 
         conn = _raw_conn()
@@ -2150,7 +2176,7 @@ class TestRecurringSiteCheckInSchedules:
         conn.commit()
         conn.close()
 
-        create_arrival_schedule(
+        exact = create_arrival_schedule(
             client,
             auth,
             employee_id,
@@ -2169,12 +2195,15 @@ class TestRecurringSiteCheckInSchedules:
         )
         assert overridden.status_code == 200, overridden.text
         check_in = overridden.json()["checkIn"]
-        assert check_in["classification"] == "on_time"
-        assert check_in["classificationReason"] == "verified_scheduled_site"
-        assert check_in["scheduleId"] is None
+        assert check_in["classification"] == "needs_review"
+        assert (
+            check_in["classificationReason"]
+            == "legacy_arrival_policy_cutover_pending"
+        )
+        assert check_in["scheduleId"] == exact["id"]
         assert check_in["scheduleRuleId"] is None
-        assert check_in["scheduledStart"] is None
-        assert check_in["graceMinutes"] is None
+        assert check_in["scheduledStart"] == "2026-07-20T12:30:00Z"
+        assert check_in["graceMinutes"] == 10
 
         conn = _raw_conn()
         with conn.cursor() as cur:

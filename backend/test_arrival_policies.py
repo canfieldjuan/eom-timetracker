@@ -579,7 +579,7 @@ def test_appointment_precedence_and_duplicate_snapshot_are_immutable(
         datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc),
         suffix="arrival-policy-precedence",
     )
-    create_arrival_schedule(
+    legacy_exact = create_arrival_schedule(
         client,
         auth,
         employee_id,
@@ -631,7 +631,7 @@ def test_appointment_precedence_and_duplicate_snapshot_are_immutable(
     assert evidence["arrivalPolicyRevisionId"] == first_revision["id"]
     assert evidence["arrivalPolicySnapshot"]["authority"] == "appointment"
     assert evidence["arrivalPolicySnapshot"]["classifiedBy"] == "arrival_policy"
-    assert evidence["scheduleId"] is None
+    assert evidence["scheduleId"] == legacy_exact["id"]
     assert evidence["scheduleRuleId"] is None
     assert "updateToken" not in evidence["arrivalPolicySnapshot"]
     assert "changeNote" not in evidence["arrivalPolicySnapshot"]
