@@ -3499,6 +3499,94 @@ class CommercialBillingCandidateReviewDecisionRequest(BaseModel):
         return value.strip() if isinstance(value, str) else value
 
 
+class CommercialBillingCandidateLineOverrideRequest(BaseModel):
+    """One permitted effective-line change for a provider-owned revision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    line_key: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    description: Optional[str] = Field(default=None, min_length=1, max_length=512)
+    rate_cents: Optional[int] = Field(
+        default=None,
+        strict=True,
+        gt=0,
+        le=999_999_999_999,
+    )
+    quantity: Optional[int] = Field(
+        default=None,
+        strict=True,
+        gt=0,
+        le=999_999_999_999,
+    )
+    quantity_minutes: Optional[int] = Field(
+        default=None,
+        strict=True,
+        gt=0,
+        le=999_999_999_999,
+    )
+
+
+class CommercialBillingCandidateAdjustmentRequest(BaseModel):
+    """One provider-owned charge or credit attached to an override revision."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["credit", "charge"]
+    description: str = Field(min_length=1, max_length=512)
+    amount_cents: int = Field(strict=True, gt=0, le=999_999_999_999)
+
+
+class CommercialBillingCandidateRecipientOverrideRequest(BaseModel):
+    """One requested billing recipient; ATLAS owns canonical normalization."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    email: str = Field(min_length=3, max_length=256)
+
+
+class CommercialBillingCandidateOverrideRequest(BaseModel):
+    """A full immutable, one-run candidate revision admitted by ATLAS."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_source_fingerprint: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    expected_override_revision: int = Field(strict=True, ge=0)
+    # CLOSED + ENUMERATED: this is the deployed provider's current audit-reason
+    # contract. Unknown future reasons fail at the tracker boundary until an
+    # explicit manager workflow and provider contract are reviewed together.
+    reason_code: Literal[
+        "one_time_service_variation",
+        "partial_or_missed_service",
+        "approved_pricing_exception",
+        "customer_credit",
+        "additional_charge",
+        "source_correction_pending",
+        "billing_delivery_exception",
+    ]
+    reason: str = Field(min_length=1, max_length=1000)
+    line_overrides: List[CommercialBillingCandidateLineOverrideRequest] = Field(
+        default_factory=list,
+        max_length=500,
+    )
+    adjustment: Optional[CommercialBillingCandidateAdjustmentRequest] = None
+    recipient: Optional[CommercialBillingCandidateRecipientOverrideRequest] = None
+    delivery_method: Optional[Literal["gmail_pdf", "manual_square"]] = None
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_override_reason_before_length_validation(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class CommercialBillingDeliveryPreferenceRequest(BaseModel):
     """One explicit, reviewed delivery policy for a canonical EOM customer."""
 
@@ -9529,6 +9617,46 @@ def receivables_set_commercial_billing_candidate_review_decision(
         ),
         admin,
         payload=payload.model_dump(mode="json"),
+        idempotency_key=idempotency_key,
+    )
+
+
+@app.post(
+    "/api/admin/receivables/commercial-billing-runs/"
+    "{billing_run_id}/candidates/{candidate_key}/override",
+    status_code=201,
+)
+def receivables_set_commercial_billing_candidate_override(
+    billing_run_id: UUID,
+    candidate_key: Annotated[str, FastAPIPath(min_length=1, max_length=512)],
+    payload: CommercialBillingCandidateOverrideRequest,
+    request: Request,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key", min_length=1, max_length=128
+    ),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Append one provider-owned candidate revision without financial delivery work.
+
+    The tracker deliberately carries no override, billing, or retry state. ATLAS
+    validates the immutable candidate identity and owns the durable revision;
+    this boundary forwards only the authenticated actor and operation key.
+    """
+    actor = str(admin["name"])
+    return _atlas_receivables_audited_write(
+        request,
+        "RECEIVABLES_COMMERCIAL_BILLING_CANDIDATE_OVERRIDE_SET",
+        (
+            "Commercial billing candidate override accepted by Atlas for "
+            f"{actor}; no invoice or delivery work created"
+        ),
+        "POST",
+        (
+            f"/receivables/commercial-billing-runs/{billing_run_id}/candidates/"
+            f"{quote(candidate_key, safe='')}/override"
+        ),
+        admin,
+        payload=payload.model_dump(mode="json", exclude_none=True),
         idempotency_key=idempotency_key,
     )
 
