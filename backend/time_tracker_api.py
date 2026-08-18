@@ -6152,6 +6152,10 @@ def _ensure_schema_migrations() -> None:
             ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES employees(id) ON DELETE SET NULL;
         ALTER TABLE site_check_in_schedules
             ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+        ALTER TABLE site_check_in_schedules
+            ADD COLUMN IF NOT EXISTS owner_disposition VARCHAR(32);
+        ALTER TABLE site_check_in_schedules
+            ADD COLUMN IF NOT EXISTS owner_disposition_note TEXT NOT NULL DEFAULT '';
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS site_check_in_schedule_rules (
@@ -6179,6 +6183,12 @@ def _ensure_schema_migrations() -> None:
                 timezone, starts_on, ends_on
             )
         )
+    """)
+    db.execute("""
+        ALTER TABLE site_check_in_schedule_rules
+            ADD COLUMN IF NOT EXISTS owner_disposition VARCHAR(32);
+        ALTER TABLE site_check_in_schedule_rules
+            ADD COLUMN IF NOT EXISTS owner_disposition_note TEXT NOT NULL DEFAULT '';
     """)
     db.execute("""
         CREATE TABLE IF NOT EXISTS service_schedule_rules (
@@ -8980,7 +8990,7 @@ def _matching_canonical_site_job(
     return None, "no_scheduled_job"
 
 
-def _matching_site_check_in_schedule(
+def _matching_site_check_in_schedule_reference(
     employee_id: int,
     site_id: int,
     checked_in_at: datetime,
@@ -8993,6 +9003,7 @@ def _matching_site_check_in_schedule(
         WHERE employee_id = %s
           AND location_id = %s
           AND cancelled_at IS NULL
+          AND owner_disposition IS DISTINCT FROM 'retain_history_only'
           AND scheduled_start BETWEEN
               %s - (%s * INTERVAL '1 hour')
               AND %s + (%s * INTERVAL '1 hour')
@@ -9025,6 +9036,7 @@ def _matching_site_check_in_schedule(
         WHERE employee_id = %s
           AND location_id = %s
           AND active = true
+          AND owner_disposition IS DISTINCT FROM 'retain_history_only'
         ORDER BY id
         """
     if cur is None:
@@ -9082,7 +9094,7 @@ def _classify_site_check_in(
     geofence: Dict[str, Any],
     job: Optional[Dict[str, Any]],
     job_match_reason: str,
-    schedule: Optional[Dict[str, Any]],
+    legacy_schedule_reference: Optional[Dict[str, Any]],
     policy: Optional[Dict[str, Any]],
     site_id: int,
     checked_in_at: datetime,
@@ -9099,24 +9111,20 @@ def _classify_site_check_in(
         snapshot = arrival_policies.snapshot_revision(policy)
         snapshot["authority"] = str(policy["scope_type"])
         snapshot["classifiedBy"] = "arrival_policy"
-    elif schedule:
-        snapshot = {
-            "authority": "legacy_employee_schedule",
-            "classifiedBy": (
-                "legacy_exact"
-                if schedule.get("id") is not None
-                else "legacy_recurring"
-            ),
-            "scheduleId": schedule.get("id"),
-            "scheduleRuleId": schedule.get("schedule_rule_id"),
-            "scheduledStart": to_utc_iso(schedule["scheduled_start"]),
-            "graceMinutes": int(schedule["grace_minutes"]),
-        }
     else:
         snapshot = {
             "authority": "implicit_flexible_during_migration",
             "classifiedBy": "implicit_flexible",
         }
+        if legacy_schedule_reference:
+            snapshot["legacyScheduleReference"] = {
+                "scheduleId": legacy_schedule_reference.get("id"),
+                "scheduleRuleId": legacy_schedule_reference.get("schedule_rule_id"),
+                "scheduledStart": to_utc_iso(
+                    legacy_schedule_reference["scheduled_start"]
+                ),
+                "graceMinutes": int(legacy_schedule_reference["grace_minutes"]),
+            }
     geofence_reason = {
         "site_unpinned": "site_missing_location_pin",
         "low_accuracy": "location_accuracy_too_low",
@@ -9140,20 +9148,14 @@ def _classify_site_check_in(
             checked_in_at=checked_in_at,
         )
 
-    if schedule:
-        scheduled_start = schedule["scheduled_start"]
-        grace_deadline = scheduled_start + timedelta(
-            minutes=int(schedule["grace_minutes"])
-        )
-        if checked_in_at <= grace_deadline:
-            result = ("on_time", "within_grace_period", "not_required")
-        else:
-            result = ("late", "after_grace_period", "not_required")
+    if legacy_schedule_reference:
         return (
-            *result,
+            "needs_review",
+            "legacy_arrival_policy_cutover_pending",
+            "pending",
             snapshot,
-            scheduled_start,
-            int(schedule["grace_minutes"]),
+            legacy_schedule_reference["scheduled_start"],
+            int(legacy_schedule_reference["grace_minutes"]),
         )
 
     return (
@@ -9185,14 +9187,12 @@ def _insert_site_arrival_evidence(
         site_id=int(site["id"]),
         job_id=int(job["id"]) if job else None,
     )
-    schedule = None
-    if policy is None:
-        schedule = _matching_site_check_in_schedule(
-            int(employee["id"]),
-            int(site["id"]),
-            official_time,
-            cur=cur,
-        )
+    legacy_schedule_reference = _matching_site_check_in_schedule_reference(
+        int(employee["id"]),
+        int(site["id"]),
+        official_time,
+        cur=cur,
+    )
     device_clock_skew_seconds = abs(
         (
             official_time - payload.scannedAt.astimezone(timezone.utc)
@@ -9209,7 +9209,7 @@ def _insert_site_arrival_evidence(
         geofence,
         job,
         job_match_reason,
-        schedule,
+        legacy_schedule_reference,
         policy,
         int(site["id"]),
         official_time,
@@ -9248,20 +9248,16 @@ def _insert_site_arrival_evidence(
             geofence["status"],
             classification,
             reason,
-            schedule.get("id") if schedule else None,
-            schedule.get("schedule_rule_id") if schedule else None,
+            legacy_schedule_reference.get("id") if legacy_schedule_reference else None,
+            (
+                legacy_schedule_reference.get("schedule_rule_id")
+                if legacy_schedule_reference
+                else None
+            ),
             int(policy["id"]) if policy else None,
             psycopg2.extras.Json(policy_snapshot),
-            (
-                policy_scheduled_start
-                if policy
-                else (schedule["scheduled_start"] if schedule else None)
-            ),
-            (
-                policy_grace_minutes
-                if policy
-                else (schedule["grace_minutes"] if schedule else None)
-            ),
+            policy_scheduled_start,
+            policy_grace_minutes,
             device_clock_skew_seconds,
             review_status,
         ),
@@ -11591,14 +11587,12 @@ def record_site_check_in(
                 site_id=int(site["id"]),
                 job_id=int(job["id"]) if job else None,
             )
-            schedule = None
-            if policy is None:
-                schedule = _matching_site_check_in_schedule(
-                    int(employee["id"]),
-                    int(site["id"]),
-                    official_time,
-                    cur=cur,
-                )
+            legacy_schedule_reference = _matching_site_check_in_schedule_reference(
+                int(employee["id"]),
+                int(site["id"]),
+                official_time,
+                cur=cur,
+            )
             device_clock_skew_seconds = abs(
                 (
                     official_time - payload.scannedAt.astimezone(timezone.utc)
@@ -11615,12 +11609,17 @@ def record_site_check_in(
                 geofence,
                 job,
                 job_match_reason,
-                schedule,
+                legacy_schedule_reference,
                 policy,
                 int(site["id"]),
                 official_time,
                 device_clock_skew_seconds,
             )
+            evidence_scheduled_start = policy_scheduled_start
+            evidence_grace_minutes = policy_grace_minutes
+            if legacy_schedule_reference:
+                evidence_scheduled_start = legacy_schedule_reference["scheduled_start"]
+                evidence_grace_minutes = int(legacy_schedule_reference["grace_minutes"])
             cur.execute(
                 """
                 INSERT INTO site_check_ins (
@@ -11656,20 +11655,20 @@ def record_site_check_in(
                     geofence["status"],
                     classification,
                     reason,
-                    schedule.get("id") if schedule else None,
-                    schedule.get("schedule_rule_id") if schedule else None,
+                    (
+                        legacy_schedule_reference.get("id")
+                        if legacy_schedule_reference
+                        else None
+                    ),
+                    (
+                        legacy_schedule_reference.get("schedule_rule_id")
+                        if legacy_schedule_reference
+                        else None
+                    ),
                     int(policy["id"]) if policy else None,
                     psycopg2.extras.Json(policy_snapshot),
-                    (
-                        policy_scheduled_start
-                        if policy
-                        else (schedule["scheduled_start"] if schedule else None)
-                    ),
-                    (
-                        policy_grace_minutes
-                        if policy
-                        else (schedule["grace_minutes"] if schedule else None)
-                    ),
+                    evidence_scheduled_start,
+                    evidence_grace_minutes,
                     device_clock_skew_seconds,
                     review_status,
                 ),
@@ -12426,6 +12425,37 @@ def _apply_arrival_policy_legacy_mapping_once(
                 disposition = str(entry.get("disposition") or "")
                 legacy_key = str(entry.get("legacyKey") or "")
                 source = source_rows[legacy_key]
+                if disposition == "retain_history_only":
+                    note = str(entry.get("reviewNote") or "").strip()
+                    if str(source["legacyKey"]).startswith("exact:"):
+                        cur.execute(
+                            """
+                            UPDATE site_check_in_schedules
+                            SET owner_disposition = 'retain_history_only',
+                                owner_disposition_note = %s
+                            WHERE id = %s
+                            """,
+                            (note, int(source["legacyId"])),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE site_check_in_schedule_rules
+                            SET owner_disposition = 'retain_history_only',
+                                owner_disposition_note = %s,
+                                updated_at = NOW()
+                            WHERE id = %s
+                            """,
+                            (note, int(source["legacyId"])),
+                        )
+                    applied.append(
+                        {
+                            "legacyKey": legacy_key,
+                            "disposition": disposition,
+                            "status": "retained_history_only",
+                        }
+                    )
+                    continue
                 if disposition not in {"map_to_appointment", "promote_to_site"}:
                     skipped.append(
                         {

@@ -201,7 +201,8 @@ def build_inventory(
         """
         SELECT sc.id, sc.employee_id, e.name AS employee_name,
                sc.location_id, l.address AS site_name, sc.scheduled_start,
-               sc.grace_minutes, sc.created_at,
+               sc.grace_minutes, sc.created_at, sc.owner_disposition,
+               sc.owner_disposition_note,
                COUNT(ci.id) AS history_reference_count
         FROM site_check_in_schedules sc
         LEFT JOIN employees e ON e.id = sc.employee_id
@@ -222,6 +223,7 @@ def build_inventory(
                sr.local_start_time, sr.timezone, sr.starts_on,
                NULLIF(sr.ends_on, 'infinity'::date) AS ends_on,
                sr.grace_minutes, sr.created_at, sr.updated_at,
+               sr.owner_disposition, sr.owner_disposition_note,
                COUNT(ci.id) AS history_reference_count
         FROM site_check_in_schedule_rules sr
         LEFT JOIN employees e ON e.id = sr.employee_id
@@ -301,6 +303,8 @@ def build_inventory(
                 "scheduledStart": _utc_text(start),
                 "graceMinutes": int(row["grace_minutes"]),
                 "historyReferenceCount": int(row["history_reference_count"]),
+                "ownerDisposition": row.get("owner_disposition"),
+                "ownerDispositionNote": str(row.get("owner_disposition_note") or ""),
                 "candidateJobIds": candidate_ids,
                 "eligibleAppointmentJobId": eligible_job_id,
                 "runtimeCandidateJobIds": runtime_candidate_ids,
@@ -331,6 +335,8 @@ def build_inventory(
                 "endsOn": _date_text(row.get("ends_on")),
                 "graceMinutes": int(row["grace_minutes"]),
                 "historyReferenceCount": int(row["history_reference_count"]),
+                "ownerDisposition": row.get("owner_disposition"),
+                "ownerDispositionNote": str(row.get("owner_disposition_note") or ""),
             }
         )
 
@@ -494,15 +500,24 @@ def build_cutover_readiness(
         schedule_window_hours=schedule_window_hours,
     )
     mapping_errors: List[str] = []
-    dispositions: Dict[str, str] = {}
+    dispositions: Dict[str, str] = {
+        str(row["legacyKey"]): str(row["ownerDisposition"])
+        for row in [
+            *inventory.get("activeFutureExactSchedules", []),
+            *inventory.get("activeOpenRecurringRules", []),
+        ]
+        if row.get("ownerDisposition")
+    }
     if owner_mapping is not None:
         mapping_errors = _readiness_mapping_errors(inventory, owner_mapping)
         if not mapping_errors:
-            dispositions = {
-                str(entry.get("legacyKey")): str(entry.get("disposition"))
-                for entry in owner_mapping.get("entries", [])
-                if isinstance(entry, dict)
-            }
+            dispositions.update(
+                {
+                    str(entry.get("legacyKey")): str(entry.get("disposition"))
+                    for entry in owner_mapping.get("entries", [])
+                    if isinstance(entry, dict)
+                }
+            )
 
     current_site_policies: Dict[int, Dict[str, Any]] = {}
     current_appointment_policies: Dict[int, Dict[str, Any]] = {}
@@ -625,10 +640,10 @@ def build_cutover_readiness(
             return "owner_marked_needs_review"
         if replacement is not None:
             return None
-        if owner_mapping is None:
-            return "missing_replacement_policy_or_owner_mapping"
         if owner_disposition == "retain_history_only":
             return None
+        if owner_mapping is None:
+            return "missing_replacement_policy_or_owner_mapping"
         return "owner_mapping_does_not_retire_or_replace_legacy_row"
 
     for source in inventory.get("activeFutureExactSchedules", []):

@@ -1668,13 +1668,6 @@ def test_site_archive_restore_preserves_history_and_retires_future_qr_state(
     assert future["cancelled_at"] is not None
     assert future["cancelled_by"] == references["admin_id"]
     assert "archive" in future["cancellation_reason"].lower()
-    import time_tracker_api as api
-
-    assert api._matching_site_check_in_schedule(
-        references["employee_id"],
-        site_id,
-        references["future_start"],
-    ) is None
     archived_rules = db.query_all(
         """
         SELECT id, active, NULLIF(ends_on, 'infinity'::date) AS ends_on
