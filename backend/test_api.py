@@ -2006,6 +2006,566 @@ class TestReceivablesProxy:
         assert oversized_candidate.status_code == 422
         assert calls == []
 
+    def test_commercial_billing_candidate_override_model_is_closed_and_normalizes_reason(
+        self,
+    ):
+        import time_tracker_api as api
+
+        payload = api.CommercialBillingCandidateOverrideRequest.model_validate(
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "expected_override_revision": 0,
+                "reason_code": "approved_pricing_exception",
+                "reason": " One-time service correction. ",
+                "line_overrides": [
+                    {
+                        "line_key": "b" * 64,
+                        "description": "Deep-clean adjustment",
+                        "rate_cents": 4825,
+                        "quantity_minutes": 60,
+                    },
+                    {"line_key": "c" * 64, "quantity": 2},
+                ],
+                "adjustment": {
+                    "kind": "charge",
+                    "description": "One-time supply charge",
+                    "amount_cents": 1250,
+                },
+                "recipient": {
+                    "display_name": "Accounts Payable",
+                    "email": "billing@example.com",
+                },
+                "delivery_method": "gmail_pdf",
+            }
+        )
+
+        assert payload.model_dump(mode="json", exclude_none=True) == {
+            "expected_source_fingerprint": "a" * 64,
+            "expected_override_revision": 0,
+            "reason_code": "approved_pricing_exception",
+            "reason": "One-time service correction.",
+            "line_overrides": [
+                {
+                    "line_key": "b" * 64,
+                    "description": "Deep-clean adjustment",
+                    "rate_cents": 4825,
+                    "quantity_minutes": 60,
+                },
+                {"line_key": "c" * 64, "quantity": 2},
+            ],
+            "adjustment": {
+                "kind": "charge",
+                "description": "One-time supply charge",
+                "amount_cents": 1250,
+            },
+            "recipient": {
+                "display_name": "Accounts Payable",
+                "email": "billing@example.com",
+            },
+            "delivery_method": "gmail_pdf",
+        }
+        for invalid in (
+            {
+                "expected_source_fingerprint": "A" * 64,
+                "expected_override_revision": 0,
+                "reason_code": "approved_pricing_exception",
+                "reason": "One-time service correction.",
+            },
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "expected_override_revision": -1,
+                "reason_code": "approved_pricing_exception",
+                "reason": "One-time service correction.",
+            },
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "expected_override_revision": 0,
+                "reason_code": "other",
+                "reason": "One-time service correction.",
+            },
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "expected_override_revision": 0,
+                "reason_code": "approved_pricing_exception",
+                "reason": "   ",
+            },
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "expected_override_revision": 0,
+                "reason_code": "approved_pricing_exception",
+                "reason": "One-time service correction.",
+                "line_overrides": [{"line_key": "b" * 64, "rate_cents": 0}],
+            },
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "expected_override_revision": 0,
+                "reason_code": "approved_pricing_exception",
+                "reason": "One-time service correction.",
+                "recipient": {"email": "billing@example.com", "unexpected": True},
+            },
+            {
+                "expected_source_fingerprint": "a" * 64,
+                "expected_override_revision": 0,
+                "reason_code": "approved_pricing_exception",
+                "reason": "One-time service correction.",
+                "unexpected": True,
+            },
+        ):
+            with pytest.raises(api.ValidationError):
+                api.CommercialBillingCandidateOverrideRequest.model_validate(invalid)
+
+    def test_commercial_billing_candidate_override_forwards_audited_provider_command_without_local_state(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        candidate_key = "candidate:acme:2026-03"
+        source_fingerprint = "a" * 64
+        provider_result = {
+            "override": {
+                "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "billingRunId": billing_run_id,
+                "candidateKey": candidate_key,
+                "sourceFingerprint": source_fingerprint,
+                "overrideRevision": 1,
+                "reasonCode": "approved_pricing_exception",
+                "reason": "One-time service correction.",
+            },
+            "replayed": False,
+        }
+        calls = []
+        audits = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse(provider_result, status_code=201)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", fake_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        response = client.post(
+            (
+                "/api/admin/receivables/commercial-billing-runs/"
+                f"{billing_run_id}/candidates/{candidate_key}/override"
+            ),
+            headers={**auth, "Idempotency-Key": "override-acme-2026-03"},
+            json={
+                "expected_source_fingerprint": source_fingerprint,
+                "expected_override_revision": 0,
+                "reason_code": "approved_pricing_exception",
+                "reason": " One-time service correction. ",
+                "line_overrides": [
+                    {
+                        "line_key": "b" * 64,
+                        "description": "Deep-clean adjustment",
+                        "rate_cents": 4825,
+                        "quantity_minutes": 60,
+                    },
+                    {"line_key": "c" * 64, "quantity": 2},
+                ],
+                "adjustment": {
+                    "kind": "charge",
+                    "description": "One-time supply charge",
+                    "amount_cents": 1250,
+                },
+                "recipient": {
+                    "display_name": "Accounts Payable",
+                    "email": "billing@example.com",
+                },
+                "delivery_method": "gmail_pdf",
+            },
+        )
+
+        assert response.status_code == 201
+        assert response.json() == provider_result
+        assert GENERATED_RECEIVABLES_TOKEN not in response.text
+        assert (
+            db.query_one("SELECT COUNT(*) AS n FROM receivables_operation_attempts")[
+                "n"
+            ]
+            == 0
+        )
+        assert len(calls) == 1
+        method, url, kwargs = calls[0]
+        assert method == "POST"
+        assert url == (
+            "https://atlas.test/api/v1/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/candidates/candidate%3Aacme%3A2026-03/override"
+        )
+        assert kwargs["headers"]["Authorization"] == (
+            f"Bearer {GENERATED_RECEIVABLES_TOKEN}"
+        )
+        assert kwargs["headers"]["X-EOM-Actor"] == "Juan Canfield"
+        assert kwargs["headers"]["Idempotency-Key"] == "override-acme-2026-03"
+        assert kwargs["json"] == {
+            "expected_source_fingerprint": source_fingerprint,
+            "expected_override_revision": 0,
+            "reason_code": "approved_pricing_exception",
+            "reason": "One-time service correction.",
+            "line_overrides": [
+                {
+                    "line_key": "b" * 64,
+                    "description": "Deep-clean adjustment",
+                    "rate_cents": 4825,
+                    "quantity_minutes": 60,
+                },
+                {"line_key": "c" * 64, "quantity": 2},
+            ],
+            "adjustment": {
+                "kind": "charge",
+                "description": "One-time supply charge",
+                "amount_cents": 1250,
+            },
+            "recipient": {
+                "display_name": "Accounts Payable",
+                "email": "billing@example.com",
+            },
+            "delivery_method": "gmail_pdf",
+        }
+        assert kwargs["params"] is None
+        assert audits == [
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_CANDIDATE_OVERRIDE_SET",
+                True,
+                (
+                    "Commercial billing candidate override accepted by Atlas for "
+                    "Juan Canfield; no invoice or delivery work created"
+                ),
+            )
+        ]
+
+    def test_commercial_billing_candidate_override_survives_local_audit_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: _AtlasResponse(
+                {"override": {"id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}},
+                status_code=201,
+            ),
+        )
+
+        def unavailable_audit(*_args, **_kwargs):
+            raise OSError("access-log storage unavailable")
+
+        monkeypatch.setattr(api, "append_access_log", unavailable_audit)
+
+        response = client.post(
+            (
+                "/api/admin/receivables/commercial-billing-runs/"
+                f"{billing_run_id}/candidates/candidate:acme:2026-03/override"
+            ),
+            headers={**auth, "Idempotency-Key": "override-audit-failure"},
+            json={
+                "expected_source_fingerprint": "a" * 64,
+                "expected_override_revision": 0,
+                "reason_code": "source_correction_pending",
+                "reason": "Source correction pending.",
+            },
+        )
+
+        assert response.status_code == 201
+        assert response.json()["override"]["id"] == (
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        )
+        assert (
+            db.query_one("SELECT COUNT(*) AS n FROM receivables_operation_attempts")[
+                "n"
+            ]
+            == 0
+        )
+
+    def test_commercial_billing_candidate_override_preserves_atlas_stale_conflict_without_local_state(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        calls = []
+        audits = []
+
+        def stale_provider(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return _AtlasResponse(
+                {
+                    "detail": {
+                        "code": "commercial_billing_candidate_override_stale",
+                        "message": "Candidate source evidence changed; regenerate it",
+                    }
+                },
+                status_code=409,
+            )
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", stale_provider)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+
+        response = client.post(
+            (
+                "/api/admin/receivables/commercial-billing-runs/"
+                f"{billing_run_id}/candidates/candidate:acme:2026-03/override"
+            ),
+            headers={**auth, "Idempotency-Key": "stale-override-2026-03"},
+            json={
+                "expected_source_fingerprint": "a" * 64,
+                "expected_override_revision": 0,
+                "reason_code": "source_correction_pending",
+                "reason": "Source correction pending.",
+            },
+        )
+
+        assert response.status_code == 409
+        assert (
+            response.json()["error"]
+            == "Candidate source evidence changed; regenerate it"
+        )
+        assert len(calls) == 1
+        assert calls[0][0] == "POST"
+        assert calls[0][2]["headers"]["Idempotency-Key"] == "stale-override-2026-03"
+        assert (
+            db.query_one("SELECT COUNT(*) AS n FROM receivables_operation_attempts")[
+                "n"
+            ]
+            == 0
+        )
+        assert audits == [
+            (
+                "RECEIVABLES_COMMERCIAL_BILLING_CANDIDATE_OVERRIDE_SET",
+                False,
+                (
+                    "Atlas request for Juan Canfield failed (409): Candidate source "
+                    "evidence changed; regenerate it"
+                ),
+            )
+        ]
+
+    def test_commercial_billing_candidate_override_retry_reuses_provider_key_after_ambiguous_transport_failure(
+        self, client, auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        provider_result = {
+            "override": {
+                "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "billingRunId": billing_run_id,
+                "candidateKey": "candidate:acme:2026-03",
+                "overrideRevision": 1,
+            },
+            "replayed": True,
+        }
+        calls = []
+        audits = []
+
+        def flaky_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if len(calls) == 1:
+                raise api.requests.ConnectionError("upstream timeout")
+            return _AtlasResponse(provider_result, status_code=201)
+
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_BASE_URL", "https://atlas.test/api/v1"
+        )
+        monkeypatch.setattr(
+            api, "ATLAS_RECEIVABLES_SERVICE_TOKEN", GENERATED_RECEIVABLES_TOKEN
+        )
+        monkeypatch.setattr(api.requests, "request", flaky_request)
+        monkeypatch.setattr(
+            api,
+            "append_access_log",
+            lambda _request, action, allowed, reason="": audits.append(
+                (action, allowed, reason)
+            ),
+        )
+        headers = {**auth, "Idempotency-Key": "override-acme-retry"}
+        payload = {
+            "expected_source_fingerprint": "a" * 64,
+            "expected_override_revision": 0,
+            "reason_code": "source_correction_pending",
+            "reason": "Source correction pending.",
+        }
+        path = (
+            "/api/admin/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/candidates/candidate:acme:2026-03/override"
+        )
+
+        failed = client.post(path, headers=headers, json=payload)
+        recovered = client.post(path, headers=headers, json=payload)
+
+        assert failed.status_code == 503
+        assert failed.headers["retry-after"] == "5"
+        assert recovered.status_code == 201
+        assert recovered.json() == provider_result
+        assert [call[0] for call in calls] == ["POST", "POST"]
+        assert calls[0][1] == calls[1][1]
+        assert (
+            calls[0][2]["headers"]["Idempotency-Key"]
+            == calls[1][2]["headers"]["Idempotency-Key"]
+            == "override-acme-retry"
+        )
+        expected_provider_payload = {**payload, "line_overrides": []}
+        assert calls[0][2]["json"] == calls[1][2]["json"] == expected_provider_payload
+        assert (
+            db.query_one("SELECT COUNT(*) AS n FROM receivables_operation_attempts")[
+                "n"
+            ]
+            == 0
+        )
+        assert audits[0][0:2] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_CANDIDATE_OVERRIDE_SET",
+            False,
+        )
+        assert "Atlas request for Juan Canfield failed (503)" in audits[0][2]
+        assert audits[1] == (
+            "RECEIVABLES_COMMERCIAL_BILLING_CANDIDATE_OVERRIDE_SET",
+            True,
+            (
+                "Commercial billing candidate override accepted by Atlas for "
+                "Juan Canfield; no invoice or delivery work created"
+            ),
+        )
+
+    def test_commercial_billing_candidate_override_rejects_stale_sessions_and_invalid_requests_before_atlas(
+        self, client, auth, emp_auth, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        billing_run_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        path = (
+            "/api/admin/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/candidates/candidate:acme:2026-03/override"
+        )
+        payload = {
+            "expected_source_fingerprint": "a" * 64,
+            "expected_override_revision": 0,
+            "reason_code": "source_correction_pending",
+            "reason": "Source correction pending.",
+        }
+        calls = []
+        monkeypatch.setattr(
+            api.requests,
+            "request",
+            lambda *_args, **_kwargs: calls.append((_args, _kwargs)),
+        )
+        expired_token = api.jwt.encode(
+            {"sub": "1", "name": "Juan Canfield", "role": "admin", "exp": 1},
+            api.JWT_SECRET,
+            algorithm=api.JWT_ALGORITHM,
+        )
+
+        unauthenticated = client.post(
+            path,
+            headers={"Idempotency-Key": "unauthenticated-override"},
+            json=payload,
+        )
+        employee = client.post(
+            path,
+            headers={**emp_auth, "Idempotency-Key": "employee-override"},
+            json=payload,
+        )
+        expired = client.post(
+            path,
+            headers={
+                "Authorization": f"Bearer {expired_token}",
+                "Idempotency-Key": "expired-override",
+            },
+            json=payload,
+        )
+        missing_key = client.post(path, headers=auth, json=payload)
+        invalid_fingerprint = client.post(
+            path,
+            headers={**auth, "Idempotency-Key": "invalid-override-fingerprint"},
+            json={**payload, "expected_source_fingerprint": "not-a-fingerprint"},
+        )
+        invalid_revision = client.post(
+            path,
+            headers={**auth, "Idempotency-Key": "invalid-override-revision"},
+            json={**payload, "expected_override_revision": -1},
+        )
+        invalid_reason = client.post(
+            path,
+            headers={**auth, "Idempotency-Key": "invalid-override-reason"},
+            json={**payload, "reason_code": "other"},
+        )
+        blank_reason = client.post(
+            path,
+            headers={**auth, "Idempotency-Key": "blank-override-reason"},
+            json={**payload, "reason": "   "},
+        )
+        invalid_line = client.post(
+            path,
+            headers={**auth, "Idempotency-Key": "invalid-override-line"},
+            json={
+                **payload,
+                "line_overrides": [{"line_key": "b" * 64, "rate_cents": 0}],
+            },
+        )
+        unexpected_field = client.post(
+            path,
+            headers={**auth, "Idempotency-Key": "extra-override-field"},
+            json={**payload, "unexpected": True},
+        )
+        invalid_run = client.post(
+            "/api/admin/receivables/commercial-billing-runs/not-a-uuid/"
+            "candidates/candidate:acme:2026-03/override",
+            headers={**auth, "Idempotency-Key": "invalid-override-run"},
+            json=payload,
+        )
+        oversized_candidate = client.post(
+            "/api/admin/receivables/commercial-billing-runs/"
+            f"{billing_run_id}/candidates/{'a' * 513}/override",
+            headers={**auth, "Idempotency-Key": "oversized-override-candidate"},
+            json=payload,
+        )
+
+        assert unauthenticated.status_code == 401
+        assert employee.status_code == 403
+        assert expired.status_code == 401
+        assert missing_key.status_code == 422
+        assert invalid_fingerprint.status_code == 422
+        assert invalid_revision.status_code == 422
+        assert invalid_reason.status_code == 422
+        assert blank_reason.status_code == 422
+        assert invalid_line.status_code == 422
+        assert unexpected_field.status_code == 422
+        assert invalid_run.status_code == 422
+        assert oversized_candidate.status_code == 422
+        assert calls == []
+
     def test_commercial_billing_approval_model_requires_exact_source_fingerprint(self):
         import time_tracker_api as api
 
