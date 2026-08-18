@@ -11132,6 +11132,26 @@ def home_base_status(
     }
 
 
+def _append_home_base_location_metadata(response: Dict[str, Any]) -> None:
+    home_base = _active_home_base_config()
+    if not home_base:
+        return
+    latitude = home_base.get("latitude")
+    longitude = home_base.get("longitude")
+    if latitude is None or longitude is None:
+        return
+    label = f"Home Base — {home_base['label']}"
+    response.setdefault("location_coords", {})[label] = {
+        "lat": float(latitude),
+        "lng": float(longitude),
+    }
+    # Home Base is internal dispatch evidence, not a customer Site. Keep it out
+    # of customer/site lists while still letting the portal's GPS preflight
+    # recognize the office pin before the authoritative clock endpoint records
+    # the Home Base event.
+    response.setdefault("location_customers", {})[label] = ""
+
+
 @app.post("/api/timesheet/home-base/scan")
 def record_home_base_scan(
     payload: HomeBaseActionRequest,
@@ -14564,8 +14584,7 @@ def timesheet_locations(
         }
         for row in site_rows
     ]
-    append_access_log(request, "LOCATIONS_SUCCESS", True, "Locations fetched")
-    return {
+    response = {
         "success": True,
         "locations": payload["locations"],
         "sites": sites,
@@ -14586,6 +14605,9 @@ def timesheet_locations(
             "offlineQueue": False,
         },
     }
+    _append_home_base_location_metadata(response)
+    append_access_log(request, "LOCATIONS_SUCCESS", True, "Locations fetched")
+    return response
 
 
 CUSTOMER_SELECT_COLUMNS = """

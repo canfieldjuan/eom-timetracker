@@ -300,6 +300,25 @@ def _depart_and_clock_out(
     assert clock_out.status_code == 200, clock_out.text
 
 
+def test_timesheet_locations_exposes_home_base_as_internal_gps_pin(client, auth):
+    employee_id, employee_auth = _create_employee(client, "Home Base location meta")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+
+    response = client.get("/api/timesheet/locations", headers=employee_auth)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    label = "Home Base — EOM Office Home Base"
+    assert body["location_coords"][label] == pytest.approx({
+        "lat": BASE_LATITUDE,
+        "lng": BASE_LONGITUDE,
+    })
+    assert body["location_customers"][label] == ""
+    assert label not in body["locations"]
+    assert all(site["name"] != label for site in body["sites"])
+
+
 def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
     employee_id, employee_auth = _create_employee(client, "Morning")
     _enroll_in_morning_crew(employee_id)
