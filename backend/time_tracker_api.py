@@ -11140,16 +11140,17 @@ def _append_home_base_location_metadata(response: Dict[str, Any]) -> None:
     longitude = home_base.get("longitude")
     if latitude is None or longitude is None:
         return
-    label = f"Home Base — {home_base['label']}"
-    response.setdefault("location_coords", {})[label] = {
-        "lat": float(latitude),
-        "lng": float(longitude),
-    }
     # Home Base is internal dispatch evidence, not a customer Site. Keep it out
-    # of customer/site lists while still letting the portal's GPS preflight
-    # recognize the office pin before the authoritative clock endpoint records
-    # the Home Base event.
-    response.setdefault("location_customers", {})[label] = ""
+    # of customer-owned location maps so a real Site whose address collides
+    # with this label is not overwritten in /api/timesheet/locations.
+    response.setdefault("internal_locations", []).append(
+        {
+            "kind": "home_base",
+            "name": f"Home Base — {home_base['label']}",
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+        }
+    )
 
 
 @app.post("/api/timesheet/home-base/scan")

@@ -310,13 +310,61 @@ def test_timesheet_locations_exposes_home_base_as_internal_gps_pin(client, auth)
     body = response.json()
 
     label = "Home Base — EOM Office Home Base"
-    assert body["location_coords"][label] == pytest.approx({
-        "lat": BASE_LATITUDE,
-        "lng": BASE_LONGITUDE,
-    })
-    assert body["location_customers"][label] == ""
+    assert body["internal_locations"] == pytest.approx(
+        [
+            {
+                "kind": "home_base",
+                "name": label,
+                "latitude": BASE_LATITUDE,
+                "longitude": BASE_LONGITUDE,
+            }
+        ]
+    )
+    assert label not in body["location_coords"]
+    assert label not in body["location_customers"]
     assert label not in body["locations"]
     assert all(site["name"] != label for site in body["sites"])
+
+
+def test_timesheet_locations_preserves_customer_site_when_home_base_label_collides(client, auth):
+    employee_id, employee_auth = _create_employee(client, "Home Base label collision")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+
+    label = "Home Base — EOM Office Home Base"
+    customer = f"{TEST_PREFIX} Collision Customer"
+    row = db.query_one(
+        """
+        INSERT INTO locations (
+            address, customer_name, location_type, lat, lng,
+            rate, rate_type, expected_hours
+        ) VALUES (%s, %s, 'Commercial', %s, %s, 100, 'per_visit', 2)
+        RETURNING id
+        """,
+        (label, customer, BASE_LATITUDE + 0.5, BASE_LONGITUDE - 0.5),
+    )
+    assert row
+
+    response = client.get("/api/timesheet/locations", headers=employee_auth)
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["location_coords"][label] == pytest.approx(
+        {"lat": BASE_LATITUDE + 0.5, "lng": BASE_LONGITUDE - 0.5}
+    )
+    assert body["location_customers"][label] == customer
+    assert label in body["locations"]
+    assert any(site["name"] == label for site in body["sites"])
+    assert body["internal_locations"] == pytest.approx(
+        [
+            {
+                "kind": "home_base",
+                "name": label,
+                "latitude": BASE_LATITUDE,
+                "longitude": BASE_LONGITUDE,
+            }
+        ]
+    )
 
 
 def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
