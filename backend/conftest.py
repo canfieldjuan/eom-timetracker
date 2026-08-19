@@ -69,6 +69,7 @@ def _apply_schema(conn):
                 crew_memberships, crews, google_calendar_oauth_states,
                 google_calendar_sources, google_calendar_connections,
                 eom_lead_working,
+                eom_public_onboarding_reservations,
                 eom_customer_atlas_reservations,
                 eom_office_conversion_handoffs,
                 receivables_operation_attempts,
