@@ -2488,6 +2488,52 @@ class CustomerCreateRequest(BaseModel):
         return _validate_optional_email(value)
 
 
+class PublicOnboardingTokenRequest(BaseModel):
+    """Opaque public bearer forwarded only to the private Tracker service."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Atlas owns bearer grammar and authentication. Tracker accepts only an
+    # opaque string here; it deliberately does not duplicate Atlas's grammar
+    # or authentication checks before the canonical parser sees the bearer.
+    token: str
+
+
+class AtlasPublicOnboardingProjection(BaseModel):
+    """The bounded Atlas response shape used by Tracker-only helpers."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    success: Literal[True]
+    status: Literal["ready", "completed"]
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    zip: Optional[str] = None
+    customer_type: Optional[str] = None
+    token_id: Optional[UUID] = None
+    draft_id: Optional[UUID] = None
+    contact_id: Optional[UUID] = None
+    tracker_customer_id: Optional[int] = Field(default=None, gt=0)
+    tracker_site_id: Optional[int] = Field(default=None, gt=0)
+    idempotent: Optional[bool] = None
+
+
+class AtlasPublicOnboardingRevocationReceipt(BaseModel):
+    """The only public-link revocation receipt the Tracker may relay to staff."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    success: Literal[True]
+    token_id: UUID
+    contact_id: UUID
+    status: Literal["revoked"]
+    idempotent: bool
+
+
 class OfficeEstimateApprovalRequest(CustomerCreateRequest):
     """Completed-estimate facts needed for one office-created Customer/Site."""
 
@@ -4140,6 +4186,123 @@ def _atlas_funnel_request(
 # _verify_atlas_contact_links instead of reporting status=unavailable.
 _KNOWN_CONTACTS_PATH = "/eom-funnel/known-contacts"
 _ATLAS_ONBOARDING_DRAFTS_PATH = "/eom-funnel/onboarding-drafts"
+_ATLAS_ONBOARDING_DRAFT_REVOKE_LINK_PATH = (
+    "/eom-funnel/onboarding-drafts/{draft_id}/revoke-link"
+)
+_ATLAS_PUBLIC_ONBOARDING_SESSION_PATH = "/eom-funnel/public-onboarding/session"
+_ATLAS_PUBLIC_ONBOARDING_TRACKER_CONTEXT_PATH = (
+    "/eom-funnel/public-onboarding/tracker-context"
+)
+_ATLAS_PUBLIC_ONBOARDING_FINALIZE_PATH = "/eom-funnel/public-onboarding/finalize"
+_ATLAS_PUBLIC_ONBOARDING_RECOVER_PATH = "/eom-funnel/public-onboarding/recover"
+
+# CLOSED / ENUMERATED: these are the only Atlas public-onboarding paths a
+# bearer-bearing Tracker call may reach. New upstream paths must be admitted
+# deliberately here; an open proxy would turn this service credential into a
+# browser-controlled Atlas request oracle.
+_ATLAS_PUBLIC_ONBOARDING_PATHS = frozenset(
+    {
+        _ATLAS_PUBLIC_ONBOARDING_SESSION_PATH,
+        _ATLAS_PUBLIC_ONBOARDING_TRACKER_CONTEXT_PATH,
+        _ATLAS_PUBLIC_ONBOARDING_FINALIZE_PATH,
+    }
+)
+
+
+def _atlas_public_onboarding_request(
+    path: str,
+    *,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Call the closed public-link contract without forwarding an actor header.
+
+    A public bearer authorizes only Atlas's canonical parser. The browser never
+    receives the Tracker's service credential, and this helper deliberately
+    never writes the bearer to the database or a log reason.
+    """
+    _require_atlas_funnel_configuration()
+    if path not in _ATLAS_PUBLIC_ONBOARDING_PATHS:
+        raise RuntimeError("Invalid public onboarding proxy path")
+    headers = {
+        "Authorization": f"Bearer {ATLAS_FUNNEL_SERVICE_TOKEN}",
+        "Accept": "application/json",
+    }
+    try:
+        response = requests.post(
+            f"{ATLAS_FUNNEL_BASE_URL}{path}",
+            headers=headers,
+            json=payload,
+            timeout=ATLAS_FUNNEL_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise AtlasFunnelRequestError(
+            503,
+            "Public onboarding service is temporarily unavailable",
+        ) from exc
+    try:
+        content = response.json()
+    except ValueError as exc:
+        if response.status_code >= 500:
+            raise AtlasFunnelRequestError(
+                response.status_code,
+                "Public onboarding service is temporarily unavailable",
+            ) from exc
+        raise AtlasFunnelRequestError(
+            502, "Public onboarding service returned an invalid response"
+        ) from exc
+    if response.status_code in (401, 403):
+        logger.error(
+            "Atlas public onboarding service credential rejected status=%s",
+            response.status_code,
+        )
+        raise AtlasFunnelRequestError(
+            502, "Public onboarding service authentication failed"
+        )
+    if response.status_code in (404, 409):
+        # Keep token parser/state outcomes indistinguishable to browser callers.
+        raise AtlasFunnelRequestError(404, "Public onboarding link is unavailable")
+    if response.status_code >= 400:
+        detail: Any = content.get("detail", content) if isinstance(content, dict) else content
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail.get("error")
+        if not isinstance(detail, str) or not detail.strip():
+            detail = "Public onboarding service request failed"
+        raise AtlasFunnelRequestError(response.status_code, detail)
+    if not isinstance(content, dict):
+        raise AtlasFunnelRequestError(
+            502, "Public onboarding service returned an invalid response"
+        )
+    return content
+
+
+def _parse_atlas_public_onboarding_projection(
+    content: Dict[str, Any], *, require_tracker_context: bool
+) -> AtlasPublicOnboardingProjection:
+    """Validate Atlas data before selecting either private or browser fields."""
+    try:
+        projection = AtlasPublicOnboardingProjection.model_validate(content)
+    except ValidationError as exc:
+        raise AtlasFunnelRequestError(
+            502, "Public onboarding service returned an invalid response"
+        ) from exc
+    if require_tracker_context and any(
+        value is None
+        for value in (
+            projection.token_id,
+            projection.draft_id,
+            projection.contact_id,
+        )
+    ):
+        raise AtlasFunnelRequestError(
+            502, "Public onboarding service returned an invalid tracker context"
+        )
+    if projection.status == "completed" and (
+        projection.tracker_customer_id is None or projection.tracker_site_id is None
+    ):
+        raise AtlasFunnelRequestError(
+            502, "Public onboarding service returned an invalid completion"
+        )
+    return projection
 
 # GET reads Atlas allows through the funnel credential. Kept as an explicit
 # allow-list, not an open passthrough: a caller that could read any funnel path
@@ -5084,6 +5247,32 @@ def _ensure_customer_site_schema() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_eom_customer_atlas_reservations_state
                     ON eom_customer_atlas_reservations(state, updated_at);
+                """
+            )
+            # A public bearer is intentionally ephemeral, but its successful
+            # local Customer/Site write must stay recoverable if Atlas
+            # finalization is lost. Store only opaque Atlas IDs and local
+            # records -- never the bearer itself -- so staff can use Atlas's
+            # actor-audited recovery path later.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eom_public_onboarding_reservations (
+                    token_id UUID PRIMARY KEY,
+                    draft_id UUID NOT NULL UNIQUE,
+                    atlas_contact_id UUID NOT NULL,
+                    customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+                    site_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE RESTRICT,
+                    state VARCHAR(16) NOT NULL DEFAULT 'pending'
+                        CHECK (state IN ('pending', 'finalized')),
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    finalized_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS idx_eom_public_onboarding_reservations_state
+                    ON eom_public_onboarding_reservations(state, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_eom_public_onboarding_reservations_contact
+                    ON eom_public_onboarding_reservations(atlas_contact_id, state);
                 """
             )
             cur.execute(
@@ -15845,6 +16034,29 @@ def _finalize_customer_atlas_reservation(
                     ),
                 }
 
+            # Atlas returns its canonical contact before this local finalizer
+            # takes the shared Customer/Site lock. A public onboarding handoff
+            # can therefore commit that same contact in the intervening window.
+            # Do not attach a second local Customer (or a second link) to it.
+            # Both writers take this lock first, so this read closes the race
+            # without changing either normal finalization path.
+            cur.execute(
+                """
+                SELECT token_id
+                FROM eom_public_onboarding_reservations
+                WHERE atlas_contact_id = %s
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (atlas_contact_id,),
+            )
+            if cur.fetchone():
+                _raise_conflict(
+                    "customer_atlas_link_public_onboarding_reserved",
+                    "This Atlas contact already has a public onboarding handoff",
+                    {},
+                )
+
             if reservation["mode"] == "link_existing":
                 customer_id = int(reservation["customer_id"])
                 cur.execute(
@@ -16299,6 +16511,513 @@ def _clear_working_lead_marker(contact_id: str) -> None:
     with db.get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM eom_lead_working WHERE atlas_contact_id = %s", (contact_id,))
+
+
+_PUBLIC_ONBOARDING_SITE_TYPES = {
+    "residential": "Residential",
+    "commercial": "Commercial",
+}
+
+
+class PublicOnboardingReviewRequired(Exception):
+    """The anonymous path must stop and let staff resolve a local conflict."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _public_onboarding_review_response(reason: str) -> JSONResponse:
+    """Return a bounded public conflict without leaking internal record IDs."""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "success": False,
+            "status": "review_required",
+            "reason": reason,
+        },
+    )
+
+
+def _public_onboarding_pending_response() -> JSONResponse:
+    """Local records exist, but an administrator may need to finish the handoff."""
+    return JSONResponse(
+        status_code=202,
+        content={"success": True, "status": "pending_recovery"},
+    )
+
+
+def _public_onboarding_browser_projection(
+    projection: AtlasPublicOnboardingProjection,
+) -> Dict[str, Any]:
+    """Select the ID-free fields a public Website may consume."""
+    content: Dict[str, Any] = {"success": True, "status": projection.status}
+    if projection.status == "completed":
+        content["idempotent"] = bool(projection.idempotent)
+        return content
+    content.update(
+        {
+            "fullName": projection.full_name,
+            "email": projection.email,
+            "phone": projection.phone,
+            "address": projection.address,
+            "city": projection.city,
+            "state": projection.state,
+            "zip": projection.zip,
+            "customerType": projection.customer_type,
+        }
+    )
+    return content
+
+
+def _public_onboarding_nonblank(value: Optional[str]) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _public_onboarding_site_address(
+    projection: AtlasPublicOnboardingProjection,
+) -> str:
+    """Build the one Tracker Site address from Atlas's split contact fields."""
+    street = _public_onboarding_nonblank(projection.address)
+    if not street:
+        raise PublicOnboardingReviewRequired("missing_service_address")
+    city = _public_onboarding_nonblank(projection.city)
+    state = _public_onboarding_nonblank(projection.state)
+    postal_code = _public_onboarding_nonblank(projection.zip)
+    locality = " ".join(value for value in (state, postal_code) if value)
+    # Atlas stores street, locality, region, and postal code separately. The
+    # Tracker has one Site address field, so join the nonblank components rather
+    # than dropping locality and creating a collision-prone street-only key.
+    return ", ".join(value for value in (street, city, locality) if value)
+
+
+def _public_onboarding_customer_request(
+    projection: AtlasPublicOnboardingProjection,
+) -> CustomerCreateRequest:
+    customer_type = _public_onboarding_nonblank(projection.customer_type)
+    site_type = _PUBLIC_ONBOARDING_SITE_TYPES.get(
+        customer_type.casefold() if customer_type else ""
+    )
+    if site_type is None:
+        # OPEN / DERIVED from Atlas: an unknown future value must never be
+        # guessed into a billable/operational Site type.
+        raise PublicOnboardingReviewRequired("unsupported_customer_type")
+    full_name = _public_onboarding_nonblank(projection.full_name)
+    if not full_name:
+        raise PublicOnboardingReviewRequired("incomplete_profile")
+    address = _public_onboarding_site_address(projection)
+    try:
+        return CustomerCreateRequest(
+            name=full_name,
+            primaryContactName=full_name,
+            primaryPhone=_public_onboarding_nonblank(projection.phone),
+            primaryEmail=_public_onboarding_nonblank(projection.email),
+            billingName=full_name,
+            billingEmail=_public_onboarding_nonblank(projection.email),
+            billingAddress=address,
+            primarySite=PrimarySiteCreateRequest(
+                address=address,
+                locationType=site_type,
+            ),
+        )
+    except ValidationError as exc:
+        # Atlas owns this immutable prefill. A value that cannot form the
+        # existing Tracker Customer/Site model needs staff correction, not a
+        # browser-controlled fallback or partial Customer.
+        raise PublicOnboardingReviewRequired("incomplete_profile") from exc
+
+
+def _public_onboarding_reservation_row(
+    cur: Any, token_id: str, *, for_update: bool = False
+) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        "SELECT * FROM eom_public_onboarding_reservations "
+        "WHERE token_id = %s" + (" FOR UPDATE" if for_update else ""),
+        (token_id,),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _assert_public_onboarding_reservation_context(
+    reservation: Dict[str, Any], projection: AtlasPublicOnboardingProjection
+) -> None:
+    if (
+        str(reservation["draft_id"]) != str(projection.draft_id)
+        or str(reservation["atlas_contact_id"]) != str(projection.contact_id)
+    ):
+        raise HTTPException(
+            status_code=502,
+            detail="Public onboarding reservation no longer matches Atlas context",
+        )
+
+
+def _serialize_public_onboarding_reservation(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Private admin projection of one durable local recovery operation."""
+    return {
+        "tokenId": str(row["token_id"]),
+        "draftId": str(row["draft_id"]),
+        "contactId": str(row["atlas_contact_id"]),
+        "customerId": int(row["customer_id"]),
+        "siteId": int(row["site_id"]),
+        "status": str(row["state"]),
+        "lastError": row.get("last_error"),
+        "createdAt": to_utc_iso(row["created_at"]),
+        "updatedAt": to_utc_iso(row["updated_at"]),
+        "finalizedAt": (
+            to_utc_iso(row["finalized_at"])
+            if row.get("finalized_at") is not None
+            else None
+        ),
+    }
+
+
+def _has_existing_public_onboarding_claim(cur: Any, contact_id: str) -> bool:
+    """Check every local in-flight claim that can later materialize this contact."""
+    cur.execute(
+        """
+        SELECT 1
+        FROM eom_public_onboarding_reservations
+        WHERE atlas_contact_id = %s AND state = 'pending'
+        LIMIT 1
+        """,
+        (contact_id,),
+    )
+    if cur.fetchone():
+        return True
+    cur.execute(
+        """
+        SELECT 1
+        FROM eom_customer_atlas_reservations
+        WHERE atlas_contact_id = %s AND state = 'pending'
+        LIMIT 1
+        """,
+        (contact_id,),
+    )
+    return cur.fetchone() is not None
+
+
+def _reserve_public_onboarding(
+    projection: AtlasPublicOnboardingProjection,
+) -> tuple[Dict[str, Any], bool]:
+    """Persist one Customer, Site, and opaque recovery identity atomically."""
+    if (
+        projection.token_id is None
+        or projection.draft_id is None
+        or projection.contact_id is None
+    ):
+        raise RuntimeError("Public onboarding context was not validated")
+    customer_payload = _public_onboarding_customer_request(projection)
+    primary_site = customer_payload.primarySite
+    if primary_site is None:
+        raise RuntimeError("Public onboarding payload lost its required Site")
+    token_id = str(projection.token_id)
+    draft_id = str(projection.draft_id)
+    contact_id = str(projection.contact_id)
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                _lock_customer_site_mutations(cur)
+                existing = _public_onboarding_reservation_row(
+                    cur, token_id, for_update=True
+                )
+                if existing:
+                    _assert_public_onboarding_reservation_context(existing, projection)
+                    return existing, False
+
+                # A draft can issue only one Atlas token. Treat a locally
+                # contradictory tuple as a server-integrity failure rather than
+                # attaching the bearer to whichever row happened to be first.
+                cur.execute(
+                    "SELECT token_id FROM eom_public_onboarding_reservations "
+                    "WHERE draft_id = %s FOR UPDATE",
+                    (draft_id,),
+                )
+                draft_claim = cur.fetchone()
+                if draft_claim:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Public onboarding draft has inconsistent local recovery state",
+                    )
+
+                cur.execute(
+                    "SELECT id FROM customers WHERE atlas_contact_id = %s FOR UPDATE",
+                    (contact_id,),
+                )
+                if cur.fetchone() or _has_existing_public_onboarding_claim(cur, contact_id):
+                    raise PublicOnboardingReviewRequired("existing_customer")
+
+                # `_insert_site` performs the normalized-address check while
+                # this same transaction owns the customer/site mutation lock.
+                # If it raises, the preceding Customer insert rolls back too.
+                customer_id = _insert_customer(
+                    cur, customer_payload, atlas_contact_id=contact_id
+                )
+                site_id = _insert_site(cur, customer_id, customer_payload.name, primary_site)
+                cur.execute(
+                    """
+                    INSERT INTO eom_public_onboarding_reservations (
+                        token_id, draft_id, atlas_contact_id, customer_id, site_id
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (token_id, draft_id, contact_id, customer_id, site_id),
+                )
+                return dict(cur.fetchone()), True
+    except HTTPException as exc:
+        detail = exc.detail
+        if (
+            isinstance(detail, dict)
+            and detail.get("code")
+            in {"duplicate_site_address", "archived_site_address"}
+        ):
+            raise PublicOnboardingReviewRequired("existing_service_address") from exc
+        raise
+
+
+def _public_onboarding_reservation(token_id: str) -> Optional[Dict[str, Any]]:
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            return _public_onboarding_reservation_row(cur, token_id)
+
+
+def _mark_public_onboarding_finalized(
+    token_id: str, *, customer_id: int, site_id: int
+) -> Dict[str, Any]:
+    """Set the local marker only after Atlas confirms the exact local records."""
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            reservation = _public_onboarding_reservation_row(
+                cur, token_id, for_update=True
+            )
+            if not reservation:
+                raise RuntimeError("Public onboarding reservation disappeared")
+            if (
+                int(reservation["customer_id"]) != customer_id
+                or int(reservation["site_id"]) != site_id
+            ):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Public onboarding completion does not match local reservation",
+                )
+            if reservation["state"] == "finalized":
+                return reservation
+            cur.execute(
+                """
+                UPDATE eom_public_onboarding_reservations
+                SET state = 'finalized', last_error = NULL,
+                    finalized_at = COALESCE(finalized_at, NOW()), updated_at = NOW()
+                WHERE token_id = %s
+                RETURNING *
+                """,
+                (token_id,),
+            )
+            return dict(cur.fetchone())
+
+
+def _note_public_onboarding_error(token_id: str, reason: str) -> None:
+    """Best-effort diagnostic storage; failure never destroys the reservation."""
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE eom_public_onboarding_reservations
+                    SET last_error = %s, updated_at = NOW()
+                    WHERE token_id = %s AND state = 'pending'
+                    """,
+                    (reason[:1000], token_id),
+                )
+    except Exception:
+        logger.exception("Could not save public onboarding recovery diagnostic")
+
+
+def _validate_public_onboarding_completion(
+    atlas_result: Dict[str, Any], reservation: Dict[str, Any]
+) -> AtlasPublicOnboardingProjection:
+    projection = _parse_atlas_public_onboarding_projection(
+        atlas_result, require_tracker_context=False
+    )
+    if (
+        projection.status != "completed"
+        or projection.tracker_customer_id is None
+        or projection.tracker_site_id is None
+        or projection.idempotent is None
+        or int(reservation["customer_id"]) != projection.tracker_customer_id
+        or int(reservation["site_id"]) != projection.tracker_site_id
+    ):
+        raise AtlasFunnelRequestError(
+            502, "Public onboarding service returned a mismatched completion"
+        )
+    return projection
+
+
+def _reconcile_completed_public_onboarding_context(
+    projection: AtlasPublicOnboardingProjection,
+) -> bool:
+    """Repair a lost local marker from Atlas's completed, bearer-bound receipt."""
+    if (
+        projection.token_id is None
+        or projection.tracker_customer_id is None
+        or projection.tracker_site_id is None
+    ):
+        raise RuntimeError("Completed public onboarding context was not validated")
+    reservation = _public_onboarding_reservation(str(projection.token_id))
+    if reservation is None:
+        # Completion may predate this Tracker deployment or have happened via a
+        # different Tracker instance. It is still safe to tell the bearer holder
+        # that Atlas has completed, but this process must not manufacture local
+        # records from an already-redeemed link.
+        return False
+    _assert_public_onboarding_reservation_context(reservation, projection)
+    if (
+        int(reservation["customer_id"]) != projection.tracker_customer_id
+        or int(reservation["site_id"]) != projection.tracker_site_id
+    ):
+        raise PublicOnboardingReviewRequired("completion_mismatch")
+    _mark_public_onboarding_finalized(
+        str(projection.token_id),
+        customer_id=projection.tracker_customer_id,
+        site_id=projection.tracker_site_id,
+    )
+    return True
+
+
+def _raise_public_onboarding_upstream_error(exc: AtlasFunnelRequestError) -> None:
+    headers = {"Retry-After": "5"} if exc.status_code >= 500 else None
+    # Atlas error text is untrusted at this boundary. In particular, a token
+    # parser or proxy must never be able to reflect the browser's raw bearer
+    # into a public response through an upstream diagnostic.
+    detail = (
+        "Public onboarding service is temporarily unavailable"
+        if exc.status_code >= 500
+        else "Public onboarding link is unavailable"
+    )
+    raise HTTPException(
+        status_code=exc.status_code,
+        detail=detail,
+        headers=headers,
+    ) from exc
+
+
+def _public_onboarding_failure_is_recoverable(exc: AtlasFunnelRequestError) -> bool:
+    """Only ambiguous/revoked/temporary finalization outcomes become 202."""
+    return exc.status_code in {404, 500, 503, 504}
+
+
+@app.post("/api/public/onboarding/session")
+def public_onboarding_session(
+    payload: PublicOnboardingTokenRequest,
+) -> Dict[str, Any]:
+    """Resolve a raw link through Tracker without exposing private Atlas IDs."""
+    try:
+        atlas_result = _atlas_public_onboarding_request(
+            _ATLAS_PUBLIC_ONBOARDING_SESSION_PATH,
+            payload={"token": payload.token},
+        )
+        projection = _parse_atlas_public_onboarding_projection(
+            atlas_result, require_tracker_context=False
+        )
+    except AtlasFunnelRequestError as exc:
+        _raise_public_onboarding_upstream_error(exc)
+    return _public_onboarding_browser_projection(projection)
+
+
+@app.post("/api/public/onboarding/complete")
+def public_onboarding_complete(
+    payload: PublicOnboardingTokenRequest,
+) -> JSONResponse:
+    """Create and redeem exactly one public Customer/Site handoff.
+
+    Only Atlas's immutable context supplies the local record data. A browser
+    cannot select a Customer, Site, contact, or completion target.
+    """
+    try:
+        atlas_context = _atlas_public_onboarding_request(
+            _ATLAS_PUBLIC_ONBOARDING_TRACKER_CONTEXT_PATH,
+            payload={"token": payload.token},
+        )
+        projection = _parse_atlas_public_onboarding_projection(
+            atlas_context, require_tracker_context=True
+        )
+    except AtlasFunnelRequestError as exc:
+        _raise_public_onboarding_upstream_error(exc)
+
+    if projection.status == "completed":
+        try:
+            _reconcile_completed_public_onboarding_context(projection)
+        except PublicOnboardingReviewRequired as exc:
+            return _public_onboarding_review_response(exc.reason)
+        except psycopg2.Error:
+            _note_public_onboarding_error(
+                str(projection.token_id), "local completion marker was not confirmed"
+            )
+            logger.exception("Could not repair local public onboarding completion marker")
+            return _public_onboarding_pending_response()
+        return JSONResponse(
+            status_code=200,
+            content=_public_onboarding_browser_projection(projection),
+        )
+
+    try:
+        reservation, created = _reserve_public_onboarding(projection)
+    except PublicOnboardingReviewRequired as exc:
+        return _public_onboarding_review_response(exc.reason)
+
+    if reservation["state"] == "finalized":
+        # Atlas context cannot normally be ready after a local final marker.
+        # Treat it as a staff-only integrity review rather than risking a second
+        # finalizer call with a contradictory state.
+        return _public_onboarding_review_response("completion_mismatch")
+
+    try:
+        atlas_result = _atlas_public_onboarding_request(
+            _ATLAS_PUBLIC_ONBOARDING_FINALIZE_PATH,
+            payload={
+                "token": payload.token,
+                "tracker_customer_id": int(reservation["customer_id"]),
+                "tracker_site_id": int(reservation["site_id"]),
+            },
+        )
+        completion = _validate_public_onboarding_completion(atlas_result, reservation)
+        _mark_public_onboarding_finalized(
+            str(reservation["token_id"]),
+            customer_id=completion.tracker_customer_id,
+            site_id=completion.tracker_site_id,
+        )
+    except AtlasFunnelRequestError as exc:
+        _note_public_onboarding_error(
+            str(reservation["token_id"]),
+            f"Atlas public onboarding finalization status={exc.status_code}",
+        )
+        if _public_onboarding_failure_is_recoverable(exc):
+            return _public_onboarding_pending_response()
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail="Public onboarding completion was not confirmed",
+        ) from exc
+    except psycopg2.Error:
+        # Atlas may already have committed while the local state marker fails.
+        # Preserve the row for either a bearer replay (completed context) or
+        # the configured administrator's recovery operation.
+        _note_public_onboarding_error(
+            str(reservation["token_id"]), "local completion marker was not confirmed"
+        )
+        logger.exception("Could not finalize local public onboarding reservation")
+        return _public_onboarding_pending_response()
+
+    return JSONResponse(
+        status_code=201 if created else 200,
+        content={
+            "success": True,
+            "status": "completed",
+            "idempotent": (not created) or bool(completion.idempotent),
+        },
+    )
 
 
 @app.get("/api/admin/customers")
@@ -16911,6 +17630,195 @@ def admin_approve_funnel_onboarding_draft(
     return JSONResponse(
         status_code=200 if visible["idempotent"] else 201,
         content=jsonable_encoder(visible),
+    )
+
+
+@app.get("/api/admin/funnel/public-onboarding/reservations")
+def admin_list_public_onboarding_reservations(
+    request: Request,
+    reservationStatus: Optional[Literal["pending", "finalized"]] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=200),
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Show the Tracker-owned recovery queue without changing any handoff."""
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if reservationStatus is None:
+                cur.execute(
+                    """
+                    SELECT * FROM eom_public_onboarding_reservations
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT * FROM eom_public_onboarding_reservations
+                    WHERE state = %s
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT %s
+                    """,
+                    (reservationStatus, limit),
+                )
+            reservations = [
+                _serialize_public_onboarding_reservation(dict(row))
+                for row in cur.fetchall()
+            ]
+    append_access_log(
+        request,
+        "EOM_PUBLIC_ONBOARDING_RESERVATIONS_LISTED",
+        True,
+        f"count={len(reservations)}",
+    )
+    return {"success": True, "reservations": reservations}
+
+
+@app.post("/api/admin/funnel/onboarding-drafts/{draft_id}/revoke-link")
+def admin_revoke_public_onboarding_link(
+    draft_id: UUID,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Let the configured approver revoke an issued link without a raw bearer."""
+    _require_juan_funnel_approver(admin, action="revoke public onboarding links")
+    _require_atlas_funnel_configuration()
+    draft_id_text = str(draft_id)
+    try:
+        atlas_result = _atlas_funnel_request(
+            _ATLAS_ONBOARDING_DRAFT_REVOKE_LINK_PATH.format(draft_id=draft_id_text),
+            admin,
+            payload={},
+            idempotency_key=f"eom-public-onboarding-link-revoke:{draft_id_text}",
+        )
+        receipt = AtlasPublicOnboardingRevocationReceipt.model_validate(atlas_result)
+    except ValidationError as exc:
+        append_access_log(
+            request,
+            "EOM_PUBLIC_ONBOARDING_LINK_REVOKE_FAILED",
+            False,
+            "invalid Atlas revocation receipt",
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Public onboarding service returned an invalid revocation receipt",
+        ) from exc
+    except AtlasFunnelRequestError as exc:
+        append_access_log(
+            request,
+            "EOM_PUBLIC_ONBOARDING_LINK_REVOKE_FAILED",
+            False,
+            f"status={exc.status_code}",
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    append_access_log(
+        request,
+        "EOM_PUBLIC_ONBOARDING_LINK_REVOKED",
+        True,
+        f"idempotent={receipt.idempotent}",
+    )
+    return JSONResponse(
+        status_code=200 if receipt.idempotent else 201,
+        content={
+            "success": True,
+            "draftId": draft_id_text,
+            "status": "revoked",
+            "idempotent": receipt.idempotent,
+        },
+    )
+
+
+@app.post("/api/admin/funnel/public-onboarding/reservations/{token_id}/recover")
+def admin_recover_public_onboarding_reservation(
+    token_id: UUID,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Finish a persisted local handoff through Atlas's actor-audited recovery."""
+    _require_juan_funnel_approver(admin, action="recover public onboarding")
+    _require_atlas_funnel_configuration()
+    token_id_text = str(token_id)
+    reservation = _public_onboarding_reservation(token_id_text)
+    if reservation is None:
+        raise HTTPException(status_code=404, detail="Public onboarding reservation not found")
+    if reservation["state"] == "finalized":
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "idempotent": True,
+                "reservation": _serialize_public_onboarding_reservation(reservation),
+            },
+        )
+
+    try:
+        atlas_result = _atlas_funnel_request(
+            _ATLAS_PUBLIC_ONBOARDING_RECOVER_PATH,
+            admin,
+            payload={
+                "token_id": token_id_text,
+                "contact_id": str(reservation["atlas_contact_id"]),
+                "tracker_customer_id": int(reservation["customer_id"]),
+                "tracker_site_id": int(reservation["site_id"]),
+            },
+            # Atlas derives the authoritative recovery key from token ID. This
+            # header is only required by the shared Tracker transport helper.
+            idempotency_key=f"eom-public-onboarding-recovery:{token_id_text}",
+        )
+        completion = _validate_public_onboarding_completion(atlas_result, reservation)
+    except AtlasFunnelRequestError as exc:
+        _note_public_onboarding_error(
+            token_id_text,
+            f"Atlas public onboarding recovery status={exc.status_code}",
+        )
+        append_access_log(
+            request,
+            "EOM_PUBLIC_ONBOARDING_RECOVERY_FAILED",
+            False,
+            f"status={exc.status_code}",
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    try:
+        finalized = _mark_public_onboarding_finalized(
+            token_id_text,
+            customer_id=completion.tracker_customer_id,
+            site_id=completion.tracker_site_id,
+        )
+    except psycopg2.Error:
+        _note_public_onboarding_error(
+            token_id_text, "local recovery completion marker was not confirmed"
+        )
+        logger.exception("Could not mark recovered public onboarding reservation finalized")
+        refreshed = _public_onboarding_reservation(token_id_text) or reservation
+        return JSONResponse(
+            status_code=202,
+            content=jsonable_encoder(
+                {
+                    "success": False,
+                    "status": "pending_recovery",
+                    "reservation": _serialize_public_onboarding_reservation(refreshed),
+                }
+            ),
+        )
+
+    append_access_log(
+        request,
+        "EOM_PUBLIC_ONBOARDING_RECOVERED",
+        True,
+        f"idempotent={completion.idempotent}",
+    )
+    return JSONResponse(
+        status_code=200 if completion.idempotent else 201,
+        content=jsonable_encoder(
+            {
+                "success": True,
+                "idempotent": completion.idempotent,
+                "reservation": _serialize_public_onboarding_reservation(finalized),
+            }
+        ),
     )
 
 
