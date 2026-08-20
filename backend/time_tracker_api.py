@@ -7499,32 +7499,22 @@ def _ensure_geofence_pin_columns(table: str) -> None:
             INTEGER REFERENCES employees(id) ON DELETE SET NULL;
         ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pin_attestation_fingerprint VARCHAR(64);
     """)
-    # All geofence CHECK constraints are added ONCE (guarded) and never rebuilt on
-    # boot. The enum CHECKs are generated from the canonical tuples, so their DDL
-    # and the request-validation regexes share one source (Codex #220 thread 1).
-    # The radius CHECK uses the PERMANENT sanity bounds, never the provisional
-    # business bounds -- so a pin-audit retune of the business bounds needs no DB
-    # change and can never abort startup or block an unrelated edit on a
-    # grandfathered row (Codex #220 threads 2-4). Business-bound enforcement lives
-    # in request validation + derived readiness. Trusted, code-defined values only
-    # -- never user input.
-    provenance_values = ", ".join("'" + v + "'" for v in PIN_PROVENANCE_VALUES)
-    confidence_values = ", ".join("'" + v + "'" for v in PIN_CONFIDENCE_VALUES)
+    # Enum validation for pin_provenance / pin_confidence lives in ONE place: the
+    # request-validation regexes derived from PIN_*_VALUES. We deliberately do NOT
+    # mirror the enum sets in a DB CHECK -- a mutable set in a boot-guarded CHECK
+    # drifts from the API on an existing DB, and rebuilding it on boot reintroduces
+    # the tighten-against-live-data hazard (Codex #220). So there is a single
+    # source and nothing to drift. Drop any enum CHECK an earlier revision added.
+    # The DB keeps only PERMANENT/structural CHECKs: the wide radius sanity range
+    # (business bounds are enforced in request validation + derived readiness) and
+    # the fixed fingerprint format. Both are guarded add-once, never rebuilt.
+    db.execute(f"""
+        ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pin_provenance_check;
+        ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pin_confidence_check;
+    """)
     db.execute(f"""
         DO $$
         BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                WHERE conrelid = '{table}'::regclass
-                  AND conname = '{table}_pin_provenance_check') THEN
-                ALTER TABLE {table} ADD CONSTRAINT {table}_pin_provenance_check
-                    CHECK (pin_provenance IS NULL OR pin_provenance IN ({provenance_values}));
-            END IF;
-            IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                WHERE conrelid = '{table}'::regclass
-                  AND conname = '{table}_pin_confidence_check') THEN
-                ALTER TABLE {table} ADD CONSTRAINT {table}_pin_confidence_check
-                    CHECK (pin_confidence IS NULL OR pin_confidence IN ({confidence_values}));
-            END IF;
             IF NOT EXISTS (SELECT 1 FROM pg_constraint
                 WHERE conrelid = '{table}'::regclass
                   AND conname = '{table}_geofence_radius_m_check') THEN
@@ -15521,10 +15511,14 @@ def _geofence_state(
     reasons: List[str] = []
     if latitude is None or longitude is None:
         reasons.append("unpinned")
-    # Derived, so tightening the provisional business bounds immediately marks a
-    # grandfathered out-of-range override unready (the DB keeps only a permanent
-    # sanity bound, so such a row is retained, not deleted) -- Codex #220 thread 3.
-    if not (GEOFENCE_RADIUS_MIN_M <= resolved_radius_m <= GEOFENCE_RADIUS_MAX_M):
+    # The provisional business bounds apply ONLY to a per-site override, never the
+    # independently-configured global fallback (SITE_CHECK_IN_RADIUS_M) -- otherwise
+    # a valid deployment like SITE_CHECK_IN_RADIUS_M=10 would mark every fallback
+    # Site unready (Codex #220). Derived, so tightening the bounds immediately
+    # flags a grandfathered override without touching the DB.
+    if configured_radius_m is not None and not (
+        GEOFENCE_RADIUS_MIN_M <= int(configured_radius_m) <= GEOFENCE_RADIUS_MAX_M
+    ):
         reasons.append("radius_out_of_bounds")
     if pin_confidence not in PIN_CONFIDENCE_READY_VALUES:
         reasons.append("low_or_missing_confidence")

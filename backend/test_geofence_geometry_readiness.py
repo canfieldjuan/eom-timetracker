@@ -694,27 +694,48 @@ def test_api_accepts_every_canonical_provenance(client, auth, make_location, pro
 
 
 @pytest.mark.parametrize("table", ["locations", "home_bases"])
-def test_db_rejects_unknown_pin_enum(client, table):
-    """The DB CHECK derives from the same canonical set the API validates."""
+def test_enum_validation_is_app_only_no_db_drift(client, table):
+    """Enum validation is single-sourced in request validation; the DB carries no
+    enum CHECK to drift from it (Codex #220). The API rejects an unknown enum
+    (test_patch_validates_geofence_inputs); a direct DB write of a novel value is
+    DB-legal, so adding a canonical value never needs a DB migration."""
     conn = psycopg2.connect(TEST_DB_URL, sslmode="disable")
     conn.autocommit = True
     try:
         with conn.cursor() as cur:
-            with pytest.raises(psycopg2.errors.CheckViolation):
-                if table == "locations":
-                    cur.execute(
-                        "INSERT INTO locations (address, rate_type, active, pin_provenance) "
-                        "VALUES (%s, 'per_visit', true, 'teleport')",
-                        (f"{uuid.uuid4()} Enum Rd",),
-                    )
-                else:
-                    cur.execute(
-                        "INSERT INTO home_bases (label, active, pin_confidence) "
-                        "VALUES (%s, false, 'perfect')",
-                        (f"HB {uuid.uuid4()}",),
-                    )
+            cur.execute(
+                "SELECT conname FROM pg_constraint WHERE conrelid = %s::regclass "
+                "AND conname IN (%s, %s)",
+                (table, f"{table}_pin_provenance_check", f"{table}_pin_confidence_check"),
+            )
+            assert cur.fetchall() == []  # no DB enum CHECK to drift
+            if table == "locations":
+                cur.execute(
+                    "INSERT INTO locations (address, rate_type, active, pin_provenance) "
+                    "VALUES (%s, 'per_visit', true, 'surveyed') RETURNING id",
+                    (f"{uuid.uuid4()} Enum Rd",),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO home_bases (label, active, pin_confidence) "
+                    "VALUES (%s, false, 'exquisite') RETURNING id",
+                    (f"HB {uuid.uuid4()}",),
+                )
+            row_id = cur.fetchone()[0]
+            cur.execute(f"DELETE FROM {table} WHERE id = %s", (row_id,))
     finally:
         conn.close()
+
+
+def test_radius_out_of_bounds_applies_only_to_per_site_override(monkeypatch):
+    """The provisional bounds gate a per-site override only, never the global
+    fallback -- so SITE_CHECK_IN_RADIUS_M=10 must not mark fallback Sites unready
+    (Codex #220)."""
+    monkeypatch.setattr(t, "SITE_CHECK_IN_RADIUS_M", 10)
+    fallback = t._location_geofence_state(_synthetic_location_row(geofence_radius_m=None))
+    assert "radius_out_of_bounds" not in fallback["unreadyReasons"]
+    override = t._location_geofence_state(_synthetic_location_row(geofence_radius_m=600))
+    assert "radius_out_of_bounds" in override["unreadyReasons"]
 
 
 def test_out_of_provisional_radius_is_db_legal_but_unready(client, auth, make_location):
