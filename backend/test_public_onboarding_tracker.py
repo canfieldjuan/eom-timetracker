@@ -522,6 +522,7 @@ def test_pending_public_handoff_recovers_only_through_configured_approver(
         )
 
     monkeypatch.setattr(api.requests, "post", atlas_post)
+    monkeypatch.setattr(api, "_require_atlas_funnel_route", lambda *_args: None)
     pending = client.post(_PUBLIC_COMPLETE_PATH, json={"token": raw_token})
     assert pending.status_code == 202, pending.text
     assert pending.json() == {"success": True, "status": "pending_recovery"}
@@ -570,6 +571,25 @@ def test_pending_public_handoff_recovers_only_through_configured_approver(
         (token_id,),
     ) == {"state": "finalized", "last_error": None}
 
+    calls_before_replay = len(calls)
+
+    def atlas_must_not_be_read(*_args, **_kwargs):
+        raise AssertionError("a finalized local replay must not require Atlas")
+
+    monkeypatch.setattr(
+        api, "_require_atlas_funnel_configuration", atlas_must_not_be_read
+    )
+    monkeypatch.setattr(api, "_require_atlas_funnel_route", atlas_must_not_be_read)
+    replayed = client.post(
+        f"{_ADMIN_RESERVATIONS_PATH}/{token_id}/recover", headers=auth
+    )
+
+    assert replayed.status_code == 200, replayed.text
+    assert replayed.json()["success"] is True
+    assert replayed.json()["idempotent"] is True
+    assert replayed.json()["reservation"]["status"] == "finalized"
+    assert len(calls) == calls_before_replay
+
 
 def test_admin_link_revocation_is_juan_gated_and_projects_a_bounded_receipt(
     client, auth, monkeypatch
@@ -596,6 +616,7 @@ def test_admin_link_revocation_is_juan_gated_and_projects_a_bounded_receipt(
         )
 
     monkeypatch.setattr(api.requests, "post", atlas_post)
+    monkeypatch.setattr(api, "_require_atlas_funnel_route", lambda *_args: None)
     monkeypatch.setattr(api, "EOM_FUNNEL_APPROVER_EMPLOYEE_ID", 999)
     denied = client.post(
         f"/api/admin/funnel/onboarding-drafts/{draft_id}/revoke-link", headers=auth
@@ -618,6 +639,48 @@ def test_admin_link_revocation_is_juan_gated_and_projects_a_bounded_receipt(
     assert calls[0]["headers"]["X-EOM-Actor-ID"] == "1"
     assert token_id not in response.text
     assert contact_id not in response.text
+
+
+@pytest.mark.parametrize(
+    ("path", "route"),
+    (
+        (
+            lambda draft_id, _token_id: f"/api/admin/funnel/onboarding-drafts/{draft_id}/revoke-link",
+            api._ATLAS_PUBLIC_ONBOARDING_LINK_REVOKE_ROUTE,
+        ),
+        (
+            lambda _draft_id, token_id: f"{_ADMIN_RESERVATIONS_PATH}/{token_id}/recover",
+            api._ATLAS_PUBLIC_ONBOARDING_HANDOFF_RECOVER_ROUTE,
+        ),
+    ),
+)
+def test_public_onboarding_follow_up_mutations_refuse_unproved_route_before_post(
+    client, auth, monkeypatch, path, route
+):
+    draft_id, token_id = (str(uuid.uuid4()) for _ in range(2))
+    calls: list[object] = []
+    monkeypatch.setattr(api, "EOM_FUNNEL_APPROVER_EMPLOYEE_ID", 1)
+
+    def unavailable(*_args, **_kwargs):
+        raise api.AtlasFunnelRouteUnavailable(route)
+
+    def unexpected(*_args, **_kwargs):
+        calls.append(True)
+        raise AssertionError("Atlas mutation must not run after capability refusal")
+
+    if route == api._ATLAS_PUBLIC_ONBOARDING_HANDOFF_RECOVER_ROUTE:
+        monkeypatch.setattr(
+            api,
+            "_public_onboarding_reservation",
+            lambda _token_id: {"state": "pending"},
+        )
+    monkeypatch.setattr(api, "_require_atlas_funnel_route", unavailable)
+    monkeypatch.setattr(api, "_atlas_funnel_request", unexpected)
+    response = client.post(path(draft_id, token_id), headers=auth)
+
+    assert response.status_code == 501, response.text
+    assert response.json()["capability"] == f"{route[0]} {route[1]}"
+    assert calls == []
 
 
 def test_admin_reservation_list_requires_authentication(client):
