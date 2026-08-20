@@ -744,6 +744,50 @@ def test_radius_bounds_resync_when_constant_changes(client):
         conn.close()
 
 
+def test_tightening_radius_bound_does_not_abort_migration(client):
+    """Tightening a bound below an existing override must not abort startup.
+
+    The rebuilt CHECK is NOT VALID, so re-running the migration never scans (and
+    never rejects) the grandfathered row; only new writes are held to the tighter
+    bound (Codex #220 thread 2).
+    """
+    conn = psycopg2.connect(TEST_DB_URL, sslmode="disable")
+    conn.autocommit = True
+    original_max = t.GEOFENCE_RADIUS_MAX_M
+    marker = f"{uuid.uuid4()} Tighten Rd"
+    row_id = None
+    try:
+        # An override valid under the current max (500).
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO locations (address, rate_type, active, geofence_radius_m) "
+                "VALUES (%s, 'per_visit', true, 400) RETURNING id",
+                (marker,),
+            )
+            row_id = cur.fetchone()[0]
+        # Tighten the max below that override and re-run the migration.
+        t.GEOFENCE_RADIUS_MAX_M = 300
+        t._ensure_geofence_pin_columns("locations")  # must NOT raise
+        with conn.cursor() as cur:
+            # Existing override is grandfathered (not scanned / not deleted).
+            cur.execute("SELECT geofence_radius_m FROM locations WHERE id = %s", (row_id,))
+            assert cur.fetchone()[0] == 400
+            # New writes are held to the tightened bound.
+            with pytest.raises(psycopg2.errors.CheckViolation):
+                cur.execute(
+                    "INSERT INTO locations (address, rate_type, active, geofence_radius_m) "
+                    "VALUES (%s, 'per_visit', true, 400)",
+                    (f"{uuid.uuid4()} Tighten2 Rd",),
+                )
+    finally:
+        t.GEOFENCE_RADIUS_MAX_M = original_max
+        t._ensure_geofence_pin_columns("locations")
+        if row_id is not None:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM locations WHERE id = %s", (row_id,))
+        conn.close()
+
+
 def test_home_base_attest_honors_update_token(client, auth, morning_crew):
     put = client.put(
         "/api/admin/home-base",

@@ -7496,22 +7496,27 @@ def _ensure_geofence_pin_columns(table: str) -> None:
     # every boot, so retuning a constant re-applies to an existing production DB
     # -- the DB and the request-validation regexes can never drift, and the pin
     # audit's "one-line radius retune" actually takes effect (Codex #220). These
-    # are trusted, code-defined values only, never user input. DROP+ADD runs in
-    # one statement (ACCESS EXCLUSIVE lock), so there is no window where the
-    # constraint is absent while another connection could write.
+    # are trusted, code-defined values only, never user input.
+    #
+    # Each ADD is `NOT VALID`: it enforces the constraint on all NEW writes but
+    # does NOT scan existing rows. So *tightening* a bound (or removing an enum
+    # value) while a grandfathered override sits outside the new range can never
+    # abort startup (Codex #220 thread 2) -- the legacy row is left as-is and only
+    # future writes are held to the new rule. NOT VALID also avoids a full-table
+    # validation scan on every boot.
     provenance_values = ", ".join("'" + v + "'" for v in PIN_PROVENANCE_VALUES)
     confidence_values = ", ".join("'" + v + "'" for v in PIN_CONFIDENCE_VALUES)
     db.execute(f"""
         ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pin_provenance_check;
         ALTER TABLE {table} ADD CONSTRAINT {table}_pin_provenance_check
-            CHECK (pin_provenance IS NULL OR pin_provenance IN ({provenance_values}));
+            CHECK (pin_provenance IS NULL OR pin_provenance IN ({provenance_values})) NOT VALID;
         ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pin_confidence_check;
         ALTER TABLE {table} ADD CONSTRAINT {table}_pin_confidence_check
-            CHECK (pin_confidence IS NULL OR pin_confidence IN ({confidence_values}));
+            CHECK (pin_confidence IS NULL OR pin_confidence IN ({confidence_values})) NOT VALID;
         ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_geofence_radius_m_check;
         ALTER TABLE {table} ADD CONSTRAINT {table}_geofence_radius_m_check
             CHECK (geofence_radius_m IS NULL
-                OR geofence_radius_m BETWEEN {GEOFENCE_RADIUS_MIN_M} AND {GEOFENCE_RADIUS_MAX_M});
+                OR geofence_radius_m BETWEEN {GEOFENCE_RADIUS_MIN_M} AND {GEOFENCE_RADIUS_MAX_M}) NOT VALID;
     """)
     # The fingerprint format is fixed (sha256 hex), not tied to a mutable set, so
     # a guarded add (never rebuilt) is sufficient.
