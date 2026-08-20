@@ -2713,6 +2713,49 @@ class AtlasFunnelOnboardingDraftSentReceipt(BaseModel):
         return value
 
 
+class AtlasPublicOnboardingIssuedLinkItem(BaseModel):
+    """Closed current-token projection safe for the office browser."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    draftId: UUID
+    contactId: UUID
+    fullName: str = Field(min_length=1, max_length=256)
+    recipientEmail: Optional[str] = Field(default=None, max_length=254)
+    status: Literal["issued"]
+    issuedAt: datetime
+
+    @field_validator("fullName", mode="before")
+    @classmethod
+    def require_nonblank_name(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be non-blank text")
+        return value
+
+    @field_validator("recipientEmail", mode="before")
+    @classmethod
+    def require_optional_recipient(cls, value: Any) -> Any:
+        if value is not None and not isinstance(value, str):
+            raise ValueError("must be text or null")
+        return value
+
+    @field_validator("issuedAt", mode="before")
+    @classmethod
+    def require_issued_at_string(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be an ISO date-time string")
+        return value
+
+
+class AtlasPublicOnboardingIssuedLinkPage(BaseModel):
+    """Bounded issued-token list returned by the Atlas office read."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    links: list[AtlasPublicOnboardingIssuedLinkItem]
+    limit: int = Field(ge=1, le=200)
+
+
 class FunnelContactCreateRequest(BaseModel):
     """One manual CRM contact request from the authenticated office portal.
 
@@ -4189,6 +4232,9 @@ _ATLAS_ONBOARDING_DRAFTS_PATH = "/eom-funnel/onboarding-drafts"
 _ATLAS_ONBOARDING_DRAFT_REVOKE_LINK_PATH = (
     "/eom-funnel/onboarding-drafts/{draft_id}/revoke-link"
 )
+_ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH = (
+    "/eom-funnel/public-onboarding/issued-links"
+)
 _ATLAS_PUBLIC_ONBOARDING_SESSION_PATH = "/eom-funnel/public-onboarding/session"
 _ATLAS_PUBLIC_ONBOARDING_TRACKER_CONTEXT_PATH = (
     "/eom-funnel/public-onboarding/tracker-context"
@@ -4308,10 +4354,16 @@ def _parse_atlas_public_onboarding_projection(
 # allow-list, not an open passthrough: a caller that could read any funnel path
 # would turn this EOM-scoped token into a broad read oracle. known-contacts
 # (ATLAS #2352) is id-only link verification, added for the write-boundary
-# audit. The pending onboarding projection is the only additional office queue
-# read admitted by this slice; all other funnel paths still fail closed.
+# audit. The pending-draft and issued-token projections are the only additional
+# office queue reads admitted by this slice; all other funnel paths still fail
+# closed.
 _ATLAS_FUNNEL_READ_PATHS = frozenset(
-    {"/eom-funnel/leads", _KNOWN_CONTACTS_PATH, _ATLAS_ONBOARDING_DRAFTS_PATH}
+    {
+        "/eom-funnel/leads",
+        _KNOWN_CONTACTS_PATH,
+        _ATLAS_ONBOARDING_DRAFTS_PATH,
+        _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH,
+    }
 )
 
 
@@ -4391,6 +4443,15 @@ ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
 # both tracker controls rather than treating a route name as proof of support.
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_LIST = "onboarding.draft.list"
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND = "onboarding.draft.approve_send"
+ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST = (
+    "onboarding.public_link.list"
+)
+ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_LINK_REVOKE = (
+    "onboarding.public_link.revoke"
+)
+ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_HANDOFF_RECOVER = (
+    "onboarding.public_handoff.recover"
+)
 ATLAS_FUNNEL_VISIBLE_LEAD_STAGES = frozenset({"new", "estimate_booked", "won"})
 
 # The Atlas operator-mutation boundary this service writes customers through.
@@ -4518,6 +4579,21 @@ def _parse_atlas_onboarding_draft_page(content: Dict[str, Any]) -> Dict[str, Any
         raise HTTPException(
             status_code=502,
             detail="EOM onboarding draft service returned an invalid response",
+        ) from exc
+    return page.model_dump(mode="json")
+
+
+def _parse_atlas_public_onboarding_issued_link_page(
+    content: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate and close the durable issued-token read before browser use."""
+
+    try:
+        page = AtlasPublicOnboardingIssuedLinkPage.model_validate(content)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Public onboarding service returned an invalid issued-link response",
         ) from exc
     return page.model_dump(mode="json")
 
@@ -17525,6 +17601,25 @@ def admin_list_funnel_review(
             and ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND
             in lead_page["capabilities"]
         ),
+        # These follow-up fields are deployment proofs for the Website. The
+        # local reservation list itself is Tracker-owned; its mutation still
+        # needs the Atlas recovery capability below.
+        "publicOnboardingIssuedLinkListAvailable": (
+            lead_page["capabilities"] is not None
+            and ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST
+            in lead_page["capabilities"]
+        ),
+        "publicOnboardingLinkRevokeAvailable": (
+            lead_page["capabilities"] is not None
+            and ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_LINK_REVOKE
+            in lead_page["capabilities"]
+        ),
+        "publicOnboardingReservationListAvailable": True,
+        "publicOnboardingRecoveryAvailable": (
+            lead_page["capabilities"] is not None
+            and ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_HANDOFF_RECOVER
+            in lead_page["capabilities"]
+        ),
     }
 
 
@@ -17633,6 +17728,54 @@ def admin_approve_funnel_onboarding_draft(
     )
 
 
+@app.get("/api/admin/funnel/public-onboarding/issued-links")
+def admin_list_public_onboarding_issued_links(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Relay only current issued-token evidence for all office admins.
+
+    A sent draft is delivery evidence, not proof that its customer link remains
+    usable. Atlas owns token state, and this closed relay strips every field
+    outside the office action contract before it reaches the Website.
+    """
+
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST, admin
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_PUBLIC_ONBOARDING_ISSUED_LINK_LIST_CAPABILITY_UNAVAILABLE",
+            False,
+            f"capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    page = _parse_atlas_public_onboarding_issued_link_page(
+        _atlas_funnel_read(
+            _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH,
+            admin,
+            params={"limit": limit},
+        )
+    )
+    if page["limit"] != limit:
+        raise HTTPException(
+            status_code=502,
+            detail="Public onboarding service returned an invalid issued-link response",
+        )
+    append_access_log(
+        request,
+        "EOM_PUBLIC_ONBOARDING_ISSUED_LINKS_LISTED",
+        True,
+        f"links={len(page['links'])}",
+    )
+    return {"success": True, **page}
+
+
 @app.get("/api/admin/funnel/public-onboarding/reservations")
 def admin_list_public_onboarding_reservations(
     request: Request,
@@ -17684,6 +17827,18 @@ def admin_revoke_public_onboarding_link(
     """Let the configured approver revoke an issued link without a raw bearer."""
     _require_juan_funnel_approver(admin, action="revoke public onboarding links")
     _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_LINK_REVOKE, admin
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_PUBLIC_ONBOARDING_LINK_REVOKE_CAPABILITY_UNAVAILABLE",
+            False,
+            f"capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
     draft_id_text = str(draft_id)
     try:
         atlas_result = _atlas_funnel_request(
@@ -17739,6 +17894,18 @@ def admin_recover_public_onboarding_reservation(
     """Finish a persisted local handoff through Atlas's actor-audited recovery."""
     _require_juan_funnel_approver(admin, action="recover public onboarding")
     _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_HANDOFF_RECOVER, admin
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_PUBLIC_ONBOARDING_RECOVERY_CAPABILITY_UNAVAILABLE",
+            False,
+            f"capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
     token_id_text = str(token_id)
     reservation = _public_onboarding_reservation(token_id_text)
     if reservation is None:
