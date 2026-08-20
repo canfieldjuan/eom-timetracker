@@ -276,6 +276,34 @@ SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES = (
     SITE_CHECK_IN_RECONCILIATION_GAP_DEFAULT_MINUTES
 )
 
+# --- Geofence C1 (#213): per-site geometry config, provenance, attestation ---
+# PROVISIONAL radius bounds for a per-site geofence override, adjustable from the
+# pin audit. These live ONLY in the app layer (request validation + derived
+# readiness), so retuning them is a genuine one-line change with no DB migration,
+# no startup risk, and no grandfathering problem. A NULL per-site
+# ``geofence_radius_m`` inherits the global ``SITE_CHECK_IN_RADIUS_M`` fallback.
+GEOFENCE_RADIUS_MIN_M = 15
+GEOFENCE_RADIUS_MAX_M = 500
+# PERMANENT structural sanity bounds enforced in PostgreSQL (defense-in-depth
+# against a garbage direct write). Deliberately wide and NEVER retuned, so the DB
+# constraint is added once and never rebuilt: the provisional business bounds
+# above can move freely inside this range without any DB change (Codex #220).
+GEOFENCE_RADIUS_SANITY_MIN_M = 1
+GEOFENCE_RADIUS_SANITY_MAX_M = 100_000
+PIN_CAPTURE_ACCURACY_MAX_M = 100_000
+PIN_PROVENANCE_VALUES = ("gps_capture", "map_placement", "geocoded", "imported", "unknown")
+PIN_CONFIDENCE_VALUES = ("high", "medium", "low")
+# Confidence levels that a *ready* pin is allowed to carry (derived readiness).
+PIN_CONFIDENCE_READY_VALUES = ("high", "medium")
+# Bump when the canonical fingerprint payload shape changes, so a stored
+# attestation from an older shape is treated as stale (not silently valid).
+GEOFENCE_GEOMETRY_FINGERPRINT_VERSION = "geofence_geometry_v1"
+# Single source of truth: derive the request-validation regexes AND the DB CHECK
+# DDL (see _ensure_geofence_pin_columns) from these tuples, so the API and
+# PostgreSQL can never accept/reject different enum members.
+_PIN_PROVENANCE_PATTERN = "^(" + "|".join(PIN_PROVENANCE_VALUES) + ")$"
+_PIN_CONFIDENCE_PATTERN = "^(" + "|".join(PIN_CONFIDENCE_VALUES) + ")$"
+
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     R = 6_371_000
@@ -2894,6 +2922,21 @@ class SiteUpdateRequest(BaseModel):
     servicePreferences: Optional[str] = Field(default=None, max_length=SITE_DETAIL_MAX_LENGTH)
     petNotes: Optional[str] = Field(default=None, max_length=SITE_PET_NOTES_MAX_LENGTH)
     serviceStartDate: Optional[date] = None
+    # Geofence C1 (#213): editable geometry config. Attestation fields
+    # (pin_attested_*) are NOT settable here -- they are computed and written
+    # only by the server-side attest endpoint. Send geofenceRadiusM: null to
+    # clear a per-site override back to the global fallback.
+    geofenceRadiusM: Optional[int] = Field(
+        default=None, ge=GEOFENCE_RADIUS_MIN_M, le=GEOFENCE_RADIUS_MAX_M
+    )
+    pinProvenance: Optional[str] = Field(
+        default=None,
+        pattern=_PIN_PROVENANCE_PATTERN,
+    )
+    pinCaptureAccuracyM: Optional[float] = Field(
+        default=None, ge=0, le=PIN_CAPTURE_ACCURACY_MAX_M, allow_inf_nan=False
+    )
+    pinConfidence: Optional[str] = Field(default=None, pattern=_PIN_CONFIDENCE_PATTERN)
 
     @field_validator("customerName", "address", mode="before")
     @classmethod
@@ -2916,6 +2959,25 @@ class SiteUpdateRequest(BaseModel):
     @classmethod
     def validate_service_start_date(cls, value: Any) -> Any:
         return _validate_iso_service_date(value)
+
+
+class GeofenceAttestRequest(BaseModel):
+    """Geofence C1 (#213): admin attests CURRENT geometry.
+
+    The server computes and stores the fingerprint, the attesting admin, and the
+    server timestamp -- a client can never submit an authoritative fingerprint or
+    attestation time. ``expectedUpdateToken`` is the usual optimistic-concurrency
+    guard on the entity row; ``expectedFingerprint``, when provided, must equal
+    the server-computed current fingerprint (else 409), so an admin cannot attest
+    geometry they did not actually see. Neither client value is ever persisted.
+    """
+
+    expectedUpdateToken: Optional[str] = Field(
+        default=None, min_length=64, max_length=64, pattern="^[0-9a-f]{64}$",
+    )
+    expectedFingerprint: Optional[str] = Field(
+        default=None, min_length=64, max_length=64, pattern="^[0-9a-f]{64}$",
+    )
 
 
 MAX_LOCATION_LEN            = parse_int(os.getenv("MAX_LOCATION_LEN"),            500)
@@ -3202,6 +3264,20 @@ class HomeBasePutRequest(BaseModel):
     address: str = Field(default="", max_length=500)
     latitude: Optional[float] = Field(default=None, ge=-90, le=90)
     longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    # Geofence C1 (#213): optional geometry config. Only fields actually present
+    # in the request are written, so a normal Home Base PUT never wipes previously
+    # set geofence config. Attestation is server-only (attest endpoint).
+    geofenceRadiusM: Optional[int] = Field(
+        default=None, ge=GEOFENCE_RADIUS_MIN_M, le=GEOFENCE_RADIUS_MAX_M
+    )
+    pinProvenance: Optional[str] = Field(
+        default=None,
+        pattern=_PIN_PROVENANCE_PATTERN,
+    )
+    pinCaptureAccuracyM: Optional[float] = Field(
+        default=None, ge=0, le=PIN_CAPTURE_ACCURACY_MAX_M, allow_inf_nan=False
+    )
+    pinConfidence: Optional[str] = Field(default=None, pattern=_PIN_CONFIDENCE_PATTERN)
 
     @field_validator("label", "address", mode="before")
     @classmethod
@@ -7377,6 +7453,11 @@ def _ensure_schema_migrations() -> None:
 
     ensure_calendar_schema()
     _ensure_home_base_schema()
+    # Geofence C1 (#213): additive per-site + Home Base geofence/pin columns.
+    # Idempotent (ADD COLUMN IF NOT EXISTS + guarded ADD CONSTRAINT), safe on a
+    # rolling deploy. Must run before the one-time backfills below.
+    _ensure_geofence_pin_columns("locations")
+    _ensure_geofence_pin_columns("home_bases")
 
     # One-time rate backfills run LAST, after every CREATE TABLE / ALTER above.
     # The allocation backfill queries payroll_hour_correction_allocations and
@@ -7393,6 +7474,63 @@ def _ensure_schema_migrations() -> None:
     # that predate the provenance column or were written by an old instance
     # during a rolling deploy, catching the latter on the next boot.
     _reconcile_unstamped_allocation_costs()
+
+
+def _ensure_geofence_pin_columns(table: str) -> None:
+    """Add the Geofence C1 (#213) per-site geometry + pin-attestation columns.
+
+    Additive and idempotent (``ADD COLUMN IF NOT EXISTS`` + guarded
+    ``ADD CONSTRAINT``), applied identically to ``locations`` and ``home_bases``.
+    The columns are currently DORMANT -- no evaluator reads them yet (that wiring
+    is #214) -- so this only records configuration and admin pin attestation.
+    Never touches the immutable per-event ``geofence_radius_m`` snapshot columns
+    on the evidence tables (site_check_ins / site_qr_action_receipts /
+    home_base_events).
+    """
+    if table not in ("locations", "home_bases"):
+        raise ValueError(f"unexpected geofence pin table: {table!r}")
+    db.execute(f"""
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS geofence_radius_m INTEGER;
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pin_provenance VARCHAR(32);
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pin_capture_accuracy_m NUMERIC(10, 2);
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pin_confidence VARCHAR(16);
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pin_attested_at TIMESTAMPTZ;
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pin_attested_by
+            INTEGER REFERENCES employees(id) ON DELETE SET NULL;
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pin_attestation_fingerprint VARCHAR(64);
+    """)
+    # Enum validation for pin_provenance / pin_confidence lives in ONE place: the
+    # request-validation regexes derived from PIN_*_VALUES. We deliberately do NOT
+    # mirror the enum sets in a DB CHECK -- a mutable set in a boot-guarded CHECK
+    # drifts from the API on an existing DB, and rebuilding it on boot reintroduces
+    # the tighten-against-live-data hazard (Codex #220). So there is a single
+    # source and nothing to drift. Drop any enum CHECK an earlier revision added.
+    # The DB keeps only PERMANENT/structural CHECKs: the wide radius sanity range
+    # (business bounds are enforced in request validation + derived readiness) and
+    # the fixed fingerprint format. Both are guarded add-once, never rebuilt.
+    db.execute(f"""
+        ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pin_provenance_check;
+        ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pin_confidence_check;
+    """)
+    db.execute(f"""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conrelid = '{table}'::regclass
+                  AND conname = '{table}_geofence_radius_m_check') THEN
+                ALTER TABLE {table} ADD CONSTRAINT {table}_geofence_radius_m_check
+                    CHECK (geofence_radius_m IS NULL
+                        OR geofence_radius_m BETWEEN {GEOFENCE_RADIUS_SANITY_MIN_M} AND {GEOFENCE_RADIUS_SANITY_MAX_M});
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conrelid = '{table}'::regclass
+                  AND conname = '{table}_pin_attestation_fingerprint_check') THEN
+                ALTER TABLE {table} ADD CONSTRAINT {table}_pin_attestation_fingerprint_check
+                    CHECK (pin_attestation_fingerprint IS NULL
+                        OR pin_attestation_fingerprint ~ '^[0-9a-f]{{64}}$');
+            END IF;
+        END $$;
+    """)
 
 
 def _auto_migrate_if_empty() -> bool:
@@ -7611,6 +7749,9 @@ def _active_home_base_config(*, cur: Optional[Any] = None) -> Optional[Dict[str,
     query = """
         SELECT hb.id AS home_base_id, hb.label, hb.address, hb.latitude, hb.longitude,
                hb.active, hb.check_in_token_nonce, hb.check_in_token_rotated_at,
+               hb.geofence_radius_m, hb.pin_provenance, hb.pin_capture_accuracy_m,
+               hb.pin_confidence, hb.pin_attested_at, hb.pin_attested_by,
+               hb.pin_attestation_fingerprint, hb.updated_at,
                policy.id AS policy_id, policy.crew_id, policy.active AS policy_active,
                crew.name AS crew_name
         FROM home_bases hb
@@ -10491,6 +10632,14 @@ def _serialize_home_base_config(
                     if config.get("check_in_token_rotated_at")
                     else None
                 ),
+                # Optimistic-concurrency token (mirrors Sites) so a client can
+                # attest against the geometry it actually read (Codex #220).
+                "updateToken": _entity_update_token(
+                    "home_base",
+                    {"id": config["home_base_id"], "updated_at": config["updated_at"]},
+                ),
+                # Geofence C1 (#213): Home Base geometry config + DERIVED readiness.
+                "geofence": _home_base_geofence_state(config),
             }
             if config
             else None
@@ -10552,11 +10701,26 @@ def admin_put_home_base(
                 "SELECT id FROM home_bases WHERE active = true FOR UPDATE"
             )
             existing = _row_from_cursor(cur)
+            # Geofence C1 (#213): write only the geofence fields actually present
+            # in the request so a normal Home Base PUT preserves prior config.
+            hb_geofence_map = {
+                "geofenceRadiusM": "geofence_radius_m",
+                "pinProvenance": "pin_provenance",
+                "pinCaptureAccuracyM": "pin_capture_accuracy_m",
+                "pinConfidence": "pin_confidence",
+            }
+            geofence_set: List[str] = []
+            geofence_params: List[Any] = []
+            for field, column in hb_geofence_map.items():
+                if field in payload.model_fields_set:
+                    geofence_set.append(f"{column} = %s")
+                    geofence_params.append(getattr(payload, field))
             if existing:
+                extra = (", " + ", ".join(geofence_set)) if geofence_set else ""
                 cur.execute(
-                    """
+                    f"""
                     UPDATE home_bases
-                    SET label = %s, address = %s, latitude = %s, longitude = %s,
+                    SET label = %s, address = %s, latitude = %s, longitude = %s{extra},
                         updated_at = NOW()
                     WHERE id = %s
                     RETURNING id
@@ -10566,6 +10730,7 @@ def admin_put_home_base(
                         payload.address,
                         payload.latitude,
                         payload.longitude,
+                        *geofence_params,
                         int(existing["id"]),
                     ),
                 )
@@ -10574,8 +10739,10 @@ def admin_put_home_base(
                 cur.execute(
                     """
                     INSERT INTO home_bases (
-                        label, address, latitude, longitude, created_by
-                    ) VALUES (%s, %s, %s, %s, %s)
+                        label, address, latitude, longitude, created_by,
+                        geofence_radius_m, pin_provenance,
+                        pin_capture_accuracy_m, pin_confidence
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -10584,6 +10751,10 @@ def admin_put_home_base(
                         payload.latitude,
                         payload.longitude,
                         int(admin["id"]),
+                        payload.geofenceRadiusM,
+                        payload.pinProvenance,
+                        payload.pinCaptureAccuracyM,
+                        payload.pinConfidence,
                     ),
                 )
                 home_base_id = int(_row_from_cursor(cur)["id"])
@@ -15144,7 +15315,11 @@ SITE_SELECT_COLUMNS = """
     l.access_instructions, l.service_preferences, l.pet_notes,
     l.service_start_date, l.check_in_token_nonce, l.active, l.created_at,
     l.updated_at, l.archived_at, l.archived_by,
-    c.name AS canonical_customer_name, c.customer_type AS customer_type
+    l.geofence_radius_m, l.pin_provenance, l.pin_capture_accuracy_m,
+    l.pin_confidence, l.pin_attested_at, l.pin_attested_by,
+    l.pin_attestation_fingerprint,
+    c.name AS canonical_customer_name, c.customer_type AS customer_type,
+    c.active AS customer_active, c.archived_at AS customer_archived_at
 """
 
 
@@ -15187,6 +15362,280 @@ def _require_current_update_token(
         f"stale_{entity}_update",
         f"{entity_label} changed after it was read; reload before retrying",
         {f"{entity}Id": int(row["id"])},
+    )
+
+
+# --- Geofence C1 (#213): canonical geometry fingerprint + derived readiness ---
+def _canonical_coordinate(value: Any) -> Optional[str]:
+    """Canonicalize a latitude/longitude to a stable 7-decimal string.
+
+    Coordinates are stored as ``NUMERIC(10,7)``. Formatting through ``Decimal``
+    with a fixed 7-place quantize (never float ``str()``) keeps the fingerprint
+    payload deterministic and free of locale / float-repr drift.
+    """
+    if value is None:
+        return None
+    quantized = Decimal(str(value)).quantize(Decimal("0.0000001"), rounding=ROUND_HALF_UP)
+    return format(quantized, "f")
+
+
+def _canonical_meters_2dp(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    quantized = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return format(quantized, "f")
+
+
+def _resolve_geofence_radius_m(configured_radius_m: Any) -> Tuple[int, str]:
+    """Resolve the effective radius: the per-entity value, else the global fallback.
+
+    Returns ``(resolved_radius_m, source)`` where source is ``'per_site'`` or
+    ``'global_fallback'``. The fallback is the same ``SITE_CHECK_IN_RADIUS_M`` the
+    evaluator uses today, so C1 config stays consistent with live behavior even
+    though nothing reads the per-site value yet (that wiring is #214).
+    """
+    if configured_radius_m is not None:
+        return int(configured_radius_m), "per_site"
+    return int(SITE_CHECK_IN_RADIUS_M), "global_fallback"
+
+
+def geofence_geometry_fingerprint_payload(
+    *,
+    entity_type: str,
+    entity_id: int,
+    latitude: Any,
+    longitude: Any,
+    resolved_radius_m: int,
+    radius_source: str,
+    max_accuracy_policy_m: int,
+    pin_provenance: Optional[str],
+    pin_confidence: Optional[str],
+    pin_capture_accuracy_m: Any,
+    active: bool,
+    archived: bool,
+    location_type: Optional[str],
+    parent_linked: bool,
+    parent_customer_active: Optional[bool],
+    parent_customer_archived: Optional[bool],
+) -> Dict[str, Any]:
+    """Build the canonical, versioned payload every readiness decision hashes.
+
+    Every field that changes whether a pin is 'ready' is included, so any change
+    to geometry, the resolved radius (including the global fallback value when it
+    is used), the max-accuracy policy, provenance/confidence, active/archive
+    state, location type, or parent-customer state invalidates a prior attestation
+    via fingerprint mismatch. Non-applicable fields (e.g. a Home Base has no
+    parent customer) are explicit ``None``, never omitted, so no two distinct
+    states can serialize to the same payload.
+    """
+    return {
+        "version": GEOFENCE_GEOMETRY_FINGERPRINT_VERSION,
+        "entityType": entity_type,
+        "entityId": int(entity_id),
+        "latitude": _canonical_coordinate(latitude),
+        "longitude": _canonical_coordinate(longitude),
+        "resolvedRadiusM": int(resolved_radius_m),
+        "radiusSource": radius_source,
+        "maxAccuracyPolicyM": int(max_accuracy_policy_m),
+        "pinProvenance": pin_provenance,
+        "pinConfidence": pin_confidence,
+        "pinCaptureAccuracyM": _canonical_meters_2dp(pin_capture_accuracy_m),
+        "active": bool(active),
+        "archived": bool(archived),
+        "locationType": location_type,
+        "parentLinked": bool(parent_linked),
+        "parentCustomerActive": parent_customer_active,
+        "parentCustomerArchived": parent_customer_archived,
+    }
+
+
+def geofence_geometry_fingerprint(**kwargs: Any) -> str:
+    """SHA-256 hex of the canonical geometry payload (sorted, compact JSON)."""
+    payload = geofence_geometry_fingerprint_payload(**kwargs)
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _geofence_state(
+    *,
+    entity_type: str,
+    entity_id: int,
+    latitude: Any,
+    longitude: Any,
+    configured_radius_m: Any,
+    pin_provenance: Optional[str],
+    pin_confidence: Optional[str],
+    pin_capture_accuracy_m: Any,
+    active: bool,
+    archived: bool,
+    location_type: Optional[str],
+    parent_linked: bool,
+    parent_customer_active: Optional[bool],
+    parent_customer_archived: Optional[bool],
+    pin_attested_at: Any,
+    pin_attested_by: Any,
+    stored_fingerprint: Optional[str],
+) -> Dict[str, Any]:
+    """Additive ``geofence`` response block: config echo, current fingerprint,
+    attestation state, DERIVED readiness, and human-readable unready reasons.
+
+    Readiness is never persisted -- it is recomputed here from current state and
+    compared against the stored attestation fingerprint, so any change to a
+    fingerprint input makes a previously-attested pin unready automatically.
+    """
+    resolved_radius_m, radius_source = _resolve_geofence_radius_m(configured_radius_m)
+    max_accuracy_policy_m = int(SITE_CHECK_IN_MAX_ACCURACY_M)
+    current_fingerprint = geofence_geometry_fingerprint(
+        entity_type=entity_type,
+        entity_id=entity_id,
+        latitude=latitude,
+        longitude=longitude,
+        resolved_radius_m=resolved_radius_m,
+        radius_source=radius_source,
+        max_accuracy_policy_m=max_accuracy_policy_m,
+        pin_provenance=pin_provenance,
+        pin_confidence=pin_confidence,
+        pin_capture_accuracy_m=pin_capture_accuracy_m,
+        active=active,
+        archived=archived,
+        location_type=location_type,
+        parent_linked=parent_linked,
+        parent_customer_active=parent_customer_active,
+        parent_customer_archived=parent_customer_archived,
+    )
+    fingerprint_match = bool(
+        stored_fingerprint is not None
+        and hmac.compare_digest(stored_fingerprint, current_fingerprint)
+    )
+    reasons: List[str] = []
+    if latitude is None or longitude is None:
+        reasons.append("unpinned")
+    # The provisional business bounds apply ONLY to a per-site override, never the
+    # independently-configured global fallback (SITE_CHECK_IN_RADIUS_M) -- otherwise
+    # a valid deployment like SITE_CHECK_IN_RADIUS_M=10 would mark every fallback
+    # Site unready (Codex #220). Derived, so tightening the bounds immediately
+    # flags a grandfathered override without touching the DB.
+    if configured_radius_m is not None and not (
+        GEOFENCE_RADIUS_MIN_M <= int(configured_radius_m) <= GEOFENCE_RADIUS_MAX_M
+    ):
+        reasons.append("radius_out_of_bounds")
+    if pin_confidence not in PIN_CONFIDENCE_READY_VALUES:
+        reasons.append("low_or_missing_confidence")
+    if not active:
+        reasons.append("inactive")
+    if archived:
+        reasons.append("archived")
+    if parent_linked and parent_customer_active is False:
+        reasons.append("parent_customer_inactive")
+    if parent_linked and parent_customer_archived is True:
+        reasons.append("parent_customer_archived")
+    if stored_fingerprint is None:
+        reasons.append("not_attested")
+    elif not fingerprint_match:
+        reasons.append("attestation_stale")
+    return {
+        "geofenceRadiusM": (
+            int(configured_radius_m) if configured_radius_m is not None else None
+        ),
+        "resolvedRadiusM": resolved_radius_m,
+        "radiusSource": radius_source,
+        "maxAccuracyPolicyM": max_accuracy_policy_m,
+        "pinProvenance": pin_provenance,
+        "pinConfidence": pin_confidence,
+        "pinCaptureAccuracyM": (
+            float(pin_capture_accuracy_m)
+            if pin_capture_accuracy_m is not None
+            else None
+        ),
+        "pinAttestedAt": to_utc_iso(pin_attested_at) if pin_attested_at else None,
+        "pinAttestedByEmployeeId": (
+            int(pin_attested_by) if pin_attested_by is not None else None
+        ),
+        "attestationFingerprint": stored_fingerprint,
+        "currentFingerprint": current_fingerprint,
+        "fingerprintMatch": fingerprint_match,
+        "ready": not reasons,
+        "unreadyReasons": reasons,
+        # An active, un-parented legacy Site stays business-eligible but is
+        # flagged so the pin audit can link/verify it. Home Base is never legacy.
+        "unlinkedLegacy": bool(entity_type == "location" and not parent_linked),
+    }
+
+
+def _location_business_eligible(row: Dict[str, Any]) -> bool:
+    """Geofence C1 (#213) report classifier: is this Site business-ELIGIBLE?
+
+    Eligibility (the #215 rule) is separate from enforcement readiness. An active,
+    approved EOM customer Site is Residential/Commercial, active, not archived,
+    and -- when linked -- under an active, non-archived Customer. Unlinked legacy
+    Sites stay eligible (flagged separately). Inactive, archived, non-EOM, or
+    type-less Sites, and Sites under an inactive/archived Customer, are NOT
+    eligible. Read-side classifier for the readiness report only; it does not
+    resolve a clock-in target (that is #215).
+    """
+    if not bool(row.get("active")):
+        return False
+    if row.get("archived_at") is not None:
+        return False
+    if row.get("location_type") not in ("Residential", "Commercial"):
+        return False
+    if row.get("customer_id") is not None:
+        if not bool(row.get("customer_active")):
+            return False
+        if row.get("customer_archived_at") is not None:
+            return False
+    return True
+
+
+def _location_geofence_state(row: Dict[str, Any]) -> Dict[str, Any]:
+    parent_linked = row.get("customer_id") is not None
+    return _geofence_state(
+        entity_type="location",
+        entity_id=int(row["id"]),
+        latitude=row.get("lat"),
+        longitude=row.get("lng"),
+        configured_radius_m=row.get("geofence_radius_m"),
+        pin_provenance=row.get("pin_provenance"),
+        pin_confidence=row.get("pin_confidence"),
+        pin_capture_accuracy_m=row.get("pin_capture_accuracy_m"),
+        active=bool(row.get("active")),
+        archived=row.get("archived_at") is not None,
+        location_type=row.get("location_type"),
+        parent_linked=parent_linked,
+        parent_customer_active=(
+            bool(row.get("customer_active")) if parent_linked else None
+        ),
+        parent_customer_archived=(
+            (row.get("customer_archived_at") is not None) if parent_linked else None
+        ),
+        pin_attested_at=row.get("pin_attested_at"),
+        pin_attested_by=row.get("pin_attested_by"),
+        stored_fingerprint=row.get("pin_attestation_fingerprint"),
+    )
+
+
+def _home_base_geofence_state(config: Dict[str, Any]) -> Dict[str, Any]:
+    return _geofence_state(
+        entity_type="home_base",
+        entity_id=int(config["home_base_id"]),
+        latitude=config.get("latitude"),
+        longitude=config.get("longitude"),
+        configured_radius_m=config.get("geofence_radius_m"),
+        pin_provenance=config.get("pin_provenance"),
+        pin_confidence=config.get("pin_confidence"),
+        pin_capture_accuracy_m=config.get("pin_capture_accuracy_m"),
+        active=bool(config.get("active", True)),
+        # Home Base has no archive concept (single active office); represent the
+        # non-applicable location/customer fields as explicit not-applicable.
+        archived=False,
+        location_type=None,
+        parent_linked=False,
+        parent_customer_active=None,
+        parent_customer_archived=None,
+        pin_attested_at=config.get("pin_attested_at"),
+        pin_attested_by=config.get("pin_attested_by"),
+        stored_fingerprint=config.get("pin_attestation_fingerprint"),
     )
 
 
@@ -15294,6 +15743,9 @@ def _serialize_site(row: Dict[str, Any]) -> Dict[str, Any]:
         "status": _site_status(row),
         "checklist": {"required": required, "optional": optional},
         "migrationReview": migration_review,
+        # Geofence C1 (#213): additive per-site geometry config + DERIVED
+        # readiness. Purely informational here -- does not gate any action (#218).
+        "geofence": _location_geofence_state(row),
         "createdAt": to_utc_iso(row["created_at"]),
         "updatedAt": to_utc_iso(row["updated_at"]),
         "updateToken": _entity_update_token("site", row),
@@ -19054,6 +19506,221 @@ def admin_create_customer_site(
     return {"success": True, "location": location}
 
 
+@app.post("/api/admin/locations/{site_id}/attest-geofence")
+def admin_attest_location_geofence(
+    site_id: int,
+    payload: GeofenceAttestRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Geofence C1 (#213): admin attests the CURRENT Site geometry.
+
+    The server recomputes the geometry fingerprint from authoritative row state
+    and stores it together with the attesting admin and a server timestamp. A
+    client-supplied fingerprint/time is never trusted; ``expectedFingerprint`` is
+    only a staleness guard. Attesting does not change geometry, so it never gates
+    any clock action (enforcement is #218).
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            existing = _site_row(cur, site_id, for_update=True)
+            if not existing:
+                raise HTTPException(status_code=404, detail="Location not found")
+            _require_current_update_token("site", existing, payload.expectedUpdateToken)
+            current_fingerprint = _location_geofence_state(existing)["currentFingerprint"]
+            if payload.expectedFingerprint is not None and not hmac.compare_digest(
+                payload.expectedFingerprint, current_fingerprint
+            ):
+                _raise_conflict(
+                    "stale_geofence_attestation",
+                    "Site geometry changed after it was read; reload before attesting",
+                    {"siteId": site_id},
+                )
+            cur.execute(
+                """
+                UPDATE locations
+                SET pin_attested_at = NOW(),
+                    pin_attested_by = %s,
+                    pin_attestation_fingerprint = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (int(admin["id"]), current_fingerprint, site_id),
+            )
+            location = _canonical_site(cur, site_id)
+    append_access_log(
+        request,
+        "LOCATION_GEOFENCE_ATTESTED",
+        True,
+        f"Location {site_id} geofence attested by {admin['name']}",
+    )
+    return {"success": True, "location": location}
+
+
+@app.post("/api/admin/home-base/attest-geofence")
+def admin_attest_home_base_geofence(
+    payload: GeofenceAttestRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Geofence C1 (#213): admin attests the CURRENT Home Base geometry."""
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (HOME_BASE_CONFIG_LOCK_KEY,),
+            )
+            config = _active_home_base_config(cur=cur)
+            if not config:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Configure Home Base before attesting its geofence",
+                )
+            # Honor the optimistic-concurrency guard here too, mirroring the Site
+            # attest path, so a stale request can't attest geometry the admin did
+            # not see (Codex #220).
+            if payload.expectedUpdateToken is not None:
+                current_token = _entity_update_token(
+                    "home_base",
+                    {"id": config["home_base_id"], "updated_at": config["updated_at"]},
+                )
+                if not hmac.compare_digest(payload.expectedUpdateToken, current_token):
+                    _raise_conflict(
+                        "stale_home_base_update",
+                        "Home Base changed after it was read; reload before retrying",
+                        {"homeBaseId": int(config["home_base_id"])},
+                    )
+            current_fingerprint = _home_base_geofence_state(config)["currentFingerprint"]
+            if payload.expectedFingerprint is not None and not hmac.compare_digest(
+                payload.expectedFingerprint, current_fingerprint
+            ):
+                _raise_conflict(
+                    "stale_geofence_attestation",
+                    "Home Base geometry changed after it was read; reload before attesting",
+                    {"homeBaseId": int(config["home_base_id"])},
+                )
+            cur.execute(
+                """
+                UPDATE home_bases
+                SET pin_attested_at = NOW(),
+                    pin_attested_by = %s,
+                    pin_attestation_fingerprint = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (int(admin["id"]), current_fingerprint, int(config["home_base_id"])),
+            )
+    append_access_log(
+        request,
+        "HOME_BASE_GEOFENCE_ATTESTED",
+        True,
+        f"Home Base geofence attested by {admin['name']}",
+    )
+    return {
+        "success": True,
+        **_serialize_home_base_config(
+            _active_home_base_config(),
+            _morning_crew_config(),
+        ),
+    }
+
+
+@app.get("/api/admin/geofence-readiness")
+def admin_geofence_readiness(
+    request: Request,
+    includeArchived: bool = Query(default=False),
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Geofence C1 (#213): derived geofence readiness across all Sites + Home Base.
+
+    Read-only report. Business eligibility (any active approved EOM Site) is
+    separate from enforcement readiness: an active, unpinned/unattested Site is
+    eligible-but-unready, and unlinked legacy Sites are surfaced for verification.
+    """
+    # Default view excludes archived Sites. active=true alone can leak an
+    # active-but-archived row, so filter on archived_at too.
+    active_clause = (
+        "" if includeArchived else " WHERE l.active = true AND l.archived_at IS NULL"
+    )
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT {SITE_SELECT_COLUMNS}
+                FROM locations l
+                LEFT JOIN customers c ON c.id = l.customer_id
+                {active_clause}
+                ORDER BY l.id
+                """
+            )
+            location_rows = [dict(row) for row in cur.fetchall()]
+            home_base_config = _active_home_base_config(cur=cur)
+
+    locations: List[Dict[str, Any]] = []
+    for row in location_rows:
+        locations.append(
+            {
+                "id": int(row["id"]),
+                "entityType": "location",
+                "address": str(row.get("address") or ""),
+                "customerId": (
+                    int(row["customer_id"]) if row.get("customer_id") is not None else None
+                ),
+                "customerName": str(
+                    row.get("canonical_customer_name") or row.get("customer_name") or ""
+                ),
+                "locationType": row.get("location_type"),
+                "active": bool(row.get("active")),
+                "archived": row.get("archived_at") is not None,
+                "eligible": _location_business_eligible(row),
+                "pinned": row.get("lat") is not None and row.get("lng") is not None,
+                "geofence": _location_geofence_state(row),
+            }
+        )
+    home_bases: List[Dict[str, Any]] = []
+    if home_base_config:
+        home_bases.append(
+            {
+                "id": int(home_base_config["home_base_id"]),
+                "entityType": "home_base",
+                "label": str(home_base_config.get("label") or ""),
+                "active": bool(home_base_config.get("active", True)),
+                "pinned": (
+                    home_base_config.get("latitude") is not None
+                    and home_base_config.get("longitude") is not None
+                ),
+                "geofence": _home_base_geofence_state(home_base_config),
+            }
+        )
+    ready_locations = sum(1 for x in locations if x["geofence"]["ready"])
+    # Eligible-but-unready = business-ELIGIBLE (type + parent-customer, not just
+    # active/archived) yet not enforcement-ready. Excludes unauthorized Sites.
+    eligible_unready = sum(
+        1 for x in locations if x["eligible"] and not x["geofence"]["ready"]
+    )
+    unlinked_legacy = sum(1 for x in locations if x["geofence"]["unlinkedLegacy"])
+    summary = {
+        "totalLocations": len(locations),
+        "readyLocations": ready_locations,
+        "eligibleUnreadyLocations": eligible_unready,
+        "unlinkedLegacyLocations": unlinked_legacy,
+        "homeBaseConfigured": bool(home_bases),
+        "homeBaseReady": bool(home_bases and home_bases[0]["geofence"]["ready"]),
+        "globalFallbackRadiusM": int(SITE_CHECK_IN_RADIUS_M),
+        "maxAccuracyPolicyM": int(SITE_CHECK_IN_MAX_ACCURACY_M),
+    }
+    append_access_log(
+        request, "GEOFENCE_READINESS_LISTED", True, f"{len(locations)} sites"
+    )
+    return {
+        "success": True,
+        "summary": summary,
+        "locations": locations,
+        "homeBases": home_bases,
+    }
+
+
 @app.get("/api/admin/locations")
 def admin_list_locations(
     request: Request,
@@ -19438,6 +20105,11 @@ def admin_patch_location(
         "servicePreferences": "service_preferences",
         "petNotes": "pet_notes",
         "serviceStartDate": "service_start_date",
+        # Geofence C1 (#213): editable geometry config (dormant until #214).
+        "geofenceRadiusM": "geofence_radius_m",
+        "pinProvenance": "pin_provenance",
+        "pinCaptureAccuracyM": "pin_capture_accuracy_m",
+        "pinConfidence": "pin_confidence",
     }
 
     with db.get_conn() as conn:
