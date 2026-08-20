@@ -79,7 +79,9 @@ CREATE TABLE locations (
     -- these are additive, currently DORMANT (evaluate_site_check_in_geofence does
     -- not read them yet -- wiring is #214). Readiness is DERIVED from a matching
     -- attestation fingerprint, never a stored boolean.
-    geofence_radius_m           INTEGER,
+    geofence_radius_m           INTEGER
+                                CHECK (geofence_radius_m IS NULL
+                                    OR geofence_radius_m BETWEEN 15 AND 500),
     pin_provenance              VARCHAR(32)
                                 CHECK (pin_provenance IS NULL OR pin_provenance IN
                                     ('gps_capture', 'map_placement', 'geocoded', 'imported', 'unknown')),
@@ -725,7 +727,9 @@ CREATE TABLE home_bases (
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- Geofence C1 (#213): mirror the per-site geofence config + pin attestation on
     -- the Home Base. geofence_radius_m NULL => global SITE_CHECK_IN_RADIUS_M fallback.
-    geofence_radius_m           INTEGER,
+    geofence_radius_m           INTEGER
+                                CHECK (geofence_radius_m IS NULL
+                                    OR geofence_radius_m BETWEEN 15 AND 500),
     pin_provenance              VARCHAR(32)
                                 CHECK (pin_provenance IS NULL OR pin_provenance IN
                                     ('gps_capture', 'map_placement', 'geocoded', 'imported', 'unknown')),

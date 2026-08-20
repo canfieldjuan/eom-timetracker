@@ -7528,6 +7528,22 @@ def _ensure_geofence_pin_columns(table: str) -> None:
                         OR pin_attestation_fingerprint ~ '^[0-9a-f]{{64}}$'
                     );
             END IF;
+
+            -- Provisional radius bounds (match GEOFENCE_RADIUS_MIN_M/MAX_M);
+            -- retune deliberately from the pin audit. Enforced in the DB so a
+            -- direct write cannot store an out-of-range radius.
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = '{table}'::regclass
+                  AND conname = '{table}_geofence_radius_m_check'
+            ) THEN
+                ALTER TABLE {table}
+                    ADD CONSTRAINT {table}_geofence_radius_m_check
+                    CHECK (
+                        geofence_radius_m IS NULL
+                        OR geofence_radius_m BETWEEN 15 AND 500
+                    );
+            END IF;
         END $$;
     """)
 
@@ -15547,6 +15563,31 @@ def _geofence_state(
     }
 
 
+def _location_business_eligible(row: Dict[str, Any]) -> bool:
+    """Geofence C1 (#213) report classifier: is this Site business-ELIGIBLE?
+
+    Eligibility (the #215 rule) is separate from enforcement readiness. An active,
+    approved EOM customer Site is Residential/Commercial, active, not archived,
+    and -- when linked -- under an active, non-archived Customer. Unlinked legacy
+    Sites stay eligible (flagged separately). Inactive, archived, non-EOM, or
+    type-less Sites, and Sites under an inactive/archived Customer, are NOT
+    eligible. Read-side classifier for the readiness report only; it does not
+    resolve a clock-in target (that is #215).
+    """
+    if not bool(row.get("active")):
+        return False
+    if row.get("archived_at") is not None:
+        return False
+    if row.get("location_type") not in ("Residential", "Commercial"):
+        return False
+    if row.get("customer_id") is not None:
+        if not bool(row.get("customer_active")):
+            return False
+        if row.get("customer_archived_at") is not None:
+            return False
+    return True
+
+
 def _location_geofence_state(row: Dict[str, Any]) -> Dict[str, Any]:
     parent_linked = row.get("customer_id") is not None
     return _geofence_state(
@@ -19583,7 +19624,11 @@ def admin_geofence_readiness(
     separate from enforcement readiness: an active, unpinned/unattested Site is
     eligible-but-unready, and unlinked legacy Sites are surfaced for verification.
     """
-    active_clause = "" if includeArchived else " WHERE l.active = true"
+    # Default view excludes archived Sites. active=true alone can leak an
+    # active-but-archived row, so filter on archived_at too.
+    active_clause = (
+        "" if includeArchived else " WHERE l.active = true AND l.archived_at IS NULL"
+    )
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -19614,6 +19659,7 @@ def admin_geofence_readiness(
                 "locationType": row.get("location_type"),
                 "active": bool(row.get("active")),
                 "archived": row.get("archived_at") is not None,
+                "eligible": _location_business_eligible(row),
                 "pinned": row.get("lat") is not None and row.get("lng") is not None,
                 "geofence": _location_geofence_state(row),
             }
@@ -19634,10 +19680,10 @@ def admin_geofence_readiness(
             }
         )
     ready_locations = sum(1 for x in locations if x["geofence"]["ready"])
+    # Eligible-but-unready = business-ELIGIBLE (type + parent-customer, not just
+    # active/archived) yet not enforcement-ready. Excludes unauthorized Sites.
     eligible_unready = sum(
-        1
-        for x in locations
-        if x["active"] and not x["archived"] and not x["geofence"]["ready"]
+        1 for x in locations if x["eligible"] and not x["geofence"]["ready"]
     )
     unlinked_legacy = sum(1 for x in locations if x["geofence"]["unlinkedLegacy"])
     summary = {

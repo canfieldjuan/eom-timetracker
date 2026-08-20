@@ -407,18 +407,15 @@ def make_location():
         capture=None,
         radius=None,
         active=True,
+        location_type="Commercial",
+        location_archived=False,
     ):
         with conn.cursor() as cur:
             customer_id = None
             if linked:
                 cur.execute(
-                    "INSERT INTO customers (name, active, archived_at) "
-                    "VALUES (%s, %s, %s) RETURNING id",
-                    (
-                        f"GC {uuid.uuid4()}",
-                        customer_active,
-                        "NOW()" if False else None,
-                    ),
+                    "INSERT INTO customers (name, active) VALUES (%s, %s) RETURNING id",
+                    (f"GC {uuid.uuid4()}", customer_active),
                 )
                 customer_id = cur.fetchone()[0]
                 if customer_archived:
@@ -434,7 +431,7 @@ def make_location():
                     rate, rate_type, lat, lng, active,
                     geofence_radius_m, pin_provenance, pin_confidence,
                     pin_capture_accuracy_m
-                ) VALUES (%s, %s, %s, 'Commercial', 100.00, 'per_visit',
+                ) VALUES (%s, %s, %s, %s, 100.00, 'per_visit',
                           %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
@@ -442,6 +439,7 @@ def make_location():
                     customer_id,
                     f"{uuid.uuid4()} Test Rd, Effingham",
                     "GeoCust",
+                    location_type,
                     lat,
                     lng,
                     active,
@@ -452,6 +450,12 @@ def make_location():
                 ),
             )
             site_id = cur.fetchone()[0]
+            if location_archived:
+                # Simulate an active-but-archived row (the leak scenario).
+                cur.execute(
+                    "UPDATE locations SET archived_at = NOW() WHERE id = %s",
+                    (site_id,),
+                )
         conn.commit()
         created_sites.append(site_id)
         return site_id
@@ -599,6 +603,74 @@ def test_parent_customer_inactive_makes_site_unready(client, auth, make_location
     geo = _site_geofence(client, auth, site_id)
     assert geo["ready"] is False
     assert "parent_customer_archived" in geo["unreadyReasons"]
+
+
+def test_readiness_report_excludes_active_but_archived_by_default(
+    client, auth, make_location
+):
+    leaked = make_location(active=True, location_archived=True)
+    default = client.get("/api/admin/geofence-readiness", headers=auth)
+    assert default.status_code == 200, default.text
+    assert leaked not in {x["id"] for x in default.json()["locations"]}
+    # It still shows when archived rows are explicitly requested.
+    incl = client.get(
+        "/api/admin/geofence-readiness?includeArchived=true", headers=auth
+    )
+    assert leaked in {x["id"] for x in incl.json()["locations"]}
+
+
+def test_eligible_unready_excludes_unauthorized_locations(client, auth, make_location):
+    # Business-eligible but unready (pinned, unattested) -> counts.
+    eligible = make_location()
+    # NOT eligible: no location_type (unauthorized), though active+pinned.
+    typeless = make_location(location_type=None)
+    # NOT eligible: active Site under an archived Customer.
+    bad_parent = make_location(customer_archived=True)
+
+    body = client.get("/api/admin/geofence-readiness", headers=auth).json()
+    by_id = {x["id"]: x for x in body["locations"]}
+    assert by_id[eligible]["eligible"] is True
+    assert by_id[typeless]["eligible"] is False
+    assert by_id[bad_parent]["eligible"] is False
+    # None of the three is ready, but only the eligible one is eligible-unready.
+    assert by_id[eligible]["geofence"]["ready"] is False
+    # The unauthorized ones must not be counted as eligible-unready.
+    unauthorized_ids = {typeless, bad_parent}
+    eligible_unready_ids = {
+        x["id"] for x in body["locations"] if x["eligible"] and not x["geofence"]["ready"]
+    }
+    assert eligible_unready_ids.isdisjoint(unauthorized_ids)
+    assert eligible in eligible_unready_ids
+
+
+@pytest.mark.parametrize("table", ["locations", "home_bases"])
+@pytest.mark.parametrize("value,ok", [(15, True), (500, True), (14, False), (501, False), (None, True)])
+def test_db_enforces_radius_bounds(client, table, value, ok):
+    """A direct DB write cannot store an out-of-range radius (not just the API)."""
+    conn = psycopg2.connect(TEST_DB_URL, sslmode="disable")
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            if table == "locations":
+                cur.execute(
+                    "INSERT INTO locations (address, rate_type, active, geofence_radius_m) "
+                    "VALUES (%s, 'per_visit', true, %s) RETURNING id",
+                    (f"{uuid.uuid4()} Radius Rd", value),
+                )
+            else:
+                # active=false avoids the one-active-home-base unique index.
+                cur.execute(
+                    "INSERT INTO home_bases (label, active, geofence_radius_m) "
+                    "VALUES (%s, false, %s) RETURNING id",
+                    (f"HB {uuid.uuid4()}"[:150], value),
+                )
+            row_id = cur.fetchone()[0]
+            cur.execute(f"DELETE FROM {table} WHERE id = %s", (row_id,))
+        assert ok, f"{table} accepted out-of-range radius {value}"
+    except psycopg2.errors.CheckViolation:
+        assert not ok, f"{table} rejected valid radius {value}"
+    finally:
+        conn.close()
 
 
 def test_non_admin_cannot_edit_or_attest_geofence(client, emp_auth, make_location):
