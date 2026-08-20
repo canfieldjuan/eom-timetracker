@@ -644,9 +644,14 @@ def test_eligible_unready_excludes_unauthorized_locations(client, auth, make_loc
 
 
 @pytest.mark.parametrize("table", ["locations", "home_bases"])
-@pytest.mark.parametrize("value,ok", [(15, True), (500, True), (14, False), (501, False), (None, True)])
-def test_db_enforces_radius_bounds(client, table, value, ok):
-    """A direct DB write cannot store an out-of-range radius (not just the API)."""
+@pytest.mark.parametrize(
+    "value,ok",
+    [(1, True), (100000, True), (600, True), (0, False), (-5, False), (100001, False), (None, True)],
+)
+def test_db_enforces_radius_sanity_bounds(client, table, value, ok):
+    """The DB enforces only a PERMANENT sanity range (garbage guard). The
+    provisional business bounds (15-500) are enforced by request validation, so a
+    direct write of 600 is DB-legal (600 <= sanity max) but the API rejects it."""
     conn = psycopg2.connect(TEST_DB_URL, sslmode="disable")
     conn.autocommit = True
     try:
@@ -712,80 +717,46 @@ def test_db_rejects_unknown_pin_enum(client, table):
         conn.close()
 
 
-def test_radius_bounds_resync_when_constant_changes(client):
-    """Retuning GEOFENCE_RADIUS_MAX_M re-applies to the DB (Codex #220 thread 1)."""
-    conn = psycopg2.connect(TEST_DB_URL, sslmode="disable")
-    conn.autocommit = True
+def test_out_of_provisional_radius_is_db_legal_but_unready(client, auth, make_location):
+    """A per-site radius above the provisional max (but within DB sanity) is stored
+    by the DB, and derived readiness flags it (Codex #220 thread 3)."""
+    site_id = make_location(
+        radius=600, confidence="high", provenance="gps_capture", capture=4.5
+    )
+    geo = _site_geofence(client, auth, site_id)
+    assert geo["geofenceRadiusM"] == 600  # DB accepted it (600 <= sanity max)
+    assert geo["ready"] is False
+    assert "radius_out_of_bounds" in geo["unreadyReasons"]
+
+
+def test_tightening_provisional_bound_marks_unready_without_blocking_edits(
+    client, auth, make_location
+):
+    """Tightening the provisional business bound below a grandfathered override
+    marks it unready (thread 3) yet never blocks an unrelated edit (thread 4),
+    because the DB holds only the permanent sanity bound."""
+    site_id = make_location(
+        radius=400, confidence="high", provenance="gps_capture", capture=4.5
+    )
+    attest = client.post(
+        f"/api/admin/locations/{site_id}/attest-geofence", headers=auth, json={}
+    )
+    assert attest.status_code == 200, attest.text
+    assert attest.json()["location"]["geofence"]["ready"] is True
+
     original_max = t.GEOFENCE_RADIUS_MAX_M
-    marker = f"{uuid.uuid4()} Resync Rd"
     try:
-        # Baseline: 600 is above the default max (500) -> DB rejects it.
-        with conn.cursor() as cur, pytest.raises(psycopg2.errors.CheckViolation):
-            cur.execute(
-                "INSERT INTO locations (address, rate_type, active, geofence_radius_m) "
-                "VALUES (%s, 'per_visit', true, 600)",
-                (marker,),
-            )
-        # Retune the canonical max and re-run the migration -> DB now accepts 600.
-        t.GEOFENCE_RADIUS_MAX_M = 750
-        t._ensure_geofence_pin_columns("locations")
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO locations (address, rate_type, active, geofence_radius_m) "
-                "VALUES (%s, 'per_visit', true, 600) RETURNING id",
-                (marker,),
-            )
-            new_id = cur.fetchone()[0]
-            cur.execute("DELETE FROM locations WHERE id = %s", (new_id,))
-    finally:
-        # Restore the constant AND the DB constraint (re-sync back to 500).
-        t.GEOFENCE_RADIUS_MAX_M = original_max
-        t._ensure_geofence_pin_columns("locations")
-        conn.close()
-
-
-def test_tightening_radius_bound_does_not_abort_migration(client):
-    """Tightening a bound below an existing override must not abort startup.
-
-    The rebuilt CHECK is NOT VALID, so re-running the migration never scans (and
-    never rejects) the grandfathered row; only new writes are held to the tighter
-    bound (Codex #220 thread 2).
-    """
-    conn = psycopg2.connect(TEST_DB_URL, sslmode="disable")
-    conn.autocommit = True
-    original_max = t.GEOFENCE_RADIUS_MAX_M
-    marker = f"{uuid.uuid4()} Tighten Rd"
-    row_id = None
-    try:
-        # An override valid under the current max (500).
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO locations (address, rate_type, active, geofence_radius_m) "
-                "VALUES (%s, 'per_visit', true, 400) RETURNING id",
-                (marker,),
-            )
-            row_id = cur.fetchone()[0]
-        # Tighten the max below that override and re-run the migration.
-        t.GEOFENCE_RADIUS_MAX_M = 300
-        t._ensure_geofence_pin_columns("locations")  # must NOT raise
-        with conn.cursor() as cur:
-            # Existing override is grandfathered (not scanned / not deleted).
-            cur.execute("SELECT geofence_radius_m FROM locations WHERE id = %s", (row_id,))
-            assert cur.fetchone()[0] == 400
-            # New writes are held to the tightened bound.
-            with pytest.raises(psycopg2.errors.CheckViolation):
-                cur.execute(
-                    "INSERT INTO locations (address, rate_type, active, geofence_radius_m) "
-                    "VALUES (%s, 'per_visit', true, 400)",
-                    (f"{uuid.uuid4()} Tighten2 Rd",),
-                )
+        t.GEOFENCE_RADIUS_MAX_M = 300  # tighten below the 400 override
+        geo = _site_geofence(client, auth, site_id)
+        assert geo["ready"] is False
+        assert "radius_out_of_bounds" in geo["unreadyReasons"]
+        # An UNRELATED edit still succeeds (400 is DB-legal under the sanity bound).
+        edit = client.patch(
+            f"/api/admin/locations/{site_id}", headers=auth, json={"pinConfidence": "medium"}
+        )
+        assert edit.status_code == 200, edit.text
     finally:
         t.GEOFENCE_RADIUS_MAX_M = original_max
-        t._ensure_geofence_pin_columns("locations")
-        if row_id is not None:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM locations WHERE id = %s", (row_id,))
-        conn.close()
 
 
 def test_home_base_attest_honors_update_token(client, auth, morning_crew):

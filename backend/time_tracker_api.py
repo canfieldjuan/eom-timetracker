@@ -277,11 +277,19 @@ SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES = (
 )
 
 # --- Geofence C1 (#213): per-site geometry config, provenance, attestation ---
-# Provisional radius bounds for a per-site geofence override, adjustable from the
-# pin audit. Centralized here so tuning is a one-line change. A NULL per-site
+# PROVISIONAL radius bounds for a per-site geofence override, adjustable from the
+# pin audit. These live ONLY in the app layer (request validation + derived
+# readiness), so retuning them is a genuine one-line change with no DB migration,
+# no startup risk, and no grandfathering problem. A NULL per-site
 # ``geofence_radius_m`` inherits the global ``SITE_CHECK_IN_RADIUS_M`` fallback.
 GEOFENCE_RADIUS_MIN_M = 15
 GEOFENCE_RADIUS_MAX_M = 500
+# PERMANENT structural sanity bounds enforced in PostgreSQL (defense-in-depth
+# against a garbage direct write). Deliberately wide and NEVER retuned, so the DB
+# constraint is added once and never rebuilt: the provisional business bounds
+# above can move freely inside this range without any DB change (Codex #220).
+GEOFENCE_RADIUS_SANITY_MIN_M = 1
+GEOFENCE_RADIUS_SANITY_MAX_M = 100_000
 PIN_CAPTURE_ACCURACY_MAX_M = 100_000
 PIN_PROVENANCE_VALUES = ("gps_capture", "map_placement", "geocoded", "imported", "unknown")
 PIN_CONFIDENCE_VALUES = ("high", "medium", "low")
@@ -7491,49 +7499,45 @@ def _ensure_geofence_pin_columns(table: str) -> None:
             INTEGER REFERENCES employees(id) ON DELETE SET NULL;
         ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pin_attestation_fingerprint VARCHAR(64);
     """)
-    # Derive the enum + radius-bounds CHECK DDL from the canonical Python
-    # definitions (PIN_*_VALUES / GEOFENCE_RADIUS_MIN_M/MAX_M) and DROP+ADD on
-    # every boot, so retuning a constant re-applies to an existing production DB
-    # -- the DB and the request-validation regexes can never drift, and the pin
-    # audit's "one-line radius retune" actually takes effect (Codex #220). These
-    # are trusted, code-defined values only, never user input.
-    #
-    # Each ADD is `NOT VALID`: it enforces the constraint on all NEW writes but
-    # does NOT scan existing rows. So *tightening* a bound (or removing an enum
-    # value) while a grandfathered override sits outside the new range can never
-    # abort startup (Codex #220 thread 2) -- the legacy row is left as-is and only
-    # future writes are held to the new rule. NOT VALID also avoids a full-table
-    # validation scan on every boot.
+    # All geofence CHECK constraints are added ONCE (guarded) and never rebuilt on
+    # boot. The enum CHECKs are generated from the canonical tuples, so their DDL
+    # and the request-validation regexes share one source (Codex #220 thread 1).
+    # The radius CHECK uses the PERMANENT sanity bounds, never the provisional
+    # business bounds -- so a pin-audit retune of the business bounds needs no DB
+    # change and can never abort startup or block an unrelated edit on a
+    # grandfathered row (Codex #220 threads 2-4). Business-bound enforcement lives
+    # in request validation + derived readiness. Trusted, code-defined values only
+    # -- never user input.
     provenance_values = ", ".join("'" + v + "'" for v in PIN_PROVENANCE_VALUES)
     confidence_values = ", ".join("'" + v + "'" for v in PIN_CONFIDENCE_VALUES)
     db.execute(f"""
-        ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pin_provenance_check;
-        ALTER TABLE {table} ADD CONSTRAINT {table}_pin_provenance_check
-            CHECK (pin_provenance IS NULL OR pin_provenance IN ({provenance_values})) NOT VALID;
-        ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pin_confidence_check;
-        ALTER TABLE {table} ADD CONSTRAINT {table}_pin_confidence_check
-            CHECK (pin_confidence IS NULL OR pin_confidence IN ({confidence_values})) NOT VALID;
-        ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_geofence_radius_m_check;
-        ALTER TABLE {table} ADD CONSTRAINT {table}_geofence_radius_m_check
-            CHECK (geofence_radius_m IS NULL
-                OR geofence_radius_m BETWEEN {GEOFENCE_RADIUS_MIN_M} AND {GEOFENCE_RADIUS_MAX_M}) NOT VALID;
-    """)
-    # The fingerprint format is fixed (sha256 hex), not tied to a mutable set, so
-    # a guarded add (never rebuilt) is sufficient.
-    db.execute(f"""
         DO $$
         BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint
                 WHERE conrelid = '{table}'::regclass
-                  AND conname = '{table}_pin_attestation_fingerprint_check'
-            ) THEN
-                ALTER TABLE {table}
-                    ADD CONSTRAINT {table}_pin_attestation_fingerprint_check
-                    CHECK (
-                        pin_attestation_fingerprint IS NULL
-                        OR pin_attestation_fingerprint ~ '^[0-9a-f]{{64}}$'
-                    );
+                  AND conname = '{table}_pin_provenance_check') THEN
+                ALTER TABLE {table} ADD CONSTRAINT {table}_pin_provenance_check
+                    CHECK (pin_provenance IS NULL OR pin_provenance IN ({provenance_values}));
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conrelid = '{table}'::regclass
+                  AND conname = '{table}_pin_confidence_check') THEN
+                ALTER TABLE {table} ADD CONSTRAINT {table}_pin_confidence_check
+                    CHECK (pin_confidence IS NULL OR pin_confidence IN ({confidence_values}));
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conrelid = '{table}'::regclass
+                  AND conname = '{table}_geofence_radius_m_check') THEN
+                ALTER TABLE {table} ADD CONSTRAINT {table}_geofence_radius_m_check
+                    CHECK (geofence_radius_m IS NULL
+                        OR geofence_radius_m BETWEEN {GEOFENCE_RADIUS_SANITY_MIN_M} AND {GEOFENCE_RADIUS_SANITY_MAX_M});
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conrelid = '{table}'::regclass
+                  AND conname = '{table}_pin_attestation_fingerprint_check') THEN
+                ALTER TABLE {table} ADD CONSTRAINT {table}_pin_attestation_fingerprint_check
+                    CHECK (pin_attestation_fingerprint IS NULL
+                        OR pin_attestation_fingerprint ~ '^[0-9a-f]{{64}}$');
             END IF;
         END $$;
     """)
@@ -15517,6 +15521,11 @@ def _geofence_state(
     reasons: List[str] = []
     if latitude is None or longitude is None:
         reasons.append("unpinned")
+    # Derived, so tightening the provisional business bounds immediately marks a
+    # grandfathered out-of-range override unready (the DB keeps only a permanent
+    # sanity bound, so such a row is retained, not deleted) -- Codex #220 thread 3.
+    if not (GEOFENCE_RADIUS_MIN_M <= resolved_radius_m <= GEOFENCE_RADIUS_MAX_M):
+        reasons.append("radius_out_of_bounds")
     if pin_confidence not in PIN_CONFIDENCE_READY_VALUES:
         reasons.append("low_or_missing_confidence")
     if not active:
