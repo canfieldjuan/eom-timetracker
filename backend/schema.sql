@@ -79,16 +79,16 @@ CREATE TABLE locations (
     -- these are additive, currently DORMANT (evaluate_site_check_in_geofence does
     -- not read them yet -- wiring is #214). Readiness is DERIVED from a matching
     -- attestation fingerprint, never a stored boolean.
-    geofence_radius_m           INTEGER
-                                CHECK (geofence_radius_m IS NULL
-                                    OR geofence_radius_m BETWEEN 15 AND 500),
-    pin_provenance              VARCHAR(32)
-                                CHECK (pin_provenance IS NULL OR pin_provenance IN
-                                    ('gps_capture', 'map_placement', 'geocoded', 'imported', 'unknown')),
+    -- Enum + radius-bounds CHECKs are applied and kept in sync with the
+    -- canonical Python definitions (PIN_*_VALUES / GEOFENCE_RADIUS_MIN_M/MAX_M)
+    -- by the runtime migration _ensure_geofence_pin_columns, which DROP+ADDs
+    -- them on boot. Deliberately kept off the fresh-install DDL so those sets
+    -- have a single source of truth (Codex #220). The runtime migration always
+    -- runs at startup, so a deployed/test DB still ends up constrained.
+    geofence_radius_m           INTEGER,
+    pin_provenance              VARCHAR(32),
     pin_capture_accuracy_m      NUMERIC(10, 2),
-    pin_confidence              VARCHAR(16)
-                                CHECK (pin_confidence IS NULL OR pin_confidence IN
-                                    ('high', 'medium', 'low')),
+    pin_confidence              VARCHAR(16),
     pin_attested_at             TIMESTAMPTZ,
     pin_attested_by             INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     pin_attestation_fingerprint VARCHAR(64)
@@ -727,16 +727,16 @@ CREATE TABLE home_bases (
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- Geofence C1 (#213): mirror the per-site geofence config + pin attestation on
     -- the Home Base. geofence_radius_m NULL => global SITE_CHECK_IN_RADIUS_M fallback.
-    geofence_radius_m           INTEGER
-                                CHECK (geofence_radius_m IS NULL
-                                    OR geofence_radius_m BETWEEN 15 AND 500),
-    pin_provenance              VARCHAR(32)
-                                CHECK (pin_provenance IS NULL OR pin_provenance IN
-                                    ('gps_capture', 'map_placement', 'geocoded', 'imported', 'unknown')),
+    -- Enum + radius-bounds CHECKs are applied and kept in sync with the
+    -- canonical Python definitions (PIN_*_VALUES / GEOFENCE_RADIUS_MIN_M/MAX_M)
+    -- by the runtime migration _ensure_geofence_pin_columns, which DROP+ADDs
+    -- them on boot. Deliberately kept off the fresh-install DDL so those sets
+    -- have a single source of truth (Codex #220). The runtime migration always
+    -- runs at startup, so a deployed/test DB still ends up constrained.
+    geofence_radius_m           INTEGER,
+    pin_provenance              VARCHAR(32),
     pin_capture_accuracy_m      NUMERIC(10, 2),
-    pin_confidence              VARCHAR(16)
-                                CHECK (pin_confidence IS NULL OR pin_confidence IN
-                                    ('high', 'medium', 'low')),
+    pin_confidence              VARCHAR(16),
     pin_attested_at             TIMESTAMPTZ,
     pin_attested_by             INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     pin_attestation_fingerprint VARCHAR(64)

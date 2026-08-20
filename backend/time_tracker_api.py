@@ -290,6 +290,11 @@ PIN_CONFIDENCE_READY_VALUES = ("high", "medium")
 # Bump when the canonical fingerprint payload shape changes, so a stored
 # attestation from an older shape is treated as stale (not silently valid).
 GEOFENCE_GEOMETRY_FINGERPRINT_VERSION = "geofence_geometry_v1"
+# Single source of truth: derive the request-validation regexes AND the DB CHECK
+# DDL (see _ensure_geofence_pin_columns) from these tuples, so the API and
+# PostgreSQL can never accept/reject different enum members.
+_PIN_PROVENANCE_PATTERN = "^(" + "|".join(PIN_PROVENANCE_VALUES) + ")$"
+_PIN_CONFIDENCE_PATTERN = "^(" + "|".join(PIN_CONFIDENCE_VALUES) + ")$"
 
 
 def haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -2918,12 +2923,12 @@ class SiteUpdateRequest(BaseModel):
     )
     pinProvenance: Optional[str] = Field(
         default=None,
-        pattern="^(gps_capture|map_placement|geocoded|imported|unknown)$",
+        pattern=_PIN_PROVENANCE_PATTERN,
     )
     pinCaptureAccuracyM: Optional[float] = Field(
         default=None, ge=0, le=PIN_CAPTURE_ACCURACY_MAX_M, allow_inf_nan=False
     )
-    pinConfidence: Optional[str] = Field(default=None, pattern="^(high|medium|low)$")
+    pinConfidence: Optional[str] = Field(default=None, pattern=_PIN_CONFIDENCE_PATTERN)
 
     @field_validator("customerName", "address", mode="before")
     @classmethod
@@ -3259,12 +3264,12 @@ class HomeBasePutRequest(BaseModel):
     )
     pinProvenance: Optional[str] = Field(
         default=None,
-        pattern="^(gps_capture|map_placement|geocoded|imported|unknown)$",
+        pattern=_PIN_PROVENANCE_PATTERN,
     )
     pinCaptureAccuracyM: Optional[float] = Field(
         default=None, ge=0, le=PIN_CAPTURE_ACCURACY_MAX_M, allow_inf_nan=False
     )
-    pinConfidence: Optional[str] = Field(default=None, pattern="^(high|medium|low)$")
+    pinConfidence: Optional[str] = Field(default=None, pattern=_PIN_CONFIDENCE_PATTERN)
 
     @field_validator("label", "address", mode="before")
     @classmethod
@@ -7486,36 +7491,33 @@ def _ensure_geofence_pin_columns(table: str) -> None:
             INTEGER REFERENCES employees(id) ON DELETE SET NULL;
         ALTER TABLE {table} ADD COLUMN IF NOT EXISTS pin_attestation_fingerprint VARCHAR(64);
     """)
+    # Derive the enum + radius-bounds CHECK DDL from the canonical Python
+    # definitions (PIN_*_VALUES / GEOFENCE_RADIUS_MIN_M/MAX_M) and DROP+ADD on
+    # every boot, so retuning a constant re-applies to an existing production DB
+    # -- the DB and the request-validation regexes can never drift, and the pin
+    # audit's "one-line radius retune" actually takes effect (Codex #220). These
+    # are trusted, code-defined values only, never user input. DROP+ADD runs in
+    # one statement (ACCESS EXCLUSIVE lock), so there is no window where the
+    # constraint is absent while another connection could write.
+    provenance_values = ", ".join("'" + v + "'" for v in PIN_PROVENANCE_VALUES)
+    confidence_values = ", ".join("'" + v + "'" for v in PIN_CONFIDENCE_VALUES)
+    db.execute(f"""
+        ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pin_provenance_check;
+        ALTER TABLE {table} ADD CONSTRAINT {table}_pin_provenance_check
+            CHECK (pin_provenance IS NULL OR pin_provenance IN ({provenance_values}));
+        ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pin_confidence_check;
+        ALTER TABLE {table} ADD CONSTRAINT {table}_pin_confidence_check
+            CHECK (pin_confidence IS NULL OR pin_confidence IN ({confidence_values}));
+        ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_geofence_radius_m_check;
+        ALTER TABLE {table} ADD CONSTRAINT {table}_geofence_radius_m_check
+            CHECK (geofence_radius_m IS NULL
+                OR geofence_radius_m BETWEEN {GEOFENCE_RADIUS_MIN_M} AND {GEOFENCE_RADIUS_MAX_M});
+    """)
+    # The fingerprint format is fixed (sha256 hex), not tied to a mutable set, so
+    # a guarded add (never rebuilt) is sufficient.
     db.execute(f"""
         DO $$
         BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conrelid = '{table}'::regclass
-                  AND conname = '{table}_pin_provenance_check'
-            ) THEN
-                ALTER TABLE {table}
-                    ADD CONSTRAINT {table}_pin_provenance_check
-                    CHECK (
-                        pin_provenance IS NULL
-                        OR pin_provenance IN
-                           ('gps_capture', 'map_placement', 'geocoded', 'imported', 'unknown')
-                    );
-            END IF;
-
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conrelid = '{table}'::regclass
-                  AND conname = '{table}_pin_confidence_check'
-            ) THEN
-                ALTER TABLE {table}
-                    ADD CONSTRAINT {table}_pin_confidence_check
-                    CHECK (
-                        pin_confidence IS NULL
-                        OR pin_confidence IN ('high', 'medium', 'low')
-                    );
-            END IF;
-
             IF NOT EXISTS (
                 SELECT 1 FROM pg_constraint
                 WHERE conrelid = '{table}'::regclass
@@ -7526,22 +7528,6 @@ def _ensure_geofence_pin_columns(table: str) -> None:
                     CHECK (
                         pin_attestation_fingerprint IS NULL
                         OR pin_attestation_fingerprint ~ '^[0-9a-f]{{64}}$'
-                    );
-            END IF;
-
-            -- Provisional radius bounds (match GEOFENCE_RADIUS_MIN_M/MAX_M);
-            -- retune deliberately from the pin audit. Enforced in the DB so a
-            -- direct write cannot store an out-of-range radius.
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint
-                WHERE conrelid = '{table}'::regclass
-                  AND conname = '{table}_geofence_radius_m_check'
-            ) THEN
-                ALTER TABLE {table}
-                    ADD CONSTRAINT {table}_geofence_radius_m_check
-                    CHECK (
-                        geofence_radius_m IS NULL
-                        OR geofence_radius_m BETWEEN 15 AND 500
                     );
             END IF;
         END $$;
@@ -7766,7 +7752,7 @@ def _active_home_base_config(*, cur: Optional[Any] = None) -> Optional[Dict[str,
                hb.active, hb.check_in_token_nonce, hb.check_in_token_rotated_at,
                hb.geofence_radius_m, hb.pin_provenance, hb.pin_capture_accuracy_m,
                hb.pin_confidence, hb.pin_attested_at, hb.pin_attested_by,
-               hb.pin_attestation_fingerprint,
+               hb.pin_attestation_fingerprint, hb.updated_at,
                policy.id AS policy_id, policy.crew_id, policy.active AS policy_active,
                crew.name AS crew_name
         FROM home_bases hb
@@ -10646,6 +10632,12 @@ def _serialize_home_base_config(
                     to_utc_iso(config["check_in_token_rotated_at"])
                     if config.get("check_in_token_rotated_at")
                     else None
+                ),
+                # Optimistic-concurrency token (mirrors Sites) so a client can
+                # attest against the geometry it actually read (Codex #220).
+                "updateToken": _entity_update_token(
+                    "home_base",
+                    {"id": config["home_base_id"], "updated_at": config["updated_at"]},
                 ),
                 # Geofence C1 (#213): Home Base geometry config + DERIVED readiness.
                 "geofence": _home_base_geofence_state(config),
@@ -19577,6 +19569,20 @@ def admin_attest_home_base_geofence(
                     status_code=409,
                     detail="Configure Home Base before attesting its geofence",
                 )
+            # Honor the optimistic-concurrency guard here too, mirroring the Site
+            # attest path, so a stale request can't attest geometry the admin did
+            # not see (Codex #220).
+            if payload.expectedUpdateToken is not None:
+                current_token = _entity_update_token(
+                    "home_base",
+                    {"id": config["home_base_id"], "updated_at": config["updated_at"]},
+                )
+                if not hmac.compare_digest(payload.expectedUpdateToken, current_token):
+                    _raise_conflict(
+                        "stale_home_base_update",
+                        "Home Base changed after it was read; reload before retrying",
+                        {"homeBaseId": int(config["home_base_id"])},
+                    )
             current_fingerprint = _home_base_geofence_state(config)["currentFingerprint"]
             if payload.expectedFingerprint is not None and not hmac.compare_digest(
                 payload.expectedFingerprint, current_fingerprint

@@ -673,6 +673,112 @@ def test_db_enforces_radius_bounds(client, table, value, ok):
         conn.close()
 
 
+def test_pin_enum_patterns_derive_from_canonical_tuples():
+    assert t._PIN_PROVENANCE_PATTERN == "^(" + "|".join(t.PIN_PROVENANCE_VALUES) + ")$"
+    assert t._PIN_CONFIDENCE_PATTERN == "^(" + "|".join(t.PIN_CONFIDENCE_VALUES) + ")$"
+
+
+@pytest.mark.parametrize("provenance", list(t.PIN_PROVENANCE_VALUES))
+def test_api_accepts_every_canonical_provenance(client, auth, make_location, provenance):
+    site_id = make_location()
+    resp = client.patch(
+        f"/api/admin/locations/{site_id}", headers=auth, json={"pinProvenance": provenance}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["location"]["geofence"]["pinProvenance"] == provenance
+
+
+@pytest.mark.parametrize("table", ["locations", "home_bases"])
+def test_db_rejects_unknown_pin_enum(client, table):
+    """The DB CHECK derives from the same canonical set the API validates."""
+    conn = psycopg2.connect(TEST_DB_URL, sslmode="disable")
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            with pytest.raises(psycopg2.errors.CheckViolation):
+                if table == "locations":
+                    cur.execute(
+                        "INSERT INTO locations (address, rate_type, active, pin_provenance) "
+                        "VALUES (%s, 'per_visit', true, 'teleport')",
+                        (f"{uuid.uuid4()} Enum Rd",),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO home_bases (label, active, pin_confidence) "
+                        "VALUES (%s, false, 'perfect')",
+                        (f"HB {uuid.uuid4()}",),
+                    )
+    finally:
+        conn.close()
+
+
+def test_radius_bounds_resync_when_constant_changes(client):
+    """Retuning GEOFENCE_RADIUS_MAX_M re-applies to the DB (Codex #220 thread 1)."""
+    conn = psycopg2.connect(TEST_DB_URL, sslmode="disable")
+    conn.autocommit = True
+    original_max = t.GEOFENCE_RADIUS_MAX_M
+    marker = f"{uuid.uuid4()} Resync Rd"
+    try:
+        # Baseline: 600 is above the default max (500) -> DB rejects it.
+        with conn.cursor() as cur, pytest.raises(psycopg2.errors.CheckViolation):
+            cur.execute(
+                "INSERT INTO locations (address, rate_type, active, geofence_radius_m) "
+                "VALUES (%s, 'per_visit', true, 600)",
+                (marker,),
+            )
+        # Retune the canonical max and re-run the migration -> DB now accepts 600.
+        t.GEOFENCE_RADIUS_MAX_M = 750
+        t._ensure_geofence_pin_columns("locations")
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO locations (address, rate_type, active, geofence_radius_m) "
+                "VALUES (%s, 'per_visit', true, 600) RETURNING id",
+                (marker,),
+            )
+            new_id = cur.fetchone()[0]
+            cur.execute("DELETE FROM locations WHERE id = %s", (new_id,))
+    finally:
+        # Restore the constant AND the DB constraint (re-sync back to 500).
+        t.GEOFENCE_RADIUS_MAX_M = original_max
+        t._ensure_geofence_pin_columns("locations")
+        conn.close()
+
+
+def test_home_base_attest_honors_update_token(client, auth, morning_crew):
+    put = client.put(
+        "/api/admin/home-base",
+        headers=auth,
+        json={
+            "label": "EOM Office",
+            "address": "100 Dispatch Lane, Effingham",
+            "latitude": LAT,
+            "longitude": LNG,
+            "pinConfidence": "high",
+        },
+    )
+    assert put.status_code == 200, put.text
+    token = put.json()["homeBase"]["updateToken"]
+    assert token and len(token) == 64
+
+    # A stale/incorrect token is rejected (no silent success).
+    stale = client.post(
+        "/api/admin/home-base/attest-geofence",
+        headers=auth,
+        json={"expectedUpdateToken": "0" * 64},
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["code"] == "stale_home_base_update"
+
+    # The current token succeeds.
+    ok = client.post(
+        "/api/admin/home-base/attest-geofence",
+        headers=auth,
+        json={"expectedUpdateToken": token},
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["homeBase"]["geofence"]["fingerprintMatch"] is True
+
+
 def test_non_admin_cannot_edit_or_attest_geofence(client, emp_auth, make_location):
     site_id = make_location()
     patched = client.patch(
