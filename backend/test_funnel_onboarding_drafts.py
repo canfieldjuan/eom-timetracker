@@ -100,6 +100,41 @@ def _issued_link(draft_id: str, *, contact_id: str | None = None) -> dict[str, o
     }
 
 
+def _public_onboarding_capability_routes() -> list[dict[str, str]]:
+    """Atlas's registered signatures, deliberately independent of names."""
+
+    return [
+        {
+            "method": "GET",
+            "path": "/eom-funnel/public-onboarding/issued-links",
+        },
+        {
+            "method": "POST",
+            "path": "/eom-funnel/onboarding-drafts/{draft_id}/revoke-link",
+        },
+        {
+            "method": "POST",
+            "path": "/eom-funnel/public-onboarding/recover",
+        },
+    ]
+
+
+def _issued_link_page(
+    links: list[dict[str, object]],
+    *,
+    limit: int,
+    cursor: str | None = None,
+    has_more: bool = False,
+) -> dict[str, object]:
+    return {
+        "links": links,
+        "limit": limit,
+        "cursor": cursor,
+        "hasMore": has_more,
+        "nextCursor": "cursor-0123456789" if has_more else None,
+    }
+
+
 def test_review_relays_pending_queue_deployment_proofs(client, auth, monkeypatch):
     def atlas_leads(*_args, **_kwargs):
         return {
@@ -110,10 +145,11 @@ def test_review_relays_pending_queue_deployment_proofs(client, auth, monkeypatch
             "capabilities": [
                 api.ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_LIST,
                 api.ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND,
-                api.ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST,
-                api.ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_LINK_REVOKE,
-                api.ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_HANDOFF_RECOVER,
+                # These intentionally do not match any public-control name.
+                # Their availability must come from the route signatures below.
+                "onboarding.public_link.renamed",
             ],
+            "capabilityRoutes": _public_onboarding_capability_routes(),
         }
 
     monkeypatch.setattr(api, "_atlas_funnel_read", atlas_leads)
@@ -140,6 +176,34 @@ def test_review_relays_pending_queue_deployment_proofs(client, auth, monkeypatch
     assert unavailable.json()["publicOnboardingLinkRevokeAvailable"] is False
     assert unavailable.json()["publicOnboardingReservationListAvailable"] is True
     assert unavailable.json()["publicOnboardingRecoveryAvailable"] is False
+
+
+def test_review_fails_closed_when_public_route_proof_is_malformed(
+    client, auth, monkeypatch
+):
+    def atlas_leads(*_args, **_kwargs):
+        return {
+            "leads": [],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+            # Correct-looking legacy names are insufficient without exact route
+            # signatures from Atlas.
+            "capabilities": [
+                "onboarding.public_link.list",
+                "onboarding.public_link.revoke",
+                "onboarding.public_handoff.recover",
+            ],
+            "capabilityRoutes": [{"method": "GET", "path": "not-a-route"}],
+        }
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_leads)
+    response = client.get("/api/admin/funnel/review", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["publicOnboardingIssuedLinkListAvailable"] is False
+    assert response.json()["publicOnboardingLinkRevokeAvailable"] is False
+    assert response.json()["publicOnboardingRecoveryAvailable"] is False
 
 
 def test_pending_draft_read_is_normal_admin_and_forwards_only_pending_page_query(
@@ -249,13 +313,12 @@ def test_issued_link_read_is_normal_admin_and_reprojects_only_safe_fields(
                 "cursor": None,
                 "hasMore": False,
                 "nextCursor": None,
-                "capabilities": [
-                    api.ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST
-                ],
+                "capabilities": [],
+                "capabilityRoutes": _public_onboarding_capability_routes(),
             }
         assert path == api._ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH
         assert params == {"limit": 2}
-        return {"links": [link], "limit": 2}
+        return _issued_link_page([link], limit=2)
 
     monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
     response = client.get(f"{_ISSUED_LINKS_PATH}?limit=2", headers=auth)
@@ -274,10 +337,49 @@ def test_issued_link_read_is_normal_admin_and_reprojects_only_safe_fields(
             }
         ],
         "limit": 2,
+        "cursor": None,
+        "hasMore": False,
+        "nextCursor": None,
     }
     assert str(link["tokenId"]) not in response.text
     assert reads[0]["path"] == "/eom-funnel/leads"
     assert reads[0]["params"] == {"limit": 1}
+
+
+def test_issued_link_read_relays_the_opaque_next_page_cursor(client, auth, monkeypatch):
+    draft_id = str(uuid.uuid4())
+    cursor = "cursor-0123456789"
+    reads: list[dict[str, object]] = []
+
+    def atlas_read(path, admin, *, params=None):
+        reads.append({"path": path, "admin": admin, "params": params})
+        if path == "/eom-funnel/leads":
+            return {
+                "leads": [],
+                "cursor": None,
+                "hasMore": False,
+                "nextCursor": None,
+                "capabilities": [],
+                "capabilityRoutes": _public_onboarding_capability_routes(),
+            }
+        assert path == api._ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH
+        assert params == {"limit": 1, "cursor": cursor}
+        return _issued_link_page(
+            [_issued_link(draft_id)],
+            limit=1,
+            cursor=cursor,
+            has_more=True,
+        )
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read)
+    response = client.get(f"{_ISSUED_LINKS_PATH}?limit=1&cursor={cursor}", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cursor"] == cursor
+    assert response.json()["hasMore"] is True
+    assert response.json()["nextCursor"] == "cursor-0123456789"
+    assert reads[0]["params"] == {"limit": 1}
+    assert reads[1]["params"] == {"limit": 1, "cursor": cursor}
 
 
 def test_issued_link_read_refuses_unadvertised_capability_before_upstream_read(
@@ -286,22 +388,22 @@ def test_issued_link_read_refuses_unadvertised_capability_before_upstream_read(
     reads: list[str] = []
 
     def unavailable(*_args, **_kwargs):
-        raise api.AtlasFunnelCapabilityUnavailable(
-            api.ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST
+        raise api.AtlasFunnelRouteUnavailable(
+            api._ATLAS_PUBLIC_ONBOARDING_ISSUED_LINK_LIST_ROUTE
         )
 
     def unexpected_read(path, *_args, **_kwargs):
         reads.append(path)
         raise AssertionError("issued links must not be read after capability refusal")
 
-    monkeypatch.setattr(api, "_require_atlas_funnel_capability", unavailable)
+    monkeypatch.setattr(api, "_require_atlas_funnel_route", unavailable)
     monkeypatch.setattr(api, "_atlas_funnel_read", unexpected_read)
     response = client.get(_ISSUED_LINKS_PATH, headers=auth)
 
     assert response.status_code == 501, response.text
     assert (
         response.json()["capability"]
-        == api.ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST
+        == "GET /eom-funnel/public-onboarding/issued-links"
     )
     assert reads == []
 
@@ -314,9 +416,8 @@ def test_issued_link_read_rejects_malformed_atlas_projection(client, auth, monke
                 "cursor": None,
                 "hasMore": False,
                 "nextCursor": None,
-                "capabilities": [
-                    api.ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST
-                ],
+                "capabilities": [],
+                "capabilityRoutes": _public_onboarding_capability_routes(),
             }
         return {"links": [{"status": "issued"}], "limit": 100}
 

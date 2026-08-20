@@ -2754,6 +2754,22 @@ class AtlasPublicOnboardingIssuedLinkPage(BaseModel):
 
     links: list[AtlasPublicOnboardingIssuedLinkItem]
     limit: int = Field(ge=1, le=200)
+    cursor: Optional[str] = Field(default=None, min_length=16, max_length=512)
+    hasMore: bool
+    nextCursor: Optional[str] = Field(default=None, min_length=16, max_length=512)
+
+    @field_validator("hasMore", mode="before")
+    @classmethod
+    def require_boolean_has_more(cls, value: Any) -> Any:
+        if not isinstance(value, bool):
+            raise ValueError("must be a boolean")
+        return value
+
+    @model_validator(mode="after")
+    def require_next_cursor_when_more(self) -> "AtlasPublicOnboardingIssuedLinkPage":
+        if self.hasMore and not self.nextCursor:
+            raise ValueError("nextCursor is required when hasMore is true")
+        return self
 
 
 class FunnelContactCreateRequest(BaseModel):
@@ -4242,6 +4258,23 @@ _ATLAS_PUBLIC_ONBOARDING_TRACKER_CONTEXT_PATH = (
 _ATLAS_PUBLIC_ONBOARDING_FINALIZE_PATH = "/eom-funnel/public-onboarding/finalize"
 _ATLAS_PUBLIC_ONBOARDING_RECOVER_PATH = "/eom-funnel/public-onboarding/recover"
 
+# The three office follow-up controls derive deployment proof from Atlas's
+# registered method/path signatures, not a copied capability name. The paths
+# remain closed local constants because the Tracker must never become an open
+# Atlas proxy.
+_ATLAS_PUBLIC_ONBOARDING_ISSUED_LINK_LIST_ROUTE = (
+    "GET",
+    _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH,
+)
+_ATLAS_PUBLIC_ONBOARDING_LINK_REVOKE_ROUTE = (
+    "POST",
+    _ATLAS_ONBOARDING_DRAFT_REVOKE_LINK_PATH,
+)
+_ATLAS_PUBLIC_ONBOARDING_HANDOFF_RECOVER_ROUTE = (
+    "POST",
+    _ATLAS_PUBLIC_ONBOARDING_RECOVER_PATH,
+)
+
 # CLOSED / ENUMERATED: these are the only Atlas public-onboarding paths a
 # bearer-bearing Tracker call may reach. New upstream paths must be admitted
 # deliberately here; an open proxy would turn this service credential into a
@@ -4443,15 +4476,6 @@ ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
 # both tracker controls rather than treating a route name as proof of support.
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_LIST = "onboarding.draft.list"
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND = "onboarding.draft.approve_send"
-ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST = (
-    "onboarding.public_link.list"
-)
-ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_LINK_REVOKE = (
-    "onboarding.public_link.revoke"
-)
-ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_HANDOFF_RECOVER = (
-    "onboarding.public_handoff.recover"
-)
 ATLAS_FUNNEL_VISIBLE_LEAD_STAGES = frozenset({"new", "estimate_booked", "won"})
 
 # The Atlas operator-mutation boundary this service writes customers through.
@@ -4487,6 +4511,14 @@ class AtlasFunnelCapabilityUnavailable(Exception):
         self.capability = capability
 
 
+class AtlasFunnelRouteUnavailable(AtlasFunnelCapabilityUnavailable):
+    """The deployed Atlas did not prove an exact method/path control."""
+
+    def __init__(self, route: Tuple[str, str]) -> None:
+        self.route = route
+        super().__init__(f"{route[0]} {route[1]}")
+
+
 def _extract_atlas_funnel_capabilities(
     content: Dict[str, Any]
 ) -> Optional[FrozenSet[str]]:
@@ -4510,6 +4542,37 @@ def _extract_atlas_funnel_capabilities(
     return frozenset(
         item.strip() for item in raw if isinstance(item, str) and item.strip()
     )
+
+
+def _extract_atlas_funnel_capability_routes(
+    content: Dict[str, Any],
+) -> Optional[FrozenSet[Tuple[str, str]]]:
+    """Registered Atlas route signatures, or None when their proof is absent.
+
+    A partial or malformed signature set is not safely usable: accepting the
+    well-formed members would let a broken upstream response selectively enable
+    controls. The public-onboarding callers therefore fail closed as one set.
+    """
+
+    raw = content.get("capabilityRoutes")
+    if not isinstance(raw, list):
+        return None
+    routes: set[Tuple[str, str]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        method = item.get("method")
+        path = item.get("path")
+        if (
+            not isinstance(method, str)
+            or not method
+            or method != method.upper()
+            or not isinstance(path, str)
+            or not path.startswith("/eom-funnel/")
+        ):
+            return None
+        routes.add((method, path))
+    return frozenset(routes)
 
 
 def _atlas_funnel_visible_lead_stage(value: Any) -> Optional[str]:
@@ -4568,6 +4631,7 @@ def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]
         "hasMore": has_more,
         "nextCursor": next_cursor,
         "capabilities": _extract_atlas_funnel_capabilities(content),
+        "capabilityRoutes": _extract_atlas_funnel_capability_routes(content),
     }
 
 
@@ -17533,6 +17597,7 @@ def admin_list_funnel_review(
         params["cursor"] = cursor
     content = _atlas_funnel_read("/eom-funnel/leads", admin, params=params)
     lead_page = _parse_atlas_lead_review_response(content)
+    capability_routes = lead_page["capabilityRoutes"]
     leads = lead_page["leads"]
     lead_state_markers = _list_lead_state_markers([lead["contactId"] for lead in leads])
     new_leads: List[Dict[str, Any]] = []
@@ -17602,23 +17667,21 @@ def admin_list_funnel_review(
             in lead_page["capabilities"]
         ),
         # These follow-up fields are deployment proofs for the Website. The
-        # local reservation list itself is Tracker-owned; its mutation still
-        # needs the Atlas recovery capability below.
+        # local reservation list itself is Tracker-owned; the three Atlas
+        # controls rely on exact registered signatures rather than copied
+        # capability-name strings.
         "publicOnboardingIssuedLinkListAvailable": (
-            lead_page["capabilities"] is not None
-            and ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST
-            in lead_page["capabilities"]
+            capability_routes is not None
+            and _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINK_LIST_ROUTE in capability_routes
         ),
         "publicOnboardingLinkRevokeAvailable": (
-            lead_page["capabilities"] is not None
-            and ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_LINK_REVOKE
-            in lead_page["capabilities"]
+            capability_routes is not None
+            and _ATLAS_PUBLIC_ONBOARDING_LINK_REVOKE_ROUTE in capability_routes
         ),
         "publicOnboardingReservationListAvailable": True,
         "publicOnboardingRecoveryAvailable": (
-            lead_page["capabilities"] is not None
-            and ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_HANDOFF_RECOVER
-            in lead_page["capabilities"]
+            capability_routes is not None
+            and _ATLAS_PUBLIC_ONBOARDING_HANDOFF_RECOVER_ROUTE in capability_routes
         ),
     }
 
@@ -17732,6 +17795,7 @@ def admin_approve_funnel_onboarding_draft(
 def admin_list_public_onboarding_issued_links(
     request: Request,
     limit: int = Query(default=100, ge=1, le=200),
+    cursor: Optional[str] = Query(default=None, min_length=16, max_length=512),
     admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     """Relay only current issued-token evidence for all office admins.
@@ -17743,8 +17807,8 @@ def admin_list_public_onboarding_issued_links(
 
     _require_atlas_funnel_configuration()
     try:
-        _require_atlas_funnel_capability(
-            ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_ISSUED_LINK_LIST, admin
+        _require_atlas_funnel_route(
+            _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINK_LIST_ROUTE, admin
         )
     except AtlasFunnelCapabilityUnavailable as exc:
         append_access_log(
@@ -17759,10 +17823,13 @@ def admin_list_public_onboarding_issued_links(
         _atlas_funnel_read(
             _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH,
             admin,
-            params={"limit": limit},
+            params={
+                "limit": limit,
+                **({"cursor": cursor} if cursor else {}),
+            },
         )
     )
-    if page["limit"] != limit:
+    if page["limit"] != limit or page["cursor"] != cursor:
         raise HTTPException(
             status_code=502,
             detail="Public onboarding service returned an invalid issued-link response",
@@ -17771,7 +17838,7 @@ def admin_list_public_onboarding_issued_links(
         request,
         "EOM_PUBLIC_ONBOARDING_ISSUED_LINKS_LISTED",
         True,
-        f"links={len(page['links'])}",
+        f"links={len(page['links'])} has_more={page['hasMore']}",
     )
     return {"success": True, **page}
 
@@ -17828,9 +17895,7 @@ def admin_revoke_public_onboarding_link(
     _require_juan_funnel_approver(admin, action="revoke public onboarding links")
     _require_atlas_funnel_configuration()
     try:
-        _require_atlas_funnel_capability(
-            ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_LINK_REVOKE, admin
-        )
+        _require_atlas_funnel_route(_ATLAS_PUBLIC_ONBOARDING_LINK_REVOKE_ROUTE, admin)
     except AtlasFunnelCapabilityUnavailable as exc:
         append_access_log(
             request,
@@ -17893,19 +17958,6 @@ def admin_recover_public_onboarding_reservation(
 ) -> JSONResponse:
     """Finish a persisted local handoff through Atlas's actor-audited recovery."""
     _require_juan_funnel_approver(admin, action="recover public onboarding")
-    _require_atlas_funnel_configuration()
-    try:
-        _require_atlas_funnel_capability(
-            ATLAS_FUNNEL_CAPABILITY_PUBLIC_ONBOARDING_HANDOFF_RECOVER, admin
-        )
-    except AtlasFunnelCapabilityUnavailable as exc:
-        append_access_log(
-            request,
-            "EOM_PUBLIC_ONBOARDING_RECOVERY_CAPABILITY_UNAVAILABLE",
-            False,
-            f"capability={exc.capability}",
-        )
-        return _atlas_capability_unavailable_response(exc)
     token_id_text = str(token_id)
     reservation = _public_onboarding_reservation(token_id_text)
     if reservation is None:
@@ -17919,6 +17971,20 @@ def admin_recover_public_onboarding_reservation(
                 "reservation": _serialize_public_onboarding_reservation(reservation),
             },
         )
+
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_route(
+            _ATLAS_PUBLIC_ONBOARDING_HANDOFF_RECOVER_ROUTE, admin
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_PUBLIC_ONBOARDING_RECOVERY_CAPABILITY_UNAVAILABLE",
+            False,
+            f"capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
 
     try:
         atlas_result = _atlas_funnel_request(
@@ -18435,6 +18501,15 @@ def _require_atlas_funnel_capability(capability: str, admin: Dict[str, Any]) -> 
     capabilities = _extract_atlas_funnel_capabilities(content)
     if capabilities is None or capability not in capabilities:
         raise AtlasFunnelCapabilityUnavailable(capability)
+
+
+def _require_atlas_funnel_route(route: Tuple[str, str], admin: Dict[str, Any]) -> None:
+    """Refuse a public-onboarding control absent from Atlas's route proof."""
+
+    content = _atlas_funnel_read("/eom-funnel/leads", admin, params={"limit": 1})
+    routes = _extract_atlas_funnel_capability_routes(content)
+    if routes is None or route not in routes:
+        raise AtlasFunnelRouteUnavailable(route)
 
 
 def _atlas_capability_unavailable_response(
