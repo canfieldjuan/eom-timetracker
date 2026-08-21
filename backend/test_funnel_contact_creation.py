@@ -72,6 +72,9 @@ def test_review_proves_the_tracker_contact_proxy_only_when_atlas_allows_it(
             "hasMore": False,
             "nextCursor": None,
             "capabilities": [api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION],
+            "capabilityRoutes": [
+                {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+            ],
         }
 
     monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read_with_contact_capability)
@@ -92,6 +95,77 @@ def test_review_proves_the_tracker_contact_proxy_only_when_atlas_allows_it(
     assert unavailable.status_code == 200, unavailable.text
     assert unavailable.json()["contactCreationAvailable"] is False
     assert unavailable.json()["contactEditAvailable"] is False
+
+
+def test_edit_proof_requires_the_strict_name_and_exact_route(client, auth, monkeypatch):
+    """The edit proof gates a MUTATION control, so it holds the strict manifest
+    standard: capability name (one malformed member poisons the set) AND the
+    exact registered method/path. Name-only, route-only, and junk manifests
+    all read false."""
+    shapes = [
+        # Name present but no route proof: an older Atlas whose manifest
+        # predates capabilityRoutes, or a rollback that dropped the route.
+        (
+            {
+                "capabilities": [api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION],
+            },
+            False,
+        ),
+        # Route present but capability name missing.
+        (
+            {
+                "capabilities": ["lead.lost"],
+                "capabilityRoutes": [
+                    {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+                ],
+            },
+            False,
+        ),
+        # One malformed member poisons the whole capability set.
+        (
+            {
+                "capabilities": [
+                    api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
+                    1,
+                ],
+                "capabilityRoutes": [
+                    {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+                ],
+            },
+            False,
+        ),
+    ]
+    for manifest_fields, expected in shapes:
+        content = {
+            "leads": [],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+            **manifest_fields,
+        }
+        monkeypatch.setattr(api, "_atlas_funnel_read", lambda *_a, _c=content, **_k: _c)
+        response = client.get("/api/admin/funnel/review", headers=auth)
+        assert response.status_code == 200, response.text
+        assert response.json()["contactEditAvailable"] is expected, manifest_fields
+        # Creation gates a mutation control through the same standard.
+        assert response.json()["contactCreationAvailable"] is expected, manifest_fields
+        # And the ENDPOINT enforces what the proof advertises: the same
+        # manifest that reads unavailable must refuse the mutation itself,
+        # for both a create and a contactId-bearing edit.
+        for body_extra in ({}, {"contactId": str(uuid.uuid4())}):
+            attempt = client.post(
+                "/api/admin/funnel/contacts",
+                headers=auth,
+                json={
+                    "contactType": "lead",
+                    "fullName": "Gate Probe",
+                    "email": None,
+                    "phone": None,
+                    "idempotencyKey": str(uuid.uuid4()),
+                    **body_extra,
+                },
+            )
+            assert attempt.status_code == 501, (manifest_fields, attempt.text)
 
 
 def test_manual_lead_create_forwards_the_exact_canonical_contract_and_no_local_rows(
@@ -237,7 +311,8 @@ def test_manual_contact_refuses_when_atlas_does_not_advertise_the_capability(
         calls.append(True)
         raise AssertionError("Atlas must not be called after capability refusal")
 
-    monkeypatch.setattr(api, "_require_atlas_funnel_capability", unavailable)
+    # The endpoint now applies the strict name+route gate.
+    monkeypatch.setattr(api, "_require_atlas_funnel_capability_route", unavailable)
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
     response = client.post(_path(), headers=auth, json=_payload(str(uuid.uuid4())))
 
