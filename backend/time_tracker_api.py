@@ -4782,7 +4782,7 @@ def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]
 
 
 def _parse_atlas_contact_directory_response(
-    content: Dict[str, Any], *, limit: int, cursor: Optional[str]
+    content: Dict[str, Any], *, limit: int, cursor: Optional[str], kind: str = "all"
 ) -> Dict[str, Any]:
     """Validate the complete Atlas directory envelope and every item.
 
@@ -4817,6 +4817,10 @@ def _parse_atlas_contact_directory_response(
     # 422 on a cursor this response handed out.
     if next_cursor is not None and not (16 <= len(next_cursor) <= 512):
         raise invalid
+    # A continuation that does not advance would send the browser in a loop
+    # over the same page forever.
+    if cursor and next_cursor == cursor:
+        raise invalid
     parsed: List[Dict[str, Any]] = []
     seen_contact_ids: set = set()
     for item in contacts:
@@ -4845,9 +4849,17 @@ def _parse_atlas_contact_directory_response(
             not full_name
             or not created_at
             or contact_id in seen_contact_ids
+            # Enum fields must BE strings before membership: an unhashable
+            # JSON value (list/object) would raise TypeError mid-check
+            # instead of reaching this 502.
+            or not isinstance(contact_type, str)
+            or not isinstance(customer_type, str)
             or contact_type not in ATLAS_CONTACT_DIRECTORY_CONTACT_TYPES
             or customer_type not in ATLAS_CONTACT_DIRECTORY_CUSTOMER_TYPES
             or item.get("status") != "active"
+            # A kind-scoped request must never relay an out-of-scope row: a
+            # mis-filtered upstream page is a broken response, not data.
+            or (kind != "all" and contact_type != kind)
         ):
             raise invalid
         seen_contact_ids.add(contact_id)
@@ -18415,7 +18427,9 @@ def admin_list_funnel_contact_directory(
     if cursor:
         params["cursor"] = cursor
     content = _atlas_funnel_read(_ATLAS_CONTACT_DIRECTORY_PATH, admin, params=params)
-    page = _parse_atlas_contact_directory_response(content, limit=limit, cursor=cursor)
+    page = _parse_atlas_contact_directory_response(
+        content, limit=limit, cursor=cursor, kind=kind
+    )
     append_access_log(
         request,
         "EOM_FUNNEL_CONTACT_DIRECTORY_LISTED",

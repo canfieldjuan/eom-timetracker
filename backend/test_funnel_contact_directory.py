@@ -345,6 +345,45 @@ def test_a_malformed_atlas_item_is_rejected(client, auth, monkeypatch):
         assert response.status_code == 502, (items, response.text)
 
 
+def test_a_non_advancing_continuation_cursor_is_rejected(client, auth, monkeypatch):
+    """hasMore=true with nextCursor equal to the echoed cursor would loop the
+    browser over the same page forever."""
+    cursor = "loop-cursor-0123456789abcdef"
+    _install_atlas(
+        monkeypatch,
+        _directory_content(cursor=cursor, has_more=True, next_cursor=cursor),
+    )
+    response = client.get(f"{_path()}?cursor={cursor}", headers=auth)
+    assert response.status_code == 502, response.text
+
+
+def test_an_out_of_scope_row_on_a_kind_filtered_page_is_rejected(
+    client, auth, monkeypatch
+):
+    """A customer-only request must never relay a lead row Atlas mis-filtered
+    into the page -- that is a broken response, not data."""
+    _install_atlas(
+        monkeypatch,
+        _directory_content([
+            _directory_item(contact_type="lead", lead_stage="new"),
+        ]),
+    )
+    response = client.get(f"{_path()}?kind=customer", headers=auth)
+    assert response.status_code == 502, response.text
+
+
+def test_unhashable_enum_fields_are_rejected_not_crashed(client, auth, monkeypatch):
+    """A list/object contactType or customerType must reach the intended 502,
+    not raise TypeError inside a frozenset membership check."""
+    for items in (
+        [{**_directory_item(), "contactType": ["customer"]}],
+        [{**_directory_item(), "customerType": {"value": "unknown"}}],
+    ):
+        _install_atlas(monkeypatch, _directory_content(items))
+        response = client.get(_path(), headers=auth)
+        assert response.status_code == 502, (items, response.text)
+
+
 def test_a_lost_lead_relays_with_its_stage(client, auth, monkeypatch):
     _install_atlas(
         monkeypatch,
