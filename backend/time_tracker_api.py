@@ -4404,6 +4404,11 @@ def _atlas_funnel_request(
 # not an HTTPException and so escapes the degradation path in
 # _verify_atlas_contact_links instead of reporting status=unavailable.
 _KNOWN_CONTACTS_PATH = "/eom-funnel/known-contacts"
+_ATLAS_CONTACT_DIRECTORY_PATH = "/eom-funnel/contact-directory"
+# The exact registered Atlas signature the directory proof requires. Kept as
+# a (method, path) pair because the tracker derives deployment evidence from
+# Atlas's capabilityRoutes, not from a copied capability-name string alone.
+_ATLAS_CONTACT_DIRECTORY_ROUTE = ("GET", _ATLAS_CONTACT_DIRECTORY_PATH)
 _ATLAS_ONBOARDING_DRAFTS_PATH = "/eom-funnel/onboarding-drafts"
 _ATLAS_ONBOARDING_DRAFT_REVOKE_LINK_PATH = (
     "/eom-funnel/onboarding-drafts/{draft_id}/revoke-link"
@@ -4554,6 +4559,7 @@ _ATLAS_FUNNEL_READ_PATHS = frozenset(
     {
         "/eom-funnel/leads",
         _KNOWN_CONTACTS_PATH,
+        _ATLAS_CONTACT_DIRECTORY_PATH,
         _ATLAS_ONBOARDING_DRAFTS_PATH,
         _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH,
     }
@@ -4662,7 +4668,19 @@ ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
 # both tracker controls rather than treating a route name as proof of support.
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_LIST = "onboarding.draft.list"
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND = "onboarding.draft.approve_send"
+ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY = "contact.directory"
 ATLAS_FUNNEL_VISIBLE_LEAD_STAGES = frozenset({"new", "estimate_booked", "won"})
+# CLOSED / ENUMERATED: the exact kind filter the Atlas directory admits
+# (atlas_brain/eom_api/funnel.py Literal["all","lead","customer"]) and the
+# closed item vocabularies its projection is constrained to. An out-of-set
+# browser kind is refused before any Atlas call; an out-of-set Atlas item
+# value rejects the whole page (502) rather than relaying an unreviewed row.
+ATLAS_CONTACT_DIRECTORY_KINDS = ("all", "lead", "customer")
+ATLAS_CONTACT_DIRECTORY_CONTACT_TYPES = frozenset({"lead", "customer"})
+ATLAS_CONTACT_DIRECTORY_CUSTOMER_TYPES = frozenset(
+    {"residential", "commercial", "unknown"}
+)
+_ATLAS_CONTACT_DIRECTORY_MAX_SEARCH_LENGTH = 120
 
 # The Atlas operator-mutation boundary this service writes customers through.
 # `_atlas_funnel_request` requires the "/eom-funnel/" prefix and prepends
@@ -4728,6 +4746,32 @@ def _extract_atlas_funnel_capabilities(
     return frozenset(
         item.strip() for item in raw if isinstance(item, str) and item.strip()
     )
+
+
+def _extract_strict_atlas_funnel_capabilities(
+    content: Dict[str, Any],
+) -> Optional[FrozenSet[str]]:
+    """Directory-proof variant: any malformed member poisons the whole set.
+
+    The lenient extractor above deliberately drops non-string members so an
+    unreadable manifest cannot break the pre-existing lead-queue consumers
+    (Atlas #2308). The contact-directory proof is newer and holds itself to
+    the route-proof standard instead: a manifest that carries junk is not
+    evidence of anything, so the entire capability half fails closed --
+    matching how `_extract_atlas_funnel_capability_routes` already treats a
+    malformed signature list.
+    """
+    if "capabilities" not in content:
+        return None
+    raw = content.get("capabilities")
+    if not isinstance(raw, list):
+        return None
+    members: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        members.add(item.strip())
+    return frozenset(members)
 
 
 def _extract_atlas_funnel_capability_routes(
@@ -4818,6 +4862,113 @@ def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]
         "nextCursor": next_cursor,
         "capabilities": _extract_atlas_funnel_capabilities(content),
         "capabilityRoutes": _extract_atlas_funnel_capability_routes(content),
+    }
+
+
+def _parse_atlas_contact_directory_response(
+    content: Dict[str, Any], *, limit: int, cursor: Optional[str], kind: str = "all"
+) -> Dict[str, Any]:
+    """Validate the complete Atlas directory envelope and every item.
+
+    Nothing is relayed on partial validity: one malformed item rejects the
+    whole page (502) rather than exposing an unreviewed row shape to the
+    browser. The projection is rebuilt field by field, never passed through.
+    """
+    invalid = HTTPException(
+        status_code=502,
+        detail="EOM contact directory service returned an invalid response",
+    )
+    contacts = content.get("contacts")
+    has_more = content.get("hasMore")
+    if not isinstance(contacts, list) or not isinstance(has_more, bool):
+        raise invalid
+    limit_value = content.get("limit")
+    if not isinstance(limit_value, int) or isinstance(limit_value, bool) or limit_value != limit:
+        raise invalid
+    # The echoed limit is the claim; the row count is the behavior. An
+    # oversized page breaks the bounded-page contract even when every row in
+    # it is individually valid.
+    if len(contacts) > limit:
+        raise invalid
+    next_cursor = _strip_optional_atlas_text(content.get("nextCursor"))
+    cursor_echo = _strip_optional_atlas_text(content.get("cursor"))
+    if cursor_echo != (cursor or None):
+        raise invalid
+    if has_more and not next_cursor:
+        raise invalid
+    # A relayed continuation cursor must satisfy the same bounds this route
+    # enforces on the way in (16..512), or the very next page request would
+    # 422 on a cursor this response handed out.
+    if next_cursor is not None and not (16 <= len(next_cursor) <= 512):
+        raise invalid
+    # A continuation that does not advance would send the browser in a loop
+    # over the same page forever.
+    if cursor and next_cursor == cursor:
+        raise invalid
+    parsed: List[Dict[str, Any]] = []
+    seen_contact_ids: set = set()
+    for item in contacts:
+        if not isinstance(item, dict):
+            raise invalid
+        # Required fields must BE strings, not merely stringify: str() would
+        # otherwise admit a numeric fullName, an object createdAt, or a
+        # 32-digit integer contactId (whose digits parse as a fabricated
+        # UUID) instead of the intended 502.
+        raw_contact_id = item.get("contactId")
+        if not isinstance(raw_contact_id, str):
+            raise invalid
+        try:
+            contact_id = str(UUID(raw_contact_id))
+        except (TypeError, ValueError) as exc:
+            raise invalid from exc
+        raw_full_name = item.get("fullName")
+        raw_created_at = item.get("createdAt")
+        if not isinstance(raw_full_name, str) or not isinstance(raw_created_at, str):
+            raise invalid
+        full_name = raw_full_name.strip()
+        created_at = raw_created_at.strip()
+        contact_type = item.get("contactType")
+        customer_type = item.get("customerType")
+        if (
+            not full_name
+            or not created_at
+            or contact_id in seen_contact_ids
+            # Enum fields must BE strings before membership: an unhashable
+            # JSON value (list/object) would raise TypeError mid-check
+            # instead of reaching this 502.
+            or not isinstance(contact_type, str)
+            or not isinstance(customer_type, str)
+            or contact_type not in ATLAS_CONTACT_DIRECTORY_CONTACT_TYPES
+            or customer_type not in ATLAS_CONTACT_DIRECTORY_CUSTOMER_TYPES
+            or item.get("status") != "active"
+            # A kind-scoped request must never relay an out-of-scope row: a
+            # mis-filtered upstream page is a broken response, not data.
+            or (kind != "all" and contact_type != kind)
+        ):
+            raise invalid
+        seen_contact_ids.add(contact_id)
+        parsed.append(
+            {
+                "contactId": contact_id,
+                "fullName": full_name,
+                "email": _strip_optional_atlas_text(item.get("email")),
+                "phone": _strip_optional_atlas_text(item.get("phone")),
+                "address": _strip_optional_atlas_text(item.get("address")),
+                "contactType": contact_type,
+                "customerType": customer_type,
+                "leadStage": _strip_optional_atlas_text(item.get("leadStage")),
+                "status": "active",
+                "source": _strip_optional_atlas_text(item.get("source")),
+                "createdAt": created_at,
+                "updatedAt": _strip_optional_atlas_text(item.get("updatedAt")),
+            }
+        )
+    return {
+        "contacts": parsed,
+        "limit": limit,
+        "cursor": cursor or None,
+        "hasMore": has_more,
+        "nextCursor": next_cursor,
     }
 
 
@@ -18322,6 +18473,10 @@ def admin_list_funnel_review(
     content = _atlas_funnel_read("/eom-funnel/leads", admin, params=params)
     lead_page = _parse_atlas_lead_review_response(content)
     capability_routes = lead_page["capabilityRoutes"]
+    # The directory proof reads the manifest through the strict extractor: a
+    # single malformed capability member invalidates the whole proof rather
+    # than being dropped around the member the proof needs.
+    strict_capabilities = _extract_strict_atlas_funnel_capabilities(content)
     leads = lead_page["leads"]
     lead_state_markers = _list_lead_state_markers([lead["contactId"] for lead in leads])
     new_leads: List[Dict[str, Any]] = []
@@ -18363,6 +18518,18 @@ def admin_list_funnel_review(
             lead_page["capabilities"] is not None
             and ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION
             in lead_page["capabilities"]
+        ),
+        # Directory proof: true only when Atlas advertises BOTH the capability
+        # name and the exact registered GET method/path, and -- by this field
+        # existing at all -- this tracker build contains the directory proxy.
+        # A pre-manifest Atlas (None), a missing capability, a mismatched
+        # signature, or a malformed manifest all read false, and the Website
+        # must not offer Customer creation without it (website #240).
+        "contactDirectoryAvailable": (
+            strict_capabilities is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY in strict_capabilities
+            and capability_routes is not None
+            and _ATLAS_CONTACT_DIRECTORY_ROUTE in capability_routes
         ),
         # These are tracker deployment proofs, not aliases for the Atlas
         # manifest. Website may deploy before this tracker has the matching
@@ -18453,6 +18620,67 @@ def admin_list_funnel_onboarding_drafts(
         "EOM_FUNNEL_ONBOARDING_DRAFTS_LISTED",
         True,
         f"drafts={len(page['drafts'])} has_more={page['hasMore']}",
+    )
+    return {"success": True, **page}
+
+
+@app.get("/api/admin/funnel/contact-directory")
+def admin_list_funnel_contact_directory(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    cursor: Optional[str] = Query(default=None, min_length=16, max_length=512),
+    search: Optional[str] = Query(
+        default=None, min_length=1, max_length=_ATLAS_CONTACT_DIRECTORY_MAX_SEARCH_LENGTH
+    ),
+    kind: str = Query(default="all"),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Relay the bounded Atlas contact directory for operator discovery.
+
+    A normal authenticated-admin read: the tracker owns the Atlas credential,
+    forwards only the bounded search/filter/cursor inputs, and validates the
+    complete upstream envelope before the browser sees a row. No tracker
+    Customer, Site, reservation, handoff, schedule, payroll, billing, QR, or
+    onboarding row is created or modified here -- Atlas remains the only
+    system of record this read reflects (website #240).
+    """
+    _require_atlas_funnel_configuration()
+    if kind not in ATLAS_CONTACT_DIRECTORY_KINDS:
+        raise HTTPException(
+            status_code=422, detail="kind must be one of: all, lead, customer"
+        )
+    normalized_search = search.strip() if search is not None else None
+    if search is not None and not normalized_search:
+        raise HTTPException(status_code=422, detail="search must not be blank")
+    try:
+        _require_atlas_funnel_capability_route(
+            ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY,
+            _ATLAS_CONTACT_DIRECTORY_ROUTE,
+            admin,
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_CONTACT_DIRECTORY_CAPABILITY_UNAVAILABLE",
+            False,
+            f"capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    params: Dict[str, Any] = {"limit": limit, "kind": kind}
+    if normalized_search:
+        params["search"] = normalized_search
+    if cursor:
+        params["cursor"] = cursor
+    content = _atlas_funnel_read(_ATLAS_CONTACT_DIRECTORY_PATH, admin, params=params)
+    page = _parse_atlas_contact_directory_response(
+        content, limit=limit, cursor=cursor, kind=kind
+    )
+    append_access_log(
+        request,
+        "EOM_FUNNEL_CONTACT_DIRECTORY_LISTED",
+        True,
+        f"contacts={len(page['contacts'])} kind={kind} has_more={page['hasMore']}",
     )
     return {"success": True, **page}
 
@@ -19231,6 +19459,26 @@ def _require_atlas_funnel_route(route: Tuple[str, str], admin: Dict[str, Any]) -
     """Refuse a public-onboarding control absent from Atlas's route proof."""
 
     content = _atlas_funnel_read("/eom-funnel/leads", admin, params={"limit": 1})
+    routes = _extract_atlas_funnel_capability_routes(content)
+    if routes is None or route not in routes:
+        raise AtlasFunnelRouteUnavailable(route)
+
+
+def _require_atlas_funnel_capability_route(
+    capability: str, route: Tuple[str, str], admin: Dict[str, Any]
+) -> None:
+    """Refuse an action unless Atlas proves BOTH the capability name and the
+    exact registered method/path, from one manifest read.
+
+    The directory proof deliberately requires both: the name alone is a
+    spelling a rollback could leave stale, and the registered signature is the
+    evidence the deployed build actually serves the route. A missing,
+    malformed, or pre-manifest response fails closed on either check.
+    """
+    content = _atlas_funnel_read("/eom-funnel/leads", admin, params={"limit": 1})
+    capabilities = _extract_strict_atlas_funnel_capabilities(content)
+    if capabilities is None or capability not in capabilities:
+        raise AtlasFunnelCapabilityUnavailable(capability)
     routes = _extract_atlas_funnel_capability_routes(content)
     if routes is None or route not in routes:
         raise AtlasFunnelRouteUnavailable(route)
