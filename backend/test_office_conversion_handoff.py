@@ -570,6 +570,121 @@ def test_funnel_review_proxy_keeps_service_token_server_side(monkeypatch, config
     assert captured["params"] == {"limit": 25}
 
 
+def test_funnel_read_retries_one_transport_failure_with_safe_diagnostics(
+    monkeypatch, configured_office_conversion, caplog
+):
+    api = configured_office_conversion
+    calls: list[dict[str, object]] = []
+    delays: list[float] = []
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None}
+
+    attempts = [api.requests.ConnectionError("temporary transport failure"), _Response()]
+
+    def get(url, *, headers, params, timeout):
+        calls.append({"url": url, "headers": headers, "params": params, "timeout": timeout})
+        result = attempts.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(api.requests, "get", get)
+    monkeypatch.setattr(api.time, "sleep", delays.append)
+
+    with caplog.at_level("WARNING", logger=api.logger.name):
+        result = api._atlas_funnel_read(
+            "/eom-funnel/leads",
+            {"id": 1, "name": "Juan Canfield"},
+            params={"limit": 25, "cursor": "opaque-cursor"},
+        )
+
+    assert result == {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None}
+    assert len(calls) == 2
+    assert [call["timeout"] for call in calls] == [
+        api.ATLAS_FUNNEL_TIMEOUT_SECONDS,
+        min(api.ATLAS_FUNNEL_TIMEOUT_SECONDS, api._ATLAS_FUNNEL_READ_RETRY_TIMEOUT_SECONDS),
+    ]
+    assert all(call["params"] == {"limit": 25, "cursor": "opaque-cursor"} for call in calls)
+    assert delays == [api._ATLAS_FUNNEL_READ_RETRY_DELAY_SECONDS]
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "path=/eom-funnel/leads" in message
+    assert "upstream_host=atlas.example.test" in message
+    assert "attempt=1/2" in message
+    assert "exception_type=ConnectionError" in message
+    assert "tracker-only-test-token" not in message
+    assert "Juan Canfield" not in message
+    assert "opaque-cursor" not in message
+
+
+def test_funnel_read_stops_after_one_retry_and_preserves_unavailable_response(
+    monkeypatch, configured_office_conversion, caplog
+):
+    api = configured_office_conversion
+    calls: list[object] = []
+    delays: list[float] = []
+
+    def get(*_args, **_kwargs):
+        calls.append(None)
+        raise api.requests.exceptions.SSLError("persistent transport failure")
+
+    monkeypatch.setattr(api.requests, "get", get)
+    monkeypatch.setattr(api.time, "sleep", delays.append)
+
+    with caplog.at_level("WARNING", logger=api.logger.name):
+        with pytest.raises(api.HTTPException) as error:
+            api._atlas_funnel_read(
+                "/eom-funnel/leads",
+                {"id": 1, "name": "Juan Canfield"},
+                params={"cursor": "opaque-cursor"},
+            )
+
+    assert error.value.status_code == 503
+    assert error.value.detail == "EOM lead review service is temporarily unavailable; retry this request"
+    assert len(calls) == 2
+    assert delays == [api._ATLAS_FUNNEL_READ_RETRY_DELAY_SECONDS]
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 2
+    assert "attempt=1/2" in messages[0]
+    assert "attempt=2/2" in messages[1]
+    assert all("elapsed_ms=" in message for message in messages)
+    assert all("exception_type=SSLError" in message for message in messages)
+    assert all("tracker-only-test-token" not in message for message in messages)
+    assert all("opaque-cursor" not in message for message in messages)
+
+
+def test_funnel_read_does_not_retry_completed_upstream_error(monkeypatch, configured_office_conversion):
+    api = configured_office_conversion
+    calls: list[object] = []
+    delays: list[float] = []
+
+    class _Response:
+        status_code = 503
+
+        def json(self):
+            return {"detail": "Atlas is temporarily unavailable"}
+
+    def get(*_args, **_kwargs):
+        calls.append(None)
+        return _Response()
+
+    monkeypatch.setattr(api.requests, "get", get)
+    monkeypatch.setattr(api.time, "sleep", delays.append)
+
+    with pytest.raises(api.HTTPException) as error:
+        api._atlas_funnel_read("/eom-funnel/leads", {"id": 1, "name": "Juan Canfield"})
+
+    assert error.value.status_code == 503
+    assert error.value.detail == "Atlas is temporarily unavailable"
+    assert error.value.headers == {"Retry-After": "5"}
+    assert len(calls) == 1
+    assert delays == []
+
+
 def test_funnel_review_proxy_forwards_cursor_without_exposing_service_token(
     client, auth, monkeypatch, configured_office_conversion
 ):
