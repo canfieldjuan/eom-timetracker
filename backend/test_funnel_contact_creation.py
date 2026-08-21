@@ -48,6 +48,8 @@ def _atlas_result(
     full_name: str = "Ada Operator",
     operation: str = "contact_created",
     idempotent: bool = False,
+    email: str | None = None,
+    phone: str | None = None,
 ) -> dict[str, object]:
     return {
         "success": True,
@@ -58,6 +60,8 @@ def _atlas_result(
             "contactId": contact_id,
             "fullName": full_name,
             "contactType": contact_type,
+            "email": email,
+            "phone": phone,
         },
     }
 
@@ -208,6 +212,8 @@ def test_manual_lead_create_forwards_the_exact_canonical_contract_and_no_local_r
             "contactId": contact_id,
             "fullName": "Ada Operator",
             "contactType": "lead",
+            "email": None,
+            "phone": None,
         },
     }
     assert calls == [
@@ -434,3 +440,252 @@ def test_manual_contact_edit_fails_closed_when_atlas_edits_a_different_contact(
     )
 
     assert response.status_code == 502, response.text
+
+
+# -- Slice 5 (website #254): field-clearing tri-state through the proxy --------
+
+
+def test_manual_contact_edit_clear_forwards_null_and_response_proves_it(
+    client, auth, monkeypatch
+):
+    """Present JSON null on an edit rides the wire untouched: no falsy-value
+    filtering between the browser and Atlas, and the widened response
+    projection returns the null so the browser can prove the clear persisted."""
+    key = str(uuid.uuid4())
+    target_id = str(uuid.uuid4())
+    calls: list[dict[str, object]] = []
+    before = _operational_counts()
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        calls.append(payload)
+        return _atlas_result(
+            target_id,
+            full_name="Ada Cleared",
+            operation="contact_updated",
+            email=None,
+            phone="2175550100",
+        )
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    body = _payload(key, full_name="Ada Cleared", email=None)
+    body["contactId"] = target_id
+    response = client.post(_path(), headers=auth, json=body)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["operation"] == "contact_updated"
+    assert response.json()["contact"]["email"] is None
+    assert response.json()["contact"]["phone"] == "2175550100"
+    # The forwarded body carries email as PRESENT null (clear), phone as a
+    # value (replace), and contact_id (edit target).
+    assert calls == [
+        {
+            "full_name": "Ada Cleared",
+            "phone": "217-555-0100",
+            "contact_id": target_id,
+            "email": None,
+            "contact_type": "lead",
+            "source_channel": "time_tracker",
+            "source_ref": f"portal-contact:{key}",
+        }
+    ]
+    assert _operational_counts() == before
+
+
+def test_manual_contact_edit_blank_field_is_rejected_as_ambiguous(
+    client, auth, monkeypatch
+):
+    """On the edit path a blank string is neither keep nor clear -- 422.
+
+    The website never sends blanks (it converts a deliberately emptied field
+    to null), so a blank arriving on an edit is a contract violation to
+    refuse, not a value to guess about. Both optional fields hold the rule.
+    """
+    calls: list[object] = []
+
+    def atlas_request(*_args, **_kwargs):
+        calls.append(True)
+        raise AssertionError("no Atlas call may follow an ambiguous blank")
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    for field in ("email", "phone"):
+        body = _payload(str(uuid.uuid4()))
+        body[field] = "   "
+        body["contactId"] = str(uuid.uuid4())
+        response = client.post(_path(), headers=auth, json=body)
+        assert response.status_code == 422, (field, response.text)
+    assert calls == []
+
+
+def test_manual_contact_create_blank_and_null_still_omit(client, auth, monkeypatch):
+    """The create-or-match door is byte-identical to Slice 4: blank AND null
+    optional fields are omitted, never forwarded as clears, because a create
+    resolving to an existing contact by one identity field must not null the
+    other."""
+    key = str(uuid.uuid4())
+    contact_id = str(uuid.uuid4())
+    calls: list[dict[str, object]] = []
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        calls.append(payload)
+        return _atlas_result(contact_id, full_name="Create Omit")
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    body = _payload(key, full_name="Create Omit", email=None, phone="   ")
+    response = client.post(_path(), headers=auth, json=body)
+
+    assert response.status_code == 201, response.text
+    assert calls == [
+        {
+            "full_name": "Create Omit",
+            "contact_type": "lead",
+            "source_channel": "time_tracker",
+            "source_ref": f"portal-contact:{key}",
+        }
+    ]
+
+
+def test_clear_bearing_edit_refuses_without_the_field_clear_capability(
+    client, auth, monkeypatch
+):
+    """contactEditAvailable proves the route exists; it does NOT prove null
+    semantics. A clear-bearing edit against an Atlas that advertises only the
+    operator mutation must refuse 501 before any mutation call -- and a
+    non-clear edit under the same manifest must still work (the new gate must
+    not over-fire on ordinary edits)."""
+    mutations: list[dict[str, object]] = []
+
+    def atlas_read_without_field_clear(*_args, **_kwargs):
+        return {
+            "leads": [],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+            "capabilities": [api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION],
+            "capabilityRoutes": [
+                {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+            ],
+        }
+
+    target_id = str(uuid.uuid4())
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        mutations.append(payload)
+        return _atlas_result(
+            target_id,
+            full_name="Ada Operator",
+            operation="contact_updated",
+            phone="2175550100",
+        )
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read_without_field_clear)
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+
+    clear_body = _payload(str(uuid.uuid4()), email=None)
+    clear_body["contactId"] = target_id
+    refused = client.post(_path(), headers=auth, json=clear_body)
+    assert refused.status_code == 501, refused.text
+    assert refused.json()["error"] == "atlas_capability_unavailable"
+    assert refused.json()["capability"] == "contact.field_clear"
+    assert mutations == [], "the refusal must precede any Atlas mutation"
+
+    plain_body = _payload(str(uuid.uuid4()))
+    del plain_body["email"]
+    plain_body["contactId"] = target_id
+    allowed = client.post(_path(), headers=auth, json=plain_body)
+    assert allowed.status_code == 201, allowed.text
+    assert len(mutations) == 1, "an ordinary edit must not need the clear capability"
+
+
+def test_manual_contact_edit_fails_closed_when_atlas_does_not_clear(
+    client, auth, monkeypatch
+):
+    """A success whose cleared field still carries a value is the silent
+    fake-save this slice exists to prevent -- 502, never reported as saved."""
+    target_id = str(uuid.uuid4())
+
+    def atlas_request(*_args, **_kwargs):
+        return _atlas_result(
+            target_id,
+            full_name="Ada Operator",
+            operation="contact_updated",
+            email="still@there.example",
+        )
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    body = _payload(str(uuid.uuid4()), email=None)
+    body["contactId"] = target_id
+    response = client.post(_path(), headers=auth, json=body)
+
+    assert response.status_code == 502, response.text
+
+
+def test_review_advertises_field_clear_only_with_strict_name_and_route(
+    client, auth, monkeypatch
+):
+    """contactFieldClearAvailable holds the strict mutation-proof standard:
+    the versioned capability NAME and the exact registered route, together,
+    from one manifest read. Edit-available shapes without the name read false."""
+    shapes = [
+        # Operator mutation only: edit works, clearing must not.
+        (
+            {
+                "capabilities": [api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION],
+                "capabilityRoutes": [
+                    {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+                ],
+            },
+            {"edit": True, "clear": False},
+        ),
+        # Both names + route: clearing is provably supported.
+        (
+            {
+                "capabilities": [
+                    api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
+                    api.ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR,
+                ],
+                "capabilityRoutes": [
+                    {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+                ],
+            },
+            {"edit": True, "clear": True},
+        ),
+        # Name without the registered route: rollback shape, both false.
+        (
+            {
+                "capabilities": [
+                    api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
+                    api.ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR,
+                ],
+            },
+            {"edit": False, "clear": False},
+        ),
+        # A malformed member poisons the strict set for both proofs.
+        (
+            {
+                "capabilities": [
+                    api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
+                    api.ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR,
+                    7,
+                ],
+                "capabilityRoutes": [
+                    {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+                ],
+            },
+            {"edit": False, "clear": False},
+        ),
+    ]
+    for manifest_fields, expected in shapes:
+        content = {
+            "leads": [],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+            **manifest_fields,
+        }
+        monkeypatch.setattr(api, "_atlas_funnel_read", lambda *_a, _c=content, **_k: _c)
+        response = client.get("/api/admin/funnel/review", headers=auth)
+        assert response.status_code == 200, response.text
+        assert response.json()["contactEditAvailable"] is expected["edit"], manifest_fields
+        assert (
+            response.json()["contactFieldClearAvailable"] is expected["clear"]
+        ), manifest_fields
