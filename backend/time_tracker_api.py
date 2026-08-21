@@ -270,6 +270,12 @@ SITE_CHECK_IN_QR_VERSION = "eom1"
 HOME_BASE_QR_VERSION = "eom-home-base-v1"
 SITE_CHECK_IN_RADIUS_M = SITE_CHECK_IN_RADIUS_DEFAULT_M
 SITE_CHECK_IN_MAX_ACCURACY_M = SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M
+# Geofence C2 (#214): master switch for geofence ENFORCEMENT. Default OFF -- with
+# it off, the effective radius is the global fallback for every entity (per-site
+# overrides are inert), so C1 config + C2 wiring ship dormant with zero behavior
+# change. Flipping it on (a later, deliberately-tested step) makes the per-site
+# radius govern the decision. Env-resolved below.
+GEOFENCE_ENFORCEMENT_ENABLED = False
 SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS
 SITE_CHECK_IN_DEVICE_SKEW_SECONDS = SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS
 SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES = (
@@ -404,17 +410,65 @@ def evaluate_site_check_in_geofence(
     *,
     site_latitude: Optional[float],
     site_longitude: Optional[float],
-    latitude: float,
-    longitude: float,
-    accuracy: float,
+    latitude: Optional[float],
+    longitude: Optional[float],
+    accuracy: Optional[float],
+    resolved_radius_m: Optional[int] = None,
+    radius_source: Optional[str] = None,
+    max_accuracy_policy_m: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if site_latitude is None or site_longitude is None:
+    """Canonical accuracy-aware geofence evaluator (Geofence C2, #214).
+
+    Radius-parameterized so ONE function is the sole geometry authority. The
+    caller resolves the EFFECTIVE radius with ``_effective_geofence_radius`` (which
+    honors the C1 per-site override only when enforcement is enabled -- see that
+    helper) and passes it here. Defaulting the three new params to the module
+    globals keeps every existing caller byte-for-byte: the four original result
+    keys and the decision math are unchanged, and the three additive keys simply
+    echo the policy that governed the decision (for the immutable event snapshot).
+    """
+    effective_radius_m = (
+        int(resolved_radius_m)
+        if resolved_radius_m is not None
+        else int(SITE_CHECK_IN_RADIUS_M)
+    )
+    effective_source = radius_source if radius_source is not None else "global_fallback"
+    effective_max_accuracy_m = (
+        int(max_accuracy_policy_m)
+        if max_accuracy_policy_m is not None
+        else int(SITE_CHECK_IN_MAX_ACCURACY_M)
+    )
+
+    def _finite(value: Any) -> bool:
+        return isinstance(value, (int, float)) and math.isfinite(value)
+
+    def _result(
+        status: str,
+        distance_m: Optional[float],
+        accuracy_out: Optional[float],
+    ) -> Dict[str, Any]:
         return {
-            "status": "site_unpinned",
-            "distanceM": None,
-            "radiusM": SITE_CHECK_IN_RADIUS_M,
-            "accuracyM": round(float(accuracy), 2),
+            "status": status,
+            "distanceM": distance_m,
+            "radiusM": effective_radius_m,
+            "accuracyM": accuracy_out,
+            # Additive (C2): the resolved policy that governed this decision, for the
+            # immutable per-event snapshot. Ignored by pre-C2 consumers.
+            "resolvedRadiusM": effective_radius_m,
+            "radiusSource": effective_source,
+            "maxAccuracyPolicyM": effective_max_accuracy_m,
         }
+
+    # Missing/invalid device GPS: no fix, nothing can be decided. Unreachable by
+    # today's callers (all guard device coords upstream and pass finite floats), so
+    # this outcome is additive and changes no current behavior.
+    if not (_finite(latitude) and _finite(longitude) and _finite(accuracy)):
+        return _result(
+            "missing_gps", None, round(float(accuracy), 2) if _finite(accuracy) else None
+        )
+
+    if site_latitude is None or site_longitude is None:
+        return _result("site_unpinned", None, round(float(accuracy), 2))
 
     distance_m = haversine_m(
         latitude,
@@ -423,21 +477,16 @@ def evaluate_site_check_in_geofence(
         float(site_longitude),
     )
     accuracy_m = float(accuracy)
-    if accuracy_m > SITE_CHECK_IN_MAX_ACCURACY_M:
+    if accuracy_m > effective_max_accuracy_m:
         geofence_status = "low_accuracy"
-    elif distance_m + accuracy_m <= SITE_CHECK_IN_RADIUS_M:
+    elif distance_m + accuracy_m <= effective_radius_m:
         geofence_status = "inside"
-    elif distance_m - accuracy_m > SITE_CHECK_IN_RADIUS_M:
+    elif distance_m - accuracy_m > effective_radius_m:
         geofence_status = "outside"
     else:
         geofence_status = "uncertain"
 
-    return {
-        "status": geofence_status,
-        "distanceM": round(distance_m, 2),
-        "radiusM": SITE_CHECK_IN_RADIUS_M,
-        "accuracyM": round(accuracy_m, 2),
-    }
+    return _result(geofence_status, round(distance_m, 2), round(accuracy_m, 2))
 
 
 def _site_check_in_coordinate_bounds(
@@ -451,7 +500,11 @@ def _site_check_in_coordinate_bounds(
     coarse, indexable superset, so it must include the configured radius plus
     the reported device accuracy and cope with the international date line.
     """
-    envelope_m = float(SITE_CHECK_IN_RADIUS_M) + max(float(accuracy), 0.0)
+    # C2 (#214): size the box to the LARGEST radius any candidate could resolve to
+    # under the current enforcement gate, so it stays a conservative superset of the
+    # exact haversine circle for every per-site radius. Gate OFF -> this equals the
+    # global radius, so the box is byte-for-byte identical to pre-C2.
+    envelope_m = float(_max_effective_geofence_radius_m()) + max(float(accuracy), 0.0)
     # This is intentionally lower than a degree's distance under the same
     # spherical radius used by ``haversine_m``.  Dividing by the lower value
     # makes the box a superset instead of allowing a boundary point to fall
@@ -3873,6 +3926,10 @@ SITE_CHECK_IN_MAX_ACCURACY_M = max(
         os.getenv("SITE_CHECK_IN_MAX_ACCURACY_M"),
         SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M,
     ),
+)
+# Geofence C2 (#214): enforcement master switch, default OFF (see constant above).
+GEOFENCE_ENFORCEMENT_ENABLED = parse_bool(
+    os.getenv("GEOFENCE_ENFORCEMENT_ENABLED"), False
 )
 SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = max(
     1,
@@ -15423,6 +15480,43 @@ def _resolve_geofence_radius_m(configured_radius_m: Any) -> Tuple[int, str]:
     if configured_radius_m is not None:
         return int(configured_radius_m), "per_site"
     return int(SITE_CHECK_IN_RADIUS_M), "global_fallback"
+
+
+def _effective_geofence_radius(configured_radius_m: Any) -> Tuple[int, str]:
+    """Geofence C2 (#214) enforcement gate over C1's ``_resolve_geofence_radius_m``.
+
+    This is the ONLY radius the evaluator's decision and the event snapshot should
+    use. It is deliberately distinct from the read-side ``_geofence_state`` (which
+    always reports configured intent/readiness on the ungated resolver):
+
+    - Enforcement OFF (default): return the global fallback for EVERY entity --
+      per-site overrides are inert -- so the live decision and the stored snapshot
+      are byte-for-byte identical to pre-C2 for NULL and override sites alike.
+    - Enforcement ON: honor the C1 per-site value, clamped to the business max
+      ``GEOFENCE_RADIUS_MAX_M`` so a grandfathered out-of-bounds override cannot
+      produce an unbounded geofence (the bounding box is sized to the same clamp).
+
+    ``source`` stays in the existing ``{'per_site', 'global_fallback'}`` vocabulary
+    and always names the quantity that actually governed the decision.
+    """
+    resolved, source = _resolve_geofence_radius_m(configured_radius_m)
+    if not GEOFENCE_ENFORCEMENT_ENABLED:
+        return int(SITE_CHECK_IN_RADIUS_M), "global_fallback"
+    if source == "per_site":
+        resolved = min(int(resolved), GEOFENCE_RADIUS_MAX_M)
+    return int(resolved), source
+
+
+def _max_effective_geofence_radius_m() -> int:
+    """Largest radius any candidate can resolve to under the current gate.
+
+    Used to size the candidate bounding box so it stays a conservative superset of
+    the exact haversine circle for every per-site radius. Must be >= the radius the
+    evaluator can decide with (which clamps a per-site override to the same max).
+    """
+    if not GEOFENCE_ENFORCEMENT_ENABLED:
+        return int(SITE_CHECK_IN_RADIUS_M)
+    return max(int(SITE_CHECK_IN_RADIUS_M), GEOFENCE_RADIUS_MAX_M)
 
 
 def geofence_geometry_fingerprint_payload(
