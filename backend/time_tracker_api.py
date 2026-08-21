@@ -4822,13 +4822,17 @@ def _parse_atlas_contact_directory_response(
     for item in contacts:
         if not isinstance(item, dict):
             raise invalid
+        # Required fields must BE strings, not merely stringify: str() would
+        # otherwise admit a numeric fullName, an object createdAt, or a
+        # 32-digit integer contactId (whose digits parse as a fabricated
+        # UUID) instead of the intended 502.
+        raw_contact_id = item.get("contactId")
+        if not isinstance(raw_contact_id, str):
+            raise invalid
         try:
-            contact_id = str(UUID(str(item.get("contactId", ""))))
+            contact_id = str(UUID(raw_contact_id))
         except (TypeError, ValueError) as exc:
             raise invalid from exc
-        # Required fields must BE strings, not merely stringify: str() would
-        # otherwise admit a numeric fullName or an object createdAt as a
-        # fabricated projection value instead of the intended 502.
         raw_full_name = item.get("fullName")
         raw_created_at = item.get("createdAt")
         if not isinstance(raw_full_name, str) or not isinstance(raw_created_at, str):

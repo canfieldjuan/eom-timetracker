@@ -332,9 +332,11 @@ def test_a_malformed_atlas_item_is_rejected(client, auth, monkeypatch):
           "customerType": "unknown", "status": "active",
           "createdAt": "2026-08-20T12:00:00+00:00"}],
         # Required fields must BE strings: str() coercion would otherwise
-        # fabricate projection values out of malformed upstream types.
+        # fabricate projection values out of malformed upstream types --
+        # including a 32-digit integer whose digits parse as a UUID.
         [{**_directory_item(), "fullName": 123}],
         [{**_directory_item(), "createdAt": {"bad": True}}],
+        [{**_directory_item(), "contactId": 11111111222222223333333344444444}],
         [_directory_item(duplicate_id), _directory_item(duplicate_id)],
     ]
     for items in item_pages:
