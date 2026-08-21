@@ -18592,6 +18592,12 @@ def admin_list_funnel_review(
         # degrades to Slice 4 behavior instead of a silent no-op save.
         "contactFieldClearAvailable": (
             strict_capabilities is not None
+            # BOTH names: the endpoint refuses a clear-bearing edit unless the
+            # base mutation capability AND the clear semantics are advertised,
+            # so the proof must require the same pair -- a partial manifest
+            # naming only contact.field_clear would otherwise advertise an
+            # operation every request 501s.
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION in strict_capabilities
             and ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR in strict_capabilities
             and capability_routes is not None
             and _ATLAS_OPERATOR_CONTACTS_ROUTE in capability_routes

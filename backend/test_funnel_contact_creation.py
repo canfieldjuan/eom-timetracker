@@ -676,6 +676,18 @@ def test_review_advertises_field_clear_only_with_strict_name_and_route(
             },
             {"edit": False, "clear": False},
         ),
+        # field_clear WITHOUT the base mutation capability: the endpoint
+        # would 501 every clear-bearing edit, so the proof must read false --
+        # proof and enforcement require the same pair.
+        (
+            {
+                "capabilities": [api.ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR],
+                "capabilityRoutes": [
+                    {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+                ],
+            },
+            {"edit": False, "clear": False},
+        ),
         # A malformed member poisons the strict set for both proofs.
         (
             {
