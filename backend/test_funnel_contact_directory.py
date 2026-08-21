@@ -38,6 +38,7 @@ def _manifest_content(
     with_route: bool = True,
     declared: bool = True,
     routes_malformed: bool = False,
+    capabilities_malformed: bool = False,
 ) -> dict[str, object]:
     content: dict[str, object] = {
         "leads": [],
@@ -46,9 +47,11 @@ def _manifest_content(
         "nextCursor": None,
     }
     if declared:
-        capabilities = ["lead.lost"]
+        capabilities: list[object] = ["lead.lost"]
         if with_name:
             capabilities.append(api.ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY)
+        if capabilities_malformed:
+            capabilities.append(1)
         content["capabilities"] = capabilities
         routes: list[object] = [{"method": "POST", "path": "/eom-funnel/operator-contacts"}]
         if with_route:
@@ -133,6 +136,12 @@ def test_review_proves_the_directory_only_with_both_name_and_route(
         (_manifest_content(with_name=False, with_route=True), False),
         (_manifest_content(declared=False), False),
         (_manifest_content(with_name=True, with_route=True, routes_malformed=True), False),
+        # One junk member in the capability list poisons the whole proof, even
+        # though the member the proof needs is present and well-formed.
+        (
+            _manifest_content(with_name=True, with_route=True, capabilities_malformed=True),
+            False,
+        ),
     ]
     for manifest, expected in shapes:
         monkeypatch.setattr(
@@ -284,12 +293,32 @@ def test_a_malformed_atlas_envelope_is_rejected(client, auth, monkeypatch):
         _directory_content(limit=50),  # limit echo mismatch (request default 100)
         _directory_content(cursor="unexpected-cursor-echo-value"),
         _directory_content(has_more=True, next_cursor=None),
+        # An in-flight continuation cursor outside this route's own 16..512
+        # bounds would 422 the very next page request it hands out.
+        _directory_content(has_more=True, next_cursor="abc"),
+        _directory_content(has_more=True, next_cursor="x" * 513),
         {"limit": 100, "cursor": None, "hasMore": False, "nextCursor": None},
     ]
     for envelope in envelopes:
         _install_atlas(monkeypatch, envelope)
         response = client.get(_path(), headers=auth)
         assert response.status_code == 502, (envelope, response.text)
+
+
+def test_a_page_larger_than_the_requested_limit_is_rejected(client, auth, monkeypatch):
+    """The echoed limit is a claim; the row count is the behavior. Every row
+    being individually valid must not launder an oversized page."""
+    oversized = _directory_content(
+        [
+            _directory_item(str(uuid.uuid4())),
+            _directory_item(str(uuid.uuid4())),
+            _directory_item(str(uuid.uuid4())),
+        ],
+        limit=2,
+    )
+    _install_atlas(monkeypatch, oversized)
+    response = client.get(f"{_path()}?limit=2", headers=auth)
+    assert response.status_code == 502, response.text
 
 
 def test_a_malformed_atlas_item_is_rejected(client, auth, monkeypatch):
@@ -302,6 +331,10 @@ def test_a_malformed_atlas_item_is_rejected(client, auth, monkeypatch):
         [{"contactId": str(uuid.uuid4()), "fullName": "", "contactType": "lead",
           "customerType": "unknown", "status": "active",
           "createdAt": "2026-08-20T12:00:00+00:00"}],
+        # Required fields must BE strings: str() coercion would otherwise
+        # fabricate projection values out of malformed upstream types.
+        [{**_directory_item(), "fullName": 123}],
+        [{**_directory_item(), "createdAt": {"bad": True}}],
         [_directory_item(duplicate_id), _directory_item(duplicate_id)],
     ]
     for items in item_pages:

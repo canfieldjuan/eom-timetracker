@@ -4664,6 +4664,32 @@ def _extract_atlas_funnel_capabilities(
     )
 
 
+def _extract_strict_atlas_funnel_capabilities(
+    content: Dict[str, Any],
+) -> Optional[FrozenSet[str]]:
+    """Directory-proof variant: any malformed member poisons the whole set.
+
+    The lenient extractor above deliberately drops non-string members so an
+    unreadable manifest cannot break the pre-existing lead-queue consumers
+    (Atlas #2308). The contact-directory proof is newer and holds itself to
+    the route-proof standard instead: a manifest that carries junk is not
+    evidence of anything, so the entire capability half fails closed --
+    matching how `_extract_atlas_funnel_capability_routes` already treats a
+    malformed signature list.
+    """
+    if "capabilities" not in content:
+        return None
+    raw = content.get("capabilities")
+    if not isinstance(raw, list):
+        return None
+    members: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        members.add(item.strip())
+    return frozenset(members)
+
+
 def _extract_atlas_funnel_capability_routes(
     content: Dict[str, Any],
 ) -> Optional[FrozenSet[Tuple[str, str]]]:
@@ -4775,11 +4801,21 @@ def _parse_atlas_contact_directory_response(
     limit_value = content.get("limit")
     if not isinstance(limit_value, int) or isinstance(limit_value, bool) or limit_value != limit:
         raise invalid
+    # The echoed limit is the claim; the row count is the behavior. An
+    # oversized page breaks the bounded-page contract even when every row in
+    # it is individually valid.
+    if len(contacts) > limit:
+        raise invalid
     next_cursor = _strip_optional_atlas_text(content.get("nextCursor"))
     cursor_echo = _strip_optional_atlas_text(content.get("cursor"))
     if cursor_echo != (cursor or None):
         raise invalid
     if has_more and not next_cursor:
+        raise invalid
+    # A relayed continuation cursor must satisfy the same bounds this route
+    # enforces on the way in (16..512), or the very next page request would
+    # 422 on a cursor this response handed out.
+    if next_cursor is not None and not (16 <= len(next_cursor) <= 512):
         raise invalid
     parsed: List[Dict[str, Any]] = []
     seen_contact_ids: set = set()
@@ -4790,8 +4826,15 @@ def _parse_atlas_contact_directory_response(
             contact_id = str(UUID(str(item.get("contactId", ""))))
         except (TypeError, ValueError) as exc:
             raise invalid from exc
-        full_name = str(item.get("fullName") or "").strip()
-        created_at = str(item.get("createdAt") or "").strip()
+        # Required fields must BE strings, not merely stringify: str() would
+        # otherwise admit a numeric fullName or an object createdAt as a
+        # fabricated projection value instead of the intended 502.
+        raw_full_name = item.get("fullName")
+        raw_created_at = item.get("createdAt")
+        if not isinstance(raw_full_name, str) or not isinstance(raw_created_at, str):
+            raise invalid
+        full_name = raw_full_name.strip()
+        created_at = raw_created_at.strip()
         contact_type = item.get("contactType")
         customer_type = item.get("customerType")
         if (
@@ -18168,6 +18211,10 @@ def admin_list_funnel_review(
     content = _atlas_funnel_read("/eom-funnel/leads", admin, params=params)
     lead_page = _parse_atlas_lead_review_response(content)
     capability_routes = lead_page["capabilityRoutes"]
+    # The directory proof reads the manifest through the strict extractor: a
+    # single malformed capability member invalidates the whole proof rather
+    # than being dropped around the member the proof needs.
+    strict_capabilities = _extract_strict_atlas_funnel_capabilities(content)
     leads = lead_page["leads"]
     lead_state_markers = _list_lead_state_markers([lead["contactId"] for lead in leads])
     new_leads: List[Dict[str, Any]] = []
@@ -18217,9 +18264,8 @@ def admin_list_funnel_review(
         # signature, or a malformed manifest all read false, and the Website
         # must not offer Customer creation without it (website #240).
         "contactDirectoryAvailable": (
-            lead_page["capabilities"] is not None
-            and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY
-            in lead_page["capabilities"]
+            strict_capabilities is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY in strict_capabilities
             and capability_routes is not None
             and _ATLAS_CONTACT_DIRECTORY_ROUTE in capability_routes
         ),
@@ -19166,7 +19212,7 @@ def _require_atlas_funnel_capability_route(
     malformed, or pre-manifest response fails closed on either check.
     """
     content = _atlas_funnel_read("/eom-funnel/leads", admin, params={"limit": 1})
-    capabilities = _extract_atlas_funnel_capabilities(content)
+    capabilities = _extract_strict_atlas_funnel_capabilities(content)
     if capabilities is None or capability not in capabilities:
         raise AtlasFunnelCapabilityUnavailable(capability)
     routes = _extract_atlas_funnel_capability_routes(content)
