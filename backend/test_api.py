@@ -5084,6 +5084,9 @@ class TestQrEventSchemaMigration:
                 "missing_departure_visit_ids": "_int4",
                 "response_body": "jsonb",
                 "created_at": "timestamptz",
+                # Geofence C2 (#214) snapshot columns.
+                "radius_source": "varchar",
+                "max_accuracy_policy_m": "int4",
             }
             assert receipt_columns["missing_departure_visit_ids"][
                 "is_nullable"

@@ -4,7 +4,7 @@ nearest-match, and the bounding-box conservative-superset property.
 
 Pure-function tests -- no DB. The evaluator is radius-parameterized; the
 enforcement gate is exercised via _effective_geofence_radius /
-_max_effective_geofence_radius_m with GEOFENCE_ENFORCEMENT_ENABLED toggled.
+_max_effective_geofence_radius_m with GEOFENCE_PER_SITE_RADIUS_ENABLED toggled.
 """
 from __future__ import annotations
 
@@ -159,7 +159,7 @@ def _box_contains(bounds, lat, lng):
 def test_bounding_box_is_conservative_superset_when_enforced(monkeypatch, lat):
     # With enforcement ON, a per-site override up to GEOFENCE_RADIUS_MAX_M must
     # never place an inside/uncertain point outside the candidate box.
-    monkeypatch.setattr(api, "GEOFENCE_ENFORCEMENT_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
     lng = 10.0
     accuracy = 30.0
     envelope = api._max_effective_geofence_radius_m() + accuracy
@@ -173,7 +173,7 @@ def test_bounding_box_is_conservative_superset_when_enforced(monkeypatch, lat):
 
 
 def test_bounding_box_unchanged_when_enforcement_off(monkeypatch):
-    monkeypatch.setattr(api, "GEOFENCE_ENFORCEMENT_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
     assert api._max_effective_geofence_radius_m() == int(api.SITE_CHECK_IN_RADIUS_M)
     off = api._site_check_in_coordinate_bounds(39.1, -88.5, 20.0)
     # Envelope is exactly global radius + accuracy, as pre-C2.
@@ -185,13 +185,13 @@ def test_bounding_box_unchanged_when_enforcement_off(monkeypatch):
 # ---- gate helper unit behavior ---------------------------------------------
 
 def test_effective_radius_gate_off_ignores_override(monkeypatch):
-    monkeypatch.setattr(api, "GEOFENCE_ENFORCEMENT_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
     assert api._effective_geofence_radius(200) == (int(api.SITE_CHECK_IN_RADIUS_M), "global_fallback")
     assert api._effective_geofence_radius(None) == (int(api.SITE_CHECK_IN_RADIUS_M), "global_fallback")
 
 
 def test_effective_radius_gate_on_honors_and_clamps(monkeypatch):
-    monkeypatch.setattr(api, "GEOFENCE_ENFORCEMENT_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
     assert api._effective_geofence_radius(200) == (200, "per_site")
     # Clamp a grandfathered out-of-bounds override to the business max.
     assert api._effective_geofence_radius(10_000) == (api.GEOFENCE_RADIUS_MAX_M, "per_site")

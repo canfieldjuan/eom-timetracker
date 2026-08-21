@@ -2453,3 +2453,119 @@ class TestSiteCheckInAdminReview:
             "companyDate": "2026-07-17",
             "offlineQueue": False,
         }
+
+
+class TestGeofenceC2PerSiteRadius:
+    """Geofence C2 (#214): the per-site radius reaches the shared evaluator and is
+    snapshotted immutably on the event -- all behind GEOFENCE_PER_SITE_RADIUS_ENABLED
+    (default OFF). A device ~100 m from the site is OUTSIDE the 50 m global radius but
+    INSIDE a 200 m per-site override, so the two gate states diverge observably."""
+
+    DEVICE_LAT = SITE_LATITUDE + 100.0 / 111_000.0  # ~100 m north of the site
+    DEVICE_LNG = SITE_LONGITUDE
+
+    def _set_radius(self, location_id, value):
+        conn = _raw_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE locations SET geofence_radius_m = %s WHERE id = %s",
+                (value, location_id),
+            )
+        conn.commit()
+        conn.close()
+
+    def _read_snapshot(self, employee_id, location_id):
+        conn = _raw_conn()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT geofence_radius_m, radius_source, max_accuracy_policy_m,
+                       geofence_status
+                FROM site_check_ins
+                WHERE employee_id = %s AND location_id = %s
+                ORDER BY id DESC LIMIT 1
+                """,
+                (employee_id, location_id),
+            )
+            row = cur.fetchone()
+        conn.close()
+        return row
+
+    def _arrive_100m_away(self, client, auth, employee_id, employee_auth, location_id):
+        create_canonical_job(
+            location_id,
+            datetime.now(timezone.utc) - timedelta(minutes=15),
+            suffix=f"c2-radius-job-{uuid4()}",
+        )
+        clock_in_action_employee(client, employee_auth)
+        token = create_site_qr(client, auth, location_id)["token"]
+        resolved = client.post(
+            "/api/timesheet/site-check-in/resolve",
+            headers=employee_auth,
+            json={"token": token},
+        ).json()
+        payload = explicit_action_payload(
+            employee_id,
+            location_id,
+            token,
+            resolved["actionState"],
+            latitude=self.DEVICE_LAT,
+            longitude=self.DEVICE_LNG,
+            accuracy=5.0,
+        )
+        resp = client.post(
+            "/api/timesheet/site-check-in", headers=employee_auth, json=payload
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def test_per_site_radius_governs_and_snapshots_when_enabled(
+        self, client, auth, location_id, explicit_action_employee, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+        employee_id, employee_auth = explicit_action_employee
+        self._set_radius(location_id, 200)
+        try:
+            body = self._arrive_100m_away(
+                client, auth, employee_id, employee_auth, location_id
+            )
+            # ~100 m is inside the 200 m override -> the arrival records paid time.
+            assert body["outcome"] == "recorded", body
+            snap = self._read_snapshot(employee_id, location_id)
+            assert snap["geofence_status"] == "inside"
+            # Decision and snapshot share the exact resolved policy.
+            assert snap["geofence_radius_m"] == 200
+            assert snap["radius_source"] == "per_site"
+            assert snap["max_accuracy_policy_m"] == int(api.SITE_CHECK_IN_MAX_ACCURACY_M)
+            # Immutability: a later config change must not rewrite the historical row.
+            self._set_radius(location_id, 350)
+            snap2 = self._read_snapshot(employee_id, location_id)
+            assert snap2["geofence_radius_m"] == 200
+            assert snap2["radius_source"] == "per_site"
+        finally:
+            self._set_radius(location_id, None)
+
+    def test_override_is_inert_and_not_hard_gated_when_disabled(
+        self, client, auth, location_id, explicit_action_employee, monkeypatch
+    ):
+        import time_tracker_api as api
+
+        monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+        employee_id, employee_auth = explicit_action_employee
+        self._set_radius(location_id, 200)  # present, but must be inert while OFF
+        try:
+            body = self._arrive_100m_away(
+                client, auth, employee_id, employee_auth, location_id
+            )
+            # The override is ignored -> global 50 m governs -> ~100 m is outside.
+            # The action is NOT hard-gated: it is accepted as evidence-only review.
+            assert body["outcome"] == "evidence_only_review", body
+            snap = self._read_snapshot(employee_id, location_id)
+            assert snap["geofence_status"] != "inside"
+            # Byte-for-byte snapshot: global radius + fallback source, as pre-C2.
+            assert snap["geofence_radius_m"] == int(api.SITE_CHECK_IN_RADIUS_M)
+            assert snap["radius_source"] == "global_fallback"
+        finally:
+            self._set_radius(location_id, None)
