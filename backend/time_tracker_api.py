@@ -18587,6 +18587,17 @@ def admin_list_funnel_review(
             and ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION
             in lead_page["capabilities"]
         ),
+        # Edit uses the same Atlas operator-mutation capability as creation, but
+        # only this tracker build forwards an edit target (contactId); an older
+        # tracker rejects that field outright (extra="forbid"). This field's very
+        # presence is therefore the deployment proof: an older tracker omits it,
+        # the Website reads it absent and keeps the Edit affordance closed, so the
+        # Website stays independently safe to deploy ahead of this tracker.
+        "contactEditAvailable": (
+            lead_page["capabilities"] is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION
+            in lead_page["capabilities"]
+        ),
         # Directory proof: true only when Atlas advertises BOTH the capability
         # name and the exact registered GET method/path, and -- by this field
         # existing at all -- this tracker build contains the directory proxy.
