@@ -3334,6 +3334,12 @@ class ClockOutRequest(BaseModel):
 
 
 class HomeBasePutRequest(BaseModel):
+    expectedUpdateToken: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern="^[0-9a-f]{64}$",
+    )
     label: str = Field(min_length=1, max_length=160)
     address: str = Field(default="", max_length=500)
     latitude: Optional[float] = Field(default=None, ge=-90, le=90)
@@ -10866,7 +10872,7 @@ def admin_put_home_base(
                     detail="Configure the existing Morning Crew before Home Base",
                 )
             cur.execute(
-                "SELECT id FROM home_bases WHERE active = true FOR UPDATE"
+                "SELECT id, updated_at FROM home_bases WHERE active = true FOR UPDATE"
             )
             existing = _row_from_cursor(cur)
             # Geofence C1 (#213): write only the geofence fields actually present
@@ -10884,6 +10890,11 @@ def admin_put_home_base(
                     geofence_set.append(f"{column} = %s")
                     geofence_params.append(getattr(payload, field))
             if existing:
+                _require_current_update_token(
+                    "home_base",
+                    existing,
+                    payload.expectedUpdateToken,
+                )
                 extra = (", " + ", ".join(geofence_set)) if geofence_set else ""
                 cur.execute(
                     f"""
@@ -15559,6 +15570,13 @@ def _entity_update_token(entity: str, row: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+_UPDATE_TOKEN_CONFLICT_CONTEXT = {
+    "customer": ("Customer", "customerId"),
+    "site": ("Site", "siteId"),
+    "home_base": ("Home Base", "homeBaseId"),
+}
+
+
 def _require_current_update_token(
     entity: str,
     row: Dict[str, Any],
@@ -15569,11 +15587,14 @@ def _require_current_update_token(
     current_token = _entity_update_token(entity, row)
     if hmac.compare_digest(expected_token, current_token):
         return
-    entity_label = "Customer" if entity == "customer" else "Site"
+    try:
+        entity_label, entity_id_key = _UPDATE_TOKEN_CONFLICT_CONTEXT[entity]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported update-token entity: {entity}") from exc
     _raise_conflict(
         f"stale_{entity}_update",
         f"{entity_label} changed after it was read; reload before retrying",
-        {f"{entity}Id": int(row["id"])},
+        {entity_id_key: int(row["id"])},
     )
 
 
