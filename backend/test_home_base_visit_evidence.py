@@ -585,6 +585,22 @@ def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
         {"action": "start", "outcome": "exception", "exception_reason": "Office was inaccessible"},
     ]
 
+    # Geofence C2 (#214): a documented exception evaluated a geofence (GPS was
+    # present, just outside the office), so the event must retain an immutable
+    # record of the policy + result that caused confirmation to fail -- not NULL.
+    exception_geofence = db.query_one(
+        """
+        SELECT geofence_status, geofence_radius_m, radius_source, max_accuracy_policy_m
+        FROM home_base_events
+        WHERE shift_id = %s AND action = 'start'
+        """,
+        (exception_shift_id,),
+    )
+    assert exception_geofence["geofence_status"] not in (None, "inside")
+    assert exception_geofence["geofence_radius_m"] is not None
+    assert exception_geofence["radius_source"] == "global_fallback"
+    assert exception_geofence["max_accuracy_policy_m"] is not None
+
     evening_id, evening_auth = _create_employee(client, "Evening")
     assert evening_id != employee_id
     out_of_scope = client.post(

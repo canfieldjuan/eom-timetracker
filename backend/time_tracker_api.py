@@ -14498,7 +14498,11 @@ def clock_in(
             latitude=payload.latitude,
             longitude=payload.longitude,
             accuracy=payload.accuracy,
-            geofence=home_base["geofence"] if outcome == "recorded" else None,
+            # Geofence C2 (#214): record the evaluated geofence whenever one exists,
+            # including for a documented exception -- that snapshot is the immutable
+            # record of the policy + result that caused GPS confirmation to fail.
+            # None only when no geofence was evaluated (e.g. missing GPS).
+            geofence=home_base["geofence"],
             idempotency_key=payload.idempotencyKey,
             request_fingerprint=(
                 _plain_time_action_request_fingerprint("clock-in", payload)
@@ -20947,6 +20951,10 @@ def _correction_shift_snapshots(
             event.longitude,
             event.accuracy_m,
             event.geofence_radius_m,
+            -- Geofence C2 (#214): preserve the full resolved-policy snapshot; the
+            -- home_base_events row cascade-deletes with the shift on correction.
+            event.radius_source,
+            event.max_accuracy_policy_m,
             event.distance_m,
             event.geofence_status,
             event.idempotency_key,
@@ -20981,6 +20989,12 @@ def _correction_shift_snapshots(
             evidence.geofence_status,
             evidence.distance_m,
             evidence.accuracy_m,
+            -- Geofence C2 (#214): the resolved-policy snapshot is part of the
+            -- acceptance rationale, and the evidence row cascade-deletes with the
+            -- shift, so the archive must carry it too or a corrected shift loses it.
+            evidence.geofence_radius_m,
+            evidence.radius_source,
+            evidence.max_accuracy_policy_m,
             evidence.created_at
         FROM visit_evidence_events evidence
         WHERE evidence.shift_id = ANY(%s)
@@ -21156,6 +21170,17 @@ def _correction_shift_snapshots(
                 if row.get("geofence_radius_m") is not None
                 else None
             ),
+            # Geofence C2 (#214): preserve the resolved-policy snapshot in the archive.
+            "radiusSource": (
+                str(row["radius_source"])
+                if row.get("radius_source") is not None
+                else None
+            ),
+            "maxAccuracyPolicyM": (
+                int(row["max_accuracy_policy_m"])
+                if row.get("max_accuracy_policy_m") is not None
+                else None
+            ),
             "distanceM": (
                 float(row["distance_m"])
                 if row.get("distance_m") is not None
@@ -21198,6 +21223,22 @@ def _correction_shift_snapshots(
             "accuracyM": (
                 float(row["accuracy_m"])
                 if row.get("accuracy_m") is not None
+                else None
+            ),
+            # Geofence C2 (#214): preserve the resolved-policy snapshot in the archive.
+            "geofenceRadiusM": (
+                int(row["geofence_radius_m"])
+                if row.get("geofence_radius_m") is not None
+                else None
+            ),
+            "radiusSource": (
+                str(row["radius_source"])
+                if row.get("radius_source") is not None
+                else None
+            ),
+            "maxAccuracyPolicyM": (
+                int(row["max_accuracy_policy_m"])
+                if row.get("max_accuracy_policy_m") is not None
                 else None
             ),
             "createdAt": to_utc_iso(row["created_at"]),
