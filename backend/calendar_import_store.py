@@ -26,6 +26,7 @@ import db
 
 MORNING_CREW_NAME = "Morning Crew"
 MORNING_CREW_EXPECTED_NAMES = ("Carmen", "Pamela", "Tina")
+PLANNED_VISIT_ASSIGNMENT_MUTATION_LOCK = "eom_planned_visit_assignment_mutations_v1"
 RESIDENTIAL_MORNING_ROLE = "residential_morning"
 COMMERCIAL_EVENING_NIGHT_ROLE = "commercial_evening_night"
 CALENDAR_SOURCE_ROLES = (
@@ -45,6 +46,14 @@ class CalendarStoreError(RuntimeError):
 
 class CalendarConfigurationError(CalendarStoreError):
     """Raised when server-only Calendar encryption is not configured."""
+
+
+def lock_planned_visit_assignment_mutations(cur: Any) -> None:
+    """Serialize schedule-assignment and membership writes with C3's tie-break."""
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (PLANNED_VISIT_ASSIGNMENT_MUTATION_LOCK,),
+    )
 
 
 class OAuthStateError(CalendarStoreError):
@@ -981,6 +990,7 @@ def bootstrap_morning_crew_memberships(*, effective_from: date) -> dict[str, Any
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 ("morning-crew-bootstrap",),
             )
+            lock_planned_visit_assignment_mutations(cur)
             cur.execute(
                 "SELECT id FROM crews WHERE name = %s AND active = true FOR UPDATE",
                 (MORNING_CREW_NAME,),
@@ -1074,6 +1084,7 @@ def replace_crew_memberships(
     effective_from = effective_from or date.today()
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            lock_planned_visit_assignment_mutations(cur)
             cur.execute(
                 "SELECT id, name FROM crews WHERE id = %s AND active = true FOR UPDATE",
                 (crew_id,),
@@ -1719,6 +1730,11 @@ def apply_reviewed_preview(
     items_by_key = {item.source_key: item for item in preview.items}
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # C3 can use an employee's qualifying assignment or crew membership
+            # to resolve an overlap. Hold the same lock it takes before changing
+            # either schedule input, so final resolution remains true through
+            # this approval transaction.
+            lock_planned_visit_assignment_mutations(cur)
             cur.execute(
                 """
                 SELECT id, connection_id, calendar_id, preview_fingerprint,
