@@ -166,6 +166,7 @@ def clear_access_log_entries(setup_db):
 # one test module because Customer creation now needs
 # `contact.operator_mutation` on any suite that creates a Customer.
 ATLAS_FULL_CAPABILITIES = [
+    "contact.field_clear",
     "contact.operator_mutation",
     "lead.customer_handoff",
     "lead.estimate_booking",
