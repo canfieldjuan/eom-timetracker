@@ -278,6 +278,9 @@ SITE_CHECK_IN_MAX_ACCURACY_M = SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M
 # switch: it only chooses WHICH radius the evaluator uses, never whether an action
 # is gated. Env-resolved below.
 GEOFENCE_PER_SITE_RADIUS_ENABLED = False
+# Geofence C3 (#215): resolution ships dormant. It may associate a confirmed
+# Site, but it cannot deny an unresolved clock action before C6.
+GEOFENCE_SITE_RESOLUTION_ENABLED = False
 SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS
 SITE_CHECK_IN_DEVICE_SKEW_SECONDS = SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS
 SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES = (
@@ -1259,11 +1262,20 @@ def _save_timesheets_to_db(
     pre_shift_ids: set,
     pre_visit_counts: Dict[int, int],
     pre_departure_counts: Dict[int, int],
+    before_save: Optional[Callable[[Any], None]] = None,
     after_save: Optional[Callable[[Any], None]] = None,
 ) -> None:
     """Persist time evidence without mutating the server-authoritative Site list."""
     with db.get_conn() as conn:
         cur = conn.cursor()
+
+        # A time action may derive a customer Site from mutable configuration.
+        # Let that narrow caller re-read and update its pending in-memory entry
+        # after this transaction begins but before any shift or visit is written.
+        # Existing callbacks intentionally keep their post-write position below:
+        # Home Base and explicit-evidence events require persisted row ids.
+        if before_save is not None:
+            before_save(cur)
 
         cur.execute("SELECT id, address FROM locations WHERE active = true")
         addr_to_id: Dict[str, int] = {
@@ -3107,6 +3119,8 @@ MAX_GPS_OVERRIDE_DETAIL_LEN = parse_int(os.getenv("MAX_GPS_OVERRIDE_DETAIL_LEN")
 
 class ClockInRequest(BaseModel):
     location: str = Field(default="", max_length=MAX_LOCATION_LEN)
+    # C3's optional explicit target. Legacy clock-in callers omit it.
+    locationId: Optional[int] = Field(default=None, gt=0)
     notes: str = Field(default="", max_length=MAX_NOTES_LEN)
     latitude: Optional[float] = Field(default=None, ge=-90, le=90)
     longitude: Optional[float] = Field(default=None, ge=-180, le=180)
@@ -3125,7 +3139,6 @@ class ClockInRequest(BaseModel):
 class VisitRequest(ClockInRequest):
     """Additive explicit-site evidence for the existing manual-arrival route."""
 
-    locationId: Optional[int] = Field(default=None, gt=0)
     plannedVisitId: Optional[int] = Field(default=None, gt=0)
     evidenceMethod: Optional[
         Literal[
@@ -3144,12 +3157,12 @@ class VisitRequest(ClockInRequest):
 
     @model_validator(mode="after")
     def selected_site_evidence_is_complete(self) -> "VisitRequest":
-        selected = self.locationId is not None or self.plannedVisitId is not None
-        if selected and (self.locationId is None or self.evidenceMethod is None):
+        legacy_selected = self.evidenceMethod is not None or self.plannedVisitId is not None
+        if legacy_selected and (self.locationId is None or self.evidenceMethod is None):
             raise ValueError(
                 "locationId and evidenceMethod are required for an explicit Site arrival"
             )
-        if selected and (
+        if legacy_selected and (
             self.latitude is None
             or self.longitude is None
             or self.accuracy is None
@@ -3157,14 +3170,27 @@ class VisitRequest(ClockInRequest):
             raise ValueError(
                 "explicit Site evidence requires latitude, longitude, and accuracy"
             )
-        if not selected and (
-            self.evidenceMethod is not None
-            or self.exceptionReason
-            or self.exceptionDetail
-        ):
+        if not legacy_selected and (self.exceptionReason or self.exceptionDetail):
             raise ValueError(
-                "explicit Site evidence requires locationId"
+                "exception details require an explicit Site evidence method"
             )
+        # C3 selected-site arrival deliberately has no legacy evidenceMethod.
+        # It must carry the GPS sample evaluated by the resolver.
+        if self.locationId is not None and not legacy_selected:
+            # Before C3 is explicitly enabled this preserves the legacy route's
+            # validation: a locationId is evidence selection, not an inert hint.
+            if not GEOFENCE_SITE_RESOLUTION_ENABLED:
+                raise ValueError(
+                    "locationId and evidenceMethod are required for an explicit Site arrival"
+                )
+            if (
+                self.latitude is None
+                or self.longitude is None
+                or self.accuracy is None
+            ):
+                raise ValueError(
+                    "selected Site resolution requires latitude, longitude, and accuracy"
+                )
         if self.evidenceMethod in {
             "unplanned_residential",
             "commercial_qr_fallback",
@@ -3193,6 +3219,16 @@ class VisitCandidatesRequest(BaseModel):
     latitude: float = Field(ge=-90, le=90, allow_inf_nan=False)
     longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
     accuracy: float = Field(ge=0, le=100_000, allow_inf_nan=False)
+
+
+class SiteResolutionRequest(BaseModel):
+    """Read-only C3 target resolution for ordinary clock-in or arrival."""
+
+    action: Literal["clock-in", "arrive"]
+    latitude: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
+    accuracy: float = Field(ge=0, le=100_000, allow_inf_nan=False)
+    locationId: Optional[int] = Field(default=None, gt=0)
 
 
 class SiteQrRequest(BaseModel):
@@ -4002,6 +4038,11 @@ SITE_CHECK_IN_MAX_ACCURACY_M = max(
 # Geofence C2 (#214): per-site-radius rollout switch, default OFF (see constant above).
 GEOFENCE_PER_SITE_RADIUS_ENABLED = parse_bool(
     os.getenv("GEOFENCE_PER_SITE_RADIUS_ENABLED"), False
+)
+# Geofence C3 (#215): resolution is separate from C6's hard gate and stays
+# disabled in production until an approved later rollout turns it on.
+GEOFENCE_SITE_RESOLUTION_ENABLED = parse_bool(
+    os.getenv("GEOFENCE_SITE_RESOLUTION_ENABLED"), False
 )
 SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = max(
     1,
@@ -11956,6 +11997,7 @@ def update_timesheets_for_plain_time_action(
     employee: Dict[str, Any],
     mutator: Callable[[Dict[str, Any]], Tuple[bool, Any]],
     response_builder: Callable[[Any, Dict[str, Any]], Dict[str, Any]],
+    before_persist: Optional[Callable[[Any, Any, Dict[str, Any]], None]] = None,
     after_response_saved: Optional[Callable[[Any, Any, Dict[str, Any]], None]] = None,
 ) -> Tuple[bool, Any]:
     if action not in PLAIN_TIME_ACTION_NAMES:
@@ -11997,6 +12039,10 @@ def update_timesheets_for_plain_time_action(
 
             holder: Dict[str, Any] = {}
 
+            def before_save(cur: Any) -> None:
+                if before_persist is not None:
+                    before_persist(cur, result, timesheet_data)
+
             def after_save(cur: Any) -> None:
                 response = response_builder(result, timesheet_data)
                 if after_response_saved is not None:
@@ -12029,6 +12075,7 @@ def update_timesheets_for_plain_time_action(
                     pre_shift_ids,
                     pre_visit_counts,
                     pre_departure_counts,
+                    before_save=before_save,
                     after_save=after_save,
                 )
             except psycopg2.errors.UniqueViolation as exc:
@@ -14578,6 +14625,10 @@ def clock_in(
         "geofence": None,
         "confirmed": False,
     }
+    # C3 is dormant unless the deployment explicitly enables it.  Keep the
+    # resolver's provisional and transaction-authoritative observations here so
+    # the receipt tells an enabled client what was actually associated.
+    site_resolution: Dict[str, Any] = {"resolution": None, "snapshot": None}
     home_base_exception = _home_base_exception_reason(payload)
     exception_error = _validate_home_base_exception(home_base_exception)
     if exception_error:
@@ -14680,6 +14731,32 @@ def clock_in(
                 payload.gpsOverrideDetail,
                 payload.accuracy,
             )
+
+        if GEOFENCE_SITE_RESOLUTION_ENABLED:
+            provisional_resolution = _c3_resolve_site(
+                "clock-in",
+                payload,
+                employee,
+                reference_time=now_utc,
+            )
+            site_resolution["resolution"] = provisional_resolution
+            # Home Base and its documented exception retain their existing
+            # internal-dispatch meaning.  C3 cannot turn either into a
+            # customer Site merely because their coordinates overlap.
+            if not (
+                home_base["confirmed"]
+                or (home_base["policy"] and home_base_exception)
+            ):
+                site_resolution["snapshot"] = _c3_target_snapshot(
+                    entry,
+                    gps_meta_key="clockInGpsMeta",
+                )
+                _c3_apply_site_resolution(
+                    entry,
+                    payload,
+                    provisional_resolution,
+                    gps_meta_key="clockInGpsMeta",
+                )
         timesheet_data["entries"].append(entry)
         timesheet_data["nextId"] = entry_id + 1
         return True, entry
@@ -14691,7 +14768,44 @@ def clock_in(
         loc = result.get("location", "")
         location_customers: Dict[str, str] = timesheet_data.get("location_customers", {})
         result["customer"] = _resolve_customer(loc, location_customers)
-        return {"success": True, "entry": result}
+        response: Dict[str, Any] = {"success": True, "entry": result}
+        if GEOFENCE_SITE_RESOLUTION_ENABLED and site_resolution["resolution"]:
+            response["siteResolution"] = _c3_public_resolution(
+                site_resolution["resolution"]
+            )
+        return response
+
+    def re_resolve_customer_site_before_persist(
+        cur: Any,
+        result: Dict[str, Any],
+        _timesheet_data: Dict[str, Any],
+    ) -> None:
+        snapshot = site_resolution.get("snapshot")
+        if not GEOFENCE_SITE_RESOLUTION_ENABLED or not isinstance(snapshot, dict):
+            return
+        current_resolution = _c3_resolve_site(
+            "clock-in",
+            payload,
+            employee,
+            cur=cur,
+            reference_time=now_utc,
+        )
+        site_resolution["resolution"] = current_resolution
+        if current_resolution.get("state") == "customer_site":
+            _c3_apply_site_resolution(
+                result,
+                payload,
+                current_resolution,
+                gps_meta_key="clockInGpsMeta",
+            )
+        else:
+            # C3 is association-only.  A Site that changes after the initial
+            # read is not a reason to deny an otherwise valid legacy clock-in.
+            _c3_restore_target(
+                result,
+                snapshot,
+                gps_meta_key="clockInGpsMeta",
+            )
 
     def record_home_base_event(
         cur: Any,
@@ -14754,6 +14868,7 @@ def clock_in(
         employee,
         mutator,
         response_builder,
+        before_persist=re_resolve_customer_site_before_persist,
         after_response_saved=record_home_base_event,
     )
     if not ok:
@@ -15046,6 +15161,44 @@ def visit_candidates(
     }
 
 
+@app.post("/api/timesheet/site-resolution")
+def resolve_customer_site(
+    payload: SiteResolutionRequest,
+    request: Request,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Read a C3 customer-site association without changing a time record.
+
+    This deliberately returns only Sites whose current geofence contains the
+    sample.  It is not a searchable customer roster, and C3's default-off
+    response lets independently deployed portal versions keep their legacy
+    action flow until the server is deliberately enabled.
+    """
+    if not GEOFENCE_SITE_RESOLUTION_ENABLED:
+        return {"success": True, "enabled": False}
+    resolution = _c3_resolve_site(
+        payload.action,
+        payload,
+        employee,
+        reference_time=utc_now(),
+    )
+    public_resolution = _c3_public_resolution(resolution)
+    append_access_log(
+        request,
+        "SITE_RESOLUTION_LOADED",
+        True,
+        (
+            f"Employee {employee['name']} {payload.action} "
+            f"{public_resolution['state']}"
+        ),
+    )
+    return {
+        "success": True,
+        "enabled": True,
+        "resolution": public_resolution,
+    }
+
+
 @app.post("/api/timesheet/visit")
 def log_visit(
     payload: VisitRequest,
@@ -15059,11 +15212,27 @@ def log_visit(
     enforce_clock_action_hours(request)
     has_gps = payload.latitude is not None and payload.longitude is not None
     now_utc = utc_now()
-    explicit_site, planned_visit, selected_geofence, explicit_error = (
-        _resolve_explicit_visit_site(payload, employee, now_utc)
+    # C3 is intentionally separate from the established evidence route.  A
+    # legacy evidenceMethod keeps its complete planned-visit/evidence-event
+    # contract; only the additive no-evidenceMethod form participates in C3.
+    legacy_explicit_site = (
+        payload.evidenceMethod is not None or payload.plannedVisitId is not None
     )
+    if legacy_explicit_site:
+        explicit_site, planned_visit, selected_geofence, explicit_error = (
+            _resolve_explicit_visit_site(payload, employee, now_utc)
+        )
+    else:
+        explicit_site, planned_visit, selected_geofence, explicit_error = (
+            None,
+            None,
+            None,
+            None,
+        )
     if explicit_error:
         raise HTTPException(status_code=400, detail=explicit_error)
+    c3_mode = bool(GEOFENCE_SITE_RESOLUTION_ENABLED and not legacy_explicit_site)
+    site_resolution: Dict[str, Any] = {"resolution": None, "snapshot": None}
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
         stale_open = get_stale_open_entry(
@@ -15097,13 +15266,13 @@ def log_visit(
             location = str(payload.location or "").strip() or "Unknown"
             customer = timesheet_data.get("location_customers", {}).get(location, "")
 
-        # Avoid duplicate: skip if location matches the most recent visit
-        active_visit = get_active_visit(open_entry)
-        if active_visit and active_visit.get("location") == location:
-            return True, {
-                "alreadyHere": True,
-                "entryId": open_entry["id"],
-            }
+        if c3_mode:
+            site_resolution["resolution"] = _c3_resolve_site(
+                "arrive",
+                payload,
+                employee,
+                reference_time=now_utc,
+            )
 
         visit = {
             "arrivalTime": to_utc_iso(now_utc),
@@ -15147,12 +15316,88 @@ def log_visit(
         # changing the selected Site identity.
         if explicit_site is not None:
             visit["locationId"] = int(explicit_site["location_id"])
+        elif c3_mode:
+            site_resolution["snapshot"] = _c3_target_snapshot(
+                visit,
+                gps_meta_key="gpsMeta",
+            )
+            _c3_apply_site_resolution(
+                visit,
+                payload,
+                site_resolution["resolution"],
+                gps_meta_key="gpsMeta",
+            )
+
+        # Avoid duplicate: C3's candidate (when enabled) is the tentative
+        # visible target, then the persistence callback repeats this check with
+        # the transaction-authoritative target if it changed meanwhile.
+        active_visit = get_active_visit(open_entry)
+        if active_visit and active_visit.get("location") == visit["location"]:
+            return True, {
+                "alreadyHere": True,
+                "entryId": open_entry["id"],
+            }
 
         if not isinstance(open_entry.get("visits"), list):
             open_entry["visits"] = []
         open_entry["visits"].append(visit)
 
         return True, {"visit": visit, "entryId": open_entry["id"]}
+
+    def re_resolve_customer_site_before_persist(
+        cur: Any,
+        result: Dict[str, Any],
+        timesheet_data: Dict[str, Any],
+    ) -> None:
+        if not c3_mode or result.get("alreadyHere"):
+            return
+        visit = result.get("visit")
+        snapshot = site_resolution.get("snapshot")
+        if not isinstance(visit, dict) or not isinstance(snapshot, dict):
+            return
+        current_resolution = _c3_resolve_site(
+            "arrive",
+            payload,
+            employee,
+            cur=cur,
+            reference_time=now_utc,
+        )
+        site_resolution["resolution"] = current_resolution
+        if current_resolution.get("state") == "customer_site":
+            _c3_apply_site_resolution(
+                visit,
+                payload,
+                current_resolution,
+                gps_meta_key="gpsMeta",
+            )
+        else:
+            # C3 records a resolution when possible but is not C6 enforcement.
+            # A changed Site falls back to the exact legacy arrival target.
+            _c3_restore_target(visit, snapshot, gps_meta_key="gpsMeta")
+
+        entry = next(
+            (
+                candidate
+                for candidate in timesheet_data.get("entries", [])
+                if candidate.get("id") == result.get("entryId")
+            ),
+            None,
+        )
+        visits = entry.get("visits") if isinstance(entry, dict) else None
+        # ``visit`` is already appended to the pending entry.  Compare only
+        # against the previously active visit; otherwise every C3 arrival
+        # would incorrectly appear to duplicate itself at commit time.
+        prior_entry = (
+            {**entry, "visits": [candidate for candidate in visits if candidate is not visit]}
+            if isinstance(entry, dict) and isinstance(visits, list)
+            else entry
+        )
+        active_visit = get_active_visit(prior_entry) if isinstance(prior_entry, dict) else None
+        if active_visit and active_visit.get("location") == visit.get("location"):
+            if isinstance(visits, list) and visit in visits:
+                visits.remove(visit)
+            result.clear()
+            result.update({"alreadyHere": True, "entryId": entry["id"]})
 
     def record_explicit_visit_evidence(
         cur: Any,
@@ -15284,16 +15529,28 @@ def log_visit(
             "exceptionReason": payload.exceptionReason,
         }
 
+    def response_builder(
+        result: Dict[str, Any],
+        _timesheet_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        response: Dict[str, Any] = {
+            "success": True,
+            "alreadyHere": bool(result.get("alreadyHere")),
+            **result,
+        }
+        if c3_mode and site_resolution["resolution"]:
+            response["siteResolution"] = _c3_public_resolution(
+                site_resolution["resolution"]
+            )
+        return response
+
     ok, result = update_timesheets_for_plain_time_action(
         "arrive",
         payload,
         employee,
         mutator,
-        lambda result, _timesheet_data: {
-            "success": True,
-            "alreadyHere": bool(result.get("alreadyHere")),
-            **result,
-        },
+        response_builder,
+        before_persist=re_resolve_customer_site_before_persist if c3_mode else None,
         after_response_saved=record_explicit_visit_evidence,
     )
     if not ok:
@@ -16043,15 +16300,15 @@ def _geofence_state(
 
 
 def _location_business_eligible(row: Dict[str, Any]) -> bool:
-    """Geofence C1 (#213) report classifier: is this Site business-ELIGIBLE?
+    """Is this Site business-eligible under the C3 customer-site rule?
 
     Eligibility (the #215 rule) is separate from enforcement readiness. An active,
     approved EOM customer Site is Residential/Commercial, active, not archived,
     and -- when linked -- under an active, non-archived Customer. Unlinked legacy
     Sites stay eligible (flagged separately). Inactive, archived, non-EOM, or
     type-less Sites, and Sites under an inactive/archived Customer, are NOT
-    eligible. Read-side classifier for the readiness report only; it does not
-    resolve a clock-in target (that is #215).
+    eligible. This derived predicate is shared by the readiness report and C3
+    resolution so they cannot silently disagree about authorization.
     """
     if not bool(row.get("active")):
         return False
@@ -16065,6 +16322,429 @@ def _location_business_eligible(row: Dict[str, Any]) -> bool:
         if row.get("customer_archived_at") is not None:
             return False
     return True
+
+
+def _c3_rows_from_cursor(cur: Any) -> List[Dict[str, Any]]:
+    """Normalize tuple and RealDict cursors without changing write-cursor use."""
+    rows = cur.fetchall()
+    if not rows:
+        return []
+    if isinstance(rows[0], dict):
+        return [dict(row) for row in rows]
+    columns = [column[0] for column in (cur.description or [])]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def _c3_customer_site_rows(
+    payload: BaseModel,
+    *,
+    selected_location_id: Optional[int] = None,
+    cur: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    """Load only Sites that can resolve this GPS sample, or one explicit Site.
+
+    The eligible set is OPEN and DERIVED from ``locations`` at request time. An
+    unpinned Site is still eligible, but it cannot be an ``inside`` candidate;
+    explicit selection reads it by id so it cannot be mistaken for unauthorized.
+    ``cur`` makes the final action read lock the selected candidate rows before
+    persistence without converting the high-volume time writer to a dict cursor.
+    """
+    latitude = getattr(payload, "latitude", None)
+    longitude = getattr(payload, "longitude", None)
+    accuracy = getattr(payload, "accuracy", None)
+    if latitude is None or longitude is None or accuracy is None:
+        return []
+
+    if selected_location_id is None:
+        (
+            latitude_lower,
+            latitude_upper,
+            longitude_lower,
+            longitude_upper,
+            crosses_date_line,
+        ) = _site_check_in_coordinate_bounds(
+            float(latitude), float(longitude), float(accuracy)
+        )
+        longitude_predicate = (
+            "(l.lng >= %s OR l.lng <= %s)"
+            if crosses_date_line
+            else "l.lng BETWEEN %s AND %s"
+        )
+        where = f"""
+            l.lat IS NOT NULL
+            AND l.lng IS NOT NULL
+            AND l.lat BETWEEN %s AND %s
+            AND {longitude_predicate}
+        """
+        params: Tuple[Any, ...] = (
+            latitude_lower,
+            latitude_upper,
+            longitude_lower,
+            longitude_upper,
+        )
+    else:
+        where = "l.id = %s"
+        params = (int(selected_location_id),)
+
+    query = f"""
+        SELECT l.id AS location_id, l.address, l.customer_name,
+               COALESCE(NULLIF(c.name, ''), l.customer_name, '') AS canonical_customer_name,
+               l.location_type, l.lat, l.lng, l.geofence_radius_m,
+               l.active, l.archived_at, l.customer_id,
+               c.active AS customer_active, c.archived_at AS customer_archived_at
+        FROM locations l
+        LEFT JOIN customers c ON c.id = l.customer_id
+        WHERE {where}
+        ORDER BY l.id
+    """ + (" FOR SHARE OF l" if cur is not None else "")
+
+    if cur is None:
+        rows = [dict(row) for row in db.query_all(query, params)]
+    else:
+        cur.execute(query, params)
+        rows = _c3_rows_from_cursor(cur)
+        # ``FOR SHARE OF c`` cannot lock the nullable side of this outer join.
+        # Lock the actual linked parent separately after the Site row is locked;
+        # this makes the parent state used by eligibility authoritative too.
+        for row in rows:
+            customer_id = row.get("customer_id")
+            if customer_id is None:
+                continue
+            cur.execute(
+                "SELECT active, archived_at FROM customers WHERE id = %s FOR SHARE",
+                (int(customer_id),),
+            )
+            parent = _row_from_cursor(cur)
+            row["customer_active"] = parent.get("active") if parent else False
+            row["customer_archived_at"] = parent.get("archived_at") if parent else "missing"
+    return rows
+
+
+def _c3_site_geofence(site: Dict[str, Any], payload: BaseModel) -> Dict[str, Any]:
+    radius_m, radius_source = _effective_geofence_radius(site.get("geofence_radius_m"))
+    return evaluate_site_check_in_geofence(
+        site_latitude=(float(site["lat"]) if site.get("lat") is not None else None),
+        site_longitude=(float(site["lng"]) if site.get("lng") is not None else None),
+        latitude=getattr(payload, "latitude", None),
+        longitude=getattr(payload, "longitude", None),
+        accuracy=getattr(payload, "accuracy", None),
+        resolved_radius_m=radius_m,
+        radius_source=radius_source,
+    )
+
+
+def _c3_public_site(site: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "locationId": int(site["location_id"]),
+        "address": str(site.get("address") or ""),
+        "customerName": str(
+            site.get("canonical_customer_name") or site.get("customer_name") or ""
+        ),
+        "locationType": str(site.get("location_type") or ""),
+        "legacyUnlinked": site.get("customer_id") is None,
+    }
+
+
+def _c3_planned_inside_location_ids(
+    employee_id: int,
+    reference_time: datetime,
+    inside_location_ids: set[int],
+    *,
+    cur: Optional[Any] = None,
+) -> set[int]:
+    """Schedules can break an overlap tie, never add authorization."""
+    if not inside_location_ids:
+        return set()
+    if cur is None:
+        return {
+            int(row["location_id"])
+            for row in _scheduled_visit_candidates_for_employee(employee_id, reference_time)
+            if int(row["location_id"]) in inside_location_ids
+        }
+
+    # This is the write-transaction form of the scheduled-candidate query.
+    # C3 never requires a schedule to arrive, but when a schedule is the sole
+    # reason an overlap resolves automatically, lock every state input that
+    # made that tie-break valid before associating the Site.
+    from calendar_import_store import MORNING_CREW_NAME
+
+    range_start, range_end = _local_workday_bounds(reference_time)
+    local_day = reference_time.astimezone(APP_TIMEZONE).date()
+    cur.execute(
+        """
+        SELECT pv.id AS planned_visit_id, pv.location_id,
+               assignment.crew_id AS assignment_crew_id,
+               membership.id AS membership_id, l.location_type
+        FROM planned_service_visits pv
+        JOIN locations l ON l.id = pv.location_id AND l.active = true
+        JOIN planned_visit_assignments assignment
+          ON assignment.planned_visit_id = pv.id
+         AND assignment.active = true
+        LEFT JOIN crews assigned_crew
+          ON assigned_crew.id = assignment.crew_id
+         AND assigned_crew.active = true
+        LEFT JOIN crew_memberships membership
+          ON membership.crew_id = assigned_crew.id
+         AND membership.employee_id = %s
+         AND membership.effective_from <= %s
+         AND (
+             membership.effective_to IS NULL
+             OR membership.effective_to > %s
+         )
+        WHERE pv.status = 'planned'
+          AND pv.approximate_start < %s
+          AND pv.approximate_end > %s
+          AND pv.location_id = ANY(%s)
+          AND (
+              assignment.employee_id = %s
+              OR (
+                  membership.employee_id IS NOT NULL
+                  AND (
+                      l.location_type <> 'Residential'
+                      OR assigned_crew.name = %s
+                  )
+              )
+          )
+        ORDER BY pv.id, assignment.id
+        FOR SHARE OF pv, l, assignment
+        """,
+        (
+            int(employee_id),
+            local_day,
+            local_day,
+            range_end,
+            range_start,
+            sorted(int(location_id) for location_id in inside_location_ids),
+            int(employee_id),
+            MORNING_CREW_NAME,
+        ),
+    )
+    candidate_rows = _c3_rows_from_cursor(cur)
+    eligible_location_ids: set[int] = set()
+    for row in candidate_rows:
+        assignment_crew_id = row.get("assignment_crew_id")
+        if assignment_crew_id is None:
+            eligible_location_ids.add(int(row["location_id"]))
+            continue
+        membership_id = row.get("membership_id")
+        if membership_id is None:
+            continue
+        cur.execute(
+            """
+            SELECT membership.id
+            FROM crews assigned_crew
+            JOIN crew_memberships membership
+              ON membership.crew_id = assigned_crew.id
+            WHERE assigned_crew.id = %s
+              AND assigned_crew.active = true
+              AND membership.id = %s
+              AND membership.employee_id = %s
+              AND membership.effective_from <= %s
+              AND (
+                  membership.effective_to IS NULL
+                  OR membership.effective_to > %s
+              )
+              AND (
+                  %s <> 'Residential'
+                  OR assigned_crew.name = %s
+              )
+            FOR SHARE OF assigned_crew, membership
+            """,
+            (
+                int(assignment_crew_id),
+                int(membership_id),
+                int(employee_id),
+                local_day,
+                local_day,
+                str(row["location_type"]),
+                MORNING_CREW_NAME,
+            ),
+        )
+        if cur.fetchone() is not None:
+            eligible_location_ids.add(int(row["location_id"]))
+    return {
+        location_id
+        for location_id in eligible_location_ids
+        if location_id in inside_location_ids
+    }
+
+
+def _c3_resolve_site(
+    action: str,
+    payload: BaseModel,
+    employee: Dict[str, Any],
+    *,
+    cur: Optional[Any] = None,
+    reference_time: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Resolve a non-authorizing C3 target from live customer-site state.
+
+    The resolver does not consult ``find_nearest_location``.  Its candidate set
+    is OPEN/DERIVED from the canonical locations table; every member outside the
+    business-eligibility predicate is fail-closed for association.
+    """
+    latitude = getattr(payload, "latitude", None)
+    longitude = getattr(payload, "longitude", None)
+    accuracy = getattr(payload, "accuracy", None)
+    if latitude is None or longitude is None or accuracy is None:
+        return {"state": "unresolved", "reason": "missing_gps"}
+    reference_time = reference_time or utc_now()
+
+    if action == "clock-in":
+        home_base = _active_home_base_config(cur=cur)
+        home_base_geofence = _home_base_geofence_from_payload(home_base, payload)
+        if _home_base_gps_confirmed(home_base_geofence):
+            return {
+                "state": "home_base",
+                "source": "home_base",
+                "homeBase": home_base,
+                "geofence": home_base_geofence,
+            }
+
+    selected_location_id = getattr(payload, "locationId", None)
+    rows = _c3_customer_site_rows(
+        payload,
+        selected_location_id=(int(selected_location_id) if selected_location_id else None),
+        cur=cur,
+    )
+    eligible_rows = [row for row in rows if _location_business_eligible(row)]
+
+    if selected_location_id is not None:
+        selected = eligible_rows[0] if eligible_rows else None
+        if selected is None:
+            return {"state": "unresolved", "reason": "selected_site_ineligible"}
+        geofence = _c3_site_geofence(selected, payload)
+        if geofence["status"] != "inside":
+            return {"state": "unresolved", "reason": "selected_site_not_inside"}
+        return {
+            "state": "customer_site",
+            "source": "explicit",
+            "site": selected,
+            "geofence": geofence,
+        }
+
+    inside = [
+        (row, _c3_site_geofence(row, payload))
+        for row in eligible_rows
+    ]
+    inside = [(row, geofence) for row, geofence in inside if geofence["status"] == "inside"]
+    if len(inside) == 1:
+        row, geofence = inside[0]
+        return {
+            "state": "customer_site",
+            "source": "single_inside",
+            "site": row,
+            "geofence": geofence,
+        }
+    if len(inside) > 1:
+        planned_ids = _c3_planned_inside_location_ids(
+            int(employee["id"]),
+            reference_time,
+            {int(row["location_id"]) for row, _ in inside},
+            cur=cur,
+        )
+        planned = [(row, geofence) for row, geofence in inside if int(row["location_id"]) in planned_ids]
+        if len(planned) == 1:
+            row, geofence = planned[0]
+            return {
+                "state": "customer_site",
+                "source": "planned_tiebreak",
+                "site": row,
+                "geofence": geofence,
+            }
+        return {
+            "state": "selection_required",
+            "reason": "multiple_inside_sites",
+            "candidates": [row for row, _ in inside],
+        }
+    return {"state": "unresolved", "reason": "no_eligible_inside_site"}
+
+
+def _c3_public_resolution(resolution: Dict[str, Any]) -> Dict[str, Any]:
+    public: Dict[str, Any] = {
+        "state": str(resolution.get("state") or "unresolved"),
+    }
+    if resolution.get("source"):
+        public["source"] = str(resolution["source"])
+    if resolution.get("reason"):
+        public["reason"] = str(resolution["reason"])
+    if isinstance(resolution.get("site"), dict):
+        public["site"] = _c3_public_site(resolution["site"])
+    if isinstance(resolution.get("candidates"), list):
+        public["candidates"] = [
+            _c3_public_site(site)
+            for site in resolution["candidates"]
+            if isinstance(site, dict)
+        ]
+    return public
+
+
+def _c3_site_gps_meta(
+    payload: BaseModel,
+    resolution: Dict[str, Any],
+) -> Dict[str, Any]:
+    site = resolution["site"]
+    geofence = resolution["geofence"]
+    return {
+        "override": bool(str(getattr(payload, "gpsOverrideReason", "") or "").strip()),
+        "overrideReason": str(getattr(payload, "gpsOverrideReason", "") or "").strip(),
+        "overrideDetail": str(getattr(payload, "gpsOverrideDetail", "") or "").strip(),
+        "matchedLocation": str(site.get("address") or ""),
+        "distanceM": geofence.get("distanceM"),
+        "withinRadius": True,
+        "accuracyM": geofence.get("accuracyM"),
+        "selectedSite": resolution.get("source") == "explicit",
+        "siteResolutionSource": resolution.get("source"),
+        "legacyUnlinked": site.get("customer_id") is None,
+    }
+
+
+def _c3_apply_site_resolution(
+    target: Dict[str, Any],
+    payload: BaseModel,
+    resolution: Dict[str, Any],
+    *,
+    gps_meta_key: str,
+) -> None:
+    """Apply only a confirmed customer Site; unresolved remains observational."""
+    if resolution.get("state") != "customer_site":
+        return
+    site = resolution["site"]
+    target["location"] = str(site.get("address") or "")
+    target["customer"] = str(
+        site.get("canonical_customer_name") or site.get("customer_name") or ""
+    )
+    target["locationId"] = int(site["location_id"])
+    target[gps_meta_key] = _c3_site_gps_meta(payload, resolution)
+
+
+def _c3_target_snapshot(
+    target: Dict[str, Any],
+    *,
+    gps_meta_key: str,
+) -> Dict[str, Any]:
+    """Preserve the exact dormant-path target for a final C3 re-resolution."""
+    keys = ("location", "customer", "locationId", gps_meta_key)
+    return {
+        key: target.get(key)
+        for key in keys
+    } | {
+        f"{key}Present": key in target
+        for key in keys
+    }
+
+
+def _c3_restore_target(
+    target: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    *,
+    gps_meta_key: str,
+) -> None:
+    for key in ("location", "customer", "locationId", gps_meta_key):
+        if snapshot.get(f"{key}Present"):
+            target[key] = snapshot.get(key)
+        else:
+            target.pop(key, None)
 
 
 def _location_geofence_state(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -21139,6 +21819,10 @@ def timesheet_current_status(
     append_access_log(request, "CURRENT_STATUS_SUCCESS", True, f"{len(response_rows)} employees working")
     return {
         "success": True,
+        # Additive capability negotiation: portal builds released before C3
+        # simply ignore it, while a C3 portal keeps the legacy flow unless the
+        # server owner has explicitly enabled customer-site resolution.
+        "siteResolutionEnabled": bool(GEOFENCE_SITE_RESOLUTION_ENABLED),
         "currentlyWorking": response_rows,
         "staleOpenShift": stale_open_shift,
         "staleOpenShifts": stale_open_shifts,
