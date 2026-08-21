@@ -501,6 +501,8 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
                 "longitude": None,
                 "accuracyM": None,
                 "geofenceRadiusM": None,
+                "radiusSource": None,
+                "maxAccuracyPolicyM": None,
                 "distanceM": None,
                 "geofenceStatus": None,
                 "idempotencyKey": None,
@@ -529,6 +531,13 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
                 "geofenceStatus": "inside",
                 "distanceM": 0.0,
                 "accuracyM": 5.0,
+                # Geofence C2 (#214): resolved-policy snapshot preserved in the archive.
+                # This fixture inserts the evidence row directly with only the pre-C2
+                # columns, so the new snapshot fields are NULL -- the archive faithfully
+                # carries them through (a real arrival would populate them).
+                "geofenceRadiusM": None,
+                "radiusSource": None,
+                "maxAccuracyPolicyM": None,
                 "createdAt": archived_qr_shift["visitEvidenceEvents"][0]["createdAt"],
             }
         ]

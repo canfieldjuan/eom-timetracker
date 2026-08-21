@@ -270,6 +270,14 @@ SITE_CHECK_IN_QR_VERSION = "eom1"
 HOME_BASE_QR_VERSION = "eom-home-base-v1"
 SITE_CHECK_IN_RADIUS_M = SITE_CHECK_IN_RADIUS_DEFAULT_M
 SITE_CHECK_IN_MAX_ACCURACY_M = SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M
+# Geofence C2 (#214): whether the C1 per-site radius reaches the shared evaluator.
+# Default OFF -- with it off, the effective radius is the global fallback for every
+# entity (per-site overrides are inert), so C1 config + C2 wiring ship dormant with
+# zero behavior change. Flipping it on (a later, deliberately-tested step) makes the
+# per-site radius govern the decision. This is NOT #218's hard-enforcement kill
+# switch: it only chooses WHICH radius the evaluator uses, never whether an action
+# is gated. Env-resolved below.
+GEOFENCE_PER_SITE_RADIUS_ENABLED = False
 SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = SITE_CHECK_IN_SCHEDULE_WINDOW_DEFAULT_HOURS
 SITE_CHECK_IN_DEVICE_SKEW_SECONDS = SITE_CHECK_IN_DEVICE_SKEW_DEFAULT_SECONDS
 SITE_CHECK_IN_RECONCILIATION_GAP_MINUTES = (
@@ -404,17 +412,65 @@ def evaluate_site_check_in_geofence(
     *,
     site_latitude: Optional[float],
     site_longitude: Optional[float],
-    latitude: float,
-    longitude: float,
-    accuracy: float,
+    latitude: Optional[float],
+    longitude: Optional[float],
+    accuracy: Optional[float],
+    resolved_radius_m: Optional[int] = None,
+    radius_source: Optional[str] = None,
+    max_accuracy_policy_m: Optional[int] = None,
 ) -> Dict[str, Any]:
-    if site_latitude is None or site_longitude is None:
+    """Canonical accuracy-aware geofence evaluator (Geofence C2, #214).
+
+    Radius-parameterized so ONE function is the sole geometry authority. The
+    caller resolves the EFFECTIVE radius with ``_effective_geofence_radius`` (which
+    honors the C1 per-site override only when enforcement is enabled -- see that
+    helper) and passes it here. Defaulting the three new params to the module
+    globals keeps every existing caller byte-for-byte: the four original result
+    keys and the decision math are unchanged, and the three additive keys simply
+    echo the policy that governed the decision (for the immutable event snapshot).
+    """
+    effective_radius_m = (
+        int(resolved_radius_m)
+        if resolved_radius_m is not None
+        else int(SITE_CHECK_IN_RADIUS_M)
+    )
+    effective_source = radius_source if radius_source is not None else "global_fallback"
+    effective_max_accuracy_m = (
+        int(max_accuracy_policy_m)
+        if max_accuracy_policy_m is not None
+        else int(SITE_CHECK_IN_MAX_ACCURACY_M)
+    )
+
+    def _finite(value: Any) -> bool:
+        return isinstance(value, (int, float)) and math.isfinite(value)
+
+    def _result(
+        status: str,
+        distance_m: Optional[float],
+        accuracy_out: Optional[float],
+    ) -> Dict[str, Any]:
         return {
-            "status": "site_unpinned",
-            "distanceM": None,
-            "radiusM": SITE_CHECK_IN_RADIUS_M,
-            "accuracyM": round(float(accuracy), 2),
+            "status": status,
+            "distanceM": distance_m,
+            "radiusM": effective_radius_m,
+            "accuracyM": accuracy_out,
+            # Additive (C2): the resolved policy that governed this decision, for the
+            # immutable per-event snapshot. Ignored by pre-C2 consumers.
+            "resolvedRadiusM": effective_radius_m,
+            "radiusSource": effective_source,
+            "maxAccuracyPolicyM": effective_max_accuracy_m,
         }
+
+    # Missing/invalid device GPS: no fix, nothing can be decided. Unreachable by
+    # today's callers (all guard device coords upstream and pass finite floats), so
+    # this outcome is additive and changes no current behavior.
+    if not (_finite(latitude) and _finite(longitude) and _finite(accuracy)):
+        return _result(
+            "missing_gps", None, round(float(accuracy), 2) if _finite(accuracy) else None
+        )
+
+    if site_latitude is None or site_longitude is None:
+        return _result("site_unpinned", None, round(float(accuracy), 2))
 
     distance_m = haversine_m(
         latitude,
@@ -423,21 +479,16 @@ def evaluate_site_check_in_geofence(
         float(site_longitude),
     )
     accuracy_m = float(accuracy)
-    if accuracy_m > SITE_CHECK_IN_MAX_ACCURACY_M:
+    if accuracy_m > effective_max_accuracy_m:
         geofence_status = "low_accuracy"
-    elif distance_m + accuracy_m <= SITE_CHECK_IN_RADIUS_M:
+    elif distance_m + accuracy_m <= effective_radius_m:
         geofence_status = "inside"
-    elif distance_m - accuracy_m > SITE_CHECK_IN_RADIUS_M:
+    elif distance_m - accuracy_m > effective_radius_m:
         geofence_status = "outside"
     else:
         geofence_status = "uncertain"
 
-    return {
-        "status": geofence_status,
-        "distanceM": round(distance_m, 2),
-        "radiusM": SITE_CHECK_IN_RADIUS_M,
-        "accuracyM": round(accuracy_m, 2),
-    }
+    return _result(geofence_status, round(distance_m, 2), round(accuracy_m, 2))
 
 
 def _site_check_in_coordinate_bounds(
@@ -451,7 +502,11 @@ def _site_check_in_coordinate_bounds(
     coarse, indexable superset, so it must include the configured radius plus
     the reported device accuracy and cope with the international date line.
     """
-    envelope_m = float(SITE_CHECK_IN_RADIUS_M) + max(float(accuracy), 0.0)
+    # C2 (#214): size the box to the LARGEST radius any candidate could resolve to
+    # under the current enforcement gate, so it stays a conservative superset of the
+    # exact haversine circle for every per-site radius. Gate OFF -> this equals the
+    # global radius, so the box is byte-for-byte identical to pre-C2.
+    envelope_m = float(_max_effective_geofence_radius_m()) + max(float(accuracy), 0.0)
     # This is intentionally lower than a degree's distance under the same
     # spherical radius used by ``haversine_m``.  Dividing by the lower value
     # makes the box a superset instead of allowing a boundary point to fall
@@ -3874,6 +3929,10 @@ SITE_CHECK_IN_MAX_ACCURACY_M = max(
         SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M,
     ),
 )
+# Geofence C2 (#214): per-site-radius rollout switch, default OFF (see constant above).
+GEOFENCE_PER_SITE_RADIUS_ENABLED = parse_bool(
+    os.getenv("GEOFENCE_PER_SITE_RADIUS_ENABLED"), False
+)
 SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = max(
     1,
     parse_int(
@@ -6237,6 +6296,26 @@ def _ensure_home_base_schema() -> None:
             ALTER COLUMN gps_override_reason TYPE TEXT
         """
     )
+    # Geofence C2 (#214): immutable per-event snapshot of the resolved geofence
+    # policy that governed the decision. The resolved radius reuses the existing
+    # geofence_radius_m column (event rows are write-once) -- visit_evidence_events
+    # is the only event table that lacked one, so add it here. All nullable:
+    # retro-added to tables with existing history; new rows always populate them.
+    db.execute(
+        "ALTER TABLE home_base_events ADD COLUMN IF NOT EXISTS radius_source VARCHAR(32)"
+    )
+    db.execute(
+        "ALTER TABLE home_base_events ADD COLUMN IF NOT EXISTS max_accuracy_policy_m INTEGER"
+    )
+    db.execute(
+        "ALTER TABLE visit_evidence_events ADD COLUMN IF NOT EXISTS geofence_radius_m INTEGER"
+    )
+    db.execute(
+        "ALTER TABLE visit_evidence_events ADD COLUMN IF NOT EXISTS radius_source VARCHAR(32)"
+    )
+    db.execute(
+        "ALTER TABLE visit_evidence_events ADD COLUMN IF NOT EXISTS max_accuracy_policy_m INTEGER"
+    )
     db.execute(
         """
         DO $$
@@ -6749,6 +6828,19 @@ def _ensure_schema_migrations() -> None:
         ADD COLUMN IF NOT EXISTS schedule_rule_id
             BIGINT REFERENCES site_check_in_schedule_rules(id) ON DELETE SET NULL
     """)
+    # Geofence C2 (#214): immutable per-event snapshot of the resolved policy that
+    # governed the geofence decision. The resolved radius reuses the existing
+    # geofence_radius_m column (event rows are write-once); only the source +
+    # max-accuracy policy are new. Nullable: retro-added over existing history,
+    # always populated on new rows. site_check_ins exists above; the matching
+    # site_qr_action_receipts ALTERs live right after THAT table's CREATE below,
+    # so a from-scratch migration never ALTERs a not-yet-created table.
+    db.execute(
+        "ALTER TABLE site_check_ins ADD COLUMN IF NOT EXISTS radius_source VARCHAR(32)"
+    )
+    db.execute(
+        "ALTER TABLE site_check_ins ADD COLUMN IF NOT EXISTS max_accuracy_policy_m INTEGER"
+    )
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_site_check_in_schedules_lookup
         ON site_check_in_schedules(employee_id, location_id, scheduled_start)
@@ -6999,6 +7091,15 @@ def _ensure_schema_migrations() -> None:
         CREATE INDEX IF NOT EXISTS idx_site_qr_action_receipts_shift
         ON site_qr_action_receipts(shift_id, server_recorded_at DESC)
     """)
+    # Geofence C2 (#214): snapshot columns for site_qr_action_receipts, placed AFTER
+    # its CREATE so a from-scratch migration never ALTERs a not-yet-created table
+    # (the site_check_ins equivalents live after that table's CREATE above).
+    db.execute(
+        "ALTER TABLE site_qr_action_receipts ADD COLUMN IF NOT EXISTS radius_source VARCHAR(32)"
+    )
+    db.execute(
+        "ALTER TABLE site_qr_action_receipts ADD COLUMN IF NOT EXISTS max_accuracy_policy_m INTEGER"
+    )
     db.execute("""
         CREATE TABLE IF NOT EXISTS plain_time_action_receipts (
             id                    BIGSERIAL PRIMARY KEY,
@@ -7805,6 +7906,9 @@ def _home_base_geofence_from_payload(
     accuracy = getattr(payload, "accuracy", None)
     if latitude is None or longitude is None or accuracy is None:
         return None
+    resolved_radius_m, radius_source = _effective_geofence_radius(
+        policy.get("geofence_radius_m")
+    )
     return evaluate_site_check_in_geofence(
         site_latitude=(
             float(policy["latitude"])
@@ -7819,6 +7923,8 @@ def _home_base_geofence_from_payload(
         latitude=latitude,
         longitude=longitude,
         accuracy=accuracy,
+        resolved_radius_m=resolved_radius_m,
+        radius_source=radius_source,
     )
 
 
@@ -7854,7 +7960,7 @@ def _resolve_home_base_qr(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     query = """
         SELECT id AS home_base_id, label, address, latitude, longitude,
-               check_in_token_nonce, check_in_token_rotated_at
+               check_in_token_nonce, check_in_token_rotated_at, geofence_radius_m
         FROM home_bases
         WHERE id = %s AND active = true
     """ + (" FOR UPDATE" if for_update else "")
@@ -7933,11 +8039,12 @@ def _record_home_base_event(
         INSERT INTO home_base_events (
             shift_id, employee_id, home_base_id, home_base_policy_id,
             action, outcome, exception_reason, recorded_at,
-            latitude, longitude, accuracy_m, geofence_radius_m, distance_m,
+            latitude, longitude, accuracy_m, geofence_radius_m,
+            radius_source, max_accuracy_policy_m, distance_m,
             geofence_status, idempotency_key, request_fingerprint
         ) VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         )
         RETURNING id
         """,
@@ -7958,6 +8065,8 @@ def _record_home_base_event(
             longitude,
             accuracy,
             geofence.get("radiusM") if geofence else None,
+            geofence.get("radiusSource") if geofence else None,
+            geofence.get("maxAccuracyPolicyM") if geofence else None,
             geofence.get("distanceM") if geofence else None,
             geofence.get("status") if geofence else None,
             str(idempotency_key) if idempotency_key else None,
@@ -7997,7 +8106,7 @@ def _scheduled_visit_candidates_for_employee(
         SELECT DISTINCT pv.id AS planned_visit_id, pv.location_id,
                pv.migrated_job_id AS job_id, pv.approximate_start,
                pv.approximate_end, l.address, l.customer_name, l.location_type,
-               l.lat, l.lng
+               l.lat, l.lng, l.geofence_radius_m
         FROM planned_service_visits pv
         JOIN locations l ON l.id = pv.location_id AND l.active = true
         WHERE pv.status = 'planned'
@@ -8091,7 +8200,7 @@ def _eligible_planned_visit(
             SELECT pv.id AS planned_visit_id, pv.location_id,
                    pv.migrated_job_id AS job_id, pv.approximate_start,
                    pv.approximate_end, l.address, l.customer_name,
-                   l.location_type, l.lat, l.lng,
+                   l.location_type, l.lat, l.lng, l.geofence_radius_m,
                    assignment.crew_id AS assignment_crew_id,
                    membership.id AS membership_id
             FROM planned_service_visits pv
@@ -8290,7 +8399,8 @@ def _resolve_explicit_visit_site(
         if payload.plannedVisitId is not None:
             return None, None, None, "An unplanned visit cannot use a scheduled visit id"
         site_query = """
-            SELECT id AS location_id, address, customer_name, location_type, lat, lng
+            SELECT id AS location_id, address, customer_name, location_type, lat, lng,
+                   geofence_radius_m
             FROM locations
             WHERE id = %s AND active = true
         """
@@ -8310,12 +8420,17 @@ def _resolve_explicit_visit_site(
     assert site is not None
     assert payload.latitude is not None and payload.longitude is not None
     assert payload.accuracy is not None
+    resolved_radius_m, radius_source = _effective_geofence_radius(
+        site.get("geofence_radius_m")
+    )
     geofence = evaluate_site_check_in_geofence(
         site_latitude=float(site["lat"]) if site.get("lat") is not None else None,
         site_longitude=float(site["lng"]) if site.get("lng") is not None else None,
         latitude=payload.latitude,
         longitude=payload.longitude,
         accuracy=payload.accuracy,
+        resolved_radius_m=resolved_radius_m,
+        radius_source=radius_source,
     )
     if geofence["status"] != "inside":
         # Unlike a scheduled Site, an unplanned Residential exception has no
@@ -8346,12 +8461,17 @@ def _serialize_visit_candidate(
     candidate: Dict[str, Any],
     payload: VisitCandidatesRequest,
 ) -> Dict[str, Any]:
+    resolved_radius_m, radius_source = _effective_geofence_radius(
+        candidate.get("geofence_radius_m")
+    )
     geofence = evaluate_site_check_in_geofence(
         site_latitude=(float(candidate["lat"]) if candidate.get("lat") is not None else None),
         site_longitude=(float(candidate["lng"]) if candidate.get("lng") is not None else None),
         latitude=payload.latitude,
         longitude=payload.longitude,
         accuracy=payload.accuracy,
+        resolved_radius_m=resolved_radius_m,
+        radius_source=radius_source,
     )
     return {
         "plannedVisitId": int(candidate["planned_visit_id"]),
@@ -8379,7 +8499,7 @@ def _resolve_site_check_in_qr(
 
     query = """
         SELECT id, address, customer_name, location_type, lat, lng, check_in_token_nonce,
-               check_in_token_rotated_at
+               check_in_token_rotated_at, geofence_radius_m
         FROM locations
         WHERE id = %s AND active = true
         """ + (" FOR UPDATE" if for_update else "")
@@ -9740,14 +9860,15 @@ def _insert_site_arrival_evidence(
         INSERT INTO site_check_ins (
             employee_id, location_id, job_id, server_checked_in_at,
             device_scanned_at, latitude, longitude, accuracy_m,
-            geofence_radius_m, distance_m, geofence_status,
+            geofence_radius_m, radius_source, max_accuracy_policy_m,
+            distance_m, geofence_status,
             classification, classification_reason, schedule_id,
             schedule_rule_id, arrival_policy_revision_id,
             arrival_policy_snapshot, scheduled_start, grace_minutes,
             device_clock_skew_seconds, review_status
         )
         VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         )
         ON CONFLICT (employee_id, location_id, device_scanned_at)
@@ -9764,6 +9885,8 @@ def _insert_site_arrival_evidence(
             payload.longitude,
             payload.accuracy,
             geofence["radiusM"],
+            geofence.get("radiusSource"),
+            geofence.get("maxAccuracyPolicyM"),
             geofence["distanceM"],
             geofence["status"],
             classification,
@@ -11266,6 +11389,9 @@ def _record_explicit_site_action(
             if payload.action == "arrive":
                 enforce_clock_action_hours(request)
 
+            resolved_radius_m, radius_source = _effective_geofence_radius(
+                site.get("geofence_radius_m")
+            )
             geofence = evaluate_site_check_in_geofence(
                 site_latitude=(
                     float(site["lat"]) if site.get("lat") is not None else None
@@ -11276,6 +11402,8 @@ def _record_explicit_site_action(
                 latitude=payload.latitude,
                 longitude=payload.longitude,
                 accuracy=payload.accuracy,
+                resolved_radius_m=resolved_radius_m,
+                radius_source=radius_source,
             )
             records_time_event = geofence["status"] == "inside"
             outcome = (
@@ -11438,13 +11566,14 @@ def _record_explicit_site_action(
                     employee_id, location_id, shift_id, action,
                     idempotency_key, request_fingerprint, server_recorded_at,
                     device_scanned_at, latitude, longitude, accuracy_m,
-                    geofence_radius_m, distance_m, geofence_status, outcome,
+                    geofence_radius_m, radius_source, max_accuracy_policy_m,
+                    distance_m, geofence_status, outcome,
                     site_check_in_id, visit_id, departure_id,
                     missing_departure_visit_ids, response_body
                 )
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 """,
                 (
@@ -11460,6 +11589,8 @@ def _record_explicit_site_action(
                     payload.longitude,
                     payload.accuracy,
                     geofence["radiusM"],
+                    geofence.get("radiusSource"),
+                    geofence.get("maxAccuracyPolicyM"),
                     geofence["distanceM"],
                     geofence["status"],
                     outcome,
@@ -11859,6 +11990,9 @@ def record_home_base_scan(
     policy = _active_home_base_config()
     if not policy or int(policy["home_base_id"]) != int(home_base["home_base_id"]):
         raise HTTPException(status_code=403, detail="Home Base is not active")
+    resolved_radius_m, radius_source = _effective_geofence_radius(
+        home_base.get("geofence_radius_m")
+    )
     geofence = evaluate_site_check_in_geofence(
         site_latitude=(
             float(home_base["latitude"])
@@ -11873,6 +12007,8 @@ def record_home_base_scan(
         latitude=payload.latitude,
         longitude=payload.longitude,
         accuracy=payload.accuracy,
+        resolved_radius_m=resolved_radius_m,
+        radius_source=radius_source,
     )
     if geofence["status"] != "inside":
         raise HTTPException(
@@ -11922,7 +12058,11 @@ def record_home_base_scan(
         # Base without rotating the nonce, so a still-valid token may now point
         # at different coordinates. Recompute the geofence from the row this
         # lookup just returned rather than the one the preflight saw, or a
-        # worker standing at the former location still buys paid time.
+        # worker standing at the former location still buys paid time. Resolve the
+        # radius from this same locked row too (not the preflight value).
+        current_radius_m, current_radius_source = _effective_geofence_radius(
+            current_home_base.get("geofence_radius_m")
+        )
         current_geofence = evaluate_site_check_in_geofence(
             site_latitude=(
                 float(current_home_base["latitude"])
@@ -11937,6 +12077,8 @@ def record_home_base_scan(
             latitude=payload.latitude,
             longitude=payload.longitude,
             accuracy=payload.accuracy,
+            resolved_radius_m=current_radius_m,
+            radius_source=current_radius_source,
         )
         if current_geofence["status"] != "inside":
             return False, (
@@ -12120,6 +12262,9 @@ def record_site_check_in(
                 )
 
             official_time = utc_now()
+            resolved_radius_m, radius_source = _effective_geofence_radius(
+                site.get("geofence_radius_m")
+            )
             geofence = evaluate_site_check_in_geofence(
                 site_latitude=(
                     float(site["lat"]) if site.get("lat") is not None else None
@@ -12130,6 +12275,8 @@ def record_site_check_in(
                 latitude=payload.latitude,
                 longitude=payload.longitude,
                 accuracy=payload.accuracy,
+                resolved_radius_m=resolved_radius_m,
+                radius_source=radius_source,
             )
             job, job_match_reason = _matching_canonical_site_job(
                 int(site["id"]),
@@ -12179,7 +12326,8 @@ def record_site_check_in(
                 INSERT INTO site_check_ins (
                     employee_id, location_id, job_id, server_checked_in_at,
                     device_scanned_at, latitude, longitude, accuracy_m,
-                    geofence_radius_m, distance_m, geofence_status,
+                    geofence_radius_m, radius_source, max_accuracy_policy_m,
+                    distance_m, geofence_status,
                     classification, classification_reason, schedule_id,
                     schedule_rule_id, arrival_policy_revision_id,
                     arrival_policy_snapshot, scheduled_start, grace_minutes,
@@ -12189,7 +12337,7 @@ def record_site_check_in(
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s,
                     %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (employee_id, location_id, device_scanned_at)
                 DO NOTHING
@@ -12205,6 +12353,8 @@ def record_site_check_in(
                     payload.longitude,
                     payload.accuracy,
                     geofence["radiusM"],
+                    geofence.get("radiusSource"),
+                    geofence.get("maxAccuracyPolicyM"),
                     geofence["distanceM"],
                     geofence["status"],
                     classification,
@@ -14348,7 +14498,11 @@ def clock_in(
             latitude=payload.latitude,
             longitude=payload.longitude,
             accuracy=payload.accuracy,
-            geofence=home_base["geofence"] if outcome == "recorded" else None,
+            # Geofence C2 (#214): record the evaluated geofence whenever one exists,
+            # including for a documented exception -- that snapshot is the immutable
+            # record of the policy + result that caused GPS confirmation to fail.
+            # None only when no geofence was evaluated (e.g. missing GPS).
+            geofence=home_base["geofence"],
             idempotency_key=payload.idempotencyKey,
             request_fingerprint=(
                 _plain_time_action_request_fingerprint("clock-in", payload)
@@ -14589,7 +14743,8 @@ def visit_candidates(
 
     nearby_rows = db.query_all(
         f"""
-        SELECT id AS location_id, address, customer_name, location_type, lat, lng
+        SELECT id AS location_id, address, customer_name, location_type, lat, lng,
+               geofence_radius_m
         FROM locations
         WHERE active = true
           AND location_type = 'Residential'
@@ -14610,12 +14765,17 @@ def visit_candidates(
     for row in nearby_rows:
         if int(row["location_id"]) in scheduled_location_ids:
             continue
+        resolved_radius_m, radius_source = _effective_geofence_radius(
+            row.get("geofence_radius_m")
+        )
         geofence = evaluate_site_check_in_geofence(
             site_latitude=float(row["lat"]),
             site_longitude=float(row["lng"]),
             latitude=payload.latitude,
             longitude=payload.longitude,
             accuracy=payload.accuracy,
+            resolved_radius_m=resolved_radius_m,
+            radius_source=radius_source,
         )
         # An unplanned exception remains bounded to a physically confirmed,
         # pinned home. Overlapping pins are deliberately returned separately so
@@ -14847,8 +15007,9 @@ def log_visit(
                 visit_id, shift_id, employee_id, location_id, planned_visit_id,
                 evidence_method, exception_reason, exception_detail,
                 gps_override_reason, gps_override_detail,
-                geofence_status, distance_m, accuracy_m
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                geofence_status, distance_m, accuracy_m,
+                geofence_radius_m, radius_source, max_accuracy_policy_m
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -14871,6 +15032,12 @@ def log_visit(
                 current_geofence["status"],
                 current_geofence.get("distanceM"),
                 current_geofence.get("accuracyM"),
+                # radiusM == resolvedRadiusM (C2): the resolved-radius snapshot for
+                # this event, alongside the source + max-accuracy policy that
+                # governed the same decision above.
+                current_geofence.get("radiusM"),
+                current_geofence.get("radiusSource"),
+                current_geofence.get("maxAccuracyPolicyM"),
             ),
         )
         row = _row_from_cursor(cur)
@@ -15423,6 +15590,45 @@ def _resolve_geofence_radius_m(configured_radius_m: Any) -> Tuple[int, str]:
     if configured_radius_m is not None:
         return int(configured_radius_m), "per_site"
     return int(SITE_CHECK_IN_RADIUS_M), "global_fallback"
+
+
+def _effective_geofence_radius(configured_radius_m: Any) -> Tuple[int, str]:
+    """Geofence C2 (#214) rollout gate over C1's ``_resolve_geofence_radius_m``.
+
+    This is the ONLY radius the evaluator's decision and the event snapshot should
+    use. It is deliberately distinct from the read-side ``_geofence_state`` (which
+    always reports configured intent/readiness on the ungated resolver):
+
+    - ``GEOFENCE_PER_SITE_RADIUS_ENABLED`` OFF (default): return the global fallback
+      for EVERY entity -- per-site overrides are inert -- so the live decision and
+      the stored snapshot are byte-for-byte identical to pre-C2 for NULL and
+      override sites alike.
+    - ON: honor the C1 per-site value, clamped to the business max
+      ``GEOFENCE_RADIUS_MAX_M`` so a grandfathered out-of-bounds override cannot
+      produce an unbounded geofence (the bounding box is sized to the same clamp).
+
+    This only chooses WHICH radius governs; it never gates an action (that is #218).
+    ``source`` stays in the existing ``{'per_site', 'global_fallback'}`` vocabulary
+    and always names the quantity that actually governed the decision.
+    """
+    resolved, source = _resolve_geofence_radius_m(configured_radius_m)
+    if not GEOFENCE_PER_SITE_RADIUS_ENABLED:
+        return int(SITE_CHECK_IN_RADIUS_M), "global_fallback"
+    if source == "per_site":
+        resolved = min(int(resolved), GEOFENCE_RADIUS_MAX_M)
+    return int(resolved), source
+
+
+def _max_effective_geofence_radius_m() -> int:
+    """Largest radius any candidate can resolve to under the current C2 gate.
+
+    Used to size the candidate bounding box so it stays a conservative superset of
+    the exact haversine circle for every per-site radius. Must be >= the radius the
+    evaluator can decide with (which clamps a per-site override to the same max).
+    """
+    if not GEOFENCE_PER_SITE_RADIUS_ENABLED:
+        return int(SITE_CHECK_IN_RADIUS_M)
+    return max(int(SITE_CHECK_IN_RADIUS_M), GEOFENCE_RADIUS_MAX_M)
 
 
 def geofence_geometry_fingerprint_payload(
@@ -20745,6 +20951,10 @@ def _correction_shift_snapshots(
             event.longitude,
             event.accuracy_m,
             event.geofence_radius_m,
+            -- Geofence C2 (#214): preserve the full resolved-policy snapshot; the
+            -- home_base_events row cascade-deletes with the shift on correction.
+            event.radius_source,
+            event.max_accuracy_policy_m,
             event.distance_m,
             event.geofence_status,
             event.idempotency_key,
@@ -20779,6 +20989,12 @@ def _correction_shift_snapshots(
             evidence.geofence_status,
             evidence.distance_m,
             evidence.accuracy_m,
+            -- Geofence C2 (#214): the resolved-policy snapshot is part of the
+            -- acceptance rationale, and the evidence row cascade-deletes with the
+            -- shift, so the archive must carry it too or a corrected shift loses it.
+            evidence.geofence_radius_m,
+            evidence.radius_source,
+            evidence.max_accuracy_policy_m,
             evidence.created_at
         FROM visit_evidence_events evidence
         WHERE evidence.shift_id = ANY(%s)
@@ -20954,6 +21170,17 @@ def _correction_shift_snapshots(
                 if row.get("geofence_radius_m") is not None
                 else None
             ),
+            # Geofence C2 (#214): preserve the resolved-policy snapshot in the archive.
+            "radiusSource": (
+                str(row["radius_source"])
+                if row.get("radius_source") is not None
+                else None
+            ),
+            "maxAccuracyPolicyM": (
+                int(row["max_accuracy_policy_m"])
+                if row.get("max_accuracy_policy_m") is not None
+                else None
+            ),
             "distanceM": (
                 float(row["distance_m"])
                 if row.get("distance_m") is not None
@@ -20996,6 +21223,22 @@ def _correction_shift_snapshots(
             "accuracyM": (
                 float(row["accuracy_m"])
                 if row.get("accuracy_m") is not None
+                else None
+            ),
+            # Geofence C2 (#214): preserve the resolved-policy snapshot in the archive.
+            "geofenceRadiusM": (
+                int(row["geofence_radius_m"])
+                if row.get("geofence_radius_m") is not None
+                else None
+            ),
+            "radiusSource": (
+                str(row["radius_source"])
+                if row.get("radius_source") is not None
+                else None
+            ),
+            "maxAccuracyPolicyM": (
+                int(row["max_accuracy_policy_m"])
+                if row.get("max_accuracy_policy_m") is not None
                 else None
             ),
             "createdAt": to_utc_iso(row["created_at"]),
