@@ -122,7 +122,7 @@ def test_defaults_reproduce_global_policy():
     assert r["maxAccuracyPolicyM"] == int(api.SITE_CHECK_IN_MAX_ACCURACY_M)
 
 
-# ---- Area-B algebraic equivalence -----------------------------------------
+# ---- Area-B compatibility wrapper: boundary + output equivalence (#214) -----
 
 def test_nearest_match_equals_evaluator_zero_accuracy_projection():
     """find_nearest_location_match's binary withinRadius is exactly the evaluator
@@ -142,6 +142,42 @@ def test_nearest_match_equals_evaluator_zero_accuracy_projection():
         resolved_radius_m=api.LOCATION_MATCH_RADIUS_M,
     )
     assert match["withinRadius"] == (ev["status"] == "inside")
+
+
+def test_nearest_match_output_shape_and_raw_distance_unchanged():
+    """Output equivalence: the wrapper returns exactly {location, distanceM,
+    withinRadius}, and distanceM is the RAW scan haversine (not the evaluator's
+    rounded echo)."""
+    device = (39.10, -88.54)
+    pin = (39.1002, -88.5402)
+    ts = {"location_coords": {"Site A": {"lat": pin[0], "lng": pin[1]}}}
+    match = api.find_nearest_location_match(device[0], device[1], ts)
+    assert set(match) == {"location", "distanceM", "withinRadius"}
+    assert match["location"] == "Site A"
+    # Exact raw distance, unrounded.
+    assert match["distanceM"] == api.haversine_m(device[0], device[1], pin[0], pin[1])
+
+
+@pytest.mark.parametrize("offset_m,expected_within", [
+    (api.LOCATION_MATCH_RADIUS_M - 2.0, True),   # inside
+    (api.LOCATION_MATCH_RADIUS_M + 2.0, False),  # outside
+])
+def test_nearest_match_boundary_matches_historical_binary(offset_m, expected_within):
+    """Boundary equivalence: the delegated decision reproduces the historical
+    `distance <= LOCATION_MATCH_RADIUS_M` binary (boundary-inclusive)."""
+    device = (39.10, -88.54)
+    pin_lat, pin_lng = _destination(device[0], device[1], offset_m, 90)
+    ts = {"location_coords": {"Site A": {"lat": pin_lat, "lng": pin_lng}}}
+    match = api.find_nearest_location_match(device[0], device[1], ts)
+    assert match["withinRadius"] is expected_within
+    # Delegated result equals the old direct comparison on the same raw distance.
+    assert match["withinRadius"] == (match["distanceM"] <= api.LOCATION_MATCH_RADIUS_M)
+
+
+def test_nearest_match_empty_map_returns_none():
+    assert api.find_nearest_location_match(39.1, -88.5, {"location_coords": {}}) is None
+    # find_nearest_location depends on this None for require_gps_override.
+    assert api.find_nearest_location(39.1, -88.5, {"location_coords": {}}) is None
 
 
 # ---- bounding-box conservative-superset property ---------------------------

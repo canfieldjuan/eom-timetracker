@@ -154,6 +154,8 @@ def _attach_qr_arrive_depart_receipts(
                     longitude,
                     accuracy_m,
                     geofence_radius_m,
+                    radius_source,
+                    max_accuracy_policy_m,
                     distance_m,
                     geofence_status,
                     outcome,
@@ -163,7 +165,7 @@ def _attach_qr_arrive_depart_receipts(
                 )
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s,
-                    39.1203, -88.54335, 8.0, 75, 0.0,
+                    39.1203, -88.54335, 8.0, 75, 'global_fallback', 100, 0.0,
                     'inside', 'recorded', %s, %s, %s::jsonb
                 )
                 RETURNING id
@@ -482,6 +484,11 @@ def test_apply_is_confirmed_atomic_archived_and_stale_plan_safe(
             row["action"]: row for row in archived_qr_shift["siteQrActionReceipts"]
         }
         assert set(archived_receipts) == {"arrive", "depart"}
+        # Geofence C2 (#214): the QR receipt's resolved-policy snapshot must survive
+        # archival before the corrected shift (and its cascade rows) are deleted.
+        assert archived_receipts["arrive"]["geofenceRadiusM"] == 75
+        assert archived_receipts["arrive"]["radiusSource"] == "global_fallback"
+        assert archived_receipts["arrive"]["maxAccuracyPolicyM"] == 100
         assert archived_receipts["arrive"]["visitId"] == qr_events["visitId"]
         assert archived_receipts["arrive"]["departureId"] is None
         assert archived_receipts["depart"]["visitId"] == qr_events["visitId"]

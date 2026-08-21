@@ -559,18 +559,37 @@ def find_nearest_location_match(
     *,
     coordinate_map_key: str = "location_coords",
 ) -> Optional[Dict[str, Any]]:
+    """Nearest saved pin + whether the device is within it.
+
+    The nearest-of-many scan stays here, but the inside/outside DECISION delegates
+    to the one canonical evaluator (Geofence C2, #214), so it is the sole geometry
+    authority. ``accuracy=0`` with ``LOCATION_MATCH_RADIUS_M`` reproduces this
+    path's historical binary decision exactly -- the evaluator's ``inside`` is
+    ``distance + 0 <= radius``, i.e. ``distance <= LOCATION_MATCH_RADIUS_M``, the
+    same boundary-inclusive comparison as before -- so behavior is unchanged. Per-site
+    radius and enforcement stay off on this path (this is not the site-check-in flow).
+    """
     coords = timesheet_data.get(coordinate_map_key, {})
-    best_name, best_dist = None, float("inf")
+    best_name, best_dist, best_coords = None, float("inf"), None
     for name, c in coords.items():
         d = haversine_m(lat, lng, c["lat"], c["lng"])
         if d < best_dist:
-            best_name, best_dist = name, d
+            best_name, best_dist, best_coords = name, d, c
     if not best_name:
         return None
+    geofence = evaluate_site_check_in_geofence(
+        site_latitude=best_coords["lat"],
+        site_longitude=best_coords["lng"],
+        latitude=lat,
+        longitude=lng,
+        accuracy=0,
+        resolved_radius_m=LOCATION_MATCH_RADIUS_M,
+    )
     return {
         "location": best_name,
+        # Unchanged: the raw scan distance, not the evaluator's rounded echo.
         "distanceM": best_dist,
-        "withinRadius": best_dist <= LOCATION_MATCH_RADIUS_M,
+        "withinRadius": geofence["status"] == "inside",
     }
 
 
@@ -20919,6 +20938,10 @@ def _correction_shift_snapshots(
             receipt.longitude,
             receipt.accuracy_m,
             receipt.geofence_radius_m,
+            -- Geofence C2 (#214): the resolved-policy snapshot cascade-deletes with
+            -- the shift, so the correction archive must carry it too.
+            receipt.radius_source,
+            receipt.max_accuracy_policy_m,
             receipt.distance_m,
             receipt.geofence_status,
             receipt.outcome,
@@ -21110,6 +21133,17 @@ def _correction_shift_snapshots(
             "longitude": float(row["longitude"]),
             "accuracyM": float(row["accuracy_m"]),
             "geofenceRadiusM": int(row["geofence_radius_m"]),
+            # Geofence C2 (#214): preserve the resolved-policy snapshot in the archive.
+            "radiusSource": (
+                str(row["radius_source"])
+                if row.get("radius_source") is not None
+                else None
+            ),
+            "maxAccuracyPolicyM": (
+                int(row["max_accuracy_policy_m"])
+                if row.get("max_accuracy_policy_m") is not None
+                else None
+            ),
             "distanceM": (
                 float(row["distance_m"])
                 if row.get("distance_m") is not None
