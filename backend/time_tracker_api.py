@@ -18525,10 +18525,15 @@ def admin_list_funnel_review(
         # an older tracker can relay Atlas's contact capability yet has no
         # /funnel/contacts proxy. Its absent field must therefore fail closed
         # in the Website until this route is actually deployed.
+        # Strict like the edit proof below: this field enables a MUTATION
+        # control, so a junk manifest member or a missing registered route
+        # reads false -- and the endpoint gate applies the same standard, so
+        # proof and enforcement can never disagree.
         "contactCreationAvailable": (
-            lead_page["capabilities"] is not None
-            and ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION
-            in lead_page["capabilities"]
+            strict_capabilities is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION in strict_capabilities
+            and capability_routes is not None
+            and _ATLAS_OPERATOR_CONTACTS_ROUTE in capability_routes
         ),
         # Edit uses the same Atlas operator-mutation capability as creation, but
         # only this tracker build forwards an edit target (contactId); an older
@@ -19323,8 +19328,14 @@ def admin_create_funnel_contact(
     """
     _require_atlas_funnel_configuration()
     try:
-        _require_atlas_funnel_capability(
-            ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION, admin
+        # The strict gate (capability name through the strict extractor AND
+        # the exact registered route) -- the same standard the advertised
+        # proofs use, so a junk or rolled-back manifest that reads
+        # unavailable on the review can never still admit the mutation here.
+        _require_atlas_funnel_capability_route(
+            ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
+            _ATLAS_OPERATOR_CONTACTS_ROUTE,
+            admin,
         )
     except AtlasFunnelCapabilityUnavailable as exc:
         append_access_log(

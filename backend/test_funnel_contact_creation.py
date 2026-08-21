@@ -147,6 +147,25 @@ def test_edit_proof_requires_the_strict_name_and_exact_route(client, auth, monke
         response = client.get("/api/admin/funnel/review", headers=auth)
         assert response.status_code == 200, response.text
         assert response.json()["contactEditAvailable"] is expected, manifest_fields
+        # Creation gates a mutation control through the same standard.
+        assert response.json()["contactCreationAvailable"] is expected, manifest_fields
+        # And the ENDPOINT enforces what the proof advertises: the same
+        # manifest that reads unavailable must refuse the mutation itself,
+        # for both a create and a contactId-bearing edit.
+        for body_extra in ({}, {"contactId": str(uuid.uuid4())}):
+            attempt = client.post(
+                "/api/admin/funnel/contacts",
+                headers=auth,
+                json={
+                    "contactType": "lead",
+                    "fullName": "Gate Probe",
+                    "email": None,
+                    "phone": None,
+                    "idempotencyKey": str(uuid.uuid4()),
+                    **body_extra,
+                },
+            )
+            assert attempt.status_code == 501, (manifest_fields, attempt.text)
 
 
 def test_manual_lead_create_forwards_the_exact_canonical_contract_and_no_local_rows(
@@ -292,7 +311,8 @@ def test_manual_contact_refuses_when_atlas_does_not_advertise_the_capability(
         calls.append(True)
         raise AssertionError("Atlas must not be called after capability refusal")
 
-    monkeypatch.setattr(api, "_require_atlas_funnel_capability", unavailable)
+    # The endpoint now applies the strict name+route gate.
+    monkeypatch.setattr(api, "_require_atlas_funnel_capability_route", unavailable)
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
     response = client.post(_path(), headers=auth, json=_payload(str(uuid.uuid4())))
 

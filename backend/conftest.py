@@ -239,6 +239,11 @@ def stub_atlas_funnel(setup_db, monkeypatch):
                 "hasMore": False,
                 "nextCursor": None,
                 "capabilities": list(ATLAS_FULL_CAPABILITIES),
+                # The strict mutation gates require the registered signature,
+                # not just the capability name.
+                "capabilityRoutes": [
+                    {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+                ],
             },
         )
 
