@@ -18835,19 +18835,25 @@ def admin_list_funnel_contact_directory(
     if search is not None and not normalized_search:
         raise HTTPException(status_code=422, detail="search must not be blank")
     try:
-        _require_atlas_funnel_capability_route(
-            ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY,
-            _ATLAS_CONTACT_DIRECTORY_ROUTE,
-            admin,
-        )
         if lifecycle == "archived":
             # The archived view needs the newer proof: only an Atlas whose
             # directory understands `lifecycle` advertises this name, so an
             # older deployment reads unavailable instead of 422ing (or,
             # worse, ignoring the filter and serving active rows as if they
-            # were the archive).
+            # were the archive). BOTH names are proven from ONE manifest
+            # read -- a pair spanning two fetches is not a proven pair
+            # during a deploy or rollback.
+            _require_atlas_funnel_capability_routes(
+                (
+                    ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY,
+                    ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_ARCHIVED,
+                ),
+                _ATLAS_CONTACT_DIRECTORY_ROUTE,
+                admin,
+            )
+        else:
             _require_atlas_funnel_capability_route(
-                ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_ARCHIVED,
+                ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY,
                 _ATLAS_CONTACT_DIRECTORY_ROUTE,
                 admin,
             )

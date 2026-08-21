@@ -526,3 +526,30 @@ def test_the_archived_proof_requires_the_base_directory_capability_too(
         "/api/admin/funnel/contact-directory?lifecycle=archived", headers=auth
     )
     assert archived.status_code == 501, archived.text
+
+
+def test_the_archived_gate_proves_both_names_from_one_manifest_read(
+    client, auth, monkeypatch
+):
+    """A deploy race can serve consecutive manifests that each carry one half
+    of the pair; the gate must prove BOTH names from a single read, so an
+    alternating upstream can never admit the request."""
+    flips = {"n": 0}
+
+    def alternating_read(path, admin, *, params=None):
+        assert path == "/eom-funnel/leads", path
+        flips["n"] += 1
+        # Read 1 carries only the base name, read 2 only the archived name.
+        drop = (
+            api.ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_ARCHIVED
+            if flips["n"] % 2 == 1
+            else api.ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY
+        )
+        return _manifest(drop_name=drop)
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", alternating_read)
+    response = client.get(
+        "/api/admin/funnel/contact-directory?lifecycle=archived", headers=auth
+    )
+    assert response.status_code == 501, response.text
+    assert flips["n"] == 1, "the pair must be judged from exactly one manifest read"
