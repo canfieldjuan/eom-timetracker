@@ -7,7 +7,9 @@ import hashlib
 import json
 import math
 import psycopg2
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from threading import Barrier
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -162,6 +164,84 @@ def _configure_home_base(client, auth: dict[str, str]) -> dict:
     assert body["configured"] is True
     assert body["homeBase"]["label"] == "EOM Office Home Base"
     return body
+
+
+def test_home_base_put_honors_optional_update_token(client, auth):
+    employee_id, _employee_auth = _create_employee(client, "Home Base update token")
+    _enroll_in_morning_crew(employee_id)
+    configured = _configure_home_base(client, auth)
+    home_base = configured["homeBase"]
+    original_token = home_base["updateToken"]
+    assert len(original_token) == 64
+    int(original_token, 16)
+
+    def update(label: str):
+        return client.put(
+            "/api/admin/home-base",
+            headers=auth,
+            json={
+                "expectedUpdateToken": original_token,
+                "label": label,
+                "address": "100 Dispatch Lane, Effingham",
+                "latitude": BASE_LATITUDE,
+                "longitude": BASE_LONGITUDE,
+            },
+        )
+
+    start = Barrier(2)
+
+    def concurrent_update(label: str):
+        start.wait(timeout=10)
+        return update(label)
+
+    labels = ["EOM Office Home Base East", "EOM Office Home Base West"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = [
+            future.result(timeout=20)
+            for future in [pool.submit(concurrent_update, label) for label in labels]
+        ]
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    winner = next(response for response in responses if response.status_code == 200)
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.json() == {
+        "success": False,
+        "error": "Home Base changed after it was read; reload before retrying",
+        "code": "stale_home_base_update",
+        "details": {"homeBaseId": home_base["id"]},
+    }
+    assert winner.json()["homeBase"]["label"] in labels
+    stored = client.get("/api/admin/home-base", headers=auth)
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["homeBase"]["label"] == winner.json()["homeBase"]["label"]
+
+    # Existing callers that have not adopted the token remain compatible.
+    legacy = client.put(
+        "/api/admin/home-base",
+        headers=auth,
+        json={
+            "label": "EOM Office Home Base Legacy Save",
+            "address": "100 Dispatch Lane, Effingham",
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+        },
+    )
+    assert legacy.status_code == 200, legacy.text
+    assert legacy.json()["homeBase"]["label"] == "EOM Office Home Base Legacy Save"
+
+    malformed = client.put(
+        "/api/admin/home-base",
+        headers=auth,
+        json={
+            "expectedUpdateToken": "not-a-token",
+            "label": "Malformed token save",
+            "address": "100 Dispatch Lane, Effingham",
+            "latitude": BASE_LATITUDE,
+            "longitude": BASE_LONGITUDE,
+        },
+    )
+    assert malformed.status_code == 422, malformed.text
+    assert "expectedUpdateToken" in malformed.json()["details"]["fields"]
 
 
 def _insert_site(
