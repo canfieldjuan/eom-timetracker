@@ -11899,9 +11899,16 @@ def _plain_time_action_request_fingerprint(
     action: str,
     payload: Optional[BaseModel],
 ) -> str:
+    payload_material = payload.model_dump(mode="json") if payload is not None else {}
+    # C3 added ``locationId`` to ClockInRequest. A pre-C3 clock-in receipt was
+    # fingerprinted before that default existed, so
+    # preserve its exact material when an existing caller omits the optional
+    # field.  A selected C3 Site still remains part of the fingerprint.
+    if action == "clock-in" and payload_material.get("locationId") is None:
+        payload_material.pop("locationId", None)
     material = {
         "action": action,
-        "payload": payload.model_dump(mode="json") if payload is not None else {},
+        "payload": payload_material,
     }
     return hashlib.sha256(
         json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -14654,7 +14661,28 @@ def clock_in(
         if existing_open:
             return False, "Already clocked in"
 
-        if not home_base["confirmed"]:
+        provisional_resolution: Optional[Dict[str, Any]] = None
+        if GEOFENCE_SITE_RESOLUTION_ENABLED:
+            # C3 must resolve its effective per-Site radius before the legacy
+            # nearest-pin fallback.  The latter only knows the one global
+            # radius, so consulting it first would reject a valid C2 override.
+            provisional_resolution = _c3_resolve_site(
+                "clock-in",
+                payload,
+                employee,
+                reference_time=now_utc,
+            )
+            site_resolution["resolution"] = provisional_resolution
+
+        # Preserve Home Base and documented-exception behavior exactly.  Only a
+        # C3 customer Site that will actually be associated may satisfy the
+        # legacy known-site gate; unresolved C3 results retain that fallback.
+        c3_customer_site = bool(
+            provisional_resolution
+            and provisional_resolution.get("state") == "customer_site"
+            and not (home_base["policy"] and home_base_exception)
+        )
+        if not home_base["confirmed"] and not c3_customer_site:
             override_error = require_gps_override(
                 timesheet_data,
                 payload.latitude,
@@ -14732,14 +14760,7 @@ def clock_in(
                 payload.accuracy,
             )
 
-        if GEOFENCE_SITE_RESOLUTION_ENABLED:
-            provisional_resolution = _c3_resolve_site(
-                "clock-in",
-                payload,
-                employee,
-                reference_time=now_utc,
-            )
-            site_resolution["resolution"] = provisional_resolution
+        if provisional_resolution is not None:
             # Home Base and its documented exception retain their existing
             # internal-dispatch meaning.  C3 cannot turn either into a
             # customer Site merely because their coordinates overlap.
@@ -14783,6 +14804,11 @@ def clock_in(
         snapshot = site_resolution.get("snapshot")
         if not GEOFENCE_SITE_RESOLUTION_ENABLED or not isinstance(snapshot, dict):
             return
+        # The candidate query's row locks cannot cover a Site created or moved
+        # into the GPS envelope after the query begins.  Use the same
+        # transaction advisory lock as Site mutations before this authoritative
+        # re-read so the candidate set and following time write share one view.
+        _lock_customer_site_mutations(cur)
         current_resolution = _c3_resolve_site(
             "clock-in",
             payload,
@@ -15244,7 +15270,23 @@ def log_visit(
         if not open_entry:
             return False, "Not currently clocked in"
 
-        if explicit_site is None:
+        provisional_resolution: Optional[Dict[str, Any]] = None
+        if c3_mode:
+            # See clock_in: C3's effective per-Site radius must resolve before
+            # the legacy global-radius fallback can decide whether an override
+            # is required.
+            provisional_resolution = _c3_resolve_site(
+                "arrive",
+                payload,
+                employee,
+                reference_time=now_utc,
+            )
+            site_resolution["resolution"] = provisional_resolution
+
+        if explicit_site is None and not (
+            provisional_resolution
+            and provisional_resolution.get("state") == "customer_site"
+        ):
             override_error = require_gps_override(
                 timesheet_data,
                 payload.latitude,
@@ -15265,14 +15307,6 @@ def log_visit(
         else:
             location = str(payload.location or "").strip() or "Unknown"
             customer = timesheet_data.get("location_customers", {}).get(location, "")
-
-        if c3_mode:
-            site_resolution["resolution"] = _c3_resolve_site(
-                "arrive",
-                payload,
-                employee,
-                reference_time=now_utc,
-            )
 
         visit = {
             "arrivalTime": to_utc_iso(now_utc),
@@ -15332,7 +15366,11 @@ def log_visit(
         # visible target, then the persistence callback repeats this check with
         # the transaction-authoritative target if it changed meanwhile.
         active_visit = get_active_visit(open_entry)
-        if active_visit and active_visit.get("location") == visit["location"]:
+        if active_visit and _visits_refer_to_same_target(
+            active_visit,
+            visit,
+            use_site_identity=GEOFENCE_SITE_RESOLUTION_ENABLED,
+        ):
             return True, {
                 "alreadyHere": True,
                 "entryId": open_entry["id"],
@@ -15355,6 +15393,7 @@ def log_visit(
         snapshot = site_resolution.get("snapshot")
         if not isinstance(visit, dict) or not isinstance(snapshot, dict):
             return
+        _lock_customer_site_mutations(cur)
         current_resolution = _c3_resolve_site(
             "arrive",
             payload,
@@ -15393,7 +15432,11 @@ def log_visit(
             else entry
         )
         active_visit = get_active_visit(prior_entry) if isinstance(prior_entry, dict) else None
-        if active_visit and active_visit.get("location") == visit.get("location"):
+        if active_visit and _visits_refer_to_same_target(
+            active_visit,
+            visit,
+            use_site_identity=True,
+        ):
             if isinstance(visits, list) and visit in visits:
                 visits.remove(visit)
             result.clear()
@@ -15560,6 +15603,30 @@ def log_visit(
         append_access_log(request, "VISIT_LOGGED", True,
                           f"Employee: {employee['name']} arrived at {result['visit']['location']}")
     return result
+
+
+def _visit_location_id(visit: Dict[str, Any]) -> Optional[int]:
+    """Return a durable Site id when a visit has one, otherwise None."""
+    try:
+        location_id = int(visit.get("locationId"))
+    except (TypeError, ValueError):
+        return None
+    return location_id if location_id > 0 else None
+
+
+def _visits_refer_to_same_target(
+    active_visit: Dict[str, Any],
+    candidate_visit: Dict[str, Any],
+    *,
+    use_site_identity: bool,
+) -> bool:
+    """Deduplicate C3 visits by Site identity, retaining the legacy fallback."""
+    if use_site_identity:
+        active_location_id = _visit_location_id(active_visit)
+        candidate_location_id = _visit_location_id(candidate_visit)
+        if active_location_id is not None and candidate_location_id is not None:
+            return active_location_id == candidate_location_id
+    return active_visit.get("location") == candidate_visit.get("location")
 
 
 def get_active_visit(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:

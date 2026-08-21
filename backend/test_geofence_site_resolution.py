@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bcrypt
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -96,6 +97,8 @@ def _create_site(
     *,
     latitude: float | None = LATITUDE,
     longitude: float | None = LONGITUDE,
+    address: str | None = None,
+    geofence_radius_m: int | None = None,
     location_type: str | None = "Residential",
     customer_active: bool = True,
     customer_archived: bool = False,
@@ -122,17 +125,18 @@ def _create_site(
         """
         INSERT INTO locations (
             customer_id, address, customer_name, location_type, lat, lng,
-            rate, rate_type, expected_hours
-        ) VALUES (%s, %s, %s, %s, %s, %s, 100, 'per_visit', 2)
+            geofence_radius_m, rate, rate_type, expected_hours
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, 100, 'per_visit', 2)
         RETURNING id
         """,
         (
             customer_id,
-            f"{PREFIX} {suffix}",
+            address or f"{PREFIX} {suffix}",
             customer_name,
             location_type,
             latitude,
             longitude,
+            geofence_radius_m,
         ),
     )
     assert site
@@ -403,6 +407,152 @@ def test_c3_associates_clock_in_and_arrival_without_creating_legacy_evidence(
     assert db.query_one("SELECT COUNT(*) AS count FROM visit_evidence_events") == {
         "count": 0
     }
+
+
+def test_c3_uses_site_identity_when_a_site_address_is_reused(client, monkeypatch):
+    _employee_id, employee_auth = _create_employee(client, "reused-address arrivals")
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    shared_address = f"{PREFIX} shared address"
+    first_site_id = _create_site("reused address first", address=shared_address)
+
+    clock_in = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": first_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert clock_in.status_code == 200, clock_in.text
+
+    first_arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": first_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert first_arrival.status_code == 200, first_arrival.text
+    assert first_arrival.json()["alreadyHere"] is False
+
+    # The canonical Site table prevents concurrent duplicate addresses, but an
+    # active historical visit keeps its old label after an admin edits Site A.
+    # Once Site B takes the freed address, C3 must distinguish their durable ids.
+    db.execute(
+        "UPDATE locations SET address = %s WHERE id = %s",
+        (f"{PREFIX} first address after edit", first_site_id),
+    )
+    second_site_id = _create_site("reused address second", address=shared_address)
+
+    second_arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": second_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert second_arrival.status_code == 200, second_arrival.text
+    assert second_arrival.json()["alreadyHere"] is False
+    assert second_arrival.json()["visit"]["locationId"] == second_site_id
+
+
+def test_c3_resolves_a_supported_per_site_radius_before_legacy_gate(client, monkeypatch):
+    _employee_id, employee_auth = _create_employee(client, "per-site radius")
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    site_id = _create_site("wide radius", geofence_radius_m=250)
+
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            # About 111m from the pin: outside the 50m legacy matcher but
+            # inside this C2-enabled Site's supported effective radius.
+            "latitude": LATITUDE + 0.001,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["siteResolution"]["state"] == "customer_site"
+    assert response.json()["entry"]["locationId"] == site_id
+
+
+def test_c3_commit_recheck_serializes_with_customer_site_mutations(client, monkeypatch):
+    _employee_id, employee_auth = _create_employee(client, "site mutation lock")
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    _create_site("locked recheck")
+    events: list[str] = []
+    original_resolver = api._c3_resolve_site
+
+    def record_lock(_cur):
+        events.append("lock")
+
+    def record_commit_resolver(*args, **kwargs):
+        if kwargs.get("cur") is not None:
+            events.append("resolve")
+        return original_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(api, "_lock_customer_site_mutations", record_lock)
+    monkeypatch.setattr(api, "_c3_resolve_site", record_commit_resolver)
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+    assert response.status_code == 200, response.text
+
+    arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+    assert arrival.status_code == 200, arrival.text
+    assert events == ["lock", "resolve", "lock", "resolve"]
+
+
+def test_c3_clock_in_omitting_location_id_replays_a_predeploy_receipt(client, monkeypatch):
+    _employee_id, employee_auth = _create_employee(client, "legacy fingerprint")
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _create_site("legacy fingerprint pin")
+    body = {
+        "latitude": LATITUDE,
+        "longitude": LONGITUDE,
+        "accuracy": 5,
+        "idempotencyKey": str(uuid4()),
+    }
+    first = client.post("/api/timesheet/clock-in", headers=employee_auth, json=body)
+    assert first.status_code == 200, first.text
+
+    predeploy_payload = api.ClockInRequest(**body).model_dump(mode="json")
+    predeploy_payload.pop("locationId", None)
+    predeploy_fingerprint = hashlib.sha256(
+        json.dumps(
+            {"action": "clock-in", "payload": predeploy_payload},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    db.execute(
+        """
+        UPDATE plain_time_action_receipts
+        SET request_fingerprint = %s
+        WHERE idempotency_key = %s
+        """,
+        (predeploy_fingerprint, body["idempotencyKey"]),
+    )
+
+    replay = client.post("/api/timesheet/clock-in", headers=employee_auth, json=body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True
 
 
 def test_c3_rechecks_before_persist_and_falls_back_without_denial(client, monkeypatch):
