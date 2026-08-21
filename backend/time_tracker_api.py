@@ -2884,6 +2884,13 @@ class FunnelContactCreateRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # When present this targets an existing Atlas contact for edit; when absent
+    # the mutation is a create-or-match by the supplied identity fields. The
+    # tracker forwards it verbatim as the Atlas body's contact_id; Atlas is the
+    # resolution authority and fails closed with a typed 409 if the id and the
+    # supplied identity fields point at different contacts (never a silent
+    # merge, never a lead<->customer type flip).
+    contactId: Optional[UUID] = Field(default=None)
     contactType: Literal["lead", "customer"]
     fullName: str = Field(min_length=1, max_length=256)
     email: Optional[str] = Field(default=None, max_length=256)
@@ -19027,6 +19034,12 @@ def _atlas_funnel_contact_create_body(
         "phone": payload.phone,
     }
     body = {key: value for key, value in candidates.items() if value}
+    # An explicit contact_id makes this an edit of that exact Atlas contact
+    # rather than a create-or-match by identity. Atlas ignores source_ref on the
+    # update path (provenance is only written on create), so forwarding it below
+    # is harmless for an edit and required for a create.
+    if payload.contactId is not None:
+        body["contact_id"] = str(payload.contactId)
     body.update(
         {
             "contact_type": payload.contactType,
@@ -19041,6 +19054,7 @@ def _validate_atlas_funnel_contact_create_result(
     atlas_result: Dict[str, Any],
     *,
     requested_contact_type: str,
+    requested_contact_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return the closed browser projection of an Atlas contact mutation.
 
@@ -19094,6 +19108,14 @@ def _validate_atlas_funnel_contact_create_result(
             raise AtlasFunnelRequestError(
                 502, "EOM contact service returned an invalid contact id"
             ) from exc
+    # An edit names its target contact_id up front. Atlas resolves that id to
+    # exactly one row or fails closed with a 409, so a success result naming a
+    # different contact would mean the edit silently landed on the wrong row.
+    # Fail closed rather than report that write as the caller's success.
+    if requested_contact_id is not None and contact_id != requested_contact_id:
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service edited a different contact than requested"
+        )
     return {
         "success": True,
         "idempotent": idempotent,
@@ -19303,6 +19325,9 @@ def admin_create_funnel_contact(
         visible = _validate_atlas_funnel_contact_create_result(
             atlas_result,
             requested_contact_type=payload.contactType,
+            requested_contact_id=(
+                str(payload.contactId) if payload.contactId is not None else None
+            ),
         )
     except AtlasFunnelRequestError as exc:
         append_access_log(

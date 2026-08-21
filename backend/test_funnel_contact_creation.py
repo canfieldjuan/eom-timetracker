@@ -247,10 +247,7 @@ def test_manual_contact_refuses_when_atlas_does_not_advertise_the_capability(
     assert calls == []
 
 
-def test_manual_contact_rejects_an_edit_identifier_or_malformed_atlas_result(
-    client, auth, monkeypatch
-):
-    key = str(uuid.uuid4())
+def test_manual_contact_rejects_a_malformed_atlas_result(client, auth, monkeypatch):
     calls: list[object] = []
 
     def atlas_request(*_args, **_kwargs):
@@ -264,13 +261,97 @@ def test_manual_contact_rejects_an_edit_identifier_or_malformed_atlas_result(
         }
 
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
-    rejected = client.post(
-        _path(),
-        headers=auth,
-        json={**_payload(key), "contactId": str(uuid.uuid4())},
-    )
     malformed = client.post(_path(), headers=auth, json=_payload(str(uuid.uuid4())))
 
-    assert rejected.status_code == 422, rejected.text
     assert malformed.status_code == 502, malformed.text
     assert calls == [True]
+
+
+def test_manual_contact_edit_forwards_the_target_id_and_creates_no_local_rows(
+    client, auth, monkeypatch
+):
+    key = str(uuid.uuid4())
+    target_id = str(uuid.uuid4())
+    calls: list[dict[str, object]] = []
+    before = _operational_counts()
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        calls.append(payload)
+        return _atlas_result(
+            target_id,
+            full_name="Ada Edited",
+            operation="contact_updated",
+        )
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    response = client.post(
+        _path(),
+        headers=auth,
+        json={
+            **_payload(key, full_name="Ada Edited"),
+            "contactId": target_id,
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["operation"] == "contact_updated"
+    assert response.json()["contact"]["contactId"] == target_id
+    # The edit names its target as the Atlas body's contact_id; identity fields
+    # ride alongside as the new values, and no tracker-local row is written.
+    assert calls == [
+        {
+            "full_name": "Ada Edited",
+            "email": "ada@example.test",
+            "phone": "217-555-0100",
+            "contact_id": target_id,
+            "contact_type": "lead",
+            "source_channel": "time_tracker",
+            "source_ref": f"portal-contact:{key}",
+        }
+    ]
+    assert _operational_counts() == before
+
+
+def test_manual_contact_edit_relays_the_atlas_identity_collision_409(
+    client, auth, monkeypatch
+):
+    target_id = str(uuid.uuid4())
+    before = _operational_counts()
+
+    def atlas_request(*_args, **_kwargs):
+        raise api.AtlasFunnelRequestError(
+            409, "Operator contact identity belongs to another contact"
+        )
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    response = client.post(
+        _path(),
+        headers=auth,
+        json={**_payload(str(uuid.uuid4())), "contactId": target_id},
+    )
+
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["success"] is False
+    assert "another contact" in body["error"]
+    # A fail-closed collision must not leave any tracker-local trace behind.
+    assert _operational_counts() == before
+
+
+def test_manual_contact_edit_fails_closed_when_atlas_edits_a_different_contact(
+    client, auth, monkeypatch
+):
+    target_id = str(uuid.uuid4())
+    other_id = str(uuid.uuid4())
+
+    def atlas_request(*_args, **_kwargs):
+        return _atlas_result(other_id, operation="contact_updated")
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    response = client.post(
+        _path(),
+        headers=auth,
+        json={**_payload(str(uuid.uuid4())), "contactId": target_id},
+    )
+
+    assert response.status_code == 502, response.text
