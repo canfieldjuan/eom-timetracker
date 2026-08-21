@@ -768,3 +768,41 @@ def test_clear_gate_proves_the_capability_pair_from_one_manifest_read(
     assert response.json()["capability"] == "contact.field_clear"
     assert mutations == []
     assert len(reads) == 1, "the pair must be proven from exactly one manifest read"
+
+
+def test_boundary_length_values_with_padding_normalize_instead_of_422(
+    client, auth, monkeypatch
+):
+    """Stripping must precede the length constraints: a boundary-length value
+    with surrounding whitespace is the normalize-and-replace case of the
+    tri-state contract, not a too-long rejection."""
+    key = str(uuid.uuid4())
+    target_id = str(uuid.uuid4())
+    calls: list[dict[str, object]] = []
+    max_phone = "2" * 64
+    max_email = ("a" * 246) + "@ex.test"  # 254 chars, under the 256 cap
+    assert len(max_email) <= 256
+
+    def atlas_request(path, admin, *, payload, idempotency_key):
+        calls.append(payload)
+        return _atlas_result(
+            target_id,
+            full_name="Padded Target",
+            operation="contact_updated",
+            email=max_email,
+            phone=max_phone,
+        )
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    body = _payload(
+        key,
+        full_name="Padded Target",
+        email=f"  {max_email}  ",
+        phone=f" {max_phone} ",
+    )
+    body["contactId"] = target_id
+    response = client.post(_path(), headers=auth, json=body)
+
+    assert response.status_code == 201, response.text
+    assert calls[0]["email"] == max_email
+    assert calls[0]["phone"] == max_phone

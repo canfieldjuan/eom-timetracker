@@ -2902,6 +2902,20 @@ class FunnelContactCreateRequest(BaseModel):
     def normalize_full_name(cls, value: Any) -> Any:
         return _strip_required_text(value)
 
+    @field_validator("email", "phone", mode="before")
+    @classmethod
+    def strip_optional_contact_fields(cls, value: Any) -> Any:
+        # Strip BEFORE the Field length constraints run, so a boundary-length
+        # value with surrounding whitespace normalizes (the tri-state promise:
+        # non-empty string = normalize and replace) instead of 422ing on the
+        # padding. Whole-whitespace collapses to "" -- still PRESENT, so the
+        # tri-state validator below keeps the blank signal (edit: 422
+        # ambiguous; create: omitted) instead of a length error swallowing it.
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped if stripped else ""
+        return value
+
     @model_validator(mode="after")
     def normalize_tri_state_contact_fields(self) -> "FunnelContactCreateRequest":
         # Tri-state wire contract (website #254). On an EDIT (contactId
