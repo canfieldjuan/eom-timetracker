@@ -11,7 +11,8 @@ CREATE TABLE employees (
                       CHECK (role IN ('admin', 'employee', 'payroll')),
     hourly_rate   NUMERIC(8, 2),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_login_at TIMESTAMPTZ
+    last_login_at TIMESTAMPTZ,
+    password_changed_at TIMESTAMPTZ
 );
 
 -- Customers (stable business identity; a draft may have zero job sites)
