@@ -2912,6 +2912,63 @@ class FunnelContactCreateRequest(BaseModel):
         return _strip_optional_text(value)
 
 
+class FunnelContactEditRequest(BaseModel):
+    """One bounded id-targeted CRM contact edit from the office portal.
+
+    The browser submits ONLY the fields the operator actually changed (a
+    partial diff against the loaded row), so an untouched field can never
+    clobber a newer concurrent value; Atlas applies exactly what is present.
+    Unlike the create model above, a present-but-blank value is REJECTED
+    rather than silently dropped: in an edit, blank is ambiguous between
+    "clear this field" (unsupported in this slice) and a typo, and silence
+    would turn either into a no-op the operator believes was saved.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fullName: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    email: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    phone: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    address: Optional[str] = Field(default=None, min_length=1, max_length=2000)
+    customerType: Optional[str] = Field(default=None, min_length=1, max_length=32)
+    idempotencyKey: UUID = Field(...)
+
+    @field_validator("fullName", "email", "phone", "address", "customerType", mode="before")
+    @classmethod
+    def reject_blank_edits(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("an edited field must not be blank")
+        return value.strip()
+
+    @field_validator("customerType")
+    @classmethod
+    def customer_type_in_contract(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        candidate = value.lower()
+        if candidate not in ATLAS_CONTACT_DIRECTORY_CUSTOMER_TYPES:
+            raise ValueError("customerType must be residential, commercial, or unknown")
+        return candidate
+
+    @model_validator(mode="after")
+    def require_one_edited_field(self) -> "FunnelContactEditRequest":
+        editable = ("fullName", "email", "phone", "address", "customerType")
+        # An EXPLICIT null is a client-serialized clear, not an omission: the
+        # body builder would silently drop it and the endpoint would report
+        # success for a change Atlas never received. model_fields_set is what
+        # distinguishes "absent" from "provided as null".
+        for field in editable:
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(
+                    "an edited field must not be null; omit unchanged fields"
+                )
+        if all(getattr(self, field) is None for field in editable):
+            raise ValueError("at least one edited field is required")
+        return self
+
+
 class CustomerUpdateRequest(BaseModel):
     expectedUpdateToken: Optional[str] = Field(
         default=None,
@@ -4693,6 +4750,10 @@ _ATLAS_CONTACT_DIRECTORY_MAX_SEARCH_LENGTH = 120
 # `_atlas_funnel_request` requires the "/eom-funnel/" prefix and prepends
 # ATLAS_FUNNEL_BASE_URL, which already ends in /api/v1.
 ATLAS_OPERATOR_CONTACTS_PATH = "/eom-funnel/operator-contacts"
+# The exact registered signature the contact-EDITING proof requires: edits ride
+# the same operator-mutation route as creates, so the proof binds to that
+# route's registered method/path, never a copied capability spelling alone.
+_ATLAS_OPERATOR_CONTACTS_ROUTE = ("POST", ATLAS_OPERATOR_CONTACTS_PATH)
 ATLAS_ESTIMATE_BOOKINGS_PATH = "/eom-funnel/leads/{contact_id}/estimate-bookings"
 ATLAS_FIRST_CLEAN_BOOKINGS_PATH = "/eom-funnel/leads/{contact_id}/first-clean-bookings"
 ATLAS_ONBOARDING_DRAFT_APPROVE_SEND_PATH = (
@@ -18538,6 +18599,15 @@ def admin_list_funnel_review(
             and capability_routes is not None
             and _ATLAS_CONTACT_DIRECTORY_ROUTE in capability_routes
         ),
+        # Editing proof (website #250): same strict shape, bound to the
+        # operator-mutation name AND its exact registered route, plus this
+        # tracker build containing the PATCH relay by field presence.
+        "contactEditingAvailable": (
+            strict_capabilities is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION in strict_capabilities
+            and capability_routes is not None
+            and _ATLAS_OPERATOR_CONTACTS_ROUTE in capability_routes
+        ),
         # These are tracker deployment proofs, not aliases for the Atlas
         # manifest. Website may deploy before this tracker has the matching
         # proxy routes, so a missing field on an older tracker must stay false.
@@ -19019,6 +19089,98 @@ def _portal_contact_source_ref(idempotency_key: UUID) -> str:
     return f"portal-contact:{idempotency_key}"
 
 
+def _atlas_funnel_contact_edit_body(
+    contact_id: UUID, payload: FunnelContactEditRequest
+) -> Dict[str, Any]:
+    """Build the exact id-targeted Atlas operator-contact edit request.
+
+    Only fields the operator submitted are forwarded -- the Atlas boundary
+    applies exactly what is present, which is what makes the browser's
+    partial-diff protection real end to end.
+    """
+    body: Dict[str, Any] = {"contact_id": str(contact_id)}
+    for browser_field, atlas_field in (
+        ("fullName", "full_name"),
+        ("email", "email"),
+        ("phone", "phone"),
+        ("address", "address"),
+        ("customerType", "customer_type"),
+    ):
+        value = getattr(payload, browser_field)
+        if value is not None:
+            body[atlas_field] = value
+    body.update(
+        {
+            "source_channel": ATLAS_OPERATOR_SOURCE_CHANNEL,
+            "source_ref": _portal_contact_source_ref(payload.idempotencyKey),
+        }
+    )
+    return body
+
+
+def _validate_atlas_funnel_contact_edit_result(
+    atlas_result: Dict[str, Any], *, contact_id: UUID
+) -> Dict[str, Any]:
+    """Return the closed browser projection of an id-targeted contact edit.
+
+    An id-targeted request can never legitimately create: Atlas 404s an
+    unknown id before any write, so a `contact_created` operation here means a
+    broken upstream and rejects the whole response rather than reporting a
+    fabricated outcome. The echoed contact id must match the path id.
+    """
+    invalid = AtlasFunnelRequestError(
+        502, "EOM contact service returned an invalid edit result"
+    )
+    if atlas_result.get("success") is not True:
+        raise invalid
+    if atlas_result.get("operation") != "contact_updated":
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned a non-update operation for an edit"
+        )
+    idempotent = atlas_result.get("idempotent")
+    if not isinstance(idempotent, bool):
+        raise invalid
+    contact = atlas_result.get("contact")
+    if not isinstance(contact, dict):
+        raise invalid
+    try:
+        returned_id = str(UUID(str(atlas_result.get("contactId", ""))))
+        contact_field_id = str(UUID(str(contact.get("contactId", ""))))
+    except (TypeError, ValueError) as exc:
+        raise invalid from exc
+    if returned_id != str(contact_id) or contact_field_id != str(contact_id):
+        raise AtlasFunnelRequestError(
+            502, "EOM contact service returned a mismatched contact for an edit"
+        )
+    raw_full_name = contact.get("fullName")
+    contact_type = contact.get("contactType")
+    customer_type = contact.get("customerType")
+    if (
+        not isinstance(raw_full_name, str)
+        or not raw_full_name.strip()
+        or not isinstance(contact_type, str)
+        or contact_type not in ATLAS_CONTACT_DIRECTORY_CONTACT_TYPES
+        or not isinstance(customer_type, str)
+        or customer_type not in ATLAS_CONTACT_DIRECTORY_CUSTOMER_TYPES
+    ):
+        raise invalid
+    return {
+        "success": True,
+        "idempotent": idempotent,
+        "operation": "contact_updated",
+        "contact": {
+            "contactId": str(contact_id),
+            "fullName": raw_full_name.strip(),
+            "email": _strip_optional_atlas_text(contact.get("email")),
+            "phone": _strip_optional_atlas_text(contact.get("phone")),
+            "address": _strip_optional_atlas_text(contact.get("address")),
+            "contactType": contact_type,
+            "customerType": customer_type,
+            "updatedAt": _strip_optional_atlas_text(contact.get("updatedAt")),
+        },
+    }
+
+
 def _atlas_funnel_contact_create_body(
     payload: FunnelContactCreateRequest,
 ) -> Dict[str, Any]:
@@ -19349,6 +19511,66 @@ def admin_create_funnel_contact(
         status_code=200 if visible["idempotent"] else 201,
         content=jsonable_encoder(visible),
     )
+
+
+@app.patch("/api/admin/funnel/contacts/{contact_id}")
+def admin_edit_funnel_contact(
+    contact_id: UUID,
+    payload: FunnelContactEditRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Edit one canonical Atlas CRM contact from the Leads page (website #250).
+
+    Rides the same Atlas operator mutation boundary as contact creation --
+    never a competing write path. Atlas owns validation, tenant pinning,
+    identity conflicts, idempotency, and the previous-value lifecycle audit;
+    this relay contributes bounded input, the deployment proof, and a closed
+    response. No tracker Customer, Site, reservation, or mirror row exists on
+    this path.
+    """
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability_route(
+            ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
+            _ATLAS_OPERATOR_CONTACTS_ROUTE,
+            admin,
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_CONTACT_EDIT_CAPABILITY_UNAVAILABLE",
+            False,
+            f"contact={contact_id} capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_OPERATOR_CONTACTS_PATH,
+            admin,
+            payload=_atlas_funnel_contact_edit_body(contact_id, payload),
+            idempotency_key=str(payload.idempotencyKey),
+        )
+        visible = _validate_atlas_funnel_contact_edit_result(
+            atlas_result, contact_id=contact_id
+        )
+    except AtlasFunnelRequestError as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_CONTACT_EDIT_FAILED",
+            False,
+            f"contact={contact_id} status={exc.status_code}",
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    append_access_log(
+        request,
+        "EOM_FUNNEL_CONTACT_EDITED",
+        True,
+        f"contact={contact_id} idempotent={visible['idempotent']}",
+    )
+    return JSONResponse(status_code=200, content=jsonable_encoder(visible))
 
 
 @app.post("/api/admin/funnel/handoffs/{contact_id}/retry")
