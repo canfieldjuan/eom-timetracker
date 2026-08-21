@@ -79,6 +79,9 @@ def test_review_proves_the_tracker_contact_proxy_only_when_atlas_allows_it(
 
     assert available.status_code == 200, available.text
     assert available.json()["contactCreationAvailable"] is True
+    # Edit rides the same Atlas capability; this tracker build advertises its own
+    # deployment proof so the Website can gate the Edit affordance on it.
+    assert available.json()["contactEditAvailable"] is True
 
     def atlas_read_without_contact_capability(*_args, **_kwargs):
         return {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None}
@@ -88,6 +91,7 @@ def test_review_proves_the_tracker_contact_proxy_only_when_atlas_allows_it(
 
     assert unavailable.status_code == 200, unavailable.text
     assert unavailable.json()["contactCreationAvailable"] is False
+    assert unavailable.json()["contactEditAvailable"] is False
 
 
 def test_manual_lead_create_forwards_the_exact_canonical_contract_and_no_local_rows(
