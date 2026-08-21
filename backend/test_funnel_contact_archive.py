@@ -506,3 +506,23 @@ def test_an_out_of_set_lifecycle_is_refused_before_any_atlas_call(
     )
     assert response.status_code == 422, response.text
     assert calls == []
+
+
+def test_the_archived_proof_requires_the_base_directory_capability_too(
+    client, auth, monkeypatch
+):
+    """The endpoint's archived pre-flight requires BOTH directory names, so
+    the proof must as well -- a manifest carrying only the archived name must
+    read unavailable rather than advertise a control the endpoint 501s."""
+    _install_manifest(
+        monkeypatch,
+        _manifest(drop_name=api.ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY),
+    )
+    review = client.get("/api/admin/funnel/review", headers=auth)
+    assert review.status_code == 200, review.text
+    assert review.json()["contactDirectoryArchivedAvailable"] is False
+    # And the endpoint refuses the same manifest, so proof == enforcement.
+    archived = client.get(
+        "/api/admin/funnel/contact-directory?lifecycle=archived", headers=auth
+    )
+    assert archived.status_code == 501, archived.text

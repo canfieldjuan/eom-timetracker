@@ -18692,9 +18692,14 @@ def admin_list_funnel_review(
         ),
         # The archived VIEW rides the directory's registered GET; the newer
         # capability name is what proves the deployed directory understands
-        # the `lifecycle` filter (an older Atlas never advertises it).
+        # the `lifecycle` filter (an older Atlas never advertises it). The
+        # proof requires the BASE directory name too, because the endpoint's
+        # pre-flight checks both -- proof and enforcement must share one
+        # predicate, so a manifest carrying only the archived name reads
+        # unavailable instead of advertising a control the endpoint 501s.
         "contactDirectoryArchivedAvailable": (
             strict_capabilities is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY in strict_capabilities
             and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_ARCHIVED
             in strict_capabilities
             and capability_routes is not None
