@@ -2673,6 +2673,22 @@ class FunnelLeadReopenRequest(BaseModel):
     idempotencyKey: UUID = Field(...)
 
 
+class FunnelContactArchiveRequest(BaseModel):
+    """Reversibly park one Atlas CRM contact out of the active directory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotencyKey: UUID = Field(...)
+
+
+class FunnelContactRestoreRequest(BaseModel):
+    """Return one archived Atlas CRM contact to the active directory."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    idempotencyKey: UUID = Field(...)
+
+
 class FunnelLeadStartEstimateRequest(BaseModel):
     """Fresh lead-review state required before moving a lead to Working."""
 
@@ -4762,6 +4778,14 @@ ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_LIST = "onboarding.draft.list"
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND = "onboarding.draft.approve_send"
 ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY = "contact.directory"
+# Archive/restore transitions and the archived directory view (website #253).
+# `contact.directory.archived` is Atlas's proof that the DEPLOYED directory
+# understands the closed `lifecycle` filter: the name exists only in builds
+# whose capability map (and therefore code) carries it, and an older Atlas
+# also 422s the unknown parameter -- two independent skew defenses.
+ATLAS_FUNNEL_CAPABILITY_CONTACT_ARCHIVE = "contact.archive"
+ATLAS_FUNNEL_CAPABILITY_CONTACT_RESTORE = "contact.restore"
+ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_ARCHIVED = "contact.directory.archived"
 ATLAS_FUNNEL_VISIBLE_LEAD_STAGES = frozenset({"new", "estimate_booked", "won"})
 # CLOSED / ENUMERATED: the exact kind filter the Atlas directory admits
 # (atlas_brain/eom_api/funnel.py Literal["all","lead","customer"]) and the
@@ -4769,6 +4793,10 @@ ATLAS_FUNNEL_VISIBLE_LEAD_STAGES = frozenset({"new", "estimate_booked", "won"})
 # browser kind is refused before any Atlas call; an out-of-set Atlas item
 # value rejects the whole page (502) rather than relaying an unreviewed row.
 ATLAS_CONTACT_DIRECTORY_KINDS = ("all", "lead", "customer")
+# CLOSED / ENUMERATED: the exact lifecycle views the Atlas directory admits.
+# One status per page by contract -- the archived view is a real server-side
+# read, never a client-side filter over a mixed set.
+ATLAS_CONTACT_DIRECTORY_LIFECYCLES = ("active", "archived")
 ATLAS_CONTACT_DIRECTORY_CONTACT_TYPES = frozenset({"lead", "customer"})
 ATLAS_CONTACT_DIRECTORY_CUSTOMER_TYPES = frozenset(
     {"residential", "commercial", "unknown"}
@@ -4783,6 +4811,13 @@ ATLAS_OPERATOR_CONTACTS_PATH = "/eom-funnel/operator-contacts"
 # the same operator-mutation route as creates, so the proof binds to that
 # route's registered method/path, never a copied capability spelling alone.
 _ATLAS_OPERATOR_CONTACTS_ROUTE = ("POST", ATLAS_OPERATOR_CONTACTS_PATH)
+# The canonical Atlas archive/restore transitions (website #253). The proofs
+# and endpoint gates bind to these exact registered signatures, never a copied
+# capability-name string alone.
+ATLAS_CONTACT_ARCHIVE_PATH = "/eom-funnel/contacts/{contact_id}/archive"
+ATLAS_CONTACT_RESTORE_PATH = "/eom-funnel/contacts/{contact_id}/restore"
+_ATLAS_CONTACT_ARCHIVE_ROUTE = ("POST", ATLAS_CONTACT_ARCHIVE_PATH)
+_ATLAS_CONTACT_RESTORE_ROUTE = ("POST", ATLAS_CONTACT_RESTORE_PATH)
 ATLAS_ESTIMATE_BOOKINGS_PATH = "/eom-funnel/leads/{contact_id}/estimate-bookings"
 ATLAS_FIRST_CLEAN_BOOKINGS_PATH = "/eom-funnel/leads/{contact_id}/first-clean-bookings"
 ATLAS_ONBOARDING_DRAFT_APPROVE_SEND_PATH = (
@@ -4963,13 +4998,21 @@ def _parse_atlas_lead_review_response(content: Dict[str, Any]) -> Dict[str, Any]
 
 
 def _parse_atlas_contact_directory_response(
-    content: Dict[str, Any], *, limit: int, cursor: Optional[str], kind: str = "all"
+    content: Dict[str, Any],
+    *,
+    limit: int,
+    cursor: Optional[str],
+    kind: str = "all",
+    lifecycle: str = "active",
 ) -> Dict[str, Any]:
     """Validate the complete Atlas directory envelope and every item.
 
     Nothing is relayed on partial validity: one malformed item rejects the
     whole page (502) rather than exposing an unreviewed row shape to the
     browser. The projection is rebuilt field by field, never passed through.
+    Every row's status must equal the requested lifecycle -- a mixed page is
+    a broken upstream response, and relaying it would leak one lifecycle
+    view's rows into the other.
     """
     invalid = HTTPException(
         status_code=502,
@@ -5037,7 +5080,7 @@ def _parse_atlas_contact_directory_response(
             or not isinstance(customer_type, str)
             or contact_type not in ATLAS_CONTACT_DIRECTORY_CONTACT_TYPES
             or customer_type not in ATLAS_CONTACT_DIRECTORY_CUSTOMER_TYPES
-            or item.get("status") != "active"
+            or item.get("status") != lifecycle
             # A kind-scoped request must never relay an out-of-scope row: a
             # mis-filtered upstream page is a broken response, not data.
             or (kind != "all" and contact_type != kind)
@@ -5054,7 +5097,7 @@ def _parse_atlas_contact_directory_response(
                 "contactType": contact_type,
                 "customerType": customer_type,
                 "leadStage": _strip_optional_atlas_text(item.get("leadStage")),
-                "status": "active",
+                "status": lifecycle,
                 "source": _strip_optional_atlas_text(item.get("source")),
                 "createdAt": created_at,
                 "updatedAt": _strip_optional_atlas_text(item.get("updatedAt")),
@@ -19414,6 +19457,40 @@ def admin_list_funnel_review(
             and capability_routes is not None
             and _ATLAS_CONTACT_DIRECTORY_ROUTE in capability_routes
         ),
+        # Archive/restore proofs (website #253): strict like every mutation
+        # proof -- the capability NAME through the strict extractor AND the
+        # exact registered method/path, with the endpoint gates applying the
+        # SAME predicate so proof and enforcement can never disagree. Each
+        # field's presence is additionally this tracker build's own proof
+        # that the matching relay route exists; an older tracker omits it and
+        # the Website keeps the control closed.
+        "contactArchiveAvailable": (
+            strict_capabilities is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_ARCHIVE in strict_capabilities
+            and capability_routes is not None
+            and _ATLAS_CONTACT_ARCHIVE_ROUTE in capability_routes
+        ),
+        "contactRestoreAvailable": (
+            strict_capabilities is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_RESTORE in strict_capabilities
+            and capability_routes is not None
+            and _ATLAS_CONTACT_RESTORE_ROUTE in capability_routes
+        ),
+        # The archived VIEW rides the directory's registered GET; the newer
+        # capability name is what proves the deployed directory understands
+        # the `lifecycle` filter (an older Atlas never advertises it). The
+        # proof requires the BASE directory name too, because the endpoint's
+        # pre-flight checks both -- proof and enforcement must share one
+        # predicate, so a manifest carrying only the archived name reads
+        # unavailable instead of advertising a control the endpoint 501s.
+        "contactDirectoryArchivedAvailable": (
+            strict_capabilities is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY in strict_capabilities
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_ARCHIVED
+            in strict_capabilities
+            and capability_routes is not None
+            and _ATLAS_CONTACT_DIRECTORY_ROUTE in capability_routes
+        ),
         # These are tracker deployment proofs, not aliases for the Atlas
         # manifest. Website may deploy before this tracker has the matching
         # proxy routes, so a missing field on an older tracker must stay false.
@@ -19516,6 +19593,7 @@ def admin_list_funnel_contact_directory(
         default=None, min_length=1, max_length=_ATLAS_CONTACT_DIRECTORY_MAX_SEARCH_LENGTH
     ),
     kind: str = Query(default="all"),
+    lifecycle: str = Query(default="active"),
     admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
     """Relay the bounded Atlas contact directory for operator discovery.
@@ -19525,22 +19603,46 @@ def admin_list_funnel_contact_directory(
     complete upstream envelope before the browser sees a row. No tracker
     Customer, Site, reservation, handoff, schedule, payroll, billing, QR, or
     onboarding row is created or modified here -- Atlas remains the only
-    system of record this read reflects (website #240).
+    system of record this read reflects (website #240). The archived view
+    (website #253) is the same closed projection over the other lifecycle,
+    gated on Atlas's archived-directory proof and requested server-side --
+    never assembled by filtering a mixed page.
     """
     _require_atlas_funnel_configuration()
     if kind not in ATLAS_CONTACT_DIRECTORY_KINDS:
         raise HTTPException(
             status_code=422, detail="kind must be one of: all, lead, customer"
         )
+    if lifecycle not in ATLAS_CONTACT_DIRECTORY_LIFECYCLES:
+        raise HTTPException(
+            status_code=422, detail="lifecycle must be one of: active, archived"
+        )
     normalized_search = search.strip() if search is not None else None
     if search is not None and not normalized_search:
         raise HTTPException(status_code=422, detail="search must not be blank")
     try:
-        _require_atlas_funnel_capability_route(
-            ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY,
-            _ATLAS_CONTACT_DIRECTORY_ROUTE,
-            admin,
-        )
+        if lifecycle == "archived":
+            # The archived view needs the newer proof: only an Atlas whose
+            # directory understands `lifecycle` advertises this name, so an
+            # older deployment reads unavailable instead of 422ing (or,
+            # worse, ignoring the filter and serving active rows as if they
+            # were the archive). BOTH names are proven from ONE manifest
+            # read -- a pair spanning two fetches is not a proven pair
+            # during a deploy or rollback.
+            _require_atlas_funnel_capability_routes(
+                (
+                    ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY,
+                    ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_ARCHIVED,
+                ),
+                _ATLAS_CONTACT_DIRECTORY_ROUTE,
+                admin,
+            )
+        else:
+            _require_atlas_funnel_capability_route(
+                ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY,
+                _ATLAS_CONTACT_DIRECTORY_ROUTE,
+                admin,
+            )
     except AtlasFunnelCapabilityUnavailable as exc:
         append_access_log(
             request,
@@ -19551,19 +19653,25 @@ def admin_list_funnel_contact_directory(
         return _atlas_capability_unavailable_response(exc)
 
     params: Dict[str, Any] = {"limit": limit, "kind": kind}
+    if lifecycle != "active":
+        # Omitted for the active view so the pre-#253 request shape -- and
+        # therefore this route's behavior against ANY deployed Atlas -- is
+        # byte-identical to before this slice.
+        params["lifecycle"] = lifecycle
     if normalized_search:
         params["search"] = normalized_search
     if cursor:
         params["cursor"] = cursor
     content = _atlas_funnel_read(_ATLAS_CONTACT_DIRECTORY_PATH, admin, params=params)
     page = _parse_atlas_contact_directory_response(
-        content, limit=limit, cursor=cursor, kind=kind
+        content, limit=limit, cursor=cursor, kind=kind, lifecycle=lifecycle
     )
     append_access_log(
         request,
         "EOM_FUNNEL_CONTACT_DIRECTORY_LISTED",
         True,
-        f"contacts={len(page['contacts'])} kind={kind} has_more={page['hasMore']}",
+        f"contacts={len(page['contacts'])} kind={kind} lifecycle={lifecycle} "
+        f"has_more={page['hasMore']}",
     )
     return {"success": True, **page}
 
@@ -20578,6 +20686,173 @@ def admin_reopen_funnel_lead(
     return JSONResponse(
         status_code=200,
         content=jsonable_encoder({"success": True, "lead": atlas_result}),
+    )
+
+
+def _validate_atlas_contact_lifecycle_result(
+    content: Any, *, contact_id: str, expected_status: str
+) -> Dict[str, Any]:
+    """Validate an Atlas archive/restore echo before the browser sees it.
+
+    The response must identify exactly the targeted contact and carry exactly
+    the resulting status this operation promises. A wrong-target echo, an
+    unexpected status, or a malformed shape is a broken upstream response
+    (502), never data -- the same closed-relay standard as the directory page.
+    """
+    invalid = AtlasFunnelRequestError(
+        502, "EOM contact lifecycle service returned an invalid response"
+    )
+    if not isinstance(content, dict) or content.get("success") is not True:
+        raise invalid
+    echoed_id = content.get("contact_id")
+    if not isinstance(echoed_id, str) or echoed_id != contact_id:
+        raise invalid
+    status_value = content.get("status")
+    if status_value != expected_status:
+        raise invalid
+    contact_type = content.get("contact_type")
+    if (
+        not isinstance(contact_type, str)
+        or contact_type not in ATLAS_CONTACT_DIRECTORY_CONTACT_TYPES
+    ):
+        raise invalid
+    idempotent = content.get("idempotent")
+    if not isinstance(idempotent, bool):
+        raise invalid
+    lead_stage = content.get("lead_stage")
+    if lead_stage is not None and not isinstance(lead_stage, str):
+        raise invalid
+    return {
+        "success": True,
+        "contactId": echoed_id,
+        "contactType": contact_type,
+        "leadStage": _strip_optional_atlas_text(lead_stage),
+        "status": status_value,
+        "idempotent": idempotent,
+    }
+
+
+@app.post("/api/admin/funnel/contacts/{contact_id}/archive")
+def admin_archive_funnel_contact(
+    contact_id: UUID,
+    payload: FunnelContactArchiveRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Relay the canonical Atlas archive transition for one CRM contact.
+
+    A pure relay: no tracker Customer, Site, reservation, or mirror row is
+    touched, and no local lock is taken -- Atlas owns the transition, its
+    receipts, and its refusals (website #253). Soft archive only; nothing is
+    deleted anywhere.
+    """
+    _require_atlas_funnel_configuration()
+    try:
+        # The same strict predicate the review's contactArchiveAvailable proof
+        # uses, so the proof and this gate can never disagree.
+        _require_atlas_funnel_capability_route(
+            ATLAS_FUNNEL_CAPABILITY_CONTACT_ARCHIVE,
+            _ATLAS_CONTACT_ARCHIVE_ROUTE,
+            admin,
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_CONTACT_ARCHIVE_CAPABILITY_UNAVAILABLE",
+            False,
+            f"contact={contact_id} capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    contact_id_text = str(contact_id)
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_CONTACT_ARCHIVE_PATH.format(contact_id=contact_id_text),
+            admin,
+            payload={},
+            idempotency_key=str(payload.idempotencyKey),
+        )
+        visible = _validate_atlas_contact_lifecycle_result(
+            atlas_result, contact_id=contact_id_text, expected_status="archived"
+        )
+    except AtlasFunnelRequestError as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_CONTACT_ARCHIVE_FAILED",
+            False,
+            f"contact={contact_id_text} status={exc.status_code}",
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    append_access_log(
+        request,
+        "EOM_FUNNEL_CONTACT_ARCHIVED",
+        True,
+        f"contact={contact_id_text} idempotent={visible['idempotent']}",
+    )
+    return JSONResponse(
+        status_code=200 if visible["idempotent"] else 201,
+        content=jsonable_encoder(visible),
+    )
+
+
+@app.post("/api/admin/funnel/contacts/{contact_id}/restore")
+def admin_restore_funnel_contact(
+    contact_id: UUID,
+    payload: FunnelContactRestoreRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Relay the canonical Atlas restore transition for one archived contact.
+
+    The exact inverse relay of archive: no local state, no lock, identity and
+    resulting status validated from Atlas's echo before the browser sees it.
+    """
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability_route(
+            ATLAS_FUNNEL_CAPABILITY_CONTACT_RESTORE,
+            _ATLAS_CONTACT_RESTORE_ROUTE,
+            admin,
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_CONTACT_RESTORE_CAPABILITY_UNAVAILABLE",
+            False,
+            f"contact={contact_id} capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    contact_id_text = str(contact_id)
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_CONTACT_RESTORE_PATH.format(contact_id=contact_id_text),
+            admin,
+            payload={},
+            idempotency_key=str(payload.idempotencyKey),
+        )
+        visible = _validate_atlas_contact_lifecycle_result(
+            atlas_result, contact_id=contact_id_text, expected_status="active"
+        )
+    except AtlasFunnelRequestError as exc:
+        append_access_log(
+            request,
+            "EOM_FUNNEL_CONTACT_RESTORE_FAILED",
+            False,
+            f"contact={contact_id_text} status={exc.status_code}",
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    append_access_log(
+        request,
+        "EOM_FUNNEL_CONTACT_RESTORED",
+        True,
+        f"contact={contact_id_text} idempotent={visible['idempotent']}",
+    )
+    return JSONResponse(
+        status_code=200 if visible["idempotent"] else 201,
+        content=jsonable_encoder(visible),
     )
 
 
