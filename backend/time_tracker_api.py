@@ -19223,14 +19223,19 @@ def _validate_atlas_funnel_contact_create_result(
                 502, "EOM contact service returned an invalid contact"
             )
         optional_fields[optional_field] = optional_value
-        # The effect proof for a clear: a success whose cleared field still
-        # carries a value means the null was dropped somewhere upstream, and
-        # reporting that as saved would be exactly the silent fake-save the
-        # #252 refusal existed to prevent. Fail closed instead.
-        if optional_field in requested_clear_fields and optional_value is not None:
+        # The effect proof for a clear: the receipt must POSITIVELY affirm the
+        # null. An absent key reads None through .get() too, but absence is a
+        # receipt that says nothing -- treating it as a confirmed clear would
+        # synthesize the very success shape this check exists to verify. And a
+        # present value means the null was dropped somewhere upstream. Either
+        # way, reporting saved would be exactly the silent fake-save the #252
+        # refusal existed to prevent. Fail closed on both.
+        if optional_field in requested_clear_fields and (
+            optional_field not in contact or optional_value is not None
+        ):
             raise AtlasFunnelRequestError(
                 502,
-                f"EOM contact service did not clear {optional_field}",
+                f"EOM contact service did not confirm clearing {optional_field}",
             )
     return {
         "success": True,

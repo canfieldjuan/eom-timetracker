@@ -599,24 +599,41 @@ def test_clear_bearing_edit_refuses_without_the_field_clear_capability(
 def test_manual_contact_edit_fails_closed_when_atlas_does_not_clear(
     client, auth, monkeypatch
 ):
-    """A success whose cleared field still carries a value is the silent
-    fake-save this slice exists to prevent -- 502, never reported as saved."""
+    """The receipt must POSITIVELY affirm a clear: a success whose cleared
+    field still carries a value AND a success whose receipt omits the key
+    entirely are both 502, never reported as saved. An absent key reads None
+    through .get() exactly like a real null, so without the presence check a
+    dropped mutation would synthesize the success shape this guard verifies."""
     target_id = str(uuid.uuid4())
+    shapes = []
 
-    def atlas_request(*_args, **_kwargs):
-        return _atlas_result(
-            target_id,
-            full_name="Ada Operator",
-            operation="contact_updated",
-            email="still@there.example",
-        )
+    still_set = _atlas_result(
+        target_id,
+        full_name="Ada Operator",
+        operation="contact_updated",
+        email="still@there.example",
+    )
+    shapes.append(still_set)
 
-    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
-    body = _payload(str(uuid.uuid4()), email=None)
-    body["contactId"] = target_id
-    response = client.post(_path(), headers=auth, json=body)
+    key_absent = _atlas_result(
+        target_id,
+        full_name="Ada Operator",
+        operation="contact_updated",
+    )
+    del key_absent["contact"]["email"]
+    shapes.append(key_absent)
 
-    assert response.status_code == 502, response.text
+    for shape in shapes:
+        def atlas_request(*_args, _shape=shape, **_kwargs):
+            return _shape
+
+        monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+        body = _payload(str(uuid.uuid4()), email=None)
+        body["contactId"] = target_id
+        response = client.post(_path(), headers=auth, json=body)
+
+        assert response.status_code == 502, response.text
+        assert "did not confirm clearing email" in response.json()["error"], response.text
 
 
 def test_review_advertises_field_clear_only_with_strict_name_and_route(
