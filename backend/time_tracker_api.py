@@ -2904,12 +2904,50 @@ class FunnelContactCreateRequest(BaseModel):
 
     @field_validator("email", "phone", mode="before")
     @classmethod
-    def normalize_optional_contact_fields(cls, value: Any) -> Any:
-        # The Atlas operator boundary is the validation authority. Stripping
-        # here has one narrower purpose: blank browser fields must be omitted
-        # from the forwarded mutation rather than become an explicit clear on
-        # an Atlas contact matched by the other supplied identity field.
-        return _strip_optional_text(value)
+    def strip_optional_contact_fields(cls, value: Any) -> Any:
+        # Strip BEFORE the Field length constraints run, so a boundary-length
+        # value with surrounding whitespace normalizes (the tri-state promise:
+        # non-empty string = normalize and replace) instead of 422ing on the
+        # padding. Whole-whitespace collapses to "" -- still PRESENT, so the
+        # tri-state validator below keeps the blank signal (edit: 422
+        # ambiguous; create: omitted) instead of a length error swallowing it.
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped if stripped else ""
+        return value
+
+    @model_validator(mode="after")
+    def normalize_tri_state_contact_fields(self) -> "FunnelContactCreateRequest":
+        # Tri-state wire contract (website #254). On an EDIT (contactId
+        # present): an omitted key preserves the stored value, an explicit
+        # JSON null clears it, and a non-empty value replaces it. A
+        # blank/whitespace string is AMBIGUOUS on that wire -- the website
+        # converts a deliberately emptied field to null and never sends "" --
+        # so an edit refuses it instead of guessing between keep and clear.
+        # On a CREATE the pre-#254 contract holds unchanged: blank collapses
+        # to None and the body builder omits it, because a create-or-match
+        # resolving by one identity field must never clear the other.
+        editing = self.contactId is not None
+        for field in ("email", "phone"):
+            if field not in self.model_fields_set:
+                continue
+            value = getattr(self, field)
+            if value is None:
+                # Present null: an explicit clear on the edit path, and the
+                # legacy omit shape on the create path (the body builder's
+                # truthiness filter drops it there).
+                continue
+            stripped = value.strip()
+            if stripped:
+                setattr(self, field, stripped)
+            elif editing:
+                raise ValueError(
+                    f"{field} must be sent as null to clear or omitted to "
+                    "keep; a blank string is ambiguous"
+                )
+            else:
+                setattr(self, field, None)
+        return self
 
 
 class CustomerUpdateRequest(BaseModel):
@@ -4667,6 +4705,13 @@ def _atlas_funnel_read(
 ATLAS_FUNNEL_CAPABILITY_LEAD_LOST = "lead.lost"
 ATLAS_FUNNEL_CAPABILITY_LEAD_REOPEN = "lead.reopen"
 ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION = "contact.operator_mutation"
+# Versions the operator-mutation route's SEMANTICS, not its existence: Atlas
+# advertises this name only from builds that ship the audited null-clear
+# contract (present-null clears email/phone; cleared_fields in the lifecycle
+# event -- website #254). The route being registered is NOT proof of null
+# semantics, so clear-bearing requests gate on this name, never on
+# contact.operator_mutation alone.
+ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR = "contact.field_clear"
 ATLAS_FUNNEL_CAPABILITY_LEAD_ESTIMATE_BOOKING = "lead.estimate_booking"
 ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
 # CLOSED / ENUMERATED: these two names are the exact existing Atlas
@@ -18551,6 +18596,26 @@ def admin_list_funnel_review(
             and capability_routes is not None
             and _ATLAS_OPERATOR_CONTACTS_ROUTE in capability_routes
         ),
+        # Field-clearing proof (website #254): the edit proof above says the
+        # mutation route exists; THIS says the deployed Atlas honors
+        # present-null as an audited clear -- a distinct, versioned capability
+        # name on the same route, held to the same strict standard, and
+        # enforced identically at the mutation endpoint for clear-bearing
+        # requests. The Website keeps the blank-clear refusal as its fallback
+        # whenever this reads false, so every intermediate deployment state
+        # degrades to Slice 4 behavior instead of a silent no-op save.
+        "contactFieldClearAvailable": (
+            strict_capabilities is not None
+            # BOTH names: the endpoint refuses a clear-bearing edit unless the
+            # base mutation capability AND the clear semantics are advertised,
+            # so the proof must require the same pair -- a partial manifest
+            # naming only contact.field_clear would otherwise advertise an
+            # operation every request 501s.
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION in strict_capabilities
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR in strict_capabilities
+            and capability_routes is not None
+            and _ATLAS_OPERATOR_CONTACTS_ROUTE in capability_routes
+        ),
         # Directory proof: true only when Atlas advertises BOTH the capability
         # name and the exact registered GET method/path, and -- by this field
         # existing at all -- this tracker build contains the directory proxy.
@@ -19044,6 +19109,24 @@ def _portal_contact_source_ref(idempotency_key: UUID) -> str:
     return f"portal-contact:{idempotency_key}"
 
 
+def _requested_clear_fields(payload: FunnelContactCreateRequest) -> Tuple[str, ...]:
+    """The optional fields this EDIT explicitly clears (present JSON null).
+
+    Empty for every create: on the create-or-match door a present null keeps
+    its legacy omit meaning, because a create resolving to an existing contact
+    by one identity field must never null the other. The clearable set is
+    structurally email/phone only -- the request model admits no other
+    optional contact field (extra="forbid") and fullName rejects null.
+    """
+    if payload.contactId is None:
+        return ()
+    return tuple(
+        field
+        for field in ("email", "phone")
+        if field in payload.model_fields_set and getattr(payload, field) is None
+    )
+
+
 def _atlas_funnel_contact_create_body(
     payload: FunnelContactCreateRequest,
 ) -> Dict[str, Any]:
@@ -19051,7 +19134,10 @@ def _atlas_funnel_contact_create_body(
 
     Atlas may resolve this request to an existing contact by the supplied phone
     or email and applies received fields as authenticated operator intent. For
-    that reason optional blank fields are deliberately absent, not null.
+    that reason optional blank fields are deliberately absent, not null --
+    except an EDIT's explicit clears, which ride as present nulls per the
+    website #254 tri-state contract (omitted = keep, null = clear, value =
+    replace) and are re-added after the truthiness filter below.
     """
     candidates = {
         "full_name": payload.fullName,
@@ -19065,6 +19151,12 @@ def _atlas_funnel_contact_create_body(
     # is harmless for an edit and required for a create.
     if payload.contactId is not None:
         body["contact_id"] = str(payload.contactId)
+        # Preserve null keys through the proxy (no falsy-value filtering on an
+        # explicit clear): Atlas distinguishes present-null (clear) from
+        # key-absent (keep) via model_fields_set, so the truthiness filter
+        # above would silently turn the operator's delete into a no-op.
+        for field in _requested_clear_fields(payload):
+            body[field] = None
     body.update(
         {
             "contact_type": payload.contactType,
@@ -19080,12 +19172,14 @@ def _validate_atlas_funnel_contact_create_result(
     *,
     requested_contact_type: str,
     requested_contact_id: Optional[str] = None,
+    requested_clear_fields: Tuple[str, ...] = (),
 ) -> Dict[str, Any]:
     """Return the closed browser projection of an Atlas contact mutation.
 
     Do not relay the complete upstream object. The page only needs identity,
-    the requested kind, and the outcome needed to say whether Atlas created,
-    updated, or replayed the canonical contact.
+    the requested kind, the outcome needed to say whether Atlas created,
+    updated, or replayed the canonical contact -- and, since website #254, the
+    nullable email/phone so the response itself proves a clear persisted.
     """
     if atlas_result.get("success") is not True:
         raise AtlasFunnelRequestError(
@@ -19141,6 +19235,28 @@ def _validate_atlas_funnel_contact_create_result(
         raise AtlasFunnelRequestError(
             502, "EOM contact service edited a different contact than requested"
         )
+    optional_fields: Dict[str, Optional[str]] = {}
+    for optional_field in ("email", "phone"):
+        optional_value = contact.get(optional_field)
+        if optional_value is not None and not isinstance(optional_value, str):
+            raise AtlasFunnelRequestError(
+                502, "EOM contact service returned an invalid contact"
+            )
+        optional_fields[optional_field] = optional_value
+        # The effect proof for a clear: the receipt must POSITIVELY affirm the
+        # null. An absent key reads None through .get() too, but absence is a
+        # receipt that says nothing -- treating it as a confirmed clear would
+        # synthesize the very success shape this check exists to verify. And a
+        # present value means the null was dropped somewhere upstream. Either
+        # way, reporting saved would be exactly the silent fake-save the #252
+        # refusal existed to prevent. Fail closed on both.
+        if optional_field in requested_clear_fields and (
+            optional_field not in contact or optional_value is not None
+        ):
+            raise AtlasFunnelRequestError(
+                502,
+                f"EOM contact service did not confirm clearing {optional_field}",
+            )
     return {
         "success": True,
         "idempotent": idempotent,
@@ -19149,6 +19265,8 @@ def _validate_atlas_funnel_contact_create_result(
             "contactId": contact_id,
             "fullName": full_name.strip(),
             "contactType": contact_type,
+            "email": optional_fields["email"],
+            "phone": optional_fields["phone"],
         },
     }
 
@@ -19327,13 +19445,29 @@ def admin_create_funnel_contact(
     this endpoint creates.
     """
     _require_atlas_funnel_configuration()
+    clear_fields = _requested_clear_fields(payload)
     try:
         # The strict gate (capability name through the strict extractor AND
         # the exact registered route) -- the same standard the advertised
         # proofs use, so a junk or rolled-back manifest that reads
         # unavailable on the review can never still admit the mutation here.
-        _require_atlas_funnel_capability_route(
+        required_capabilities: Tuple[str, ...] = (
             ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
+        )
+        if clear_fields:
+            # A clear-bearing edit additionally needs the semantics version:
+            # the mutation route existing does not prove the deployed Atlas
+            # honors present-null as an audited clear (an older build serves
+            # the same route). Refusing here is fail-closed and explicit --
+            # forwarding anyway could silently drop the operator's delete.
+            # Both names are proven from ONE manifest read: a pair spanning
+            # two fetches is not a pair (consecutive reads can disagree).
+            required_capabilities = (
+                ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
+                ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR,
+            )
+        _require_atlas_funnel_capability_routes(
+            required_capabilities,
             _ATLAS_OPERATOR_CONTACTS_ROUTE,
             admin,
         )
@@ -19359,6 +19493,7 @@ def admin_create_funnel_contact(
             requested_contact_id=(
                 str(payload.contactId) if payload.contactId is not None else None
             ),
+            requested_clear_fields=clear_fields,
         )
     except AtlasFunnelRequestError as exc:
         append_access_log(
@@ -19520,24 +19655,35 @@ def _require_atlas_funnel_route(route: Tuple[str, str], admin: Dict[str, Any]) -
         raise AtlasFunnelRouteUnavailable(route)
 
 
-def _require_atlas_funnel_capability_route(
-    capability: str, route: Tuple[str, str], admin: Dict[str, Any]
+def _require_atlas_funnel_capability_routes(
+    capabilities: Tuple[str, ...], route: Tuple[str, str], admin: Dict[str, Any]
 ) -> None:
-    """Refuse an action unless Atlas proves BOTH the capability name and the
-    exact registered method/path, from one manifest read.
+    """Refuse an action unless ONE manifest read proves every required
+    capability name and the exact registered method/path.
 
-    The directory proof deliberately requires both: the name alone is a
+    One read on purpose: a requirement spanning two fetches is not a proven
+    pair -- consecutive manifests can disagree (deploy races, rollbacks), and
+    a mutation gated on "name A in read 1, name B in read 2" would proceed on
+    a pair no single deployed Atlas ever advertised. The name alone is a
     spelling a rollback could leave stale, and the registered signature is the
     evidence the deployed build actually serves the route. A missing,
-    malformed, or pre-manifest response fails closed on either check.
+    malformed, or pre-manifest response fails closed on any check.
     """
     content = _atlas_funnel_read("/eom-funnel/leads", admin, params={"limit": 1})
-    capabilities = _extract_strict_atlas_funnel_capabilities(content)
-    if capabilities is None or capability not in capabilities:
-        raise AtlasFunnelCapabilityUnavailable(capability)
+    advertised = _extract_strict_atlas_funnel_capabilities(content)
+    for capability in capabilities:
+        if advertised is None or capability not in advertised:
+            raise AtlasFunnelCapabilityUnavailable(capability)
     routes = _extract_atlas_funnel_capability_routes(content)
     if routes is None or route not in routes:
         raise AtlasFunnelRouteUnavailable(route)
+
+
+def _require_atlas_funnel_capability_route(
+    capability: str, route: Tuple[str, str], admin: Dict[str, Any]
+) -> None:
+    """Single-capability form; see _require_atlas_funnel_capability_routes."""
+    _require_atlas_funnel_capability_routes((capability,), route, admin)
 
 
 def _atlas_capability_unavailable_response(
