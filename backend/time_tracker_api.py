@@ -14778,7 +14778,11 @@ def clock_in(
                     provisional_resolution,
                     gps_meta_key="clockInGpsMeta",
                 )
-        if home_base["policy"] and home_base_exception:
+        if (
+            home_base["policy"]
+            and home_base_exception
+            and not home_base["confirmed"]
+        ):
             # The durable entry is intentionally internal dispatch evidence,
             # never the overlapping customer Site seen by the C3 preflight.
             # Keep the additive response equally truthful for clients and

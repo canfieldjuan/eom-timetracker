@@ -49,7 +49,7 @@ class CalendarConfigurationError(CalendarStoreError):
 
 
 def lock_planned_visit_assignment_mutations(cur: Any) -> None:
-    """Serialize assignment writes with C3's commit-time schedule tie-break."""
+    """Serialize schedule-assignment and membership writes with C3's tie-break."""
     cur.execute(
         "SELECT pg_advisory_xact_lock(hashtext(%s))",
         (PLANNED_VISIT_ASSIGNMENT_MUTATION_LOCK,),
@@ -990,6 +990,7 @@ def bootstrap_morning_crew_memberships(*, effective_from: date) -> dict[str, Any
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 ("morning-crew-bootstrap",),
             )
+            lock_planned_visit_assignment_mutations(cur)
             cur.execute(
                 "SELECT id FROM crews WHERE name = %s AND active = true FOR UPDATE",
                 (MORNING_CREW_NAME,),
@@ -1083,6 +1084,7 @@ def replace_crew_memberships(
     effective_from = effective_from or date.today()
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            lock_planned_visit_assignment_mutations(cur)
             cur.execute(
                 "SELECT id, name FROM crews WHERE id = %s AND active = true FOR UPDATE",
                 (crew_id,),
@@ -1728,10 +1730,10 @@ def apply_reviewed_preview(
     items_by_key = {item.source_key: item for item in preview.items}
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # C3 can use an employee's qualifying assignment to resolve an
-            # overlap. Hold the same lock it takes before changing any planned
-            # visit or assignment, so that final resolution remains true
-            # through this approval transaction.
+            # C3 can use an employee's qualifying assignment or crew membership
+            # to resolve an overlap. Hold the same lock it takes before changing
+            # either schedule input, so final resolution remains true through
+            # this approval transaction.
             lock_planned_visit_assignment_mutations(cur)
             cur.execute(
                 """

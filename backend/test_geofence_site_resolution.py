@@ -806,6 +806,45 @@ def test_c3_dispatch_exception_reports_an_unassociated_resolution(client, monkey
     }
 
 
+def test_c3_confirmed_home_base_keeps_its_resolution_despite_an_exception(
+    client,
+    monkeypatch,
+):
+    _employee_id, employee_auth = _create_employee(
+        client, "confirmed home base exception"
+    )
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    home_base = {
+        "home_base_id": 987655,
+        "label": "C3 Test Home Base",
+        "latitude": LATITUDE,
+        "longitude": LONGITUDE,
+        "geofence_radius_m": 50,
+    }
+    monkeypatch.setattr(
+        api,
+        "_active_home_base_config",
+        lambda *, cur=None: home_base,
+    )
+    monkeypatch.setattr(api, "_record_home_base_event", lambda *args, **kwargs: {})
+
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "homeBaseExceptionReason": "Office was inaccessible",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["entry"]["location"] == "Home Base — C3 Test Home Base"
+    assert body["siteResolution"] == {"state": "home_base", "source": "home_base"}
+
+
 def test_c3_rechecks_a_planned_overlap_tiebreak_before_persist(client, monkeypatch):
     employee_id, employee_auth = _create_employee(client, "assignment recheck")
     monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)

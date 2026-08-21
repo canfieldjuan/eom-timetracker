@@ -1879,16 +1879,32 @@ def test_startup_preserves_retained_crew_membership_and_audit(monkeypatch):
 
 
 def test_bootstrap_seeds_morning_crew_only_from_three_unique_active_identities(
-    retired_planner_client, auth
+    retired_planner_client,
+    auth,
+    monkeypatch,
 ):
     crew_id = db.query_one("SELECT id FROM crews WHERE name = 'Morning Crew'")["id"]
     db.execute("DELETE FROM crew_memberships WHERE crew_id = %s", (crew_id,))
+
+    lock_calls: list[bool] = []
+    original_lock = store.lock_planned_visit_assignment_mutations
+
+    def record_schedule_lock(cur):
+        lock_calls.append(True)
+        return original_lock(cur)
+
+    monkeypatch.setattr(
+        store,
+        "lock_planned_visit_assignment_mutations",
+        record_schedule_lock,
+    )
 
     result = store.bootstrap_morning_crew_memberships(
         effective_from=datetime.now(ZoneInfo("America/Chicago")).date()
     )
 
     assert result["changed"] is True
+    assert lock_calls == [True]
     assert len(result["employee_ids"]) == 3
     crew = retired_planner_client.get("/api/admin/planned-visits/crews", headers=auth).json()[
         "morningCrew"
@@ -2597,6 +2613,48 @@ def test_calendar_approval_serializes_with_c3_schedule_tiebreaks(
 
             blocker.rollback()
             response = approval.result(timeout=15)
+
+        assert response.status_code == 200, response.text
+    finally:
+        if blocker.closed == 0:
+            blocker.close()
+
+
+def test_crew_membership_replacement_serializes_with_c3_schedule_tiebreaks(
+    retired_planner_client,
+    auth,
+):
+    """Crew eligibility writes share C3's authoritative schedule lock."""
+    crew = db.query_one(
+        "SELECT id FROM crews WHERE active = true ORDER BY id LIMIT 1"
+    )
+    employee = db.query_one(
+        "SELECT id FROM employees WHERE active = true ORDER BY id LIMIT 1"
+    )
+    assert crew is not None
+    assert employee is not None
+
+    blocker = psycopg2.connect(os.environ["DATABASE_URL"], sslmode="disable")
+    blocker.autocommit = False
+    try:
+        with blocker.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (store.PLANNED_VISIT_ASSIGNMENT_MUTATION_LOCK,),
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            replacement = executor.submit(
+                retired_planner_client.put,
+                f"/api/admin/planned-visits/crews/{crew['id']}/memberships",
+                headers=auth,
+                json={"employeeIds": [int(employee["id"])]},
+            )
+            with pytest.raises(FutureTimeoutError):
+                replacement.result(timeout=2)
+
+            blocker.rollback()
+            response = replacement.result(timeout=15)
 
         assert response.status_code == 200, response.text
     finally:
