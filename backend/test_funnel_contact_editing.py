@@ -276,6 +276,24 @@ def test_blank_edited_fields_are_rejected(client, auth, monkeypatch):
     assert calls == []
 
 
+def test_an_explicitly_null_edit_field_is_rejected(client, auth, monkeypatch):
+    """A client-serialized null is a clear, not an omission: silently dropping
+    it would report success for a change Atlas never received."""
+    calls: list[dict[str, object]] = []
+    _install_atlas(monkeypatch, _edit_result(str(uuid.uuid4())), calls=calls)
+    response = client.patch(
+        _path(str(uuid.uuid4())),
+        headers=auth,
+        json={
+            "email": None,
+            "phone": "2175550177",
+            "idempotencyKey": str(uuid.uuid4()),
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert calls == []
+
+
 def test_an_unsupported_customer_type_is_rejected(client, auth, monkeypatch):
     calls: list[dict[str, object]] = []
     _install_atlas(monkeypatch, _edit_result(str(uuid.uuid4())), calls=calls)

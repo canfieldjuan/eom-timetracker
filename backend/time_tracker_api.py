@@ -2947,10 +2947,17 @@ class FunnelContactEditRequest(BaseModel):
 
     @model_validator(mode="after")
     def require_one_edited_field(self) -> "FunnelContactEditRequest":
-        if all(
-            getattr(self, field) is None
-            for field in ("fullName", "email", "phone", "address", "customerType")
-        ):
+        editable = ("fullName", "email", "phone", "address", "customerType")
+        # An EXPLICIT null is a client-serialized clear, not an omission: the
+        # body builder would silently drop it and the endpoint would report
+        # success for a change Atlas never received. model_fields_set is what
+        # distinguishes "absent" from "provided as null".
+        for field in editable:
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(
+                    "an edited field must not be null; omit unchanged fields"
+                )
+        if all(getattr(self, field) is None for field in editable):
             raise ValueError("at least one edited field is required")
         return self
 
