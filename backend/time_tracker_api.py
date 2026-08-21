@@ -19437,10 +19437,8 @@ def admin_create_funnel_contact(
         # the exact registered route) -- the same standard the advertised
         # proofs use, so a junk or rolled-back manifest that reads
         # unavailable on the review can never still admit the mutation here.
-        _require_atlas_funnel_capability_route(
+        required_capabilities: Tuple[str, ...] = (
             ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
-            _ATLAS_OPERATOR_CONTACTS_ROUTE,
-            admin,
         )
         if clear_fields:
             # A clear-bearing edit additionally needs the semantics version:
@@ -19448,11 +19446,17 @@ def admin_create_funnel_contact(
             # honors present-null as an audited clear (an older build serves
             # the same route). Refusing here is fail-closed and explicit --
             # forwarding anyway could silently drop the operator's delete.
-            _require_atlas_funnel_capability_route(
+            # Both names are proven from ONE manifest read: a pair spanning
+            # two fetches is not a pair (consecutive reads can disagree).
+            required_capabilities = (
+                ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
                 ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR,
-                _ATLAS_OPERATOR_CONTACTS_ROUTE,
-                admin,
             )
+        _require_atlas_funnel_capability_routes(
+            required_capabilities,
+            _ATLAS_OPERATOR_CONTACTS_ROUTE,
+            admin,
+        )
     except AtlasFunnelCapabilityUnavailable as exc:
         append_access_log(
             request,
@@ -19637,24 +19641,35 @@ def _require_atlas_funnel_route(route: Tuple[str, str], admin: Dict[str, Any]) -
         raise AtlasFunnelRouteUnavailable(route)
 
 
-def _require_atlas_funnel_capability_route(
-    capability: str, route: Tuple[str, str], admin: Dict[str, Any]
+def _require_atlas_funnel_capability_routes(
+    capabilities: Tuple[str, ...], route: Tuple[str, str], admin: Dict[str, Any]
 ) -> None:
-    """Refuse an action unless Atlas proves BOTH the capability name and the
-    exact registered method/path, from one manifest read.
+    """Refuse an action unless ONE manifest read proves every required
+    capability name and the exact registered method/path.
 
-    The directory proof deliberately requires both: the name alone is a
+    One read on purpose: a requirement spanning two fetches is not a proven
+    pair -- consecutive manifests can disagree (deploy races, rollbacks), and
+    a mutation gated on "name A in read 1, name B in read 2" would proceed on
+    a pair no single deployed Atlas ever advertised. The name alone is a
     spelling a rollback could leave stale, and the registered signature is the
     evidence the deployed build actually serves the route. A missing,
-    malformed, or pre-manifest response fails closed on either check.
+    malformed, or pre-manifest response fails closed on any check.
     """
     content = _atlas_funnel_read("/eom-funnel/leads", admin, params={"limit": 1})
-    capabilities = _extract_strict_atlas_funnel_capabilities(content)
-    if capabilities is None or capability not in capabilities:
-        raise AtlasFunnelCapabilityUnavailable(capability)
+    advertised = _extract_strict_atlas_funnel_capabilities(content)
+    for capability in capabilities:
+        if advertised is None or capability not in advertised:
+            raise AtlasFunnelCapabilityUnavailable(capability)
     routes = _extract_atlas_funnel_capability_routes(content)
     if routes is None or route not in routes:
         raise AtlasFunnelRouteUnavailable(route)
+
+
+def _require_atlas_funnel_capability_route(
+    capability: str, route: Tuple[str, str], admin: Dict[str, Any]
+) -> None:
+    """Single-capability form; see _require_atlas_funnel_capability_routes."""
+    _require_atlas_funnel_capability_routes((capability,), route, admin)
 
 
 def _atlas_capability_unavailable_response(

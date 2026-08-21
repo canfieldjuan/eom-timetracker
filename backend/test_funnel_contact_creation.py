@@ -317,8 +317,9 @@ def test_manual_contact_refuses_when_atlas_does_not_advertise_the_capability(
         calls.append(True)
         raise AssertionError("Atlas must not be called after capability refusal")
 
-    # The endpoint now applies the strict name+route gate.
-    monkeypatch.setattr(api, "_require_atlas_funnel_capability_route", unavailable)
+    # The endpoint now applies the strict name+route gate (single-read,
+    # multi-capability form).
+    monkeypatch.setattr(api, "_require_atlas_funnel_capability_routes", unavailable)
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
     response = client.post(_path(), headers=auth, json=_payload(str(uuid.uuid4())))
 
@@ -718,3 +719,52 @@ def test_review_advertises_field_clear_only_with_strict_name_and_route(
         assert (
             response.json()["contactFieldClearAvailable"] is expected["clear"]
         ), manifest_fields
+
+
+def test_clear_gate_proves_the_capability_pair_from_one_manifest_read(
+    client, auth, monkeypatch
+):
+    """A pair proven across two manifest fetches is not a pair.
+
+    An Atlas that alternates between advertising only the base mutation and
+    only the clear capability (deploy race / rollback flapping) must refuse a
+    clear-bearing edit: under a split-read gate the first fetch would prove
+    the base name and the second would prove the clear name, admitting a
+    mutation no single deployed manifest ever advertised.
+    """
+    reads: list[int] = []
+    mutations: list[object] = []
+
+    def alternating_manifest(*_args, **_kwargs):
+        reads.append(len(reads))
+        names = (
+            [api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION]
+            if len(reads) % 2 == 1
+            else [api.ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR]
+        )
+        return {
+            "leads": [],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+            "capabilities": names,
+            "capabilityRoutes": [
+                {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+            ],
+        }
+
+    def atlas_request(*_args, **_kwargs):
+        mutations.append(True)
+        raise AssertionError("no mutation may pass a split-read capability pair")
+
+    monkeypatch.setattr(api, "_atlas_funnel_read", alternating_manifest)
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+
+    body = _payload(str(uuid.uuid4()), email=None)
+    body["contactId"] = str(uuid.uuid4())
+    response = client.post(_path(), headers=auth, json=body)
+
+    assert response.status_code == 501, response.text
+    assert response.json()["capability"] == "contact.field_clear"
+    assert mutations == []
+    assert len(reads) == 1, "the pair must be proven from exactly one manifest read"
