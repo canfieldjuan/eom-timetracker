@@ -72,6 +72,9 @@ def test_review_proves_the_tracker_contact_proxy_only_when_atlas_allows_it(
             "hasMore": False,
             "nextCursor": None,
             "capabilities": [api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION],
+            "capabilityRoutes": [
+                {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+            ],
         }
 
     monkeypatch.setattr(api, "_atlas_funnel_read", atlas_read_with_contact_capability)
@@ -92,6 +95,58 @@ def test_review_proves_the_tracker_contact_proxy_only_when_atlas_allows_it(
     assert unavailable.status_code == 200, unavailable.text
     assert unavailable.json()["contactCreationAvailable"] is False
     assert unavailable.json()["contactEditAvailable"] is False
+
+
+def test_edit_proof_requires_the_strict_name_and_exact_route(client, auth, monkeypatch):
+    """The edit proof gates a MUTATION control, so it holds the strict manifest
+    standard: capability name (one malformed member poisons the set) AND the
+    exact registered method/path. Name-only, route-only, and junk manifests
+    all read false."""
+    shapes = [
+        # Name present but no route proof: an older Atlas whose manifest
+        # predates capabilityRoutes, or a rollback that dropped the route.
+        (
+            {
+                "capabilities": [api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION],
+            },
+            False,
+        ),
+        # Route present but capability name missing.
+        (
+            {
+                "capabilities": ["lead.lost"],
+                "capabilityRoutes": [
+                    {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+                ],
+            },
+            False,
+        ),
+        # One malformed member poisons the whole capability set.
+        (
+            {
+                "capabilities": [
+                    api.ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
+                    1,
+                ],
+                "capabilityRoutes": [
+                    {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+                ],
+            },
+            False,
+        ),
+    ]
+    for manifest_fields, expected in shapes:
+        content = {
+            "leads": [],
+            "cursor": None,
+            "hasMore": False,
+            "nextCursor": None,
+            **manifest_fields,
+        }
+        monkeypatch.setattr(api, "_atlas_funnel_read", lambda *_a, _c=content, **_k: _c)
+        response = client.get("/api/admin/funnel/review", headers=auth)
+        assert response.status_code == 200, response.text
+        assert response.json()["contactEditAvailable"] is expected, manifest_fields
 
 
 def test_manual_lead_create_forwards_the_exact_canonical_contract_and_no_local_rows(
