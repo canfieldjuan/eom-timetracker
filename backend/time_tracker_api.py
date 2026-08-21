@@ -14778,6 +14778,15 @@ def clock_in(
                     provisional_resolution,
                     gps_meta_key="clockInGpsMeta",
                 )
+        if home_base["policy"] and home_base_exception:
+            # The durable entry is intentionally internal dispatch evidence,
+            # never the overlapping customer Site seen by the C3 preflight.
+            # Keep the additive response equally truthful for clients and
+            # idempotency receipts.
+            site_resolution["resolution"] = {
+                "state": "unresolved",
+                "reason": "home_base_exception",
+            }
         timesheet_data["entries"].append(entry)
         timesheet_data["nextId"] = entry_id + 1
         return True, entry
@@ -14825,8 +14834,20 @@ def clock_in(
                 gps_meta_key="clockInGpsMeta",
             )
         else:
-            # C3 is association-only.  A Site that changes after the initial
-            # read is not a reason to deny an otherwise valid legacy clock-in.
+            # C3 is association-only. A Site that changes after the initial
+            # read is not a reason to deny an otherwise valid legacy clock-in,
+            # but C3's provisional association must not skip the legacy GPS
+            # rule once it is no longer authoritative.
+            if current_resolution.get("state") != "home_base":
+                override_error = require_gps_override(
+                    _timesheet_data,
+                    payload.latitude,
+                    payload.longitude,
+                    payload.gpsOverrideReason,
+                    payload.gpsOverrideDetail,
+                )
+                if override_error:
+                    raise HTTPException(status_code=400, detail=override_error)
             _c3_restore_target(
                 result,
                 snapshot,
@@ -15362,15 +15383,15 @@ def log_visit(
                 gps_meta_key="gpsMeta",
             )
 
-        # Avoid duplicate: C3's candidate (when enabled) is the tentative
-        # visible target, then the persistence callback repeats this check with
-        # the transaction-authoritative target if it changed meanwhile.
+        # Avoid duplicate: C3's candidate is only tentative. Keep a provisional
+        # duplicate pending through the transaction-authoritative re-resolution;
+        # the callback removes it only if the final Site is still the active one.
         active_visit = get_active_visit(open_entry)
         if active_visit and _visits_refer_to_same_target(
             active_visit,
             visit,
             use_site_identity=GEOFENCE_SITE_RESOLUTION_ENABLED,
-        ):
+        ) and not c3_mode:
             return True, {
                 "alreadyHere": True,
                 "entryId": open_entry["id"],
@@ -15387,7 +15408,7 @@ def log_visit(
         result: Dict[str, Any],
         timesheet_data: Dict[str, Any],
     ) -> None:
-        if not c3_mode or result.get("alreadyHere"):
+        if not c3_mode:
             return
         visit = result.get("visit")
         snapshot = site_resolution.get("snapshot")
@@ -15411,7 +15432,17 @@ def log_visit(
             )
         else:
             # C3 records a resolution when possible but is not C6 enforcement.
-            # A changed Site falls back to the exact legacy arrival target.
+            # A changed Site falls back only when the legacy GPS rule accepts
+            # the exact target that will be persisted.
+            override_error = require_gps_override(
+                timesheet_data,
+                payload.latitude,
+                payload.longitude,
+                payload.gpsOverrideReason,
+                payload.gpsOverrideDetail,
+            )
+            if override_error:
+                raise HTTPException(status_code=400, detail=override_error)
             _c3_restore_target(visit, snapshot, gps_meta_key="gpsMeta")
 
         entry = next(
@@ -16533,8 +16564,12 @@ def _c3_planned_inside_location_ids(
     # C3 never requires a schedule to arrive, but when a schedule is the sole
     # reason an overlap resolves automatically, lock every state input that
     # made that tie-break valid before associating the Site.
-    from calendar_import_store import MORNING_CREW_NAME
+    from calendar_import_store import (
+        MORNING_CREW_NAME,
+        lock_planned_visit_assignment_mutations,
+    )
 
+    lock_planned_visit_assignment_mutations(cur)
     range_start, range_end = _local_workday_bounds(reference_time)
     local_day = reference_time.astimezone(APP_TIMEZONE).date()
     cur.execute(

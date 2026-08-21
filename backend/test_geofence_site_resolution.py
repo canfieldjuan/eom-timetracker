@@ -5,11 +5,13 @@ from __future__ import annotations
 import bcrypt
 import hashlib
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
 
+import calendar_import_store
 import db
 import time_tracker_api as api
 from conftest import _raw_conn
@@ -464,6 +466,57 @@ def test_c3_uses_site_identity_when_a_site_address_is_reused(client, monkeypatch
     assert second_arrival.json()["visit"]["locationId"] == second_site_id
 
 
+def test_c3_rechecks_a_provisional_duplicate_before_returning_already_here(
+    client,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "provisional duplicate")
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    initial_site_id = _create_site("provisional duplicate initial")
+
+    clock_in = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+    assert clock_in.status_code == 200, clock_in.text
+    first_arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+    assert first_arrival.status_code == 200, first_arrival.text
+    assert first_arrival.json()["visit"]["locationId"] == initial_site_id
+
+    original_resolver = api._c3_resolve_site
+    replacement_site_id: int | None = None
+
+    def resolve_after_site_replaced(*args, **kwargs):
+        nonlocal replacement_site_id
+        if kwargs.get("cur") is not None and replacement_site_id is None:
+            db.execute(
+                "UPDATE locations SET active = false WHERE id = %s",
+                (initial_site_id,),
+            )
+            replacement_site_id = _create_site("provisional duplicate replacement")
+        return original_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(api, "_c3_resolve_site", resolve_after_site_replaced)
+    second_arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+
+    assert second_arrival.status_code == 200, second_arrival.text
+    assert second_arrival.json()["alreadyHere"] is False
+    assert second_arrival.json()["visit"]["locationId"] == replacement_site_id
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM visits WHERE shift_id = %s",
+        (clock_in.json()["entry"]["id"],),
+    ) == {"count": 2}
+
+
 def test_c3_resolves_a_supported_per_site_radius_before_legacy_gate(client, monkeypatch):
     _employee_id, employee_auth = _create_employee(client, "per-site radius")
     monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
@@ -519,6 +572,56 @@ def test_c3_commit_recheck_serializes_with_customer_site_mutations(client, monke
     assert events == ["lock", "resolve", "lock", "resolve"]
 
 
+def test_c3_tiebreak_recheck_waits_for_calendar_assignment_mutations(
+    client,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "schedule mutation lock")
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    planned_site_id = _create_site("schedule lock planned")
+    _create_site("schedule lock alternate")
+    _assign_planned_visit(employee_id, planned_site_id, "schedule-lock")
+
+    blocker = _raw_conn()
+    blocker.autocommit = False
+    worker: threading.Thread | None = None
+    completed: dict[str, object] = {}
+    try:
+        with blocker.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (calendar_import_store.PLANNED_VISIT_ASSIGNMENT_MUTATION_LOCK,),
+            )
+
+        def clock_in_while_calendar_assignment_is_locked() -> None:
+            completed["response"] = client.post(
+                "/api/timesheet/clock-in",
+                headers=employee_auth,
+                json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+            )
+
+        worker = threading.Thread(target=clock_in_while_calendar_assignment_is_locked)
+        worker.start()
+        worker.join(timeout=2)
+        assert worker.is_alive(), "C3 did not wait for the calendar assignment lock"
+        assert db.query_one(
+            "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
+            (employee_id,),
+        ) == {"count": 0}
+
+        blocker.rollback()
+        worker.join(timeout=15)
+        assert not worker.is_alive(), "C3 did not resume after the calendar lock released"
+        response = completed.get("response")
+        assert response is not None
+        assert response.status_code == 200, response.text
+    finally:
+        if blocker.closed == 0:
+            blocker.close()
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=15)
+
+
 def test_c3_clock_in_omitting_location_id_replays_a_predeploy_receipt(client, monkeypatch):
     _employee_id, employee_auth = _create_employee(client, "legacy fingerprint")
     monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
@@ -555,7 +658,10 @@ def test_c3_clock_in_omitting_location_id_replays_a_predeploy_receipt(client, mo
     assert replay.json()["replayed"] is True
 
 
-def test_c3_rechecks_before_persist_and_falls_back_without_denial(client, monkeypatch):
+def test_c3_rechecks_before_persist_and_falls_back_when_legacy_gps_allows_it(
+    client,
+    monkeypatch,
+):
     _employee_id, employee_auth = _create_employee(client, "recheck")
     monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
     site_id = _create_site("rechecked site")
@@ -582,6 +688,122 @@ def test_c3_rechecks_before_persist_and_falls_back_without_denial(client, monkey
     assert db.query_one(
         "SELECT location_id FROM shifts WHERE id = %s", (body["entry"]["id"],)
     ) == {"location_id": None}
+
+
+def test_c3_clock_in_fallback_reapplies_the_legacy_gps_guard(client, monkeypatch):
+    employee_id, employee_auth = _create_employee(client, "clock fallback guard")
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    site_id = _create_site("clock fallback guard", geofence_radius_m=250)
+    original_resolver = api._c3_resolve_site
+
+    def resolve_after_site_becomes_ineligible(*args, **kwargs):
+        if kwargs.get("cur") is not None:
+            db.execute("UPDATE locations SET active = false WHERE id = %s", (site_id,))
+        return original_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(api, "_c3_resolve_site", resolve_after_site_becomes_ineligible)
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            # Inside the configured Site radius but outside the legacy 50m pin.
+            "latitude": LATITUDE + 0.001,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "GPS is" in response.json()["error"]
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+
+
+def test_c3_arrival_fallback_reapplies_the_legacy_gps_guard(client, monkeypatch):
+    employee_id, employee_auth = _create_employee(client, "arrival fallback guard")
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    clock_in_latitude = LATITUDE - 0.02
+    _create_site("arrival fallback start", latitude=clock_in_latitude)
+    target_latitude = LATITUDE + 0.02
+    target_site_id = _create_site(
+        "arrival fallback target",
+        latitude=target_latitude,
+        geofence_radius_m=250,
+    )
+
+    clock_in = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={"latitude": clock_in_latitude, "longitude": LONGITUDE, "accuracy": 5},
+    )
+    assert clock_in.status_code == 200, clock_in.text
+
+    original_resolver = api._c3_resolve_site
+
+    def resolve_after_arrival_site_becomes_ineligible(*args, **kwargs):
+        if kwargs.get("cur") is not None and args[0] == "arrive":
+            db.execute(
+                "UPDATE locations SET active = false WHERE id = %s",
+                (target_site_id,),
+            )
+        return original_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(api, "_c3_resolve_site", resolve_after_arrival_site_becomes_ineligible)
+    response = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "latitude": target_latitude + 0.001,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "GPS is" in response.json()["error"]
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM visits WHERE shift_id = %s",
+        (clock_in.json()["entry"]["id"],),
+    ) == {"count": 0}
+
+
+def test_c3_dispatch_exception_reports_an_unassociated_resolution(client, monkeypatch):
+    _employee_id, employee_auth = _create_employee(client, "dispatch exception")
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    _create_site("dispatch exception overlap")
+    home_base = {
+        "home_base_id": 987654,
+        "label": "C3 Test Home Base",
+        "latitude": LATITUDE + 1,
+        "longitude": LONGITUDE,
+        "geofence_radius_m": 50,
+    }
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: home_base)
+    monkeypatch.setattr(api, "_record_home_base_event", lambda *args, **kwargs: {})
+
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "homeBaseExceptionReason": "Office was inaccessible",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["entry"]["location"] == "Dispatch exception"
+    assert body["entry"]["locationId"] is None
+    assert body["siteResolution"] == {
+        "state": "unresolved",
+        "reason": "home_base_exception",
+    }
 
 
 def test_c3_rechecks_a_planned_overlap_tiebreak_before_persist(client, monkeypatch):

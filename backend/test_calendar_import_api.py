@@ -2560,6 +2560,50 @@ def test_concurrent_approvals_serialize_one_occurrence_creation(retired_planner_
     assert db.query_one("SELECT COUNT(*) AS n FROM planned_service_visits")["n"] == 1
 
 
+def test_calendar_approval_serializes_with_c3_schedule_tiebreaks(
+    retired_planner_client,
+    auth,
+):
+    """Calendar assignment writes share C3's authoritative tie-break lock."""
+    connect_selected_calendar()
+    FakeGoogleClient.occurrences = [google_occurrence("c3-assignment-lock")]
+    preview = retired_planner_client.post(
+        "/api/admin/google-calendar/preview",
+        headers=auth,
+        json={"resolutions": []},
+    ).json()
+
+    blocker = psycopg2.connect(os.environ["DATABASE_URL"], sslmode="disable")
+    blocker.autocommit = False
+    try:
+        with blocker.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (store.PLANNED_VISIT_ASSIGNMENT_MUTATION_LOCK,),
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            approval = executor.submit(
+                retired_planner_client.post,
+                "/api/admin/google-calendar/approve",
+                headers=auth,
+                json={
+                    "previewId": preview["previewId"],
+                    "previewFingerprint": preview["previewFingerprint"],
+                },
+            )
+            with pytest.raises(FutureTimeoutError):
+                approval.result(timeout=2)
+
+            blocker.rollback()
+            response = approval.result(timeout=15)
+
+        assert response.status_code == 200, response.text
+    finally:
+        if blocker.closed == 0:
+            blocker.close()
+
+
 def approve_current_preview(retired_planner_client, auth) -> dict:
     preview = retired_planner_client.post(
         "/api/admin/google-calendar/preview",

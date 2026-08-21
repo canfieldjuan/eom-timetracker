@@ -26,6 +26,7 @@ import db
 
 MORNING_CREW_NAME = "Morning Crew"
 MORNING_CREW_EXPECTED_NAMES = ("Carmen", "Pamela", "Tina")
+PLANNED_VISIT_ASSIGNMENT_MUTATION_LOCK = "eom_planned_visit_assignment_mutations_v1"
 RESIDENTIAL_MORNING_ROLE = "residential_morning"
 COMMERCIAL_EVENING_NIGHT_ROLE = "commercial_evening_night"
 CALENDAR_SOURCE_ROLES = (
@@ -45,6 +46,14 @@ class CalendarStoreError(RuntimeError):
 
 class CalendarConfigurationError(CalendarStoreError):
     """Raised when server-only Calendar encryption is not configured."""
+
+
+def lock_planned_visit_assignment_mutations(cur: Any) -> None:
+    """Serialize assignment writes with C3's commit-time schedule tie-break."""
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (PLANNED_VISIT_ASSIGNMENT_MUTATION_LOCK,),
+    )
 
 
 class OAuthStateError(CalendarStoreError):
@@ -1719,6 +1728,11 @@ def apply_reviewed_preview(
     items_by_key = {item.source_key: item for item in preview.items}
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # C3 can use an employee's qualifying assignment to resolve an
+            # overlap. Hold the same lock it takes before changing any planned
+            # visit or assignment, so that final resolution remains true
+            # through this approval transaction.
+            lock_planned_visit_assignment_mutations(cur)
             cur.execute(
                 """
                 SELECT id, connection_id, calendar_id, preview_fingerprint,
