@@ -14,9 +14,14 @@ Run:  cd backend && pytest -v test_auth_revocation.py
 from __future__ import annotations
 
 from datetime import timedelta
+import os
+from pathlib import Path
+import uuid
 
 import bcrypt
 import jwt
+import psycopg2
+from psycopg2 import sql
 
 import db
 import time_tracker_api
@@ -24,6 +29,38 @@ import time_tracker_api
 
 OLD_PASSWORD = "original-password-1"
 NEW_PASSWORD = "rotated-password-2"
+
+
+def test_fresh_schema_bootstraps_password_changed_at():
+    """The raw bootstrap DDL must satisfy the employee mapper before startup."""
+    schema_name = f"password_version_{uuid.uuid4().hex}"
+    schema_sql = Path(__file__).with_name("schema.sql").read_text()
+    connection = psycopg2.connect(os.environ["DATABASE_URL"], sslmode="disable")
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+            )
+            cur.execute(
+                sql.SQL("SET LOCAL search_path TO {}").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+            cur.execute(schema_sql)
+            cur.execute(
+                """
+                SELECT data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = 'employees'
+                  AND column_name = 'password_changed_at'
+                """,
+                (schema_name,),
+            )
+            assert cur.fetchone() == ("timestamp with time zone", "YES")
+    finally:
+        connection.rollback()
+        connection.close()
 
 
 def _create_employee(name: str, password: str = OLD_PASSWORD) -> int:

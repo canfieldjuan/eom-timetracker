@@ -810,6 +810,10 @@ def _atlas_types(
 
     include_field=False models an Atlas that predates ATLAS #2357 and does not
     report the field at all -- the deployed state at the time this was written.
+    When type evidence is present, ``types_by_id`` is this fake's closed Atlas
+    inventory: an unlisted submitted id is dangling. That keeps the known-id
+    verdict and both evidence maps internally consistent when another suite
+    leaves a linked Customer in the session database.
     """
     omit = {str(value) for value in omit_ids}
     revisions_by_id = revisions_by_id or {}
@@ -817,7 +821,11 @@ def _atlas_types(
     def _get(url, *, headers=None, params=None, timeout=None):
         if "/known-contacts" in str(url):
             submitted = [str(v) for v in (params or {}).get("contact_id") or []]
-            known = [v for v in submitted if v not in omit]
+            known = [
+                v
+                for v in submitted
+                if v not in omit and (not include_field or v in types_by_id)
+            ]
             body = {"knownContactIds": known, "checked": len(submitted), "limit": 100}
             if include_field:
                 reported_types = {k: v for k, v in types_by_id.items() if k in known}
@@ -892,6 +900,37 @@ def test_refresh_applies_the_type_atlas_reports(client, auth, monkeypatch):
         (f"%{TEST_PREFIX}%",),
     )
     assert batch["snapshot"]["changes"][0]["sourceRevision"] == 1
+
+
+def test_type_fixture_isolates_unmodelled_linked_customers(client, auth, monkeypatch):
+    """A test-local Atlas inventory must not certify another suite's Customer."""
+    import time_tracker_api as api
+
+    contact = str(uuid.uuid4())
+    customer = _create_customer("Closed Fixture Inventory", contact)
+    unrelated_customer = int(
+        db.execute_returning(
+            "INSERT INTO customers (name, atlas_contact_id) VALUES (%s, %s) "
+            "RETURNING id",
+            (f"Other Suite Customer {uuid.uuid4()}", str(uuid.uuid4())),
+        )
+    )
+
+    try:
+        _set_type(customer, "unknown")
+        monkeypatch.setattr(api.requests, "get", _atlas_types({contact: "commercial"}))
+        response = client.post(
+            TYPE_PREVIEW_PATH, headers=auth, json={"reason": TYPE_REASON}
+        )
+        assert response.status_code == 200, response.text
+        changes = response.json()["changes"]
+        assert any(
+            change["customerId"] == customer and change["to"] == "commercial"
+            for change in changes
+        )
+        assert all(change["customerId"] != unrelated_customer for change in changes)
+    finally:
+        db.execute("DELETE FROM customers WHERE id = %s", (unrelated_customer,))
 
 
 def test_an_atlas_without_the_field_never_blanks_the_mirror(client, auth, monkeypatch):
