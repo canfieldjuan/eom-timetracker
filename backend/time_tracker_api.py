@@ -4474,6 +4474,9 @@ _ATLAS_FUNNEL_READ_PATHS = frozenset(
         _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH,
     }
 )
+_ATLAS_FUNNEL_READ_MAX_ATTEMPTS = 2
+_ATLAS_FUNNEL_READ_RETRY_DELAY_SECONDS = 0.25
+_ATLAS_FUNNEL_READ_RETRY_TIMEOUT_SECONDS = 2.0
 
 
 def _atlas_funnel_read(
@@ -4492,18 +4495,41 @@ def _atlas_funnel_read(
         "X-EOM-Actor-ID": str(admin["id"]),
         "Accept": "application/json",
     }
-    try:
-        response = requests.get(
-            f"{ATLAS_FUNNEL_BASE_URL}{path}",
-            headers=headers,
-            params=params,
-            timeout=ATLAS_FUNNEL_TIMEOUT_SECONDS,
+    upstream_url = f"{ATLAS_FUNNEL_BASE_URL}{path}"
+    upstream_host = urlsplit(ATLAS_FUNNEL_BASE_URL).hostname or "unknown"
+    for attempt in range(1, _ATLAS_FUNNEL_READ_MAX_ATTEMPTS + 1):
+        timeout = (
+            ATLAS_FUNNEL_TIMEOUT_SECONDS
+            if attempt == 1
+            else min(ATLAS_FUNNEL_TIMEOUT_SECONDS, _ATLAS_FUNNEL_READ_RETRY_TIMEOUT_SECONDS)
         )
-    except requests.RequestException as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="EOM lead review service is temporarily unavailable; retry this request",
-        ) from exc
+        started_at = time.monotonic()
+        try:
+            response = requests.get(
+                upstream_url,
+                headers=headers,
+                params=params,
+                timeout=timeout,
+            )
+            break
+        except requests.RequestException as exc:
+            elapsed_ms = round((time.monotonic() - started_at) * 1000)
+            logger.warning(
+                "Atlas EOM funnel read transport failure path=%s upstream_host=%s "
+                "attempt=%s/%s elapsed_ms=%s exception_type=%s",
+                path,
+                upstream_host,
+                attempt,
+                _ATLAS_FUNNEL_READ_MAX_ATTEMPTS,
+                elapsed_ms,
+                type(exc).__name__,
+            )
+            if attempt == _ATLAS_FUNNEL_READ_MAX_ATTEMPTS:
+                raise HTTPException(
+                    status_code=503,
+                    detail="EOM lead review service is temporarily unavailable; retry this request",
+                ) from exc
+            time.sleep(_ATLAS_FUNNEL_READ_RETRY_DELAY_SECONDS)
     try:
         content = response.json()
     except ValueError as exc:
