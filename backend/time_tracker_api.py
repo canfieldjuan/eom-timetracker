@@ -43,6 +43,8 @@ import arrival_policy_inventory
 import arrival_policies
 import db
 from time_action_registry import (
+    DATABASE_TIME_ACTION_CAPABILITIES_SETTING,
+    DATABASE_TIME_ACTION_SETTING,
     TIME_ACTION_MIGRATION_SOURCE_ACTIONS,
     TimeMutationCapability,
     registered_time_action,
@@ -7318,8 +7320,7 @@ def _ensure_schema_migrations() -> None:
     # omits it entirely; this trigger stamps those rows so the rolling-deploy
     # window cannot leave a rated employee's shift unsnapshotted. Only fills a
     # NULL (an app-supplied value wins) and leaves a rate-less employee NULL.
-    # CREATE OR REPLACE + DROP/CREATE TRIGGER are idempotent. NOTE: this is the
-    # only trigger in the codebase.
+    # CREATE OR REPLACE + DROP/CREATE TRIGGER are idempotent.
     db.execute("""
         CREATE OR REPLACE FUNCTION stamp_shift_hourly_rate_cents()
         RETURNS TRIGGER AS $$
@@ -7973,6 +7974,226 @@ def _ensure_schema_migrations() -> None:
     # that predate the provenance column or were written by an old instance
     # during a rolling deploy, catching the latter on the next boot.
     _reconcile_unstamped_allocation_costs()
+    _ensure_time_mutation_guard_schema()
+
+
+def _ensure_time_mutation_guard_schema() -> None:
+    """Install the observe-only database boundary for declared time actions.
+
+    The action registry remains the source of granted capabilities.  The
+    database owns the table/operation requirement and records an event whenever
+    a direct cursor, bulk executor, or other writer reaches time evidence
+    without the matching transaction-local context.  This release deliberately
+    observes rather than rejects so production can prove the complete writer
+    set before the later fail-closed migration.
+    """
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS time_mutation_guard_events (
+            id                  BIGSERIAL PRIMARY KEY,
+            observed_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            mode                TEXT NOT NULL CHECK (mode IN ('observe', 'enforce')),
+            table_name          TEXT NOT NULL,
+            operation           TEXT NOT NULL,
+            required_capability TEXT NOT NULL,
+            action              TEXT NOT NULL DEFAULT '',
+            supplied_capabilities TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+            database_user       TEXT NOT NULL,
+            application_name    TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_time_mutation_guard_events_observed_at
+        ON time_mutation_guard_events(observed_at DESC, id DESC)
+    """)
+
+    # Keep every DROP + CREATE in one transaction. A rolling deploy must never
+    # leave a committed interval where only some protected tables have a guard.
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                CREATE OR REPLACE FUNCTION observe_time_mutation_guard()
+                RETURNS TRIGGER AS $$
+                DECLARE
+                    active_action TEXT := COALESCE(
+                        current_setting('{DATABASE_TIME_ACTION_SETTING}', true),
+                        ''
+                    );
+                    active_capabilities TEXT[] := string_to_array(
+                        COALESCE(
+                            current_setting(
+                                '{DATABASE_TIME_ACTION_CAPABILITIES_SETTING}',
+                                true
+                            ),
+                            ''
+                        ),
+                        ','
+                    );
+                    required_capability TEXT := TG_ARGV[0];
+                BEGIN
+                    IF active_action = '' OR NOT (
+                        required_capability = ANY(
+                            COALESCE(active_capabilities, ARRAY[]::TEXT[])
+                        )
+                    ) THEN
+                        INSERT INTO time_mutation_guard_events (
+                            mode,
+                            table_name,
+                            operation,
+                            required_capability,
+                            action,
+                            supplied_capabilities,
+                            database_user,
+                            application_name
+                        )
+                        VALUES (
+                            'observe',
+                            TG_TABLE_NAME,
+                            TG_OP,
+                            required_capability,
+                            active_action,
+                            COALESCE(active_capabilities, ARRAY[]::TEXT[]),
+                            current_user,
+                            COALESCE(current_setting('application_name', true), '')
+                        );
+                    END IF;
+
+                    IF TG_OP = 'DELETE' THEN
+                        RETURN OLD;
+                    END IF;
+                    RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+            """)
+
+            for statement in (
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_shifts_insert ON shifts",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_shifts_update ON shifts",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_shifts_delete ON shifts",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_visits_insert ON visits",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_visits_update ON visits",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_visits_delete ON visits",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_departures_insert ON departures",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_departures_update ON departures",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_departures_delete ON departures",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_correction_batches ON time_data_correction_batches",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_hour_corrections ON payroll_hour_corrections",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_hour_allocations_insert_delete ON payroll_hour_correction_allocations",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_hour_allocations_update ON payroll_hour_correction_allocations",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_shift_corrections ON payroll_shift_corrections",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_manual_shifts ON payroll_manual_shift_versions",
+                "DROP TRIGGER IF EXISTS trg_observe_time_mutation_shift_exclusions ON payroll_shift_exclusions",
+                """
+                CREATE TRIGGER trg_observe_time_mutation_shifts_insert
+                    BEFORE INSERT ON shifts
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('shift-time-write')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_shifts_update
+                    BEFORE UPDATE OF clock_in, clock_out, total_hours ON shifts
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('shift-time-write')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_shifts_delete
+                    BEFORE DELETE ON shifts
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('time-evidence-delete')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_visits_insert
+                    BEFORE INSERT ON visits
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('visit-time-write')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_visits_update
+                    BEFORE UPDATE OF arrival_time ON visits
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('visit-time-write')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_visits_delete
+                    BEFORE DELETE ON visits
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('time-evidence-delete')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_departures_insert
+                    BEFORE INSERT ON departures
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('departure-time-write')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_departures_update
+                    BEFORE UPDATE OF departure_time ON departures
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('departure-time-write')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_departures_delete
+                    BEFORE DELETE ON departures
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('time-evidence-delete')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_correction_batches
+                    BEFORE INSERT OR UPDATE OR DELETE ON time_data_correction_batches
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('time-correction-batch-write')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_hour_corrections
+                    BEFORE INSERT OR UPDATE OR DELETE ON payroll_hour_corrections
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('payroll-hour-correction-write')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_hour_allocations_insert_delete
+                    BEFORE INSERT OR DELETE ON payroll_hour_correction_allocations
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard(
+                        'payroll-hour-correction-allocation-write'
+                    )
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_hour_allocations_update
+                    BEFORE UPDATE OF
+                        allocated_delta_minutes,
+                        correction_date,
+                        correction_id,
+                        employee_id,
+                        job_id,
+                        location_id,
+                        status,
+                        week_start
+                    ON payroll_hour_correction_allocations
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard(
+                        'payroll-hour-correction-allocation-write'
+                    )
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_shift_corrections
+                    BEFORE INSERT OR UPDATE OR DELETE ON payroll_shift_corrections
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('payroll-shift-correction-write')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_manual_shifts
+                    BEFORE INSERT OR UPDATE OR DELETE ON payroll_manual_shift_versions
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('payroll-timesheet-overlay-write')
+                """,
+                """
+                CREATE TRIGGER trg_observe_time_mutation_shift_exclusions
+                    BEFORE INSERT OR UPDATE OR DELETE ON payroll_shift_exclusions
+                    FOR EACH ROW
+                    EXECUTE FUNCTION observe_time_mutation_guard('payroll-timesheet-overlay-write')
+                """,
+            ):
+                cur.execute(statement)
 
 
 def _ensure_geofence_pin_columns(table: str) -> None:

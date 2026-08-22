@@ -19,6 +19,10 @@ from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
+from time_action_registry import (
+    TIME_ACTION_MIGRATION_SOURCE_ACTIONS,
+    apply_registered_time_action_database_context,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parent
 BASE_DIR = BACKEND_DIR.parent
@@ -227,6 +231,10 @@ def main():
     timesheet_data  = json.loads(TIMESHEETS_FILE.read_text())
 
     conn = connect(args.db_url)
+    apply_registered_time_action_database_context(
+        conn,
+        action=TIME_ACTION_MIGRATION_SOURCE_ACTIONS["migrate_json_to_pg.py"],
+    )
     cur  = conn.cursor()
 
     try:

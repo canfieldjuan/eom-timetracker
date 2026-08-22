@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import inspect
 
 import pytest
@@ -75,6 +76,66 @@ EXPECTED_RUNTIME_HANDLERS = {
     ),
 }
 
+EXPECTED_DATABASE_MUTATION_CAPABILITIES = {
+    "clock-in": frozenset({"shift-time-write"}),
+    "clock-out": frozenset({"shift-time-write"}),
+    "arrive": frozenset({"visit-time-write"}),
+    "depart": frozenset({"departure-time-write"}),
+    "home-base-start": frozenset({"shift-time-write"}),
+    "home-base-end": frozenset({"shift-time-write"}),
+    "site-qr-arrive": frozenset({"visit-time-write"}),
+    "site-qr-depart": frozenset({"departure-time-write"}),
+    "site-check-in-evidence": frozenset(),
+    "admin-entry-adjustment": frozenset({"shift-time-write"}),
+    "admin-time-data-correction": frozenset(
+        {
+            "shift-time-write",
+            "time-evidence-delete",
+            "time-correction-batch-write",
+            "payroll-timesheet-overlay-write",
+            "payroll-shift-correction-write",
+        }
+    ),
+    "admin-utilization-missing-departure-correction": frozenset(
+        {"time-correction-batch-write"}
+    ),
+    "payroll-timesheet-change": frozenset(
+        {
+            "payroll-timesheet-overlay-write",
+            "payroll-hour-correction-write",
+            "payroll-hour-correction-allocation-write",
+            "payroll-shift-correction-write",
+        }
+    ),
+    "payroll-hour-correction": frozenset(
+        {
+            "payroll-hour-correction-write",
+            "payroll-hour-correction-allocation-write",
+        }
+    ),
+    "payroll-hour-correction-void": frozenset(
+        {
+            "payroll-hour-correction-write",
+            "payroll-hour-correction-allocation-write",
+        }
+    ),
+    "payroll-hour-correction-allocation": frozenset(
+        {"payroll-hour-correction-allocation-write"}
+    ),
+    "payroll-hour-correction-allocation-void": frozenset(
+        {"payroll-hour-correction-allocation-write"}
+    ),
+    "payroll-shift-correction": frozenset({"payroll-shift-correction-write"}),
+    "payroll-shift-correction-void": frozenset(
+        {"payroll-shift-correction-write"}
+    ),
+    "schema-migration": frozenset(),
+    "legacy-json-import": frozenset(
+        {"shift-time-write", "visit-time-write"}
+    ),
+    "post-import-rate-snapshot-backfill": frozenset(),
+}
+
 
 def test_startup_time_action_registry_is_complete() -> None:
     registry.validate_time_action_registry()
@@ -90,6 +151,17 @@ def test_startup_completeness_gate_rejects_handler_for_undeclared_policy() -> No
 
     with pytest.raises(RuntimeError, match="synthetic-time-mutation"):
         registry.validate_time_action_registry(handlers=handlers)
+
+
+def test_startup_completeness_gate_rejects_unknown_database_capability() -> None:
+    policies = dict(registry.TIME_ACTION_POLICIES)
+    policies["clock-in"] = replace(
+        policies["clock-in"],
+        database_mutation_capabilities=frozenset({"unknown-database-capability"}),
+    )
+
+    with pytest.raises(RuntimeError, match="unknown database mutation capability"):
+        registry.validate_time_action_registry(policies=policies)
 
 
 def test_startup_completeness_gate_rejects_unguarded_direct_time_writer() -> None:
@@ -465,6 +537,13 @@ def test_runtime_policy_fields_match_the_current_time_action_contract() -> None:
         assert audit_fragment in policy.audit_target
         assert gps_fragment in policy.weak_or_missing_gps_behavior
         assert exception_fragment in policy.exception_method
+
+
+def test_runtime_policy_database_capabilities_match_the_guard_contract() -> None:
+    assert {
+        action_name: policy.database_mutation_capabilities
+        for action_name, policy in registry.TIME_ACTION_POLICIES.items()
+    } == EXPECTED_DATABASE_MUTATION_CAPABILITIES
 
 
 def test_migration_policies_are_declared_and_explicitly_non_gated() -> None:
