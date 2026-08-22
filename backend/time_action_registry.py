@@ -40,8 +40,10 @@ ActionResolver = Callable[..., str]
 _DIRECT_TIME_MUTATION_SQL = re.compile(
     r"\b(?:insert\s+into|delete\s+from)\s+(?:shifts|visits|departures|time_data_correction_batches)\b"
 )
-_PAYROLL_HOUR_CORRECTION_OVERLAY_SQL = re.compile(
-    r"\b(?:insert\s+into|delete\s+from|update)\s+payroll_hour_corrections\b"
+_PAYROLL_TIME_OVERLAY_SQL = re.compile(
+    r"\b(?:insert\s+into|delete\s+from|update)\s+"
+    r"(?:payroll_hour_corrections|payroll_shift_corrections|"
+    r"payroll_manual_shift_versions|payroll_shift_exclusions)\b"
 )
 _SQL_EXECUTION_METHODS = frozenset(
     {"execute", "execute_returning", "query_one", "query_all"}
@@ -607,7 +609,7 @@ def _is_direct_time_mutation_sql(sql: str) -> bool:
     normalized = " ".join(sql.lower().split())
     if (
         _DIRECT_TIME_MUTATION_SQL.search(normalized)
-        or _PAYROLL_HOUR_CORRECTION_OVERLAY_SQL.search(normalized)
+        or _PAYROLL_TIME_OVERLAY_SQL.search(normalized)
     ):
         return True
     for table_name, columns in _TEMPORAL_UPDATE_COLUMNS.items():
@@ -627,11 +629,12 @@ def validate_time_action_mutation_source(
 
     This intentionally derives writers from direct SQL in production sources
     rather than guessing from FastAPI route shape. A writer that creates/deletes
-    a shift, visit, departure, or time-affecting correction overlay—or alters a
-    temporal boundary—must establish its registered context unconditionally before
-    executing that SQL. A caller may classify one source as a declared
-    non-request migration; that exception is validated against the closed policy
-    registry. The scanner covers all local SQL execution helpers and resolves
+    a shift, visit, departure, or time-affecting payroll/correction overlay—or
+    alters a temporal boundary—must establish its registered context with a
+    standalone, direct function-body guard before executing that SQL. A caller may
+    classify one source as a declared non-request migration; that exception is
+    validated against the closed policy registry. The scanner covers all local SQL
+    execution helpers and resolves
     simple local string bindings first.
     """
 
@@ -654,37 +657,26 @@ def validate_time_action_mutation_source(
     class DirectTimeMutationVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.function_stack: list[_TimeMutationSourceScope] = []
-            self.control_flow_depths: list[int] = []
+
+        @staticmethod
+        def _is_unconditional_context_guard(statement: ast.stmt) -> bool:
+            return (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Name)
+                and statement.value.func.id == "require_registered_time_action_context"
+            )
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            self.function_stack.append(_TimeMutationSourceScope(node.name, [], {}))
-            self.control_flow_depths.append(0)
+            scope = _TimeMutationSourceScope(node.name, [], {})
+            self.function_stack.append(scope)
             for statement in node.body:
+                if self._is_unconditional_context_guard(statement):
+                    scope.guard_lines.append(statement.lineno)
                 self.visit(statement)
-            self.control_flow_depths.pop()
             self.function_stack.pop()
 
         visit_AsyncFunctionDef = visit_FunctionDef
-
-        def _visit_nested_control_flow(self, node: ast.AST) -> None:
-            if not self.function_stack:
-                self.generic_visit(node)
-                return
-            self.control_flow_depths[-1] += 1
-            try:
-                self.generic_visit(node)
-            finally:
-                self.control_flow_depths[-1] -= 1
-
-        visit_If = _visit_nested_control_flow
-        visit_For = _visit_nested_control_flow
-        visit_AsyncFor = _visit_nested_control_flow
-        visit_While = _visit_nested_control_flow
-        visit_Try = _visit_nested_control_flow
-        visit_TryStar = _visit_nested_control_flow
-        visit_With = _visit_nested_control_flow
-        visit_AsyncWith = _visit_nested_control_flow
-        visit_Match = _visit_nested_control_flow
 
         def _sql_text(self, node: ast.AST) -> Optional[str]:
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -738,14 +730,6 @@ def validate_time_action_mutation_source(
             self.generic_visit(node)
 
         def visit_Call(self, node: ast.Call) -> None:
-            if (
-                self.function_stack
-                and self.control_flow_depths[-1] == 0
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "require_registered_time_action_context"
-            ):
-                self.function_stack[-1].guard_lines.append(node.lineno)
-
             sql = (
                 self._sql_text(node.args[0])
                 if (

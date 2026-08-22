@@ -23484,6 +23484,10 @@ def _migrate_duplicate_payroll_shift_corrections(
     cur: Any,
     duplicate_resolutions: List[Dict[str, Any]],
 ) -> List[int]:
+    require_registered_time_action_context(
+        "admin-time-data-correction",
+        required_capabilities=frozenset({"closes_shift"}),
+    )
     migrated_ids: List[int] = []
     for resolution in duplicate_resolutions:
         canonical_shift_id = int(resolution["canonicalShiftId"])
@@ -28989,6 +28993,7 @@ def _payroll_insert_manual_shift_version(
     batch_id: int,
     actor: Dict[str, Any],
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-timesheet-change")
     cur.execute(
         """
         INSERT INTO payroll_manual_shift_versions (
@@ -29031,6 +29036,7 @@ def _payroll_supersede_manual_shift(
     batch_id: int,
     actor: Dict[str, Any],
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-timesheet-change")
     cur.execute(
         """
         UPDATE payroll_manual_shift_versions
@@ -29197,6 +29203,7 @@ def admin_apply_payroll_timesheet_changes(
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-timesheet-change")
     week_start = _parse_payroll_week_start(payload.weekStart)
     _week_end, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
     request_fingerprint = _payroll_timesheet_change_request_fingerprint(payload)
@@ -29713,6 +29720,7 @@ def admin_create_payroll_shift_correction(
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-shift-correction")
     week_start = _parse_payroll_week_start(payload.weekStart)
     correction_date = _parse_payroll_correction_date(payload.date, week_start)
     corrected_clock_in = _parse_payroll_shift_correction_datetime(
@@ -29889,6 +29897,7 @@ def admin_void_payroll_shift_correction(
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-shift-correction-void")
     with timesheet_postgres_advisory_lock():
         with db.get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:

@@ -112,6 +112,20 @@ def conditional_time_writer(enabled):
         registry.validate_time_action_mutation_source(source)
 
 
+def test_startup_completeness_gate_rejects_short_circuited_guard() -> None:
+    source = """
+def short_circuited_time_writer(enabled):
+    enabled and require_registered_time_action_context()
+    db.execute('INSERT INTO shifts (employee_id) VALUES (1)')
+"""
+
+    with pytest.raises(
+        RuntimeError,
+        match="short_circuited_time_writer:4",
+    ):
+        registry.validate_time_action_mutation_source(source)
+
+
 def test_startup_completeness_gate_rejects_unguarded_time_correction_overlay() -> None:
     source = """
 def synthetic_time_correction_overlay():
@@ -125,15 +139,50 @@ def synthetic_time_correction_overlay():
         registry.validate_time_action_mutation_source(source)
 
 
-def test_startup_completeness_gate_rejects_unguarded_payroll_overlay_void() -> None:
-    source = """
-def synthetic_payroll_overlay_void():
-    db.execute(\"UPDATE payroll_hour_corrections SET status = 'voided'\")
+@pytest.mark.parametrize(
+    "table_name",
+    (
+        "payroll_hour_corrections",
+        "payroll_shift_corrections",
+        "payroll_manual_shift_versions",
+        "payroll_shift_exclusions",
+    ),
+)
+def test_startup_completeness_gate_rejects_unguarded_payroll_overlay_insert(
+    table_name: str,
+) -> None:
+    source = f"""
+def synthetic_payroll_overlay_insert():
+    db.execute(\"INSERT INTO {table_name} (id) VALUES (1)\")
 """
 
     with pytest.raises(
         RuntimeError,
-        match="synthetic_payroll_overlay_void:3",
+        match="synthetic_payroll_overlay_insert:3",
+    ):
+        registry.validate_time_action_mutation_source(source)
+
+
+@pytest.mark.parametrize(
+    "table_name",
+    (
+        "payroll_hour_corrections",
+        "payroll_shift_corrections",
+        "payroll_manual_shift_versions",
+        "payroll_shift_exclusions",
+    ),
+)
+def test_startup_completeness_gate_rejects_unguarded_payroll_overlay_update(
+    table_name: str,
+) -> None:
+    source = f"""
+def synthetic_payroll_overlay_update():
+    db.execute(\"UPDATE {table_name} SET status = 'voided'\")
+"""
+
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic_payroll_overlay_update:3",
     ):
         registry.validate_time_action_mutation_source(source)
 
