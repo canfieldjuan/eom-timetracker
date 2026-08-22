@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bcrypt
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from uuid import uuid4
 
@@ -232,6 +233,52 @@ def test_direct_clock_in_is_admin_only_server_timed_and_audited(client, auth, mo
         "shift_id": int(result["entry"]["id"]),
         "visit_id": None,
     }
+
+
+def test_direct_record_samples_its_timestamp_after_timesheet_serialization(
+    client, auth, monkeypatch
+):
+    employee_id, _ = _create_employee(client, "serialized timestamp")
+    site_id = _create_site("serialized timestamp")
+    preflight_at = datetime(2026, 8, 22, 15, 30, tzinfo=timezone.utc)
+    recorded_at = datetime(2026, 8, 22, 15, 31, tzinfo=timezone.utc)
+    lock_held = False
+
+    @contextmanager
+    def tracked_timesheet_lock():
+        nonlocal lock_held
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
+
+    monkeypatch.setattr(api, "timesheet_postgres_advisory_lock", tracked_timesheet_lock)
+    monkeypatch.setattr(
+        api,
+        "utc_now",
+        lambda: recorded_at if lock_held else preflight_at,
+    )
+
+    response = client.post(
+        "/api/admin/time-actions/direct-record",
+        headers=auth,
+        json=_payload(employee_id, site_id),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["recordedAt"] == "2026-08-22T15:31:00Z"
+    assert db.query_one(
+        "SELECT clock_in FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"clock_in": recorded_at}
+
+
+def test_home_base_config_advertises_direct_record_capability(client, auth):
+    response = client.get("/api/admin/home-base", headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["adminDirectRecordEnabled"] is True
 
 
 def test_direct_record_replays_once_and_its_receipt_is_immutable(client, auth):

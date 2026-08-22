@@ -11525,6 +11525,10 @@ def _serialize_home_base_config(
     morning_crew: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     return {
+        # An older tracker does not advertise this field, which lets a newer
+        # portal fail closed instead of enabling a form whose route it cannot
+        # yet serve.  This code path and the direct-record route ship together.
+        "adminDirectRecordEnabled": True,
         "configured": config is not None,
         "homeBase": (
             {
@@ -15231,14 +15235,17 @@ def admin_direct_record_time_action(
     if replay is not None:
         return replay
 
-    now_utc = utc_now()
+    # This preflight can return a quick validation error, but its reference
+    # time must never become the recorded event time: another writer can
+    # finish while this request waits for the serialized timesheet lock.
+    preflight_now_utc = utc_now()
     target_employee = _admin_direct_record_employee(int(payload.employeeId))
     if target_employee is None:
         raise HTTPException(status_code=404, detail="Active employee not found")
     target = _admin_direct_record_target(
         payload,
         employee_id=int(target_employee["id"]),
-        reference_time=now_utc,
+        reference_time=preflight_now_utc,
     )
     if target is None:
         raise HTTPException(
@@ -15251,6 +15258,13 @@ def admin_direct_record_time_action(
         "target": target,
     }
     holder: Dict[str, Any] = {}
+    recorded_at_ref: Dict[str, datetime] = {}
+
+    def recorded_at() -> datetime:
+        value = recorded_at_ref.get("value")
+        if not isinstance(value, datetime):
+            raise RuntimeError("Administrator direct record has no serialized timestamp")
+        return value
 
     def target_public() -> Dict[str, Any]:
         current = authoritative["target"]
@@ -15266,6 +15280,11 @@ def admin_direct_record_time_action(
         return (True, locked_replay) if locked_replay is not None else None
 
     def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        # The timestamp is authoritative only after update_timesheets has
+        # acquired both in-process and PostgreSQL advisory locks and loaded the
+        # state this event will follow.
+        now_utc = utc_now()
+        recorded_at_ref["value"] = now_utc
         employee_id = int(payload.employeeId)
         stale_open = get_stale_open_entry(
             timesheet_data["entries"], employee_id, now_utc
@@ -15375,6 +15394,7 @@ def admin_direct_record_time_action(
     result_ref: Dict[str, Any] = {}
 
     def validate_target_before_persist(cur: Any) -> None:
+        now_utc = recorded_at()
         current_employee = _admin_direct_record_employee(
             int(payload.employeeId),
             cur=cur,
@@ -15420,6 +15440,7 @@ def admin_direct_record_time_action(
             visit["customer"] = str(current_target.get("customerName") or "")
 
     def response_builder(result: Dict[str, Any]) -> Dict[str, Any]:
+        now_utc = recorded_at()
         response: Dict[str, Any] = {
             "success": True,
             "action": payload.action,
@@ -15440,6 +15461,7 @@ def admin_direct_record_time_action(
         return response
 
     def after_save(cur: Any) -> None:
+        now_utc = recorded_at()
         response = response_builder(result_ref)
         current_target = authoritative["target"]
         # A new shift starts with an in-memory nextId, but PostgreSQL owns the
