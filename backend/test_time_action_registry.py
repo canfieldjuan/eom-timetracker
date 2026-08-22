@@ -261,6 +261,24 @@ def synthetic_{executor}_time_writer():
         registry.validate_time_action_mutation_source(source)
 
 
+def test_startup_completeness_gate_checks_local_sql_wrappers() -> None:
+    source = """
+def query_rows(sql, cursor=None):
+    if cursor is None:
+        return db.query_all(sql)
+    cursor.execute(sql)
+
+def synthetic_wrapped_time_writer():
+    query_rows('DELETE FROM shifts WHERE id = 1 RETURNING id')
+"""
+
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic_wrapped_time_writer:8",
+    ):
+        registry.validate_time_action_mutation_source(source)
+
+
 def test_registered_routes_preserve_evaluated_api_model_annotations() -> None:
     signature = inspect.signature(api.record_home_base_scan)
 
@@ -271,6 +289,39 @@ def test_registered_routes_preserve_evaluated_api_model_annotations() -> None:
 def test_multi_action_handler_must_declare_its_resolver() -> None:
     with pytest.raises(ValueError, match="needs an action resolver"):
         registry.registered_time_action("clock-in", "clock-out")
+
+
+def test_identical_handler_registration_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(registry, "_HANDLER_REGISTRATIONS", {})
+
+    def build_handler() -> None:
+        @registry.registered_time_action("clock-in")
+        def synthetic_handler() -> None:
+            return None
+
+    build_handler()
+    build_handler()
+
+    handlers = registry.registered_time_action_handlers()
+    assert len(handlers) == 1
+    assert next(iter(handlers.values())).action_names == frozenset({"clock-in"})
+
+
+def test_conflicting_handler_registration_still_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(registry, "_HANDLER_REGISTRATIONS", {})
+
+    def build_handler(action: str) -> None:
+        @registry.registered_time_action(action)
+        def synthetic_handler() -> None:
+            return None
+
+    build_handler("clock-in")
+    with pytest.raises(RuntimeError, match="conflicting actions"):
+        build_handler("clock-out")
 
 
 def test_runtime_writers_are_all_registered_with_their_closed_action_set() -> None:

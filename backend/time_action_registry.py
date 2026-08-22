@@ -90,6 +90,12 @@ class _TimeMutationSourceScope:
 
 
 @dataclass(frozen=True)
+class _LocalSqlExecutionWrapper:
+    sql_parameter: str
+    positional_index: Optional[int]
+
+
+@dataclass(frozen=True)
 class TimeActionPolicy:
     """The complete declared policy for one time-producing workflow."""
 
@@ -526,12 +532,18 @@ def registered_time_action(
 
     def decorate(handler: Callable[P, T]) -> Callable[P, T]:
         handler_name = f"{handler.__module__}.{handler.__qualname__}"
-        if handler_name in _HANDLER_REGISTRATIONS:
-            raise RuntimeError(f"Time-action handler already registered: {handler_name}")
-        _HANDLER_REGISTRATIONS[handler_name] = TimeActionHandlerRegistration(
-            handler=handler_name,
-            action_names=normalized_actions,
-        )
+        existing_registration = _HANDLER_REGISTRATIONS.get(handler_name)
+        if existing_registration is not None:
+            if existing_registration.action_names != normalized_actions:
+                raise RuntimeError(
+                    "Time-action handler already registered with conflicting actions: "
+                    f"{handler_name}"
+                )
+        else:
+            _HANDLER_REGISTRATIONS[handler_name] = TimeActionHandlerRegistration(
+                handler=handler_name,
+                action_names=normalized_actions,
+            )
 
         @wraps(handler)
         def wrapped(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -688,8 +700,8 @@ def validate_time_action_mutation_source(
     alters a temporal boundary—must establish its registered context with a
     standalone, direct function-body guard before executing that SQL. A caller may
     classify one source as a declared non-request migration; that exception is
-    validated against the closed policy registry. The scanner covers all local SQL
-    execution helpers and resolves
+    validated against the closed policy registry. The scanner detects direct SQL
+    execution helpers, traces simple named local SQL wrappers, and resolves
     simple local string bindings first.
     """
 
@@ -709,9 +721,100 @@ def validate_time_action_mutation_source(
             )
             migration_policy = None
 
+    def _sql_argument_for_wrapper_call(
+        node: ast.Call,
+        wrapper: _LocalSqlExecutionWrapper,
+    ) -> Optional[ast.AST]:
+        if (
+            wrapper.positional_index is not None
+            and len(node.args) > wrapper.positional_index
+        ):
+            return node.args[wrapper.positional_index]
+        for keyword in node.keywords:
+            if keyword.arg == wrapper.sql_parameter:
+                return keyword.value
+        return None
+
+    def _local_sql_execution_wrappers() -> Dict[str, _LocalSqlExecutionWrapper]:
+        function_nodes = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        wrappers: Dict[str, _LocalSqlExecutionWrapper] = {}
+
+        class SqlForwardingVisitor(ast.NodeVisitor):
+            def __init__(self, parameter_names: set[str]) -> None:
+                self.parameter_names = parameter_names
+                self.forwarded_parameter: Optional[str] = None
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                # A nested function has its own parameters and is not part of
+                # the enclosing function's local SQL-forwarding contract.
+                return
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Call(self, node: ast.Call) -> None:
+                sql_argument: Optional[ast.AST] = None
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in _SQL_EXECUTION_METHODS
+                    and node.args
+                ):
+                    sql_argument = node.args[0]
+                elif isinstance(node.func, ast.Name):
+                    wrapper = wrappers.get(node.func.id)
+                    if wrapper is not None:
+                        sql_argument = _sql_argument_for_wrapper_call(node, wrapper)
+                if (
+                    isinstance(sql_argument, ast.Name)
+                    and sql_argument.id in self.parameter_names
+                ):
+                    self.forwarded_parameter = sql_argument.id
+                self.generic_visit(node)
+
+        while True:
+            added_wrapper = False
+            for function in function_nodes:
+                if function.name in wrappers:
+                    continue
+                positional_parameters = [
+                    *function.args.posonlyargs,
+                    *function.args.args,
+                ]
+                parameter_names = {
+                    parameter.arg
+                    for parameter in (
+                        *positional_parameters,
+                        *function.args.kwonlyargs,
+                    )
+                }
+                visitor = SqlForwardingVisitor(parameter_names)
+                for statement in function.body:
+                    visitor.visit(statement)
+                if visitor.forwarded_parameter is None:
+                    continue
+                positional_index = next(
+                    (
+                        index
+                        for index, parameter in enumerate(positional_parameters)
+                        if parameter.arg == visitor.forwarded_parameter
+                    ),
+                    None,
+                )
+                wrappers[function.name] = _LocalSqlExecutionWrapper(
+                    sql_parameter=visitor.forwarded_parameter,
+                    positional_index=positional_index,
+                )
+                added_wrapper = True
+            if not added_wrapper:
+                return wrappers
+
     class DirectTimeMutationVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.function_stack: list[_TimeMutationSourceScope] = []
+            self.local_sql_wrappers = _local_sql_execution_wrappers()
 
         @staticmethod
         def _is_unconditional_context_guard(statement: ast.stmt) -> bool:
@@ -785,16 +888,19 @@ def validate_time_action_mutation_source(
             self.generic_visit(node)
 
         def visit_Call(self, node: ast.Call) -> None:
-            sql = (
-                self._sql_text(node.args[0])
-                if (
-                    self.function_stack
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in _SQL_EXECUTION_METHODS
-                    and node.args
-                )
-                else None
-            )
+            sql_argument: Optional[ast.AST] = None
+            if (
+                self.function_stack
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _SQL_EXECUTION_METHODS
+                and node.args
+            ):
+                sql_argument = node.args[0]
+            elif self.function_stack and isinstance(node.func, ast.Name):
+                wrapper = self.local_sql_wrappers.get(node.func.id)
+                if wrapper is not None:
+                    sql_argument = _sql_argument_for_wrapper_call(node, wrapper)
+            sql = self._sql_text(sql_argument) if sql_argument is not None else None
             if isinstance(sql, str) and _is_direct_time_mutation_sql(sql):
                 scope = self.function_stack[-1]
                 if migration_policy is None and not any(
