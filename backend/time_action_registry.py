@@ -45,6 +45,23 @@ _PAYROLL_TIME_OVERLAY_SQL = re.compile(
     r"(?:payroll_hour_corrections|payroll_shift_corrections|"
     r"payroll_manual_shift_versions|payroll_shift_exclusions)\b"
 )
+_PAYROLL_ALLOCATION_SQL = re.compile(
+    r"\b(?:insert\s+into|delete\s+from)\s+payroll_hour_correction_allocations\b"
+)
+# Cost/provenance-only reconciliation is a money maintenance operation. These
+# columns instead decide whether and where correction minutes are allocated.
+_PAYROLL_ALLOCATION_TIME_UPDATE_COLUMNS = frozenset(
+    {
+        "allocated_delta_minutes",
+        "correction_date",
+        "correction_id",
+        "employee_id",
+        "job_id",
+        "location_id",
+        "status",
+        "week_start",
+    }
+)
 _SQL_EXECUTION_METHODS = frozenset(
     {"execute", "execute_returning", "query_one", "query_all"}
 )
@@ -311,6 +328,34 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             exception_method="payroll void reason and verification-week workflow",
             idempotency_mechanism="active correction state and row locking",
             audit_target="payroll_hour_corrections and access_log_entries",
+            requires_active_context=True,
+        ),
+        "payroll-hour-correction-allocation": TimeActionPolicy(
+            action="payroll-hour-correction-allocation",
+            workflow="correction",
+            opens_shift=False,
+            closes_shift=False,
+            opens_visit=False,
+            closes_visit=False,
+            location_gate_mode="none",
+            weak_or_missing_gps_behavior="not applicable to a payroll allocation correction",
+            exception_method="payroll allocation reason and verification-week workflow",
+            idempotency_mechanism="matching active allocation is replayed",
+            audit_target="payroll_hour_correction_allocations and access_log_entries",
+            requires_active_context=True,
+        ),
+        "payroll-hour-correction-allocation-void": TimeActionPolicy(
+            action="payroll-hour-correction-allocation-void",
+            workflow="correction",
+            opens_shift=False,
+            closes_shift=False,
+            opens_visit=False,
+            closes_visit=False,
+            location_gate_mode="none",
+            weak_or_missing_gps_behavior="not applicable to a payroll allocation correction",
+            exception_method="payroll allocation void reason and verification-week workflow",
+            idempotency_mechanism="active allocation state and row locking",
+            audit_target="payroll_hour_correction_allocations and access_log_entries",
             requires_active_context=True,
         ),
         "payroll-shift-correction": TimeActionPolicy(
@@ -610,6 +655,7 @@ def _is_direct_time_mutation_sql(sql: str) -> bool:
     if (
         _DIRECT_TIME_MUTATION_SQL.search(normalized)
         or _PAYROLL_TIME_OVERLAY_SQL.search(normalized)
+        or _PAYROLL_ALLOCATION_SQL.search(normalized)
     ):
         return True
     for table_name, columns in _TEMPORAL_UPDATE_COLUMNS.items():
@@ -617,6 +663,15 @@ def _is_direct_time_mutation_sql(sql: str) -> bool:
             re.search(rf"\b{column}\b", normalized) for column in columns
         ):
             return True
+    allocation_update = re.search(
+        r"\bupdate\s+payroll_hour_correction_allocations\b",
+        normalized,
+    )
+    if allocation_update and any(
+        re.search(rf"\b{column}\b", normalized)
+        for column in _PAYROLL_ALLOCATION_TIME_UPDATE_COLUMNS
+    ):
+        return True
     return False
 
 

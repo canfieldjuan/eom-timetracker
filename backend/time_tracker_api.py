@@ -30259,12 +30259,14 @@ def admin_void_payroll_hour_correction(
 
 
 @app.post("/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation")
+@registered_time_action("payroll-hour-correction-allocation")
 def admin_allocate_payroll_hour_correction(
     correction_id: int,
     payload: PayrollCorrectionAllocationRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-hour-correction-allocation")
     result: Dict[str, Any]
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -30447,12 +30449,14 @@ def admin_allocate_payroll_hour_correction(
 
 
 @app.post("/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation/void")
+@registered_time_action("payroll-hour-correction-allocation-void")
 def admin_void_payroll_hour_correction_allocation(
     correction_id: int,
     payload: PayrollCorrectionVoidRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-hour-correction-allocation-void")
     result: Dict[str, Any]
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:

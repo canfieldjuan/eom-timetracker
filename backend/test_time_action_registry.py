@@ -28,6 +28,8 @@ EXPECTED_RUNTIME_POLICIES = {
     "payroll-timesheet-change": ("correction", False, False, False, False, "none", "request id", "payroll_timesheet_change_batches", "payroll overlay", "payroll reason"),
     "payroll-hour-correction": ("correction", False, False, False, False, "none", "matching active correction", "payroll_hour_corrections", "payroll-total overlay", "payroll reason"),
     "payroll-hour-correction-void": ("correction", False, False, False, False, "none", "active correction state", "payroll_hour_corrections", "payroll-total overlay", "payroll void reason"),
+    "payroll-hour-correction-allocation": ("correction", False, False, False, False, "none", "matching active allocation", "payroll_hour_correction_allocations", "payroll allocation correction", "payroll allocation reason"),
+    "payroll-hour-correction-allocation-void": ("correction", False, False, False, False, "none", "active allocation state", "payroll_hour_correction_allocations", "payroll allocation correction", "payroll allocation void reason"),
     "payroll-shift-correction": ("correction", False, False, False, False, "none", "matching active correction", "payroll_shift_corrections", "payroll overlay", "payroll reason"),
     "payroll-shift-correction-void": ("correction", False, False, False, False, "none", "active correction state", "payroll_shift_corrections", "payroll overlay", "payroll void reason"),
 }
@@ -58,6 +60,12 @@ EXPECTED_RUNTIME_HANDLERS = {
     ),
     "time_tracker_api.admin_void_payroll_hour_correction": frozenset(
         {"payroll-hour-correction-void"}
+    ),
+    "time_tracker_api.admin_allocate_payroll_hour_correction": frozenset(
+        {"payroll-hour-correction-allocation"}
+    ),
+    "time_tracker_api.admin_void_payroll_hour_correction_allocation": frozenset(
+        {"payroll-hour-correction-allocation-void"}
     ),
     "time_tracker_api.admin_create_payroll_shift_correction": frozenset(
         {"payroll-shift-correction"}
@@ -143,6 +151,7 @@ def synthetic_time_correction_overlay():
     "table_name",
     (
         "payroll_hour_corrections",
+        "payroll_hour_correction_allocations",
         "payroll_shift_corrections",
         "payroll_manual_shift_versions",
         "payroll_shift_exclusions",
@@ -167,6 +176,7 @@ def synthetic_payroll_overlay_insert():
     "table_name",
     (
         "payroll_hour_corrections",
+        "payroll_hour_correction_allocations",
         "payroll_shift_corrections",
         "payroll_manual_shift_versions",
         "payroll_shift_exclusions",
