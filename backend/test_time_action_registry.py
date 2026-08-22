@@ -105,6 +105,15 @@ def synthetic_time_writer():
         registry.validate_time_action_mutation_source(source)
 
 
+def test_startup_completeness_gate_rejects_module_scope_time_writer() -> None:
+    source = """
+db.execute('INSERT INTO shifts (employee_id) VALUES (1)')
+"""
+
+    with pytest.raises(RuntimeError, match=r"<module>:2"):
+        registry.validate_time_action_mutation_source(source)
+
+
 def test_startup_completeness_gate_rejects_conditionally_guarded_writer() -> None:
     source = """
 def conditional_time_writer(enabled):
@@ -205,6 +214,10 @@ def import_legacy_time_data():
 
     registry.validate_time_action_mutation_source(
         source,
+        migration_action="legacy-json-import",
+    )
+    registry.validate_time_action_mutation_source(
+        "db.execute('INSERT INTO shifts (employee_id) VALUES (1)')",
         migration_action="legacy-json-import",
     )
 

@@ -816,6 +816,14 @@ def validate_time_action_mutation_source(
             self.function_stack: list[_TimeMutationSourceScope] = []
             self.local_sql_wrappers = _local_sql_execution_wrappers()
 
+        def visit_Module(self, node: ast.Module) -> None:
+            # Import-time writers cannot establish a request action context;
+            # only a declared migration source may bypass this source guard.
+            self.function_stack.append(_TimeMutationSourceScope("<module>", [], {}))
+            for statement in node.body:
+                self.visit(statement)
+            self.function_stack.pop()
+
         @staticmethod
         def _is_unconditional_context_guard(statement: ast.stmt) -> bool:
             return (
