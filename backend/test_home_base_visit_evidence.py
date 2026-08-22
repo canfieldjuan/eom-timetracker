@@ -18,6 +18,7 @@ import pytest
 import db
 import operations_schedule
 import time_tracker_api
+from time_action_registry import registered_time_action_context
 from conftest import _raw_conn
 
 
@@ -1951,12 +1952,13 @@ def test_customer_label_with_home_base_prefix_still_auto_links_first_visit(clien
         "departures": [],
     }
 
-    time_tracker_api._save_timesheets_to_db(
-        {"entries": [entry]},
-        set(),
-        {},
-        {},
-    )
+    with registered_time_action_context("admin-entry-adjustment"):
+        time_tracker_api._save_timesheets_to_db(
+            {"entries": [entry]},
+            set(),
+            {},
+            {},
+        )
 
     assert db.query_one(
         "SELECT location_id FROM shifts WHERE id = %s",

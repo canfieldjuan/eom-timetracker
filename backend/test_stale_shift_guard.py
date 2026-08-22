@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import db
+from time_action_registry import registered_time_action_context
 
 
 def _insert_stale_shift(employee_id, location_id, *, days_old=3):
@@ -168,7 +169,8 @@ def test_unrelated_write_never_auto_closes_stale_shift(
     monkeypatch.setattr(tta, "AUTO_CLOSE_STALE_SHIFTS", True, raising=False)
 
     try:
-        ok, result = tta.update_timesheets(lambda _: (True, "unrelated write"))
+        with registered_time_action_context("admin-entry-adjustment"):
+            ok, result = tta.update_timesheets(lambda _: (True, "unrelated write"))
         assert ok is True
         assert result == "unrelated write"
 

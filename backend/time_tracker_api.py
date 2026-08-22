@@ -42,6 +42,12 @@ import qrcode.image.svg
 import arrival_policy_inventory
 import arrival_policies
 import db
+from time_action_registry import (
+    registered_time_action,
+    registered_time_action_context,
+    require_registered_time_action_context,
+    validate_time_action_registry,
+)
 from fastapi import Depends, FastAPI, Header, HTTPException, Path as FastAPIPath, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -1266,6 +1272,7 @@ def _save_timesheets_to_db(
     after_save: Optional[Callable[[Any], None]] = None,
 ) -> None:
     """Persist time evidence without mutating the server-authoritative Site list."""
+    require_registered_time_action_context()
     with db.get_conn() as conn:
         cur = conn.cursor()
 
@@ -1691,6 +1698,7 @@ def update_timesheets(
     mutator,
     after_save: Optional[Callable[[Any], None]] = None,
 ) -> Tuple[bool, Any]:
+    require_registered_time_action_context()
     with TIMESHEET_WRITE_LOCK:
         with timesheet_postgres_advisory_lock():
             timesheet_data = _load_timesheets_from_db()
@@ -8001,12 +8009,18 @@ def _auto_migrate_if_empty() -> bool:
 
 @app.on_event("startup")
 def startup_event() -> None:
+    validate_time_action_registry()
     database_url = os.getenv("DATABASE_URL", "")
     if not database_url:
         raise RuntimeError("DATABASE_URL env var not set")
     db.init_pool(database_url)
-    _ensure_schema_migrations()
-    imported_legacy_json = _auto_migrate_if_empty()
+    # Migrations are registered non-gated workflows. They intentionally do not
+    # use the request-writer guard below, but startup still declares which
+    # historical time data operation is running.
+    with registered_time_action_context("schema-migration"):
+        _ensure_schema_migrations()
+    with registered_time_action_context("legacy-json-import"):
+        imported_legacy_json = _auto_migrate_if_empty()
     # A first-run JSON import happens after the schema upgrade and can insert
     # legacy Sites. Re-run the idempotent Customer/address backfill immediately.
     if imported_legacy_json:
@@ -8014,7 +8028,8 @@ def startup_event() -> None:
         # The importer inserts shifts without hourly_rate_cents, and the backfill
         # above already ran against an empty table, so imported history would
         # keep a NULL snapshot forever and stay exposed to rate edits. Idempotent.
-        _backfill_shift_hourly_rate_snapshots()
+        with registered_time_action_context("post-import-rate-snapshot-backfill"):
+            _backfill_shift_hourly_rate_snapshots()
     apply_bootstrap_admins()
 
 
@@ -11584,6 +11599,7 @@ def _record_explicit_site_action(
     employee: Dict[str, Any],
 ) -> Dict[str, Any]:
     assert payload.action is not None
+    require_registered_time_action_context(f"site-qr-{payload.action}")
     assert payload.actionStateToken is not None
     assert payload.idempotencyKey is not None
     fingerprint = _site_action_request_fingerprint(payload)
@@ -12052,6 +12068,7 @@ def update_timesheets_for_plain_time_action(
 ) -> Tuple[bool, Any]:
     if action not in PLAIN_TIME_ACTION_NAMES:
         raise ValueError(f"Unsupported plain time action: {action}")
+    require_registered_time_action_context(action)
 
     idempotency_key = getattr(payload, "idempotencyKey", None) if payload else None
     fingerprint = (
@@ -12296,7 +12313,20 @@ def _append_home_base_location_metadata(response: Dict[str, Any]) -> None:
     )
 
 
+def _home_base_time_action_name(
+    payload: HomeBaseActionRequest,
+    *_args: Any,
+    **_kwargs: Any,
+) -> str:
+    return f"home-base-{payload.action}"
+
+
 @app.post("/api/timesheet/home-base/scan")
+@registered_time_action(
+    "home-base-start",
+    "home-base-end",
+    resolver=_home_base_time_action_name,
+)
 def record_home_base_scan(
     payload: HomeBaseActionRequest,
     request: Request,
@@ -12546,7 +12576,23 @@ def record_home_base_scan(
     return result
 
 
+def _site_check_in_time_action_name(
+    payload: SiteCheckInRequest,
+    *_args: Any,
+    **_kwargs: Any,
+) -> str:
+    if payload.action is None:
+        return "site-check-in-evidence"
+    return f"site-qr-{payload.action}"
+
+
 @app.post("/api/timesheet/site-check-in")
+@registered_time_action(
+    "site-qr-arrive",
+    "site-qr-depart",
+    "site-check-in-evidence",
+    resolver=_site_check_in_time_action_name,
+)
 def record_site_check_in(
     payload: SiteCheckInRequest,
     request: Request,
@@ -12576,6 +12622,7 @@ def record_site_check_in(
         )
         return result
 
+    require_registered_time_action_context("site-check-in-evidence")
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             site = _resolve_site_check_in_qr(
@@ -14655,6 +14702,7 @@ def admin_employee_hours(
 
 
 @app.post("/api/timesheet/clock-in")
+@registered_time_action("clock-in")
 def clock_in(
     payload: ClockInRequest,
     request: Request,
@@ -14975,6 +15023,7 @@ def clock_in(
 
 
 @app.post("/api/timesheet/clock-out")
+@registered_time_action("clock-out")
 def clock_out(
     request: Request,
     payload: Optional[ClockOutRequest] = None,
@@ -15294,6 +15343,7 @@ def resolve_customer_site(
 
 
 @app.post("/api/timesheet/visit")
+@registered_time_action("arrive")
 def log_visit(
     payload: VisitRequest,
     request: Request,
@@ -15747,6 +15797,7 @@ def get_active_visit(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 @app.post("/api/timesheet/depart")
+@registered_time_action("depart")
 def depart_location(
     payload: Optional[DepartRequest],
     request: Request,
@@ -15831,6 +15882,7 @@ def depart_location(
 
 
 @app.patch("/api/admin/entries/{entry_id}")
+@registered_time_action("admin-entry-adjustment")
 def admin_adjust_entry(
     entry_id: int,
     payload: EntryAdjustRequest,
@@ -23438,11 +23490,13 @@ def _migrate_duplicate_home_base_events(
 
 
 @app.post("/api/admin/corrections/time-data/apply")
+@registered_time_action("admin-time-data-correction")
 def admin_apply_time_data_correction(
     payload: TimeDataCorrectionApplyRequest,
     request: Request,
     current_admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("admin-time-data-correction")
     requested_ids = {
         int(value)
         for row in payload.duplicateResolutions
@@ -29013,6 +29067,7 @@ def admin_payroll_timesheet(
 
 
 @app.post("/api/admin/payroll/timesheet/changes")
+@registered_time_action("payroll-timesheet-change")
 def admin_apply_payroll_timesheet_changes(
     payload: PayrollTimesheetChangesRequest,
     request: Request,
@@ -29528,6 +29583,7 @@ def admin_apply_payroll_timesheet_changes(
 
 
 @app.post("/api/admin/payroll/timesheet/shift-corrections")
+@registered_time_action("payroll-shift-correction")
 def admin_create_payroll_shift_correction(
     payload: PayrollShiftCorrectionRequest,
     request: Request,
@@ -29702,6 +29758,7 @@ def admin_create_payroll_shift_correction(
 
 
 @app.post("/api/admin/payroll/timesheet/shift-corrections/{correction_id}/void")
+@registered_time_action("payroll-shift-correction-void")
 def admin_void_payroll_shift_correction(
     correction_id: int,
     payload: PayrollCorrectionVoidRequest,

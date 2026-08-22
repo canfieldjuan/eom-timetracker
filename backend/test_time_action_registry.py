@@ -1,0 +1,164 @@
+"""Structural contract tests for the Geofence C4 time-action registry."""
+
+from __future__ import annotations
+
+import pytest
+
+import time_action_registry as registry
+import time_tracker_api as api
+
+
+# workflow, shift/visit transitions, location-gate mode, and the distinctive
+# idempotency/audit/exception behavior observed on each live route.
+EXPECTED_RUNTIME_POLICIES = {
+    "clock-in": ("interactive", True, False, False, False, "hard_when_enabled", "plain_time_action_receipts", "shifts", "GPS override", "Home Base"),
+    "clock-out": ("interactive", False, True, False, False, "none", "plain_time_action_receipts", "shifts", "GPS override", "Home Base"),
+    "arrive": ("interactive", False, False, True, False, "hard_when_enabled", "plain_time_action_receipts", "visits", "GPS override", "Site evidence"),
+    "depart": ("interactive", False, False, False, True, "none", "plain_time_action_receipts", "departures", "GPS override", "GPS override"),
+    "home-base-start": ("interactive", True, False, False, False, "evidence_paid_on_inside", "plain_time_action_receipts", "home_base_events", "QR scan", "none"),
+    "home-base-end": ("interactive", False, True, False, False, "evidence_paid_on_inside", "plain_time_action_receipts", "home_base_events", "QR scan", "none"),
+    "site-qr-arrive": ("interactive", False, False, True, False, "evidence_paid_on_inside", "site_qr_action_receipts", "site_check_ins", "no visit", "evidence-only"),
+    "site-qr-depart": ("interactive", False, False, False, True, "evidence_paid_on_inside", "site_qr_action_receipts", "site_check_ins", "no departure", "evidence-only"),
+    "site-check-in-evidence": ("interactive", False, False, False, False, "evidence_paid_on_inside", "site_check_ins", "site_check_ins", "without a time event", "none"),
+    "admin-entry-adjustment": ("correction", True, True, False, False, "none", "none", "shifts", "administrator correction", "administrator correction"),
+    "admin-time-data-correction": ("correction", False, True, False, False, "none", "plan token", "time_data_correction_batches", "reviewed data correction", "confirmation phrase"),
+    "payroll-timesheet-change": ("correction", False, False, False, False, "none", "request id", "payroll_timesheet_change_batches", "payroll overlay", "payroll reason"),
+    "payroll-shift-correction": ("correction", False, False, False, False, "none", "matching active correction", "payroll_shift_corrections", "payroll overlay", "payroll reason"),
+    "payroll-shift-correction-void": ("correction", False, False, False, False, "none", "active correction state", "payroll_shift_corrections", "payroll overlay", "payroll void reason"),
+}
+
+EXPECTED_RUNTIME_HANDLERS = {
+    "time_tracker_api.record_home_base_scan": frozenset(
+        {"home-base-start", "home-base-end"}
+    ),
+    "time_tracker_api.record_site_check_in": frozenset(
+        {"site-qr-arrive", "site-qr-depart", "site-check-in-evidence"}
+    ),
+    "time_tracker_api.clock_in": frozenset({"clock-in"}),
+    "time_tracker_api.clock_out": frozenset({"clock-out"}),
+    "time_tracker_api.log_visit": frozenset({"arrive"}),
+    "time_tracker_api.depart_location": frozenset({"depart"}),
+    "time_tracker_api.admin_adjust_entry": frozenset({"admin-entry-adjustment"}),
+    "time_tracker_api.admin_apply_time_data_correction": frozenset(
+        {"admin-time-data-correction"}
+    ),
+    "time_tracker_api.admin_apply_payroll_timesheet_changes": frozenset(
+        {"payroll-timesheet-change"}
+    ),
+    "time_tracker_api.admin_create_payroll_shift_correction": frozenset(
+        {"payroll-shift-correction"}
+    ),
+    "time_tracker_api.admin_void_payroll_shift_correction": frozenset(
+        {"payroll-shift-correction-void"}
+    ),
+}
+
+
+def test_startup_time_action_registry_is_complete() -> None:
+    registry.validate_time_action_registry()
+
+
+def test_startup_completeness_gate_rejects_undeclared_time_producing_handler() -> None:
+    handlers = dict(registry.registered_time_action_handlers())
+    handlers["synthetic.time_producing_route"] = registry.TimeActionHandlerRegistration(
+        handler="synthetic.time_producing_route",
+        action_names=frozenset({"synthetic-time-mutation"}),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic-time-mutation"):
+        registry.validate_time_action_registry(handlers=handlers)
+
+
+def test_multi_action_handler_must_declare_its_resolver() -> None:
+    with pytest.raises(ValueError, match="needs an action resolver"):
+        registry.registered_time_action("clock-in", "clock-out")
+
+
+def test_runtime_writers_are_all_registered_with_their_closed_action_set() -> None:
+    handlers = registry.registered_time_action_handlers()
+    assert set(handlers) == set(EXPECTED_RUNTIME_HANDLERS)
+    for handler_name, expected_actions in EXPECTED_RUNTIME_HANDLERS.items():
+        assert handlers[handler_name].action_names == expected_actions
+
+
+def test_mutation_layer_rejects_missing_registered_action_context() -> None:
+    with pytest.raises(RuntimeError, match="active registered time-action context"):
+        api.update_timesheets(lambda _timesheet_data: (False, None))
+
+    with pytest.raises(RuntimeError, match="active registered time-action context"):
+        api._save_timesheets_to_db({}, set(), {}, {})
+
+    with registry.registered_time_action_context("schema-migration"):
+        with pytest.raises(RuntimeError, match="migration-only"):
+            api._save_timesheets_to_db({}, set(), {}, {})
+
+    with registry.registered_time_action_context("clock-in"):
+        with pytest.raises(RuntimeError, match="expected arrive, active clock-in"):
+            api.update_timesheets_for_plain_time_action(
+                "arrive",
+                None,
+                {},
+                lambda _timesheet_data: (False, None),
+                lambda _result, _timesheet_data: {},
+            )
+
+
+def test_runtime_policy_fields_match_the_current_time_action_contract() -> None:
+    assert set(EXPECTED_RUNTIME_POLICIES) == {
+        action_name
+        for action_name, policy in registry.TIME_ACTION_POLICIES.items()
+        if policy.requires_active_context
+    }
+
+    for action_name, expected in EXPECTED_RUNTIME_POLICIES.items():
+        (
+            workflow,
+            opens_shift,
+            closes_shift,
+            opens_visit,
+            closes_visit,
+            location_gate_mode,
+            idempotency_fragment,
+            audit_fragment,
+            gps_fragment,
+            exception_fragment,
+        ) = expected
+        policy = registry.TIME_ACTION_POLICIES[action_name]
+        assert policy.action == action_name
+        assert (
+            policy.workflow,
+            policy.opens_shift,
+            policy.closes_shift,
+            policy.opens_visit,
+            policy.closes_visit,
+            policy.location_gate_mode,
+        ) == (
+            workflow,
+            opens_shift,
+            closes_shift,
+            opens_visit,
+            closes_visit,
+            location_gate_mode,
+        )
+        assert idempotency_fragment in policy.idempotency_mechanism
+        assert audit_fragment in policy.audit_target
+        assert gps_fragment in policy.weak_or_missing_gps_behavior
+        assert exception_fragment in policy.exception_method
+
+
+def test_migration_policies_are_declared_and_explicitly_non_gated() -> None:
+    migration_actions = {
+        "schema-migration",
+        "legacy-json-import",
+        "post-import-rate-snapshot-backfill",
+    }
+    assert migration_actions == {
+        action_name
+        for action_name, policy in registry.TIME_ACTION_POLICIES.items()
+        if policy.workflow == "migration"
+    }
+    assert all(
+        registry.TIME_ACTION_POLICIES[action_name].location_gate_mode == "none"
+        and not registry.TIME_ACTION_POLICIES[action_name].requires_active_context
+        for action_name in migration_actions
+    )

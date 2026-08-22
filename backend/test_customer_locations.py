@@ -10,6 +10,7 @@ import psycopg2.extras
 import pytest
 
 from conftest import _raw_conn
+from time_action_registry import registered_time_action_context
 
 
 TEST_PREFIX = "Issue 19 API"
@@ -1081,12 +1082,13 @@ def test_stale_time_save_cannot_recreate_a_renamed_site_or_repoint_history(
     assert replacement_response.status_code == 201, replacement_response.text
     replacement_site = replacement_response.json()["location"]
 
-    api._save_timesheets_to_db(
-        stale_snapshot,
-        pre_shift_ids,
-        pre_visit_counts,
-        pre_departure_counts,
-    )
+    with registered_time_action_context("admin-entry-adjustment"):
+        api._save_timesheets_to_db(
+            stale_snapshot,
+            pre_shift_ids,
+            pre_visit_counts,
+            pre_departure_counts,
+        )
 
     assert api.db.query_one(
         "SELECT id FROM locations WHERE address = %s",
