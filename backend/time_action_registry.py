@@ -303,6 +303,55 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             audit_target="shifts and access_log_entries",
             requires_active_context=True,
         ),
+        "admin-direct-clock-in": TimeActionPolicy(
+            action="admin-direct-clock-in",
+            workflow="correction",
+            opens_shift=True,
+            closes_shift=False,
+            opens_visit=False,
+            closes_visit=False,
+            database_mutation_capabilities=frozenset({"shift-time-write"}),
+            location_gate_mode="none",
+            weak_or_missing_gps_behavior=(
+                "administrator records a documented immediate exception without "
+                "client GPS"
+            ),
+            exception_method=(
+                "administrator direct-record reason and detail; server time only"
+            ),
+            idempotency_mechanism=(
+                "admin_direct_time_action_receipts by administrator and "
+                "idempotency key"
+            ),
+            audit_target=(
+                "shifts, Home Base events when applicable, and "
+                "admin_direct_time_action_receipts"
+            ),
+            requires_active_context=True,
+        ),
+        "admin-direct-arrive": TimeActionPolicy(
+            action="admin-direct-arrive",
+            workflow="correction",
+            opens_shift=False,
+            closes_shift=False,
+            opens_visit=True,
+            closes_visit=False,
+            database_mutation_capabilities=frozenset({"visit-time-write"}),
+            location_gate_mode="none",
+            weak_or_missing_gps_behavior=(
+                "administrator records a documented immediate exception without "
+                "client GPS"
+            ),
+            exception_method=(
+                "administrator direct-record reason and detail; server time only"
+            ),
+            idempotency_mechanism=(
+                "admin_direct_time_action_receipts by administrator and "
+                "idempotency key"
+            ),
+            audit_target="visits and admin_direct_time_action_receipts",
+            requires_active_context=True,
+        ),
         "admin-time-data-correction": TimeActionPolicy(
             action="admin-time-data-correction",
             workflow="correction",

@@ -211,6 +211,8 @@ CREATE TABLE shifts (
     clock_in_gps_meta   JSONB,
     clock_out_gps       JSONB,
     clock_out_gps_meta  JSONB,
+    recorded_source     VARCHAR(32) NOT NULL DEFAULT 'employee'
+                            CHECK (recorded_source IN ('employee', 'admin_recorded')),
     job_id              INTEGER REFERENCES jobs(id),
     -- Rate the shift was actually worked at, stamped once at clock-in and never
     -- rewritten. employees.hourly_rate stays editable; money surfaces prefer
@@ -263,6 +265,8 @@ CREATE TABLE visits (
     arrival_time   TIMESTAMPTZ NOT NULL,
     gps            JSONB,
     gps_meta       JSONB,
+    recorded_source VARCHAR(32) NOT NULL DEFAULT 'employee'
+                         CHECK (recorded_source IN ('employee', 'admin_recorded')),
     job_id         INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
     sequence_version SMALLINT NOT NULL DEFAULT 1
                          CHECK (sequence_version IN (1, 2)),
@@ -1348,6 +1352,56 @@ CREATE INDEX idx_site_qr_action_receipts_shift
     ON site_qr_action_receipts(shift_id, server_recorded_at DESC);
 CREATE INDEX idx_plain_time_action_receipts_shift
     ON plain_time_action_receipts(shift_id, server_recorded_at DESC);
+
+-- Administrator direct-record exceptions are a distinct, append-only audit
+-- ledger. The target/result identifiers are intentionally snapshots rather than
+-- foreign keys: a later, authorized correction can retire source time without
+-- erasing the evidence of who recorded this immediate exception and why.
+CREATE TABLE admin_direct_time_action_receipts (
+    id                     BIGSERIAL PRIMARY KEY,
+    admin_employee_id      INTEGER NOT NULL,
+    admin_employee_name    TEXT NOT NULL,
+    employee_id            INTEGER NOT NULL,
+    employee_name          TEXT NOT NULL,
+    action                 VARCHAR(16) NOT NULL
+                               CHECK (action IN ('clock-in', 'arrive')),
+    target_kind            VARCHAR(16) NOT NULL
+                               CHECK (target_kind IN ('site', 'home_base')),
+    target_id              BIGINT NOT NULL,
+    target_label           TEXT NOT NULL,
+    target_customer_name   TEXT NOT NULL DEFAULT '',
+    reason                 TEXT NOT NULL CHECK (char_length(btrim(reason)) BETWEEN 3 AND 120),
+    detail                 TEXT NOT NULL CHECK (char_length(btrim(detail)) BETWEEN 3 AND 500),
+    idempotency_key        UUID NOT NULL,
+    request_fingerprint    VARCHAR(64) NOT NULL
+                               CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+    before_state_fingerprint VARCHAR(64) NOT NULL
+                               CHECK (before_state_fingerprint ~ '^[0-9a-f]{64}$'),
+    server_recorded_at     TIMESTAMPTZ NOT NULL,
+    shift_id               INTEGER,
+    visit_id               INTEGER,
+    response_body          JSONB NOT NULL,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT admin_direct_time_action_receipts_actor_key
+        UNIQUE (admin_employee_id, idempotency_key)
+);
+
+CREATE INDEX idx_admin_direct_time_action_receipts_employee_time
+    ON admin_direct_time_action_receipts(employee_id, server_recorded_at DESC);
+
+CREATE OR REPLACE FUNCTION reject_admin_direct_time_action_receipt_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'admin direct time action receipts are immutable';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_reject_admin_direct_time_action_receipt_mutation
+    ON admin_direct_time_action_receipts;
+CREATE TRIGGER trg_reject_admin_direct_time_action_receipt_mutation
+    BEFORE UPDATE OR DELETE ON admin_direct_time_action_receipts
+    FOR EACH ROW
+    EXECUTE FUNCTION reject_admin_direct_time_action_receipt_mutation();
 CREATE INDEX idx_site_check_in_reconciliation_reviews_lookup
     ON site_check_in_reconciliation_reviews(
         occurrence_key, evidence_fingerprint, reviewed_at DESC

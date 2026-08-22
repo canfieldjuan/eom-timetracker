@@ -1059,6 +1059,7 @@ def _row_to_visit(row: Dict[str, Any]) -> Dict[str, Any]:
         "customer":    row["customer_name"] or "",
         "gps":         row["gps"],
         "gpsMeta":     row.get("gps_meta"),
+        "recordedSource": str(row.get("recorded_source") or "employee"),
         "jobId":       (
             int(row["job_id"])
             if row.get("job_id") is not None
@@ -1112,6 +1113,7 @@ def _row_to_entry(
         "clockInGpsMeta": row.get("clock_in_gps_meta"),
         "clockOutGps":  row["clock_out_gps"],
         "clockOutGpsMeta": row.get("clock_out_gps_meta"),
+        "recordedSource": str(row.get("recorded_source") or "employee"),
         "jobId":        row.get("job_id"),
         "timeCategory": row.get("time_category", "productive"),
         "nonProductiveType": row.get("non_productive_type"),
@@ -1190,7 +1192,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
         """
         SELECT v.id, v.shift_id, v.location_id, COALESCE(l.address, '') AS location,
                v.location_label, v.customer_name, v.arrival_time, v.gps, v.gps_meta,
-               v.job_id, v.sequence_version, v.site_check_in_id
+               v.recorded_source, v.job_id, v.sequence_version, v.site_check_in_id
         FROM visits v
         LEFT JOIN locations l ON v.location_id = l.id
         ORDER BY v.shift_id, v.arrival_time
@@ -1222,7 +1224,7 @@ def _load_timesheets_from_db() -> Dict[str, Any]:
                s.notes, s.local_date, s.timezone,
                s.clock_in_gps, s.clock_in_gps_meta,
                s.clock_out_gps, s.clock_out_gps_meta,
-               s.job_id, s.time_category, s.non_productive_type,
+               s.recorded_source, s.job_id, s.time_category, s.non_productive_type,
                EXISTS (
                    SELECT 1
                    FROM home_base_events home_base_event
@@ -1285,32 +1287,6 @@ def _save_timesheets_to_db(
     require_registered_time_action_context(
         required_capabilities=required_capabilities
     )
-    observed_capabilities: set[TimeMutationCapability] = set()
-    for entry in timesheet_data.get("entries", []):
-        if entry["id"] not in pre_shift_ids:
-            observed_capabilities.add("opens_shift")
-            if entry.get("clockOut") is not None:
-                observed_capabilities.add("closes_shift")
-        previous_boundaries = pre_shift_boundaries.get(entry["id"])
-        if previous_boundaries is not None:
-            previous_clock_in, previous_clock_out = previous_boundaries
-            if entry.get("clockIn") != previous_clock_in:
-                observed_capabilities.add("opens_shift")
-            if entry.get("clockOut") != previous_clock_out:
-                if entry.get("clockOut") is None:
-                    observed_capabilities.add("opens_shift")
-                else:
-                    observed_capabilities.add("closes_shift")
-        if len(entry.get("visits", [])) > pre_visit_counts.get(entry["id"], 0):
-            observed_capabilities.add("opens_visit")
-        if len(entry.get("departures", [])) > pre_departure_counts.get(entry["id"], 0):
-            observed_capabilities.add("closes_visit")
-    undeclared_capabilities = observed_capabilities - required_capabilities
-    if undeclared_capabilities:
-        raise RuntimeError(
-            "Time persistence capability declaration omits: "
-            + ", ".join(sorted(undeclared_capabilities))
-        )
     with db.get_conn() as conn:
         cur = conn.cursor()
 
@@ -1321,6 +1297,33 @@ def _save_timesheets_to_db(
         # Home Base and explicit-evidence events require persisted row ids.
         if before_save is not None:
             before_save(cur)
+
+        observed_capabilities: set[TimeMutationCapability] = set()
+        for entry in timesheet_data.get("entries", []):
+            if entry["id"] not in pre_shift_ids:
+                observed_capabilities.add("opens_shift")
+                if entry.get("clockOut") is not None:
+                    observed_capabilities.add("closes_shift")
+            previous_boundaries = pre_shift_boundaries.get(entry["id"])
+            if previous_boundaries is not None:
+                previous_clock_in, previous_clock_out = previous_boundaries
+                if entry.get("clockIn") != previous_clock_in:
+                    observed_capabilities.add("opens_shift")
+                if entry.get("clockOut") != previous_clock_out:
+                    if entry.get("clockOut") is None:
+                        observed_capabilities.add("opens_shift")
+                    else:
+                        observed_capabilities.add("closes_shift")
+            if len(entry.get("visits", [])) > pre_visit_counts.get(entry["id"], 0):
+                observed_capabilities.add("opens_visit")
+            if len(entry.get("departures", [])) > pre_departure_counts.get(entry["id"], 0):
+                observed_capabilities.add("closes_visit")
+        undeclared_capabilities = observed_capabilities - required_capabilities
+        if undeclared_capabilities:
+            raise RuntimeError(
+                "Time persistence capability declaration omits: "
+                + ", ".join(sorted(undeclared_capabilities))
+            )
 
         cur.execute("SELECT id, address FROM locations WHERE active = true")
         addr_to_id: Dict[str, int] = {
@@ -1350,8 +1353,8 @@ def _save_timesheets_to_db(
                       (employee_id, location_id, location_label, clock_in, clock_out, total_hours,
                        notes, local_date, timezone, clock_in_gps, clock_in_gps_meta,
                        clock_out_gps, clock_out_gps_meta,
-                       job_id, time_category, non_productive_type, hourly_rate_cents)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                       job_id, time_category, non_productive_type, recorded_source, hourly_rate_cents)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                             (SELECT ROUND(e.hourly_rate * 100)
                              FROM employees e
                              WHERE e.id = %s))
@@ -1374,6 +1377,7 @@ def _save_timesheets_to_db(
                         entry.get("jobId"),
                         entry.get("timeCategory", "productive"),
                         entry.get("nonProductiveType"),
+                        entry.get("recordedSource", "employee"),
                         entry["employeeId"],
                     ),
                 )
@@ -1432,9 +1436,9 @@ def _save_timesheets_to_db(
                     INSERT INTO visits (
                         shift_id, location_id, location_label, customer_name,
                         arrival_time, gps, gps_meta, sequence_version,
-                        site_check_in_id, job_id
+                        site_check_in_id, job_id, recorded_source
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -1448,6 +1452,7 @@ def _save_timesheets_to_db(
                         int(visit.get("sequenceVersion") or 2),
                         visit.get("siteCheckInId"),
                         visit.get("jobId"),
+                        visit.get("recordedSource", "employee"),
                     ),
                 )
                 visit["id"] = int(cur.fetchone()[0])
@@ -1737,6 +1742,8 @@ def update_timesheets(
     after_save: Optional[Callable[[Any], None]] = None,
     *,
     required_capabilities: FrozenSet[TimeMutationCapability],
+    before_save: Optional[Callable[[Any], None]] = None,
+    before_load: Optional[Callable[[], Optional[Tuple[bool, Any]]]] = None,
 ) -> Tuple[bool, Any]:
     if not required_capabilities:
         raise ValueError("Time persistence must declare mutation capabilities")
@@ -1745,6 +1752,10 @@ def update_timesheets(
     )
     with TIMESHEET_WRITE_LOCK:
         with timesheet_postgres_advisory_lock():
+            if before_load is not None:
+                early_result = before_load()
+                if early_result is not None:
+                    return early_result
             timesheet_data = _load_timesheets_from_db()
             pre_shift_ids = {e["id"] for e in timesheet_data["entries"]}
             pre_visit_counts = {
@@ -1768,6 +1779,7 @@ def update_timesheets(
                     pre_departure_counts,
                     pre_shift_boundaries=pre_shift_boundaries,
                     required_capabilities=required_capabilities,
+                    before_save=before_save,
                     after_save=after_save,
                 )
             return ok, payload
@@ -3546,6 +3558,42 @@ class HomeBaseActionRequest(HomeBaseQrResolveRequest):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("scannedAt must include a timezone")
         return value.astimezone(timezone.utc)
+
+
+class AdminDirectRecordRequest(BaseModel):
+    """One administrator-authorized, immediate time-recording exception.
+
+    This deliberately accepts neither a client timestamp nor GPS data. The route
+    records its timestamp on the server and validates the selected target under
+    the time-write lock; a past-time repair remains the separate correction
+    workflow.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    employeeId: int = Field(gt=0)
+    action: Literal["clock-in", "arrive"]
+    targetKind: Literal["site", "home-base"]
+    siteId: Optional[int] = Field(default=None, gt=0)
+    reason: str = Field(min_length=3, max_length=120)
+    detail: str = Field(min_length=3, max_length=500)
+    idempotencyKey: UUID
+
+    @field_validator("reason", "detail", mode="before")
+    @classmethod
+    def normalize_admin_direct_record_text(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+    @model_validator(mode="after")
+    def require_a_valid_action_target_pair(self) -> "AdminDirectRecordRequest":
+        if self.targetKind == "home-base":
+            if self.action != "clock-in":
+                raise ValueError("Home Base supports immediate clock-in only")
+            if self.siteId is not None:
+                raise ValueError("siteId is only valid for a Site target")
+        elif self.siteId is None:
+            raise ValueError("siteId is required for a Site target")
+        return self
 
 
 class DepartRequest(BaseModel):
@@ -7313,6 +7361,11 @@ def _ensure_schema_migrations() -> None:
         "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS clock_out_gps_meta JSONB"
     )
     db.execute(
+        "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS "
+        "recorded_source VARCHAR(32) NOT NULL DEFAULT 'employee' "
+        "CHECK (recorded_source IN ('employee', 'admin_recorded'))"
+    )
+    db.execute(
         "ALTER TABLE shifts ADD COLUMN IF NOT EXISTS hourly_rate_cents INTEGER"
     )
     # DB-level snapshot stamp on every shift INSERT. The app also stamps at
@@ -7353,6 +7406,11 @@ def _ensure_schema_migrations() -> None:
             """)
     db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS gps_meta JSONB"
+    )
+    db.execute(
+        "ALTER TABLE visits ADD COLUMN IF NOT EXISTS "
+        "recorded_source VARCHAR(32) NOT NULL DEFAULT 'employee' "
+        "CHECK (recorded_source IN ('employee', 'admin_recorded'))"
     )
     db.execute(
         "ALTER TABLE visits ADD COLUMN IF NOT EXISTS location_label TEXT NOT NULL DEFAULT ''"
@@ -7496,6 +7554,63 @@ def _ensure_schema_migrations() -> None:
         CREATE INDEX IF NOT EXISTS idx_plain_time_action_receipts_shift
         ON plain_time_action_receipts(shift_id, server_recorded_at DESC)
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS admin_direct_time_action_receipts (
+            id                     BIGSERIAL PRIMARY KEY,
+            admin_employee_id      INTEGER NOT NULL,
+            admin_employee_name    TEXT NOT NULL,
+            employee_id            INTEGER NOT NULL,
+            employee_name          TEXT NOT NULL,
+            action                 VARCHAR(16) NOT NULL
+                                       CHECK (action IN ('clock-in', 'arrive')),
+            target_kind            VARCHAR(16) NOT NULL
+                                       CHECK (target_kind IN ('site', 'home_base')),
+            target_id              BIGINT NOT NULL,
+            target_label           TEXT NOT NULL,
+            target_customer_name   TEXT NOT NULL DEFAULT '',
+            reason                 TEXT NOT NULL
+                                       CHECK (char_length(btrim(reason)) BETWEEN 3 AND 120),
+            detail                 TEXT NOT NULL
+                                       CHECK (char_length(btrim(detail)) BETWEEN 3 AND 500),
+            idempotency_key        UUID NOT NULL,
+            request_fingerprint    VARCHAR(64) NOT NULL
+                                       CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+            before_state_fingerprint VARCHAR(64) NOT NULL
+                                       CHECK (before_state_fingerprint ~ '^[0-9a-f]{64}$'),
+            server_recorded_at     TIMESTAMPTZ NOT NULL,
+            shift_id               INTEGER,
+            visit_id               INTEGER,
+            response_body          JSONB NOT NULL,
+            created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT admin_direct_time_action_receipts_actor_key
+                UNIQUE (admin_employee_id, idempotency_key)
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_admin_direct_time_action_receipts_employee_time
+        ON admin_direct_time_action_receipts(employee_id, server_recorded_at DESC)
+    """)
+    db.execute("""
+        CREATE OR REPLACE FUNCTION reject_admin_direct_time_action_receipt_mutation()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            RAISE EXCEPTION 'admin direct time action receipts are immutable';
+        END;
+        $$ LANGUAGE plpgsql
+    """)
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DROP TRIGGER IF EXISTS "
+                "trg_reject_admin_direct_time_action_receipt_mutation "
+                "ON admin_direct_time_action_receipts"
+            )
+            cur.execute("""
+                CREATE TRIGGER trg_reject_admin_direct_time_action_receipt_mutation
+                    BEFORE UPDATE OR DELETE ON admin_direct_time_action_receipts
+                    FOR EACH ROW
+                    EXECUTE FUNCTION reject_admin_direct_time_action_receipt_mutation()
+            """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_week ON schedules(week_start)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_schedules_employee ON schedules(employee_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_departures_shift_id ON departures(shift_id)")
@@ -11410,6 +11525,10 @@ def _serialize_home_base_config(
     morning_crew: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     return {
+        # An older tracker does not advertise this field, which lets a newer
+        # portal fail closed instead of enabling a form whose route it cannot
+        # yet serve.  This code path and the direct-record route ship together.
+        "adminDirectRecordEnabled": True,
         "configured": config is not None,
         "homeBase": (
             {
@@ -12525,6 +12644,209 @@ def update_timesheets_for_plain_time_action(
                     ) from exc
                 raise
             return True, holder["response"]
+
+
+ADMIN_DIRECT_TIME_ACTION_RECEIPT_UNIQUE_CONSTRAINT = (
+    "admin_direct_time_action_receipts_actor_key"
+)
+
+
+def _admin_direct_time_action_name(
+    payload: AdminDirectRecordRequest,
+    *_args: Any,
+    **_kwargs: Any,
+) -> str:
+    return f"admin-direct-{payload.action}"
+
+
+def _admin_direct_record_request_fingerprint(
+    payload: AdminDirectRecordRequest,
+    admin: Dict[str, Any],
+) -> str:
+    material = {
+        "adminEmployeeId": int(admin["id"]),
+        "employeeId": int(payload.employeeId),
+        "action": payload.action,
+        "targetKind": payload.targetKind,
+        "siteId": int(payload.siteId) if payload.siteId is not None else None,
+        "reason": payload.reason,
+        "detail": payload.detail,
+    }
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _admin_direct_record_replay_response(
+    payload: AdminDirectRecordRequest,
+    admin: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    fingerprint = _admin_direct_record_request_fingerprint(payload, admin)
+    existing = db.query_one(
+        """
+        SELECT id, request_fingerprint, response_body
+        FROM admin_direct_time_action_receipts
+        WHERE admin_employee_id = %s
+          AND idempotency_key = %s
+        """,
+        (int(admin["id"]), str(payload.idempotencyKey)),
+    )
+    if not existing:
+        return None
+    if not hmac.compare_digest(str(existing["request_fingerprint"]), fingerprint):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This administrator direct-record key already belongs to "
+                "different action details."
+            ),
+        )
+    replay = dict(existing.get("response_body") or {})
+    receipt = replay.get("receipt")
+    replay["receipt"] = {
+        **(receipt if isinstance(receipt, dict) else {}),
+        "id": int(existing["id"]),
+        "immutable": True,
+    }
+    replay["replayed"] = True
+    return replay
+
+
+def _admin_direct_record_state_fingerprint(
+    entries: Iterable[Dict[str, Any]],
+    employee_id: int,
+) -> str:
+    """Fingerprint the target employee's pre-action time state under the lock."""
+
+    state = []
+    for entry in entries:
+        if int(entry.get("employeeId") or 0) != int(employee_id):
+            continue
+        active_visit = get_active_visit(entry)
+        state.append(
+            {
+                "shiftId": int(entry.get("id") or 0),
+                "clockIn": str(entry.get("clockIn") or ""),
+                "clockOut": entry.get("clockOut"),
+                "activeVisitId": (
+                    int(active_visit["id"])
+                    if isinstance(active_visit, dict)
+                    and active_visit.get("id") is not None
+                    else None
+                ),
+                "activeVisitLocationId": (
+                    int(active_visit["locationId"])
+                    if isinstance(active_visit, dict)
+                    and active_visit.get("locationId") is not None
+                    else None
+                ),
+            }
+        )
+    state.sort(key=lambda row: row["shiftId"])
+    return hashlib.sha256(
+        json.dumps(
+            {"employeeId": int(employee_id), "entries": state},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _admin_direct_record_employee(
+    employee_id: int,
+    *,
+    cur: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    query = (
+        "SELECT id, name, active FROM employees WHERE id = %s"
+        + (" FOR SHARE" if cur is not None else "")
+    )
+    if cur is None:
+        row = db.query_one(query, (int(employee_id),))
+    else:
+        cur.execute(query, (int(employee_id),))
+        row = _row_from_cursor(cur)
+    if not row or not bool(row.get("active")):
+        return None
+    return {
+        "id": int(row["id"]),
+        "name": str(row["name"]),
+    }
+
+
+def _admin_direct_record_site(
+    site_id: int,
+    *,
+    cur: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """Read one current customer Site without applying a GPS gate.
+
+    C5 is a documented administrator exception, so it never infers a Site from
+    a GPS sample. It still shares C3's active/business-eligible Site predicate
+    so an archived, non-customer, or non-EOM row cannot be named as paid work.
+    """
+
+    query = """
+        SELECT l.id AS location_id, l.address, l.customer_name,
+               COALESCE(NULLIF(c.name, ''), l.customer_name, '') AS canonical_customer_name,
+               l.location_type, l.active, l.archived_at, l.customer_id,
+               c.active AS customer_active, c.archived_at AS customer_archived_at
+        FROM locations l
+        LEFT JOIN customers c ON c.id = l.customer_id
+        WHERE l.id = %s
+    """ + (" FOR SHARE OF l" if cur is not None else "")
+    if cur is None:
+        row = db.query_one(query, (int(site_id),))
+    else:
+        cur.execute(query, (int(site_id),))
+        row = _row_from_cursor(cur)
+        if row and row.get("customer_id") is not None:
+            cur.execute(
+                "SELECT active, archived_at FROM customers WHERE id = %s FOR SHARE",
+                (int(row["customer_id"]),),
+            )
+            customer = _row_from_cursor(cur)
+            row["customer_active"] = customer.get("active") if customer else False
+            row["customer_archived_at"] = (
+                customer.get("archived_at") if customer else "missing"
+            )
+    if not row or not _location_business_eligible(row):
+        return None
+    return {
+        "kind": "site",
+        "id": int(row["location_id"]),
+        "label": str(row.get("address") or ""),
+        "customerName": str(
+            row.get("canonical_customer_name") or row.get("customer_name") or ""
+        ),
+    }
+
+
+def _admin_direct_record_target(
+    payload: AdminDirectRecordRequest,
+    *,
+    employee_id: int,
+    reference_time: datetime,
+    cur: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    if payload.targetKind == "site":
+        assert payload.siteId is not None
+        return _admin_direct_record_site(int(payload.siteId), cur=cur)
+    policy = _home_base_policy_for_employee(
+        employee_id,
+        reference_time,
+        cur=cur,
+        for_update=cur is not None,
+    )
+    if not policy:
+        return None
+    return {
+        "kind": "home_base",
+        "id": int(policy["home_base_id"]),
+        "label": str(policy.get("label") or ""),
+        "customerName": "",
+        "policy": policy,
+    }
 
 
 @app.post("/api/timesheet/site-check-in/resolve")
@@ -14889,6 +15211,390 @@ def admin_list_employees(
 
     append_access_log(request, "ADMIN_EMPLOYEES", True, f"{len(rows)} employees")
     return {"success": True, "employees": rows}
+
+
+@app.post("/api/admin/time-actions/direct-record")
+@registered_time_action(
+    "admin-direct-clock-in",
+    "admin-direct-arrive",
+    resolver=_admin_direct_time_action_name,
+)
+def admin_direct_record_time_action(
+    payload: AdminDirectRecordRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Record one documented administrator exception at server-owned now.
+
+    This is intentionally separate from the entry-edit correction route: it
+    accepts no client timestamp and therefore cannot turn a late correction
+    into an invisible backdated clock event.
+    """
+
+    replay = _admin_direct_record_replay_response(payload, admin)
+    if replay is not None:
+        return replay
+
+    # This preflight can return a quick validation error, but its reference
+    # time must never become the recorded event time: another writer can
+    # finish while this request waits for the serialized timesheet lock.
+    preflight_now_utc = utc_now()
+    target_employee = _admin_direct_record_employee(int(payload.employeeId))
+    if target_employee is None:
+        raise HTTPException(status_code=404, detail="Active employee not found")
+    target = _admin_direct_record_target(
+        payload,
+        employee_id=int(target_employee["id"]),
+        reference_time=preflight_now_utc,
+    )
+    if target is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Selected target is not available to this employee",
+        )
+
+    authoritative: Dict[str, Any] = {
+        "employee": target_employee,
+        "target": target,
+    }
+    holder: Dict[str, Any] = {}
+    recorded_at_ref: Dict[str, datetime] = {}
+
+    def recorded_at() -> datetime:
+        value = recorded_at_ref.get("value")
+        if not isinstance(value, datetime):
+            raise RuntimeError("Administrator direct record has no serialized timestamp")
+        return value
+
+    def target_public() -> Dict[str, Any]:
+        current = authoritative["target"]
+        return {
+            "kind": str(current["kind"]),
+            "id": int(current["id"]),
+            "label": str(current["label"]),
+            "customerName": str(current.get("customerName") or ""),
+        }
+
+    def replay_under_write_lock() -> Optional[Tuple[bool, Any]]:
+        locked_replay = _admin_direct_record_replay_response(payload, admin)
+        return (True, locked_replay) if locked_replay is not None else None
+
+    def mutator(timesheet_data: Dict[str, Any]) -> Tuple[bool, Any]:
+        # The timestamp is authoritative only after update_timesheets has
+        # acquired both in-process and PostgreSQL advisory locks and loaded the
+        # state this event will follow.
+        now_utc = utc_now()
+        recorded_at_ref["value"] = now_utc
+        employee_id = int(payload.employeeId)
+        stale_open = get_stale_open_entry(
+            timesheet_data["entries"], employee_id, now_utc
+        )
+        if stale_open:
+            return False, stale_shift_review_failure(stale_open, now_utc)
+
+        before_state_fingerprint = _admin_direct_record_state_fingerprint(
+            timesheet_data["entries"],
+            employee_id,
+        )
+        current_target = authoritative["target"]
+        if payload.action == "clock-in":
+            if get_open_entry(timesheet_data["entries"], employee_id):
+                return False, "Employee is already clocked in"
+            entry_id = int(timesheet_data["nextId"])
+            is_home_base = current_target["kind"] == "home_base"
+            entry = {
+                "id": entry_id,
+                "employeeId": employee_id,
+                "employeeName": authoritative["employee"]["name"],
+                "location": (
+                    f"Home Base — {current_target['label']}"
+                    if is_home_base
+                    else current_target["label"]
+                ),
+                "clockIn": to_utc_iso(now_utc),
+                "clockOut": None,
+                "totalHours": 0,
+                "notes": "",
+                "date": now_utc.astimezone(APP_TIMEZONE).date().isoformat(),
+                "timezone": TIMEZONE_NAME,
+                "clockInGps": None,
+                "clockInGpsMeta": {
+                    "adminRecorded": True,
+                    "reason": payload.reason,
+                    "detail": payload.detail,
+                },
+                "clockOutGps": None,
+                "clockOutGpsMeta": None,
+                "recordedSource": "admin_recorded",
+                "jobId": None,
+                "timeCategory": "productive",
+                "nonProductiveType": None,
+                "visits": [],
+            }
+            if is_home_base:
+                # Do not let a later Site visit turn an internal-dispatch shift
+                # into paid customer labor through the persistence auto-link.
+                entry["locationId"] = None
+                entry["internalHomeBase"] = True
+            else:
+                entry["locationId"] = int(current_target["id"])
+            timesheet_data["entries"].append(entry)
+            timesheet_data["nextId"] = entry_id + 1
+            result = {
+                "entry": entry,
+                "entryId": entry_id,
+                "beforeStateFingerprint": before_state_fingerprint,
+            }
+            result_ref.update(result)
+            return True, result
+
+        open_entry = get_open_entry(timesheet_data["entries"], employee_id)
+        if not open_entry:
+            return False, "Employee is not currently clocked in"
+        active_visit = get_active_visit(open_entry)
+        if (
+            active_visit
+            and _visits_refer_to_same_target(
+                active_visit,
+                {
+                    "locationId": current_target["id"],
+                    "location": current_target["label"],
+                },
+                use_site_identity=True,
+            )
+        ):
+            return False, "Employee already has an active arrival at this Site"
+        visit = {
+            "arrivalTime": to_utc_iso(now_utc),
+            "location": str(current_target["label"]),
+            "locationId": int(current_target["id"]),
+            "customer": str(current_target.get("customerName") or ""),
+            "gps": None,
+            "gpsMeta": {
+                "adminRecorded": True,
+                "reason": payload.reason,
+                "detail": payload.detail,
+            },
+            "recordedSource": "admin_recorded",
+            "sequenceVersion": 2,
+            "siteCheckInId": None,
+            "jobId": None,
+        }
+        if not isinstance(open_entry.get("visits"), list):
+            open_entry["visits"] = []
+        open_entry["visits"].append(visit)
+        result = {
+            "visit": visit,
+            "entryId": int(open_entry["id"]),
+            "beforeStateFingerprint": before_state_fingerprint,
+        }
+        result_ref.update(result)
+        return True, result
+
+    result_ref: Dict[str, Any] = {}
+
+    def validate_target_before_persist(cur: Any) -> None:
+        now_utc = recorded_at()
+        current_employee = _admin_direct_record_employee(
+            int(payload.employeeId),
+            cur=cur,
+        )
+        if current_employee is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Employee is no longer active; reload before recording time",
+            )
+        if payload.targetKind == "site":
+            _lock_customer_site_mutations(cur)
+        current_target = _admin_direct_record_target(
+            payload,
+            employee_id=int(current_employee["id"]),
+            reference_time=now_utc,
+            cur=cur,
+        )
+        if current_target is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Selected target changed or is no longer active; reload before recording time",
+            )
+
+        authoritative["employee"] = current_employee
+        authoritative["target"] = current_target
+        # The preliminary target made the pending row readable; this
+        # transaction-authoritative target is the only one that may be saved.
+        if payload.action == "clock-in":
+            entry = result_ref["entry"]
+            if current_target["kind"] == "home_base":
+                entry["location"] = f"Home Base — {current_target['label']}"
+                entry["locationId"] = None
+                entry["internalHomeBase"] = True
+            else:
+                entry["location"] = str(current_target["label"])
+                entry["locationId"] = int(current_target["id"])
+                entry.pop("internalHomeBase", None)
+            entry["employeeName"] = current_employee["name"]
+        else:
+            visit = result_ref["visit"]
+            visit["location"] = str(current_target["label"])
+            visit["locationId"] = int(current_target["id"])
+            visit["customer"] = str(current_target.get("customerName") or "")
+
+    def response_builder(result: Dict[str, Any]) -> Dict[str, Any]:
+        now_utc = recorded_at()
+        response: Dict[str, Any] = {
+            "success": True,
+            "action": payload.action,
+            "recordedAt": to_utc_iso(now_utc),
+            "recordedSource": "admin_recorded",
+            "employee": {
+                "id": int(authoritative["employee"]["id"]),
+                "name": str(authoritative["employee"]["name"]),
+            },
+            "target": target_public(),
+            "replayed": False,
+        }
+        if payload.action == "clock-in":
+            response["entry"] = result["entry"]
+        else:
+            response["visit"] = result["visit"]
+            response["entryId"] = int(result["entryId"])
+        return response
+
+    def after_save(cur: Any) -> None:
+        now_utc = recorded_at()
+        response = response_builder(result_ref)
+        current_target = authoritative["target"]
+        # A new shift starts with an in-memory nextId, but PostgreSQL owns the
+        # real serial id. `_save_timesheets_to_db` has now replaced the entry's
+        # id, so use that persisted identity for the Home Base event and receipt
+        # rather than the provisional result value.
+        if payload.action == "clock-in":
+            result_ref["entryId"] = int(result_ref["entry"]["id"])
+        shift_id = _plain_time_action_shift_id(result_ref, response)
+        if shift_id is None:
+            raise RuntimeError("Administrator direct record did not persist a shift")
+        if current_target["kind"] == "home_base":
+            policy = current_target.get("policy")
+            if not isinstance(policy, dict):
+                raise RuntimeError("Administrator direct Home Base record lost its policy")
+            response["homeBaseEvent"] = _record_home_base_event(
+                cur,
+                shift_id=shift_id,
+                employee_id=int(payload.employeeId),
+                policy=policy,
+                action="start",
+                outcome="exception",
+                exception_reason=payload.reason,
+                recorded_at=now_utc,
+            )
+
+        receipt_snapshot = {
+            **response,
+            "receipt": {
+                "id": None,
+                "immutable": True,
+            },
+        }
+        cur.execute(
+            """
+            INSERT INTO admin_direct_time_action_receipts (
+                admin_employee_id, admin_employee_name,
+                employee_id, employee_name,
+                action, target_kind, target_id, target_label, target_customer_name,
+                reason, detail, idempotency_key, request_fingerprint,
+                before_state_fingerprint, server_recorded_at, shift_id, visit_id,
+                response_body
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            RETURNING id
+            """,
+            (
+                int(admin["id"]),
+                str(admin["name"]),
+                int(authoritative["employee"]["id"]),
+                str(authoritative["employee"]["name"]),
+                payload.action,
+                str(current_target["kind"]),
+                int(current_target["id"]),
+                str(current_target["label"]),
+                str(current_target.get("customerName") or ""),
+                payload.reason,
+                payload.detail,
+                str(payload.idempotencyKey),
+                _admin_direct_record_request_fingerprint(payload, admin),
+                str(result_ref["beforeStateFingerprint"]),
+                now_utc,
+                shift_id,
+                (
+                    int(result_ref["visit"]["id"])
+                    if payload.action == "arrive"
+                    and result_ref.get("visit", {}).get("id") is not None
+                    else None
+                ),
+                psycopg2.extras.Json(jsonable_encoder(receipt_snapshot)),
+            ),
+        )
+        receipt = _row_from_cursor(cur)
+        if not receipt:
+            raise RuntimeError("Administrator direct record receipt was not stored")
+        response["receipt"] = {
+            "id": int(receipt["id"]),
+            "immutable": True,
+        }
+        holder["response"] = response
+
+    try:
+        ok, result = update_timesheets(
+            mutator,
+            after_save=after_save,
+            required_capabilities=(
+                frozenset({"opens_shift"})
+                if payload.action == "clock-in"
+                else frozenset({"opens_visit"})
+            ),
+            before_save=validate_target_before_persist,
+            before_load=replay_under_write_lock,
+        )
+    except psycopg2.errors.UniqueViolation as exc:
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", "")
+        if constraint != ADMIN_DIRECT_TIME_ACTION_RECEIPT_UNIQUE_CONSTRAINT:
+            raise
+        replay = _admin_direct_record_replay_response(payload, admin)
+        if replay is not None:
+            return replay
+        raise HTTPException(
+            status_code=503,
+            detail="This administrator direct record is still being saved; retry the same request.",
+        ) from exc
+
+    if not ok:
+        append_access_log(
+            request,
+            "ADMIN_DIRECT_TIME_RECORD_FAILED",
+            False,
+            f"admin={admin['id']} employee={payload.employeeId} action={payload.action}",
+        )
+        raise_timesheet_mutation_failure(result)
+    if result.get("replayed"):
+        return result
+
+    result_ref.update(result)
+    response = holder.get("response")
+    if not isinstance(response, dict):
+        raise RuntimeError("Administrator direct record response was not stored")
+    append_access_log(
+        request,
+        "ADMIN_DIRECT_TIME_RECORDED",
+        True,
+        (
+            f"admin={admin['id']} employee={payload.employeeId} "
+            f"action={payload.action} target={response['target']['kind']}:"
+            f"{response['target']['id']}"
+        ),
+    )
+    return response
 
 
 @app.get("/api/admin/employees/{employee_id}/hours")
