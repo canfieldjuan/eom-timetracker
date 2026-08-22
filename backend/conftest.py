@@ -83,6 +83,7 @@ def _apply_schema(conn):
                 payroll_verification_events, payroll_verification_batches,
                 time_data_correction_batches,
                 atlas_linkage_backfill_batches,
+                admin_direct_time_action_receipts,
                 plain_time_action_receipts,
                 site_qr_action_receipts,
                 site_check_in_reconciliation_reviews, site_check_ins,

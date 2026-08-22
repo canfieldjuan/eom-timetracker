@@ -24,6 +24,8 @@ EXPECTED_RUNTIME_POLICIES = {
     "site-qr-depart": ("interactive", False, False, False, True, "evidence_paid_on_inside", "site_qr_action_receipts", "site_check_ins", "no departure", "evidence-only"),
     "site-check-in-evidence": ("interactive", False, False, False, False, "evidence_paid_on_inside", "site_check_ins", "site_check_ins", "without a time event", "none"),
     "admin-entry-adjustment": ("correction", True, True, False, False, "none", "none", "shifts", "administrator correction", "administrator correction"),
+    "admin-direct-clock-in": ("correction", True, False, False, False, "none", "admin_direct_time_action_receipts", "shifts", "administrator records", "server time only"),
+    "admin-direct-arrive": ("correction", False, False, True, False, "none", "admin_direct_time_action_receipts", "visits", "administrator records", "server time only"),
     "admin-time-data-correction": ("correction", False, True, False, False, "none", "plan token", "time_data_correction_batches", "reviewed data correction", "confirmation phrase"),
     "admin-utilization-missing-departure-correction": ("correction", False, False, False, True, "none", "plan token", "time_data_correction_batches", "utilization departure overlay", "evidence fingerprint"),
     "payroll-timesheet-change": ("correction", False, False, False, False, "none", "request id", "payroll_timesheet_change_batches", "payroll overlay", "payroll reason"),
@@ -47,6 +49,9 @@ EXPECTED_RUNTIME_HANDLERS = {
     "time_tracker_api.log_visit": frozenset({"arrive"}),
     "time_tracker_api.depart_location": frozenset({"depart"}),
     "time_tracker_api.admin_adjust_entry": frozenset({"admin-entry-adjustment"}),
+    "time_tracker_api.admin_direct_record_time_action": frozenset(
+        {"admin-direct-clock-in", "admin-direct-arrive"}
+    ),
     "time_tracker_api.admin_apply_time_data_correction": frozenset(
         {"admin-time-data-correction"}
     ),
@@ -87,6 +92,8 @@ EXPECTED_DATABASE_MUTATION_CAPABILITIES = {
     "site-qr-depart": frozenset({"departure-time-write"}),
     "site-check-in-evidence": frozenset(),
     "admin-entry-adjustment": frozenset({"shift-time-write"}),
+    "admin-direct-clock-in": frozenset({"shift-time-write"}),
+    "admin-direct-arrive": frozenset({"visit-time-write"}),
     "admin-time-data-correction": frozenset(
         {
             "shift-time-write",
@@ -493,6 +500,28 @@ def test_time_persistence_rejects_an_undeclared_appended_mutation_kind() -> None
                 {1: 0},
                 pre_shift_boundaries={1: (None, None)},
                 required_capabilities=frozenset({"opens_shift"}),
+            )
+
+
+def test_time_persistence_rechecks_capabilities_after_a_pre_save_hook() -> None:
+    entry = {"id": 1, "visits": [], "departures": []}
+
+    def append_visit(_cur) -> None:
+        entry["visits"].append({})
+
+    with registry.registered_time_action_context("admin-entry-adjustment"):
+        with pytest.raises(
+            RuntimeError,
+            match="capability declaration omits: opens_visit",
+        ):
+            api._save_timesheets_to_db(
+                {"entries": [entry]},
+                {1},
+                {1: 0},
+                {1: 0},
+                pre_shift_boundaries={1: (None, None)},
+                required_capabilities=frozenset({"opens_shift"}),
+                before_save=append_visit,
             )
 
 
