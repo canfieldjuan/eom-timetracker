@@ -44,6 +44,7 @@ import arrival_policies
 import db
 from time_action_registry import (
     TIME_ACTION_MIGRATION_SOURCE_ACTIONS,
+    TimeMutationCapability,
     registered_time_action,
     registered_time_action_context,
     require_registered_time_action_context,
@@ -1270,11 +1271,44 @@ def _save_timesheets_to_db(
     pre_shift_ids: set,
     pre_visit_counts: Dict[int, int],
     pre_departure_counts: Dict[int, int],
+    *,
+    pre_shift_boundaries: Dict[int, Tuple[Optional[str], Optional[str]]],
+    required_capabilities: FrozenSet[TimeMutationCapability],
     before_save: Optional[Callable[[Any], None]] = None,
     after_save: Optional[Callable[[Any], None]] = None,
 ) -> None:
     """Persist time evidence without mutating the server-authoritative Site list."""
-    require_registered_time_action_context()
+    if not required_capabilities:
+        raise ValueError("Time persistence must declare mutation capabilities")
+    require_registered_time_action_context(
+        required_capabilities=required_capabilities
+    )
+    observed_capabilities: set[TimeMutationCapability] = set()
+    for entry in timesheet_data.get("entries", []):
+        if entry["id"] not in pre_shift_ids:
+            observed_capabilities.add("opens_shift")
+            if entry.get("clockOut") is not None:
+                observed_capabilities.add("closes_shift")
+        previous_boundaries = pre_shift_boundaries.get(entry["id"])
+        if previous_boundaries is not None:
+            previous_clock_in, previous_clock_out = previous_boundaries
+            if entry.get("clockIn") != previous_clock_in:
+                observed_capabilities.add("opens_shift")
+            if entry.get("clockOut") != previous_clock_out:
+                if entry.get("clockOut") is None:
+                    observed_capabilities.add("opens_shift")
+                else:
+                    observed_capabilities.add("closes_shift")
+        if len(entry.get("visits", [])) > pre_visit_counts.get(entry["id"], 0):
+            observed_capabilities.add("opens_visit")
+        if len(entry.get("departures", [])) > pre_departure_counts.get(entry["id"], 0):
+            observed_capabilities.add("closes_visit")
+    undeclared_capabilities = observed_capabilities - required_capabilities
+    if undeclared_capabilities:
+        raise RuntimeError(
+            "Time persistence capability declaration omits: "
+            + ", ".join(sorted(undeclared_capabilities))
+        )
     with db.get_conn() as conn:
         cur = conn.cursor()
 
@@ -1699,8 +1733,14 @@ def timesheet_postgres_advisory_lock():
 def update_timesheets(
     mutator,
     after_save: Optional[Callable[[Any], None]] = None,
+    *,
+    required_capabilities: FrozenSet[TimeMutationCapability],
 ) -> Tuple[bool, Any]:
-    require_registered_time_action_context()
+    if not required_capabilities:
+        raise ValueError("Time persistence must declare mutation capabilities")
+    require_registered_time_action_context(
+        required_capabilities=required_capabilities
+    )
     with TIMESHEET_WRITE_LOCK:
         with timesheet_postgres_advisory_lock():
             timesheet_data = _load_timesheets_from_db()
@@ -1712,6 +1752,10 @@ def update_timesheets(
                 e["id"]: len(e.get("departures", []))
                 for e in timesheet_data["entries"]
             }
+            pre_shift_boundaries = {
+                e["id"]: (e.get("clockIn"), e.get("clockOut"))
+                for e in timesheet_data["entries"]
+            }
 
             ok, payload = mutator(timesheet_data)
             if ok:
@@ -1720,6 +1764,8 @@ def update_timesheets(
                     pre_shift_ids,
                     pre_visit_counts,
                     pre_departure_counts,
+                    pre_shift_boundaries=pre_shift_boundaries,
+                    required_capabilities=required_capabilities,
                     after_save=after_save,
                 )
             return ok, payload
@@ -11637,7 +11683,16 @@ def _record_explicit_site_action(
     employee: Dict[str, Any],
 ) -> Dict[str, Any]:
     assert payload.action is not None
-    require_registered_time_action_context(f"site-qr-{payload.action}")
+    if payload.action == "arrive":
+        required_capabilities = frozenset({"opens_visit"})
+    elif payload.action == "depart":
+        required_capabilities = frozenset({"closes_visit"})
+    else:
+        raise ValueError(f"Unsupported Site QR action: {payload.action}")
+    require_registered_time_action_context(
+        f"site-qr-{payload.action}",
+        required_capabilities=required_capabilities,
+    )
     assert payload.actionStateToken is not None
     assert payload.idempotencyKey is not None
     fingerprint = _site_action_request_fingerprint(payload)
@@ -11992,6 +12047,20 @@ PLAIN_TIME_ACTION_RECEIPT_UNIQUE_CONSTRAINT = (
 )
 
 
+def _plain_time_action_required_capabilities(
+    action: str,
+) -> FrozenSet[TimeMutationCapability]:
+    if action in {"clock-in", "home-base-start"}:
+        return frozenset({"opens_shift"})
+    if action in {"clock-out", "home-base-end"}:
+        return frozenset({"closes_shift"})
+    if action == "arrive":
+        return frozenset({"opens_visit"})
+    if action == "depart":
+        return frozenset({"closes_visit"})
+    raise ValueError(f"Unsupported plain time action: {action}")
+
+
 def _plain_time_action_request_fingerprint(
     action: str,
     payload: Optional[BaseModel],
@@ -12106,7 +12175,11 @@ def update_timesheets_for_plain_time_action(
 ) -> Tuple[bool, Any]:
     if action not in PLAIN_TIME_ACTION_NAMES:
         raise ValueError(f"Unsupported plain time action: {action}")
-    require_registered_time_action_context(action)
+    required_capabilities = _plain_time_action_required_capabilities(action)
+    require_registered_time_action_context(
+        action,
+        required_capabilities=required_capabilities,
+    )
 
     idempotency_key = getattr(payload, "idempotencyKey", None) if payload else None
     fingerprint = (
@@ -12129,6 +12202,10 @@ def update_timesheets_for_plain_time_action(
             }
             pre_departure_counts = {
                 e["id"]: len(e.get("departures", []))
+                for e in timesheet_data["entries"]
+            }
+            pre_shift_boundaries = {
+                e["id"]: (e.get("clockIn"), e.get("clockOut"))
                 for e in timesheet_data["entries"]
             }
 
@@ -12180,6 +12257,8 @@ def update_timesheets_for_plain_time_action(
                     pre_shift_ids,
                     pre_visit_counts,
                     pre_departure_counts,
+                    pre_shift_boundaries=pre_shift_boundaries,
+                    required_capabilities=required_capabilities,
                     before_save=before_save,
                     after_save=after_save,
                 )
@@ -16016,7 +16095,10 @@ def admin_adjust_entry(
 
         return True, entry
 
-    ok, result = update_timesheets(mutator)
+    ok, result = update_timesheets(
+        mutator,
+        required_capabilities=frozenset({"opens_shift", "closes_shift"}),
+    )
     if not ok:
         raise HTTPException(status_code=400, detail=str(result))
 
@@ -23534,7 +23616,10 @@ def admin_apply_time_data_correction(
     request: Request,
     current_admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    require_registered_time_action_context("admin-time-data-correction")
+    require_registered_time_action_context(
+        "admin-time-data-correction",
+        required_capabilities=frozenset({"closes_shift"}),
+    )
     requested_ids = {
         int(value)
         for row in payload.duplicateResolutions

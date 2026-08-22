@@ -170,7 +170,10 @@ def test_unrelated_write_never_auto_closes_stale_shift(
 
     try:
         with registered_time_action_context("admin-entry-adjustment"):
-            ok, result = tta.update_timesheets(lambda _: (True, "unrelated write"))
+            ok, result = tta.update_timesheets(
+                lambda _: (True, "unrelated write"),
+                required_capabilities=frozenset({"opens_shift", "closes_shift"}),
+            )
         assert ok is True
         assert result == "unrelated write"
 

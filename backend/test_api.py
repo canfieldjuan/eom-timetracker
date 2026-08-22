@@ -5255,6 +5255,10 @@ class TestVisitJobIdentity:
                     pre_shift_ids,
                     pre_visit_counts,
                     pre_departure_counts,
+                    pre_shift_boundaries={
+                        shift_id: (entry.get("clockIn"), entry.get("clockOut"))
+                    },
+                    required_capabilities=frozenset({"opens_visit"}),
                 )
 
             stored = db.query_one(

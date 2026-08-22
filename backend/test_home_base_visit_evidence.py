@@ -1936,19 +1936,7 @@ def test_customer_label_with_home_base_prefix_still_auto_links_first_visit(clien
         "jobId": None,
         "timeCategory": "productive",
         "nonProductiveType": None,
-        "visits": [
-            {
-                "locationId": customer_site_id,
-                "location": f"{TEST_PREFIX} Customer Prefix Auto-link Site",
-                "customer": f"{TEST_PREFIX} Customer Customer Prefix Auto-link Site",
-                "arrivalTime": time_tracker_api.to_utc_iso(now + timedelta(minutes=5)),
-                "gps": None,
-                "gpsMeta": None,
-                "sequenceVersion": 2,
-                "siteCheckInId": None,
-                "jobId": None,
-            }
-        ],
+        "visits": [],
         "departures": [],
     }
 
@@ -1958,6 +1946,33 @@ def test_customer_label_with_home_base_prefix_still_auto_links_first_visit(clien
             set(),
             {},
             {},
+            pre_shift_boundaries={},
+            required_capabilities=frozenset({"opens_shift", "closes_shift"}),
+        )
+
+    entry["visits"].append(
+        {
+            "locationId": customer_site_id,
+            "location": f"{TEST_PREFIX} Customer Prefix Auto-link Site",
+            "customer": f"{TEST_PREFIX} Customer Customer Prefix Auto-link Site",
+            "arrivalTime": time_tracker_api.to_utc_iso(now + timedelta(minutes=5)),
+            "gps": None,
+            "gpsMeta": None,
+            "sequenceVersion": 2,
+            "siteCheckInId": None,
+            "jobId": None,
+        }
+    )
+    with registered_time_action_context("arrive"):
+        time_tracker_api._save_timesheets_to_db(
+            {"entries": [entry]},
+            {entry["id"]},
+            {entry["id"]: 0},
+            {entry["id"]: 0},
+            pre_shift_boundaries={
+                entry["id"]: (entry.get("clockIn"), entry.get("clockOut"))
+            },
+            required_capabilities=frozenset({"opens_visit"}),
         )
 
     assert db.query_one(

@@ -24,6 +24,7 @@ EXPECTED_RUNTIME_POLICIES = {
     "site-check-in-evidence": ("interactive", False, False, False, False, "evidence_paid_on_inside", "site_check_ins", "site_check_ins", "without a time event", "none"),
     "admin-entry-adjustment": ("correction", True, True, False, False, "none", "none", "shifts", "administrator correction", "administrator correction"),
     "admin-time-data-correction": ("correction", False, True, False, False, "none", "plan token", "time_data_correction_batches", "reviewed data correction", "confirmation phrase"),
+    "admin-utilization-missing-departure-correction": ("correction", False, False, False, True, "none", "plan token", "time_data_correction_batches", "utilization departure overlay", "evidence fingerprint"),
     "payroll-timesheet-change": ("correction", False, False, False, False, "none", "request id", "payroll_timesheet_change_batches", "payroll overlay", "payroll reason"),
     "payroll-shift-correction": ("correction", False, False, False, False, "none", "matching active correction", "payroll_shift_corrections", "payroll overlay", "payroll reason"),
     "payroll-shift-correction-void": ("correction", False, False, False, False, "none", "active correction state", "payroll_shift_corrections", "payroll overlay", "payroll void reason"),
@@ -43,6 +44,9 @@ EXPECTED_RUNTIME_HANDLERS = {
     "time_tracker_api.admin_adjust_entry": frozenset({"admin-entry-adjustment"}),
     "time_tracker_api.admin_apply_time_data_correction": frozenset(
         {"admin-time-data-correction"}
+    ),
+    "operations_schedule.build_operations_schedule_router.<locals>.correct_utilization_missing_departure": frozenset(
+        {"admin-utilization-missing-departure-correction"}
     ),
     "time_tracker_api.admin_apply_payroll_timesheet_changes": frozenset(
         {"payroll-timesheet-change"}
@@ -81,6 +85,34 @@ def synthetic_time_writer():
     with pytest.raises(
         RuntimeError,
         match="synthetic_time_writer:3",
+    ):
+        registry.validate_time_action_mutation_source(source)
+
+
+def test_startup_completeness_gate_rejects_conditionally_guarded_writer() -> None:
+    source = """
+def conditional_time_writer(enabled):
+    if enabled:
+        require_registered_time_action_context()
+    db.execute('INSERT INTO shifts (employee_id) VALUES (1)')
+"""
+
+    with pytest.raises(
+        RuntimeError,
+        match="conditional_time_writer:5",
+    ):
+        registry.validate_time_action_mutation_source(source)
+
+
+def test_startup_completeness_gate_rejects_unguarded_time_correction_overlay() -> None:
+    source = """
+def synthetic_time_correction_overlay():
+    db.execute("INSERT INTO time_data_correction_batches (plan_token) VALUES ('x')")
+"""
+
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic_time_correction_overlay:3",
     ):
         registry.validate_time_action_mutation_source(source)
 
@@ -170,14 +202,31 @@ def test_runtime_writers_are_all_registered_with_their_closed_action_set() -> No
 
 def test_mutation_layer_rejects_missing_registered_action_context() -> None:
     with pytest.raises(RuntimeError, match="active registered time-action context"):
-        api.update_timesheets(lambda _timesheet_data: (False, None))
+        api.update_timesheets(
+            lambda _timesheet_data: (False, None),
+            required_capabilities=frozenset({"opens_shift"}),
+        )
 
     with pytest.raises(RuntimeError, match="active registered time-action context"):
-        api._save_timesheets_to_db({}, set(), {}, {})
+        api._save_timesheets_to_db(
+            {},
+            set(),
+            {},
+            {},
+            pre_shift_boundaries={},
+            required_capabilities=frozenset({"opens_shift"}),
+        )
 
     with registry.registered_time_action_context("schema-migration"):
         with pytest.raises(RuntimeError, match="migration-only"):
-            api._save_timesheets_to_db({}, set(), {}, {})
+            api._save_timesheets_to_db(
+                {},
+                set(),
+                {},
+                {},
+                pre_shift_boundaries={},
+                required_capabilities=frozenset({"opens_shift"}),
+            )
 
     with registry.registered_time_action_context("clock-in"):
         with pytest.raises(RuntimeError, match="expected arrive, active clock-in"):
@@ -187,6 +236,33 @@ def test_mutation_layer_rejects_missing_registered_action_context() -> None:
                 {},
                 lambda _timesheet_data: (False, None),
                 lambda _result, _timesheet_data: {},
+            )
+
+
+def test_mutation_layer_rejects_a_policy_without_the_requested_capability() -> None:
+    with registry.registered_time_action_context("site-check-in-evidence"):
+        with pytest.raises(
+            RuntimeError,
+            match="site-check-in-evidence does not allow capability: opens_shift",
+        ):
+            registry.require_registered_time_action_context(
+                required_capabilities=frozenset({"opens_shift"})
+            )
+
+
+def test_time_persistence_rejects_an_undeclared_appended_mutation_kind() -> None:
+    with registry.registered_time_action_context("admin-entry-adjustment"):
+        with pytest.raises(
+            RuntimeError,
+            match="capability declaration omits: opens_visit",
+        ):
+            api._save_timesheets_to_db(
+                {"entries": [{"id": 1, "visits": [{}], "departures": []}]},
+                {1},
+                {1: 0},
+                {1: 0},
+                pre_shift_boundaries={1: (None, None)},
+                required_capabilities=frozenset({"opens_shift"}),
             )
 
 

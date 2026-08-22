@@ -17,7 +17,7 @@ from functools import wraps
 import inspect
 import re
 from types import MappingProxyType
-from typing import Callable, Dict, FrozenSet, Iterator, Literal, Mapping, Optional, ParamSpec, TypeVar
+from typing import Callable, Dict, FrozenSet, Iterable, Iterator, Literal, Mapping, Optional, ParamSpec, TypeVar
 
 
 LocationGateMode = Literal[
@@ -26,13 +26,19 @@ LocationGateMode = Literal[
     "evidence_paid_on_inside",
 ]
 TimeActionWorkflow = Literal["interactive", "correction", "migration"]
+TimeMutationCapability = Literal[
+    "opens_shift",
+    "closes_shift",
+    "opens_visit",
+    "closes_visit",
+]
 
 P = ParamSpec("P")
 T = TypeVar("T")
 ActionResolver = Callable[..., str]
 
 _DIRECT_TIME_MUTATION_SQL = re.compile(
-    r"\b(?:insert\s+into|delete\s+from)\s+(?:shifts|visits|departures)\b"
+    r"\b(?:insert\s+into|delete\s+from)\s+(?:shifts|visits|departures|time_data_correction_batches)\b"
 )
 _SQL_EXECUTION_METHODS = frozenset(
     {"execute", "execute_returning", "query_one", "query_all"}
@@ -42,6 +48,9 @@ _TEMPORAL_UPDATE_COLUMNS = {
     "visits": frozenset({"arrival_time"}),
     "departures": frozenset({"departure_time"}),
 }
+_TIME_MUTATION_CAPABILITIES: FrozenSet[TimeMutationCapability] = frozenset(
+    {"opens_shift", "closes_shift", "opens_visit", "closes_visit"}
+)
 # A production source that writes historical time evidence outside a request
 # context must be declared here.  The startup source sweep still examines every
 # production module; this closed map makes the one intentional exception
@@ -243,6 +252,20 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             audit_target="time_data_correction_batches, shifts, and access_log_entries",
             requires_active_context=True,
         ),
+        "admin-utilization-missing-departure-correction": TimeActionPolicy(
+            action="admin-utilization-missing-departure-correction",
+            workflow="correction",
+            opens_shift=False,
+            closes_shift=False,
+            opens_visit=False,
+            closes_visit=True,
+            location_gate_mode="none",
+            weak_or_missing_gps_behavior="not applicable to a reviewed utilization departure overlay",
+            exception_method="administrator correction reason and evidence fingerprint",
+            idempotency_mechanism="locked plan token derived from the request idempotency key",
+            audit_target="time_data_correction_batches and utilization review overlays",
+            requires_active_context=True,
+        ),
         "payroll-timesheet-change": TimeActionPolicy(
             action="payroll-timesheet-change",
             workflow="correction",
@@ -366,8 +389,10 @@ def registered_time_action_context(action: str) -> Iterator[TimeActionPolicy]:
 
 def require_registered_time_action_context(
     expected_action: Optional[str] = None,
+    *,
+    required_capabilities: Iterable[TimeMutationCapability] = (),
 ) -> TimeActionPolicy:
-    """Reject a time mutation that was reached outside its declared action."""
+    """Reject a time mutation outside its declared action or capabilities."""
 
     policy = _ACTIVE_TIME_ACTION.get()
     if policy is None:
@@ -382,6 +407,23 @@ def require_registered_time_action_context(
         raise RuntimeError(
             "Time mutation action context mismatch: "
             f"expected {expected_action}, active {policy.action}"
+        )
+    requested_capabilities = frozenset(required_capabilities)
+    unknown_capabilities = requested_capabilities - _TIME_MUTATION_CAPABILITIES
+    if unknown_capabilities:
+        raise RuntimeError(
+            "Unknown time mutation capability: "
+            + ", ".join(sorted(unknown_capabilities))
+        )
+    disallowed_capabilities = sorted(
+        capability
+        for capability in requested_capabilities
+        if not getattr(policy, capability)
+    )
+    if disallowed_capabilities:
+        raise RuntimeError(
+            f"Time mutation action {policy.action} does not allow capability: "
+            + ", ".join(disallowed_capabilities)
         )
     return policy
 
@@ -551,11 +593,12 @@ def validate_time_action_mutation_source(
 
     This intentionally derives writers from direct SQL in production sources
     rather than guessing from FastAPI route shape. A writer that creates/deletes
-    a shift, visit, or departure—or alters a temporal boundary—must establish
-    its registered context before executing that SQL. A caller may classify one
-    source as a declared non-request migration; that exception is validated
-    against the closed policy registry. The scanner covers all local SQL
-    execution helpers and resolves simple local string bindings first.
+    a shift, visit, departure, or correction-ledger overlay—or alters a temporal
+    boundary—must establish its registered context unconditionally before
+    executing that SQL. A caller may classify one source as a declared
+    non-request migration; that exception is validated against the closed policy
+    registry. The scanner covers all local SQL execution helpers and resolves
+    simple local string bindings first.
     """
 
     tree = ast.parse(source)
@@ -577,14 +620,37 @@ def validate_time_action_mutation_source(
     class DirectTimeMutationVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
             self.function_stack: list[_TimeMutationSourceScope] = []
+            self.control_flow_depths: list[int] = []
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
             self.function_stack.append(_TimeMutationSourceScope(node.name, [], {}))
+            self.control_flow_depths.append(0)
             for statement in node.body:
                 self.visit(statement)
+            self.control_flow_depths.pop()
             self.function_stack.pop()
 
         visit_AsyncFunctionDef = visit_FunctionDef
+
+        def _visit_nested_control_flow(self, node: ast.AST) -> None:
+            if not self.function_stack:
+                self.generic_visit(node)
+                return
+            self.control_flow_depths[-1] += 1
+            try:
+                self.generic_visit(node)
+            finally:
+                self.control_flow_depths[-1] -= 1
+
+        visit_If = _visit_nested_control_flow
+        visit_For = _visit_nested_control_flow
+        visit_AsyncFor = _visit_nested_control_flow
+        visit_While = _visit_nested_control_flow
+        visit_Try = _visit_nested_control_flow
+        visit_TryStar = _visit_nested_control_flow
+        visit_With = _visit_nested_control_flow
+        visit_AsyncWith = _visit_nested_control_flow
+        visit_Match = _visit_nested_control_flow
 
         def _sql_text(self, node: ast.AST) -> Optional[str]:
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -638,8 +704,11 @@ def validate_time_action_mutation_source(
             self.generic_visit(node)
 
         def visit_Call(self, node: ast.Call) -> None:
-            if self.function_stack and isinstance(node.func, ast.Name) and (
-                node.func.id == "require_registered_time_action_context"
+            if (
+                self.function_stack
+                and self.control_flow_depths[-1] == 0
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "require_registered_time_action_context"
             ):
                 self.function_stack[-1].guard_lines.append(node.lineno)
 
@@ -659,8 +728,8 @@ def validate_time_action_mutation_source(
                     line < node.lineno for line in scope.guard_lines
                 ):
                     errors.append(
-                        "direct time mutation without a preceding registered "
-                        f"context guard: {scope.name}:{node.lineno}"
+                        "direct time mutation without a preceding unconditional "
+                        f"registered context guard: {scope.name}:{node.lineno}"
                     )
             self.generic_visit(node)
 

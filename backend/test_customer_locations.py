@@ -1065,6 +1065,10 @@ def test_stale_time_save_cannot_recreate_a_renamed_site_or_repoint_history(
         entry["id"]: len(entry.get("departures", []))
         for entry in stale_snapshot["entries"]
     }
+    pre_shift_boundaries = {
+        entry["id"]: (entry.get("clockIn"), entry.get("clockOut"))
+        for entry in stale_snapshot["entries"]
+    }
 
     renamed = client.patch(
         f"/api/admin/locations/{site['id']}",
@@ -1088,6 +1092,8 @@ def test_stale_time_save_cannot_recreate_a_renamed_site_or_repoint_history(
             pre_shift_ids,
             pre_visit_counts,
             pre_departure_counts,
+            pre_shift_boundaries=pre_shift_boundaries,
+            required_capabilities=frozenset({"opens_shift", "closes_shift"}),
         )
 
     assert api.db.query_one(
