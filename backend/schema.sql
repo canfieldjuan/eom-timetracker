@@ -713,6 +713,20 @@ CREATE TABLE crew_memberships (
     UNIQUE (crew_id, employee_id, effective_from)
 );
 
+-- Geofence C6 (#218): default-off, per-crew foreground hard-gate scope.
+-- The environment kill switch remains the global emergency rollback; absence of
+-- a row is intentionally equivalent to enabled = false so no crew is enrolled
+-- merely by deploying this additive table.
+CREATE TABLE geofence_hard_gate_scopes (
+    id          BIGSERIAL PRIMARY KEY,
+    crew_id     BIGINT NOT NULL UNIQUE REFERENCES crews(id) ON DELETE CASCADE,
+    enabled     BOOLEAN NOT NULL DEFAULT false,
+    created_by  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    updated_by  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- The office is an internal paid-workplace boundary, not a Customer/Site.  It
 -- deliberately has no customer, service, rate, revenue, or job reference.
 -- A partial unique index below keeps the first release to one active office
