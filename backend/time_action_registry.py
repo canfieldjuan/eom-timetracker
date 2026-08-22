@@ -40,6 +40,9 @@ ActionResolver = Callable[..., str]
 _DIRECT_TIME_MUTATION_SQL = re.compile(
     r"\b(?:insert\s+into|delete\s+from)\s+(?:shifts|visits|departures|time_data_correction_batches)\b"
 )
+_PAYROLL_HOUR_CORRECTION_OVERLAY_SQL = re.compile(
+    r"\b(?:insert\s+into|delete\s+from|update)\s+payroll_hour_corrections\b"
+)
 _SQL_EXECUTION_METHODS = frozenset(
     {"execute", "execute_returning", "query_one", "query_all"}
 )
@@ -278,6 +281,34 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             exception_method="payroll reason and verification-week workflow",
             idempotency_mechanism="payroll request id and request fingerprint",
             audit_target="payroll_timesheet_change_batches and correction tables",
+            requires_active_context=True,
+        ),
+        "payroll-hour-correction": TimeActionPolicy(
+            action="payroll-hour-correction",
+            workflow="correction",
+            opens_shift=False,
+            closes_shift=False,
+            opens_visit=False,
+            closes_visit=False,
+            location_gate_mode="none",
+            weak_or_missing_gps_behavior="not applicable to a payroll-total overlay correction",
+            exception_method="payroll reason and verification-week workflow",
+            idempotency_mechanism="matching active correction is replayed",
+            audit_target="payroll_hour_corrections and access_log_entries",
+            requires_active_context=True,
+        ),
+        "payroll-hour-correction-void": TimeActionPolicy(
+            action="payroll-hour-correction-void",
+            workflow="correction",
+            opens_shift=False,
+            closes_shift=False,
+            opens_visit=False,
+            closes_visit=False,
+            location_gate_mode="none",
+            weak_or_missing_gps_behavior="not applicable to a payroll-total overlay correction",
+            exception_method="payroll void reason and verification-week workflow",
+            idempotency_mechanism="active correction state and row locking",
+            audit_target="payroll_hour_corrections and access_log_entries",
             requires_active_context=True,
         ),
         "payroll-shift-correction": TimeActionPolicy(
@@ -574,7 +605,10 @@ def _is_direct_time_mutation_sql(sql: str) -> bool:
     """Whether a literal statement creates, deletes, or changes time boundaries."""
 
     normalized = " ".join(sql.lower().split())
-    if _DIRECT_TIME_MUTATION_SQL.search(normalized):
+    if (
+        _DIRECT_TIME_MUTATION_SQL.search(normalized)
+        or _PAYROLL_HOUR_CORRECTION_OVERLAY_SQL.search(normalized)
+    ):
         return True
     for table_name, columns in _TEMPORAL_UPDATE_COLUMNS.items():
         if re.search(rf"\bupdate\s+{table_name}\b", normalized) and any(
@@ -593,8 +627,8 @@ def validate_time_action_mutation_source(
 
     This intentionally derives writers from direct SQL in production sources
     rather than guessing from FastAPI route shape. A writer that creates/deletes
-    a shift, visit, departure, or correction-ledger overlay—or alters a temporal
-    boundary—must establish its registered context unconditionally before
+    a shift, visit, departure, or time-affecting correction overlay—or alters a
+    temporal boundary—must establish its registered context unconditionally before
     executing that SQL. A caller may classify one source as a declared
     non-request migration; that exception is validated against the closed policy
     registry. The scanner covers all local SQL execution helpers and resolves

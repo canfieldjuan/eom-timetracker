@@ -26,6 +26,8 @@ EXPECTED_RUNTIME_POLICIES = {
     "admin-time-data-correction": ("correction", False, True, False, False, "none", "plan token", "time_data_correction_batches", "reviewed data correction", "confirmation phrase"),
     "admin-utilization-missing-departure-correction": ("correction", False, False, False, True, "none", "plan token", "time_data_correction_batches", "utilization departure overlay", "evidence fingerprint"),
     "payroll-timesheet-change": ("correction", False, False, False, False, "none", "request id", "payroll_timesheet_change_batches", "payroll overlay", "payroll reason"),
+    "payroll-hour-correction": ("correction", False, False, False, False, "none", "matching active correction", "payroll_hour_corrections", "payroll-total overlay", "payroll reason"),
+    "payroll-hour-correction-void": ("correction", False, False, False, False, "none", "active correction state", "payroll_hour_corrections", "payroll-total overlay", "payroll void reason"),
     "payroll-shift-correction": ("correction", False, False, False, False, "none", "matching active correction", "payroll_shift_corrections", "payroll overlay", "payroll reason"),
     "payroll-shift-correction-void": ("correction", False, False, False, False, "none", "active correction state", "payroll_shift_corrections", "payroll overlay", "payroll void reason"),
 }
@@ -50,6 +52,12 @@ EXPECTED_RUNTIME_HANDLERS = {
     ),
     "time_tracker_api.admin_apply_payroll_timesheet_changes": frozenset(
         {"payroll-timesheet-change"}
+    ),
+    "time_tracker_api.admin_create_payroll_hour_correction": frozenset(
+        {"payroll-hour-correction"}
+    ),
+    "time_tracker_api.admin_void_payroll_hour_correction": frozenset(
+        {"payroll-hour-correction-void"}
     ),
     "time_tracker_api.admin_create_payroll_shift_correction": frozenset(
         {"payroll-shift-correction"}
@@ -113,6 +121,19 @@ def synthetic_time_correction_overlay():
     with pytest.raises(
         RuntimeError,
         match="synthetic_time_correction_overlay:3",
+    ):
+        registry.validate_time_action_mutation_source(source)
+
+
+def test_startup_completeness_gate_rejects_unguarded_payroll_overlay_void() -> None:
+    source = """
+def synthetic_payroll_overlay_void():
+    db.execute(\"UPDATE payroll_hour_corrections SET status = 'voided'\")
+"""
+
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic_payroll_overlay_void:3",
     ):
         registry.validate_time_action_mutation_source(source)
 

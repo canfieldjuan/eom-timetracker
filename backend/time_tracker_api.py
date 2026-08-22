@@ -29110,6 +29110,7 @@ def _retire_payroll_day_total_corrections(
     reason: str,
     actor: Dict[str, Any],
 ) -> None:
+    require_registered_time_action_context("payroll-timesheet-change")
     dates = sorted(set(touched_dates))
     if not dates:
         return
@@ -30037,11 +30038,13 @@ def admin_payroll_weekly_hours_corrections(
 
 
 @app.post("/api/admin/payroll/weekly-hours/corrections")
+@registered_time_action("payroll-hour-correction")
 def admin_create_payroll_hour_correction(
     payload: PayrollCorrectionRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-hour-correction")
     week_start = _parse_payroll_week_start(payload.weekStart)
     correction_date = _parse_payroll_correction_date(payload.date, week_start)
     result: Dict[str, Any]
@@ -30152,12 +30155,14 @@ def admin_create_payroll_hour_correction(
 
 
 @app.post("/api/admin/payroll/weekly-hours/corrections/{correction_id}/void")
+@registered_time_action("payroll-hour-correction-void")
 def admin_void_payroll_hour_correction(
     correction_id: int,
     payload: PayrollCorrectionVoidRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-hour-correction-void")
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
