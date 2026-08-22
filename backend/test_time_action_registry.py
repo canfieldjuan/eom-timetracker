@@ -258,7 +258,7 @@ def synthetic_bound_time_writer():
         registry.validate_time_action_mutation_source(source)
 
 
-@pytest.mark.parametrize("executor", ("query_one", "query_all"))
+@pytest.mark.parametrize("executor", ("query_one", "query_all", "executemany"))
 def test_startup_completeness_gate_checks_every_local_sql_executor(
     executor: str,
 ) -> None:
@@ -302,6 +302,20 @@ def test_registered_routes_preserve_evaluated_api_model_annotations() -> None:
 def test_multi_action_handler_must_declare_its_resolver() -> None:
     with pytest.raises(ValueError, match="needs an action resolver"):
         registry.registered_time_action("clock-in", "clock-out")
+
+
+def test_registered_time_action_rejects_async_handler_before_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(registry, "_HANDLER_REGISTRATIONS", {})
+
+    async def synthetic_handler() -> None:
+        return None
+
+    with pytest.raises(TypeError, match="does not support async handlers"):
+        registry.registered_time_action("clock-in")(synthetic_handler)
+
+    assert registry.registered_time_action_handlers() == {}
 
 
 def test_identical_handler_registration_is_idempotent(

@@ -63,7 +63,7 @@ _PAYROLL_ALLOCATION_TIME_UPDATE_COLUMNS = frozenset(
     }
 )
 _SQL_EXECUTION_METHODS = frozenset(
-    {"execute", "execute_returning", "query_one", "query_all"}
+    {"execute", "executemany", "execute_returning", "query_one", "query_all"}
 )
 _TEMPORAL_UPDATE_COLUMNS = {
     "shifts": frozenset({"clock_in", "clock_out", "total_hours"}),
@@ -531,6 +531,11 @@ def registered_time_action(
         raise ValueError("A multi-action handler needs an action resolver")
 
     def decorate(handler: Callable[P, T]) -> Callable[P, T]:
+        if inspect.iscoroutinefunction(handler):
+            raise TypeError(
+                "registered_time_action does not support async handlers; "
+                "add async-aware action-context support before registering one"
+            )
         handler_name = f"{handler.__module__}.{handler.__qualname__}"
         existing_registration = _HANDLER_REGISTRATIONS.get(handler_name)
         if existing_registration is not None:
