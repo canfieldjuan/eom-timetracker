@@ -42,6 +42,13 @@ _TEMPORAL_UPDATE_COLUMNS = {
     "visits": frozenset({"arrival_time"}),
     "departures": frozenset({"departure_time"}),
 }
+# A production source that writes historical time evidence outside a request
+# context must be declared here.  The startup source sweep still examines every
+# production module; this closed map makes the one intentional exception
+# explicit rather than allowing a module to opt itself out of the guard.
+TIME_ACTION_MIGRATION_SOURCE_ACTIONS: Mapping[str, str] = MappingProxyType(
+    {"migrate_json_to_pg.py": "legacy-json-import"}
+)
 
 
 @dataclass
@@ -478,6 +485,17 @@ def validate_time_action_registry(
         if policy.workflow == "migration" and policy.requires_active_context:
             errors.append(f"{action_name} must remain outside the request writer")
 
+    for source_name, action_name in TIME_ACTION_MIGRATION_SOURCE_ACTIONS.items():
+        policy = policies.get(action_name)
+        if policy is None:
+            errors.append(
+                f"migration source {source_name} declares unknown action {action_name}"
+            )
+        elif policy.workflow != "migration" or policy.requires_active_context:
+            errors.append(
+                f"migration source {source_name} must declare a non-request migration"
+            )
+
     bound_actions: set[str] = set()
     for handler_name, registration in declared_handlers.items():
         if handler_name != registration.handler:
@@ -524,18 +542,37 @@ def _is_direct_time_mutation_sql(sql: str) -> bool:
     return False
 
 
-def validate_time_action_mutation_source(source: str) -> None:
+def validate_time_action_mutation_source(
+    source: str,
+    *,
+    migration_action: Optional[str] = None,
+) -> None:
     """Reject a direct time-table writer that omits the context guard.
 
-    This intentionally derives writers from direct SQL in the API source rather
-    than guessing from FastAPI route shape.  A writer that creates/deletes a
-    shift, visit, or departure—or alters a temporal boundary—must establish its
-    registered context before executing that SQL. The scanner covers all local
-    SQL execution helpers and resolves simple local string bindings first.
+    This intentionally derives writers from direct SQL in production sources
+    rather than guessing from FastAPI route shape. A writer that creates/deletes
+    a shift, visit, or departure—or alters a temporal boundary—must establish
+    its registered context before executing that SQL. A caller may classify one
+    source as a declared non-request migration; that exception is validated
+    against the closed policy registry. The scanner covers all local SQL
+    execution helpers and resolves simple local string bindings first.
     """
 
     tree = ast.parse(source)
     errors: list[str] = []
+    migration_policy = None
+    if migration_action is not None:
+        migration_policy = TIME_ACTION_POLICIES.get(migration_action)
+        if (
+            migration_policy is None
+            or migration_policy.workflow != "migration"
+            or migration_policy.requires_active_context
+        ):
+            errors.append(
+                "source migration action must name a declared non-request "
+                f"migration: {migration_action}"
+            )
+            migration_policy = None
 
     class DirectTimeMutationVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
@@ -618,7 +655,9 @@ def validate_time_action_mutation_source(source: str) -> None:
             )
             if isinstance(sql, str) and _is_direct_time_mutation_sql(sql):
                 scope = self.function_stack[-1]
-                if not any(line < node.lineno for line in scope.guard_lines):
+                if migration_policy is None and not any(
+                    line < node.lineno for line in scope.guard_lines
+                ):
                     errors.append(
                         "direct time mutation without a preceding registered "
                         f"context guard: {scope.name}:{node.lineno}"

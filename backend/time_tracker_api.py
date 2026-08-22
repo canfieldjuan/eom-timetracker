@@ -43,6 +43,7 @@ import arrival_policy_inventory
 import arrival_policies
 import db
 from time_action_registry import (
+    TIME_ACTION_MIGRATION_SOURCE_ACTIONS,
     registered_time_action,
     registered_time_action_context,
     require_registered_time_action_context,
@@ -8008,12 +8009,45 @@ def _auto_migrate_if_empty() -> bool:
         return True
 
 
+def _production_time_action_source_paths() -> tuple[Path, ...]:
+    """Return every production backend source, excluding test-only modules."""
+
+    return tuple(
+        path
+        for path in sorted(BACKEND_DIR.rglob("*.py"))
+        if path.name != "conftest.py" and not path.name.startswith("test_")
+    )
+
+
+def _validate_production_time_action_sources() -> None:
+    """Apply the direct-time-mutation guard to the full production source set."""
+
+    source_paths = _production_time_action_source_paths()
+    source_names = {
+        path.relative_to(BACKEND_DIR).as_posix()
+        for path in source_paths
+    }
+    missing_migration_sources = sorted(
+        set(TIME_ACTION_MIGRATION_SOURCE_ACTIONS) - source_names
+    )
+    if missing_migration_sources:
+        raise RuntimeError(
+            "Time-action registry declares missing migration source(s): "
+            + ", ".join(missing_migration_sources)
+        )
+
+    for source_path in source_paths:
+        source_name = source_path.relative_to(BACKEND_DIR).as_posix()
+        validate_time_action_mutation_source(
+            source_path.read_text(encoding="utf-8"),
+            migration_action=TIME_ACTION_MIGRATION_SOURCE_ACTIONS.get(source_name),
+        )
+
+
 @app.on_event("startup")
 def startup_event() -> None:
     validate_time_action_registry()
-    validate_time_action_mutation_source(
-        Path(__file__).read_text(encoding="utf-8")
-    )
+    _validate_production_time_action_sources()
     database_url = os.getenv("DATABASE_URL", "")
     if not database_url:
         raise RuntimeError("DATABASE_URL env var not set")

@@ -58,7 +58,7 @@ EXPECTED_RUNTIME_HANDLERS = {
 
 def test_startup_time_action_registry_is_complete() -> None:
     registry.validate_time_action_registry()
-    registry.validate_time_action_mutation_source(inspect.getsource(api))
+    api._validate_production_time_action_sources()
 
 
 def test_startup_completeness_gate_rejects_handler_for_undeclared_policy() -> None:
@@ -83,6 +83,27 @@ def synthetic_time_writer():
         match="synthetic_time_writer:3",
     ):
         registry.validate_time_action_mutation_source(source)
+
+
+def test_startup_completeness_gate_allows_only_declared_migration_sources() -> None:
+    source = """
+def import_legacy_time_data():
+    cur.execute('INSERT INTO shifts (employee_id) VALUES (1)')
+"""
+
+    registry.validate_time_action_mutation_source(
+        source,
+        migration_action="legacy-json-import",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="declared non-request migration: clock-in",
+    ):
+        registry.validate_time_action_mutation_source(
+            source,
+            migration_action="clock-in",
+        )
 
 
 def test_startup_completeness_gate_rejects_execute_returning_time_writer() -> None:
@@ -228,3 +249,6 @@ def test_migration_policies_are_declared_and_explicitly_non_gated() -> None:
         and not registry.TIME_ACTION_POLICIES[action_name].requires_active_context
         for action_name in migration_actions
     )
+    assert dict(registry.TIME_ACTION_MIGRATION_SOURCE_ACTIONS) == {
+        "migrate_json_to_pg.py": "legacy-json-import"
+    }
