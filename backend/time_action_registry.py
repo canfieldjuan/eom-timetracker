@@ -34,11 +34,21 @@ ActionResolver = Callable[..., str]
 _DIRECT_TIME_MUTATION_SQL = re.compile(
     r"\b(?:insert\s+into|delete\s+from)\s+(?:shifts|visits|departures)\b"
 )
+_SQL_EXECUTION_METHODS = frozenset(
+    {"execute", "execute_returning", "query_one", "query_all"}
+)
 _TEMPORAL_UPDATE_COLUMNS = {
     "shifts": frozenset({"clock_in", "clock_out", "total_hours"}),
     "visits": frozenset({"arrival_time"}),
     "departures": frozenset({"departure_time"}),
 }
+
+
+@dataclass
+class _TimeMutationSourceScope:
+    name: str
+    guard_lines: list[int]
+    sql_bindings: Dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -520,7 +530,8 @@ def validate_time_action_mutation_source(source: str) -> None:
     This intentionally derives writers from direct SQL in the API source rather
     than guessing from FastAPI route shape.  A writer that creates/deletes a
     shift, visit, or departure—or alters a temporal boundary—must establish its
-    registered context before executing that SQL.
+    registered context before executing that SQL. The scanner covers all local
+    SQL execution helpers and resolves simple local string bindings first.
     """
 
     tree = ast.parse(source)
@@ -528,40 +539,89 @@ def validate_time_action_mutation_source(source: str) -> None:
 
     class DirectTimeMutationVisitor(ast.NodeVisitor):
         def __init__(self) -> None:
-            self.function_stack: list[tuple[str, list[int]]] = []
+            self.function_stack: list[_TimeMutationSourceScope] = []
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            self.function_stack.append((node.name, []))
+            self.function_stack.append(_TimeMutationSourceScope(node.name, [], {}))
             for statement in node.body:
                 self.visit(statement)
             self.function_stack.pop()
 
         visit_AsyncFunctionDef = visit_FunctionDef
 
+        def _sql_text(self, node: ast.AST) -> Optional[str]:
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.Name) and self.function_stack:
+                return self.function_stack[-1].sql_bindings.get(node.id)
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left = self._sql_text(node.left)
+                right = self._sql_text(node.right)
+                return left + right if left is not None and right is not None else None
+            if isinstance(node, ast.JoinedStr):
+                parts = []
+                for value in node.values:
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        parts.append(value.value)
+                    else:
+                        parts.append(" ")
+                return "".join(parts)
+            return None
+
+        def _bind_sql_name(self, target: ast.expr, value: ast.AST) -> None:
+            if not self.function_stack or not isinstance(target, ast.Name):
+                return
+            sql = self._sql_text(value)
+            if sql is None:
+                self.function_stack[-1].sql_bindings.pop(target.id, None)
+            else:
+                self.function_stack[-1].sql_bindings[target.id] = sql
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            for target in node.targets:
+                self._bind_sql_name(target, node.value)
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if node.value is not None:
+                self._bind_sql_name(node.target, node.value)
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            if self.function_stack and isinstance(node.target, ast.Name) and isinstance(
+                node.op, ast.Add
+            ):
+                bindings = self.function_stack[-1].sql_bindings
+                existing = bindings.get(node.target.id)
+                added = self._sql_text(node.value)
+                if isinstance(existing, str) and added is not None:
+                    bindings[node.target.id] = existing + added
+                else:
+                    bindings.pop(node.target.id, None)
+            self.generic_visit(node)
+
         def visit_Call(self, node: ast.Call) -> None:
             if self.function_stack and isinstance(node.func, ast.Name) and (
                 node.func.id == "require_registered_time_action_context"
             ):
-                self.function_stack[-1][1].append(node.lineno)
+                self.function_stack[-1].guard_lines.append(node.lineno)
 
             sql = (
-                node.args[0].value
+                self._sql_text(node.args[0])
                 if (
                     self.function_stack
                     and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "execute"
+                    and node.func.attr in _SQL_EXECUTION_METHODS
                     and node.args
-                    and isinstance(node.args[0], ast.Constant)
-                    and isinstance(node.args[0].value, str)
                 )
                 else None
             )
             if isinstance(sql, str) and _is_direct_time_mutation_sql(sql):
-                function_name, guard_lines = self.function_stack[-1]
-                if not any(line < node.lineno for line in guard_lines):
+                scope = self.function_stack[-1]
+                if not any(line < node.lineno for line in scope.guard_lines):
                     errors.append(
                         "direct time mutation without a preceding registered "
-                        f"context guard: {function_name}:{node.lineno}"
+                        f"context guard: {scope.name}:{node.lineno}"
                     )
             self.generic_visit(node)
 

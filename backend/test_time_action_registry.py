@@ -85,6 +85,49 @@ def synthetic_time_writer():
         registry.validate_time_action_mutation_source(source)
 
 
+def test_startup_completeness_gate_rejects_execute_returning_time_writer() -> None:
+    source = """
+def synthetic_returning_time_writer():
+    db.execute_returning('INSERT INTO shifts (employee_id) VALUES (1) RETURNING id')
+"""
+
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic_returning_time_writer:3",
+    ):
+        registry.validate_time_action_mutation_source(source)
+
+
+def test_startup_completeness_gate_resolves_local_sql_before_classifying() -> None:
+    source = """
+def synthetic_bound_time_writer():
+    statement = 'INSERT INTO ' + 'shifts (employee_id) VALUES (1)'
+    db.execute(statement)
+"""
+
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic_bound_time_writer:4",
+    ):
+        registry.validate_time_action_mutation_source(source)
+
+
+@pytest.mark.parametrize("executor", ("query_one", "query_all"))
+def test_startup_completeness_gate_checks_every_local_sql_executor(
+    executor: str,
+) -> None:
+    source = f"""
+def synthetic_{executor}_time_writer():
+    db.{executor}('DELETE FROM shifts WHERE id = 1 RETURNING id')
+"""
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"synthetic_{executor}_time_writer:3",
+    ):
+        registry.validate_time_action_mutation_source(source)
+
+
 def test_registered_routes_preserve_evaluated_api_model_annotations() -> None:
     signature = inspect.signature(api.record_home_base_scan)
 
