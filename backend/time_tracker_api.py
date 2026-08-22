@@ -47,6 +47,7 @@ from time_action_registry import (
     registered_time_action_context,
     require_registered_time_action_context,
     validate_time_action_registry,
+    validate_time_action_mutation_source,
 )
 from fastapi import Depends, FastAPI, Header, HTTPException, Path as FastAPIPath, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
@@ -8010,6 +8011,9 @@ def _auto_migrate_if_empty() -> bool:
 @app.on_event("startup")
 def startup_event() -> None:
     validate_time_action_registry()
+    validate_time_action_mutation_source(
+        Path(__file__).read_text(encoding="utf-8")
+    )
     database_url = os.getenv("DATABASE_URL", "")
     if not database_url:
         raise RuntimeError("DATABASE_URL env var not set")

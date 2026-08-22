@@ -9,10 +9,13 @@ location policy into new runtime enforcement.
 
 from __future__ import annotations
 
+import ast
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
+import inspect
+import re
 from types import MappingProxyType
 from typing import Callable, Dict, FrozenSet, Iterator, Literal, Mapping, Optional, ParamSpec, TypeVar
 
@@ -27,6 +30,15 @@ TimeActionWorkflow = Literal["interactive", "correction", "migration"]
 P = ParamSpec("P")
 T = TypeVar("T")
 ActionResolver = Callable[..., str]
+
+_DIRECT_TIME_MUTATION_SQL = re.compile(
+    r"\b(?:insert\s+into|delete\s+from)\s+(?:shifts|visits|departures)\b"
+)
+_TEMPORAL_UPDATE_COLUMNS = {
+    "shifts": frozenset({"clock_in", "clock_out", "total_hours"}),
+    "visits": frozenset({"arrival_time"}),
+    "departures": frozenset({"departure_time"}),
+}
 
 
 @dataclass(frozen=True)
@@ -399,6 +411,12 @@ def registered_time_action(
             with registered_time_action_context(resolved_action):
                 return handler(*args, **kwargs)
 
+        # FastAPI 0.115 resolves postponed annotations with the registered
+        # callable's globals. ``wrapped`` lives in this module, while the
+        # endpoint's request models live in the API module. Preserve an already
+        # evaluated signature so supported FastAPI versions see the endpoint's
+        # actual annotations rather than registry-module forward references.
+        wrapped.__signature__ = inspect.signature(handler, eval_str=True)
         return wrapped
 
     return decorate
@@ -478,5 +496,75 @@ def validate_time_action_registry(
             + ", ".join(unbound_actions)
         )
 
+    if errors:
+        raise RuntimeError("Time-action registry is incomplete: " + "; ".join(errors))
+
+
+def _is_direct_time_mutation_sql(sql: str) -> bool:
+    """Whether a literal statement creates, deletes, or changes time boundaries."""
+
+    normalized = " ".join(sql.lower().split())
+    if _DIRECT_TIME_MUTATION_SQL.search(normalized):
+        return True
+    for table_name, columns in _TEMPORAL_UPDATE_COLUMNS.items():
+        if re.search(rf"\bupdate\s+{table_name}\b", normalized) and any(
+            re.search(rf"\b{column}\b", normalized) for column in columns
+        ):
+            return True
+    return False
+
+
+def validate_time_action_mutation_source(source: str) -> None:
+    """Reject a direct time-table writer that omits the context guard.
+
+    This intentionally derives writers from direct SQL in the API source rather
+    than guessing from FastAPI route shape.  A writer that creates/deletes a
+    shift, visit, or departure—or alters a temporal boundary—must establish its
+    registered context before executing that SQL.
+    """
+
+    tree = ast.parse(source)
+    errors: list[str] = []
+
+    class DirectTimeMutationVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.function_stack: list[tuple[str, list[int]]] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.function_stack.append((node.name, []))
+            for statement in node.body:
+                self.visit(statement)
+            self.function_stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if self.function_stack and isinstance(node.func, ast.Name) and (
+                node.func.id == "require_registered_time_action_context"
+            ):
+                self.function_stack[-1][1].append(node.lineno)
+
+            sql = (
+                node.args[0].value
+                if (
+                    self.function_stack
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "execute"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                )
+                else None
+            )
+            if isinstance(sql, str) and _is_direct_time_mutation_sql(sql):
+                function_name, guard_lines = self.function_stack[-1]
+                if not any(line < node.lineno for line in guard_lines):
+                    errors.append(
+                        "direct time mutation without a preceding registered "
+                        f"context guard: {function_name}:{node.lineno}"
+                    )
+            self.generic_visit(node)
+
+    DirectTimeMutationVisitor().visit(tree)
     if errors:
         raise RuntimeError("Time-action registry is incomplete: " + "; ".join(errors))

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 import time_action_registry as registry
@@ -56,9 +58,10 @@ EXPECTED_RUNTIME_HANDLERS = {
 
 def test_startup_time_action_registry_is_complete() -> None:
     registry.validate_time_action_registry()
+    registry.validate_time_action_mutation_source(inspect.getsource(api))
 
 
-def test_startup_completeness_gate_rejects_undeclared_time_producing_handler() -> None:
+def test_startup_completeness_gate_rejects_handler_for_undeclared_policy() -> None:
     handlers = dict(registry.registered_time_action_handlers())
     handlers["synthetic.time_producing_route"] = registry.TimeActionHandlerRegistration(
         handler="synthetic.time_producing_route",
@@ -67,6 +70,26 @@ def test_startup_completeness_gate_rejects_undeclared_time_producing_handler() -
 
     with pytest.raises(RuntimeError, match="synthetic-time-mutation"):
         registry.validate_time_action_registry(handlers=handlers)
+
+
+def test_startup_completeness_gate_rejects_unguarded_direct_time_writer() -> None:
+    source = """
+def synthetic_time_writer():
+    db.execute('INSERT INTO shifts (employee_id) VALUES (1)')
+"""
+
+    with pytest.raises(
+        RuntimeError,
+        match="synthetic_time_writer:3",
+    ):
+        registry.validate_time_action_mutation_source(source)
+
+
+def test_registered_routes_preserve_evaluated_api_model_annotations() -> None:
+    signature = inspect.signature(api.record_home_base_scan)
+
+    assert signature.parameters["payload"].annotation is api.HomeBaseActionRequest
+    assert not isinstance(signature.return_annotation, str)
 
 
 def test_multi_action_handler_must_declare_its_resolver() -> None:
