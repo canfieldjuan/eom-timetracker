@@ -17,7 +17,7 @@ from functools import wraps
 import inspect
 import re
 from types import MappingProxyType
-from typing import Callable, Dict, FrozenSet, Iterable, Iterator, Literal, Mapping, Optional, ParamSpec, TypeVar
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, Literal, Mapping, Optional, ParamSpec, TypeVar
 
 
 LocationGateMode = Literal[
@@ -31,6 +31,17 @@ TimeMutationCapability = Literal[
     "closes_shift",
     "opens_visit",
     "closes_visit",
+]
+DatabaseMutationCapability = Literal[
+    "shift-time-write",
+    "visit-time-write",
+    "departure-time-write",
+    "time-evidence-delete",
+    "time-correction-batch-write",
+    "payroll-timesheet-overlay-write",
+    "payroll-hour-correction-write",
+    "payroll-hour-correction-allocation-write",
+    "payroll-shift-correction-write",
 ]
 
 P = ParamSpec("P")
@@ -73,6 +84,21 @@ _TEMPORAL_UPDATE_COLUMNS = {
 _TIME_MUTATION_CAPABILITIES: FrozenSet[TimeMutationCapability] = frozenset(
     {"opens_shift", "closes_shift", "opens_visit", "closes_visit"}
 )
+_DATABASE_MUTATION_CAPABILITIES: FrozenSet[DatabaseMutationCapability] = frozenset(
+    {
+        "shift-time-write",
+        "visit-time-write",
+        "departure-time-write",
+        "time-evidence-delete",
+        "time-correction-batch-write",
+        "payroll-timesheet-overlay-write",
+        "payroll-hour-correction-write",
+        "payroll-hour-correction-allocation-write",
+        "payroll-shift-correction-write",
+    }
+)
+DATABASE_TIME_ACTION_SETTING = "eom.time_action"
+DATABASE_TIME_ACTION_CAPABILITIES_SETTING = "eom.time_action_capabilities"
 # A production source that writes historical time evidence outside a request
 # context must be declared here.  The startup source sweep still examines every
 # production module; this closed map makes the one intentional exception
@@ -105,6 +131,7 @@ class TimeActionPolicy:
     closes_shift: bool
     opens_visit: bool
     closes_visit: bool
+    database_mutation_capabilities: FrozenSet[DatabaseMutationCapability]
     location_gate_mode: LocationGateMode
     weak_or_missing_gps_behavior: str
     exception_method: str
@@ -133,6 +160,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset({"shift-time-write"}),
             location_gate_mode="hard_when_enabled",
             weak_or_missing_gps_behavior="existing GPS override requirement remains in effect",
             exception_method="documented GPS or Home Base exception",
@@ -147,6 +175,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=True,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset({"shift-time-write"}),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="existing GPS override requirement remains in effect",
             exception_method="documented GPS or Home Base exception",
@@ -161,6 +190,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=True,
             closes_visit=False,
+            database_mutation_capabilities=frozenset({"visit-time-write"}),
             location_gate_mode="hard_when_enabled",
             weak_or_missing_gps_behavior="existing GPS override requirement remains in effect",
             exception_method="documented GPS override or selected Site evidence",
@@ -175,6 +205,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=True,
+            database_mutation_capabilities=frozenset({"departure-time-write"}),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="existing GPS override requirement remains in effect",
             exception_method="documented GPS override",
@@ -189,6 +220,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset({"shift-time-write"}),
             location_gate_mode="evidence_paid_on_inside",
             weak_or_missing_gps_behavior="reject the QR scan unless GPS confirms Home Base",
             exception_method="none on the QR-scan path",
@@ -203,6 +235,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=True,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset({"shift-time-write"}),
             location_gate_mode="evidence_paid_on_inside",
             weak_or_missing_gps_behavior="reject the QR scan unless GPS confirms Home Base",
             exception_method="none on the QR-scan path",
@@ -217,6 +250,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=True,
             closes_visit=False,
+            database_mutation_capabilities=frozenset({"visit-time-write"}),
             location_gate_mode="evidence_paid_on_inside",
             weak_or_missing_gps_behavior="store QR evidence; create no visit unless inside",
             exception_method="none; out-of-geofence scans remain evidence-only review",
@@ -231,6 +265,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=True,
+            database_mutation_capabilities=frozenset({"departure-time-write"}),
             location_gate_mode="evidence_paid_on_inside",
             weak_or_missing_gps_behavior="store QR evidence; create no departure unless inside",
             exception_method="none; out-of-geofence scans remain evidence-only review",
@@ -245,6 +280,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(),
             location_gate_mode="evidence_paid_on_inside",
             weak_or_missing_gps_behavior="store classified Site evidence without a time event",
             exception_method="none",
@@ -259,6 +295,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=True,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset({"shift-time-write"}),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to an administrator correction",
             exception_method="administrator correction workflow",
@@ -273,6 +310,17 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=True,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(
+                {
+                    "shift-time-write",
+                    "time-evidence-delete",
+                    "time-correction-batch-write",
+                    # Deleting a duplicate shift can cascade to its payroll
+                    # exclusion even though this workflow does not create one.
+                    "payroll-timesheet-overlay-write",
+                    "payroll-shift-correction-write",
+                }
+            ),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a reviewed data correction",
             exception_method="signed correction plan and confirmation phrase",
@@ -287,6 +335,9 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=True,
+            database_mutation_capabilities=frozenset(
+                {"time-correction-batch-write"}
+            ),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a reviewed utilization departure overlay",
             exception_method="administrator correction reason and evidence fingerprint",
@@ -301,6 +352,14 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(
+                {
+                    "payroll-timesheet-overlay-write",
+                    "payroll-hour-correction-write",
+                    "payroll-hour-correction-allocation-write",
+                    "payroll-shift-correction-write",
+                }
+            ),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a payroll overlay correction",
             exception_method="payroll reason and verification-week workflow",
@@ -315,6 +374,12 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(
+                {
+                    "payroll-hour-correction-write",
+                    "payroll-hour-correction-allocation-write",
+                }
+            ),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a payroll-total overlay correction",
             exception_method="payroll reason and verification-week workflow",
@@ -329,6 +394,12 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(
+                {
+                    "payroll-hour-correction-write",
+                    "payroll-hour-correction-allocation-write",
+                }
+            ),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a payroll-total overlay correction",
             exception_method="payroll void reason and verification-week workflow",
@@ -343,6 +414,9 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(
+                {"payroll-hour-correction-allocation-write"}
+            ),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a payroll allocation correction",
             exception_method="payroll allocation reason and verification-week workflow",
@@ -357,6 +431,9 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(
+                {"payroll-hour-correction-allocation-write"}
+            ),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a payroll allocation correction",
             exception_method="payroll allocation void reason and verification-week workflow",
@@ -371,6 +448,9 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(
+                {"payroll-shift-correction-write"}
+            ),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a payroll overlay correction",
             exception_method="payroll reason and verification-week workflow",
@@ -385,6 +465,9 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(
+                {"payroll-shift-correction-write"}
+            ),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a payroll overlay correction",
             exception_method="payroll void reason and verification-week workflow",
@@ -399,6 +482,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a server migration",
             exception_method="not applicable",
@@ -413,6 +497,9 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=True,
             opens_visit=True,
             closes_visit=True,
+            database_mutation_capabilities=frozenset(
+                {"shift-time-write", "visit-time-write"}
+            ),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="historical import preserves recorded values",
             exception_method="not applicable",
@@ -427,6 +514,7 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             closes_shift=False,
             opens_visit=False,
             closes_visit=False,
+            database_mutation_capabilities=frozenset(),
             location_gate_mode="none",
             weak_or_missing_gps_behavior="not applicable to a historical backfill",
             exception_method="not applicable",
@@ -455,6 +543,45 @@ def active_registered_time_action() -> Optional[TimeActionPolicy]:
     """Return the policy active in the current request/workflow context."""
 
     return _ACTIVE_TIME_ACTION.get()
+
+
+def apply_registered_time_action_database_context(
+    connection: Any,
+    *,
+    action: Optional[str] = None,
+) -> None:
+    """Attach the active or explicitly declared action to one DB transaction.
+
+    Pooled application connections inherit the active ``ContextVar`` policy.
+    The legacy importer owns a separate connection, so it supplies its declared
+    migration action explicitly. ``SET LOCAL`` resets at commit/rollback and
+    cannot leak an action into the next pooled transaction.
+    """
+
+    policy = (
+        active_registered_time_action()
+        if action is None
+        else TIME_ACTION_POLICIES.get(action)
+    )
+    if policy is None:
+        if action is None:
+            return
+        raise RuntimeError(f"Undeclared time action: {action}")
+    if getattr(connection, "autocommit", False):
+        raise RuntimeError(
+            "Registered time-action database context requires a transaction"
+        )
+
+    capabilities = ",".join(sorted(policy.database_mutation_capabilities))
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT set_config(%s, %s, true)",
+            (DATABASE_TIME_ACTION_SETTING, policy.action),
+        )
+        cursor.execute(
+            "SELECT set_config(%s, %s, true)",
+            (DATABASE_TIME_ACTION_CAPABILITIES_SETTING, capabilities),
+        )
 
 
 @contextmanager
@@ -600,6 +727,14 @@ def validate_time_action_registry(
         if policy.location_gate_mode not in allowed_gate_modes:
             errors.append(
                 f"{action_name} has an invalid location gate {policy.location_gate_mode}"
+            )
+        unknown_database_capabilities = (
+            policy.database_mutation_capabilities - _DATABASE_MUTATION_CAPABILITIES
+        )
+        if unknown_database_capabilities:
+            errors.append(
+                f"{action_name} has unknown database mutation capability: "
+                + ", ".join(sorted(unknown_database_capabilities))
             )
         for field_name in (
             "weak_or_missing_gps_behavior",

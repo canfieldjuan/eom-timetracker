@@ -28,6 +28,12 @@ def get_conn() -> Generator:
         raise RuntimeError("DB pool not initialized -- call init_pool() first")
     conn = _pool.getconn()
     try:
+        # Import lazily so this small database module remains usable by schema
+        # tools while still propagating the current request/workflow action to
+        # every pooled transaction that has one.
+        from time_action_registry import apply_registered_time_action_database_context
+
+        apply_registered_time_action_database_context(conn)
         yield conn
         conn.commit()
     except Exception:

@@ -231,9 +231,8 @@ CREATE TABLE shifts (
 -- (or a mid-deploy old instance that predates the column in its code) wrote the
 -- row. Only fills a NULL -- an explicit value from the app is left untouched --
 -- and a rate-less employee leaves the snapshot NULL so the shift keeps
--- following the live rate. This is the only trigger in the schema; it exists
--- specifically to close the rolling-deployment window where an old instance's
--- clock-in would otherwise store no snapshot.
+-- following the live rate. It closes the rolling-deployment window where an
+-- old instance's clock-in would otherwise store no snapshot.
 CREATE OR REPLACE FUNCTION stamp_shift_hourly_rate_cents()
 RETURNS TRIGGER AS $$
 BEGIN

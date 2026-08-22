@@ -60,7 +60,7 @@ def _apply_schema(conn):
     """Drop and recreate all tables from schema.sql."""
     with conn.cursor() as cur:
         cur.execute("""
-            DROP TABLE IF EXISTS access_log_entries,
+            DROP TABLE IF EXISTS time_mutation_guard_events, access_log_entries,
                 visit_evidence_events,
                 home_base_events, home_base_policies, home_bases,
                 planned_visit_audit_events,
