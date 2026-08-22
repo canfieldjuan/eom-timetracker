@@ -23,6 +23,10 @@ import db
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 import psycopg2.extras
 from pydantic import BaseModel, Field
+from time_action_registry import (
+    registered_time_action,
+    require_registered_time_action_context,
+)
 
 
 MoneyCents = Optional[int]
@@ -7913,11 +7917,16 @@ def build_operations_schedule_router(
         "/api/admin/operations/utilization/reviews/"
         "{review_key}/missing-departure"
     )
+    @registered_time_action("admin-utilization-missing-departure-correction")
     def correct_utilization_missing_departure(
         review_key: str,
         payload: UtilizationMissingDepartureCorrectionRequest,
         current_admin: Dict[str, Any] = Depends(get_current_admin),
     ) -> Dict[str, Any]:
+        require_registered_time_action_context(
+            "admin-utilization-missing-departure-correction",
+            required_capabilities=frozenset({"closes_visit"}),
+        )
         if not re.fullmatch(r"[0-9a-f]{64}", review_key):
             raise HTTPException(status_code=400, detail="Invalid utilization review key")
         reason = payload.reason.strip()

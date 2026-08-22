@@ -15,6 +15,7 @@ import bcrypt
 import pytest
 
 import db
+import time_action_registry
 
 
 # ===============================================================================
@@ -5248,12 +5249,17 @@ class TestVisitJobIdentity:
                 "jobId": job_id,
             })
 
-            api._save_timesheets_to_db(
-                timesheet_data,
-                pre_shift_ids,
-                pre_visit_counts,
-                pre_departure_counts,
-            )
+            with time_action_registry.registered_time_action_context("arrive"):
+                api._save_timesheets_to_db(
+                    timesheet_data,
+                    pre_shift_ids,
+                    pre_visit_counts,
+                    pre_departure_counts,
+                    pre_shift_boundaries={
+                        shift_id: (entry.get("clockIn"), entry.get("clockOut"))
+                    },
+                    required_capabilities=frozenset({"opens_visit"}),
+                )
 
             stored = db.query_one(
                 "SELECT job_id FROM visits WHERE shift_id = %s",

@@ -42,6 +42,15 @@ import qrcode.image.svg
 import arrival_policy_inventory
 import arrival_policies
 import db
+from time_action_registry import (
+    TIME_ACTION_MIGRATION_SOURCE_ACTIONS,
+    TimeMutationCapability,
+    registered_time_action,
+    registered_time_action_context,
+    require_registered_time_action_context,
+    validate_time_action_registry,
+    validate_time_action_mutation_source,
+)
 from fastapi import Depends, FastAPI, Header, HTTPException, Path as FastAPIPath, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -1262,10 +1271,44 @@ def _save_timesheets_to_db(
     pre_shift_ids: set,
     pre_visit_counts: Dict[int, int],
     pre_departure_counts: Dict[int, int],
+    *,
+    pre_shift_boundaries: Dict[int, Tuple[Optional[str], Optional[str]]],
+    required_capabilities: FrozenSet[TimeMutationCapability],
     before_save: Optional[Callable[[Any], None]] = None,
     after_save: Optional[Callable[[Any], None]] = None,
 ) -> None:
     """Persist time evidence without mutating the server-authoritative Site list."""
+    if not required_capabilities:
+        raise ValueError("Time persistence must declare mutation capabilities")
+    require_registered_time_action_context(
+        required_capabilities=required_capabilities
+    )
+    observed_capabilities: set[TimeMutationCapability] = set()
+    for entry in timesheet_data.get("entries", []):
+        if entry["id"] not in pre_shift_ids:
+            observed_capabilities.add("opens_shift")
+            if entry.get("clockOut") is not None:
+                observed_capabilities.add("closes_shift")
+        previous_boundaries = pre_shift_boundaries.get(entry["id"])
+        if previous_boundaries is not None:
+            previous_clock_in, previous_clock_out = previous_boundaries
+            if entry.get("clockIn") != previous_clock_in:
+                observed_capabilities.add("opens_shift")
+            if entry.get("clockOut") != previous_clock_out:
+                if entry.get("clockOut") is None:
+                    observed_capabilities.add("opens_shift")
+                else:
+                    observed_capabilities.add("closes_shift")
+        if len(entry.get("visits", [])) > pre_visit_counts.get(entry["id"], 0):
+            observed_capabilities.add("opens_visit")
+        if len(entry.get("departures", [])) > pre_departure_counts.get(entry["id"], 0):
+            observed_capabilities.add("closes_visit")
+    undeclared_capabilities = observed_capabilities - required_capabilities
+    if undeclared_capabilities:
+        raise RuntimeError(
+            "Time persistence capability declaration omits: "
+            + ", ".join(sorted(undeclared_capabilities))
+        )
     with db.get_conn() as conn:
         cur = conn.cursor()
 
@@ -1690,7 +1733,14 @@ def timesheet_postgres_advisory_lock():
 def update_timesheets(
     mutator,
     after_save: Optional[Callable[[Any], None]] = None,
+    *,
+    required_capabilities: FrozenSet[TimeMutationCapability],
 ) -> Tuple[bool, Any]:
+    if not required_capabilities:
+        raise ValueError("Time persistence must declare mutation capabilities")
+    require_registered_time_action_context(
+        required_capabilities=required_capabilities
+    )
     with TIMESHEET_WRITE_LOCK:
         with timesheet_postgres_advisory_lock():
             timesheet_data = _load_timesheets_from_db()
@@ -1702,6 +1752,10 @@ def update_timesheets(
                 e["id"]: len(e.get("departures", []))
                 for e in timesheet_data["entries"]
             }
+            pre_shift_boundaries = {
+                e["id"]: (e.get("clockIn"), e.get("clockOut"))
+                for e in timesheet_data["entries"]
+            }
 
             ok, payload = mutator(timesheet_data)
             if ok:
@@ -1710,6 +1764,8 @@ def update_timesheets(
                     pre_shift_ids,
                     pre_visit_counts,
                     pre_departure_counts,
+                    pre_shift_boundaries=pre_shift_boundaries,
+                    required_capabilities=required_capabilities,
                     after_save=after_save,
                 )
             return ok, payload
@@ -7999,14 +8055,56 @@ def _auto_migrate_if_empty() -> bool:
         return True
 
 
+def _production_time_action_source_paths() -> tuple[Path, ...]:
+    """Return every production backend source, excluding test-only modules."""
+
+    return tuple(
+        path
+        for path in sorted(BACKEND_DIR.rglob("*.py"))
+        if path.name != "conftest.py" and not path.name.startswith("test_")
+    )
+
+
+def _validate_production_time_action_sources() -> None:
+    """Apply the direct-time-mutation guard to the full production source set."""
+
+    source_paths = _production_time_action_source_paths()
+    source_names = {
+        path.relative_to(BACKEND_DIR).as_posix()
+        for path in source_paths
+    }
+    missing_migration_sources = sorted(
+        set(TIME_ACTION_MIGRATION_SOURCE_ACTIONS) - source_names
+    )
+    if missing_migration_sources:
+        raise RuntimeError(
+            "Time-action registry declares missing migration source(s): "
+            + ", ".join(missing_migration_sources)
+        )
+
+    for source_path in source_paths:
+        source_name = source_path.relative_to(BACKEND_DIR).as_posix()
+        validate_time_action_mutation_source(
+            source_path.read_text(encoding="utf-8"),
+            migration_action=TIME_ACTION_MIGRATION_SOURCE_ACTIONS.get(source_name),
+        )
+
+
 @app.on_event("startup")
 def startup_event() -> None:
+    validate_time_action_registry()
+    _validate_production_time_action_sources()
     database_url = os.getenv("DATABASE_URL", "")
     if not database_url:
         raise RuntimeError("DATABASE_URL env var not set")
     db.init_pool(database_url)
-    _ensure_schema_migrations()
-    imported_legacy_json = _auto_migrate_if_empty()
+    # Migrations are registered non-gated workflows. They intentionally do not
+    # use the request-writer guard below, but startup still declares which
+    # historical time data operation is running.
+    with registered_time_action_context("schema-migration"):
+        _ensure_schema_migrations()
+    with registered_time_action_context("legacy-json-import"):
+        imported_legacy_json = _auto_migrate_if_empty()
     # A first-run JSON import happens after the schema upgrade and can insert
     # legacy Sites. Re-run the idempotent Customer/address backfill immediately.
     if imported_legacy_json:
@@ -8014,7 +8112,8 @@ def startup_event() -> None:
         # The importer inserts shifts without hourly_rate_cents, and the backfill
         # above already ran against an empty table, so imported history would
         # keep a NULL snapshot forever and stay exposed to rate edits. Idempotent.
-        _backfill_shift_hourly_rate_snapshots()
+        with registered_time_action_context("post-import-rate-snapshot-backfill"):
+            _backfill_shift_hourly_rate_snapshots()
     apply_bootstrap_admins()
 
 
@@ -11584,6 +11683,16 @@ def _record_explicit_site_action(
     employee: Dict[str, Any],
 ) -> Dict[str, Any]:
     assert payload.action is not None
+    if payload.action == "arrive":
+        required_capabilities = frozenset({"opens_visit"})
+    elif payload.action == "depart":
+        required_capabilities = frozenset({"closes_visit"})
+    else:
+        raise ValueError(f"Unsupported Site QR action: {payload.action}")
+    require_registered_time_action_context(
+        f"site-qr-{payload.action}",
+        required_capabilities=required_capabilities,
+    )
     assert payload.actionStateToken is not None
     assert payload.idempotencyKey is not None
     fingerprint = _site_action_request_fingerprint(payload)
@@ -11938,6 +12047,20 @@ PLAIN_TIME_ACTION_RECEIPT_UNIQUE_CONSTRAINT = (
 )
 
 
+def _plain_time_action_required_capabilities(
+    action: str,
+) -> FrozenSet[TimeMutationCapability]:
+    if action in {"clock-in", "home-base-start"}:
+        return frozenset({"opens_shift"})
+    if action in {"clock-out", "home-base-end"}:
+        return frozenset({"closes_shift"})
+    if action == "arrive":
+        return frozenset({"opens_visit"})
+    if action == "depart":
+        return frozenset({"closes_visit"})
+    raise ValueError(f"Unsupported plain time action: {action}")
+
+
 def _plain_time_action_request_fingerprint(
     action: str,
     payload: Optional[BaseModel],
@@ -12052,6 +12175,11 @@ def update_timesheets_for_plain_time_action(
 ) -> Tuple[bool, Any]:
     if action not in PLAIN_TIME_ACTION_NAMES:
         raise ValueError(f"Unsupported plain time action: {action}")
+    required_capabilities = _plain_time_action_required_capabilities(action)
+    require_registered_time_action_context(
+        action,
+        required_capabilities=required_capabilities,
+    )
 
     idempotency_key = getattr(payload, "idempotencyKey", None) if payload else None
     fingerprint = (
@@ -12074,6 +12202,10 @@ def update_timesheets_for_plain_time_action(
             }
             pre_departure_counts = {
                 e["id"]: len(e.get("departures", []))
+                for e in timesheet_data["entries"]
+            }
+            pre_shift_boundaries = {
+                e["id"]: (e.get("clockIn"), e.get("clockOut"))
                 for e in timesheet_data["entries"]
             }
 
@@ -12125,6 +12257,8 @@ def update_timesheets_for_plain_time_action(
                     pre_shift_ids,
                     pre_visit_counts,
                     pre_departure_counts,
+                    pre_shift_boundaries=pre_shift_boundaries,
+                    required_capabilities=required_capabilities,
                     before_save=before_save,
                     after_save=after_save,
                 )
@@ -12296,7 +12430,20 @@ def _append_home_base_location_metadata(response: Dict[str, Any]) -> None:
     )
 
 
+def _home_base_time_action_name(
+    payload: HomeBaseActionRequest,
+    *_args: Any,
+    **_kwargs: Any,
+) -> str:
+    return f"home-base-{payload.action}"
+
+
 @app.post("/api/timesheet/home-base/scan")
+@registered_time_action(
+    "home-base-start",
+    "home-base-end",
+    resolver=_home_base_time_action_name,
+)
 def record_home_base_scan(
     payload: HomeBaseActionRequest,
     request: Request,
@@ -12546,7 +12693,23 @@ def record_home_base_scan(
     return result
 
 
+def _site_check_in_time_action_name(
+    payload: SiteCheckInRequest,
+    *_args: Any,
+    **_kwargs: Any,
+) -> str:
+    if payload.action is None:
+        return "site-check-in-evidence"
+    return f"site-qr-{payload.action}"
+
+
 @app.post("/api/timesheet/site-check-in")
+@registered_time_action(
+    "site-qr-arrive",
+    "site-qr-depart",
+    "site-check-in-evidence",
+    resolver=_site_check_in_time_action_name,
+)
 def record_site_check_in(
     payload: SiteCheckInRequest,
     request: Request,
@@ -12576,6 +12739,7 @@ def record_site_check_in(
         )
         return result
 
+    require_registered_time_action_context("site-check-in-evidence")
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             site = _resolve_site_check_in_qr(
@@ -14655,6 +14819,7 @@ def admin_employee_hours(
 
 
 @app.post("/api/timesheet/clock-in")
+@registered_time_action("clock-in")
 def clock_in(
     payload: ClockInRequest,
     request: Request,
@@ -14975,6 +15140,7 @@ def clock_in(
 
 
 @app.post("/api/timesheet/clock-out")
+@registered_time_action("clock-out")
 def clock_out(
     request: Request,
     payload: Optional[ClockOutRequest] = None,
@@ -15294,6 +15460,7 @@ def resolve_customer_site(
 
 
 @app.post("/api/timesheet/visit")
+@registered_time_action("arrive")
 def log_visit(
     payload: VisitRequest,
     request: Request,
@@ -15747,6 +15914,7 @@ def get_active_visit(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 @app.post("/api/timesheet/depart")
+@registered_time_action("depart")
 def depart_location(
     payload: Optional[DepartRequest],
     request: Request,
@@ -15831,6 +15999,7 @@ def depart_location(
 
 
 @app.patch("/api/admin/entries/{entry_id}")
+@registered_time_action("admin-entry-adjustment")
 def admin_adjust_entry(
     entry_id: int,
     payload: EntryAdjustRequest,
@@ -15926,7 +16095,10 @@ def admin_adjust_entry(
 
         return True, entry
 
-    ok, result = update_timesheets(mutator)
+    ok, result = update_timesheets(
+        mutator,
+        required_capabilities=frozenset({"opens_shift", "closes_shift"}),
+    )
     if not ok:
         raise HTTPException(status_code=400, detail=str(result))
 
@@ -23312,6 +23484,10 @@ def _migrate_duplicate_payroll_shift_corrections(
     cur: Any,
     duplicate_resolutions: List[Dict[str, Any]],
 ) -> List[int]:
+    require_registered_time_action_context(
+        "admin-time-data-correction",
+        required_capabilities=frozenset({"closes_shift"}),
+    )
     migrated_ids: List[int] = []
     for resolution in duplicate_resolutions:
         canonical_shift_id = int(resolution["canonicalShiftId"])
@@ -23438,11 +23614,16 @@ def _migrate_duplicate_home_base_events(
 
 
 @app.post("/api/admin/corrections/time-data/apply")
+@registered_time_action("admin-time-data-correction")
 def admin_apply_time_data_correction(
     payload: TimeDataCorrectionApplyRequest,
     request: Request,
     current_admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context(
+        "admin-time-data-correction",
+        required_capabilities=frozenset({"closes_shift"}),
+    )
     requested_ids = {
         int(value)
         for row in payload.duplicateResolutions
@@ -28812,6 +28993,7 @@ def _payroll_insert_manual_shift_version(
     batch_id: int,
     actor: Dict[str, Any],
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-timesheet-change")
     cur.execute(
         """
         INSERT INTO payroll_manual_shift_versions (
@@ -28854,6 +29036,7 @@ def _payroll_supersede_manual_shift(
     batch_id: int,
     actor: Dict[str, Any],
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-timesheet-change")
     cur.execute(
         """
         UPDATE payroll_manual_shift_versions
@@ -28933,6 +29116,7 @@ def _retire_payroll_day_total_corrections(
     reason: str,
     actor: Dict[str, Any],
 ) -> None:
+    require_registered_time_action_context("payroll-timesheet-change")
     dates = sorted(set(touched_dates))
     if not dates:
         return
@@ -29013,11 +29197,13 @@ def admin_payroll_timesheet(
 
 
 @app.post("/api/admin/payroll/timesheet/changes")
+@registered_time_action("payroll-timesheet-change")
 def admin_apply_payroll_timesheet_changes(
     payload: PayrollTimesheetChangesRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-timesheet-change")
     week_start = _parse_payroll_week_start(payload.weekStart)
     _week_end, week_start_utc, week_end_utc = _payroll_week_bounds(week_start)
     request_fingerprint = _payroll_timesheet_change_request_fingerprint(payload)
@@ -29528,11 +29714,13 @@ def admin_apply_payroll_timesheet_changes(
 
 
 @app.post("/api/admin/payroll/timesheet/shift-corrections")
+@registered_time_action("payroll-shift-correction")
 def admin_create_payroll_shift_correction(
     payload: PayrollShiftCorrectionRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-shift-correction")
     week_start = _parse_payroll_week_start(payload.weekStart)
     correction_date = _parse_payroll_correction_date(payload.date, week_start)
     corrected_clock_in = _parse_payroll_shift_correction_datetime(
@@ -29702,12 +29890,14 @@ def admin_create_payroll_shift_correction(
 
 
 @app.post("/api/admin/payroll/timesheet/shift-corrections/{correction_id}/void")
+@registered_time_action("payroll-shift-correction-void")
 def admin_void_payroll_shift_correction(
     correction_id: int,
     payload: PayrollCorrectionVoidRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-shift-correction-void")
     with timesheet_postgres_advisory_lock():
         with db.get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -29857,11 +30047,13 @@ def admin_payroll_weekly_hours_corrections(
 
 
 @app.post("/api/admin/payroll/weekly-hours/corrections")
+@registered_time_action("payroll-hour-correction")
 def admin_create_payroll_hour_correction(
     payload: PayrollCorrectionRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-hour-correction")
     week_start = _parse_payroll_week_start(payload.weekStart)
     correction_date = _parse_payroll_correction_date(payload.date, week_start)
     result: Dict[str, Any]
@@ -29972,12 +30164,14 @@ def admin_create_payroll_hour_correction(
 
 
 @app.post("/api/admin/payroll/weekly-hours/corrections/{correction_id}/void")
+@registered_time_action("payroll-hour-correction-void")
 def admin_void_payroll_hour_correction(
     correction_id: int,
     payload: PayrollCorrectionVoidRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-hour-correction-void")
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -30065,12 +30259,14 @@ def admin_void_payroll_hour_correction(
 
 
 @app.post("/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation")
+@registered_time_action("payroll-hour-correction-allocation")
 def admin_allocate_payroll_hour_correction(
     correction_id: int,
     payload: PayrollCorrectionAllocationRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-hour-correction-allocation")
     result: Dict[str, Any]
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -30253,12 +30449,14 @@ def admin_allocate_payroll_hour_correction(
 
 
 @app.post("/api/admin/payroll/weekly-hours/corrections/{correction_id}/allocation/void")
+@registered_time_action("payroll-hour-correction-allocation-void")
 def admin_void_payroll_hour_correction_allocation(
     correction_id: int,
     payload: PayrollCorrectionVoidRequest,
     request: Request,
     current_payroll: Dict[str, Any] = Depends(get_current_payroll),
 ) -> Dict[str, Any]:
+    require_registered_time_action_context("payroll-hour-correction-allocation-void")
     result: Dict[str, Any]
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
