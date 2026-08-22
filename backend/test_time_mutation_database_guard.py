@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import os
 
 import psycopg2
@@ -290,8 +291,28 @@ def test_explicit_migration_context_carries_declared_database_capabilities(
 def test_observe_guard_schema_is_idempotent_and_installs_every_target(
     client,
 ) -> None:
+    # Existing deployments created the event table with NOW(). The schema
+    # installer must advance that default without rewriting prior evidence.
+    db.execute(
+        "ALTER TABLE time_mutation_guard_events "
+        "ALTER COLUMN observed_at SET DEFAULT NOW()"
+    )
     api._ensure_time_mutation_guard_schema()
     api._ensure_time_mutation_guard_schema()
+
+    observed_at_default = db.query_one(
+        """
+        SELECT pg_get_expr(default_value.adbin, default_value.adrelid) AS expression
+        FROM pg_attribute AS attribute
+        JOIN pg_attrdef AS default_value
+          ON default_value.adrelid = attribute.attrelid
+         AND default_value.adnum = attribute.attnum
+        WHERE attribute.attrelid = 'time_mutation_guard_events'::regclass
+          AND attribute.attname = 'observed_at'
+          AND NOT attribute.attisdropped
+        """
+    )
+    assert observed_at_default["expression"] == "clock_timestamp()"
 
     rows = db.query_all(
         """
@@ -306,3 +327,275 @@ def test_observe_guard_schema_is_idempotent_and_installs_every_target(
     for trigger_name, capability in _EXPECTED_GUARD_TRIGGER_CAPABILITIES.items():
         assert "observe_time_mutation_guard" in definitions[trigger_name]
         assert capability in definitions[trigger_name]
+
+
+def test_guard_observation_audit_is_admin_only_bounded_and_read_only(
+    client,
+    auth,
+    emp_auth,
+) -> None:
+    _clear_guard_events()
+    try:
+        db.execute(
+            """
+            INSERT INTO time_mutation_guard_events (
+                observed_at,
+                mode,
+                table_name,
+                operation,
+                required_capability,
+                action,
+                supplied_capabilities,
+                database_user,
+                application_name
+            )
+            VALUES
+                (%s, 'observe', 'shifts', 'INSERT', 'shift-time-write', '',
+                 ARRAY[]::TEXT[], 'guard-test', 'older-event'),
+                (%s, 'observe', 'visits', 'INSERT', 'visit-time-write', 'clock-in',
+                 ARRAY['shift-time-write']::TEXT[], 'guard-test', 'included-event'),
+                (%s, 'observe', 'departures', 'DELETE', 'time-evidence-delete', '',
+                 ARRAY[]::TEXT[], 'guard-test', 'newest-event')
+            """,
+            (
+                datetime(2024, 1, 1, tzinfo=timezone.utc),
+                datetime(2024, 1, 2, tzinfo=timezone.utc),
+                datetime(2024, 1, 3, tzinfo=timezone.utc),
+            ),
+        )
+        endpoint = "/api/admin/audits/time-mutation-guard"
+        params = {"since": "2024-01-02T00:00:00Z", "limit": 1}
+
+        assert client.get(endpoint, params=params).status_code == 401
+        assert client.get(endpoint, params=params, headers=emp_auth).status_code == 403
+
+        before = db.query_one(
+            "SELECT COUNT(*) AS count FROM time_mutation_guard_events"
+        )["count"]
+        access_log_before = db.query_one(
+            "SELECT COUNT(*) AS count FROM access_log_entries"
+        )["count"]
+        response = client.get(endpoint, params=params, headers=auth)
+        after = db.query_one(
+            "SELECT COUNT(*) AS count FROM time_mutation_guard_events"
+        )["count"]
+        access_log_after = db.query_one(
+            "SELECT COUNT(*) AS count FROM access_log_entries"
+        )["count"]
+
+        assert response.status_code == 200, response.text
+        assert before == after == 3
+        assert access_log_after == access_log_before
+        payload = response.json()
+        assert payload["databaseReadOnly"] is True
+        assert payload["window"]["observedSince"] == "2024-01-02T00:00:00Z"
+        assert payload["summary"] == {
+            "eventCount": 2,
+            "firstObservedAt": "2024-01-02T00:00:00Z",
+            "latestObservedAt": "2024-01-03T00:00:00Z",
+        }
+        assert payload["eventsTruncated"] is True
+        assert isinstance(payload["nextCursor"], str)
+        assert len(payload["events"]) == 1
+        event = payload["events"][0]
+        assert isinstance(event["id"], int)
+        assert {key: value for key, value in event.items() if key != "id"} == {
+            "observedAt": "2024-01-03T00:00:00Z",
+            "mode": "observe",
+            "tableName": "departures",
+            "operation": "DELETE",
+            "requiredCapability": "time-evidence-delete",
+            "action": "",
+            "suppliedCapabilities": [],
+            "databaseUser": "guard-test",
+            "applicationName": "newest-event",
+        }
+
+        next_response = client.get(
+            endpoint,
+            params={
+                "since": params["since"],
+                "limit": 1,
+                "cursor": payload["nextCursor"],
+            },
+            headers=auth,
+        )
+        assert next_response.status_code == 200, next_response.text
+        next_payload = next_response.json()
+        assert next_payload["window"] == payload["window"]
+        assert next_payload["summary"] == payload["summary"]
+        assert next_payload["eventsTruncated"] is False
+        assert next_payload["nextCursor"] is None
+        assert len(next_payload["events"]) == 1
+        assert next_payload["events"][0]["applicationName"] == "included-event"
+        assert next_payload["events"][0]["id"] != event["id"]
+
+        cursor = payload["nextCursor"]
+        tampered_cursor = cursor[:-1] + ("0" if cursor[-1] != "0" else "1")
+        tampered = client.get(
+            endpoint,
+            params={"since": params["since"], "limit": 1, "cursor": tampered_cursor},
+            headers=auth,
+        )
+        assert tampered.status_code == 400
+
+        invalid = client.get(
+            endpoint,
+            params={"since": "2024-01-02T00:00:00", "limit": 1},
+            headers=auth,
+        )
+        assert invalid.status_code == 400
+
+        future = client.get(
+            endpoint,
+            params={"since": "2099-01-01T00:00:00Z", "limit": 1},
+            headers=auth,
+        )
+        assert future.status_code == 400
+    finally:
+        _clear_guard_events()
+
+
+def test_guard_observation_preserves_fractional_window_boundaries(
+    client,
+    auth,
+) -> None:
+    _clear_guard_events()
+    try:
+        db.execute(
+            """
+            INSERT INTO time_mutation_guard_events (
+                observed_at,
+                mode,
+                table_name,
+                operation,
+                required_capability,
+                action,
+                supplied_capabilities,
+                database_user,
+                application_name
+            )
+            VALUES
+                (%s, 'observe', 'shifts', 'INSERT', 'shift-time-write', '',
+                 ARRAY[]::TEXT[], 'guard-test', 'excluded-fraction'),
+                (%s, 'observe', 'visits', 'INSERT', 'visit-time-write', '',
+                 ARRAY[]::TEXT[], 'guard-test', 'included-fraction')
+            """,
+            (
+                datetime(2024, 1, 2, 0, 0, 0, 500_000, tzinfo=timezone.utc),
+                datetime(2024, 1, 2, 0, 0, 0, 900_000, tzinfo=timezone.utc),
+            ),
+        )
+        response = client.get(
+            "/api/admin/audits/time-mutation-guard",
+            params={"since": "2024-01-02T00:00:00.900Z"},
+            headers=auth,
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["window"]["observedSince"] == "2024-01-02T00:00:00.900000Z"
+        assert payload["summary"] == {
+            "eventCount": 1,
+            "firstObservedAt": "2024-01-02T00:00:00.900000Z",
+            "latestObservedAt": "2024-01-02T00:00:00.900000Z",
+        }
+        assert [event["applicationName"] for event in payload["events"]] == [
+            "included-fraction"
+        ]
+    finally:
+        _clear_guard_events()
+
+
+def test_guard_observation_late_writer_stays_in_the_next_window(
+    client,
+) -> None:
+    _clear_guard_events()
+    writer = _raw_connection()
+    try:
+        with writer.cursor() as cur:
+            # Establish the writer transaction before the first audit. With the
+            # old NOW() default, its later event would sort before the returned
+            # audit cutoff and disappear from the next incremental window.
+            cur.execute("SELECT NOW()")
+            first_report = api.build_time_mutation_guard_observation(
+                datetime(2024, 1, 1, tzinfo=timezone.utc),
+                limit=100,
+            )
+            assert first_report["summary"]["eventCount"] == 0
+            cur.execute(
+                """
+                INSERT INTO time_mutation_guard_events (
+                    mode,
+                    table_name,
+                    operation,
+                    required_capability,
+                    action,
+                    supplied_capabilities,
+                    database_user,
+                    application_name
+                )
+                VALUES (
+                    'observe', 'shifts', 'INSERT', 'shift-time-write', '',
+                    ARRAY[]::TEXT[], 'guard-test', 'late-writer'
+                )
+                """
+            )
+        writer.commit()
+
+        next_since = api._parse_time_mutation_guard_timestamp(
+            first_report["window"]["observedUntil"],
+            field_name="since",
+        )
+        stored_event = db.query_one(
+            "SELECT observed_at FROM time_mutation_guard_events "
+            "WHERE application_name = %s",
+            ("late-writer",),
+        )
+        assert stored_event["observed_at"] >= next_since
+
+        next_report = api.build_time_mutation_guard_observation(next_since, limit=100)
+        assert next_report["summary"]["eventCount"] == 1
+        assert [event["applicationName"] for event in next_report["events"]] == [
+            "late-writer"
+        ]
+    finally:
+        writer.close()
+        _clear_guard_events()
+
+
+def test_guard_observation_retries_while_a_guard_event_write_is_in_progress(
+    client,
+    auth,
+) -> None:
+    _clear_guard_events()
+    writer = _raw_connection()
+    try:
+        with writer.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO time_mutation_guard_events (
+                    mode,
+                    table_name,
+                    operation,
+                    required_capability,
+                    action,
+                    supplied_capabilities,
+                    database_user,
+                    application_name
+                )
+                VALUES (
+                    'observe', 'shifts', 'INSERT', 'shift-time-write', '',
+                    ARRAY[]::TEXT[], 'guard-test', 'uncommitted-event'
+                )
+                """
+            )
+            response = client.get(
+                "/api/admin/audits/time-mutation-guard",
+                params={"since": "2024-01-01T00:00:00Z"},
+                headers=auth,
+            )
+            assert response.status_code == 503
+        writer.rollback()
+    finally:
+        writer.close()
+        _clear_guard_events()
