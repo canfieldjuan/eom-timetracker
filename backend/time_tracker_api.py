@@ -7991,7 +7991,7 @@ def _ensure_time_mutation_guard_schema() -> None:
     db.execute("""
         CREATE TABLE IF NOT EXISTS time_mutation_guard_events (
             id                  BIGSERIAL PRIMARY KEY,
-            observed_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            observed_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
             mode                TEXT NOT NULL CHECK (mode IN ('observe', 'enforce')),
             table_name          TEXT NOT NULL,
             operation           TEXT NOT NULL,
@@ -8006,6 +8006,26 @@ def _ensure_time_mutation_guard_schema() -> None:
         CREATE INDEX IF NOT EXISTS idx_time_mutation_guard_events_observed_at
         ON time_mutation_guard_events(observed_at DESC, id DESC)
     """)
+    observed_at_default = db.query_one(
+        """
+        SELECT pg_get_expr(default_value.adbin, default_value.adrelid) AS expression
+        FROM pg_attribute AS attribute
+        JOIN pg_attrdef AS default_value
+          ON default_value.adrelid = attribute.attrelid
+         AND default_value.adnum = attribute.attnum
+        WHERE attribute.attrelid = 'time_mutation_guard_events'::regclass
+          AND attribute.attname = 'observed_at'
+          AND NOT attribute.attisdropped
+        """
+    )
+    if str((observed_at_default or {}).get("expression") or "").strip() != "clock_timestamp()":
+        # NOW() is a writer transaction's start time. An event inserted after an
+        # audit window closes must instead sort after that window even when the
+        # writer itself began earlier.
+        db.execute(
+            "ALTER TABLE time_mutation_guard_events "
+            "ALTER COLUMN observed_at SET DEFAULT clock_timestamp()"
+        )
 
     # Keep every DROP + CREATE in one transaction. A rolling deploy must never
     # leave a committed interval where only some protected tables have a guard.
@@ -23650,6 +23670,264 @@ def _build_time_data_correction_plan(
         "staleShiftClosures": normalized_closures,
         "_archiveSnapshot": archive_snapshot,
     }
+
+
+def _to_utc_iso_precise(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_time_mutation_guard_timestamp(value: str, *, field_name: str) -> datetime:
+    """Require one timezone-aware guard-observation boundary."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name} format; use an ISO-8601 timestamp with timezone",
+        ) from exc
+    if parsed.tzinfo is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must include a timezone",
+        )
+    return parsed.astimezone(timezone.utc)
+
+
+def _encode_time_mutation_guard_cursor(
+    observed_since: datetime,
+    observed_until: datetime,
+    before_observed_at: datetime,
+    before_id: int,
+) -> str:
+    payload = json.dumps(
+        {
+            "beforeId": before_id,
+            "beforeObservedAt": _to_utc_iso_precise(before_observed_at),
+            "observedSince": _to_utc_iso_precise(observed_since),
+            "observedUntil": _to_utc_iso_precise(observed_until),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded_payload = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(JWT_SECRET.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return f"{encoded_payload}.{signature}"
+
+
+def _parse_time_mutation_guard_cursor(
+    value: str,
+) -> Tuple[datetime, datetime, datetime, int]:
+    try:
+        encoded_payload, signature = value.split(".", 1)
+        if not (
+            re.fullmatch(r"[A-Za-z0-9_-]+", encoded_payload)
+            and re.fullmatch(r"[0-9a-f]{64}", signature)
+        ):
+            raise ValueError("invalid cursor encoding")
+        padded_payload = encoded_payload + ("=" * (-len(encoded_payload) % 4))
+        payload_bytes = base64.urlsafe_b64decode(padded_payload.encode("ascii"))
+        expected_signature = hmac.new(
+            JWT_SECRET.encode("utf-8"), payload_bytes, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected_signature):
+            raise ValueError("invalid cursor signature")
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        if not isinstance(payload, dict) or set(payload) != {
+            "beforeId",
+            "beforeObservedAt",
+            "observedSince",
+            "observedUntil",
+        }:
+            raise ValueError("invalid cursor fields")
+        before_id = payload["beforeId"]
+        if isinstance(before_id, bool) or not isinstance(before_id, int) or before_id <= 0:
+            raise ValueError("invalid cursor id")
+        values = {
+            field_name: payload[field_name]
+            for field_name in ("beforeObservedAt", "observedSince", "observedUntil")
+        }
+        if not all(isinstance(timestamp, str) for timestamp in values.values()):
+            raise ValueError("invalid cursor timestamps")
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid guard observation cursor") from exc
+
+    try:
+        before_observed_at = _parse_time_mutation_guard_timestamp(
+            values["beforeObservedAt"], field_name="cursor beforeObservedAt"
+        )
+        observed_since = _parse_time_mutation_guard_timestamp(
+            values["observedSince"], field_name="cursor observedSince"
+        )
+        observed_until = _parse_time_mutation_guard_timestamp(
+            values["observedUntil"], field_name="cursor observedUntil"
+        )
+    except HTTPException as exc:
+        raise HTTPException(status_code=400, detail="Invalid guard observation cursor") from exc
+    if not observed_since <= before_observed_at <= observed_until:
+        raise HTTPException(status_code=400, detail="Invalid guard observation cursor")
+    return observed_since, observed_until, before_observed_at, before_id
+
+
+def build_time_mutation_guard_observation(
+    observed_since: datetime,
+    limit: int,
+    cursor: Optional[Tuple[datetime, datetime, datetime, int]] = None,
+) -> Dict[str, Any]:
+    """Read one bounded, continuation-safe guard-observation window."""
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
+            try:
+                # A clean report must not race an event that is already being
+                # written. NOWAIT rejects that ambiguous state instead of
+                # waiting on its source time mutation or reporting false clean.
+                cur.execute("LOCK TABLE time_mutation_guard_events IN SHARE MODE NOWAIT")
+            except psycopg2.errors.LockNotAvailable as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Guard-event writes are in progress; retry the observation report",
+                ) from exc
+            cur.execute("SHOW transaction_read_only")
+            database_read_only = cur.fetchone()["transaction_read_only"] == "on"
+            cur.execute("SELECT clock_timestamp() AS observed_until")
+            current_observed_until = cur.fetchone()["observed_until"]
+            before_observed_at: Optional[datetime] = None
+            before_id: Optional[int] = None
+            if cursor is None:
+                observed_until = current_observed_until
+            else:
+                (
+                    cursor_since,
+                    observed_until,
+                    before_observed_at,
+                    before_id,
+                ) = cursor
+                if cursor_since != observed_since:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="cursor does not belong to the requested since window",
+                    )
+                if observed_until > current_observed_until:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="cursor observation window is in the future",
+                    )
+            if observed_since > observed_until:
+                raise HTTPException(
+                    status_code=400,
+                    detail="since must not be later than the observation snapshot",
+                )
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS event_count,
+                    MIN(observed_at) AS first_observed_at,
+                    MAX(observed_at) AS latest_observed_at
+                FROM time_mutation_guard_events
+                WHERE observed_at >= %s
+                  AND observed_at <= %s
+                """,
+                (observed_since, observed_until),
+            )
+            summary = dict(cur.fetchone())
+            cursor_clause = ""
+            event_params: list[Any] = [observed_since, observed_until]
+            if before_observed_at is not None and before_id is not None:
+                cursor_clause = " AND (observed_at, id) < (%s, %s)"
+                event_params.extend((before_observed_at, before_id))
+            event_params.append(limit + 1)
+            cur.execute(
+                """\
+                SELECT
+                    id,
+                    observed_at,
+                    mode,
+                    table_name,
+                    operation,
+                    required_capability,
+                    action,
+                    supplied_capabilities,
+                    database_user,
+                    application_name
+                FROM time_mutation_guard_events
+                WHERE observed_at >= %s
+                  AND observed_at <= %s
+                """ + cursor_clause + """
+                ORDER BY observed_at DESC, id DESC
+                LIMIT %s
+                """,
+                tuple(event_params),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+
+    event_count = int(summary["event_count"])
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    events = [
+        {
+            "id": int(row["id"]),
+            "observedAt": _to_utc_iso_precise(row["observed_at"]),
+            "mode": str(row["mode"]),
+            "tableName": str(row["table_name"]),
+            "operation": str(row["operation"]),
+            "requiredCapability": str(row["required_capability"]),
+            "action": str(row["action"]),
+            "suppliedCapabilities": [
+                str(capability) for capability in (row["supplied_capabilities"] or [])
+            ],
+            "databaseUser": str(row["database_user"]),
+            "applicationName": str(row["application_name"]),
+        }
+        for row in page_rows
+    ]
+    next_cursor = None
+    if has_more:
+        last_row = page_rows[-1]
+        next_cursor = _encode_time_mutation_guard_cursor(
+            observed_since,
+            observed_until,
+            last_row["observed_at"],
+            int(last_row["id"]),
+        )
+    return {
+        "success": True,
+        "databaseReadOnly": database_read_only,
+        "window": {
+            "observedSince": _to_utc_iso_precise(observed_since),
+            "observedUntil": _to_utc_iso_precise(observed_until),
+        },
+        "summary": {
+            "eventCount": event_count,
+            "firstObservedAt": (
+                _to_utc_iso_precise(summary["first_observed_at"])
+                if summary["first_observed_at"]
+                else None
+            ),
+            "latestObservedAt": (
+                _to_utc_iso_precise(summary["latest_observed_at"])
+                if summary["latest_observed_at"]
+                else None
+            ),
+        },
+        "eventsTruncated": has_more,
+        "nextCursor": next_cursor,
+        "events": events,
+    }
+
+
+@app.get("/api/admin/audits/time-mutation-guard")
+def admin_time_mutation_guard_audit(
+    since: str = Query(..., max_length=64),
+    limit: int = Query(default=100, ge=1, le=100),
+    cursor: Optional[str] = Query(default=None, max_length=1024),
+    _: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Expose production guard evidence without writing an access-log record."""
+    return build_time_mutation_guard_observation(
+        _parse_time_mutation_guard_timestamp(since, field_name="since"),
+        limit,
+        _parse_time_mutation_guard_cursor(cursor) if cursor else None,
+    )
 
 
 @app.get("/api/admin/audits/time-data")
