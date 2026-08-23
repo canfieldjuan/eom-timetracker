@@ -176,9 +176,15 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
             opens_visit=False,
             closes_visit=False,
             database_mutation_capabilities=frozenset({"shift-time-write"}),
-            location_gate_mode="none",
-            weak_or_missing_gps_behavior="existing GPS override requirement remains in effect",
-            exception_method="documented GPS or Home Base exception",
+            location_gate_mode="hard_when_enabled",
+            weak_or_missing_gps_behavior=(
+                "existing GPS override requirement remains in effect unless the "
+                "individual Commercial/Home Base clock boundary is enabled"
+            ),
+            exception_method=(
+                "documented GPS or Home Base exception outside the individual "
+                "Commercial/Home Base clock boundary"
+            ),
             idempotency_mechanism="plain_time_action_receipts by employee and idempotency key",
             audit_target="shifts, plain_time_action_receipts, and Home Base events when applicable",
             requires_active_context=True,
@@ -350,6 +356,30 @@ TIME_ACTION_POLICIES: Mapping[str, TimeActionPolicy] = MappingProxyType(
                 "idempotency key"
             ),
             audit_target="visits and admin_direct_time_action_receipts",
+            requires_active_context=True,
+        ),
+        "admin-direct-clock-out": TimeActionPolicy(
+            action="admin-direct-clock-out",
+            workflow="correction",
+            opens_shift=False,
+            closes_shift=True,
+            opens_visit=False,
+            closes_visit=False,
+            database_mutation_capabilities=frozenset({"shift-time-write"}),
+            location_gate_mode="none",
+            weak_or_missing_gps_behavior=(
+                "administrator closes the actual open shift at server time without "
+                "inventing client GPS or an end Site"
+            ),
+            exception_method=(
+                "administrator direct-record reason and detail; unverified end "
+                "location; server time only"
+            ),
+            idempotency_mechanism=(
+                "admin_direct_time_action_receipts by administrator and "
+                "idempotency key"
+            ),
+            audit_target="shifts and admin_direct_time_action_receipts",
             requires_active_context=True,
         ),
         "admin-time-data-correction": TimeActionPolicy(

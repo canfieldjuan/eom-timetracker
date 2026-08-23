@@ -15,7 +15,7 @@ import time_tracker_api as api
 # idempotency/audit/exception behavior observed on each live route.
 EXPECTED_RUNTIME_POLICIES = {
     "clock-in": ("interactive", True, False, False, False, "hard_when_enabled", "plain_time_action_receipts", "shifts", "GPS override", "Home Base"),
-    "clock-out": ("interactive", False, True, False, False, "none", "plain_time_action_receipts", "shifts", "GPS override", "Home Base"),
+    "clock-out": ("interactive", False, True, False, False, "hard_when_enabled", "plain_time_action_receipts", "shifts", "GPS override", "Home Base"),
     "arrive": ("interactive", False, False, True, False, "hard_when_enabled", "plain_time_action_receipts", "visits", "GPS override", "Site evidence"),
     "depart": ("interactive", False, False, False, True, "none", "plain_time_action_receipts", "departures", "GPS override", "GPS override"),
     "home-base-start": ("interactive", True, False, False, False, "evidence_paid_on_inside", "plain_time_action_receipts", "home_base_events", "QR scan", "none"),
@@ -26,6 +26,7 @@ EXPECTED_RUNTIME_POLICIES = {
     "admin-entry-adjustment": ("correction", True, True, False, False, "none", "none", "shifts", "administrator correction", "administrator correction"),
     "admin-direct-clock-in": ("correction", True, False, False, False, "none", "admin_direct_time_action_receipts", "shifts", "administrator records", "server time only"),
     "admin-direct-arrive": ("correction", False, False, True, False, "none", "admin_direct_time_action_receipts", "visits", "administrator records", "server time only"),
+    "admin-direct-clock-out": ("correction", False, True, False, False, "none", "admin_direct_time_action_receipts", "shifts", "administrator closes", "unverified end"),
     "admin-time-data-correction": ("correction", False, True, False, False, "none", "plan token", "time_data_correction_batches", "reviewed data correction", "confirmation phrase"),
     "admin-utilization-missing-departure-correction": ("correction", False, False, False, True, "none", "plan token", "time_data_correction_batches", "utilization departure overlay", "evidence fingerprint"),
     "payroll-timesheet-change": ("correction", False, False, False, False, "none", "request id", "payroll_timesheet_change_batches", "payroll overlay", "payroll reason"),
@@ -50,7 +51,7 @@ EXPECTED_RUNTIME_HANDLERS = {
     "time_tracker_api.depart_location": frozenset({"depart"}),
     "time_tracker_api.admin_adjust_entry": frozenset({"admin-entry-adjustment"}),
     "time_tracker_api.admin_direct_record_time_action": frozenset(
-        {"admin-direct-clock-in", "admin-direct-arrive"}
+        {"admin-direct-clock-in", "admin-direct-arrive", "admin-direct-clock-out"}
     ),
     "time_tracker_api.admin_apply_time_data_correction": frozenset(
         {"admin-time-data-correction"}
@@ -94,6 +95,7 @@ EXPECTED_DATABASE_MUTATION_CAPABILITIES = {
     "admin-entry-adjustment": frozenset({"shift-time-write"}),
     "admin-direct-clock-in": frozenset({"shift-time-write"}),
     "admin-direct-arrive": frozenset({"visit-time-write"}),
+    "admin-direct-clock-out": frozenset({"shift-time-write"}),
     "admin-time-data-correction": frozenset(
         {
             "shift-time-write",

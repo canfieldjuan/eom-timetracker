@@ -142,6 +142,17 @@ def _payload(employee_id: int, site_id: int, *, action: str = "clock-in") -> dic
     }
 
 
+def _clock_out_payload(employee_id: int) -> dict:
+    return {
+        "employeeId": employee_id,
+        "action": "clock-out",
+        "targetKind": "unverified-end",
+        "reason": "Employee phone battery died",
+        "detail": "Supervisor closed the open shift after speaking with the employee.",
+        "idempotencyKey": str(uuid4()),
+    }
+
+
 def test_direct_clock_in_is_admin_only_server_timed_and_audited(client, auth, monkeypatch):
     employee_id, employee_auth = _create_employee(client, "admin only")
     site_id = _create_site("admin only")
@@ -279,6 +290,7 @@ def test_home_base_config_advertises_direct_record_capability(client, auth):
 
     assert response.status_code == 200, response.text
     assert response.json()["adminDirectRecordEnabled"] is True
+    assert response.json()["adminDirectClockOutEnabled"] is True
 
 
 def test_direct_record_replays_once_and_its_receipt_is_immutable(client, auth):
@@ -315,6 +327,106 @@ def test_direct_record_replays_once_and_its_receipt_is_immutable(client, auth):
             "WHERE id = %s",
             (int(first.json()["receipt"]["id"]),),
         )
+
+
+def test_direct_clock_out_closes_only_the_open_shift_with_an_unverified_end(
+    client, auth, monkeypatch
+):
+    employee_id, _ = _create_employee(client, "unverified end")
+    site_id = _create_site("unverified end")
+    started_at = datetime(2026, 8, 22, 15, 0, tzinfo=timezone.utc)
+    ended_at = datetime(2026, 8, 22, 16, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(api, "utc_now", lambda: started_at)
+    opened = client.post(
+        "/api/admin/time-actions/direct-record",
+        headers=auth,
+        json=_payload(employee_id, site_id),
+    )
+    assert opened.status_code == 200, opened.text
+
+    monkeypatch.setattr(api, "utc_now", lambda: ended_at)
+    body = _clock_out_payload(employee_id)
+    closed = client.post(
+        "/api/admin/time-actions/direct-record",
+        headers=auth,
+        json=body,
+    )
+    assert closed.status_code == 200, closed.text
+    result = closed.json()
+    assert result["action"] == "clock-out"
+    assert result["recordedAt"] == "2026-08-22T16:30:00Z"
+    assert result["target"] == {
+        "kind": "unverified_end",
+        "label": "Unverified end location",
+        "customerName": "",
+    }
+    assert result["entry"]["id"] == opened.json()["entry"]["id"]
+    assert result["entry"]["totalHours"] == 1.5
+    assert result["entry"]["clockOutGps"] is None
+    assert result["entry"]["clockOutGpsMeta"] == {
+        "adminRecorded": True,
+        "reason": "Employee phone battery died",
+        "detail": "Supervisor closed the open shift after speaking with the employee.",
+        "unverifiedEndLocation": True,
+    }
+    assert db.query_one(
+        """
+        SELECT clock_out, total_hours, clock_out_gps, clock_out_gps_meta,
+               recorded_source
+        FROM shifts WHERE id = %s
+        """,
+        (int(result["entry"]["id"]),),
+    ) == {
+        "clock_out": ended_at,
+        "total_hours": 1.5,
+        "clock_out_gps": None,
+        "clock_out_gps_meta": {
+            "adminRecorded": True,
+            "reason": "Employee phone battery died",
+            "detail": "Supervisor closed the open shift after speaking with the employee.",
+            "unverifiedEndLocation": True,
+        },
+        "recorded_source": "admin_recorded",
+    }
+    assert db.query_one(
+        """
+        SELECT action, target_kind, target_id, shift_id, visit_id
+        FROM admin_direct_time_action_receipts
+        WHERE id = %s
+        """,
+        (int(result["receipt"]["id"]),),
+    ) == {
+        "action": "clock-out",
+        "target_kind": "unverified_end",
+        "target_id": None,
+        "shift_id": int(result["entry"]["id"]),
+        "visit_id": None,
+    }
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE shift_id = %s",
+        (int(result["entry"]["id"]),),
+    ) == {"count": 0}
+
+    replay = client.post(
+        "/api/admin/time-actions/direct-record",
+        headers=auth,
+        json=body,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["replayed"] is True
+    assert replay.json()["entry"]["id"] == result["entry"]["id"]
+
+    invalid_target = client.post(
+        "/api/admin/time-actions/direct-record",
+        headers=auth,
+        json={
+            **body,
+            "targetKind": "site",
+            "siteId": site_id,
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert invalid_target.status_code == 422
 
 
 def test_direct_arrival_requires_an_open_shift_and_records_site_provenance(client, auth):
@@ -513,6 +625,61 @@ def test_runtime_migration_is_additive_for_existing_time_rows(client):
         assert db.query_one(
             "SELECT to_regclass('admin_direct_time_action_receipts') AS table_name"
         ) == {"table_name": "admin_direct_time_action_receipts"}
+
+        # PostgreSQL generated these exact names for the pre-change unnamed
+        # checks.  Recreate that deployed shape to prove the migration replaces
+        # its *definition*, not merely a differently named legacy constraint.
+        db.execute(
+            "ALTER TABLE admin_direct_time_action_receipts "
+            "DROP CONSTRAINT admin_direct_time_action_receipts_action_check"
+        )
+        db.execute(
+            "ALTER TABLE admin_direct_time_action_receipts "
+            "DROP CONSTRAINT admin_direct_time_action_receipts_target_kind_check"
+        )
+        db.execute(
+            "ALTER TABLE admin_direct_time_action_receipts "
+            "ALTER COLUMN target_id SET NOT NULL"
+        )
+        db.execute(
+            """
+            ALTER TABLE admin_direct_time_action_receipts
+                ADD CONSTRAINT admin_direct_time_action_receipts_action_check
+                CHECK (action IN ('clock-in', 'arrive')),
+                ADD CONSTRAINT admin_direct_time_action_receipts_target_kind_check
+                CHECK (target_kind IN ('site', 'home_base'))
+            """
+        )
+
+        api._ensure_schema_migrations()
+        upgraded_checks = {
+            str(row["conname"]): str(row["definition"])
+            for row in db.query_all(
+                """
+                SELECT conname, pg_get_constraintdef(oid) AS definition
+                FROM pg_constraint
+                WHERE conrelid = 'admin_direct_time_action_receipts'::regclass
+                  AND conname IN (
+                      'admin_direct_time_action_receipts_action_check',
+                      'admin_direct_time_action_receipts_target_kind_check'
+                  )
+                """
+            )
+        }
+        assert "clock-out" in upgraded_checks[
+            "admin_direct_time_action_receipts_action_check"
+        ]
+        assert "unverified_end" in upgraded_checks[
+            "admin_direct_time_action_receipts_target_kind_check"
+        ]
+        assert db.query_one(
+            """
+            SELECT is_nullable
+            FROM information_schema.columns
+            WHERE table_name = 'admin_direct_time_action_receipts'
+              AND column_name = 'target_id'
+            """
+        ) == {"is_nullable": "YES"}
     finally:
         # Keep the shared test database compatible with following test modules.
         api._ensure_schema_migrations()

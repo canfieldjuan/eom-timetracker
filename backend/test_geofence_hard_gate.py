@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bcrypt
 import math
+import threading
 from datetime import date
 from uuid import uuid4
 
@@ -112,6 +113,7 @@ def _create_site(
     latitude: float | None = LATITUDE,
     longitude: float | None = LONGITUDE,
     ready: bool = True,
+    location_type: str = "Residential",
 ) -> int:
     customer_name = f"{PREFIX} Customer {suffix}"
     customer = db.query_one(
@@ -124,13 +126,14 @@ def _create_site(
         INSERT INTO locations (
             customer_id, address, customer_name, location_type, lat, lng,
             pin_provenance, pin_confidence
-        ) VALUES (%s, %s, %s, 'Residential', %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
             int(customer["id"]),
             f"{PREFIX} Site {suffix}",
             customer_name,
+            location_type,
             latitude,
             longitude,
             "gps_capture" if ready else None,
@@ -181,6 +184,60 @@ def _enable_employee_scope(client, auth: dict[str, str], employee_id: int) -> di
     )
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _enable_commercial_clock_boundary(
+    client,
+    auth: dict[str, str],
+    employee_id: int,
+) -> dict:
+    response = client.put(
+        f"/api/admin/geofence-hard-gate-employee-scopes/{employee_id}",
+        headers=auth,
+        json={
+            "enabled": True,
+            "profile": api.GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _configure_ready_home_base(client, auth: dict[str, str]) -> int:
+    # Home Base owns an existing Morning Crew policy even though the new
+    # individual boundary itself is not crew-scoped.
+    crew = db.query_one(
+        """
+        INSERT INTO crews (name, active)
+        VALUES ('Morning Crew', true)
+        ON CONFLICT (name) DO UPDATE SET active = true
+        RETURNING id
+        """
+    )
+    assert crew
+    configured = client.put(
+        "/api/admin/home-base",
+        headers=auth,
+        json={
+            "label": f"{PREFIX} Office",
+            "address": f"{PREFIX} 100 Office Way",
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "pinProvenance": "gps_capture",
+            "pinCaptureAccuracyM": 5,
+            "pinConfidence": "high",
+        },
+    )
+    assert configured.status_code == 200, configured.text
+    attested = client.post(
+        "/api/admin/home-base/attest-geofence",
+        headers=auth,
+        json={},
+    )
+    assert attested.status_code == 200, attested.text
+    home_base = attested.json()["homeBase"]
+    assert home_base["geofence"]["ready"] is True
+    return int(home_base["id"])
 
 
 def _hard_gate_failure(response) -> dict:
@@ -305,6 +362,317 @@ def test_c6_refuses_individual_scope_enable_until_all_eligible_sites_are_ready(
     ) == {"count": 0}
 
 
+def test_commercial_home_base_clock_boundary_allows_ready_targets_without_gating_visits(
+    client, auth, monkeypatch
+):
+    """The opt-in boundary rejects coffee/home, not ordinary visit evidence."""
+
+    employee_id, employee_auth = _create_employee(client, "commercial boundary")
+    commercial_site_id = _create_site(
+        "commercial boundary",
+        location_type="Commercial",
+    )
+    residential_site_id = _create_site(
+        "residential boundary",
+        latitude=LATITUDE + 0.01,
+        location_type="Residential",
+    )
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+
+    enabled = _enable_commercial_clock_boundary(client, auth, employee_id)
+    assert enabled["scope"]["profile"] == (
+        api.GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+    )
+    assert enabled["readiness"]["ready"] is True
+
+    scope = api._c6_employee_scope_state(employee_id, api.utc_now())
+    assert api._c6_action_scope_state(scope, "clock-in") == {
+        "effective": True,
+        "targetPolicy": api.GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY,
+    }
+    assert api._c6_action_scope_state(scope, "clock-out")["effective"] is True
+    assert api._c6_action_scope_state(scope, "arrive")["effective"] is False
+    assert api._c6_action_scope_state(scope, "depart")["effective"] is False
+
+    # A coffee stop/home-sized miss is not converted into a time action by an
+    # old free-text GPS override. The boundary admits only a ready Commercial
+    # Site or Home Base whose geofence actually contains the sample.
+    offsite_start = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.3,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "Buying coffee before work.",
+        },
+    )
+    assert offsite_start.status_code == 409, offsite_start.text
+    assert _hard_gate_failure(offsite_start)["details"]["reason"] == "outside"
+
+    residential_start = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": residential_site_id,
+            "latitude": LATITUDE + 0.01,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert residential_start.status_code == 409, residential_start.text
+    assert _hard_gate_failure(residential_start)["details"]["reason"] == (
+        "selected_site_ineligible"
+    )
+
+    clock_in = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": commercial_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert clock_in.status_code == 200, clock_in.text
+    assert clock_in.json()["entry"]["locationId"] == commercial_site_id
+
+    # The new profile deliberately does not alter an ordinary arrival's
+    # legacy GPS-override path or the QR/visit model it shares.
+    legacy_arrival = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "location": "Supplier stop",
+            "latitude": LATITUDE + 0.3,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "Dispatch asked for a supply pickup.",
+        },
+    )
+    assert legacy_arrival.status_code == 200, legacy_arrival.text
+    departed = client.post(
+        "/api/timesheet/depart",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.3,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "Leaving the supply pickup.",
+        },
+    )
+    assert departed.status_code == 200, departed.text
+
+    resolution = client.post(
+        "/api/timesheet/site-resolution",
+        headers=employee_auth,
+        json={
+            "action": "clock-out",
+            "locationId": commercial_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert resolution.status_code == 200, resolution.text
+    assert resolution.json()["enabled"] is True
+    assert resolution.json()["hardGateEnabled"] is True
+    assert resolution.json()["resolution"]["state"] == "customer_site"
+
+    residential_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "locationId": residential_site_id,
+            "latitude": LATITUDE + 0.01,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert residential_end.status_code == 409, residential_end.text
+    assert _hard_gate_failure(residential_end)["details"]["reason"] == (
+        "selected_site_ineligible"
+    )
+    assert db.query_one(
+        "SELECT clock_out FROM shifts WHERE id = %s",
+        (int(clock_in.json()["entry"]["id"]),),
+    ) == {"clock_out": None}
+
+    offsite_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.3,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "Heading home from coffee.",
+        },
+    )
+    assert offsite_end.status_code == 409, offsite_end.text
+    assert _hard_gate_failure(offsite_end)["details"]["reason"] == "outside"
+
+    commercial_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "locationId": commercial_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert commercial_end.status_code == 200, commercial_end.text
+    assert commercial_end.json()["siteResolution"]["state"] == "customer_site"
+
+
+def test_commercial_home_base_clock_boundary_keeps_unready_commercial_sites_out(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "unready commercial")
+    unready_commercial_id = _create_site(
+        "unready commercial",
+        location_type="Commercial",
+        ready=False,
+    )
+    _create_site(
+        "unready residential",
+        latitude=None,
+        longitude=None,
+        location_type="Residential",
+        ready=False,
+    )
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+
+    # Unlike the legacy all-business profile, an unready old Commercial pin
+    # does not disable every ready target. It is surfaced and rejected only
+    # when selected at the live boundary.
+    enabled = _enable_commercial_clock_boundary(client, auth, employee_id)
+    assert enabled["readiness"]["ready"] is True
+    assert [row["id"] for row in enabled["readiness"]["eligibleUnreadyLocations"]] == [
+        unready_commercial_id
+    ]
+
+    attempted = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": unready_commercial_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert attempted.status_code == 409, attempted.text
+    assert _hard_gate_failure(attempted)["details"]["reason"] == (
+        "selected_site_unready"
+    )
+
+
+def test_commercial_home_base_clock_boundary_requires_exact_choice_for_overlaps(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "commercial overlap")
+    first_commercial_id = _create_site(
+        "commercial overlap first",
+        location_type="Commercial",
+    )
+    second_commercial_id = _create_site(
+        "commercial overlap second",
+        location_type="Commercial",
+    )
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+
+    resolution = client.post(
+        "/api/timesheet/site-resolution",
+        headers=employee_auth,
+        json={
+            "action": "clock-in",
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert resolution.status_code == 200, resolution.text
+    assert resolution.json()["resolution"]["state"] == "selection_required"
+    assert {
+        row["locationId"] for row in resolution.json()["resolution"]["candidates"]
+    } == {first_commercial_id, second_commercial_id}
+
+    unspecified = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert unspecified.status_code == 409, unspecified.text
+    assert _hard_gate_failure(unspecified)["details"]["reason"] == (
+        "selection_required"
+    )
+
+    selected = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": second_commercial_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["entry"]["locationId"] == second_commercial_id
+
+
+def test_commercial_home_base_clock_boundary_allows_the_ready_office_at_both_ends(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "office boundary")
+    _create_site("office commercial", location_type="Commercial")
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+
+    office_latitude = LATITUDE + 0.02
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": office_latitude,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert started.status_code == 200, started.text
+    assert started.json()["entry"]["internalHomeBase"] is True
+    assert started.json()["siteResolution"]["state"] == "home_base"
+
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": office_latitude,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["siteResolution"]["state"] == "home_base"
+    assert ended.json()["homeBaseEvent"]["action"] == "end"
+    assert ended.json()["homeBaseEvent"]["outcome"] == "recorded"
+
+
 def test_c6_rejects_an_inactive_individual_scope_target(client, auth):
     employee_id, _employee_auth = _create_employee(client, "inactive individual")
     db.execute("UPDATE employees SET active = false WHERE id = %s", (employee_id,))
@@ -404,6 +772,7 @@ def test_c6_individual_scope_blocks_free_text_bypass_and_keeps_crew_state_empty(
         "requested": True,
         "effective": True,
         "blockedReasons": [],
+        "profile": api.GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START,
     }
     assert api._c6_employee_scope_state(employee_id, api.utc_now()) == {
         "effective": True,
@@ -742,6 +1111,182 @@ def test_c6_gated_clock_in_is_idempotent_and_final_check_holds_writer_lock(
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s", (employee_id,)
     ) == {"count": 1}
+
+
+def test_commercial_home_base_boundary_rechecks_the_office_under_lock(
+    client, auth, monkeypatch
+):
+    """A Home Base move cannot race the narrow profile's final C3 decision."""
+
+    employee_id, employee_auth = _create_employee(client, "office lock")
+    commercial_site_id = _create_site("office lock", location_type="Commercial")
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+
+    lock_conn = _raw_conn()
+    worker: threading.Thread | None = None
+    completed: dict[str, object] = {}
+    try:
+        with lock_conn.cursor() as cur:
+            # The normal Home Base writer takes this conflicting row lock
+            # before it changes either the pin or its readiness configuration.
+            cur.execute("SELECT id FROM home_bases WHERE active = true FOR UPDATE")
+
+        def clock_in_while_office_is_locked() -> None:
+            completed["response"] = client.post(
+                "/api/timesheet/clock-in",
+                headers=employee_auth,
+                json={
+                    "locationId": commercial_site_id,
+                    "latitude": LATITUDE,
+                    "longitude": LONGITUDE,
+                    "accuracy": 5,
+                },
+            )
+
+        worker = threading.Thread(target=clock_in_while_office_is_locked)
+        worker.start()
+        worker.join(timeout=2)
+        assert worker.is_alive(), "C6 did not wait for the Home Base configuration lock"
+        assert db.query_one(
+            "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
+            (employee_id,),
+        ) == {"count": 0}
+
+        lock_conn.commit()
+        worker.join(timeout=15)
+        assert not worker.is_alive(), "C6 did not resume after the Home Base lock released"
+        response = completed.get("response")
+        assert response is not None
+        assert response.status_code == 200, response.text
+    finally:
+        if lock_conn.closed == 0:
+            lock_conn.close()
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=15)
+
+
+def test_commercial_home_base_boundary_uses_final_customer_site_for_end_event(
+    client, auth, monkeypatch
+):
+    """A final Site result must not emit an event from a stale Home Base read."""
+
+    employee_id, employee_auth = _create_employee(client, "final end target")
+    start_site_id = _create_site("final end start", location_type="Commercial")
+    _create_site(
+        "final end office site",
+        latitude=LATITUDE + 0.02,
+        location_type="Commercial",
+    )
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": start_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    original_resolver = api._c3_resolve_site
+    clock_out_resolutions = 0
+
+    def move_home_base_after_provisional_resolution(action, *args, **kwargs):
+        nonlocal clock_out_resolutions
+        resolution = original_resolver(action, *args, **kwargs)
+        if action == "clock-out":
+            clock_out_resolutions += 1
+            if clock_out_resolutions == 1:
+                assert resolution["state"] == "home_base"
+                db.execute(
+                    "UPDATE home_bases SET latitude = %s WHERE active = true",
+                    (LATITUDE + 0.3,),
+                )
+        return resolution
+
+    monkeypatch.setattr(
+        api,
+        "_c3_resolve_site",
+        move_home_base_after_provisional_resolution,
+    )
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert ended.status_code == 200, ended.text
+    assert clock_out_resolutions == 2
+    result = ended.json()
+    assert result["siteResolution"]["state"] == "customer_site"
+    assert "homeBaseEvent" not in result
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE shift_id = %s",
+        (int(result["entry"]["id"]),),
+    ) == {"count": 0}
+
+
+def test_c6_profile_upgrade_defaults_legacy_scope_rows(client):
+    """The old scope table upgrades to a non-null historic policy by default."""
+
+    legacy_employee_id, _ = _create_employee(client, "legacy profile scope")
+    new_employee_id, _ = _create_employee(client, "new profile scope")
+    try:
+        db.execute(
+            "ALTER TABLE geofence_hard_gate_employee_scopes "
+            "DROP COLUMN IF EXISTS policy_profile"
+        )
+        db.execute(
+            """
+            INSERT INTO geofence_hard_gate_employee_scopes (employee_id, enabled)
+            VALUES (%s, true)
+            """,
+            (legacy_employee_id,),
+        )
+
+        api._ensure_geofence_hard_gate_scope_schema()
+
+        assert db.query_one(
+            "SELECT policy_profile FROM geofence_hard_gate_employee_scopes "
+            "WHERE employee_id = %s",
+            (legacy_employee_id,),
+        ) == {"policy_profile": "all_business_start"}
+        assert db.query_one(
+            """
+            INSERT INTO geofence_hard_gate_employee_scopes (employee_id, enabled)
+            VALUES (%s, false)
+            RETURNING policy_profile
+            """,
+            (new_employee_id,),
+        ) == {"policy_profile": "all_business_start"}
+        profile_column = db.query_one(
+            """
+            SELECT is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_name = 'geofence_hard_gate_employee_scopes'
+              AND column_name = 'policy_profile'
+            """
+        )
+        assert profile_column == {
+            "is_nullable": "NO",
+            "column_default": "'all_business_start'::character varying",
+        }
+    finally:
+        # Keep the shared test database compatible with following test modules.
+        api._ensure_geofence_hard_gate_scope_schema()
 
 
 def test_c6_blocks_a_newly_unpinned_selected_site_after_scope_enable(
