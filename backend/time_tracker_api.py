@@ -3224,7 +3224,7 @@ class GeofenceAttestRequest(BaseModel):
 
 
 class GeofenceHardGateScopeRequest(BaseModel):
-    """Administrator-controlled, default-off C6 crew scope."""
+    """Administrator-controlled, default-off C6 scope."""
 
     enabled: bool
 
@@ -6810,7 +6810,7 @@ def _ensure_home_base_schema() -> None:
 
 
 def _ensure_geofence_hard_gate_scope_schema() -> None:
-    """Add the dormant C6 per-crew scope table without enrolling anyone."""
+    """Add dormant C6 crew and employee scope tables without enrolling anyone."""
 
     db.execute(
         """
@@ -6829,6 +6829,26 @@ def _ensure_geofence_hard_gate_scope_schema() -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_geofence_hard_gate_scopes_enabled
         ON geofence_hard_gate_scopes(crew_id)
+        WHERE enabled = true
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS geofence_hard_gate_employee_scopes (
+            id          BIGSERIAL PRIMARY KEY,
+            employee_id INTEGER NOT NULL UNIQUE REFERENCES employees(id) ON DELETE CASCADE,
+            enabled     BOOLEAN NOT NULL DEFAULT false,
+            created_by  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            updated_by  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_geofence_hard_gate_employee_scopes_enabled
+        ON geofence_hard_gate_employee_scopes(employee_id)
         WHERE enabled = true
         """
     )
@@ -18311,11 +18331,12 @@ def _c6_employee_scope_state(
     *,
     cur: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Resolve an employee's effective C6 crew scope from live membership.
+    """Resolve an employee's effective C6 crew or individual scope.
 
     The scoped-crew set is OPEN/DERIVED from effective-dated memberships.  The
-    scope table is only an opt-in overlay, so a missing row and a crew outside
-    the queried membership set are both deliberately gate-off.
+    scope tables are opt-in overlays, so a missing row, a crew outside the
+    queried membership set, and an employee without an individual scope are all
+    deliberately gate-off.
 
     When ``cur`` is supplied, the caller has already taken the C6 lock order
     (scope -> customer Site -> planned-assignment/membership) before this
@@ -18328,6 +18349,7 @@ def _c6_employee_scope_state(
             "requested": False,
             "blockedReasons": ["kill_switch_off"],
             "crews": [],
+            "individualScope": False,
         }
 
     local_day = reference_time.astimezone(APP_TIMEZONE).date()
@@ -18353,15 +18375,33 @@ def _c6_employee_scope_state(
         cur.execute(query, params)
         rows = _c3_rows_from_cursor(cur)
 
+    individual_scope_query = """
+        SELECT scope.id AS scope_id
+        FROM geofence_hard_gate_employee_scopes scope
+        JOIN employees scoped_employee
+          ON scoped_employee.id = scope.employee_id
+         AND scoped_employee.active = true
+        WHERE scope.employee_id = %s
+          AND scope.enabled = true
+    """ + (" FOR SHARE OF scope, scoped_employee" if cur is not None else "")
+    if cur is None:
+        individual_scope = db.query_one(individual_scope_query, (int(employee_id),))
+    else:
+        cur.execute(individual_scope_query, (int(employee_id),))
+        individual_scope = _row_from_cursor(cur)
+
     crews = [
         {"id": int(row["crew_id"]), "name": str(row.get("crew_name") or "")}
         for row in rows
     ]
+    individually_scoped = bool(individual_scope)
+    scoped = bool(crews) or individually_scoped
     return {
-        "effective": bool(crews),
-        "requested": bool(crews),
-        "blockedReasons": [] if crews else ["employee_not_scoped"],
+        "effective": scoped,
+        "requested": scoped,
+        "blockedReasons": [] if scoped else ["employee_not_scoped"],
         "crews": crews,
+        "individualScope": individually_scoped,
     }
 
 
@@ -18393,6 +18433,7 @@ def _c6_authoritative_scope_state(
             "requested": False,
             "blockedReasons": ["kill_switch_off"],
             "crews": [],
+            "individualScope": False,
         }
     _c6_lock_authoritative_inputs(cur)
     return _c6_employee_scope_state(employee_id, reference_time, cur=cur)
@@ -18693,7 +18734,7 @@ def _c6_admin_scope_state(
     locations: List[Dict[str, Any]],
     home_bases: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Serialize all active crew scopes plus their enable-time diagnostics."""
+    """Serialize active crew and employee scopes plus enable-time diagnostics."""
 
     readiness = _c6_readiness_from_rows(locations, home_bases)
     rows = db.query_all(
@@ -18718,10 +18759,34 @@ def _c6_admin_scope_state(
                 "blockedReasons": state["blockedReasons"],
             }
         )
+    employee_rows = db.query_all(
+        """
+        SELECT employee.id AS employee_id, employee.name AS employee_name,
+               COALESCE(scope.enabled, false) AS requested
+        FROM employees employee
+        LEFT JOIN geofence_hard_gate_employee_scopes scope
+          ON scope.employee_id = employee.id
+        WHERE employee.active = true
+        ORDER BY employee.id
+        """
+    )
+    employee_scopes = []
+    for row in employee_rows:
+        state = _c6_scope_effective_state(bool(row.get("requested")))
+        employee_scopes.append(
+            {
+                "employeeId": int(row["employee_id"]),
+                "employeeName": str(row.get("employee_name") or ""),
+                "requested": state["requested"],
+                "effective": state["effective"],
+                "blockedReasons": state["blockedReasons"],
+            }
+        )
     return {
         "killSwitchEnabled": bool(GEOFENCE_HARD_GATE_ENABLED),
         "readiness": readiness,
         "scopes": scopes,
+        "employeeScopes": employee_scopes,
     }
 
 
@@ -23406,6 +23471,93 @@ def admin_put_geofence_hard_gate_scope(
             "id": int(scope_row["id"]),
             "crewId": int(crew_id),
             "crewName": str(crew["name"]),
+            "requested": state["requested"],
+            "effective": state["effective"],
+            "blockedReasons": state["blockedReasons"],
+            "updatedAt": to_utc_iso(scope_row["updated_at"]),
+        },
+        "readiness": readiness,
+    }
+
+
+@app.put("/api/admin/geofence-hard-gate-employee-scopes/{employee_id}")
+def admin_put_geofence_hard_gate_employee_scope(
+    employee_id: int,
+    payload: GeofenceHardGateScopeRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Enable or disable one active employee's C6 scope after readiness checks."""
+
+    if employee_id <= 0:
+        raise HTTPException(status_code=422, detail="Employee ID must be positive")
+
+    # Use the same outer writer lock and transaction lock as crew scopes.  An
+    # individual-scope flip cannot race a foreground time action between its
+    # preflight and final persistence.
+    with geofence_hard_gate_scope_write_lock():
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                _lock_geofence_hard_gate_scope_mutations(cur)
+                cur.execute(
+                    "SELECT id, name, active FROM employees WHERE id = %s FOR UPDATE",
+                    (int(employee_id),),
+                )
+                scoped_employee = _row_from_cursor(cur)
+                if not scoped_employee or not bool(scoped_employee.get("active")):
+                    raise HTTPException(status_code=404, detail="Active employee was not found")
+
+                readiness = None
+                if payload.enabled:
+                    # Match C6's enable-time Site lock and global readiness
+                    # guard. Individual scope never narrows the open readiness
+                    # set to one employee or one customer Site.
+                    _lock_customer_site_mutations(cur)
+                    readiness = _c6_load_readiness(cur=cur)
+                    if not readiness["ready"]:
+                        _raise_conflict(
+                            GEOFENCE_HARD_GATE_SCOPE_NOT_READY_CODE,
+                            "Repair geofence readiness before enabling this employee scope.",
+                            readiness,
+                        )
+
+                cur.execute(
+                    """
+                    INSERT INTO geofence_hard_gate_employee_scopes (
+                        employee_id, enabled, created_by, updated_by
+                    ) VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (employee_id)
+                    DO UPDATE SET enabled = EXCLUDED.enabled,
+                                  updated_by = EXCLUDED.updated_by,
+                                  updated_at = NOW()
+                    RETURNING id, enabled, updated_at
+                    """,
+                    (
+                        int(employee_id),
+                        bool(payload.enabled),
+                        int(admin["id"]),
+                        int(admin["id"]),
+                    ),
+                )
+                scope_row = _row_from_cursor(cur)
+
+    requested = bool(scope_row and scope_row.get("enabled"))
+    state = _c6_scope_effective_state(requested)
+    append_access_log(
+        request,
+        "GEOFENCE_HARD_GATE_EMPLOYEE_SCOPE_UPDATED",
+        True,
+        (
+            f"Employee {int(employee_id)} {scoped_employee['name']} "
+            f"requested={requested} by {admin['name']}"
+        ),
+    )
+    return {
+        "success": True,
+        "scope": {
+            "id": int(scope_row["id"]),
+            "employeeId": int(employee_id),
+            "employeeName": str(scoped_employee["name"]),
             "requested": state["requested"],
             "effective": state["effective"],
             "blockedReasons": state["blockedReasons"],
