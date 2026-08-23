@@ -1168,6 +1168,127 @@ def test_commercial_home_base_boundary_rechecks_the_office_under_lock(
             worker.join(timeout=15)
 
 
+def test_commercial_home_base_boundary_uses_final_customer_site_for_end_event(
+    client, auth, monkeypatch
+):
+    """A final Site result must not emit an event from a stale Home Base read."""
+
+    employee_id, employee_auth = _create_employee(client, "final end target")
+    start_site_id = _create_site("final end start", location_type="Commercial")
+    _create_site(
+        "final end office site",
+        latitude=LATITUDE + 0.02,
+        location_type="Commercial",
+    )
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": start_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    original_resolver = api._c3_resolve_site
+    clock_out_resolutions = 0
+
+    def move_home_base_after_provisional_resolution(action, *args, **kwargs):
+        nonlocal clock_out_resolutions
+        resolution = original_resolver(action, *args, **kwargs)
+        if action == "clock-out":
+            clock_out_resolutions += 1
+            if clock_out_resolutions == 1:
+                assert resolution["state"] == "home_base"
+                db.execute(
+                    "UPDATE home_bases SET latitude = %s WHERE active = true",
+                    (LATITUDE + 0.3,),
+                )
+        return resolution
+
+    monkeypatch.setattr(
+        api,
+        "_c3_resolve_site",
+        move_home_base_after_provisional_resolution,
+    )
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert ended.status_code == 200, ended.text
+    assert clock_out_resolutions == 2
+    result = ended.json()
+    assert result["siteResolution"]["state"] == "customer_site"
+    assert "homeBaseEvent" not in result
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE shift_id = %s",
+        (int(result["entry"]["id"]),),
+    ) == {"count": 0}
+
+
+def test_c6_profile_upgrade_defaults_legacy_scope_rows(client):
+    """The old scope table upgrades to a non-null historic policy by default."""
+
+    legacy_employee_id, _ = _create_employee(client, "legacy profile scope")
+    new_employee_id, _ = _create_employee(client, "new profile scope")
+    try:
+        db.execute(
+            "ALTER TABLE geofence_hard_gate_employee_scopes "
+            "DROP COLUMN IF EXISTS policy_profile"
+        )
+        db.execute(
+            """
+            INSERT INTO geofence_hard_gate_employee_scopes (employee_id, enabled)
+            VALUES (%s, true)
+            """,
+            (legacy_employee_id,),
+        )
+
+        api._ensure_geofence_hard_gate_scope_schema()
+
+        assert db.query_one(
+            "SELECT policy_profile FROM geofence_hard_gate_employee_scopes "
+            "WHERE employee_id = %s",
+            (legacy_employee_id,),
+        ) == {"policy_profile": "all_business_start"}
+        assert db.query_one(
+            """
+            INSERT INTO geofence_hard_gate_employee_scopes (employee_id, enabled)
+            VALUES (%s, false)
+            RETURNING policy_profile
+            """,
+            (new_employee_id,),
+        ) == {"policy_profile": "all_business_start"}
+        profile_column = db.query_one(
+            """
+            SELECT is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_name = 'geofence_hard_gate_employee_scopes'
+              AND column_name = 'policy_profile'
+            """
+        )
+        assert profile_column == {
+            "is_nullable": "NO",
+            "column_default": "'all_business_start'::character varying",
+        }
+    finally:
+        # Keep the shared test database compatible with following test modules.
+        api._ensure_geofence_hard_gate_scope_schema()
+
+
 def test_c6_blocks_a_newly_unpinned_selected_site_after_scope_enable(
     client, auth, monkeypatch
 ):

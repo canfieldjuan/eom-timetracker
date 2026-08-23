@@ -6902,30 +6902,39 @@ def _ensure_geofence_hard_gate_scope_schema() -> None:
         WHERE enabled = true
         """
     )
-    # Existing C6b tables predate profile selection.  Add the column with the
-    # historic behavior as its default, then install the same constraint used
-    # by a fresh database.  This is intentionally forward-only and keeps every
-    # existing enabled row on the all-business start-only policy.
-    db.execute(
-        """
-        ALTER TABLE geofence_hard_gate_employee_scopes
-            ADD COLUMN IF NOT EXISTS policy_profile VARCHAR(64)
-        """
-    )
-    db.execute(
-        """
-        UPDATE geofence_hard_gate_employee_scopes
-           SET policy_profile = 'all_business_start'
-         WHERE policy_profile IS NULL
-        """
-    )
-    db.execute(
-        """
-        ALTER TABLE geofence_hard_gate_employee_scopes
-            ALTER COLUMN policy_profile SET DEFAULT 'all_business_start',
-            ALTER COLUMN policy_profile SET NOT NULL
-        """
-    )
+    # Existing C6b tables predate profile selection.  Keep the entire upgrade
+    # atomic: a rolling old worker can insert its legacy row before this
+    # transaction, but never between a nullable column add and its default.
+    # The explicit SET DEFAULT also repairs a partially completed earlier
+    # upgrade before its NULL rows are backfilled and constrained.
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                ALTER TABLE geofence_hard_gate_employee_scopes
+                    ADD COLUMN IF NOT EXISTS policy_profile VARCHAR(64)
+                    NOT NULL DEFAULT 'all_business_start'
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE geofence_hard_gate_employee_scopes
+                    ALTER COLUMN policy_profile SET DEFAULT 'all_business_start'
+                """
+            )
+            cur.execute(
+                """
+                UPDATE geofence_hard_gate_employee_scopes
+                   SET policy_profile = 'all_business_start'
+                 WHERE policy_profile IS NULL
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE geofence_hard_gate_employee_scopes
+                    ALTER COLUMN policy_profile SET NOT NULL
+                """
+            )
     db.execute(
         """
         DO $$
@@ -16772,6 +16781,17 @@ def clock_out(
             raise HTTPException(status_code=409, detail=hard_gate_failure)
 
         if current_resolution.get("state") == "customer_site":
+            # The Home Base event is written after persistence.  Do not let
+            # its closure retain the provisional Home Base result when the
+            # authoritative resolution now identifies a customer Site.
+            home_base.update(
+                {
+                    "policy": None,
+                    "geofence": None,
+                    "confirmed": False,
+                    "exception": "",
+                }
+            )
             result["clockOutGpsMeta"] = _c3_site_gps_meta(
                 gate_payload,
                 current_resolution,
@@ -16781,6 +16801,16 @@ def clock_out(
             geofence = current_resolution.get("geofence")
             if not isinstance(home_base_config, dict) or not isinstance(geofence, dict):
                 raise RuntimeError("Clock-out Home Base resolution was incomplete")
+            # Keep the post-save Home Base event and the persisted GPS metadata
+            # derived from this same locked, final resolution.
+            home_base.update(
+                {
+                    "policy": home_base_config,
+                    "geofence": geofence,
+                    "confirmed": True,
+                    "exception": "",
+                }
+            )
             result["clockOutGpsMeta"] = _home_base_gps_meta(
                 home_base_config,
                 geofence,
