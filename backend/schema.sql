@@ -727,6 +727,42 @@ CREATE TABLE geofence_hard_gate_scopes (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Geofence C6b (#242): default-off, per-employee foreground hard-gate scope.
+-- This is intentionally separate from crew membership: an individual pilot
+-- must not create a fake crew or alter Home Base and scheduling semantics.
+-- Absence of a row remains equivalent to enabled = false.
+CREATE TABLE geofence_hard_gate_employee_scopes (
+    id          BIGSERIAL PRIMARY KEY,
+    employee_id INTEGER NOT NULL UNIQUE REFERENCES employees(id) ON DELETE CASCADE,
+    enabled     BOOLEAN NOT NULL DEFAULT false,
+    created_by  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    updated_by  INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- An individual C6b scope is an explicit active-account enrollment.  Retain
+-- its row for configuration history, but disarm it in the same transaction
+-- when that account is deactivated so a later reactivation never revives a
+-- stale foreground hard gate.
+CREATE OR REPLACE FUNCTION disarm_geofence_hard_gate_employee_scope_on_deactivation()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE geofence_hard_gate_employee_scopes
+       SET enabled = false,
+           updated_at = NOW()
+     WHERE employee_id = NEW.id
+       AND enabled = true;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_disarm_geofence_hard_gate_employee_scope_on_deactivation
+    AFTER UPDATE OF active ON employees
+    FOR EACH ROW
+    WHEN (OLD.active IS TRUE AND NEW.active IS FALSE)
+    EXECUTE FUNCTION disarm_geofence_hard_gate_employee_scope_on_deactivation();
+
 -- The office is an internal paid-workplace boundary, not a Customer/Site.  It
 -- deliberately has no customer, service, rate, revenue, or job reference.
 -- A partial unique index below keeps the first release to one active office

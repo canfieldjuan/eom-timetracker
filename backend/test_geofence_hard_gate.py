@@ -43,6 +43,11 @@ def _clean_rows() -> None:
             (f"{PREFIX}%",),
         )
         cur.execute(
+            "DELETE FROM geofence_hard_gate_employee_scopes WHERE employee_id IN "
+            "(SELECT id FROM employees WHERE name LIKE %s)",
+            (f"{PREFIX}%",),
+        )
+        cur.execute(
             "DELETE FROM crew_memberships WHERE employee_id IN "
             "(SELECT id FROM employees WHERE name LIKE %s)",
             (f"{PREFIX}%",),
@@ -168,6 +173,16 @@ def _enable_scope(client, auth: dict[str, str], crew_id: int) -> dict:
     return response.json()
 
 
+def _enable_employee_scope(client, auth: dict[str, str], employee_id: int) -> dict:
+    response = client.put(
+        f"/api/admin/geofence-hard-gate-employee-scopes/{employee_id}",
+        headers=auth,
+        json={"enabled": True},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def _hard_gate_failure(response) -> dict:
     failure = response.json()
     assert failure["code"] == api.GEOFENCE_HARD_GATE_BLOCK_CODE
@@ -213,6 +228,36 @@ def test_c6_defaults_off_and_preserves_legacy_override(client, monkeypatch):
     assert response.json()["entry"]["clockInGpsMeta"]["override"] is True
 
 
+def test_c6_individual_scope_defaults_off_without_a_scope_row(client, monkeypatch):
+    employee_id, employee_auth = _create_employee(client, "individual default off")
+    _create_site("individual default off")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+
+    state = api._c6_employee_scope_state(employee_id, api.utc_now())
+    assert state["effective"] is False
+    assert state["individualScope"] is False
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM geofence_hard_gate_employee_scopes "
+        "WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+
+    legacy = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 1,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "Parking is behind the building.",
+        },
+    )
+
+    assert legacy.status_code == 200, legacy.text
+    assert legacy.json()["entry"]["clockInGpsMeta"]["override"] is True
+
+
 def test_c6_refuses_scope_enable_until_all_eligible_sites_are_ready(
     client, auth, monkeypatch
 ):
@@ -236,6 +281,212 @@ def test_c6_refuses_scope_enable_until_all_eligible_sites_are_ready(
         "low_or_missing_confidence",
         "not_attested",
     ]
+
+
+def test_c6_refuses_individual_scope_enable_until_all_eligible_sites_are_ready(
+    client, auth, monkeypatch
+):
+    employee_id, _employee_auth = _create_employee(client, "individual readiness")
+    _create_site("individual unpinned", latitude=None, longitude=None, ready=False)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+
+    rejected = client.put(
+        f"/api/admin/geofence-hard-gate-employee-scopes/{employee_id}",
+        headers=auth,
+        json={"enabled": True},
+    )
+
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["code"] == api.GEOFENCE_HARD_GATE_SCOPE_NOT_READY_CODE
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM geofence_hard_gate_employee_scopes "
+        "WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+
+
+def test_c6_rejects_an_inactive_individual_scope_target(client, auth):
+    employee_id, _employee_auth = _create_employee(client, "inactive individual")
+    db.execute("UPDATE employees SET active = false WHERE id = %s", (employee_id,))
+
+    rejected = client.put(
+        f"/api/admin/geofence-hard-gate-employee-scopes/{employee_id}",
+        headers=auth,
+        json={"enabled": False},
+    )
+
+    assert rejected.status_code == 404, rejected.text
+    assert rejected.json() == {"success": False, "error": "Active employee was not found"}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM geofence_hard_gate_employee_scopes "
+        "WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+
+
+def test_c6_deactivation_disarms_individual_scope_without_reactivation_reviving_it(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "individual lifecycle")
+    _create_site("individual lifecycle")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_employee_scope(client, auth, employee_id)
+
+    deactivated = client.patch(
+        f"/api/admin/employees/{employee_id}",
+        headers=auth,
+        json={"active": False},
+    )
+    assert deactivated.status_code == 200, deactivated.text
+    assert deactivated.json()["employee"]["active"] is False
+    assert db.query_one(
+        "SELECT enabled FROM geofence_hard_gate_employee_scopes WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"enabled": False}
+    readiness_while_inactive = client.get("/api/admin/geofence-readiness", headers=auth)
+    assert readiness_while_inactive.status_code == 200, readiness_while_inactive.text
+    assert all(
+        scope["employeeId"] != employee_id
+        for scope in readiness_while_inactive.json()["hardGate"]["employeeScopes"]
+    )
+
+    reactivated = client.patch(
+        f"/api/admin/employees/{employee_id}",
+        headers=auth,
+        json={"active": True},
+    )
+    assert reactivated.status_code == 200, reactivated.text
+    assert reactivated.json()["employee"]["active"] is True
+    assert api._c6_employee_scope_state(employee_id, api.utc_now()) == {
+        "effective": False,
+        "requested": False,
+        "blockedReasons": ["employee_not_scoped"],
+        "crews": [],
+        "individualScope": False,
+    }
+
+    legacy = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 1,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "Parking is behind the building.",
+        },
+    )
+    assert legacy.status_code == 200, legacy.text
+    assert legacy.json()["entry"]["clockInGpsMeta"]["override"] is True
+
+
+def test_c6_individual_scope_blocks_free_text_bypass_and_keeps_crew_state_empty(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "individual clock in")
+    site_id = _create_site("individual clock in")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+
+    enabled = _enable_employee_scope(client, auth, employee_id)
+    assert enabled["scope"]["employeeId"] == employee_id
+    assert enabled["scope"]["effective"] is True
+    readiness = client.get("/api/admin/geofence-readiness", headers=auth)
+    assert readiness.status_code == 200, readiness.text
+    employee_scope = next(
+        item
+        for item in readiness.json()["hardGate"]["employeeScopes"]
+        if item["employeeId"] == employee_id
+    )
+    assert employee_scope == {
+        "employeeId": employee_id,
+        "employeeName": f"{PREFIX} individual clock in",
+        "requested": True,
+        "effective": True,
+        "blockedReasons": [],
+    }
+    assert api._c6_employee_scope_state(employee_id, api.utc_now()) == {
+        "effective": True,
+        "requested": True,
+        "blockedReasons": [],
+        "crews": [],
+        "individualScope": True,
+    }
+
+    status = client.get("/api/timesheet/current-status", headers=employee_auth)
+    assert status.status_code == 200, status.text
+    assert status.json()["hardGateEnabled"] is True
+    assert status.json()["siteResolutionEnabled"] is True
+
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": LATITUDE + 1,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "I am definitely here.",
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert _hard_gate_failure(blocked)["details"]["reason"] == "outside"
+
+
+def test_c6_individual_scope_kill_switch_rolls_back_to_legacy_behavior(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "individual kill switch")
+    _create_site("individual kill switch")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+
+    scope = _enable_employee_scope(client, auth, employee_id)
+    assert scope["scope"]["requested"] is True
+    assert scope["scope"]["effective"] is False
+    assert scope["scope"]["blockedReasons"] == ["kill_switch_off"]
+
+    legacy = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 1,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "Parking is behind the building.",
+        },
+    )
+
+    assert legacy.status_code == 200, legacy.text
+    assert legacy.json()["entry"]["clockInGpsMeta"]["override"] is True
+
+
+def test_c6_individual_scope_composes_with_an_existing_crew_scope(
+    client, auth, monkeypatch
+):
+    employee_id, _employee_auth = _create_employee(client, "individual and crew")
+    crew_id = _create_crew(employee_id, "individual and crew")
+    _create_site("individual and crew")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+
+    _enable_scope(client, auth, crew_id)
+    _enable_employee_scope(client, auth, employee_id)
+    state = api._c6_employee_scope_state(employee_id, api.utc_now())
+    assert state["effective"] is True
+    assert state["individualScope"] is True
+    assert state["crews"] == [{"id": crew_id, "name": f"{PREFIX} individual and crew"}]
+
+    disabled = client.put(
+        f"/api/admin/geofence-hard-gate-employee-scopes/{employee_id}",
+        headers=auth,
+        json={"enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+    state_after = api._c6_employee_scope_state(employee_id, api.utc_now())
+    assert state_after["effective"] is True
+    assert state_after["individualScope"] is False
+    assert state_after["crews"] == [{"id": crew_id, "name": f"{PREFIX} individual and crew"}]
 
 
 def test_c6_blocks_free_text_bypass_and_advertises_scoped_capability(
