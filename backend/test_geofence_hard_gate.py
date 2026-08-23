@@ -324,6 +324,62 @@ def test_c6_rejects_an_inactive_individual_scope_target(client, auth):
     ) == {"count": 0}
 
 
+def test_c6_deactivation_disarms_individual_scope_without_reactivation_reviving_it(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "individual lifecycle")
+    _create_site("individual lifecycle")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_employee_scope(client, auth, employee_id)
+
+    deactivated = client.patch(
+        f"/api/admin/employees/{employee_id}",
+        headers=auth,
+        json={"active": False},
+    )
+    assert deactivated.status_code == 200, deactivated.text
+    assert deactivated.json()["employee"]["active"] is False
+    assert db.query_one(
+        "SELECT enabled FROM geofence_hard_gate_employee_scopes WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"enabled": False}
+    readiness_while_inactive = client.get("/api/admin/geofence-readiness", headers=auth)
+    assert readiness_while_inactive.status_code == 200, readiness_while_inactive.text
+    assert all(
+        scope["employeeId"] != employee_id
+        for scope in readiness_while_inactive.json()["hardGate"]["employeeScopes"]
+    )
+
+    reactivated = client.patch(
+        f"/api/admin/employees/{employee_id}",
+        headers=auth,
+        json={"active": True},
+    )
+    assert reactivated.status_code == 200, reactivated.text
+    assert reactivated.json()["employee"]["active"] is True
+    assert api._c6_employee_scope_state(employee_id, api.utc_now()) == {
+        "effective": False,
+        "requested": False,
+        "blockedReasons": ["employee_not_scoped"],
+        "crews": [],
+        "individualScope": False,
+    }
+
+    legacy = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 1,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "Parking is behind the building.",
+        },
+    )
+    assert legacy.status_code == 200, legacy.text
+    assert legacy.json()["entry"]["clockInGpsMeta"]["override"] is True
+
+
 def test_c6_individual_scope_blocks_free_text_bypass_and_keeps_crew_state_empty(
     client, auth, monkeypatch
 ):

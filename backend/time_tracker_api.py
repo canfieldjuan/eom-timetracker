@@ -6852,6 +6852,57 @@ def _ensure_geofence_hard_gate_scope_schema() -> None:
         WHERE enabled = true
         """
     )
+    # Individual C6b enrollment is valid only while the employee account is
+    # active.  Put that lifecycle invariant at the database boundary so the
+    # normal admin PATCH path and any future employee writer cannot leave an
+    # invisible enabled row that reactivation would silently revive.
+    db.execute(
+        """
+        CREATE OR REPLACE FUNCTION disarm_geofence_hard_gate_employee_scope_on_deactivation()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            UPDATE geofence_hard_gate_employee_scopes
+               SET enabled = false,
+                   updated_at = NOW()
+             WHERE employee_id = NEW.id
+               AND enabled = true;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """
+    )
+    # Rebuild the trigger in one transaction so an upgrade never leaves a
+    # committed interval without the lifecycle guard.
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DROP TRIGGER IF EXISTS "
+                "trg_disarm_geofence_hard_gate_employee_scope_on_deactivation "
+                "ON employees"
+            )
+            cur.execute(
+                """
+                CREATE TRIGGER trg_disarm_geofence_hard_gate_employee_scope_on_deactivation
+                    AFTER UPDATE OF active ON employees
+                    FOR EACH ROW
+                    WHEN (OLD.active IS TRUE AND NEW.active IS FALSE)
+                    EXECUTE FUNCTION disarm_geofence_hard_gate_employee_scope_on_deactivation()
+                """
+            )
+            # A rolling deployment may encounter a row made inactive before
+            # this guard existed.  Make that historical state default-off too;
+            # retain the row rather than deleting its configuration history.
+            cur.execute(
+                """
+                UPDATE geofence_hard_gate_employee_scopes scope
+                   SET enabled = false,
+                       updated_at = NOW()
+                  FROM employees employee
+                 WHERE scope.employee_id = employee.id
+                   AND employee.active = false
+                   AND scope.enabled = true
+                """
+            )
 
 
 def _ensure_schema_migrations() -> None:
@@ -15223,7 +15274,17 @@ def admin_update_employee(
             emp["hourlyRate"] = new_hourly_rate
         return True, {"id": emp["id"], "name": emp["name"], "role": emp["role"], "active": emp["active"], "hourlyRate": emp.get("hourlyRate")}
 
-    ok, result = update_employees(mutator)
+    # A true -> false transition fires C6b's database lifecycle guard.  Take
+    # the same outer writer lock as explicit scope flips first, so a foreground
+    # time action cannot begin between the employee update and that trigger's
+    # transactional scope disarm.  Other employee edits retain their existing
+    # path and do not contend with time writers.
+    deactivating = "active" in payload and not bool(payload["active"])
+    if deactivating:
+        with geofence_hard_gate_scope_write_lock():
+            ok, result = update_employees(mutator)
+    else:
+        ok, result = update_employees(mutator)
     if not ok:
         raise HTTPException(status_code=404, detail=str(result))
     changed_fields = ",".join(sorted(str(key) for key in payload))
