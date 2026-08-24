@@ -223,6 +223,10 @@ def validate_settings(
     if not str(settings.state_dir).strip():
         raise ValueError("EOM_TRACKER_LINKAGE_AUDIT_STATE_DIR must not be blank")
     if require_measurement:
+        # CLOSED / ENUMERATED: these are every nonblank endpoint or credential
+        # setting the current login and audit requests require. Settings is the
+        # canonical monitor configuration inventory; timeout validation is above
+        # and notification settings are validated in their separate branch below.
         for label, value in (
             ("EOM_TRACKER_LINKAGE_AUDIT_BASE_URL", settings.tracker_base_url),
             ("EOM_TRACKER_LINKAGE_AUDIT_ADMIN_NAME", settings.admin_name),
@@ -403,7 +407,9 @@ def measure(settings: Settings) -> AuditResult:
     return build_signals(audit, audit_error)
 
 
-def _previous_breached(previous: Mapping[str, Any]) -> set[str] | None:
+def _previous_breached(previous: Mapping[str, Any] | None) -> set[str] | None:
+    if previous is None:
+        return None
     recorded = previous.get("breached_signals")
     consecutive = previous.get("consecutive")
     if (
@@ -420,9 +426,12 @@ def _previous_breached(previous: Mapping[str, Any]) -> set[str] | None:
 
 
 def decide_alert(
-    previous: Mapping[str, Any], breached: Sequence[str], realert_every: int
+    previous: Mapping[str, Any] | None, breached: Sequence[str], realert_every: int
 ) -> tuple[dict[str, Any], str | None]:
     """Keep each breach class visible rather than collapsing state to a boolean."""
+    # OPEN / DERIVED: this is every breach signal measured in the current run.
+    # Any future signal name remains in state and differs from the prior set,
+    # so it produces a changed-alert rather than being silently ignored.
     current = {str(name) for name in breached}
     before = _previous_breached(previous)
     if not current:
@@ -439,15 +448,15 @@ def decide_alert(
     return state, None
 
 
-def read_state(path: Path) -> tuple[dict[str, Any], str | None]:
+def read_state(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     if not path.exists():
         return {}, None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return {}, f"alert state unreadable ({type(exc).__name__})"
+        return None, f"alert state unreadable ({type(exc).__name__})"
     if not isinstance(value, dict):
-        return {}, "alert state was not an object"
+        return None, "alert state was not an object"
     return value, None
 
 

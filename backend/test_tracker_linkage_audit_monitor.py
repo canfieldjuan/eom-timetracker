@@ -425,6 +425,30 @@ def test_undelivered_alert_does_not_advance_state(tmp_path):
     assert not state_path.exists()
 
 
+@pytest.mark.parametrize("invalid_state", ["{", "[]"])
+def test_unknown_prior_state_with_clean_measurement_announces_recovery(
+    tmp_path, invalid_state: str
+):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(invalid_state, encoding="utf-8")
+    notifications = []
+
+    exit_code = monitor._notify_and_record(
+        _settings(tmp_path),
+        monitor.AuditResult(),
+        state_path,
+        lambda *args: (notifications.append(args), True)[1],
+    )
+
+    assert exit_code == 0
+    assert len(notifications) == 1
+    assert notifications[0][2] == "EOM tracker linkage audit clean"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "breached_signals": [],
+        "consecutive": 0,
+    }
+
+
 def test_publish_accepts_a_successful_notification_response(monkeypatch):
     monkeypatch.setattr(
         monitor,
