@@ -299,6 +299,7 @@ def test_corrupt_state_counter_alerts_as_a_fresh_incident():
 @pytest.mark.parametrize(
     "state",
     [
+        {},
         {"breached_signals": []},
         {"consecutive": 0},
         {"breached_signals": [], "consecutive": 0, "future": True},
@@ -356,6 +357,13 @@ def test_unknown_alert_kind_fails_closed_without_advancing_state(monkeypatch, tm
     assert notifications[0][2] == "EOM tracker linkage audit unavailable"
     assert "unsupported alert kind" in notifications[0][3]
     assert not state_path.exists()
+
+
+def test_missing_state_uses_the_canonical_clean_document(tmp_path):
+    previous, warning = monitor.read_state(tmp_path / "state.json")
+
+    assert warning is None
+    assert previous == {"breached_signals": [], "consecutive": 0}
 
 
 def test_remote_http_configuration_is_refused_before_credentials_are_sent(tmp_path):
@@ -526,7 +534,7 @@ def test_undelivered_alert_does_not_advance_state(tmp_path):
     assert not state_path.exists()
 
 
-@pytest.mark.parametrize("invalid_state", ["{", "[]", b"\xff"])
+@pytest.mark.parametrize("invalid_state", ["{", "{}", "[]", b"\xff"])
 def test_unknown_prior_state_with_clean_measurement_announces_recovery(
     tmp_path, invalid_state: str | bytes
 ):

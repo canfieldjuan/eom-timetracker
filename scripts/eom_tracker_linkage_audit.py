@@ -186,10 +186,6 @@ class AlertState:
     def from_storage(cls, value: Mapping[str, Any] | None) -> "AlertState | None":
         if value is None:
             return None
-        # A missing state file is represented as an empty mapping by read_state.
-        # It is the initial clean state, not a malformed persisted document.
-        if not value:
-            return cls([], 0)
         expected_keys = {schema_field.name for schema_field in fields(cls)}
         if set(value) != expected_keys:
             return None
@@ -545,7 +541,9 @@ def decide_alert(
 
 def read_state(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     if not path.exists():
-        return {}, None
+        # Initial state is serialized through AlertState so a real persisted
+        # empty object cannot impersonate a missing file.
+        return AlertState([], 0).to_storage(), None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
