@@ -22,6 +22,8 @@ ExecStart=/usr/bin/python3 %h/.local/bin/eom-tracker-linkage-audit.py
 # Choose 1-240 seconds above the Tracker deployment's multi-batch audit time.
 EnvironmentFile=%h/.config/eom-tracker-linkage-audit.env
 UMask=0077
-# 2 means the audit measured a real breach and delivered the alert.  Do not
-# accept 1 (script/configuration failure) or 3 (notification was undelivered).
+# CLOSED / DERIVED: normal completion (0) and a delivered real breach (2) are
+# the only accepted outcomes. The focused monitor test parses this line and
+# enforces exact membership against SUCCESS_EXIT_STATUSES in the script.
+# Do not accept 1 (script/configuration failure) or 3 (notification undelivered).
 SuccessExitStatus=0 2

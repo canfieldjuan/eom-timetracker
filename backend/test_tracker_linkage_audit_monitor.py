@@ -34,6 +34,18 @@ def _audit_payload(**overrides: object) -> dict[str, object]:
         "atlasLinkVerification": {"status": "ok", "checked": 0, "error": None},
     }
     payload.update(overrides)
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        for key in monitor.FAULT_SUMMARY_KEYS:
+            count = summary.get(key)
+            if (
+                isinstance(count, int)
+                and not isinstance(count, bool)
+                and count >= 0
+            ):
+                payload.setdefault(key, [{}] * count)
+            else:
+                payload.setdefault(key, [])
     return payload
 
 
@@ -76,6 +88,25 @@ def test_each_integrity_count_breaches_independently(signal: str):
     result = monitor.build_signals(payload)
 
     assert [item.name for item in result.breaches] == [signal]
+
+
+@pytest.mark.parametrize("signal", monitor.FAULT_SUMMARY_KEYS)
+def test_fault_detail_count_mismatch_is_an_unmeasured_breach(signal: str):
+    payload = _audit_payload()
+    payload[signal] = [{}]
+
+    result = monitor.build_signals(payload)
+
+    assert [item.name for item in result.breaches] == ["tracker_audit_unavailable"]
+
+
+@pytest.mark.parametrize("detail_rows", [None, {}, "not-a-list"])
+def test_fault_detail_must_be_a_list(detail_rows: object):
+    payload = _audit_payload(staleReservations=detail_rows)
+
+    result = monitor.build_signals(payload)
+
+    assert [item.name for item in result.breaches] == ["tracker_audit_unavailable"]
 
 
 @pytest.mark.parametrize(
@@ -218,6 +249,9 @@ def test_current_tracker_endpoint_summary_matches_monitor_contract(client, auth)
     assert response.status_code == 200, response.text
     payload = response.json()
     assert set(payload["summary"]) == monitor.EXPECTED_SUMMARY_KEYS
+    for key in monitor.FAULT_SUMMARY_KEYS:
+        assert isinstance(payload[key], list)
+        assert len(payload[key]) == payload["summary"][key]
     verification = payload["atlasLinkVerification"]
     assert payload["summary"]["unlinkedActiveCustomers"] <= payload["summary"][
         "unlinkedCustomers"
@@ -598,7 +632,15 @@ def test_systemd_unit_preserves_failure_and_secret_boundaries():
 
     assert "EnvironmentFile=%h/.config/eom-tracker-linkage-audit.env" in service
     assert "UMask=0077" in service
-    assert "SuccessExitStatus=0 2" in service
+    success_status_line = next(
+        line
+        for line in service.splitlines()
+        if line.startswith("SuccessExitStatus=")
+    )
+    configured_success_statuses = frozenset(
+        int(status) for status in success_status_line.partition("=")[2].split()
+    )
+    assert configured_success_statuses == monitor.SUCCESS_EXIT_STATUSES
     assert "\nEnvironment=EOM_TRACKER_LINKAGE_AUDIT_ADMIN_PASSWORD=" not in service
     assert "EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS" in service
     assert "TimeoutStartSec=11min" in service

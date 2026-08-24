@@ -32,9 +32,14 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote, urlsplit
 
 
+EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_BREACH = 2
 EXIT_UNDELIVERED = 3
+# CLOSED / DERIVED: these are the only outcomes systemd treats as successful.
+# They derive from the monitor's named exit constants; the unit test enforces
+# that the separately parsed systemd value has exactly this membership.
+SUCCESS_EXIT_STATUSES = frozenset({EXIT_OK, EXIT_BREACH})
 
 LOGIN_PATH = "/api/auth/login"
 AUDIT_PATH = "/api/admin/audits/atlas-linkage"
@@ -57,9 +62,11 @@ EXPECTED_SUMMARY_KEYS = frozenset(
     }
 )
 # CLOSED / ENUMERATED: these are every direct, zero-tolerance integrity
-# signal emitted from the current Tracker audit summary. Derived context counts
-# stay out of this list only when their relationship to a direct signal is
-# validated below; any future summary key is rejected by EXPECTED_SUMMARY_KEYS.
+# signal emitted from the current Tracker audit summary. Each also has an
+# identically named top-level detail list whose length is validated below.
+# Derived context counts stay out of this list only when their relationship to
+# a direct signal is validated below; any future summary key is rejected by
+# EXPECTED_SUMMARY_KEYS.
 FAULT_SUMMARY_KEYS = (
     "duplicateGroups",
     "unlinkedCustomers",
@@ -356,6 +363,10 @@ def build_signals(audit: Mapping[str, Any] | None, error: str | None = None) -> 
         return _unmeasured("audit duplicate summary counts were inconsistent")
     if summary["unlinkedActiveCustomers"] > summary["unlinkedCustomers"]:
         return _unmeasured("audit unlinked customer summary counts were inconsistent")
+    for key in FAULT_SUMMARY_KEYS:
+        detail_rows = audit.get(key)
+        if not isinstance(detail_rows, list) or len(detail_rows) != summary[key]:
+            return _unmeasured(f"audit detail list {key} did not match summary")
 
     verification = audit.get("atlasLinkVerification")
     if not isinstance(verification, Mapping):
@@ -564,7 +575,7 @@ def _notify_and_record(
         )
         if state_failure is not None:
             return state_failure
-        return EXIT_BREACH if not result.ok else 0
+        return EXIT_BREACH if not result.ok else EXIT_OK
 
     if alert == "recovered":
         delivered = notifier(
@@ -598,7 +609,7 @@ def _notify_and_record(
     state_failure = _write_state_or_alert(settings, state_path, next_state, notifier)
     if state_failure is not None:
         return state_failure
-    return EXIT_BREACH if not result.ok else 0
+    return EXIT_BREACH if not result.ok else EXIT_OK
 
 
 def _run_test_alert(settings: Settings, notifier: Callable[..., bool]) -> int:
@@ -614,7 +625,7 @@ def _run_test_alert(settings: Settings, notifier: Callable[..., bool]) -> int:
         print("WARNING test alert was not accepted for delivery", file=sys.stderr)
         return EXIT_UNDELIVERED
     print("Test alert accepted for delivery; confirm receipt in the configured channel.")
-    return 0
+    return EXIT_OK
 
 
 def _notify_state_setup_failure(
@@ -676,7 +687,7 @@ def main(
     if args.no_alert:
         result = measure(settings)
         print(result.report())
-        return EXIT_BREACH if not result.ok else 0
+        return EXIT_BREACH if not result.ok else EXIT_OK
 
     state_path = settings.state_dir / "state.json"
     lock_path = state_path.parent / "state.lock"
