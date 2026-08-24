@@ -46,6 +46,7 @@ def _settings(tmp_path: Path) -> object:
         ntfy_topic="private-topic",
         state_dir=tmp_path,
         realert_every=3,
+        audit_timeout_seconds=monitor.DEFAULT_AUDIT_TIMEOUT_SECONDS,
     )
 
 
@@ -189,6 +190,37 @@ def test_remote_http_configuration_is_refused_before_credentials_are_sent(tmp_pa
         )
 
 
+def test_monitor_timeout_has_safe_multi_batch_default():
+    assert monitor.DEFAULT_AUDIT_TIMEOUT_SECONDS >= 60
+
+
+@pytest.mark.parametrize("bad_timeout", [0, -1, float("inf"), float("nan")])
+def test_invalid_monitor_timeout_is_refused(tmp_path, bad_timeout: float):
+    with pytest.raises(ValueError, match="positive finite"):
+        monitor.validate_settings(
+            replace(_settings(tmp_path), audit_timeout_seconds=bad_timeout),
+            require_measurement=True,
+            require_notification=True,
+        )
+
+
+def test_monitor_timeout_can_be_configured_from_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS", "95")
+
+    settings = monitor.settings_from_environment(
+        state_dir=str(tmp_path), realert_every=3
+    )
+
+    assert settings.audit_timeout_seconds == 95
+
+
+def test_malformed_monitor_timeout_environment_is_refused(monkeypatch, tmp_path):
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS", "not-a-number")
+
+    with pytest.raises(ValueError, match="positive finite"):
+        monitor.settings_from_environment(state_dir=str(tmp_path), realert_every=3)
+
+
 class _Response:
     def __init__(self, body: dict[str, object], status: int = 200):
         self._body = json.dumps(body).encode("utf-8")
@@ -204,16 +236,21 @@ class _Response:
         return self._body
 
 
-class _IncompleteResponse(_Response):
+class _ProtocolErrorResponse(_Response):
+    def __init__(self, error: Exception):
+        self._error = error
+
     def read(self) -> bytes:
-        raise http.client.IncompleteRead(b'{"partial":', 20)
+        raise self._error
 
 
 def test_measure_logs_in_each_run_then_uses_the_returned_bearer(monkeypatch, tmp_path):
     calls = []
+    timeouts = []
 
-    def fake_urlopen(request):
+    def fake_urlopen(request, *, timeout_seconds):
         calls.append(request)
+        timeouts.append(timeout_seconds)
         if request.full_url.endswith("/api/auth/login"):
             assert request.get_method() == "POST"
             assert json.loads(request.data.decode("utf-8")) == {
@@ -228,20 +265,39 @@ def test_measure_logs_in_each_run_then_uses_the_returned_bearer(monkeypatch, tmp
 
     monkeypatch.setattr(monitor, "_open_no_redirect", fake_urlopen)
 
-    result = monitor.measure(_settings(tmp_path))
+    result = monitor.measure(
+        replace(_settings(tmp_path), audit_timeout_seconds=95)
+    )
 
     assert result.ok
     assert len(calls) == 2
+    assert timeouts == [95] * 2
 
 
-def test_truncated_http_response_becomes_an_unmeasured_breach(monkeypatch, tmp_path):
-    monkeypatch.setattr(monitor, "_open_no_redirect", lambda _request: _IncompleteResponse({}))
+@pytest.mark.parametrize(
+    "protocol_error",
+    [
+        http.client.IncompleteRead(b'{"partial":', 20),
+        http.client.BadStatusLine("invalid status line"),
+        http.client.LineTooLong("oversized header"),
+    ],
+)
+def test_http_protocol_failure_becomes_an_unmeasured_breach(
+    monkeypatch, tmp_path, protocol_error: http.client.HTTPException
+):
+    monkeypatch.setattr(
+        monitor,
+        "_open_no_redirect",
+        lambda _request, **_kwargs: _ProtocolErrorResponse(protocol_error),
+    )
 
     result = monitor.measure(_settings(tmp_path))
 
     assert [item.name for item in result.breaches] == ["tracker_audit_unavailable"]
     assert result.breaches[0].count is None
-    assert result.breaches[0].error == "login request failed (IncompleteRead)"
+    assert result.breaches[0].error == (
+        f"login request failed ({type(protocol_error).__name__})"
+    )
 
 
 def test_undelivered_alert_does_not_advance_state(tmp_path):
@@ -298,6 +354,7 @@ def test_systemd_unit_preserves_failure_and_secret_boundaries():
     assert "UMask=0077" in service
     assert "SuccessExitStatus=0 2" in service
     assert "\nEnvironment=EOM_TRACKER_LINKAGE_AUDIT_ADMIN_PASSWORD=" not in service
+    assert "EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS" in service
     assert "OnUnitActiveSec=1h" in timer
     assert "Persistent=true" in timer
     assert "loginctl enable-linger <monitor-user>" in timer

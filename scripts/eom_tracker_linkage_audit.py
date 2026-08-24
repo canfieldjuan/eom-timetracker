@@ -20,6 +20,7 @@ import argparse
 import fcntl
 import http.client
 import json
+import math
 import os
 import sys
 import tempfile
@@ -61,6 +62,10 @@ FAULT_SUMMARY_KEYS = (
     "staleReservations",
     "danglingLinks",
 )
+# OPEN / ENUMERATED: Tracker owns this status vocabulary. The standalone
+# monitor mirrors the statuses known at this revision because importing Tracker
+# code would prevent it from reporting a Tracker failure. Any future,
+# unlisted status fails closed as an unreadable measurement below.
 KNOWN_VERIFICATION_STATUSES = frozenset({"ok", "unavailable", "unconfigured", "skipped"})
 
 DEFAULT_STATE_DIR = Path(
@@ -68,7 +73,10 @@ DEFAULT_STATE_DIR = Path(
 ) / "eom-tracker-linkage-audit"
 DEFAULT_NTFY_URL = "https://ntfy.sh"
 DEFAULT_REALERT_EVERY = 24
-HTTP_TIMEOUT_SECONDS = 15
+# Atlas-link verification can make serial 100-ID reads. Keep a safe default
+# for normal multi-batch work, while allowing the monitor host to align its
+# finite watchdog with the Tracker deployment's configured upstream budget.
+DEFAULT_AUDIT_TIMEOUT_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -80,6 +88,7 @@ class Settings:
     ntfy_topic: str
     state_dir: Path
     realert_every: int
+    audit_timeout_seconds: float
 
 
 @dataclass(frozen=True)
@@ -124,9 +133,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _open_no_redirect(request: urllib.request.Request):
+def _open_no_redirect(
+    request: urllib.request.Request,
+    *,
+    timeout_seconds: float = DEFAULT_AUDIT_TIMEOUT_SECONDS,
+):
     return urllib.request.build_opener(_NoRedirect()).open(
-        request, timeout=HTTP_TIMEOUT_SECONDS
+        request, timeout=timeout_seconds
     )
 
 
@@ -136,8 +149,15 @@ def _setting(name: str) -> str:
 
 def settings_from_environment(*, state_dir: str | None, realert_every: int | None) -> Settings:
     configured_realert = _setting("EOM_TRACKER_LINKAGE_AUDIT_REALERT_EVERY")
+    configured_timeout = _setting("EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS")
     if realert_every is None:
         realert_every = int(configured_realert or DEFAULT_REALERT_EVERY)
+    try:
+        audit_timeout_seconds = float(configured_timeout or DEFAULT_AUDIT_TIMEOUT_SECONDS)
+    except ValueError as exc:
+        raise ValueError(
+            "EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS must be a positive finite number"
+        ) from exc
     return Settings(
         tracker_base_url=_setting("EOM_TRACKER_LINKAGE_AUDIT_BASE_URL"),
         admin_name=_setting("EOM_TRACKER_LINKAGE_AUDIT_ADMIN_NAME"),
@@ -150,6 +170,7 @@ def settings_from_environment(*, state_dir: str | None, realert_every: int | Non
             or str(DEFAULT_STATE_DIR)
         ),
         realert_every=realert_every,
+        audit_timeout_seconds=audit_timeout_seconds,
     )
 
 
@@ -176,6 +197,13 @@ def validate_settings(
     if settings.realert_every < 0:
         raise ValueError(
             "EOM_TRACKER_LINKAGE_AUDIT_REALERT_EVERY must not be negative"
+        )
+    if (
+        not math.isfinite(settings.audit_timeout_seconds)
+        or settings.audit_timeout_seconds <= 0
+    ):
+        raise ValueError(
+            "EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS must be a positive finite number"
         )
     if not str(settings.state_dir).strip():
         raise ValueError("EOM_TRACKER_LINKAGE_AUDIT_STATE_DIR must not be blank")
@@ -206,6 +234,7 @@ def _http_json(
     method: str,
     payload: Mapping[str, Any] | None = None,
     headers: Mapping[str, str] | None = None,
+    timeout_seconds: float = DEFAULT_AUDIT_TIMEOUT_SECONDS,
 ) -> tuple[dict[str, Any] | None, str | None]:
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     request_headers = {"Accept": "application/json"}
@@ -220,11 +249,11 @@ def _http_json(
         method=method,
     )
     try:
-        with _open_no_redirect(request) as response:
+        with _open_no_redirect(request, timeout_seconds=timeout_seconds) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
         return None, f"HTTP {exc.code}"
-    except (http.client.IncompleteRead, urllib.error.URLError, OSError, ValueError) as exc:
+    except (http.client.HTTPException, urllib.error.URLError, OSError, ValueError) as exc:
         return None, f"request failed ({type(exc).__name__})"
     try:
         decoded = json.loads(raw.decode("utf-8"))
@@ -240,6 +269,7 @@ def _login(settings: Settings) -> tuple[str | None, str | None]:
         _endpoint(settings.tracker_base_url, LOGIN_PATH),
         method="POST",
         payload={"name": settings.admin_name, "password": settings.admin_password},
+        timeout_seconds=settings.audit_timeout_seconds,
     )
     if error:
         return None, f"login {error}"
@@ -254,6 +284,7 @@ def _fetch_audit(settings: Settings, token: str) -> tuple[dict[str, Any] | None,
         _endpoint(settings.tracker_base_url, AUDIT_PATH),
         method="GET",
         headers={"Authorization": f"Bearer {token}"},
+        timeout_seconds=settings.audit_timeout_seconds,
     )
     if error:
         return None, f"audit {error}"
