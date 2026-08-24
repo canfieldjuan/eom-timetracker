@@ -35,6 +35,7 @@ def _operational_counts() -> dict[str, int]:
 def _manifest_content(
     *,
     with_name: bool = True,
+    with_editability: bool = False,
     with_route: bool = True,
     declared: bool = True,
     routes_malformed: bool = False,
@@ -50,6 +51,10 @@ def _manifest_content(
         capabilities: list[object] = ["lead.lost"]
         if with_name:
             capabilities.append(api.ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY)
+        if with_editability:
+            capabilities.append(
+                api.ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_EDITABILITY
+            )
         if capabilities_malformed:
             capabilities.append(1)
         content["capabilities"] = capabilities
@@ -150,6 +155,38 @@ def test_review_proves_the_directory_only_with_both_name_and_route(
         response = client.get("/api/admin/funnel/review", headers=auth)
         assert response.status_code == 200, response.text
         assert response.json()["contactDirectoryAvailable"] is expected, manifest
+
+
+def test_review_proves_directory_editability_only_with_semantics_and_route(
+    client, auth, monkeypatch
+):
+    """The row verdict requires both directory names and the registered GET.
+
+    The second name versions the response semantics; either name alone, a
+    missing/malformed route, a malformed capability member, or no manifest
+    must leave the Website's Edit affordance closed.
+    """
+    shapes = [
+        (_manifest_content(with_editability=True), True),
+        (_manifest_content(), False),
+        (_manifest_content(with_name=False, with_editability=True), False),
+        (_manifest_content(with_editability=True, with_route=False), False),
+        (_manifest_content(declared=False), False),
+        (_manifest_content(with_editability=True, routes_malformed=True), False),
+        (
+            _manifest_content(with_editability=True, capabilities_malformed=True),
+            False,
+        ),
+    ]
+    for manifest, expected in shapes:
+        monkeypatch.setattr(
+            api, "_atlas_funnel_read", lambda *_a, _m=manifest, **_k: _m
+        )
+        response = client.get("/api/admin/funnel/review", headers=auth)
+        assert response.status_code == 200, response.text
+        assert (
+            response.json()["contactDirectoryEditabilityAvailable"] is expected
+        ), manifest
 
 
 # ---------------------------------------------------------------------------

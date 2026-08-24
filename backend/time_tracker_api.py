@@ -4954,6 +4954,11 @@ ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_LIST = "onboarding.draft.list"
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND = "onboarding.draft.approve_send"
 ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY = "contact.directory"
+# Same route as the directory capability, but a separate response-semantic
+# proof: Atlas advertises this only when each row carries its authoritative
+# editable/editBlockedReason verdict. The Website must not infer that verdict
+# merely from directory route reachability.
+ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_EDITABILITY = "contact.directory.editability"
 # Archive/restore transitions and the archived directory view (website #253).
 # `contact.directory.archived` is Atlas's proof that the DEPLOYED directory
 # understands the closed `lifecycle` filter: the name exists only in builds
@@ -22052,6 +22057,18 @@ def admin_list_funnel_review(
         "contactDirectoryAvailable": (
             strict_capabilities is not None
             and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY in strict_capabilities
+            and capability_routes is not None
+            and _ATLAS_CONTACT_DIRECTORY_ROUTE in capability_routes
+        ),
+        # A directory response may be reachable without its newer row-level
+        # editability contract. Require the base directory capability, the
+        # versioned response-semantics capability, and the exact GET route from
+        # one strict manifest read; otherwise the Website keeps Edit closed.
+        "contactDirectoryEditabilityAvailable": (
+            strict_capabilities is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY in strict_capabilities
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_EDITABILITY
+            in strict_capabilities
             and capability_routes is not None
             and _ATLAS_CONTACT_DIRECTORY_ROUTE in capability_routes
         ),
