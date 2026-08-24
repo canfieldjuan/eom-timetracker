@@ -189,6 +189,29 @@ def test_inconsistent_duplicate_summary_is_an_unmeasured_breach(summary: dict[st
     assert [item.name for item in result.breaches] == ["tracker_audit_unavailable"]
 
 
+@pytest.mark.parametrize(
+    "summary",
+    [
+        _summary(unlinkedCustomers=1, unlinkedActiveCustomers=0),
+        _summary(unlinkedCustomers=1, unlinkedActiveCustomers=1),
+    ],
+)
+def test_valid_active_unlinked_counts_keep_the_direct_unlinked_breach(
+    summary: dict[str, int]
+):
+    result = monitor.build_signals(_audit_payload(summary=summary))
+
+    assert [item.name for item in result.breaches] == ["unlinkedCustomers"]
+
+
+def test_active_unlinked_count_above_total_is_an_unmeasured_breach():
+    result = monitor.build_signals(
+        _audit_payload(summary=_summary(unlinkedCustomers=0, unlinkedActiveCustomers=1))
+    )
+
+    assert [item.name for item in result.breaches] == ["tracker_audit_unavailable"]
+
+
 def test_current_tracker_endpoint_summary_matches_monitor_contract(client, auth):
     response = client.get("/api/admin/audits/atlas-linkage", headers=auth)
 
@@ -461,6 +484,33 @@ def test_test_alert_does_not_measure_or_change_state(monkeypatch, tmp_path):
     assert exit_code == 0
     assert len(delivered) == 1
     assert not (tmp_path / "state.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("delivered", "expected_exit"),
+    [(True, monitor.EXIT_ERROR), (False, monitor.EXIT_UNDELIVERED)],
+)
+def test_state_setup_failure_alerts_without_measuring(
+    monkeypatch, tmp_path, delivered: bool, expected_exit: int
+):
+    blocked_state_dir = tmp_path / "not-a-directory"
+    blocked_state_dir.write_text("file blocks state directory", encoding="utf-8")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_BASE_URL", "https://tracker.example.test")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_ADMIN_NAME", "Audit Monitor")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_ADMIN_PASSWORD", "password")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_NTFY_TOPIC", "private-topic")
+    monkeypatch.setattr(monitor, "measure", lambda _settings: pytest.fail("must not measure"))
+    notifications = []
+
+    exit_code = monitor.main(
+        ["--state-dir", str(blocked_state_dir)],
+        notifier=lambda *args: (notifications.append(args), delivered)[1],
+    )
+
+    assert exit_code == expected_exit
+    assert len(notifications) == 1
+    assert notifications[0][2] == "EOM tracker linkage audit unavailable"
+    assert "no audit was run" in notifications[0][3]
 
 
 def test_systemd_unit_preserves_failure_and_secret_boundaries():

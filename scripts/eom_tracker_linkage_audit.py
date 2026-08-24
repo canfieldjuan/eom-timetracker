@@ -32,6 +32,7 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote, urlsplit
 
 
+EXIT_ERROR = 1
 EXIT_BREACH = 2
 EXIT_UNDELIVERED = 3
 
@@ -55,6 +56,10 @@ EXPECTED_SUMMARY_KEYS = frozenset(
         "danglingLinks",
     }
 )
+# CLOSED / ENUMERATED: these are every direct, zero-tolerance integrity
+# signal emitted from the current Tracker audit summary. Derived context counts
+# stay out of this list only when their relationship to a direct signal is
+# validated below; any future summary key is rejected by EXPECTED_SUMMARY_KEYS.
 FAULT_SUMMARY_KEYS = (
     "duplicateGroups",
     "unlinkedCustomers",
@@ -345,6 +350,8 @@ def build_signals(audit: Mapping[str, Any] | None, error: str | None = None) -> 
         or duplicate_extra_customers > linked_customers - duplicate_groups
     ):
         return _unmeasured("audit duplicate summary counts were inconsistent")
+    if summary["unlinkedActiveCustomers"] > summary["unlinkedCustomers"]:
+        return _unmeasured("audit unlinked customer summary counts were inconsistent")
 
     verification = audit.get("atlasLinkVerification")
     if not isinstance(verification, Mapping):
@@ -559,6 +566,25 @@ def _run_test_alert(settings: Settings, notifier: Callable[..., bool]) -> int:
     return 0
 
 
+def _notify_state_setup_failure(
+    settings: Settings, notifier: Callable[..., bool]
+) -> int:
+    """Alert without state when the normal alert state cannot be prepared."""
+    delivered = notifier(
+        settings.ntfy_url,
+        settings.ntfy_topic,
+        "EOM tracker linkage audit unavailable",
+        "Monitor state storage could not be prepared; no audit was run. "
+        "Correct the local state directory and retry.",
+        "urgent",
+        "rotating_light,warning",
+    )
+    if not delivered:
+        print("WARNING state setup alert undelivered", file=sys.stderr)
+        return EXIT_UNDELIVERED
+    return EXIT_ERROR
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -609,10 +635,17 @@ def main(
         return EXIT_BREACH if not result.ok else 0
 
     state_path = settings.state_dir / "state.json"
-    state_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = state_path.parent / "state.lock"
-    with lock_path.open("a", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = lock_path.open("a", encoding="utf-8")
+    except OSError:
+        return _notify_state_setup_failure(settings, notifier)
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError:
+            return _notify_state_setup_failure(settings, notifier)
         # Measure while locked.  A stale clean measurement must never overwrite
         # a later breach state another invocation just recorded.
         result = measure(settings)
