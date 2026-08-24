@@ -77,6 +77,14 @@ DEFAULT_REALERT_EVERY = 24
 # for normal multi-batch work, while allowing the monitor host to align its
 # finite watchdog with the Tracker deployment's configured upstream budget.
 DEFAULT_AUDIT_TIMEOUT_SECONDS = 60.0
+# The user service caps an entire run at 11 minutes. Login and audit each use
+# this value, while the remaining minute covers notification and cleanup.
+MAX_AUDIT_TIMEOUT_SECONDS = 240.0
+
+# OPEN / ENUMERATED: these are the deliberately supported local host spellings
+# for HTTP-only development. Every unlisted hostname, including other loopback
+# aliases and addresses, is rejected rather than silently weakening HTTPS.
+LOOPBACK_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 @dataclass(frozen=True)
@@ -180,11 +188,7 @@ def _validate_url(label: str, value: str) -> None:
         raise ValueError(f"{label} must be an absolute http(s) URL")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError(f"{label} must not include credentials, query, or fragment")
-    if parsed.scheme == "http" and parsed.hostname not in {
-        "localhost",
-        "127.0.0.1",
-        "::1",
-    }:
+    if parsed.scheme == "http" and parsed.hostname not in LOOPBACK_HTTP_HOSTS:
         raise ValueError(f"{label} must use HTTPS outside loopback")
 
 
@@ -201,9 +205,11 @@ def validate_settings(
     if (
         not math.isfinite(settings.audit_timeout_seconds)
         or settings.audit_timeout_seconds <= 0
+        or settings.audit_timeout_seconds > MAX_AUDIT_TIMEOUT_SECONDS
     ):
         raise ValueError(
-            "EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS must be a positive finite number"
+            "EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS must be a positive finite "
+            f"number no greater than {MAX_AUDIT_TIMEOUT_SECONDS:g}"
         )
     if not str(settings.state_dir).strip():
         raise ValueError("EOM_TRACKER_LINKAGE_AUDIT_STATE_DIR must not be blank")
@@ -327,7 +333,10 @@ def build_signals(audit: Mapping[str, Any] | None, error: str | None = None) -> 
     if not isinstance(verification, Mapping):
         return _unmeasured("Atlas link verification status was missing or invalid")
     verification_status = verification.get("status")
-    if verification_status not in KNOWN_VERIFICATION_STATUSES:
+    if (
+        not isinstance(verification_status, str)
+        or verification_status not in KNOWN_VERIFICATION_STATUSES
+    ):
         return _unmeasured("Atlas link verification status was invalid")
     if verification_status == "ok":
         checked = verification.get("checked")

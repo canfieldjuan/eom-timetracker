@@ -73,6 +73,8 @@ def test_each_integrity_count_breaches_independently(signal: str):
         _audit_payload(summary=_summary(unlinkedCustomers=True)),
         _audit_payload(atlasLinkVerification={"status": ""}),
         _audit_payload(atlasLinkVerification={"status": "unknown-status"}),
+        _audit_payload(atlasLinkVerification={"status": []}),
+        _audit_payload(atlasLinkVerification={"status": {}}),
     ],
 )
 def test_incomplete_or_invalid_response_is_an_unmeasured_breach(payload: dict[str, object]):
@@ -190,11 +192,33 @@ def test_remote_http_configuration_is_refused_before_credentials_are_sent(tmp_pa
         )
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://[::1]:8000",
+    ],
+)
+def test_enumerated_loopback_hosts_allow_local_http(url: str):
+    monitor._validate_url("test URL", url)
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.2:8000", "http://[::2]:8000"])
+def test_unlisted_loopback_hosts_do_not_bypass_https(url: str):
+    with pytest.raises(ValueError, match="HTTPS"):
+        monitor._validate_url("test URL", url)
+
+
 def test_monitor_timeout_has_safe_multi_batch_default():
     assert monitor.DEFAULT_AUDIT_TIMEOUT_SECONDS >= 60
+    assert monitor.DEFAULT_AUDIT_TIMEOUT_SECONDS <= monitor.MAX_AUDIT_TIMEOUT_SECONDS
 
 
-@pytest.mark.parametrize("bad_timeout", [0, -1, float("inf"), float("nan")])
+@pytest.mark.parametrize(
+    "bad_timeout",
+    [0, -1, float("inf"), float("nan"), monitor.MAX_AUDIT_TIMEOUT_SECONDS + 1],
+)
 def test_invalid_monitor_timeout_is_refused(tmp_path, bad_timeout: float):
     with pytest.raises(ValueError, match="positive finite"):
         monitor.validate_settings(
@@ -355,6 +379,7 @@ def test_systemd_unit_preserves_failure_and_secret_boundaries():
     assert "SuccessExitStatus=0 2" in service
     assert "\nEnvironment=EOM_TRACKER_LINKAGE_AUDIT_ADMIN_PASSWORD=" not in service
     assert "EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS" in service
+    assert "TimeoutStartSec=11min" in service
     assert "OnUnitActiveSec=1h" in timer
     assert "Persistent=true" in timer
     assert "loginctl enable-linger <monitor-user>" in timer

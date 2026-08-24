@@ -5,6 +5,10 @@ Description=EOM Tracker Atlas-linkage audit monitor
 
 [Service]
 Type=oneshot
+# Two 240-second monitor reads, a 60-second notification request, and cleanup
+# fit below this hard wall-clock bound. It releases the monitor lock if a peer
+# trickles a response indefinitely.
+TimeoutStartSec=11min
 # Install an immutable executable copy; do not run from a disposable worktree:
 #   install -m 755 scripts/eom_tracker_linkage_audit.py \
 #     ~/.local/bin/eom-tracker-linkage-audit.py
@@ -15,7 +19,7 @@ ExecStart=/usr/bin/python3 %h/.local/bin/eom-tracker-linkage-audit.py
 # EOM_TRACKER_LINKAGE_AUDIT_ADMIN_PASSWORD=<that account password>
 # EOM_TRACKER_LINKAGE_AUDIT_NTFY_TOPIC=<private topic>
 # EOM_TRACKER_LINKAGE_AUDIT_TIMEOUT_SECONDS=60
-# Set this above the Tracker deployment's worst-case multi-batch audit time.
+# Choose 1-240 seconds above the Tracker deployment's multi-batch audit time.
 EnvironmentFile=%h/.config/eom-tracker-linkage-audit.env
 UMask=0077
 # 2 means the audit measured a real breach and delivered the alert.  Do not
