@@ -36,16 +36,16 @@ def _audit_payload(**overrides: object) -> dict[str, object]:
     payload.update(overrides)
     summary = payload.get("summary")
     if isinstance(summary, dict):
-        for key in monitor.FAULT_SUMMARY_KEYS:
-            count = summary.get(key)
+        for detail_key, summary_key in monitor.DETAIL_LIST_SUMMARY_KEYS.items():
+            count = summary.get(summary_key)
             if (
                 isinstance(count, int)
                 and not isinstance(count, bool)
                 and count >= 0
             ):
-                payload.setdefault(key, [{}] * count)
+                payload.setdefault(detail_key, [{}] * count)
             else:
-                payload.setdefault(key, [])
+                payload.setdefault(detail_key, [])
     return payload
 
 
@@ -90,19 +90,24 @@ def test_each_integrity_count_breaches_independently(signal: str):
     assert [item.name for item in result.breaches] == [signal]
 
 
-@pytest.mark.parametrize("signal", monitor.FAULT_SUMMARY_KEYS)
-def test_fault_detail_count_mismatch_is_an_unmeasured_breach(signal: str):
+@pytest.mark.parametrize(
+    ("detail_key", "summary_key"), tuple(monitor.DETAIL_LIST_SUMMARY_KEYS.items())
+)
+def test_detail_count_mismatch_is_an_unmeasured_breach(
+    detail_key: str, summary_key: str
+):
     payload = _audit_payload()
-    payload[signal] = [{}]
+    payload[detail_key] = [{}]
 
     result = monitor.build_signals(payload)
 
     assert [item.name for item in result.breaches] == ["tracker_audit_unavailable"]
 
 
+@pytest.mark.parametrize("detail_key", monitor.DETAIL_LIST_SUMMARY_KEYS)
 @pytest.mark.parametrize("detail_rows", [None, {}, "not-a-list"])
-def test_fault_detail_must_be_a_list(detail_rows: object):
-    payload = _audit_payload(staleReservations=detail_rows)
+def test_detail_must_be_a_list(detail_key: str, detail_rows: object):
+    payload = _audit_payload(**{detail_key: detail_rows})
 
     result = monitor.build_signals(payload)
 
@@ -249,9 +254,9 @@ def test_current_tracker_endpoint_summary_matches_monitor_contract(client, auth)
     assert response.status_code == 200, response.text
     payload = response.json()
     assert set(payload["summary"]) == monitor.EXPECTED_SUMMARY_KEYS
-    for key in monitor.FAULT_SUMMARY_KEYS:
-        assert isinstance(payload[key], list)
-        assert len(payload[key]) == payload["summary"][key]
+    for detail_key, summary_key in monitor.DETAIL_LIST_SUMMARY_KEYS.items():
+        assert isinstance(payload[detail_key], list)
+        assert len(payload[detail_key]) == payload["summary"][summary_key]
     verification = payload["atlasLinkVerification"]
     assert payload["summary"]["unlinkedActiveCustomers"] <= payload["summary"][
         "unlinkedCustomers"
@@ -265,18 +270,18 @@ def test_current_tracker_endpoint_summary_matches_monitor_contract(client, auth)
 
 def test_state_tracks_each_breach_class_and_announces_changes():
     state, alert = monitor.decide_alert({}, ["unlinkedCustomers"], realert_every=3)
-    assert alert == "breach"
+    assert alert is monitor.AlertKind.BREACH
 
     state, alert = monitor.decide_alert(
         state,
         ["unlinkedCustomers", "danglingLinks"],
         realert_every=3,
     )
-    assert alert == "changed"
+    assert alert is monitor.AlertKind.CHANGED
     assert state["breached_signals"] == ["danglingLinks", "unlinkedCustomers"]
 
     state, alert = monitor.decide_alert(state, [], realert_every=3)
-    assert alert == "recovered"
+    assert alert is monitor.AlertKind.RECOVERED
     assert state == {"breached_signals": [], "consecutive": 0}
 
 
@@ -287,8 +292,70 @@ def test_corrupt_state_counter_alerts_as_a_fresh_incident():
         realert_every=3,
     )
 
-    assert alert == "breach"
+    assert alert is monitor.AlertKind.BREACH
     assert state == {"breached_signals": ["unlinkedCustomers"], "consecutive": 1}
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"breached_signals": []},
+        {"consecutive": 0},
+        {"breached_signals": [], "consecutive": 0, "future": True},
+        {"breached_signals": [], "consecutive": 1},
+        {"breached_signals": ["unlinkedCustomers"], "consecutive": 0},
+        {
+            "breached_signals": ["unlinkedCustomers", "unlinkedCustomers"],
+            "consecutive": 1,
+        },
+    ],
+)
+def test_persisted_state_schema_rejects_incomplete_or_inconsistent_documents(
+    state: dict[str, object]
+):
+    assert monitor.AlertState.from_storage(state) is None
+
+    next_state, alert = monitor.decide_alert(state, ["unlinkedCustomers"], realert_every=3)
+
+    assert alert is monitor.AlertKind.BREACH
+    assert next_state == {"breached_signals": ["unlinkedCustomers"], "consecutive": 1}
+
+
+def test_reminder_uses_the_canonical_alert_kind():
+    state, alert = monitor.decide_alert(
+        {"breached_signals": ["unlinkedCustomers"], "consecutive": 2},
+        ["unlinkedCustomers"],
+        realert_every=3,
+    )
+
+    assert alert is monitor.AlertKind.REMINDER
+    assert state == {"breached_signals": ["unlinkedCustomers"], "consecutive": 3}
+
+
+def test_alert_delivery_contract_covers_the_canonical_vocabulary():
+    assert frozenset(monitor.ALERT_PRESENTATIONS) == frozenset(monitor.AlertKind)
+
+
+def test_unknown_alert_kind_fails_closed_without_advancing_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        monitor,
+        "decide_alert",
+        lambda *_args: ({"breached_signals": ["unlinkedCustomers"], "consecutive": 1}, "future"),
+    )
+    state_path = tmp_path / "state.json"
+    notifications = []
+
+    exit_code = monitor._notify_and_record(
+        _settings(tmp_path),
+        monitor.AuditResult([monitor.Signal("unlinkedCustomers", "test", count=1)]),
+        state_path,
+        lambda *args: (notifications.append(args), True)[1],
+    )
+
+    assert exit_code == monitor.EXIT_ERROR
+    assert notifications[0][2] == "EOM tracker linkage audit unavailable"
+    assert "unsupported alert kind" in notifications[0][3]
+    assert not state_path.exists()
 
 
 def test_remote_http_configuration_is_refused_before_credentials_are_sent(tmp_path):
@@ -459,12 +526,15 @@ def test_undelivered_alert_does_not_advance_state(tmp_path):
     assert not state_path.exists()
 
 
-@pytest.mark.parametrize("invalid_state", ["{", "[]"])
+@pytest.mark.parametrize("invalid_state", ["{", "[]", b"\xff"])
 def test_unknown_prior_state_with_clean_measurement_announces_recovery(
-    tmp_path, invalid_state: str
+    tmp_path, invalid_state: str | bytes
 ):
     state_path = tmp_path / "state.json"
-    state_path.write_text(invalid_state, encoding="utf-8")
+    if isinstance(invalid_state, bytes):
+        state_path.write_bytes(invalid_state)
+    else:
+        state_path.write_text(invalid_state, encoding="utf-8")
     notifications = []
 
     exit_code = monitor._notify_and_record(

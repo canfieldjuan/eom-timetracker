@@ -26,7 +26,8 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote, urlsplit
@@ -74,6 +75,19 @@ FAULT_SUMMARY_KEYS = (
     "staleReservations",
     "danglingLinks",
 )
+# CLOSED / ENUMERATED: every top-level list returned by the current Tracker
+# audit whose length is represented by a summary count. The monitor rejects a
+# missing, non-list, or mismatched collection instead of treating a partial
+# response as clean. The backend endpoint is the canonical response owner;
+# EXPECTED_SUMMARY_KEYS rejects any added or removed summary relationship.
+DETAIL_LIST_SUMMARY_KEYS = {
+    "duplicateGroups": "duplicateGroups",
+    "unlinkedCustomers": "unlinkedCustomers",
+    "handoffOrphans": "handoffOrphans",
+    "staleReservations": "staleReservations",
+    "danglingLinks": "danglingLinks",
+    "mappingTemplate": "unlinkedActiveCustomers",
+}
 # OPEN / ENUMERATED: Tracker owns this status vocabulary. The standalone
 # monitor mirrors the statuses known at this revision because importing Tracker
 # code would prevent it from reporting a Tracker failure. Any future,
@@ -113,6 +127,89 @@ class Settings:
     state_dir: Path
     realert_every: int
     audit_timeout_seconds: float
+
+
+class AlertKind(str, Enum):
+    """Every alert decision the monitor can hand to its delivery path."""
+
+    BREACH = "breach"
+    CHANGED = "changed"
+    RECOVERED = "recovered"
+    REMINDER = "reminder"
+
+
+@dataclass(frozen=True)
+class AlertPresentation:
+    title: str
+    priority: str
+    tags: str
+    body: str | None = None
+
+
+# CLOSED / ENUMERATED: AlertKind is the canonical, finite decision vocabulary.
+# This mapping must cover every member before the delivery path will send an
+# alert; a missing, extra, or unknown kind is reported as monitor-unavailable
+# without advancing state rather than falling through to a mislabeled breach.
+ALERT_PRESENTATIONS = {
+    AlertKind.BREACH: AlertPresentation(
+        title="EOM tracker linkage audit breached",
+        priority="urgent",
+        tags="rotating_light,warning",
+    ),
+    AlertKind.CHANGED: AlertPresentation(
+        title="EOM tracker linkage audit: signals changed",
+        priority="urgent",
+        tags="rotating_light,warning",
+    ),
+    AlertKind.RECOVERED: AlertPresentation(
+        title="EOM tracker linkage audit clean",
+        priority="default",
+        tags="white_check_mark",
+        body="Every tracker-to-Atlas linkage signal is back to zero.",
+    ),
+    AlertKind.REMINDER: AlertPresentation(
+        title="EOM tracker linkage audit breached",
+        priority="urgent",
+        tags="rotating_light,warning",
+    ),
+}
+
+
+@dataclass(frozen=True)
+class AlertState:
+    """The complete persisted alert-state schema owned by this monitor."""
+
+    breached_signals: list[str]
+    consecutive: int
+
+    @classmethod
+    def from_storage(cls, value: Mapping[str, Any] | None) -> "AlertState | None":
+        if value is None:
+            return None
+        # A missing state file is represented as an empty mapping by read_state.
+        # It is the initial clean state, not a malformed persisted document.
+        if not value:
+            return cls([], 0)
+        expected_keys = {schema_field.name for schema_field in fields(cls)}
+        if set(value) != expected_keys:
+            return None
+        recorded = value["breached_signals"]
+        consecutive = value["consecutive"]
+        if (
+            not isinstance(recorded, list)
+            or not all(isinstance(item, str) for item in recorded)
+            or recorded != sorted(set(recorded))
+            or isinstance(consecutive, bool)
+            or not isinstance(consecutive, int)
+            or consecutive < 0
+            or (not recorded and consecutive != 0)
+            or (recorded and consecutive == 0)
+        ):
+            return None
+        return cls(recorded, consecutive)
+
+    def to_storage(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -363,10 +460,12 @@ def build_signals(audit: Mapping[str, Any] | None, error: str | None = None) -> 
         return _unmeasured("audit duplicate summary counts were inconsistent")
     if summary["unlinkedActiveCustomers"] > summary["unlinkedCustomers"]:
         return _unmeasured("audit unlinked customer summary counts were inconsistent")
-    for key in FAULT_SUMMARY_KEYS:
-        detail_rows = audit.get(key)
-        if not isinstance(detail_rows, list) or len(detail_rows) != summary[key]:
-            return _unmeasured(f"audit detail list {key} did not match summary")
+    for detail_key, summary_key in DETAIL_LIST_SUMMARY_KEYS.items():
+        detail_rows = audit.get(detail_key)
+        if not isinstance(detail_rows, list) or len(detail_rows) != summary[summary_key]:
+            return _unmeasured(
+                f"audit detail list {detail_key} did not match summary {summary_key}"
+            )
 
     verification = audit.get("atlasLinkVerification")
     if not isinstance(verification, Mapping):
@@ -418,44 +517,29 @@ def measure(settings: Settings) -> AuditResult:
     return build_signals(audit, audit_error)
 
 
-def _previous_breached(previous: Mapping[str, Any] | None) -> set[str] | None:
-    if previous is None:
-        return None
-    recorded = previous.get("breached_signals")
-    consecutive = previous.get("consecutive")
-    if (
-        isinstance(recorded, list)
-        and all(isinstance(item, str) for item in recorded)
-        and isinstance(consecutive, int)
-        and not isinstance(consecutive, bool)
-        and consecutive >= 0
-    ):
-        return set(recorded)
-    if previous:
-        return None
-    return set()
-
-
 def decide_alert(
     previous: Mapping[str, Any] | None, breached: Sequence[str], realert_every: int
-) -> tuple[dict[str, Any], str | None]:
+) -> tuple[dict[str, Any], AlertKind | None]:
     """Keep each breach class visible rather than collapsing state to a boolean."""
     # OPEN / DERIVED: this is every breach signal measured in the current run.
     # Any future signal name remains in state and differs from the prior set,
     # so it produces a changed-alert rather than being silently ignored.
     current = {str(name) for name in breached}
-    before = _previous_breached(previous)
+    previous_state = AlertState.from_storage(previous)
+    before = (
+        set(previous_state.breached_signals) if previous_state is not None else None
+    )
     if not current:
-        state = {"breached_signals": [], "consecutive": 0}
-        return state, "recovered" if before is None or before else None
+        state = AlertState([], 0).to_storage()
+        return state, AlertKind.RECOVERED if before is None or before else None
     if before is None or current != before:
-        return {"breached_signals": sorted(current), "consecutive": 1}, (
-            "breach" if not before else "changed"
+        return AlertState(sorted(current), 1).to_storage(), (
+            AlertKind.BREACH if not before else AlertKind.CHANGED
         )
-    consecutive = int(previous.get("consecutive", 0)) + 1
-    state = {"breached_signals": sorted(current), "consecutive": consecutive}
+    consecutive = previous_state.consecutive + 1
+    state = AlertState(sorted(current), consecutive).to_storage()
     if realert_every > 0 and consecutive % realert_every == 0:
-        return state, "reminder"
+        return state, AlertKind.REMINDER
     return state, None
 
 
@@ -464,7 +548,7 @@ def read_state(path: Path) -> tuple[dict[str, Any] | None, str | None]:
         return {}, None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return None, f"alert state unreadable ({type(exc).__name__})"
     if not isinstance(value, dict):
         return None, "alert state was not an object"
@@ -517,6 +601,15 @@ def _alert_body(result: AuditResult, consecutive: int) -> str:
         [signal.describe() for signal in result.breaches]
         + [f"\nrun #{consecutive} in breach"]
     )
+
+
+def _alert_presentation(alert: object) -> AlertPresentation | None:
+    """Return an exhaustive alert configuration, or fail closed on drift."""
+    if not isinstance(alert, AlertKind):
+        return None
+    if frozenset(ALERT_PRESENTATIONS) != frozenset(AlertKind):
+        return None
+    return ALERT_PRESENTATIONS.get(alert)
 
 
 def _notify_monitor_unavailable(
@@ -577,29 +670,24 @@ def _notify_and_record(
             return state_failure
         return EXIT_BREACH if not result.ok else EXIT_OK
 
-    if alert == "recovered":
-        delivered = notifier(
-            settings.ntfy_url,
-            settings.ntfy_topic,
-            "EOM tracker linkage audit clean",
-            "Every tracker-to-Atlas linkage signal is back to zero.",
-            "default",
-            "white_check_mark",
+    presentation = _alert_presentation(alert)
+    if presentation is None:
+        return _notify_monitor_unavailable(
+            settings,
+            notifier,
+            "Monitor generated an unsupported alert kind; state was left unchanged so "
+            "the condition can be investigated and retried.",
         )
-    else:
-        title = (
-            "EOM tracker linkage audit: signals changed"
-            if alert == "changed"
-            else "EOM tracker linkage audit breached"
-        )
-        delivered = notifier(
-            settings.ntfy_url,
-            settings.ntfy_topic,
-            title,
-            _alert_body(result, int(next_state["consecutive"])),
-            "urgent",
-            "rotating_light,warning",
-        )
+    delivered = notifier(
+        settings.ntfy_url,
+        settings.ntfy_topic,
+        presentation.title,
+        presentation.body
+        if presentation.body is not None
+        else _alert_body(result, int(next_state["consecutive"])),
+        presentation.priority,
+        presentation.tags,
+    )
     if not delivered:
         print(
             "WARNING alert undelivered; state left unchanged so the next run retries",
