@@ -1,0 +1,21 @@
+[Unit]
+Description=EOM Tracker Atlas-linkage audit monitor
+# This is deliberately not tied to the Render service.  It must still be able
+# to report when the deployed Tracker cannot be read.
+
+[Service]
+Type=oneshot
+# Install an immutable executable copy; do not run from a disposable worktree:
+#   install -m 755 scripts/eom_tracker_linkage_audit.py \
+#     ~/.local/bin/eom-tracker-linkage-audit.py
+ExecStart=/usr/bin/python3 %h/.local/bin/eom-tracker-linkage-audit.py
+# Create this file with mode 0600.  It supplies only local monitor settings:
+# EOM_TRACKER_LINKAGE_AUDIT_BASE_URL=https://eom-timetracker.onrender.com
+# EOM_TRACKER_LINKAGE_AUDIT_ADMIN_NAME=<dedicated active admin account>
+# EOM_TRACKER_LINKAGE_AUDIT_ADMIN_PASSWORD=<that account password>
+# EOM_TRACKER_LINKAGE_AUDIT_NTFY_TOPIC=<private topic>
+EnvironmentFile=%h/.config/eom-tracker-linkage-audit.env
+UMask=0077
+# 2 means the audit measured a real breach and delivered the alert.  Do not
+# accept 1 (script/configuration failure) or 3 (notification was undelivered).
+SuccessExitStatus=0 2
