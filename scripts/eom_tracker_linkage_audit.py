@@ -499,6 +499,42 @@ def _alert_body(result: AuditResult, consecutive: int) -> str:
     )
 
 
+def _notify_monitor_unavailable(
+    settings: Settings, notifier: Callable[..., bool], body: str
+) -> int:
+    """Notify without relying on local alert state after a monitor failure."""
+    delivered = notifier(
+        settings.ntfy_url,
+        settings.ntfy_topic,
+        "EOM tracker linkage audit unavailable",
+        body,
+        "urgent",
+        "rotating_light,warning",
+    )
+    if not delivered:
+        print("WARNING monitor unavailable alert undelivered", file=sys.stderr)
+        return EXIT_UNDELIVERED
+    return EXIT_ERROR
+
+
+def _write_state_or_alert(
+    settings: Settings,
+    state_path: Path,
+    state: Mapping[str, Any],
+    notifier: Callable[..., bool],
+) -> int | None:
+    try:
+        write_state(state_path, state)
+    except OSError:
+        return _notify_monitor_unavailable(
+            settings,
+            notifier,
+            "Monitor state storage could not be persisted; audit results may not be "
+            "tracked. Correct the local state directory and retry.",
+        )
+    return None
+
+
 def _notify_and_record(
     settings: Settings,
     result: AuditResult,
@@ -514,7 +550,11 @@ def _notify_and_record(
         settings.realert_every,
     )
     if alert is None:
-        write_state(state_path, next_state)
+        state_failure = _write_state_or_alert(
+            settings, state_path, next_state, notifier
+        )
+        if state_failure is not None:
+            return state_failure
         return EXIT_BREACH if not result.ok else 0
 
     if alert == "recovered":
@@ -546,7 +586,9 @@ def _notify_and_record(
             file=sys.stderr,
         )
         return EXIT_UNDELIVERED
-    write_state(state_path, next_state)
+    state_failure = _write_state_or_alert(settings, state_path, next_state, notifier)
+    if state_failure is not None:
+        return state_failure
     return EXIT_BREACH if not result.ok else 0
 
 
@@ -570,19 +612,12 @@ def _notify_state_setup_failure(
     settings: Settings, notifier: Callable[..., bool]
 ) -> int:
     """Alert without state when the normal alert state cannot be prepared."""
-    delivered = notifier(
-        settings.ntfy_url,
-        settings.ntfy_topic,
-        "EOM tracker linkage audit unavailable",
+    return _notify_monitor_unavailable(
+        settings,
+        notifier,
         "Monitor state storage could not be prepared; no audit was run. "
         "Correct the local state directory and retry.",
-        "urgent",
-        "rotating_light,warning",
     )
-    if not delivered:
-        print("WARNING state setup alert undelivered", file=sys.stderr)
-        return EXIT_UNDELIVERED
-    return EXIT_ERROR
 
 
 def main(

@@ -535,6 +535,35 @@ def test_state_setup_failure_alerts_without_measuring(
     assert "no audit was run" in notifications[0][3]
 
 
+@pytest.mark.parametrize(
+    ("delivered", "expected_exit"), [(True, monitor.EXIT_ERROR), (False, monitor.EXIT_UNDELIVERED)]
+)
+def test_state_persistence_failure_alerts_after_measurement(
+    monkeypatch, tmp_path, delivered: bool, expected_exit: int
+):
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_BASE_URL", "https://tracker.example.test")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_ADMIN_NAME", "Audit Monitor")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_ADMIN_PASSWORD", "password")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_NTFY_TOPIC", "private-topic")
+    monkeypatch.setattr(monitor, "measure", lambda _settings: monitor.AuditResult())
+
+    def fail_write_state(*_args, **_kwargs):
+        raise OSError("state storage unavailable")
+
+    monkeypatch.setattr(monitor, "write_state", fail_write_state)
+    notifications = []
+
+    exit_code = monitor.main(
+        ["--state-dir", str(tmp_path)],
+        notifier=lambda *args: (notifications.append(args), delivered)[1],
+    )
+
+    assert exit_code == expected_exit
+    assert len(notifications) == 1
+    assert notifications[0][2] == "EOM tracker linkage audit unavailable"
+    assert "could not be persisted" in notifications[0][3]
+
+
 def test_systemd_unit_preserves_failure_and_secret_boundaries():
     service = (REPO_ROOT / "config" / "eom-tracker-linkage-audit.service").read_text(
         encoding="utf-8"
