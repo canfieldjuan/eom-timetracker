@@ -1,0 +1,8 @@
+[Unit]
+Description=Send EOM Tracker linkage monitor test alert
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/eom-tracker-linkage-monitor.env
+UMask=0077
+ExecStart=%h/.local/bin/eom-tracker-linkage-monitor.py --test-alert

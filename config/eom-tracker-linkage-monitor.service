@@ -1,0 +1,10 @@
+[Unit]
+Description=EOM Tracker linkage monitor
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/eom-tracker-linkage-monitor.env
+UMask=0077
+ExecStart=%h/.local/bin/eom-tracker-linkage-monitor.py
+# A breach is an observed condition, not a failed monitor invocation.
+SuccessExitStatus=0 2
