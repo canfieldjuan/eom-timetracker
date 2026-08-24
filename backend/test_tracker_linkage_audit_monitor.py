@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import http.client
 import json
 import sys
 from dataclasses import replace
@@ -92,6 +93,43 @@ def test_non_ok_atlas_verification_never_reads_as_clean(status: str):
     ]
 
 
+@pytest.mark.parametrize(
+    ("summary", "verification"),
+    [
+        (_summary(), {"status": "ok"}),
+        (_summary(), {"status": "ok", "checked": True}),
+        (
+            _summary(linkedCustomers=2, duplicateExtraCustomers=1),
+            {"status": "ok", "checked": 0},
+        ),
+        (_summary(linkedCustomers=1), {"status": "ok", "checked": 2}),
+        (
+            _summary(linkedCustomers=0, duplicateExtraCustomers=1),
+            {"status": "ok", "checked": 0},
+        ),
+    ],
+)
+def test_ok_atlas_verification_requires_complete_distinct_link_coverage(
+    summary: dict[str, int], verification: dict[str, object]
+):
+    result = monitor.build_signals(
+        _audit_payload(summary=summary, atlasLinkVerification=verification)
+    )
+
+    assert [item.name for item in result.breaches] == ["tracker_audit_unavailable"]
+
+
+def test_ok_atlas_verification_accepts_matching_distinct_link_coverage():
+    result = monitor.build_signals(
+        _audit_payload(
+            summary=_summary(linkedCustomers=3, duplicateExtraCustomers=1),
+            atlasLinkVerification={"status": "ok", "checked": 2},
+        )
+    )
+
+    assert result.ok
+
+
 def test_new_summary_key_fails_closed_instead_of_being_ignored():
     result = monitor.build_signals(
         _audit_payload(summary={**_summary(), "futureIntegritySignal": 0})
@@ -104,7 +142,14 @@ def test_current_tracker_endpoint_summary_matches_monitor_contract(client, auth)
     response = client.get("/api/admin/audits/atlas-linkage", headers=auth)
 
     assert response.status_code == 200, response.text
-    assert set(response.json()["summary"]) == monitor.EXPECTED_SUMMARY_KEYS
+    payload = response.json()
+    assert set(payload["summary"]) == monitor.EXPECTED_SUMMARY_KEYS
+    verification = payload["atlasLinkVerification"]
+    if verification["status"] == "ok":
+        assert verification["checked"] == (
+            payload["summary"]["linkedCustomers"]
+            - payload["summary"]["duplicateExtraCustomers"]
+        )
 
 
 def test_state_tracks_each_breach_class_and_announces_changes():
@@ -159,6 +204,11 @@ class _Response:
         return self._body
 
 
+class _IncompleteResponse(_Response):
+    def read(self) -> bytes:
+        raise http.client.IncompleteRead(b'{"partial":', 20)
+
+
 def test_measure_logs_in_each_run_then_uses_the_returned_bearer(monkeypatch, tmp_path):
     calls = []
 
@@ -182,6 +232,16 @@ def test_measure_logs_in_each_run_then_uses_the_returned_bearer(monkeypatch, tmp
 
     assert result.ok
     assert len(calls) == 2
+
+
+def test_truncated_http_response_becomes_an_unmeasured_breach(monkeypatch, tmp_path):
+    monkeypatch.setattr(monitor, "_open_no_redirect", lambda _request: _IncompleteResponse({}))
+
+    result = monitor.measure(_settings(tmp_path))
+
+    assert [item.name for item in result.breaches] == ["tracker_audit_unavailable"]
+    assert result.breaches[0].count is None
+    assert result.breaches[0].error == "login request failed (IncompleteRead)"
 
 
 def test_undelivered_alert_does_not_advance_state(tmp_path):
@@ -240,3 +300,4 @@ def test_systemd_unit_preserves_failure_and_secret_boundaries():
     assert "\nEnvironment=EOM_TRACKER_LINKAGE_AUDIT_ADMIN_PASSWORD=" not in service
     assert "OnUnitActiveSec=1h" in timer
     assert "Persistent=true" in timer
+    assert "loginctl enable-linger <monitor-user>" in timer

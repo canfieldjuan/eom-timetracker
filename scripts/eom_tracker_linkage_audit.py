@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import http.client
 import json
 import os
 import sys
@@ -223,7 +224,7 @@ def _http_json(
             raw = response.read()
     except urllib.error.HTTPError as exc:
         return None, f"HTTP {exc.code}"
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (http.client.IncompleteRead, urllib.error.URLError, OSError, ValueError) as exc:
         return None, f"request failed ({type(exc).__name__})"
     try:
         decoded = json.loads(raw.decode("utf-8"))
@@ -297,6 +298,19 @@ def build_signals(audit: Mapping[str, Any] | None, error: str | None = None) -> 
     verification_status = verification.get("status")
     if verification_status not in KNOWN_VERIFICATION_STATUSES:
         return _unmeasured("Atlas link verification status was invalid")
+    if verification_status == "ok":
+        checked = verification.get("checked")
+        expected_checked = (
+            summary["linkedCustomers"] - summary["duplicateExtraCustomers"]
+        )
+        if expected_checked < 0:
+            return _unmeasured("audit summary link counts were inconsistent")
+        if (
+            isinstance(checked, bool)
+            or not isinstance(checked, int)
+            or checked != expected_checked
+        ):
+            return _unmeasured("Atlas link verification coverage was missing or invalid")
 
     signals = [
         Signal(

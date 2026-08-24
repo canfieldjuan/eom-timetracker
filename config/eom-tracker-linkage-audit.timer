@@ -1,5 +1,8 @@
 [Unit]
 Description=Run the EOM Tracker Atlas-linkage audit hourly
+# This is a user timer. Before enabling it on an unattended host, enable the
+# monitor user's manager to survive logout:
+#   loginctl enable-linger <monitor-user>
 
 [Timer]
 OnBootSec=10min
