@@ -52,6 +52,13 @@ def _required_setting(name: str) -> str:
     return value
 
 
+def _required_secret(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        raise ValueError(f"{name} is required")
+    return value
+
+
 def _https_url(name: str, value: str) -> str:
     parsed = urlsplit(value)
     if parsed.scheme != "https" or not parsed.netloc:
@@ -68,7 +75,7 @@ def settings_from_environment() -> Settings:
             _required_setting("EOM_TRACKER_LINKAGE_MONITOR_BASE_URL"),
         ),
         admin_name=_required_setting("EOM_TRACKER_LINKAGE_MONITOR_ADMIN_NAME"),
-        admin_password=_required_setting("EOM_TRACKER_LINKAGE_MONITOR_ADMIN_PASSWORD"),
+        admin_password=_required_secret("EOM_TRACKER_LINKAGE_MONITOR_ADMIN_PASSWORD"),
         ntfy_url=_https_url(
             "EOM_TRACKER_LINKAGE_MONITOR_NTFY_URL",
             _required_setting("EOM_TRACKER_LINKAGE_MONITOR_NTFY_URL"),

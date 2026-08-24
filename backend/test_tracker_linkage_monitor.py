@@ -204,10 +204,23 @@ def test_environment_configuration_rejects_non_https_endpoints(monkeypatch):
         monitor.settings_from_environment()
 
 
+def test_environment_configuration_preserves_admin_password_whitespace(monkeypatch):
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_MONITOR_BASE_URL", "https://tracker.example.test")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_MONITOR_ADMIN_NAME", "Alert Monitor")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_MONITOR_ADMIN_PASSWORD", " password ")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_MONITOR_NTFY_URL", "https://ntfy.example.test")
+    monkeypatch.setenv("EOM_TRACKER_LINKAGE_MONITOR_NTFY_TOPIC", "private-topic")
+
+    assert monitor.settings_from_environment().admin_password == " password "
+
+
 def test_systemd_template_preserves_secret_and_breach_exit_boundaries():
     service = (REPO_ROOT / "config" / "eom-tracker-linkage-monitor.service").read_text(
         encoding="utf-8"
     )
+    test_service = (
+        REPO_ROOT / "config" / "eom-tracker-linkage-monitor-test.service"
+    ).read_text(encoding="utf-8")
     timer = (REPO_ROOT / "config" / "eom-tracker-linkage-monitor.timer").read_text(
         encoding="utf-8"
     )
@@ -216,6 +229,8 @@ def test_systemd_template_preserves_secret_and_breach_exit_boundaries():
     assert "UMask=0077" in service
     assert "SuccessExitStatus=0 2" in service
     assert "EOM_TRACKER_LINKAGE_MONITOR_ADMIN_PASSWORD=" not in service
+    assert "EnvironmentFile=%h/.config/eom-tracker-linkage-monitor.env" in test_service
+    assert "ExecStart=%h/.local/bin/eom-tracker-linkage-monitor.py --test-alert" in test_service
     assert "OnUnitActiveSec=1h" in timer
 
 
@@ -235,6 +250,9 @@ def test_installer_places_the_executable_and_unit_templates(tmp_path):
     installed_service = (
         test_home / ".config/systemd/user/eom-tracker-linkage-monitor.service"
     )
+    installed_test_service = (
+        test_home / ".config/systemd/user/eom-tracker-linkage-monitor-test.service"
+    )
     installed_timer = (
         test_home / ".config/systemd/user/eom-tracker-linkage-monitor.timer"
     )
@@ -245,6 +263,10 @@ def test_installer_places_the_executable_and_unit_templates(tmp_path):
     assert installed_service.read_text(encoding="utf-8") == (
         REPO_ROOT / "config/eom-tracker-linkage-monitor.service"
     ).read_text(encoding="utf-8")
+    assert installed_test_service.read_text(encoding="utf-8") == (
+        REPO_ROOT / "config/eom-tracker-linkage-monitor-test.service"
+    ).read_text(encoding="utf-8")
     assert installed_timer.read_text(encoding="utf-8") == (
         REPO_ROOT / "config/eom-tracker-linkage-monitor.timer"
     ).read_text(encoding="utf-8")
+    assert "systemctl --user start eom-tracker-linkage-monitor-test.service" in result.stdout
