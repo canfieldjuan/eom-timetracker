@@ -219,6 +219,9 @@ def test_current_tracker_endpoint_summary_matches_monitor_contract(client, auth)
     payload = response.json()
     assert set(payload["summary"]) == monitor.EXPECTED_SUMMARY_KEYS
     verification = payload["atlasLinkVerification"]
+    assert payload["summary"]["unlinkedActiveCustomers"] <= payload["summary"][
+        "unlinkedCustomers"
+    ]
     if verification["status"] == "ok":
         assert verification["checked"] == (
             payload["summary"]["linkedCustomers"]
@@ -487,14 +490,33 @@ def test_test_alert_does_not_measure_or_change_state(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("delivered", "expected_exit"),
-    [(True, monitor.EXIT_ERROR), (False, monitor.EXIT_UNDELIVERED)],
+    "setup_failure",
+    ["directory", "lock-open", "lock-acquire"],
+)
+@pytest.mark.parametrize(
+    ("delivered", "expected_exit"), [(True, monitor.EXIT_ERROR), (False, monitor.EXIT_UNDELIVERED)]
 )
 def test_state_setup_failure_alerts_without_measuring(
-    monkeypatch, tmp_path, delivered: bool, expected_exit: int
+    monkeypatch, tmp_path, setup_failure: str, delivered: bool, expected_exit: int
 ):
-    blocked_state_dir = tmp_path / "not-a-directory"
-    blocked_state_dir.write_text("file blocks state directory", encoding="utf-8")
+    state_dir = tmp_path / "state"
+    if setup_failure == "directory":
+        state_dir.write_text("file blocks state directory", encoding="utf-8")
+    elif setup_failure == "lock-open":
+        original_open = Path.open
+
+        def fail_lock_open(path, *args, **kwargs):
+            if path.name == "state.lock":
+                raise OSError("cannot open state lock")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_lock_open)
+    else:
+        monkeypatch.setattr(
+            monitor.fcntl,
+            "flock",
+            lambda *_args: (_ for _ in ()).throw(OSError("cannot acquire state lock")),
+        )
     monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_BASE_URL", "https://tracker.example.test")
     monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_ADMIN_NAME", "Audit Monitor")
     monkeypatch.setenv("EOM_TRACKER_LINKAGE_AUDIT_ADMIN_PASSWORD", "password")
@@ -503,7 +525,7 @@ def test_state_setup_failure_alerts_without_measuring(
     notifications = []
 
     exit_code = monitor.main(
-        ["--state-dir", str(blocked_state_dir)],
+        ["--state-dir", str(state_dir)],
         notifier=lambda *args: (notifications.append(args), delivered)[1],
     )
 
