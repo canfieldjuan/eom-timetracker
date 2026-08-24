@@ -59,7 +59,21 @@ def test_clean_response_is_not_a_breach():
 
 @pytest.mark.parametrize("signal", monitor.FAULT_SUMMARY_KEYS)
 def test_each_integrity_count_breaches_independently(signal: str):
-    result = monitor.build_signals(_audit_payload(summary=_summary(**{signal: 1})))
+    summary = _summary(**{signal: 1})
+    if signal == "duplicateGroups":
+        summary = _summary(
+            duplicateGroups=1,
+            duplicateExtraCustomers=1,
+            linkedCustomers=2,
+        )
+    payload = _audit_payload(summary=summary)
+    if signal == "duplicateGroups":
+        payload["atlasLinkVerification"] = {
+            "status": "ok",
+            "checked": 1,
+            "error": None,
+        }
+    result = monitor.build_signals(payload)
 
     assert [item.name for item in result.breaches] == [signal]
 
@@ -102,7 +116,11 @@ def test_non_ok_atlas_verification_never_reads_as_clean(status: str):
         (_summary(), {"status": "ok"}),
         (_summary(), {"status": "ok", "checked": True}),
         (
-            _summary(linkedCustomers=2, duplicateExtraCustomers=1),
+            _summary(
+                duplicateGroups=1,
+                linkedCustomers=2,
+                duplicateExtraCustomers=1,
+            ),
             {"status": "ok", "checked": 0},
         ),
         (_summary(linkedCustomers=1), {"status": "ok", "checked": 2}),
@@ -125,18 +143,48 @@ def test_ok_atlas_verification_requires_complete_distinct_link_coverage(
 def test_ok_atlas_verification_accepts_matching_distinct_link_coverage():
     result = monitor.build_signals(
         _audit_payload(
-            summary=_summary(linkedCustomers=3, duplicateExtraCustomers=1),
+            summary=_summary(
+                duplicateGroups=1,
+                linkedCustomers=3,
+                duplicateExtraCustomers=1,
+            ),
             atlasLinkVerification={"status": "ok", "checked": 2},
         )
     )
 
-    assert result.ok
+    assert [item.name for item in result.breaches] == ["duplicateGroups"]
 
 
 def test_new_summary_key_fails_closed_instead_of_being_ignored():
     result = monitor.build_signals(
         _audit_payload(summary={**_summary(), "futureIntegritySignal": 0})
     )
+
+    assert [item.name for item in result.breaches] == ["tracker_audit_unavailable"]
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        _summary(
+            duplicateGroups=0,
+            duplicateExtraCustomers=1,
+            linkedCustomers=1,
+        ),
+        _summary(
+            duplicateGroups=2,
+            duplicateExtraCustomers=1,
+            linkedCustomers=3,
+        ),
+        _summary(
+            duplicateGroups=1,
+            duplicateExtraCustomers=3,
+            linkedCustomers=3,
+        ),
+    ],
+)
+def test_inconsistent_duplicate_summary_is_an_unmeasured_breach(summary: dict[str, int]):
+    result = monitor.build_signals(_audit_payload(summary=summary))
 
     assert [item.name for item in result.breaches] == ["tracker_audit_unavailable"]
 
@@ -190,6 +238,19 @@ def test_remote_http_configuration_is_refused_before_credentials_are_sent(tmp_pa
         monitor.validate_settings(
             insecure, require_measurement=True, require_notification=True
         )
+
+
+def test_https_configuration_is_accepted():
+    monitor._validate_url("test URL", "https://tracker.example.test")
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["ftp://tracker.example.test", "file:///tmp/tracker", "tracker.example.test"],
+)
+def test_non_http_schemes_are_refused_before_a_request(url: str):
+    with pytest.raises(ValueError, match="absolute http\\(s\\) URL"):
+        monitor._validate_url("test URL", url)
 
 
 @pytest.mark.parametrize(
@@ -332,6 +393,25 @@ def test_undelivered_alert_does_not_advance_state(tmp_path):
 
     exit_code = monitor._notify_and_record(
         _settings(tmp_path), result, state_path, lambda *_args: False
+    )
+
+    assert exit_code == monitor.EXIT_UNDELIVERED
+    assert not state_path.exists()
+
+
+def test_http_protocol_failure_during_alert_delivery_is_undelivered(monkeypatch, tmp_path):
+    result = monitor.build_signals(
+        _audit_payload(summary=_summary(unlinkedCustomers=1))
+    )
+    state_path = tmp_path / "state.json"
+
+    def fail_open(*_args, **_kwargs):
+        raise http.client.BadStatusLine("invalid status line")
+
+    monkeypatch.setattr(monitor, "_open_no_redirect", fail_open)
+
+    exit_code = monitor._notify_and_record(
+        _settings(tmp_path), result, state_path, monitor.publish
     )
 
     assert exit_code == monitor.EXIT_UNDELIVERED

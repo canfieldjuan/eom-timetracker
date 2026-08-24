@@ -85,6 +85,10 @@ MAX_AUDIT_TIMEOUT_SECONDS = 240.0
 # for HTTP-only development. Every unlisted hostname, including other loopback
 # aliases and addresses, is rejected rather than silently weakening HTTPS.
 LOOPBACK_HTTP_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# CLOSED / ENUMERATED: the monitor only makes HTTP(S) requests. Every other
+# URI scheme is rejected before credentials, audit data, or notification data
+# can be sent to it.
+ALLOWED_URL_SCHEMES = frozenset({"https", "http"})
 
 
 @dataclass(frozen=True)
@@ -184,7 +188,7 @@ def settings_from_environment(*, state_dir: str | None, realert_every: int | Non
 
 def _validate_url(label: str, value: str) -> None:
     parsed = urlsplit(value)
-    if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+    if parsed.scheme not in ALLOWED_URL_SCHEMES or not parsed.netloc:
         raise ValueError(f"{label} must be an absolute http(s) URL")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError(f"{label} must not include credentials, query, or fragment")
@@ -329,6 +333,19 @@ def build_signals(audit: Mapping[str, Any] | None, error: str | None = None) -> 
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return _unmeasured(f"audit summary value {key} was invalid")
 
+    duplicate_groups = summary["duplicateGroups"]
+    duplicate_extra_customers = summary["duplicateExtraCustomers"]
+    linked_customers = summary["linkedCustomers"]
+    # The Tracker groups every duplicate contact link by contact ID with at
+    # least two customer rows. Each group therefore contributes at least one
+    # extra customer, and all grouped rows are part of linkedCustomers.
+    if (
+        (duplicate_groups == 0) != (duplicate_extra_customers == 0)
+        or duplicate_extra_customers < duplicate_groups
+        or duplicate_extra_customers > linked_customers - duplicate_groups
+    ):
+        return _unmeasured("audit duplicate summary counts were inconsistent")
+
     verification = audit.get("atlasLinkVerification")
     if not isinstance(verification, Mapping):
         return _unmeasured("Atlas link verification status was missing or invalid")
@@ -463,7 +480,7 @@ def publish(
     try:
         with _open_no_redirect(request) as response:
             return 200 <= int(response.status) < 300
-    except (urllib.error.URLError, OSError, ValueError):
+    except (http.client.HTTPException, urllib.error.URLError, OSError, ValueError):
         print("WARNING alert delivery failed", file=sys.stderr)
         return False
 
