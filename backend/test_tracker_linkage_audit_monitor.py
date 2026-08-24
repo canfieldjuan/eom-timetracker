@@ -399,6 +399,23 @@ def test_undelivered_alert_does_not_advance_state(tmp_path):
     assert not state_path.exists()
 
 
+def test_publish_accepts_a_successful_notification_response(monkeypatch):
+    monkeypatch.setattr(
+        monitor,
+        "_open_no_redirect",
+        lambda _request, **_kwargs: _Response({}, status=202),
+    )
+
+    assert monitor.publish(
+        "https://ntfy.example.test",
+        "private-topic",
+        "Test title",
+        "Test body",
+        "default",
+        "white_check_mark",
+    )
+
+
 def test_http_protocol_failure_during_alert_delivery_is_undelivered(monkeypatch, tmp_path):
     result = monitor.build_signals(
         _audit_payload(summary=_summary(unlinkedCustomers=1))
