@@ -64,6 +64,7 @@ def _apply_schema(conn):
                 visit_evidence_events,
                 home_base_events, home_base_policies, home_bases,
                 planned_visit_audit_events,
+                eom_first_clean_completion_reports,
                 planned_visit_assignments, planned_service_visits,
                 google_calendar_event_mappings, calendar_import_previews,
                 geofence_hard_gate_employee_scopes, geofence_hard_gate_scopes,
@@ -156,6 +157,16 @@ def clear_receivables_operation_attempts(setup_db):
 
 
 @pytest.fixture(autouse=True)
+def clear_first_clean_completion_reports(setup_db):
+    """Keep first-clean delivery recovery records isolated between tests."""
+    conn = _raw_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM eom_first_clean_completion_reports")
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture(autouse=True)
 def clear_access_log_entries(setup_db):
     """Keep request-log rows isolated between API test cases."""
     conn = _raw_conn()
@@ -174,6 +185,7 @@ ATLAS_FULL_CAPABILITIES = [
     "lead.customer_handoff",
     "lead.estimate_booking",
     "lead.first_clean_booking",
+    "customer.first_clean_completion.record",
     "lead.lost",
     "lead.reopen",
     "onboarding.draft.approve_send",
@@ -247,24 +259,53 @@ def stub_atlas_funnel(setup_db, monkeypatch):
                 # not just the capability name.
                 "capabilityRoutes": [
                     {"method": "POST", "path": "/eom-funnel/operator-contacts"},
+                    {
+                        "method": "POST",
+                        "path": (
+                            "/eom-funnel/customer-handoffs/{contact_id}/"
+                            "first-clean-completions"
+                        ),
+                    },
                 ],
             },
         )
 
     def _post(url, *, headers=None, json=None, timeout=None):
-        if not str(url).endswith(api.ATLAS_OPERATOR_CONTACTS_PATH):
-            raise AssertionError(f"unstubbed Atlas funnel call: {url}")
+        url_value = str(url)
         key = (headers or {}).get("Idempotency-Key", "")
-        return _FakeAtlasResponse(
-            201,
-            {
-                "success": True,
-                "contactId": fake_atlas_contact_id(key),
-                "operation": "contact_created",
-                "idempotent": False,
-                "contact": {},
-            },
-        )
+        if url_value.endswith(api.ATLAS_OPERATOR_CONTACTS_PATH):
+            return _FakeAtlasResponse(
+                201,
+                {
+                    "success": True,
+                    "contactId": fake_atlas_contact_id(key),
+                    "operation": "contact_created",
+                    "idempotent": False,
+                    "contact": {},
+                },
+            )
+        completion_prefix = f"{api.ATLAS_FUNNEL_BASE_URL}/eom-funnel/customer-handoffs/"
+        completion_suffix = "/first-clean-completions"
+        if url_value.startswith(completion_prefix) and url_value.endswith(completion_suffix):
+            contact_id = url_value[len(completion_prefix) : -len(completion_suffix)]
+            body = json or {}
+            return _FakeAtlasResponse(
+                201,
+                {
+                    "success": True,
+                    "receiptId": fake_atlas_contact_id(f"first-clean:{key}"),
+                    "contactId": contact_id,
+                    "handoffId": fake_atlas_contact_id(f"handoff:{contact_id}"),
+                    "trackerCustomerId": body.get("tracker_customer_id"),
+                    "trackerSiteId": body.get("tracker_site_id"),
+                    "trackerServiceKind": body.get("tracker_service_kind"),
+                    "trackerServiceId": body.get("tracker_service_id"),
+                    "completedAt": body.get("completed_at"),
+                    "recordedAt": body.get("completed_at"),
+                    "idempotent": False,
+                },
+            )
+        raise AssertionError(f"unstubbed Atlas funnel call: {url}")
 
     monkeypatch.setattr(api, "ATLAS_FUNNEL_BASE_URL", "https://atlas.example.test/api/v1")
     monkeypatch.setattr(api, "ATLAS_FUNNEL_SERVICE_TOKEN", "tracker-only-test-token")
