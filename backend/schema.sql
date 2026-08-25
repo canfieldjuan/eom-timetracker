@@ -950,6 +950,37 @@ CREATE TABLE planned_service_visits (
     CHECK (status <> 'completed' OR completed_at IS NOT NULL)
 );
 
+-- One manager-confirmed, closed-evidence completion that Tracker must safely
+-- replay to ATLAS. This is operational service evidence plus delivery recovery
+-- only; ATLAS owns the downstream onboarding, terms, card, and email states.
+CREATE TABLE eom_first_clean_completion_reports (
+    id                      UUID PRIMARY KEY,
+    planned_visit_id        BIGINT NOT NULL UNIQUE
+                                REFERENCES planned_service_visits(id) ON DELETE RESTRICT,
+    atlas_contact_id        UUID NOT NULL UNIQUE,
+    customer_id             INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    site_id                 INTEGER NOT NULL REFERENCES locations(id) ON DELETE RESTRICT,
+    idempotency_key         UUID NOT NULL UNIQUE,
+    completed_at            TIMESTAMPTZ NOT NULL,
+    reported_by_employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE RESTRICT,
+    reported_by_name        VARCHAR(200) NOT NULL
+                                CHECK (char_length(btrim(reported_by_name)) >= 1),
+    state                   VARCHAR(16) NOT NULL DEFAULT 'pending'
+                                CHECK (state IN ('pending', 'finalized')),
+    atlas_receipt_id        UUID,
+    last_error_code         VARCHAR(128),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finalized_at            TIMESTAMPTZ,
+    CHECK (
+        state <> 'finalized'
+        OR (atlas_receipt_id IS NOT NULL AND finalized_at IS NOT NULL)
+    )
+);
+
+CREATE INDEX idx_eom_first_clean_completion_reports_state
+    ON eom_first_clean_completion_reports(state, updated_at);
+
 -- Assignment changes are retired, never deleted. Exactly one of crew or
 -- employee is present so default crews and per-visit individual overrides can
 -- coexist without inventing shifts.
