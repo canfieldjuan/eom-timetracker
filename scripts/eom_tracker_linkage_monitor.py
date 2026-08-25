@@ -20,6 +20,7 @@ EXIT_BREACH = 2
 EXIT_UNDELIVERED = 3
 
 LOGIN_PATH = "/api/auth/login"
+FUNNEL_REVIEW_PATH = "/api/admin/funnel/review?limit=1"
 AUDIT_PATH = "/api/admin/audits/atlas-linkage"
 DEFAULT_STATE_FILE = Path(
     os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
@@ -130,6 +131,16 @@ def measure(settings: Settings) -> tuple[dict[str, int] | None, str | None]:
     token = login.get("token") if login is not None else None
     if error or not isinstance(token, str) or not token.strip():
         return None, error or "login response did not contain a token"
+
+    funnel_review, error = _http_json(
+        f"{settings.base_url}{FUNNEL_REVIEW_PATH}",
+        method="GET",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    if error or funnel_review is None:
+        return None, f"funnel review {error or 'response missing'}"
+    if funnel_review.get("success") is not True:
+        return None, "funnel review did not confirm success"
 
     audit, error = _http_json(
         f"{settings.base_url}{AUDIT_PATH}",

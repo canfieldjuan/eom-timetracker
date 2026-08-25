@@ -55,7 +55,9 @@ class _Response:
         return self._body
 
 
-def test_measure_logs_in_then_reads_the_existing_audit(monkeypatch, tmp_path):
+def test_measure_logs_in_then_proves_funnel_review_and_reads_the_existing_audit(
+    monkeypatch, tmp_path
+):
     requests = []
 
     def fake_open(request):
@@ -67,6 +69,10 @@ def test_measure_logs_in_then_reads_the_existing_audit(monkeypatch, tmp_path):
                 "password": "not-a-real-password",
             }
             return _Response({"token": "test-token"})
+        if request.full_url.endswith(monitor.FUNNEL_REVIEW_PATH):
+            assert request.get_method() == "GET"
+            assert request.get_header("Authorization") == "Bearer test-token"
+            return _Response({"success": True})
         assert request.full_url.endswith(monitor.AUDIT_PATH)
         assert request.get_method() == "GET"
         assert request.get_header("Authorization") == "Bearer test-token"
@@ -82,6 +88,35 @@ def test_measure_logs_in_then_reads_the_existing_audit(monkeypatch, tmp_path):
         "staleReservations": 0,
         "danglingLinks": 1,
     }
+    assert [request.full_url for request in requests] == [
+        "https://tracker.example.test/api/auth/login",
+        "https://tracker.example.test/api/admin/funnel/review?limit=1",
+        "https://tracker.example.test/api/admin/audits/atlas-linkage",
+    ]
+
+
+@pytest.mark.parametrize("payload", [{"success": False}, {}, {"success": "true"}])
+def test_unavailable_funnel_review_is_not_a_clean_measurement(
+    monkeypatch, tmp_path, payload
+):
+    requests = []
+    responses = iter(
+        [
+            _Response({"token": "test-token"}),
+            _Response(payload),
+        ]
+    )
+
+    def fake_open(request):
+        requests.append(request)
+        return next(responses)
+
+    monkeypatch.setattr(monitor, "_open", fake_open)
+
+    counts, error = monitor.measure(_settings(tmp_path))
+
+    assert counts is None
+    assert error == "funnel review did not confirm success"
     assert len(requests) == 2
 
 
@@ -118,7 +153,13 @@ def test_publish_posts_directly_to_the_configured_topic(monkeypatch, tmp_path):
     ],
 )
 def test_invalid_or_unverified_audit_is_not_clean(monkeypatch, tmp_path, payload):
-    responses = iter([_Response({"token": "test-token"}), _Response(payload)])
+    responses = iter(
+        [
+            _Response({"token": "test-token"}),
+            _Response({"success": True}),
+            _Response(payload),
+        ]
+    )
     monkeypatch.setattr(monitor, "_open", lambda _request: next(responses))
 
     counts, error = monitor.measure(_settings(tmp_path))
