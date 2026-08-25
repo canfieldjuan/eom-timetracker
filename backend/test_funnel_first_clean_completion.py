@@ -10,6 +10,82 @@ from datetime import datetime, timedelta, timezone
 import db
 import pytest
 import time_tracker_api as api
+from conftest import _raw_conn
+
+
+TEST_PREFIX = "ZZ First Clean "
+CALENDAR_EMAIL_PREFIX = "first-clean-"
+
+
+def _clean_first_clean_rows() -> None:
+    """Remove every source row created by this module's evidence fixture."""
+
+    conn = _raw_conn()
+    try:
+        with conn.cursor() as cur:
+            customer_pattern = f"{TEST_PREFIX}%"
+            calendar_pattern = f"{CALENDAR_EMAIL_PREFIX}%@example.test"
+            cur.execute(
+                "DELETE FROM eom_first_clean_completion_reports WHERE customer_id IN "
+                "(SELECT id FROM customers WHERE name LIKE %s)",
+                (customer_pattern,),
+            )
+            cur.execute(
+                "DELETE FROM planned_visit_audit_events WHERE planned_visit_id IN "
+                "(SELECT id FROM planned_service_visits WHERE source_calendar_id LIKE %s)",
+                (f"{CALENDAR_EMAIL_PREFIX}%",),
+            )
+            cur.execute(
+                "DELETE FROM planned_visit_assignments WHERE planned_visit_id IN "
+                "(SELECT id FROM planned_service_visits WHERE source_calendar_id LIKE %s)",
+                (f"{CALENDAR_EMAIL_PREFIX}%",),
+            )
+            cur.execute(
+                "DELETE FROM visit_evidence_events WHERE planned_visit_id IN "
+                "(SELECT id FROM planned_service_visits WHERE source_calendar_id LIKE %s)",
+                (f"{CALENDAR_EMAIL_PREFIX}%",),
+            )
+            cur.execute(
+                "DELETE FROM planned_service_visits WHERE source_calendar_id LIKE %s",
+                (f"{CALENDAR_EMAIL_PREFIX}%",),
+            )
+            cur.execute(
+                "DELETE FROM departures WHERE location_id IN "
+                "(SELECT id FROM locations WHERE customer_id IN "
+                "(SELECT id FROM customers WHERE name LIKE %s))",
+                (customer_pattern,),
+            )
+            cur.execute(
+                "DELETE FROM shifts WHERE location_id IN "
+                "(SELECT id FROM locations WHERE customer_id IN "
+                "(SELECT id FROM customers WHERE name LIKE %s))",
+                (customer_pattern,),
+            )
+            cur.execute(
+                "DELETE FROM eom_office_conversion_handoffs WHERE customer_id IN "
+                "(SELECT id FROM customers WHERE name LIKE %s)",
+                (customer_pattern,),
+            )
+            cur.execute(
+                "DELETE FROM google_calendar_connections WHERE google_account_email LIKE %s",
+                (calendar_pattern,),
+            )
+            cur.execute(
+                "DELETE FROM locations WHERE customer_id IN "
+                "(SELECT id FROM customers WHERE name LIKE %s)",
+                (customer_pattern,),
+            )
+            cur.execute("DELETE FROM customers WHERE name LIKE %s", (customer_pattern,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.fixture(autouse=True)
+def isolate_first_clean_completion_rows(setup_db):
+    _clean_first_clean_rows()
+    yield
+    _clean_first_clean_rows()
 
 
 def _path(planned_visit_id: int) -> str:
@@ -52,7 +128,7 @@ def _seed_first_clean(*, residential: bool = True, closed: bool = True) -> dict[
             VALUES (%s, %s, %s)
             RETURNING id
             """,
-            (f"ZZ First Clean {token}", contact_id, customer_type),
+            (f"{TEST_PREFIX}{token}", contact_id, customer_type),
         )
     )
     site_id = int(
@@ -65,7 +141,7 @@ def _seed_first_clean(*, residential: bool = True, closed: bool = True) -> dict[
             (
                 customer_id,
                 f"{token} First Clean Test Way",
-                f"ZZ First Clean {token}",
+                f"{TEST_PREFIX}{token}",
                 location_type,
             ),
         )
@@ -86,7 +162,7 @@ def _seed_first_clean(*, residential: bool = True, closed: bool = True) -> dict[
             VALUES (%s, NOW())
             RETURNING id
             """,
-            (f"first-clean-{token}@example.test",),
+            (f"{CALENDAR_EMAIL_PREFIX}{token}@example.test",),
         )
     )
     planned_visit_id = int(
@@ -102,7 +178,7 @@ def _seed_first_clean(*, residential: bool = True, closed: bool = True) -> dict[
             """,
             (
                 connection_id,
-                f"first-clean-{token}",
+                f"{CALENDAR_EMAIL_PREFIX}{token}",
                 f"event-{token}",
                 f"series-{token}",
                 f"occurrence-{token}",
@@ -157,6 +233,7 @@ def _seed_first_clean(*, residential: bool = True, closed: bool = True) -> dict[
         "contactId": contact_id,
         "customerId": customer_id,
         "siteId": site_id,
+        "calendarConnectionId": connection_id,
         "plannedVisitId": planned_visit_id,
         "completedAt": api.to_utc_iso(completed_at),
     }
@@ -172,6 +249,43 @@ def _report(planned_visit_id: int) -> dict | None:
         """,
         (planned_visit_id,),
     )
+
+
+def test_source_fixture_cleanup_removes_every_generated_operational_row(client):
+    source = _seed_first_clean()
+
+    _clean_first_clean_rows()
+
+    assert db.query_one("SELECT COUNT(*) AS count FROM customers WHERE id = %s", (source["customerId"],)) == {
+        "count": 0
+    }
+    assert db.query_one("SELECT COUNT(*) AS count FROM locations WHERE id = %s", (source["siteId"],)) == {
+        "count": 0
+    }
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM planned_service_visits WHERE id = %s",
+        (source["plannedVisitId"],),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM visit_evidence_events WHERE planned_visit_id = %s",
+        (source["plannedVisitId"],),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM departures WHERE location_id = %s",
+        (source["siteId"],),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts WHERE location_id = %s",
+        (source["siteId"],),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM eom_office_conversion_handoffs WHERE atlas_contact_id = %s",
+        (source["contactId"],),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM google_calendar_connections WHERE id = %s",
+        (source["calendarConnectionId"],),
+    ) == {"count": 0}
 
 
 def test_evidenced_residential_completion_posts_only_tracker_facts_and_finalizes(
