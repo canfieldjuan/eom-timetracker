@@ -35,6 +35,7 @@ def _operational_counts() -> dict[str, int]:
 def _manifest_content(
     *,
     with_name: bool = True,
+    with_editability_name: bool = False,
     with_route: bool = True,
     declared: bool = True,
     routes_malformed: bool = False,
@@ -50,6 +51,10 @@ def _manifest_content(
         capabilities: list[object] = ["lead.lost"]
         if with_name:
             capabilities.append(api.ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY)
+        if with_editability_name:
+            capabilities.append(
+                api.ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_EDITABILITY
+            )
         if capabilities_malformed:
             capabilities.append(1)
         content["capabilities"] = capabilities
@@ -152,6 +157,42 @@ def test_review_proves_the_directory_only_with_both_name_and_route(
         assert response.json()["contactDirectoryAvailable"] is expected, manifest
 
 
+def test_review_proves_directory_editability_only_with_the_versioned_name_and_route(
+    client, auth, monkeypatch
+):
+    """The row verdict needs Atlas's semantic capability, not GET reachability."""
+    shapes = [
+        (
+            _manifest_content(with_name=True, with_editability_name=True, with_route=True),
+            True,
+        ),
+        (_manifest_content(with_name=True, with_editability_name=False), False),
+        (_manifest_content(with_name=False, with_editability_name=True), False),
+        (
+            _manifest_content(
+                with_name=True, with_editability_name=True, with_route=False
+            ),
+            False,
+        ),
+        (_manifest_content(declared=False), False),
+        (
+            _manifest_content(
+                with_name=True,
+                with_editability_name=True,
+                capabilities_malformed=True,
+            ),
+            False,
+        ),
+    ]
+    for manifest, expected in shapes:
+        monkeypatch.setattr(
+            api, "_atlas_funnel_read", lambda *_a, _m=manifest, **_k: _m
+        )
+        response = client.get("/api/admin/funnel/review", headers=auth)
+        assert response.status_code == 200, response.text
+        assert response.json()["contactDirectoryEditabilityAvailable"] is expected, manifest
+
+
 # ---------------------------------------------------------------------------
 # Bounded forwarding, closed projection, and the no-local-rows guarantee
 # ---------------------------------------------------------------------------
@@ -203,6 +244,57 @@ def test_directory_forwards_exact_bounded_inputs_and_creates_no_rows(
         "updatedAt",
     }
     assert _operational_counts() == before, "a directory read must write nothing"
+
+
+def test_directory_projects_a_coherent_editability_verdict_without_local_policy(
+    client, auth, monkeypatch
+):
+    editable_id = str(uuid.uuid4())
+    blocked_id = str(uuid.uuid4())
+    _install_atlas(
+        monkeypatch,
+        _directory_content(
+            [
+                {
+                    **_directory_item(editable_id),
+                    "editable": True,
+                    "editBlockedReason": None,
+                },
+                {
+                    **_directory_item(blocked_id, contact_type="lead", lead_stage="lost"),
+                    "editable": False,
+                    # Intentionally not one of the current Atlas names: the
+                    # tracker does not duplicate the upstream reason-code set.
+                    "editBlockedReason": "future_not_editable_reason",
+                },
+            ]
+        ),
+    )
+
+    response = client.get(_path(), headers=auth)
+
+    assert response.status_code == 200, response.text
+    contacts = response.json()["contacts"]
+    assert contacts[0]["editable"] is True
+    assert contacts[0]["editBlockedReason"] is None
+    assert contacts[1]["editable"] is False
+    assert contacts[1]["editBlockedReason"] == "future_not_editable_reason"
+
+
+def test_directory_rejects_incoherent_editability_pairs(client, auth, monkeypatch):
+    item_pages = [
+        [{**_directory_item(), "editable": True}],
+        [{**_directory_item(), "editBlockedReason": "not_editable_stage"}],
+        [{**_directory_item(), "editable": 1, "editBlockedReason": None}],
+        [{**_directory_item(), "editable": False, "editBlockedReason": None}],
+        [{**_directory_item(), "editable": True, "editBlockedReason": "not_editable_stage"}],
+        [{**_directory_item(), "editable": False, "editBlockedReason": "   "}],
+        [{**_directory_item(), "editable": False, "editBlockedReason": ["bad"]}],
+    ]
+    for items in item_pages:
+        _install_atlas(monkeypatch, _directory_content(items))
+        response = client.get(_path(), headers=auth)
+        assert response.status_code == 502, response.text
 
 
 def test_the_service_credential_never_reaches_the_browser(client, auth, monkeypatch):

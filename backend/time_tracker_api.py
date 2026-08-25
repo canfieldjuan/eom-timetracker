@@ -4954,6 +4954,11 @@ ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_LIST = "onboarding.draft.list"
 ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND = "onboarding.draft.approve_send"
 ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY = "contact.directory"
+# Versions the directory response semantics, not the GET route itself. Atlas
+# only advertises this name when every directory row carries its authoritative
+# per-contact editability verdict. The Website must not infer that verdict from
+# the operator-mutation route or reproduce Atlas's lead-stage policy.
+ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_EDITABILITY = "contact.directory.editability"
 # Archive/restore transitions and the archived directory view (website #253).
 # `contact.directory.archived` is Atlas's proof that the DEPLOYED directory
 # understands the closed `lifecycle` filter: the name exists only in builds
@@ -4978,6 +4983,7 @@ ATLAS_CONTACT_DIRECTORY_CUSTOMER_TYPES = frozenset(
     {"residential", "commercial", "unknown"}
 )
 _ATLAS_CONTACT_DIRECTORY_MAX_SEARCH_LENGTH = 120
+_ATLAS_CONTACT_DIRECTORY_EDITABILITY_NOT_PROVIDED = object()
 
 # The Atlas operator-mutation boundary this service writes customers through.
 # `_atlas_funnel_request` requires the "/eom-funnel/" prefix and prepends
@@ -5263,22 +5269,53 @@ def _parse_atlas_contact_directory_response(
         ):
             raise invalid
         seen_contact_ids.add(contact_id)
-        parsed.append(
-            {
-                "contactId": contact_id,
-                "fullName": full_name,
-                "email": _strip_optional_atlas_text(item.get("email")),
-                "phone": _strip_optional_atlas_text(item.get("phone")),
-                "address": _strip_optional_atlas_text(item.get("address")),
-                "contactType": contact_type,
-                "customerType": customer_type,
-                "leadStage": _strip_optional_atlas_text(item.get("leadStage")),
-                "status": lifecycle,
-                "source": _strip_optional_atlas_text(item.get("source")),
-                "createdAt": created_at,
-                "updatedAt": _strip_optional_atlas_text(item.get("updatedAt")),
-            }
+        visible_contact: Dict[str, Any] = {
+            "contactId": contact_id,
+            "fullName": full_name,
+            "email": _strip_optional_atlas_text(item.get("email")),
+            "phone": _strip_optional_atlas_text(item.get("phone")),
+            "address": _strip_optional_atlas_text(item.get("address")),
+            "contactType": contact_type,
+            "customerType": customer_type,
+            "leadStage": _strip_optional_atlas_text(item.get("leadStage")),
+            "status": lifecycle,
+            "source": _strip_optional_atlas_text(item.get("source")),
+            "createdAt": created_at,
+            "updatedAt": _strip_optional_atlas_text(item.get("updatedAt")),
+        }
+        raw_editable = item.get(
+            "editable", _ATLAS_CONTACT_DIRECTORY_EDITABILITY_NOT_PROVIDED
         )
+        raw_edit_block_reason = item.get(
+            "editBlockedReason", _ATLAS_CONTACT_DIRECTORY_EDITABILITY_NOT_PROVIDED
+        )
+        # The pair is additive: an Atlas build before the semantic capability
+        # remains a usable read-only directory. When either member appears, both
+        # must be coherent before the tracker exposes either one. The reason is
+        # deliberately opaque here: Atlas owns its closed reason vocabulary, and
+        # an unknown future code still fails closed in the Website as no Edit
+        # action plus generic explanatory copy rather than a copied policy list.
+        if (
+            raw_editable is not _ATLAS_CONTACT_DIRECTORY_EDITABILITY_NOT_PROVIDED
+            or raw_edit_block_reason
+            is not _ATLAS_CONTACT_DIRECTORY_EDITABILITY_NOT_PROVIDED
+        ):
+            if not isinstance(raw_editable, bool):
+                raise invalid
+            if raw_editable:
+                if raw_edit_block_reason is not None:
+                    raise invalid
+                edit_block_reason = None
+            else:
+                if (
+                    not isinstance(raw_edit_block_reason, str)
+                    or not raw_edit_block_reason.strip()
+                ):
+                    raise invalid
+                edit_block_reason = raw_edit_block_reason.strip()
+            visible_contact["editable"] = raw_editable
+            visible_contact["editBlockedReason"] = edit_block_reason
+        parsed.append(visible_contact)
     return {
         "contacts": parsed,
         "limit": limit,
@@ -22052,6 +22089,19 @@ def admin_list_funnel_review(
         "contactDirectoryAvailable": (
             strict_capabilities is not None
             and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY in strict_capabilities
+            and capability_routes is not None
+            and _ATLAS_CONTACT_DIRECTORY_ROUTE in capability_routes
+        ),
+        # Semantic proof for the additive row verdict. The GET route already
+        # exists on older Atlas builds, so route reachability alone cannot prove
+        # `editable` / `editBlockedReason` are present. Require the base
+        # directory name too: a manifest carrying only the versioned name is not
+        # a usable directory contract, and the Website must keep Edit closed.
+        "contactDirectoryEditabilityAvailable": (
+            strict_capabilities is not None
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY in strict_capabilities
+            and ATLAS_FUNNEL_CAPABILITY_CONTACT_DIRECTORY_EDITABILITY
+            in strict_capabilities
             and capability_routes is not None
             and _ATLAS_CONTACT_DIRECTORY_ROUTE in capability_routes
         ),
