@@ -3731,6 +3731,25 @@ class AtlasLinkageBackfillApplyRequest(AtlasLinkageBackfillPlanRequest):
     confirmation: str = Field(min_length=1, max_length=100)
 
 
+class AtlasDanglingLinkCorrectionPlanRequest(BaseModel):
+    reason: str = Field(min_length=10, max_length=500)
+    customerId: int = Field(gt=0)
+    expectedAtlasContactId: UUID
+    replacementAtlasContactId: UUID
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip_reason(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
+class AtlasDanglingLinkCorrectionApplyRequest(
+    AtlasDanglingLinkCorrectionPlanRequest
+):
+    planToken: str = Field(min_length=64, max_length=64)
+    confirmation: str = Field(min_length=1, max_length=100)
+
+
 class CustomerTypeChangeRequest(BaseModel):
     customerType: str = Field(min_length=1, max_length=32)
 
@@ -7232,6 +7251,22 @@ def _ensure_schema_migrations() -> None:
     db.execute("""
         CREATE INDEX IF NOT EXISTS idx_atlas_linkage_backfill_batches_created
             ON atlas_linkage_backfill_batches(created_at)
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS atlas_linkage_correction_batches (
+            id                     BIGSERIAL PRIMARY KEY,
+            plan_token             TEXT NOT NULL UNIQUE,
+            applied_by_employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            applied_by_name        TEXT NOT NULL,
+            reason                 TEXT NOT NULL,
+            snapshot               JSONB NOT NULL,
+            result                 JSONB NOT NULL,
+            created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_atlas_linkage_correction_batches_created
+            ON atlas_linkage_correction_batches(created_at)
     """)
     db.execute("""
         ALTER TABLE employees
@@ -28253,6 +28288,176 @@ def _build_atlas_linkage_backfill_plan(
     }
 
 
+def _read_dangling_link_correction_evidence(
+    admin: Dict[str, Any],
+    payload: AtlasDanglingLinkCorrectionPlanRequest,
+) -> set:
+    """Prove the old link is absent and the replacement exists in Atlas."""
+    expected = str(payload.expectedAtlasContactId)
+    replacement = str(payload.replacementAtlasContactId)
+    if expected == replacement:
+        raise HTTPException(
+            status_code=400,
+            detail="Replacement Atlas contact must differ from the current contact",
+        )
+
+    known, _types, _revisions, status, _type_status = _fetch_known_contacts(
+        admin, [expected, replacement]
+    )
+    if status["status"] != "ok":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Cannot verify the dangling-link correction against Atlas: "
+                f"{status['status']} ({status['error']})"
+            ),
+        )
+    if expected in known:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Atlas still recognizes the expected current contact; this is "
+                "not a dangling link and nothing was changed"
+            ),
+        )
+    if replacement not in known:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Atlas does not recognize the replacement contact; nothing was "
+                "changed"
+            ),
+        )
+    return known
+
+
+def _build_atlas_dangling_link_correction_plan(
+    payload: AtlasDanglingLinkCorrectionPlanRequest,
+    known_contact_ids: set,
+    *,
+    cursor: Any = None,
+    lock_rows: bool = False,
+) -> Dict[str, Any]:
+    """Build one stale-safe local relink plan from current Atlas evidence."""
+    reason = payload.reason.strip()
+    if len(reason) < 10:
+        raise HTTPException(
+            status_code=400,
+            detail="Correction reason must be at least 10 characters",
+        )
+    customer_id = int(payload.customerId)
+    expected = str(payload.expectedAtlasContactId)
+    replacement = str(payload.replacementAtlasContactId)
+    if expected == replacement:
+        raise HTTPException(
+            status_code=400,
+            detail="Replacement Atlas contact must differ from the current contact",
+        )
+    if expected in known_contact_ids or replacement not in known_contact_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="Atlas link evidence changed; preview the correction again",
+        )
+
+    def _rows(sql: str, params: tuple) -> List[Dict[str, Any]]:
+        if cursor is not None:
+            cursor.execute(sql, params)
+            return [dict(row) for row in cursor.fetchall()]
+        return db.query_all(sql, params)
+
+    lock_clause = " FOR UPDATE" if lock_rows else ""
+    rows = _rows(
+        "SELECT id, name, active, atlas_contact_id FROM customers WHERE id = %s"
+        + lock_clause,
+        (customer_id,),
+    )
+    if not rows:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Customer {customer_id} no longer exists; reload the linkage audit",
+        )
+    customer = rows[0]
+    current = (
+        str(customer["atlas_contact_id"])
+        if customer["atlas_contact_id"] is not None
+        else None
+    )
+    if current != expected:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Customer {customer_id} no longer carries the expected Atlas "
+                "contact; reload the linkage audit"
+            ),
+        )
+
+    holders = _rows(
+        "SELECT id FROM customers WHERE atlas_contact_id = %s AND id <> %s "
+        "ORDER BY id",
+        (replacement, customer_id),
+    )
+    if holders:
+        holder_ids = [int(row["id"]) for row in holders]
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Replacement Atlas contact is already linked to Customer(s) "
+                f"{holder_ids}; nothing was changed"
+            ),
+        )
+
+    handoffs = _rows(
+        "SELECT customer_id FROM eom_office_conversion_handoffs "
+        "WHERE atlas_contact_id = %s AND customer_id <> %s ORDER BY customer_id",
+        (replacement, customer_id),
+    )
+    if handoffs:
+        reserved_for = sorted({int(row["customer_id"]) for row in handoffs})
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Replacement Atlas contact is reserved by office handoff(s) for "
+                f"Customer(s) {reserved_for}; nothing was changed"
+            ),
+        )
+
+    correction = {
+        "customerId": customer_id,
+        "customerName": customer["name"],
+        "fromAtlasContactId": expected,
+        "toAtlasContactId": replacement,
+    }
+    snapshot = {
+        "reason": reason,
+        "customerBefore": {
+            "id": customer_id,
+            "name": customer["name"],
+            "active": bool(customer["active"]),
+            "atlasContactId": expected,
+        },
+        "replacementAtlasContactId": replacement,
+        "atlasVerification": {
+            "expectedContactKnown": False,
+            "replacementContactKnown": True,
+        },
+    }
+    token_material = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    plan_token = hmac.new(
+        JWT_SECRET.encode("utf-8"),
+        token_material.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        "success": True,
+        "databaseReadOnly": True,
+        "planToken": plan_token,
+        "confirmationPhrase": f"RELINK CUSTOMER {customer_id} TO ATLAS CONTACT",
+        "summary": {"customersToRelink": 1},
+        "correction": correction,
+        "_archiveSnapshot": snapshot,
+    }
+
+
 def _build_customer_type_refresh_plan(
     admin: Dict[str, Any],
     *,
@@ -28567,6 +28772,131 @@ def admin_apply_atlas_linkage_backfill(
         "ATLAS_LINKAGE_BACKFILL_APPLIED",
         True,
         f"batch={batch_id} linked={len(linked_ids)}",
+    )
+    return {
+        "success": True,
+        "batchId": batch_id,
+        "archiveStored": True,
+        **result,
+    }
+
+
+@app.post("/api/admin/corrections/atlas-linkage/dangling/preview")
+def admin_atlas_dangling_link_correction_preview(
+    payload: AtlasDanglingLinkCorrectionPlanRequest,
+    request: Request,
+    current_admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    known = _read_dangling_link_correction_evidence(current_admin, payload)
+    result = _build_atlas_dangling_link_correction_plan(payload, known)
+    result.pop("_archiveSnapshot", None)
+    append_access_log(
+        request,
+        "ATLAS_DANGLING_LINK_CORRECTION_PLAN",
+        True,
+        f"customer={payload.customerId}",
+    )
+    return result
+
+
+@app.post("/api/admin/corrections/atlas-linkage/dangling/apply")
+def admin_apply_atlas_dangling_link_correction(
+    payload: AtlasDanglingLinkCorrectionApplyRequest,
+    request: Request,
+    current_admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    # The provider read is deliberately outside the customer/site mutation
+    # lock. Apply still requires fresh evidence, but an Atlas timeout must not
+    # stall every ordinary local Customer and Site write.
+    known = _read_dangling_link_correction_evidence(current_admin, payload)
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            plan = _build_atlas_dangling_link_correction_plan(
+                payload,
+                known,
+                cursor=cur,
+                lock_rows=True,
+            )
+            if not hmac.compare_digest(payload.planToken, plan["planToken"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Dangling-link correction plan is stale or does not "
+                        "match; preview it again"
+                    ),
+                )
+            if payload.confirmation != plan["confirmationPhrase"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Type the exact confirmation phrase: "
+                        f"{plan['confirmationPhrase']}"
+                    ),
+                )
+
+            cur.execute(
+                """
+                INSERT INTO atlas_linkage_correction_batches (
+                    plan_token,
+                    applied_by_employee_id,
+                    applied_by_name,
+                    reason,
+                    snapshot,
+                    result
+                )
+                VALUES (%s, %s, %s, %s, %s::jsonb, '{}'::jsonb)
+                RETURNING id
+                """,
+                (
+                    plan["planToken"],
+                    int(current_admin["id"]),
+                    current_admin["name"],
+                    payload.reason,
+                    json.dumps(plan["_archiveSnapshot"], sort_keys=True),
+                ),
+            )
+            batch_id = int(cur.fetchone()["id"])
+            correction = plan["correction"]
+            cur.execute(
+                """
+                UPDATE customers
+                SET atlas_contact_id = %s, updated_at = NOW()
+                WHERE id = %s AND atlas_contact_id = %s
+                RETURNING id
+                """,
+                (
+                    correction["toAtlasContactId"],
+                    correction["customerId"],
+                    correction["fromAtlasContactId"],
+                ),
+            )
+            updated = cur.fetchone()
+            if not updated:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Customer {correction['customerId']} changed before the "
+                        "dangling-link correction could be applied"
+                    ),
+                )
+
+            result = {
+                "relinkedCustomerId": int(updated["id"]),
+                "previousAtlasContactId": correction["fromAtlasContactId"],
+                "replacementAtlasContactId": correction["toAtlasContactId"],
+            }
+            cur.execute(
+                "UPDATE atlas_linkage_correction_batches "
+                "SET result = %s::jsonb WHERE id = %s",
+                (json.dumps(result, sort_keys=True), batch_id),
+            )
+
+    append_access_log(
+        request,
+        "ATLAS_DANGLING_LINK_CORRECTION_APPLIED",
+        True,
+        f"batch={batch_id} customer={result['relinkedCustomerId']}",
     )
     return {
         "success": True,

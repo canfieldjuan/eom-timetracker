@@ -1,15 +1,19 @@
-"""Atlas linkage audit + guarded backfill (issue #54 slice T3a).
+"""Atlas linkage audit and guarded linkage corrections.
 
 The audit is read-only; the backfill only fills NULL links for active
 Customers from an explicit operator mapping, guarded by the plan-token /
-confirmation-phrase pattern used by the time-data corrections flow.
+confirmation-phrase pattern used by the time-data corrections flow. The
+dangling-link path replaces one exact non-NULL link only after Atlas proves
+the old contact absent and the replacement present.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from threading import Barrier
 
 import pytest
 
@@ -25,6 +29,8 @@ TEST_PREFIX = "ZZ-LNK-TEST"
 AUDIT_PATH = "/api/admin/audits/atlas-linkage"
 PREVIEW_PATH = "/api/admin/corrections/atlas-linkage/preview"
 APPLY_PATH = "/api/admin/corrections/atlas-linkage/apply"
+RELINK_PREVIEW_PATH = "/api/admin/corrections/atlas-linkage/dangling/preview"
+RELINK_APPLY_PATH = "/api/admin/corrections/atlas-linkage/dangling/apply"
 
 REASON = "Backfill legacy customer links for the funnel arc"
 
@@ -46,6 +52,10 @@ def _clean_test_rows() -> None:
     )
     db.execute(
         "DELETE FROM atlas_linkage_backfill_batches WHERE snapshot::text LIKE %s",
+        (f"%{TEST_PREFIX}%",),
+    )
+    db.execute(
+        "DELETE FROM atlas_linkage_correction_batches WHERE snapshot::text LIKE %s",
         (f"%{TEST_PREFIX}%",),
     )
     db.execute(
@@ -99,6 +109,15 @@ def _mapping(customer_id: int, contact_id: str) -> dict:
 
 def _plan_payload(*entries: dict) -> dict:
     return {"reason": REASON, "mappings": list(entries)}
+
+
+def _relink_payload(customer_id: int, old_contact: str, new_contact: str) -> dict:
+    return {
+        "reason": "Replace a verified dangling Atlas customer link",
+        "customerId": customer_id,
+        "expectedAtlasContactId": old_contact,
+        "replacementAtlasContactId": new_contact,
+    }
 
 
 # -- audit ---------------------------------------------------------------------
@@ -473,6 +492,275 @@ def test_backfill_apply_guards(client, auth, emp_auth):
     assert _customer_link(customer) == contact
 
 
+# -- dangling-link correction ---------------------------------------------------
+
+
+def test_dangling_link_correction_preview_and_apply(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    old_contact = str(uuid.uuid4())
+    replacement = str(uuid.uuid4())
+    customer = _create_customer("Relink Happy", old_contact)
+    monkeypatch.setattr(api.requests, "get", _known_contacts_except([old_contact]))
+    payload = _relink_payload(customer, old_contact, replacement)
+
+    preview = client.post(RELINK_PREVIEW_PATH, headers=auth, json=payload)
+    assert preview.status_code == 200, preview.text
+    plan = preview.json()
+    assert plan["databaseReadOnly"] is True
+    assert len(plan["planToken"]) == 64
+    assert plan["confirmationPhrase"] == f"RELINK CUSTOMER {customer} TO ATLAS CONTACT"
+    assert plan["correction"] == {
+        "customerId": customer,
+        "customerName": f"{TEST_PREFIX} Relink Happy",
+        "fromAtlasContactId": old_contact,
+        "toAtlasContactId": replacement,
+    }
+    assert _customer_link(customer) == old_contact
+
+    applied = client.post(
+        RELINK_APPLY_PATH,
+        headers=auth,
+        json={
+            **payload,
+            "planToken": plan["planToken"],
+            "confirmation": plan["confirmationPhrase"],
+        },
+    )
+    assert applied.status_code == 200, applied.text
+    result = applied.json()
+    assert result["relinkedCustomerId"] == customer
+    assert result["previousAtlasContactId"] == old_contact
+    assert result["replacementAtlasContactId"] == replacement
+    assert _customer_link(customer) == replacement
+
+    batch = db.query_one(
+        "SELECT reason, snapshot, result FROM atlas_linkage_correction_batches "
+        "WHERE id = %s",
+        (result["batchId"],),
+    )
+    assert batch is not None
+    assert batch["reason"] == payload["reason"]
+    assert batch["snapshot"]["customerBefore"]["atlasContactId"] == old_contact
+    assert batch["snapshot"]["atlasVerification"] == {
+        "expectedContactKnown": False,
+        "replacementContactKnown": True,
+    }
+    assert batch["result"]["replacementAtlasContactId"] == replacement
+
+    log = db.query_one(
+        "SELECT reason FROM access_log_entries WHERE action = %s "
+        "ORDER BY logged_at DESC, id DESC LIMIT 1",
+        ("ATLAS_DANGLING_LINK_CORRECTION_APPLIED",),
+    )
+    assert log is not None
+    assert f"customer={customer}" in log["reason"]
+
+
+def test_dangling_link_correction_rejects_wrong_atlas_evidence(
+    client, auth, monkeypatch
+):
+    import time_tracker_api as api
+
+    old_contact = str(uuid.uuid4())
+    replacement = str(uuid.uuid4())
+    customer = _create_customer("Relink Evidence", old_contact)
+    payload = _relink_payload(customer, old_contact, replacement)
+
+    # Atlas still recognizes the current id, so this is not a dangling link.
+    still_known = client.post(RELINK_PREVIEW_PATH, headers=auth, json=payload)
+    assert still_known.status_code == 409
+    assert _customer_link(customer) == old_contact
+
+    # Atlas recognizes neither id. Replacing one unresolvable id with another
+    # must be rejected rather than dressed up as a correction.
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        _known_contacts_except([old_contact, replacement]),
+    )
+    replacement_unknown = client.post(
+        RELINK_PREVIEW_PATH, headers=auth, json=payload
+    )
+    assert replacement_unknown.status_code == 409
+    assert _customer_link(customer) == old_contact
+
+
+def test_dangling_link_correction_rejects_replacement_conflicts(
+    client, auth, location_id, monkeypatch
+):
+    import time_tracker_api as api
+
+    old_contact = str(uuid.uuid4())
+    replacement = str(uuid.uuid4())
+    customer = _create_customer("Relink Conflict", old_contact)
+    holder = _create_customer("Relink Holder", replacement)
+    monkeypatch.setattr(api.requests, "get", _known_contacts_except([old_contact]))
+
+    linked_conflict = client.post(
+        RELINK_PREVIEW_PATH,
+        headers=auth,
+        json=_relink_payload(customer, old_contact, replacement),
+    )
+    assert linked_conflict.status_code == 409
+    assert str(holder) in linked_conflict.json()["error"]
+
+    db.execute("UPDATE customers SET atlas_contact_id = NULL WHERE id = %s", (holder,))
+    _create_handoff(replacement, holder, location_id)
+    reserved_conflict = client.post(
+        RELINK_PREVIEW_PATH,
+        headers=auth,
+        json=_relink_payload(customer, old_contact, replacement),
+    )
+    assert reserved_conflict.status_code == 409
+    assert _customer_link(customer) == old_contact
+
+
+def test_dangling_link_correction_rejects_stale_plan(client, auth, monkeypatch):
+    import time_tracker_api as api
+
+    old_contact = str(uuid.uuid4())
+    replacement = str(uuid.uuid4())
+    intervening = str(uuid.uuid4())
+    customer = _create_customer("Relink Stale", old_contact)
+    monkeypatch.setattr(api.requests, "get", _known_contacts_except([old_contact]))
+    payload = _relink_payload(customer, old_contact, replacement)
+    plan = client.post(RELINK_PREVIEW_PATH, headers=auth, json=payload).json()
+
+    db.execute(
+        "UPDATE customers SET atlas_contact_id = %s WHERE id = %s",
+        (intervening, customer),
+    )
+    response = client.post(
+        RELINK_APPLY_PATH,
+        headers=auth,
+        json={
+            **payload,
+            "planToken": plan["planToken"],
+            "confirmation": plan["confirmationPhrase"],
+        },
+    )
+    assert response.status_code == 409
+    assert _customer_link(customer) == intervening
+
+
+def test_dangling_link_apply_reverifies_atlas_before_taking_local_lock(
+    client, auth, monkeypatch
+):
+    import time_tracker_api as api
+
+    old_contact = str(uuid.uuid4())
+    replacement = str(uuid.uuid4())
+    customer = _create_customer("Relink Read Before Lock", old_contact)
+    payload = _relink_payload(customer, old_contact, replacement)
+    atlas_get = _known_contacts_except([old_contact])
+    atlas_reads = 0
+
+    def counted_get(*args, **kwargs):
+        nonlocal atlas_reads
+        if "/known-contacts" in str(args[0]):
+            atlas_reads += 1
+        return atlas_get(*args, **kwargs)
+
+    original_lock = api._lock_customer_site_mutations
+
+    def assert_read_precedes_lock(cursor):
+        assert atlas_reads == 2, "apply must re-read Atlas before taking the lock"
+        return original_lock(cursor)
+
+    monkeypatch.setattr(api.requests, "get", counted_get)
+    monkeypatch.setattr(api, "_lock_customer_site_mutations", assert_read_precedes_lock)
+    plan = client.post(RELINK_PREVIEW_PATH, headers=auth, json=payload).json()
+
+    applied = client.post(
+        RELINK_APPLY_PATH,
+        headers=auth,
+        json={
+            **payload,
+            "planToken": plan["planToken"],
+            "confirmation": plan["confirmationPhrase"],
+        },
+    )
+    assert applied.status_code == 200, applied.text
+    assert atlas_reads == 2
+    assert _customer_link(customer) == replacement
+
+
+def test_dangling_link_correction_requires_admin_and_exact_plan_guards(
+    client, auth, emp_auth, monkeypatch
+):
+    import time_tracker_api as api
+
+    old_contact = str(uuid.uuid4())
+    replacement = str(uuid.uuid4())
+    customer = _create_customer("Relink Guards", old_contact)
+    monkeypatch.setattr(api.requests, "get", _known_contacts_except([old_contact]))
+    payload = _relink_payload(customer, old_contact, replacement)
+
+    assert client.post(RELINK_PREVIEW_PATH, json=payload).status_code == 401
+    assert (
+        client.post(RELINK_PREVIEW_PATH, headers=emp_auth, json=payload).status_code
+        == 403
+    )
+    plan = client.post(RELINK_PREVIEW_PATH, headers=auth, json=payload).json()
+
+    wrong_token = client.post(
+        RELINK_APPLY_PATH,
+        headers=auth,
+        json={
+            **payload,
+            "planToken": "0" * 64,
+            "confirmation": plan["confirmationPhrase"],
+        },
+    )
+    assert wrong_token.status_code == 409
+    assert _customer_link(customer) == old_contact
+
+    wrong_phrase = client.post(
+        RELINK_APPLY_PATH,
+        headers=auth,
+        json={
+            **payload,
+            "planToken": plan["planToken"],
+            "confirmation": "RELINK THE CUSTOMER",
+        },
+    )
+    assert wrong_phrase.status_code == 400
+    assert _customer_link(customer) == old_contact
+
+
+def test_concurrent_dangling_link_corrections_have_one_winner(
+    client, auth, monkeypatch
+):
+    import time_tracker_api as api
+
+    old_contact = str(uuid.uuid4())
+    replacement = str(uuid.uuid4())
+    customer = _create_customer("Relink Concurrent", old_contact)
+    monkeypatch.setattr(api.requests, "get", _known_contacts_except([old_contact]))
+    payload = _relink_payload(customer, old_contact, replacement)
+    plan = client.post(RELINK_PREVIEW_PATH, headers=auth, json=payload).json()
+    apply_payload = {
+        **payload,
+        "planToken": plan["planToken"],
+        "confirmation": plan["confirmationPhrase"],
+    }
+    start = Barrier(2)
+
+    def apply_once():
+        start.wait(timeout=10)
+        return client.post(RELINK_APPLY_PATH, headers=auth, json=apply_payload)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = [
+            future.result(timeout=20)
+            for future in [pool.submit(apply_once), pool.submit(apply_once)]
+        ]
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    assert _customer_link(customer) == replacement
+
+
 # -- reconcile through Atlas (slice 0C) -------------------------------------------
 
 
@@ -531,6 +819,10 @@ def test_schema_migration_idempotent(client):
         "SELECT to_regclass('atlas_linkage_backfill_batches') AS name"
     )
     assert table["name"] == "atlas_linkage_backfill_batches"
+    correction_table = db.query_one(
+        "SELECT to_regclass('atlas_linkage_correction_batches') AS name"
+    )
+    assert correction_table["name"] == "atlas_linkage_correction_batches"
     column = db.query_one(
         """
         SELECT data_type FROM information_schema.columns
