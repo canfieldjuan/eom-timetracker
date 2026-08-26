@@ -20715,6 +20715,44 @@ def _finalize_customer_atlas_reservation(
                     {},
                 )
 
+            # Atlas I/O completes before this transaction acquires the shared
+            # Customer/Site lock. Another serialized writer can claim the
+            # returned contact in that interval, so the finalizer must recheck
+            # ownership after taking the lock rather than relying on the
+            # reservation's earlier view. Linking the same target Customer is
+            # an idempotent winner; every other holder is a conflict.
+            target_customer_id = (
+                int(reservation["customer_id"])
+                if reservation["mode"] == "link_existing"
+                else None
+            )
+            cur.execute(
+                """
+                SELECT id
+                FROM customers
+                WHERE atlas_contact_id = %s
+                ORDER BY id
+                FOR UPDATE
+                """,
+                (atlas_contact_id,),
+            )
+            conflicting_customer_ids = [
+                int(holder["id"])
+                for holder in cur.fetchall()
+                if target_customer_id is None
+                or int(holder["id"]) != target_customer_id
+            ]
+            if conflicting_customer_ids:
+                _raise_conflict(
+                    "customer_atlas_link_conflict",
+                    "This Atlas contact was linked to another Customer while "
+                    "this reservation was in flight",
+                    {
+                        "atlasContactId": atlas_contact_id,
+                        "customerIds": conflicting_customer_ids,
+                    },
+                )
+
             if reservation["mode"] == "link_existing":
                 customer_id = int(reservation["customer_id"])
                 cur.execute(
