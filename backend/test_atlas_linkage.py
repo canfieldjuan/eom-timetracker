@@ -179,7 +179,13 @@ class _Resp:
         return self._body
 
 
-def _known_contacts_except(omit_ids):
+def _known_contacts_except(
+    omit_ids,
+    *,
+    customer_type="residential",
+    source_revision=1,
+    include_type_evidence=True,
+):
     """A requests.get replacement: Atlas knows every submitted id EXCEPT these.
 
     Patched over the autouse stub for one test, so a planted customer whose
@@ -191,7 +197,19 @@ def _known_contacts_except(omit_ids):
         if "/known-contacts" in str(url):
             submitted = [str(value) for value in (params or {}).get("contact_id") or []]
             known = [value for value in submitted if value not in omit]
-            return _Resp(200, {"knownContactIds": known, "checked": len(submitted), "limit": 100})
+            body = {
+                "knownContactIds": known,
+                "checked": len(submitted),
+                "limit": 100,
+            }
+            if include_type_evidence:
+                body["customerTypes"] = {
+                    value: customer_type for value in known
+                }
+                body["customerTypeRevisions"] = {
+                    value: source_revision for value in known
+                }
+            return _Resp(200, body)
         return _Resp(200, {"leads": [], "cursor": None, "hasMore": False, "nextCursor": None, "capabilities": []})
 
     return _get
@@ -501,7 +519,14 @@ def test_dangling_link_correction_preview_and_apply(client, auth, monkeypatch):
     old_contact = str(uuid.uuid4())
     replacement = str(uuid.uuid4())
     customer = _create_customer("Relink Happy", old_contact)
-    monkeypatch.setattr(api.requests, "get", _known_contacts_except([old_contact]))
+    _set_type(customer, "commercial", source_revision=99)
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        _known_contacts_except(
+            [old_contact], customer_type="residential", source_revision=3
+        ),
+    )
     payload = _relink_payload(customer, old_contact, replacement)
 
     preview = client.post(RELINK_PREVIEW_PATH, headers=auth, json=payload)
@@ -515,6 +540,8 @@ def test_dangling_link_correction_preview_and_apply(client, auth, monkeypatch):
         "customerName": f"{TEST_PREFIX} Relink Happy",
         "fromAtlasContactId": old_contact,
         "toAtlasContactId": replacement,
+        "toCustomerType": "residential",
+        "toCustomerTypeSourceRevision": 3,
     }
     assert _customer_link(customer) == old_contact
 
@@ -533,6 +560,8 @@ def test_dangling_link_correction_preview_and_apply(client, auth, monkeypatch):
     assert result["previousAtlasContactId"] == old_contact
     assert result["replacementAtlasContactId"] == replacement
     assert _customer_link(customer) == replacement
+    assert _get_type(customer) == "residential"
+    assert _get_source_revision(customer) == 3
 
     batch = db.query_one(
         "SELECT reason, snapshot, result FROM atlas_linkage_correction_batches "
@@ -542,11 +571,17 @@ def test_dangling_link_correction_preview_and_apply(client, auth, monkeypatch):
     assert batch is not None
     assert batch["reason"] == payload["reason"]
     assert batch["snapshot"]["customerBefore"]["atlasContactId"] == old_contact
+    assert batch["snapshot"]["customerBefore"]["customerType"] == "commercial"
+    assert batch["snapshot"]["customerBefore"]["customerTypeSourceRevision"] == 99
     assert batch["snapshot"]["atlasVerification"] == {
         "expectedContactKnown": False,
         "replacementContactKnown": True,
+        "replacementCustomerType": "residential",
+        "replacementCustomerTypeSourceRevision": 3,
     }
     assert batch["result"]["replacementAtlasContactId"] == replacement
+    assert batch["result"]["replacementCustomerType"] == "residential"
+    assert batch["result"]["replacementCustomerTypeSourceRevision"] == 3
 
     log = db.query_one(
         "SELECT reason FROM access_log_entries WHERE action = %s "
@@ -613,6 +648,63 @@ def test_dangling_link_correction_rejects_replacement_conflicts(
         json=_relink_payload(customer, old_contact, replacement),
     )
     assert reserved_conflict.status_code == 409
+    assert _customer_link(customer) == old_contact
+
+
+def test_dangling_link_correction_rejects_an_existing_old_contact_handoff(
+    client, auth, location_id, monkeypatch
+):
+    import time_tracker_api as api
+
+    old_contact = str(uuid.uuid4())
+    replacement = str(uuid.uuid4())
+    customer = _create_customer("Relink Old Handoff", old_contact)
+    _create_handoff(old_contact, customer, location_id)
+    monkeypatch.setattr(api.requests, "get", _known_contacts_except([old_contact]))
+
+    response = client.post(
+        RELINK_PREVIEW_PATH,
+        headers=auth,
+        json=_relink_payload(customer, old_contact, replacement),
+    )
+    assert response.status_code == 409
+    assert "handoff" in response.json()["error"].lower()
+    assert _customer_link(customer) == old_contact
+
+
+def test_dangling_link_correction_requires_replacement_type_evidence(
+    client, auth, monkeypatch
+):
+    import time_tracker_api as api
+
+    old_contact = str(uuid.uuid4())
+    replacement = str(uuid.uuid4())
+    customer = _create_customer("Relink Missing Type", old_contact)
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        _known_contacts_except([old_contact], include_type_evidence=False),
+    )
+
+    response = client.post(
+        RELINK_PREVIEW_PATH,
+        headers=auth,
+        json=_relink_payload(customer, old_contact, replacement),
+    )
+    assert response.status_code == 503
+    assert _customer_link(customer) == old_contact
+
+    monkeypatch.setattr(
+        api.requests,
+        "get",
+        _known_contacts_except([old_contact], customer_type="prospect"),
+    )
+    unsupported = client.post(
+        RELINK_PREVIEW_PATH,
+        headers=auth,
+        json=_relink_payload(customer, old_contact, replacement),
+    )
+    assert unsupported.status_code == 502
     assert _customer_link(customer) == old_contact
 
 

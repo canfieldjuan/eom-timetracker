@@ -6032,6 +6032,17 @@ class CustomerTypeSourceEvidence:
     customer_type: str
     revision: int
 
+
+@dataclass(frozen=True)
+class AtlasDanglingLinkCorrectionEvidence:
+    """Atlas proof required to replace one dangling local contact link."""
+
+    expected_contact_known: bool
+    replacement_contact_known: bool
+    replacement_customer_type: str
+    replacement_type_revision: int
+
+
 def _ensure_customer_site_schema() -> None:
     """Install and backfill the Customer/Site model in one transaction."""
     with db.get_conn() as conn:
@@ -28291,7 +28302,7 @@ def _build_atlas_linkage_backfill_plan(
 def _read_dangling_link_correction_evidence(
     admin: Dict[str, Any],
     payload: AtlasDanglingLinkCorrectionPlanRequest,
-) -> set:
+) -> AtlasDanglingLinkCorrectionEvidence:
     """Prove the old link is absent and the replacement exists in Atlas."""
     expected = str(payload.expectedAtlasContactId)
     replacement = str(payload.replacementAtlasContactId)
@@ -28301,7 +28312,7 @@ def _read_dangling_link_correction_evidence(
             detail="Replacement Atlas contact must differ from the current contact",
         )
 
-    known, _types, _revisions, status, _type_status = _fetch_known_contacts(
+    known, types, revisions, status, type_status = _fetch_known_contacts(
         admin, [expected, replacement]
     )
     if status["status"] != "ok":
@@ -28328,12 +28339,42 @@ def _read_dangling_link_correction_evidence(
                 "changed"
             ),
         )
-    return known
+    if type_status["status"] != "ok":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Cannot verify the replacement Atlas customer type: "
+                f"{type_status['status']} ({type_status['error']})"
+            ),
+        )
+    if replacement not in types or replacement not in revisions:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Atlas did not provide versioned customer-type evidence for "
+                "the replacement contact; nothing was changed"
+            ),
+        )
+    replacement_type = types[replacement]
+    if replacement_type not in CUSTOMER_TYPES:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Atlas reported an unsupported customer_type {replacement_type!r} "
+                f"for contact {replacement}"
+            ),
+        )
+    return AtlasDanglingLinkCorrectionEvidence(
+        expected_contact_known=False,
+        replacement_contact_known=True,
+        replacement_customer_type=replacement_type,
+        replacement_type_revision=revisions[replacement],
+    )
 
 
 def _build_atlas_dangling_link_correction_plan(
     payload: AtlasDanglingLinkCorrectionPlanRequest,
-    known_contact_ids: set,
+    evidence: AtlasDanglingLinkCorrectionEvidence,
     *,
     cursor: Any = None,
     lock_rows: bool = False,
@@ -28353,7 +28394,7 @@ def _build_atlas_dangling_link_correction_plan(
             status_code=400,
             detail="Replacement Atlas contact must differ from the current contact",
         )
-    if expected in known_contact_ids or replacement not in known_contact_ids:
+    if evidence.expected_contact_known or not evidence.replacement_contact_known:
         raise HTTPException(
             status_code=409,
             detail="Atlas link evidence changed; preview the correction again",
@@ -28367,8 +28408,8 @@ def _build_atlas_dangling_link_correction_plan(
 
     lock_clause = " FOR UPDATE" if lock_rows else ""
     rows = _rows(
-        "SELECT id, name, active, atlas_contact_id FROM customers WHERE id = %s"
-        + lock_clause,
+        "SELECT id, name, active, atlas_contact_id, customer_type, "
+        "customer_type_source_revision FROM customers WHERE id = %s" + lock_clause,
         (customer_id,),
     )
     if not rows:
@@ -28388,6 +28429,20 @@ def _build_atlas_dangling_link_correction_plan(
             detail=(
                 f"Customer {customer_id} no longer carries the expected Atlas "
                 "contact; reload the linkage audit"
+            ),
+        )
+
+    old_contact_handoffs = _rows(
+        "SELECT atlas_contact_id FROM eom_office_conversion_handoffs "
+        "WHERE atlas_contact_id = %s AND customer_id = %s",
+        (expected, customer_id),
+    )
+    if old_contact_handoffs:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Customer has an office conversion handoff under the dangling "
+                "Atlas contact; relinking would strand its first-clean contract"
             ),
         )
 
@@ -28426,6 +28481,8 @@ def _build_atlas_dangling_link_correction_plan(
         "customerName": customer["name"],
         "fromAtlasContactId": expected,
         "toAtlasContactId": replacement,
+        "toCustomerType": evidence.replacement_customer_type,
+        "toCustomerTypeSourceRevision": evidence.replacement_type_revision,
     }
     snapshot = {
         "reason": reason,
@@ -28434,11 +28491,19 @@ def _build_atlas_dangling_link_correction_plan(
             "name": customer["name"],
             "active": bool(customer["active"]),
             "atlasContactId": expected,
+            "customerType": customer["customer_type"],
+            "customerTypeSourceRevision": customer[
+                "customer_type_source_revision"
+            ],
         },
         "replacementAtlasContactId": replacement,
         "atlasVerification": {
-            "expectedContactKnown": False,
-            "replacementContactKnown": True,
+            "expectedContactKnown": evidence.expected_contact_known,
+            "replacementContactKnown": evidence.replacement_contact_known,
+            "replacementCustomerType": evidence.replacement_customer_type,
+            "replacementCustomerTypeSourceRevision": (
+                evidence.replacement_type_revision
+            ),
         },
     }
     token_material = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
@@ -28787,8 +28852,8 @@ def admin_atlas_dangling_link_correction_preview(
     request: Request,
     current_admin: Dict[str, Any] = Depends(get_current_admin),
 ) -> Dict[str, Any]:
-    known = _read_dangling_link_correction_evidence(current_admin, payload)
-    result = _build_atlas_dangling_link_correction_plan(payload, known)
+    evidence = _read_dangling_link_correction_evidence(current_admin, payload)
+    result = _build_atlas_dangling_link_correction_plan(payload, evidence)
     result.pop("_archiveSnapshot", None)
     append_access_log(
         request,
@@ -28808,13 +28873,13 @@ def admin_apply_atlas_dangling_link_correction(
     # The provider read is deliberately outside the customer/site mutation
     # lock. Apply still requires fresh evidence, but an Atlas timeout must not
     # stall every ordinary local Customer and Site write.
-    known = _read_dangling_link_correction_evidence(current_admin, payload)
+    evidence = _read_dangling_link_correction_evidence(current_admin, payload)
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_site_mutations(cur)
             plan = _build_atlas_dangling_link_correction_plan(
                 payload,
-                known,
+                evidence,
                 cursor=cur,
                 lock_rows=True,
             )
@@ -28861,12 +28926,17 @@ def admin_apply_atlas_dangling_link_correction(
             cur.execute(
                 """
                 UPDATE customers
-                SET atlas_contact_id = %s, updated_at = NOW()
+                SET atlas_contact_id = %s,
+                    customer_type = %s,
+                    customer_type_source_revision = %s,
+                    updated_at = NOW()
                 WHERE id = %s AND atlas_contact_id = %s
                 RETURNING id
                 """,
                 (
                     correction["toAtlasContactId"],
+                    correction["toCustomerType"],
+                    correction["toCustomerTypeSourceRevision"],
                     correction["customerId"],
                     correction["fromAtlasContactId"],
                 ),
@@ -28885,6 +28955,10 @@ def admin_apply_atlas_dangling_link_correction(
                 "relinkedCustomerId": int(updated["id"]),
                 "previousAtlasContactId": correction["fromAtlasContactId"],
                 "replacementAtlasContactId": correction["toAtlasContactId"],
+                "replacementCustomerType": correction["toCustomerType"],
+                "replacementCustomerTypeSourceRevision": correction[
+                    "toCustomerTypeSourceRevision"
+                ],
             }
             cur.execute(
                 "UPDATE atlas_linkage_correction_batches "
