@@ -812,6 +812,53 @@ def test_reconcile_refuses_when_another_writer_wins_the_link(
     assert "customer_atlas_link_conflict" in reservation["last_error"]
 
 
+def test_create_finalizer_refuses_contact_claimed_while_atlas_is_in_flight(
+    client, auth, monkeypatch
+):
+    """A serialized finalizer must still recheck who owns the contact.
+
+    The Atlas call happens before the finalizer takes the shared Customer/Site
+    lock. A dangling-link correction can therefore commit this contact while
+    the create reservation is in flight; the finalizer must not insert a
+    second Customer after it acquires the lock.
+    """
+    key = str(uuid.uuid4())
+    name = _name("Create Link Race")
+    contact_id = fake_atlas_contact_id(key)
+
+    def _explode(url, *, headers=None, json=None, timeout=None):
+        raise requests.RequestException("connection refused")
+
+    monkeypatch.setattr(api.requests, "post", _explode)
+    pending = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": key},
+    )
+    assert pending.status_code == 202, pending.text
+    reservation_id = pending.json()["reservation"]["reservationId"]
+
+    winner_name = _name("Correction Winner")
+    db.execute(
+        "INSERT INTO customers (name, atlas_contact_id) VALUES (%s, %s)",
+        (winner_name, contact_id),
+    )
+
+    with pytest.raises(api.HTTPException) as exc_info:
+        api._finalize_customer_atlas_reservation(
+            reservation_id,
+            contact_id,
+            CustomerCreateRequest(name=name),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "customer_atlas_link_conflict"
+    assert _customer_rows(name) == []
+    assert len(_customer_rows(winner_name)) == 1
+    reservation = _reservation_rows(name)[0]
+    assert reservation["state"] == "pending"
+
+
 # --- review round 2 (PR #149) ------------------------------------------------
 
 
