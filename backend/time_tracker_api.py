@@ -2858,6 +2858,116 @@ class FunnelFirstCleanCompletionRequest(BaseModel):
     idempotencyKey: UUID = Field(...)
 
 
+class AtlasPostCleanOnboardingCandidateItem(BaseModel):
+    """One non-sendable Atlas candidate derived from first-clean evidence."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    candidateId: UUID
+    completionReceiptId: UUID
+    contactId: UUID
+    handoffId: UUID
+    status: Literal["pending"]
+    fullName: str = Field(min_length=1, max_length=256)
+    recipientEmail: Optional[str] = Field(default=None, max_length=254)
+    blocker: Optional[
+        Literal["inactive_customer", "not_residential", "no_email"]
+    ] = None
+    trackerServiceKind: Literal["job", "planned_visit"]
+    trackerServiceId: int
+    completedAt: datetime
+    createdAt: datetime
+
+    @field_validator(
+        "candidateId",
+        "completionReceiptId",
+        "contactId",
+        "handoffId",
+        mode="before",
+    )
+    @classmethod
+    def require_uuid_string(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            raise ValueError("must be a UUID string")
+        return value
+
+    @field_validator("fullName", mode="before")
+    @classmethod
+    def require_full_name(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be non-blank text")
+        return value
+
+    @field_validator("recipientEmail", mode="before")
+    @classmethod
+    def require_optional_recipient_email(cls, value: Any) -> Any:
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError("must be non-blank text or null")
+        return value
+
+    @field_validator("trackerServiceId", mode="before")
+    @classmethod
+    def require_integer_service_id(cls, value: Any) -> Any:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("must be an integer")
+        return value
+
+    @field_validator("completedAt", "createdAt", mode="before")
+    @classmethod
+    def require_datetime_string(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be an ISO date-time string")
+        return value
+
+    @model_validator(mode="after")
+    def require_timezone_aware_datetimes(self) -> "AtlasPostCleanOnboardingCandidateItem":
+        if self.completedAt.tzinfo is None or self.createdAt.tzinfo is None:
+            raise ValueError("candidate date-times must include a timezone")
+        return self
+
+
+class AtlasPostCleanOnboardingCandidatePage(BaseModel):
+    """Closed, bounded Atlas-owned post-clean review queue."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    candidates: list[AtlasPostCleanOnboardingCandidateItem]
+    limit: int = Field(ge=1, le=200)
+    cursor: Optional[str] = Field(default=None, min_length=16, max_length=512)
+    hasMore: bool
+    nextCursor: Optional[str] = Field(default=None, min_length=16, max_length=512)
+
+    @field_validator("limit", mode="before")
+    @classmethod
+    def require_integer_limit(cls, value: Any) -> Any:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("must be an integer")
+        return value
+
+    @field_validator("hasMore", mode="before")
+    @classmethod
+    def require_boolean_has_more(cls, value: Any) -> Any:
+        if not isinstance(value, bool):
+            raise ValueError("must be a boolean")
+        return value
+
+    @model_validator(mode="after")
+    def validate_page(self) -> "AtlasPostCleanOnboardingCandidatePage":
+        if len(self.candidates) > self.limit:
+            raise ValueError("candidate page exceeds its limit")
+        if self.hasMore != (self.nextCursor is not None):
+            raise ValueError("nextCursor must agree with hasMore")
+        if self.cursor is not None and self.nextCursor == self.cursor:
+            raise ValueError("nextCursor must advance")
+        candidate_ids = {item.candidateId for item in self.candidates}
+        receipt_ids = {item.completionReceiptId for item in self.candidates}
+        if len(candidate_ids) != len(self.candidates):
+            raise ValueError("candidate IDs must be unique within a page")
+        if len(receipt_ids) != len(self.candidates):
+            raise ValueError("completion receipt IDs must be unique within a page")
+        return self
+
+
 class AtlasFunnelOnboardingDraftItem(BaseModel):
     """One pending Atlas onboarding draft safe to show in the office queue.
 
@@ -4720,6 +4830,13 @@ _ATLAS_CONTACT_DIRECTORY_PATH = "/eom-funnel/contact-directory"
 # a (method, path) pair because the tracker derives deployment evidence from
 # Atlas's capabilityRoutes, not from a copied capability-name string alone.
 _ATLAS_CONTACT_DIRECTORY_ROUTE = ("GET", _ATLAS_CONTACT_DIRECTORY_PATH)
+_ATLAS_POST_CLEAN_ONBOARDING_CANDIDATES_PATH = (
+    "/eom-funnel/post-clean-onboarding-candidates"
+)
+_ATLAS_POST_CLEAN_ONBOARDING_CANDIDATES_ROUTE = (
+    "GET",
+    _ATLAS_POST_CLEAN_ONBOARDING_CANDIDATES_PATH,
+)
 _ATLAS_ONBOARDING_DRAFTS_PATH = "/eom-funnel/onboarding-drafts"
 _ATLAS_ONBOARDING_DRAFT_REVOKE_LINK_PATH = (
     "/eom-funnel/onboarding-drafts/{draft_id}/revoke-link"
@@ -4871,6 +4988,7 @@ _ATLAS_FUNNEL_READ_PATHS = frozenset(
         "/eom-funnel/leads",
         _KNOWN_CONTACTS_PATH,
         _ATLAS_CONTACT_DIRECTORY_PATH,
+        _ATLAS_POST_CLEAN_ONBOARDING_CANDIDATES_PATH,
         _ATLAS_ONBOARDING_DRAFTS_PATH,
         _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH,
     }
@@ -4984,6 +5102,9 @@ ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
 # only after its immutable first-clean completion receipt boundary is deployed.
 ATLAS_FUNNEL_CAPABILITY_CUSTOMER_FIRST_CLEAN_COMPLETION_RECORD = (
     "customer.first_clean_completion.record"
+)
+ATLAS_FUNNEL_CAPABILITY_POST_CLEAN_ONBOARDING_CANDIDATE_LIST = (
+    "customer.post_clean_onboarding_candidate.list"
 )
 # CLOSED / ENUMERATED: these two names are the exact existing Atlas
 # ``_CAPABILITY_ROUTES`` members required by the pending-draft bridge. Atlas
@@ -5378,6 +5499,21 @@ def _parse_atlas_onboarding_draft_page(content: Dict[str, Any]) -> Dict[str, Any
         raise HTTPException(
             status_code=502,
             detail="EOM onboarding draft service returned an invalid response",
+        ) from exc
+    return page.model_dump(mode="json")
+
+
+def _parse_atlas_post_clean_onboarding_candidate_page(
+    content: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate and re-project the Atlas-owned post-clean candidate queue."""
+
+    try:
+        page = AtlasPostCleanOnboardingCandidatePage.model_validate(content)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Post-clean onboarding candidate service returned an invalid response",
         ) from exc
     return page.model_dump(mode="json")
 
@@ -22326,6 +22462,16 @@ def admin_list_funnel_review(
             and ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND
             in lead_page["capabilities"]
         ),
+        # This Tracker deployment proof and the endpoint gate share the same
+        # strict Atlas capability-name plus registered method/path predicate.
+        # A copied name, malformed manifest, or mismatched route stays false.
+        "postCleanOnboardingCandidateListAvailable": (
+            _atlas_funnel_manifest_supports_capability_route(
+                content,
+                ATLAS_FUNNEL_CAPABILITY_POST_CLEAN_ONBOARDING_CANDIDATE_LIST,
+                _ATLAS_POST_CLEAN_ONBOARDING_CANDIDATES_ROUTE,
+            )
+        ),
         # These follow-up fields are deployment proofs for the Website. The
         # local reservation list itself is Tracker-owned; the three Atlas
         # controls rely on exact registered signatures rather than copied
@@ -22344,6 +22490,54 @@ def admin_list_funnel_review(
             and _ATLAS_PUBLIC_ONBOARDING_HANDOFF_RECOVER_ROUTE in capability_routes
         ),
     }
+
+
+@app.get("/api/admin/funnel/post-clean-onboarding-candidates")
+def admin_list_post_clean_onboarding_candidates(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    cursor: Optional[str] = Query(default=None, min_length=16, max_length=512),
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Dict[str, Any]:
+    """Relay the bounded Atlas-owned queue without creating local state."""
+
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability_route(
+            ATLAS_FUNNEL_CAPABILITY_POST_CLEAN_ONBOARDING_CANDIDATE_LIST,
+            _ATLAS_POST_CLEAN_ONBOARDING_CANDIDATES_ROUTE,
+            admin,
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "EOM_POST_CLEAN_ONBOARDING_CANDIDATE_LIST_CAPABILITY_UNAVAILABLE",
+            False,
+            f"capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    params: Dict[str, Any] = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    content = _atlas_funnel_read(
+        _ATLAS_POST_CLEAN_ONBOARDING_CANDIDATES_PATH,
+        admin,
+        params=params,
+    )
+    page = _parse_atlas_post_clean_onboarding_candidate_page(content)
+    if page["limit"] != limit or page["cursor"] != cursor:
+        raise HTTPException(
+            status_code=502,
+            detail="Post-clean onboarding candidate service returned an invalid response",
+        )
+    append_access_log(
+        request,
+        "EOM_POST_CLEAN_ONBOARDING_CANDIDATES_LISTED",
+        True,
+        f"candidates={len(page['candidates'])} has_more={page['hasMore']}",
+    )
+    return {"success": True, **page}
 
 
 @app.get("/api/admin/funnel/onboarding-drafts")
@@ -24119,11 +24313,32 @@ def _require_atlas_funnel_capability_routes(
         raise AtlasFunnelRouteUnavailable(route)
 
 
+def _atlas_funnel_manifest_supports_capability_route(
+    content: Dict[str, Any], capability: str, route: Tuple[str, str]
+) -> bool:
+    """Apply the same strict name-and-route predicate used by a gated read."""
+
+    advertised = _extract_strict_atlas_funnel_capabilities(content)
+    routes = _extract_atlas_funnel_capability_routes(content)
+    return (
+        advertised is not None
+        and capability in advertised
+        and routes is not None
+        and route in routes
+    )
+
+
 def _require_atlas_funnel_capability_route(
     capability: str, route: Tuple[str, str], admin: Dict[str, Any]
 ) -> None:
     """Single-capability form; see _require_atlas_funnel_capability_routes."""
-    _require_atlas_funnel_capability_routes((capability,), route, admin)
+    content = _atlas_funnel_read("/eom-funnel/leads", admin, params={"limit": 1})
+    if _atlas_funnel_manifest_supports_capability_route(content, capability, route):
+        return
+    advertised = _extract_strict_atlas_funnel_capabilities(content)
+    if advertised is None or capability not in advertised:
+        raise AtlasFunnelCapabilityUnavailable(capability)
+    raise AtlasFunnelRouteUnavailable(route)
 
 
 def _atlas_capability_unavailable_response(
