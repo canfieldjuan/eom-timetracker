@@ -7123,6 +7123,8 @@ def _ensure_first_clean_completion_report_schema() -> None:
                         REFERENCES service_schedule_rules(id) ON DELETE RESTRICT;
                 ALTER TABLE jobs
                     ADD COLUMN IF NOT EXISTS native_occurrence_date DATE;
+                ALTER TABLE jobs
+                    ADD COLUMN IF NOT EXISTS native_schedule_snapshot JSONB;
                 CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_native_schedule_occurrence
                     ON jobs(native_schedule_rule_id, native_occurrence_date)
                     WHERE native_schedule_rule_id IS NOT NULL
@@ -7144,7 +7146,6 @@ def _ensure_first_clean_completion_report_schema() -> None:
                     END IF;
                 END
                 $$;
-
                 CREATE TABLE IF NOT EXISTS eom_first_clean_completion_reports (
                     id UUID PRIMARY KEY,
                     planned_visit_id BIGINT UNIQUE
@@ -23420,6 +23421,17 @@ def _native_first_clean_completion_source_for_update(
             "scheduled_date": scheduled_date,
             "scheduled_start": scheduled_start,
             "scheduled_end": scheduled_end,
+            "native_schedule_snapshot": {
+                "shiftBucket": str(source["shift_bucket"]),
+                "cadence": str(source["cadence"]),
+                "occurrenceException": (
+                    _operations_serialize_native_occurrence_exception(
+                        occurrence_exception
+                    )
+                    if occurrence_exception is not None
+                    else None
+                ),
+            },
         }
     )
 
@@ -23654,19 +23666,10 @@ def _closed_native_first_clean_evidence_time(
     cur: Any,
     source: Dict[str, Any],
 ) -> datetime:
-    """Find closed residential GPS evidence at the Site on the effective day."""
+    """Find closed eligible Residential evidence inside the occurrence window."""
 
-    scheduled_date = source["scheduled_date"]
-    day_start = datetime.combine(
-        scheduled_date,
-        clock_time.min,
-        tzinfo=APP_TIMEZONE,
-    ).astimezone(timezone.utc)
-    day_end = datetime.combine(
-        scheduled_date + timedelta(days=1),
-        clock_time.min,
-        tzinfo=APP_TIMEZONE,
-    ).astimezone(timezone.utc)
+    window_start = source["scheduled_start"]
+    window_end = source["scheduled_end"]
     cur.execute(
         """
         SELECT departure.departure_time
@@ -23679,7 +23682,13 @@ def _closed_native_first_clean_evidence_time(
           ON departure.visit_id = visit.id
          AND departure.shift_id = visit.shift_id
         WHERE evidence.location_id = %s
-          AND evidence.evidence_method = 'residential_gps'
+          AND (
+              evidence.evidence_method = 'residential_gps'
+              OR (
+                  evidence.evidence_method = 'unplanned_residential'
+                  AND evidence.geofence_status = 'inside'
+              )
+          )
           AND visit.arrival_time >= %s
           AND visit.arrival_time < %s
           AND departure.location_id = evidence.location_id
@@ -23688,7 +23697,7 @@ def _closed_native_first_clean_evidence_time(
         LIMIT 1
         FOR SHARE OF evidence, visit, departure
         """,
-        (int(source["site_id"]), day_start, day_end),
+        (int(source["site_id"]), window_start, window_end),
     )
     row = cur.fetchone()
     if row is None:
@@ -23884,9 +23893,13 @@ def _reserve_native_first_clean_completion_report(
                             location_id, customer_name, scheduled_date,
                             scheduled_start, scheduled_end, expected_hours,
                             status, source_title, source_timezone,
-                            native_schedule_rule_id, native_occurrence_date
+                            native_schedule_rule_id, native_occurrence_date,
+                            native_schedule_snapshot
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, 'completed', %s, %s, %s, %s)
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, 'completed', %s, %s,
+                            %s, %s, %s::jsonb
+                        )
                         RETURNING id
                         """,
                         (
@@ -23900,6 +23913,7 @@ def _reserve_native_first_clean_completion_report(
                             TIMEZONE_NAME,
                             rule_id,
                             occurrence_date,
+                            json.dumps(source["native_schedule_snapshot"]),
                         ),
                     )
                     job_row = cur.fetchone()
@@ -39195,6 +39209,7 @@ from operations_schedule import (
     _fetch_native_occurrence_exception as _operations_fetch_native_occurrence_exception,
     _preview_interval as _operations_preview_interval,
     _rule_active_on as _operations_rule_active_on,
+    _serialize_native_occurrence_exception as _operations_serialize_native_occurrence_exception,
     build_operations_forecast,
     build_operations_schedule_router,
     build_weekly_labor_profitability,

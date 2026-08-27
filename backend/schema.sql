@@ -381,6 +381,9 @@ ALTER TABLE jobs
 ALTER TABLE jobs
     ADD COLUMN IF NOT EXISTS native_occurrence_date DATE;
 
+ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS native_schedule_snapshot JSONB;
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_native_schedule_occurrence
     ON jobs(native_schedule_rule_id, native_occurrence_date)
     WHERE native_schedule_rule_id IS NOT NULL

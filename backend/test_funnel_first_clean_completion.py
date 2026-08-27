@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as clock_time, timedelta, timezone
 
 import db
 import pytest
@@ -149,7 +149,13 @@ def _native_receipt(
     }
 
 
-def _seed_first_clean(*, residential: bool = True, closed: bool = True) -> dict[str, object]:
+def _seed_first_clean(
+    *,
+    residential: bool = True,
+    closed: bool = True,
+    arrival_at: datetime | None = None,
+    completed_at: datetime | None = None,
+) -> dict[str, object]:
     """Create fake, linked operational evidence without using customer PII."""
 
     admin = db.query_one(
@@ -164,8 +170,10 @@ def _seed_first_clean(*, residential: bool = True, closed: bool = True) -> dict[
         raise RuntimeError("First-clean tests require one active admin and employee")
     token = uuid.uuid4().hex
     contact_id = str(uuid.uuid4())
-    completed_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=5)
-    arrival_at = completed_at - timedelta(hours=1)
+    completed_at = completed_at or (
+        datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=5)
+    )
+    arrival_at = arrival_at or (completed_at - timedelta(hours=1))
     source_key = hashlib.sha256(f"first-clean:{token}".encode()).hexdigest()
     source_fingerprint = hashlib.sha256(f"fingerprint:{token}".encode()).hexdigest()
     customer_type = "residential" if residential else "commercial"
@@ -298,6 +306,7 @@ def _seed_first_clean(*, residential: bool = True, closed: bool = True) -> dict[
         "siteId": site_id,
         "calendarConnectionId": connection_id,
         "plannedVisitId": planned_visit_id,
+        "arrivalAt": api.to_utc_iso(arrival_at),
         "completedAt": api.to_utc_iso(completed_at),
         "adminId": int(admin["id"]),
         "adminName": str(admin["name"]),
@@ -310,22 +319,60 @@ def _seed_native_first_clean(
     residential: bool = True,
     closed: bool = True,
     exception_action: str | None = None,
+    overnight: bool = False,
+    geofence_status: str = "inside",
 ) -> dict[str, object]:
-    """Seed Site evidence and a native rule with no retained Calendar visit."""
+    """Seed the evidence shape produced by a native-only Residential arrival."""
 
-    source = _seed_first_clean(residential=residential, closed=closed)
+    local_today = datetime.now(api.APP_TIMEZONE).date()
+    if overnight:
+        evidence_date = local_today - timedelta(days=2)
+        arrival_local = datetime.combine(
+            evidence_date + timedelta(days=1),
+            clock_time(0, 30),
+            tzinfo=api.APP_TIMEZONE,
+        )
+        completed_local = datetime.combine(
+            evidence_date + timedelta(days=1),
+            clock_time(1, 30),
+            tzinfo=api.APP_TIMEZONE,
+        )
+        local_start_time = clock_time(22, 0)
+        local_end_time = clock_time(2, 0)
+    else:
+        evidence_date = local_today - timedelta(days=1)
+        arrival_local = datetime.combine(
+            evidence_date,
+            clock_time(9, 30),
+            tzinfo=api.APP_TIMEZONE,
+        )
+        completed_local = datetime.combine(
+            evidence_date,
+            clock_time(10, 30),
+            tzinfo=api.APP_TIMEZONE,
+        )
+        local_start_time = clock_time(9, 0)
+        local_end_time = clock_time(11, 0)
+    source = _seed_first_clean(
+        residential=residential,
+        closed=closed,
+        arrival_at=arrival_local.astimezone(timezone.utc),
+        completed_at=completed_local.astimezone(timezone.utc),
+    )
     db.execute(
-        "UPDATE visit_evidence_events SET planned_visit_id = NULL "
+        "UPDATE visit_evidence_events "
+        "SET planned_visit_id = NULL, "
+        "evidence_method = 'unplanned_residential', "
+        "exception_reason = 'unplanned_visit', "
+        "exception_detail = 'native schedule arrival', "
+        "geofence_status = %s "
         "WHERE planned_visit_id = %s",
-        (source["plannedVisitId"],),
+        (geofence_status, source["plannedVisitId"]),
     )
     db.execute(
         "DELETE FROM planned_service_visits WHERE id = %s",
         (source["plannedVisitId"],),
     )
-    evidence_date = datetime.fromisoformat(
-        str(source["completedAt"]).replace("Z", "+00:00")
-    ).astimezone(api.APP_TIMEZONE).date()
     occurrence_date = (
         evidence_date - timedelta(days=7)
         if exception_action == "rescheduled"
@@ -337,10 +384,16 @@ def _seed_native_first_clean(
             INSERT INTO service_schedule_rules (
                 location_id, shift_bucket, cadence, weekdays,
                 local_start_time, local_end_time, starts_on, ends_on
-            ) VALUES (%s, 'morning', 'weekly', %s, '09:00', '11:00', %s, NULL)
+            ) VALUES (%s, 'morning', 'weekly', %s, %s, %s, %s, NULL)
             RETURNING id
             """,
-            (source["siteId"], [occurrence_date.weekday()], occurrence_date),
+            (
+                source["siteId"],
+                [occurrence_date.weekday()],
+                local_start_time,
+                local_end_time,
+                occurrence_date,
+            ),
         )
     )
     if exception_action == "cancelled":
@@ -358,10 +411,16 @@ def _seed_native_first_clean(
             INSERT INTO service_schedule_occurrence_exceptions (
                 rule_id, service_date, action, scheduled_date,
                 local_start_time, local_end_time, reason
-            ) VALUES (%s, %s, 'rescheduled', %s, '09:00', '11:00',
+            ) VALUES (%s, %s, 'rescheduled', %s, %s, %s,
                       'controlled test reschedule')
             """,
-            (rule_id, occurrence_date, evidence_date),
+            (
+                rule_id,
+                occurrence_date,
+                evidence_date,
+                local_start_time,
+                local_end_time,
+            ),
         )
     source.update(
         {
@@ -447,7 +506,8 @@ def test_completion_schema_runtime_migration_is_idempotent(client):
             COUNT(*) FILTER (
                 WHERE table_name = 'jobs'
                   AND column_name IN (
-                      'native_schedule_rule_id', 'native_occurrence_date'
+                      'native_schedule_rule_id', 'native_occurrence_date',
+                      'native_schedule_snapshot'
                   )
             ) AS job_columns,
             COUNT(*) FILTER (
@@ -464,7 +524,7 @@ def test_completion_schema_runtime_migration_is_idempotent(client):
         WHERE table_schema = current_schema()
         """
     ) == {
-        "job_columns": 2,
+        "job_columns": 3,
         "report_job_columns": 1,
         "nullable_planned_visit_columns": 1,
     }
@@ -820,6 +880,9 @@ def test_native_completion_materializes_one_job_and_posts_job_identity(
     )
     assert site_jobs[0]["ruleId"] == source["ruleId"]
     assert site_jobs[0]["occurrenceDate"] == source["occurrenceDate"]
+    assert site_jobs[0]["shiftBucket"] == "morning"
+    assert site_jobs[0]["cadence"] == "weekly"
+    assert site_jobs[0]["occurrenceException"] is None
 
 
 def test_native_completion_remote_retry_reuses_the_same_job_and_report(
@@ -883,6 +946,96 @@ def test_native_completion_requires_closed_same_day_residential_evidence(
     ) == {"count": 0}
 
 
+def test_native_completion_accepts_following_day_arrival_inside_overnight_window(
+    client, auth, monkeypatch
+):
+    source = _seed_native_first_clean(overnight=True)
+
+    def atlas_request(_path, _admin, *, payload, idempotency_key):
+        return _native_receipt(source, payload)
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    response = client.post(
+        _native_path(int(source["ruleId"]), str(source["occurrenceDate"])),
+        headers=auth,
+        json={"idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 201, response.text
+
+
+@pytest.mark.parametrize(
+    ("arrival_time", "departure_time"),
+    [
+        (clock_time(8, 59), clock_time(10, 0)),
+        (clock_time(11, 0), clock_time(11, 30)),
+    ],
+)
+def test_native_completion_rejects_arrival_outside_the_occurrence_window(
+    client,
+    auth,
+    monkeypatch,
+    arrival_time,
+    departure_time,
+):
+    source = _seed_native_first_clean()
+    service_date = datetime.fromisoformat(str(source["effectiveDate"])).date()
+    arrival_at = datetime.combine(
+        service_date, arrival_time, tzinfo=api.APP_TIMEZONE
+    ).astimezone(timezone.utc)
+    departure_at = datetime.combine(
+        service_date, departure_time, tzinfo=api.APP_TIMEZONE
+    ).astimezone(timezone.utc)
+    db.execute(
+        "UPDATE visits SET arrival_time = %s WHERE location_id = %s",
+        (arrival_at, source["siteId"]),
+    )
+    db.execute(
+        "UPDATE departures SET departure_time = %s WHERE location_id = %s",
+        (departure_at, source["siteId"]),
+    )
+    db.execute(
+        "UPDATE shifts SET clock_in = %s, clock_out = %s WHERE location_id = %s",
+        (arrival_at - timedelta(minutes=10), departure_at, source["siteId"]),
+    )
+    monkeypatch.setattr(
+        api,
+        "_atlas_funnel_request",
+        lambda *_args, **_kwargs: pytest.fail(
+            "out-of-window evidence must not reach Atlas"
+        ),
+    )
+
+    response = client.post(
+        _native_path(int(source["ruleId"]), str(source["occurrenceDate"])),
+        headers=auth,
+        json={"idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "first_clean_completion_evidence_missing"
+
+
+def test_native_completion_rejects_unplanned_evidence_outside_the_geofence(
+    client, auth, monkeypatch
+):
+    source = _seed_native_first_clean(geofence_status="outside")
+    monkeypatch.setattr(
+        api,
+        "_atlas_funnel_request",
+        lambda *_args, **_kwargs: pytest.fail("outside evidence must not reach Atlas"),
+    )
+
+    response = client.post(
+        _native_path(int(source["ruleId"]), str(source["occurrenceDate"])),
+        headers=auth,
+        json={"idempotencyKey": str(uuid.uuid4())},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "first_clean_completion_evidence_missing"
+
+
 def test_cancelled_native_occurrence_cannot_be_confirmed(client, auth, monkeypatch):
     source = _seed_native_first_clean(exception_action="cancelled")
     monkeypatch.setattr(
@@ -929,6 +1082,64 @@ def test_rescheduled_native_occurrence_uses_its_effective_service_day(
         "native_occurrence_date": datetime.fromisoformat(
             str(source["occurrenceDate"])
         ).date(),
+    }
+    schedule = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": source["effectiveDate"],
+            "end_date": source["effectiveDate"],
+            "planning_source": "native",
+        },
+    )
+    assert schedule.status_code == 200, schedule.text
+    site_job = next(
+        row
+        for row in schedule.json()["jobs"]
+        if row["locationId"] == source["siteId"]
+    )
+    assert site_job["shiftBucket"] == "morning"
+    assert site_job["cadence"] == "weekly"
+    assert site_job["occurrenceException"]["action"] == "rescheduled"
+    assert site_job["occurrenceException"]["scheduledDate"] == source["effectiveDate"]
+
+
+def test_materialized_native_occurrence_rejects_exception_changes(
+    client, auth, monkeypatch
+):
+    source = _seed_native_first_clean(exception_action="rescheduled")
+
+    def atlas_request(_path, _admin, *, payload, idempotency_key):
+        return _native_receipt(source, payload)
+
+    monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
+    completion = client.post(
+        _native_path(int(source["ruleId"]), str(source["occurrenceDate"])),
+        headers=auth,
+        json={"idempotencyKey": str(uuid.uuid4())},
+    )
+    assert completion.status_code == 201, completion.text
+
+    exception_path = (
+        "/api/admin/operations/service-schedule-rules/"
+        f"{source['ruleId']}/occurrence-exceptions/{source['occurrenceDate']}"
+    )
+    changed = client.put(
+        exception_path,
+        headers=auth,
+        json={"action": "cancelled", "reason": "should be rejected"},
+    )
+    deleted = client.delete(exception_path, headers=auth)
+
+    assert changed.status_code == 409
+    assert deleted.status_code == 409
+    assert db.query_one(
+        "SELECT action, scheduled_date FROM service_schedule_occurrence_exceptions "
+        "WHERE rule_id = %s AND service_date = %s",
+        (source["ruleId"], source["occurrenceDate"]),
+    ) == {
+        "action": "rescheduled",
+        "scheduled_date": datetime.fromisoformat(str(source["effectiveDate"])).date(),
     }
 
 
