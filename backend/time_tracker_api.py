@@ -2845,10 +2845,10 @@ class FunnelLeadBookingRequest(BaseModel):
 
 
 class FunnelFirstCleanCompletionRequest(BaseModel):
-    """One explicit manager confirmation for an evidence-backed planned visit.
+    """One explicit manager confirmation for an evidence-backed service.
 
     The browser supplies only a replay key.  Tracker re-reads the selected
-    planned Visit, Customer/Site linkage, and closed employee visit interval;
+    occurrence, Customer/Site linkage, and closed employee visit interval;
     it never accepts browser-selected contact, completion-time, or service
     identity facts for the ATLAS completion report.
     """
@@ -7114,14 +7114,43 @@ def _ensure_first_clean_completion_report_schema() -> None:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                ("eom_first_clean_completion_report_schema_v1",),
+                ("eom_first_clean_completion_report_schema_v2",),
             )
             cur.execute(
                 """
+                ALTER TABLE jobs
+                    ADD COLUMN IF NOT EXISTS native_schedule_rule_id BIGINT
+                        REFERENCES service_schedule_rules(id) ON DELETE RESTRICT;
+                ALTER TABLE jobs
+                    ADD COLUMN IF NOT EXISTS native_occurrence_date DATE;
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_native_schedule_occurrence
+                    ON jobs(native_schedule_rule_id, native_occurrence_date)
+                    WHERE native_schedule_rule_id IS NOT NULL
+                      AND native_occurrence_date IS NOT NULL;
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conrelid = 'jobs'::regclass
+                          AND conname = 'jobs_native_schedule_occurrence_pair_check'
+                    ) THEN
+                        ALTER TABLE jobs
+                            ADD CONSTRAINT jobs_native_schedule_occurrence_pair_check
+                            CHECK (
+                                (native_schedule_rule_id IS NULL) =
+                                (native_occurrence_date IS NULL)
+                            );
+                    END IF;
+                END
+                $$;
+
                 CREATE TABLE IF NOT EXISTS eom_first_clean_completion_reports (
                     id UUID PRIMARY KEY,
-                    planned_visit_id BIGINT NOT NULL UNIQUE
+                    planned_visit_id BIGINT UNIQUE
                         REFERENCES planned_service_visits(id) ON DELETE RESTRICT,
+                    job_id INTEGER
+                        REFERENCES jobs(id) ON DELETE RESTRICT,
                     atlas_contact_id UUID NOT NULL UNIQUE,
                     customer_id INTEGER NOT NULL
                         REFERENCES customers(id) ON DELETE RESTRICT,
@@ -7140,6 +7169,10 @@ def _ensure_first_clean_completion_report_schema() -> None:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     finalized_at TIMESTAMPTZ,
+                    CONSTRAINT eom_first_clean_completion_report_service_check CHECK (
+                        (planned_visit_id IS NOT NULL)::INTEGER
+                        + (job_id IS NOT NULL)::INTEGER = 1
+                    ),
                     CHECK (
                         state <> 'finalized'
                         OR (atlas_receipt_id IS NOT NULL AND finalized_at IS NOT NULL)
@@ -7147,6 +7180,32 @@ def _ensure_first_clean_completion_report_schema() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_eom_first_clean_completion_reports_state
                     ON eom_first_clean_completion_reports(state, updated_at);
+
+                ALTER TABLE eom_first_clean_completion_reports
+                    ADD COLUMN IF NOT EXISTS job_id INTEGER
+                        REFERENCES jobs(id) ON DELETE RESTRICT;
+                ALTER TABLE eom_first_clean_completion_reports
+                    ALTER COLUMN planned_visit_id DROP NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_eom_first_clean_completion_reports_job
+                    ON eom_first_clean_completion_reports(job_id)
+                    WHERE job_id IS NOT NULL;
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conrelid = 'eom_first_clean_completion_reports'::regclass
+                          AND conname = 'eom_first_clean_completion_report_service_check'
+                    ) THEN
+                        ALTER TABLE eom_first_clean_completion_reports
+                            ADD CONSTRAINT eom_first_clean_completion_report_service_check
+                            CHECK (
+                                (planned_visit_id IS NOT NULL)::INTEGER
+                                + (job_id IS NOT NULL)::INTEGER = 1
+                            );
+                    END IF;
+                END
+                $$;
                 """
             )
 
@@ -23145,6 +23204,39 @@ def _first_clean_completion_conflict(
     _raise_conflict(code, message, {"plannedVisitId": planned_visit_id})
 
 
+def _native_first_clean_completion_conflict(
+    code: str,
+    message: str,
+    rule_id: int,
+    occurrence_date: date,
+) -> None:
+    _raise_conflict(
+        code,
+        message,
+        {"ruleId": rule_id, "occurrenceDate": occurrence_date.isoformat()},
+    )
+
+
+def _first_clean_completion_source_conflict(
+    source: Dict[str, Any],
+    code: str,
+    message: str,
+) -> None:
+    if source.get("planned_visit_id") is not None:
+        _first_clean_completion_conflict(
+            code,
+            message,
+            int(source["planned_visit_id"]),
+        )
+        return
+    _native_first_clean_completion_conflict(
+        code,
+        message,
+        int(source["native_schedule_rule_id"]),
+        source["native_occurrence_date"],
+    )
+
+
 def _first_clean_completion_source_for_update(
     cur: Any,
     planned_visit_id: int,
@@ -23182,6 +23274,8 @@ def _first_clean_completion_source_for_update(
     if row is None:
         raise HTTPException(status_code=404, detail="Planned visit not found")
     source = dict(row)
+    source["service_kind"] = "planned_visit"
+    source["service_id"] = planned_visit_id
     status_value = str(source["planned_visit_status"])
     if status_value == "cancelled":
         _first_clean_completion_conflict(
@@ -23210,13 +23304,155 @@ def _first_clean_completion_source_for_update(
     return source
 
 
+def _native_first_clean_completion_source_for_update(
+    cur: Any,
+    rule_id: int,
+    occurrence_date: date,
+) -> Dict[str, Any]:
+    """Resolve one native projection to canonical service context under locks."""
+
+    cur.execute(
+        """
+        SELECT
+            rule.id AS native_schedule_rule_id,
+            rule.location_id AS site_id,
+            rule.shift_bucket,
+            rule.cadence,
+            rule.weekdays,
+            rule.local_start_time,
+            rule.local_end_time,
+            rule.starts_on,
+            rule.ends_on,
+            rule.active AS rule_active,
+            customer.id AS customer_id,
+            customer.name AS customer_name,
+            customer.atlas_contact_id,
+            customer.active AS customer_active,
+            customer.customer_type,
+            location.address AS site_address,
+            location.active AS site_active,
+            location.location_type,
+            location.expected_hours
+        FROM service_schedule_rules AS rule
+        JOIN locations AS location ON location.id = rule.location_id
+        JOIN customers AS customer ON customer.id = location.customer_id
+        WHERE rule.id = %s
+        FOR UPDATE OF rule, location, customer
+        """,
+        (rule_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Native schedule rule not found")
+    source = dict(row)
+    source["native_occurrence_date"] = occurrence_date
+    source["service_kind"] = "job"
+
+    if not bool(source.get("rule_active")) or not _operations_rule_active_on(
+        source, occurrence_date
+    ):
+        _native_first_clean_completion_conflict(
+            "first_clean_completion_occurrence_unavailable",
+            "This date is not an active occurrence of the selected native schedule rule",
+            rule_id,
+            occurrence_date,
+        )
+    if (
+        source.get("atlas_contact_id") is None
+        or not bool(source.get("customer_active"))
+        or not bool(source.get("site_active"))
+        or str(source.get("customer_type") or "") != "residential"
+        or str(source.get("location_type") or "") != "Residential"
+    ):
+        _native_first_clean_completion_conflict(
+            "first_clean_completion_not_eligible",
+            "Only an active residential customer with a canonical Atlas link can confirm a first clean",
+            rule_id,
+            occurrence_date,
+        )
+
+    occurrence_exception = _operations_fetch_native_occurrence_exception(
+        cur,
+        rule_id=rule_id,
+        service_date=occurrence_date,
+    )
+    if occurrence_exception is not None and str(occurrence_exception["action"]) == "cancelled":
+        _native_first_clean_completion_conflict(
+            "first_clean_completion_visit_cancelled",
+            "A cancelled native schedule occurrence cannot confirm a first clean",
+            rule_id,
+            occurrence_date,
+        )
+    rescheduled = (
+        occurrence_exception is not None
+        and str(occurrence_exception["action"]) == "rescheduled"
+    )
+    scheduled_date = (
+        occurrence_exception["scheduled_date"]
+        if rescheduled
+        else occurrence_date
+    )
+    local_start_time = (
+        occurrence_exception["local_start_time"]
+        if rescheduled
+        else source["local_start_time"]
+    )
+    local_end_time = (
+        occurrence_exception["local_end_time"]
+        if rescheduled
+        else source["local_end_time"]
+    )
+    scheduled_start, scheduled_end, valid_window = _operations_preview_interval(
+        scheduled_date,
+        local_start_time,
+        local_end_time,
+        APP_TIMEZONE,
+    )
+    if not valid_window:
+        _native_first_clean_completion_conflict(
+            "first_clean_completion_occurrence_unavailable",
+            "The native schedule occurrence has an invalid local service window",
+            rule_id,
+            occurrence_date,
+        )
+    source.update(
+        {
+            "scheduled_date": scheduled_date,
+            "scheduled_start": scheduled_start,
+            "scheduled_end": scheduled_end,
+        }
+    )
+
+    cur.execute(
+        """
+        SELECT id, status, location_id
+        FROM jobs
+        WHERE native_schedule_rule_id = %s
+          AND native_occurrence_date = %s
+        FOR UPDATE
+        """,
+        (rule_id, occurrence_date),
+    )
+    job = cur.fetchone()
+    if job is not None:
+        if int(job["location_id"]) != int(source["site_id"]):
+            raise RuntimeError("Materialized native occurrence changed Site identity")
+        source["job_id"] = int(job["id"])
+        source["service_id"] = int(job["id"])
+        source["job_status"] = str(job["status"])
+    else:
+        source["job_id"] = None
+        source["service_id"] = None
+        source["job_status"] = None
+    return source
+
+
 def _require_first_clean_completion_handoff(
     cur: Any,
     source: Dict[str, Any],
 ) -> str:
     """Require the finalized local half of Atlas's immutable handoff contract."""
 
-    planned_visit_id = int(source["planned_visit_id"])
     contact_id = str(source["atlas_contact_id"])
     cur.execute(
         """
@@ -23235,10 +23471,10 @@ def _require_first_clean_completion_handoff(
         or int(handoff["customer_id"]) != int(source["customer_id"])
         or int(handoff["site_id"]) != int(source["site_id"])
     ):
-        _first_clean_completion_conflict(
+        _first_clean_completion_source_conflict(
+            source,
             "first_clean_completion_handoff_unavailable",
             "This residential customer has no finalized canonical Atlas handoff",
-            planned_visit_id,
         )
     return contact_id
 
@@ -23260,28 +23496,46 @@ def _existing_first_clean_completion_report(
 ) -> Optional[Dict[str, Any]]:
     """Return an exact durable replay or fail closed on a conflicting claim."""
 
-    planned_visit_id = int(source["planned_visit_id"])
+    planned_visit_id = source.get("planned_visit_id")
+    job_id = source.get("job_id")
     contact_id = str(source["atlas_contact_id"])
     cur.execute(
         """
         SELECT *
         FROM eom_first_clean_completion_reports
-        WHERE planned_visit_id = %s
+        WHERE (%s IS NOT NULL AND planned_visit_id = %s)
+           OR (%s IS NOT NULL AND job_id = %s)
            OR atlas_contact_id = %s
            OR idempotency_key = %s
         FOR UPDATE
         """,
-        (planned_visit_id, contact_id, idempotency_key),
+        (
+            planned_visit_id,
+            planned_visit_id,
+            job_id,
+            job_id,
+            contact_id,
+            idempotency_key,
+        ),
     )
     reports = [dict(row) for row in cur.fetchall()]
     if not reports:
         return None
 
-    report_by_visit = next(
+    report_by_service = next(
         (
             report
             for report in reports
-            if int(report["planned_visit_id"]) == planned_visit_id
+            if (
+                planned_visit_id is not None
+                and report.get("planned_visit_id") is not None
+                and int(report["planned_visit_id"]) == int(planned_visit_id)
+            )
+            or (
+                job_id is not None
+                and report.get("job_id") is not None
+                and int(report["job_id"]) == int(job_id)
+            )
         ),
         None,
     )
@@ -23302,28 +23556,28 @@ def _existing_first_clean_completion_report(
         None,
     )
     if report_by_key is not None and (
-        int(report_by_key["planned_visit_id"]) != planned_visit_id
+        report_by_key is not report_by_service
         or str(report_by_key["atlas_contact_id"]) != contact_id
     ):
-        _first_clean_completion_conflict(
+        _first_clean_completion_source_conflict(
+            source,
             "first_clean_completion_key_conflict",
-            "This first-clean confirmation key belongs to a different planned visit",
-            planned_visit_id,
+            "This first-clean confirmation key belongs to a different service occurrence",
         )
-    if report_by_visit is not None and str(report_by_visit["idempotency_key"]) != idempotency_key:
-        _first_clean_completion_conflict(
+    if report_by_service is not None and str(report_by_service["idempotency_key"]) != idempotency_key:
+        _first_clean_completion_source_conflict(
+            source,
             "first_clean_completion_visit_already_confirmed",
-            "This planned visit already has a first-clean confirmation",
-            planned_visit_id,
+            "This service occurrence already has a first-clean confirmation",
         )
-    if report_by_contact is not None and int(report_by_contact["planned_visit_id"]) != planned_visit_id:
-        _first_clean_completion_conflict(
+    if report_by_contact is not None and report_by_contact is not report_by_service:
+        _first_clean_completion_source_conflict(
+            source,
             "first_clean_completion_customer_already_confirmed",
             "This customer already has first-clean completion evidence",
-            planned_visit_id,
         )
 
-    report = report_by_visit or report_by_contact or report_by_key
+    report = report_by_service or report_by_contact or report_by_key
     if report is None:
         raise RuntimeError("First-clean report lookup lost its matched row")
     if (
@@ -23332,10 +23586,10 @@ def _existing_first_clean_completion_report(
         or str(report["atlas_contact_id"]) != contact_id
         or str(report["idempotency_key"]) != idempotency_key
     ):
-        _first_clean_completion_conflict(
+        _first_clean_completion_source_conflict(
+            source,
             "first_clean_completion_record_mismatch",
             "The existing first-clean confirmation does not match the current customer linkage",
-            planned_visit_id,
         )
     return report
 
@@ -23392,6 +23646,67 @@ def _closed_first_clean_evidence_time(
             "first_clean_completion_evidence_invalid",
             "The recorded employee visit cannot support first-clean confirmation",
             planned_visit_id,
+        )
+    return completed_at.astimezone(timezone.utc)
+
+
+def _closed_native_first_clean_evidence_time(
+    cur: Any,
+    source: Dict[str, Any],
+) -> datetime:
+    """Find closed residential GPS evidence at the Site on the effective day."""
+
+    scheduled_date = source["scheduled_date"]
+    day_start = datetime.combine(
+        scheduled_date,
+        clock_time.min,
+        tzinfo=APP_TIMEZONE,
+    ).astimezone(timezone.utc)
+    day_end = datetime.combine(
+        scheduled_date + timedelta(days=1),
+        clock_time.min,
+        tzinfo=APP_TIMEZONE,
+    ).astimezone(timezone.utc)
+    cur.execute(
+        """
+        SELECT departure.departure_time
+        FROM visit_evidence_events AS evidence
+        JOIN visits AS visit
+          ON visit.id = evidence.visit_id
+         AND visit.shift_id = evidence.shift_id
+         AND visit.location_id = evidence.location_id
+        JOIN departures AS departure
+          ON departure.visit_id = visit.id
+         AND departure.shift_id = visit.shift_id
+        WHERE evidence.location_id = %s
+          AND evidence.evidence_method = 'residential_gps'
+          AND visit.arrival_time >= %s
+          AND visit.arrival_time < %s
+          AND departure.location_id = evidence.location_id
+          AND departure.departure_time > visit.arrival_time
+        ORDER BY departure.departure_time DESC, departure.id DESC
+        LIMIT 1
+        FOR SHARE OF evidence, visit, departure
+        """,
+        (int(source["site_id"]), day_start, day_end),
+    )
+    row = cur.fetchone()
+    if row is None:
+        _first_clean_completion_source_conflict(
+            source,
+            "first_clean_completion_evidence_missing",
+            "A closed employee visit at this Site on the scheduled day is required before confirming this first clean",
+        )
+    completed_at = row["departure_time"]
+    if (
+        not isinstance(completed_at, datetime)
+        or completed_at.tzinfo is None
+        or completed_at.astimezone(timezone.utc) > utc_now()
+    ):
+        _first_clean_completion_source_conflict(
+            source,
+            "first_clean_completion_evidence_invalid",
+            "The recorded employee visit cannot support first-clean confirmation",
         )
     return completed_at.astimezone(timezone.utc)
 
@@ -23533,17 +23848,167 @@ def _reserve_first_clean_completion_report(
         ) from exc
 
 
+def _reserve_native_first_clean_completion_report(
+    rule_id: int,
+    occurrence_date: date,
+    payload: FunnelFirstCleanCompletionRequest,
+    admin: Dict[str, Any],
+) -> tuple[Dict[str, Any], bool]:
+    """Materialize and reserve one manager-confirmed native occurrence."""
+
+    idempotency_key = str(payload.idempotencyKey)
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                source = _native_first_clean_completion_source_for_update(
+                    cur,
+                    rule_id,
+                    occurrence_date,
+                )
+                contact_id = _require_first_clean_completion_handoff(cur, source)
+                _lock_first_clean_completion_report(cur, contact_id)
+                existing = _existing_first_clean_completion_report(
+                    cur,
+                    source=source,
+                    idempotency_key=idempotency_key,
+                )
+                if existing is not None:
+                    return existing, False
+
+                completed_at = _closed_native_first_clean_evidence_time(cur, source)
+                job_id = source.get("job_id")
+                if job_id is None:
+                    cur.execute(
+                        """
+                        INSERT INTO jobs (
+                            location_id, customer_name, scheduled_date,
+                            scheduled_start, scheduled_end, expected_hours,
+                            status, source_title, source_timezone,
+                            native_schedule_rule_id, native_occurrence_date
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, 'completed', %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (
+                            int(source["site_id"]),
+                            str(source["customer_name"]),
+                            source["scheduled_date"],
+                            source["scheduled_start"],
+                            source["scheduled_end"],
+                            source.get("expected_hours"),
+                            "Native Site schedule rule",
+                            TIMEZONE_NAME,
+                            rule_id,
+                            occurrence_date,
+                        ),
+                    )
+                    job_row = cur.fetchone()
+                    if job_row is None:
+                        raise RuntimeError("Native schedule occurrence Job was not saved")
+                    job_id = int(job_row["id"])
+                else:
+                    job_status = str(source.get("job_status") or "")
+                    if job_status == "cancelled":
+                        _first_clean_completion_source_conflict(
+                            source,
+                            "first_clean_completion_visit_cancelled",
+                            "A cancelled native schedule Job cannot confirm a first clean",
+                        )
+                    if job_status not in {"scheduled", "in_progress", "completed"}:
+                        _first_clean_completion_source_conflict(
+                            source,
+                            "first_clean_completion_visit_unavailable",
+                            "This native schedule Job is not available for first-clean confirmation",
+                        )
+                    cur.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'completed',
+                            updated_at = NOW()
+                        WHERE id = %s
+                          AND status IN ('scheduled', 'in_progress', 'completed')
+                        """,
+                        (int(job_id),),
+                    )
+                    if cur.rowcount != 1:
+                        _first_clean_completion_source_conflict(
+                            source,
+                            "first_clean_completion_visit_changed",
+                            "This native schedule Job changed before first-clean confirmation",
+                        )
+
+                report_id = str(uuid4())
+                cur.execute(
+                    """
+                    INSERT INTO eom_first_clean_completion_reports (
+                        id, job_id, atlas_contact_id, customer_id, site_id,
+                        idempotency_key, completed_at,
+                        reported_by_employee_id, reported_by_name
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        report_id,
+                        int(job_id),
+                        contact_id,
+                        int(source["customer_id"]),
+                        int(source["site_id"]),
+                        idempotency_key,
+                        completed_at,
+                        int(admin["id"]),
+                        str(admin["name"]),
+                    ),
+                )
+                report = cur.fetchone()
+                if report is None:
+                    raise RuntimeError("First-clean completion report was not saved")
+                return dict(report), True
+    except HTTPException:
+        raise
+    except psycopg2.errors.UniqueViolation as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="A conflicting first-clean completion report already exists",
+        ) from exc
+    except psycopg2.Error as exc:
+        logger.exception("Could not reserve native first-clean completion report")
+        raise HTTPException(
+            status_code=503,
+            detail="First-clean completion recovery is unavailable; Atlas was not called",
+            headers={"Retry-After": "5"},
+        ) from exc
+
+
+def _first_clean_completion_service_identity(
+    report: Dict[str, Any],
+) -> tuple[str, int, str]:
+    planned_visit_id = report.get("planned_visit_id")
+    job_id = report.get("job_id")
+    if planned_visit_id is not None and job_id is None:
+        return "planned_visit", int(planned_visit_id), "plannedVisitId"
+    if job_id is not None and planned_visit_id is None:
+        return "job", int(job_id), "jobId"
+    raise ValueError("First-clean report must identify exactly one service")
+
+
 def _first_clean_completion_atlas_payload(report: Dict[str, Any]) -> Dict[str, Any]:
     completed_at = report.get("completed_at")
     if not isinstance(completed_at, datetime) or completed_at.tzinfo is None:
         raise AtlasFunnelRequestError(
             502, "First-clean completion recovery record is invalid"
         )
+    try:
+        service_kind, service_id, _ = _first_clean_completion_service_identity(report)
+    except (TypeError, ValueError) as exc:
+        raise AtlasFunnelRequestError(
+            502, "First-clean completion recovery record is invalid"
+        ) from exc
     return {
         "tracker_customer_id": int(report["customer_id"]),
         "tracker_site_id": int(report["site_id"]),
-        "tracker_service_kind": "planned_visit",
-        "tracker_service_id": int(report["planned_visit_id"]),
+        "tracker_service_kind": service_kind,
+        "tracker_service_id": service_id,
         "completed_at": to_utc_iso(completed_at),
     }
 
@@ -23569,7 +24034,7 @@ def _validate_atlas_first_clean_completion_result(
         or returned_contact_id != str(report["atlas_contact_id"])
         or atlas_result.get("trackerCustomerId") != expected_payload["tracker_customer_id"]
         or atlas_result.get("trackerSiteId") != expected_payload["tracker_site_id"]
-        or atlas_result.get("trackerServiceKind") != "planned_visit"
+        or atlas_result.get("trackerServiceKind") != expected_payload["tracker_service_kind"]
         or atlas_result.get("trackerServiceId") != expected_payload["tracker_service_id"]
         or to_utc_iso(returned_completed_at) != expected_payload["completed_at"]
         or not isinstance(atlas_result.get("idempotent"), bool)
@@ -23704,6 +24169,50 @@ def _existing_first_clean_completion_report_for_retry(
         ) from exc
 
 
+def _existing_native_first_clean_completion_report_for_retry(
+    rule_id: int,
+    occurrence_date: date,
+    idempotency_key: str,
+) -> Optional[Dict[str, Any]]:
+    """Return an exact native retry without depending on mutable rule state."""
+
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT report.*
+                    FROM eom_first_clean_completion_reports AS report
+                    JOIN jobs AS job ON job.id = report.job_id
+                    WHERE job.native_schedule_rule_id = %s
+                      AND job.native_occurrence_date = %s
+                    FOR SHARE OF report, job
+                    """,
+                    (rule_id, occurrence_date),
+                )
+                report = cur.fetchone()
+                if report is None:
+                    return None
+                row = dict(report)
+                if str(row["idempotency_key"]) != idempotency_key:
+                    _native_first_clean_completion_conflict(
+                        "first_clean_completion_visit_already_confirmed",
+                        "This native schedule occurrence already has a first-clean confirmation",
+                        rule_id,
+                        occurrence_date,
+                    )
+                return row
+    except HTTPException:
+        raise
+    except psycopg2.Error as exc:
+        logger.exception("Could not load native first-clean completion recovery state")
+        raise HTTPException(
+            status_code=503,
+            detail="First-clean completion recovery is unavailable; retry this confirmation",
+            headers={"Retry-After": "5"},
+        ) from exc
+
+
 def _first_clean_completion_visible_response(
     report: Dict[str, Any],
     *,
@@ -23720,9 +24229,17 @@ def _first_clean_completion_visible_response(
             status_code=502,
             detail="First-clean completion recovery record is invalid",
         )
-    return {
+    try:
+        _, service_id, service_response_key = _first_clean_completion_service_identity(
+            report
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="First-clean completion recovery record is invalid",
+        ) from exc
+    response = {
         "success": True,
-        "plannedVisitId": int(report["planned_visit_id"]),
         "contactId": str(report["atlas_contact_id"]),
         "trackerCustomerId": int(report["customer_id"]),
         "trackerSiteId": int(report["site_id"]),
@@ -23731,6 +24248,122 @@ def _first_clean_completion_visible_response(
         "status": "recorded",
         "idempotent": idempotent,
     }
+    response[service_response_key] = service_id
+    return response
+
+
+def _deliver_first_clean_completion_report(
+    report: Dict[str, Any],
+    *,
+    created: bool,
+    request: Request,
+    admin: Dict[str, Any],
+) -> JSONResponse:
+    """Deliver one durable local report through the shared Atlas receipt seam."""
+
+    try:
+        service_kind, service_id, _ = _first_clean_completion_service_identity(report)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="First-clean completion recovery record is invalid",
+        ) from exc
+    audit_detail = f"{service_kind}={service_id}"
+    if str(report["state"]) == "finalized":
+        append_access_log(
+            request,
+            "EOM_FIRST_CLEAN_COMPLETION_REPLAYED",
+            True,
+            audit_detail,
+        )
+        return JSONResponse(
+            status_code=200,
+            content=jsonable_encoder(
+                _first_clean_completion_visible_response(report, idempotent=True)
+            ),
+        )
+
+    try:
+        _require_atlas_funnel_configuration()
+    except HTTPException:
+        _note_first_clean_completion_report_error(
+            str(report["id"]), "atlas_configuration_unavailable"
+        )
+        append_access_log(
+            request,
+            "EOM_FIRST_CLEAN_COMPLETION_CONFIGURATION_UNAVAILABLE",
+            False,
+            audit_detail,
+        )
+        raise
+    try:
+        _require_atlas_funnel_capability_routes(
+            (ATLAS_FUNNEL_CAPABILITY_CUSTOMER_FIRST_CLEAN_COMPLETION_RECORD,),
+            _ATLAS_FIRST_CLEAN_COMPLETIONS_ROUTE,
+            admin,
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        _note_first_clean_completion_report_error(
+            str(report["id"]), "atlas_capability_unavailable"
+        )
+        append_access_log(
+            request,
+            "EOM_FIRST_CLEAN_COMPLETION_CAPABILITY_UNAVAILABLE",
+            False,
+            f"{audit_detail} capability={exc.capability}",
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    atlas_actor = {
+        "id": int(report["reported_by_employee_id"]),
+        "name": str(report["reported_by_name"]),
+        "role": ADMIN_ROLE,
+    }
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_FIRST_CLEAN_COMPLETIONS_PATH.format(
+                contact_id=str(report["atlas_contact_id"])
+            ),
+            atlas_actor,
+            payload=_first_clean_completion_atlas_payload(report),
+            idempotency_key=str(report["idempotency_key"]),
+        )
+        atlas_receipt_id = _validate_atlas_first_clean_completion_result(
+            atlas_result,
+            report,
+        )
+    except AtlasFunnelRequestError as exc:
+        _note_first_clean_completion_report_error(
+            str(report["id"]), f"atlas_status_{exc.status_code}"
+        )
+        append_access_log(
+            request,
+            "EOM_FIRST_CLEAN_COMPLETION_FAILED",
+            False,
+            f"{audit_detail} status={exc.status_code}",
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    try:
+        finalized = _finalize_first_clean_completion_report(report, atlas_receipt_id)
+    except HTTPException:
+        _note_first_clean_completion_report_error(
+            str(report["id"]), "tracker_finalize_unavailable"
+        )
+        raise
+
+    append_access_log(
+        request,
+        "EOM_FIRST_CLEAN_COMPLETION_RECORDED",
+        True,
+        f"{audit_detail} idempotent={not created}",
+    )
+    return JSONResponse(
+        status_code=201 if created else 200,
+        content=jsonable_encoder(
+            _first_clean_completion_visible_response(finalized, idempotent=not created)
+        ),
+    )
 
 
 @app.post(
@@ -23754,118 +24387,54 @@ def admin_record_funnel_first_clean_completion(
     existing_report = _existing_first_clean_completion_report_for_retry(
         planned_visit_id, idempotency_key
     )
-    if existing_report is not None and str(existing_report["state"]) == "finalized":
-        append_access_log(
-            request,
-            "EOM_FIRST_CLEAN_COMPLETION_REPLAYED",
-            True,
-            f"planned_visit={planned_visit_id}",
-        )
-        return JSONResponse(
-            status_code=200,
-            content=jsonable_encoder(
-                _first_clean_completion_visible_response(
-                    existing_report, idempotent=True
-                )
-            ),
-        )
-
     if existing_report is None:
         report, created = _reserve_first_clean_completion_report(
             planned_visit_id, payload, admin
         )
     else:
         report, created = existing_report, False
-    if str(report["state"]) == "finalized":
-        return JSONResponse(
-            status_code=200,
-            content=jsonable_encoder(
-                _first_clean_completion_visible_response(report, idempotent=True)
-            ),
-        )
+    return _deliver_first_clean_completion_report(
+        report,
+        created=created,
+        request=request,
+        admin=admin,
+    )
 
-    try:
-        _require_atlas_funnel_configuration()
-    except HTTPException:
-        _note_first_clean_completion_report_error(
-            str(report["id"]), "atlas_configuration_unavailable"
-        )
-        append_access_log(
-            request,
-            "EOM_FIRST_CLEAN_COMPLETION_CONFIGURATION_UNAVAILABLE",
-            False,
-            f"planned_visit={planned_visit_id}",
-        )
-        raise
-    try:
-        _require_atlas_funnel_capability_routes(
-            (ATLAS_FUNNEL_CAPABILITY_CUSTOMER_FIRST_CLEAN_COMPLETION_RECORD,),
-            _ATLAS_FIRST_CLEAN_COMPLETIONS_ROUTE,
+
+@app.post(
+    "/api/admin/funnel/native-schedule-rules/{rule_id}/occurrences/"
+    "{occurrence_date}/first-clean-completions",
+    status_code=201,
+)
+def admin_record_native_funnel_first_clean_completion(
+    rule_id: Annotated[int, FastAPIPath(gt=0)],
+    occurrence_date: date,
+    payload: FunnelFirstCleanCompletionRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Confirm one evidence-backed occurrence from the native Site schedule."""
+
+    idempotency_key = str(payload.idempotencyKey)
+    existing_report = _existing_native_first_clean_completion_report_for_retry(
+        rule_id,
+        occurrence_date,
+        idempotency_key,
+    )
+    if existing_report is None:
+        report, created = _reserve_native_first_clean_completion_report(
+            rule_id,
+            occurrence_date,
+            payload,
             admin,
         )
-    except AtlasFunnelCapabilityUnavailable as exc:
-        _note_first_clean_completion_report_error(
-            str(report["id"]), "atlas_capability_unavailable"
-        )
-        append_access_log(
-            request,
-            "EOM_FIRST_CLEAN_COMPLETION_CAPABILITY_UNAVAILABLE",
-            False,
-            f"capability={exc.capability}",
-        )
-        return _atlas_capability_unavailable_response(exc)
-
-    # Recovery must keep the original manager's actor identity.  A later admin
-    # may safely retry delivery, but cannot rewrite the attested completion
-    # fact or make Atlas bind its idempotency fingerprint to a different actor.
-    atlas_actor = {
-        "id": int(report["reported_by_employee_id"]),
-        "name": str(report["reported_by_name"]),
-        "role": ADMIN_ROLE,
-    }
-    try:
-        atlas_result = _atlas_funnel_request(
-            ATLAS_FIRST_CLEAN_COMPLETIONS_PATH.format(
-                contact_id=str(report["atlas_contact_id"])
-            ),
-            atlas_actor,
-            payload=_first_clean_completion_atlas_payload(report),
-            idempotency_key=str(report["idempotency_key"]),
-        )
-        atlas_receipt_id = _validate_atlas_first_clean_completion_result(
-            atlas_result, report
-        )
-    except AtlasFunnelRequestError as exc:
-        _note_first_clean_completion_report_error(
-            str(report["id"]), f"atlas_status_{exc.status_code}"
-        )
-        append_access_log(
-            request,
-            "EOM_FIRST_CLEAN_COMPLETION_FAILED",
-            False,
-            f"planned_visit={planned_visit_id} status={exc.status_code}",
-        )
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-
-    try:
-        finalized = _finalize_first_clean_completion_report(report, atlas_receipt_id)
-    except HTTPException:
-        _note_first_clean_completion_report_error(
-            str(report["id"]), "tracker_finalize_unavailable"
-        )
-        raise
-
-    append_access_log(
-        request,
-        "EOM_FIRST_CLEAN_COMPLETION_RECORDED",
-        True,
-        f"planned_visit={planned_visit_id} idempotent={not created}",
-    )
-    return JSONResponse(
-        status_code=201 if created else 200,
-        content=jsonable_encoder(
-            _first_clean_completion_visible_response(finalized, idempotent=not created)
-        ),
+    else:
+        report, created = existing_report, False
+    return _deliver_first_clean_completion_report(
+        report,
+        created=created,
+        request=request,
+        admin=admin,
     )
 
 
@@ -38623,6 +39192,9 @@ def admin_analytics_customer(
 # correction ledger; the router receives only the cross-process lock identity
 # and never receives a raw timekeeping mutation helper.
 from operations_schedule import (
+    _fetch_native_occurrence_exception as _operations_fetch_native_occurrence_exception,
+    _preview_interval as _operations_preview_interval,
+    _rule_active_on as _operations_rule_active_on,
     build_operations_forecast,
     build_operations_schedule_router,
     build_weekly_labor_profitability,
