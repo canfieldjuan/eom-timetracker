@@ -503,6 +503,34 @@ def _fetch_native_occurrence_exception(
     return dict(row) if row else None
 
 
+def _require_unmaterialized_native_occurrence(
+    cur: Any,
+    *,
+    rule_id: int,
+    service_date: date,
+) -> None:
+    """Keep occurrence exceptions from diverging from a durable native Job."""
+
+    cur.execute(
+        """
+        SELECT id
+        FROM jobs
+        WHERE native_schedule_rule_id = %s
+          AND native_occurrence_date = %s
+        FOR SHARE
+        """,
+        (rule_id, service_date),
+    )
+    if cur.fetchone() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This occurrence is already recorded as a Job and cannot be "
+                "changed through schedule exceptions"
+            ),
+        )
+
+
 def _find_duplicate_service_schedule_rule(
     cur: Any,
     *,
@@ -1036,7 +1064,11 @@ def _job_native_occurrence_key(
     job: Dict[str, Any],
     *,
     app_timezone: ZoneInfo,
-) -> Optional[Tuple[int, date, str]]:
+) -> Optional[Tuple[Any, ...]]:
+    native_rule_id = job.get("native_schedule_rule_id")
+    native_occurrence_date = job.get("native_occurrence_date")
+    if native_rule_id is not None and isinstance(native_occurrence_date, date):
+        return ("rule", int(native_rule_id), native_occurrence_date)
     scheduled_start = job.get("scheduled_start")
     service_date = (
         scheduled_start.astimezone(app_timezone).date()
@@ -1045,23 +1077,36 @@ def _job_native_occurrence_key(
     )
     if not isinstance(service_date, date):
         return None
-    return _native_occurrence_key(
+    legacy_key = _native_occurrence_key(
         location_id=job.get("location_id"),
         service_date=service_date,
         source_role=job.get("source_role"),
     )
+    return ("site", *legacy_key) if legacy_key is not None else None
 
 
-def _native_row_occurrence_key(row: Dict[str, Any]) -> Optional[Tuple[int, date, str]]:
+def _native_row_occurrence_keys(row: Dict[str, Any]) -> set[Tuple[Any, ...]]:
+    keys: set[Tuple[Any, ...]] = set()
+    try:
+        rule_id = int(row["ruleId"])
+        occurrence_date = date.fromisoformat(str(row["occurrenceDate"]))
+    except (KeyError, TypeError, ValueError):
+        rule_id = 0
+        occurrence_date = None
+    if rule_id > 0 and occurrence_date is not None:
+        keys.add(("rule", rule_id, occurrence_date))
     try:
         service_date = date.fromisoformat(str(row["scheduledDate"]))
     except ValueError:
-        return None
-    return _native_occurrence_key(
+        return keys
+    legacy_key = _native_occurrence_key(
         location_id=row.get("locationId"),
         service_date=service_date,
         source_role=row.get("sourceRole"),
     )
+    if legacy_key is not None:
+        keys.add(("site", *legacy_key))
+    return keys
 
 
 def _native_rows_without_persisted_overrides(
@@ -1078,7 +1123,9 @@ def _native_rows_without_persisted_overrides(
         if key is not None
     }
     return [
-        row for row in rows if _native_row_occurrence_key(row) not in persisted_keys
+        row
+        for row in rows
+        if persisted_keys.isdisjoint(_native_row_occurrence_keys(row))
     ]
 
 
@@ -1217,8 +1264,20 @@ def _load_jobs(
                j.source_calendar_id, j.source_event_id, j.source_series_id,
                j.source_occurrence_id, j.source_key, j.source_title,
                j.source_timezone, j.source_all_day, j.cancelled_at,
-               j.cancellation_reason,
-               cs.role AS source_role,
+               j.cancellation_reason, j.native_schedule_rule_id,
+               j.native_occurrence_date, j.native_schedule_snapshot,
+               COALESCE(
+                   cs.role,
+                   CASE
+                       WHEN j.native_schedule_rule_id IS NOT NULL
+                            AND l.location_type = 'Residential'
+                           THEN 'residential_morning'
+                       WHEN j.native_schedule_rule_id IS NOT NULL
+                            AND l.location_type = 'Commercial'
+                           THEN 'commercial_evening_night'
+                       ELSE NULL
+                   END
+               ) AS source_role,
                l.customer_id, l.address AS site_address,
                l.location_type AS site_type, l.rate, l.rate_type,
                l.expected_hours AS site_expected_hours,
@@ -5229,8 +5288,7 @@ def _decorate_schedule_jobs(
             actual_hours=actual_hours,
             observed_at=observed_at,
         )
-        output.append(
-            {
+        decorated_job = {
                 "id": job_id,
                 "locationId": job.get("location_id"),
                 "customerId": job.get("customer_id"),
@@ -5274,7 +5332,31 @@ def _decorate_schedule_jobs(
                 },
                 "issues": issues,
             }
-        )
+        if (
+            job.get("native_schedule_rule_id") is not None
+            and isinstance(job.get("native_occurrence_date"), date)
+        ):
+            native_rule_id = int(job["native_schedule_rule_id"])
+            native_occurrence_date = str(job["native_occurrence_date"])
+            decorated_job.update(
+                {
+                    "projectionId": f"rule-{native_rule_id}:{native_occurrence_date}",
+                    "ruleId": native_rule_id,
+                    "occurrenceDate": native_occurrence_date,
+                }
+            )
+            native_snapshot = job.get("native_schedule_snapshot")
+            if isinstance(native_snapshot, dict):
+                decorated_job.update(
+                    {
+                        "shiftBucket": native_snapshot.get("shiftBucket"),
+                        "cadence": native_snapshot.get("cadence"),
+                        "occurrenceException": native_snapshot.get(
+                            "occurrenceException"
+                        ),
+                    }
+                )
+        output.append(decorated_job)
     return output, unmatched, shift_rate_cents
 
 
@@ -7356,6 +7438,11 @@ def build_operations_schedule_router(
                         status_code=422,
                         detail="serviceDate is not generated by this rule",
                     )
+                _require_unmaterialized_native_occurrence(
+                    cur,
+                    rule_id=rule_id,
+                    service_date=service_date,
+                )
                 cur.execute(
                     """
                     INSERT INTO service_schedule_occurrence_exceptions (
@@ -7432,6 +7519,11 @@ def build_operations_schedule_router(
                         status_code=404,
                         detail="Native schedule occurrence exception not found",
                     )
+                _require_unmaterialized_native_occurrence(
+                    cur,
+                    rule_id=rule_id,
+                    service_date=service_date,
+                )
                 cur.execute(
                     """
                     DELETE FROM service_schedule_occurrence_exceptions

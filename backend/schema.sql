@@ -308,8 +308,8 @@ CREATE UNIQUE INDEX uq_schedules_employee_legacy_name_week
     ON schedules(employee_id, customer_name, week_start)
     WHERE location_id IS NULL;
 
--- Native recurring service rules owned by Sites. These rules are a shadow
--- planning source until a later cutover promotes generated visits into jobs.
+-- Native recurring service rules owned by Sites. Generated occurrences remain
+-- projections until an explicit operational boundary materializes one Job.
 CREATE TABLE service_schedule_rules (
     id               BIGSERIAL PRIMARY KEY,
     location_id      INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
@@ -369,6 +369,32 @@ CREATE TABLE service_schedule_occurrence_exceptions (
             AND local_end_time IS NOT NULL)
     )
 );
+
+-- A native schedule occurrence remains a projection until a manager confirms
+-- that the work happened.  At that boundary it becomes one durable Job so
+-- downstream receipts can identify an immutable service record without
+-- reviving Calendar as a schedule authority.
+ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS native_schedule_rule_id BIGINT
+        REFERENCES service_schedule_rules(id) ON DELETE RESTRICT;
+
+ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS native_occurrence_date DATE;
+
+ALTER TABLE jobs
+    ADD COLUMN IF NOT EXISTS native_schedule_snapshot JSONB;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_jobs_native_schedule_occurrence
+    ON jobs(native_schedule_rule_id, native_occurrence_date)
+    WHERE native_schedule_rule_id IS NOT NULL
+      AND native_occurrence_date IS NOT NULL;
+
+ALTER TABLE jobs
+    ADD CONSTRAINT jobs_native_schedule_occurrence_pair_check
+    CHECK (
+        (native_schedule_rule_id IS NULL) =
+        (native_occurrence_date IS NULL)
+    );
 
 CREATE INDEX idx_service_schedule_occurrence_exceptions_rule_window
     ON service_schedule_occurrence_exceptions(rule_id, service_date, scheduled_date);
@@ -955,8 +981,10 @@ CREATE TABLE planned_service_visits (
 -- only; ATLAS owns the downstream onboarding, terms, card, and email states.
 CREATE TABLE eom_first_clean_completion_reports (
     id                      UUID PRIMARY KEY,
-    planned_visit_id        BIGINT NOT NULL UNIQUE
+    planned_visit_id        BIGINT UNIQUE
                                 REFERENCES planned_service_visits(id) ON DELETE RESTRICT,
+    job_id                  INTEGER
+                                REFERENCES jobs(id) ON DELETE RESTRICT,
     atlas_contact_id        UUID NOT NULL UNIQUE,
     customer_id             INTEGER NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
     site_id                 INTEGER NOT NULL REFERENCES locations(id) ON DELETE RESTRICT,
@@ -972,11 +1000,19 @@ CREATE TABLE eom_first_clean_completion_reports (
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finalized_at            TIMESTAMPTZ,
+    CONSTRAINT eom_first_clean_completion_report_service_check CHECK (
+        (planned_visit_id IS NOT NULL)::INTEGER
+        + (job_id IS NOT NULL)::INTEGER = 1
+    ),
     CHECK (
         state <> 'finalized'
         OR (atlas_receipt_id IS NOT NULL AND finalized_at IS NOT NULL)
     )
 );
+
+CREATE UNIQUE INDEX uq_eom_first_clean_completion_reports_job
+    ON eom_first_clean_completion_reports(job_id)
+    WHERE job_id IS NOT NULL;
 
 CREATE INDEX idx_eom_first_clean_completion_reports_state
     ON eom_first_clean_completion_reports(state, updated_at);
