@@ -23928,6 +23928,197 @@ def _closed_native_first_clean_evidence_time(
     return completed_at.astimezone(timezone.utc)
 
 
+def _native_schedule_job_window(
+    job: Dict[str, Any],
+) -> Optional[tuple[datetime, datetime]]:
+    try:
+        scheduled_start = datetime.fromisoformat(
+            str(job.get("scheduledStart") or "").replace("Z", "+00:00")
+        )
+        scheduled_end = datetime.fromisoformat(
+            str(job.get("scheduledEnd") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return None
+    if (
+        scheduled_start.tzinfo is None
+        or scheduled_end.tzinfo is None
+        or scheduled_end <= scheduled_start
+    ):
+        return None
+    return scheduled_start.astimezone(timezone.utc), scheduled_end.astimezone(
+        timezone.utc
+    )
+
+
+def _decorate_native_first_clean_completions(
+    jobs: List[Dict[str, Any]],
+    observed_at: datetime,
+) -> bool:
+    """Add server-owned first-clean action/recovery state to native Schedule rows."""
+
+    candidates: List[tuple[Dict[str, Any], int, int, int, date, datetime, datetime]] = []
+    for job in jobs:
+        try:
+            customer_id = int(job["customerId"])
+            site_id = int(job["locationId"])
+            rule_id = int(job["ruleId"])
+            occurrence_date = date.fromisoformat(str(job["occurrenceDate"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        window = _native_schedule_job_window(job)
+        if (
+            window is None
+            or str(job.get("siteType") or "") != "Residential"
+            or str(job.get("status") or "") == "cancelled"
+        ):
+            continue
+        candidates.append(
+            (job, customer_id, site_id, rule_id, occurrence_date, window[0], window[1])
+        )
+    if not candidates:
+        return True
+
+    customer_ids = sorted({candidate[1] for candidate in candidates})
+    site_ids = sorted({candidate[2] for candidate in candidates})
+    earliest_start = min(candidate[5] for candidate in candidates)
+    latest_end = max(candidate[6] for candidate in candidates)
+    try:
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT report.customer_id, report.site_id, report.state,
+                           report.idempotency_key, report.completed_at,
+                           report.atlas_receipt_id,
+                           job.native_schedule_rule_id,
+                           job.native_occurrence_date
+                    FROM eom_first_clean_completion_reports AS report
+                    LEFT JOIN jobs AS job ON job.id = report.job_id
+                    WHERE report.customer_id = ANY(%s)
+                    """,
+                    (customer_ids,),
+                )
+                report_rows = [dict(row) for row in cur.fetchall()]
+                cur.execute(
+                    """
+                    SELECT handoff.customer_id, handoff.site_id
+                    FROM eom_office_conversion_handoffs AS handoff
+                    JOIN customers AS customer
+                      ON customer.id = handoff.customer_id
+                     AND customer.atlas_contact_id = handoff.atlas_contact_id
+                    JOIN locations AS location
+                      ON location.id = handoff.site_id
+                     AND location.customer_id = customer.id
+                    WHERE handoff.customer_id = ANY(%s)
+                      AND handoff.site_id = ANY(%s)
+                      AND handoff.state = 'finalized'
+                      AND handoff.atlas_handoff_id IS NOT NULL
+                      AND customer.active = true
+                      AND customer.customer_type = 'residential'
+                      AND location.active = true
+                      AND location.location_type = 'Residential'
+                    """,
+                    (customer_ids, site_ids),
+                )
+                eligible_pairs = {
+                    (int(row["customer_id"]), int(row["site_id"]))
+                    for row in cur.fetchall()
+                }
+                cur.execute(
+                    """
+                    SELECT evidence.location_id, visit.arrival_time,
+                           departure.departure_time
+                    FROM visit_evidence_events AS evidence
+                    JOIN visits AS visit
+                      ON visit.id = evidence.visit_id
+                     AND visit.shift_id = evidence.shift_id
+                     AND visit.location_id = evidence.location_id
+                    JOIN departures AS departure
+                      ON departure.visit_id = visit.id
+                     AND departure.shift_id = visit.shift_id
+                    WHERE evidence.location_id = ANY(%s)
+                      AND (
+                          evidence.evidence_method = 'residential_gps'
+                          OR (
+                              evidence.evidence_method = 'unplanned_residential'
+                              AND evidence.geofence_status = 'inside'
+                          )
+                      )
+                      AND visit.arrival_time >= %s
+                      AND visit.arrival_time < %s
+                      AND departure.location_id = evidence.location_id
+                      AND departure.departure_time > visit.arrival_time
+                    """,
+                    (site_ids, earliest_start, latest_end),
+                )
+                evidence_rows = [dict(row) for row in cur.fetchall()]
+    except psycopg2.Error:
+        logger.exception("Could not load native first-clean Schedule state")
+        return False
+
+    reports_by_customer: Dict[int, Dict[str, Any]] = {}
+    for report in report_rows:
+        customer_id = int(report["customer_id"])
+        if customer_id in reports_by_customer:
+            logger.error(
+                "Multiple first-clean reports found for tracker customer %s",
+                customer_id,
+            )
+            return False
+        reports_by_customer[customer_id] = report
+
+    evidence_by_site: Dict[int, List[Dict[str, Any]]] = {}
+    for evidence in evidence_rows:
+        evidence_by_site.setdefault(int(evidence["location_id"]), []).append(evidence)
+
+    observed_utc = observed_at.astimezone(timezone.utc)
+    for job, customer_id, site_id, rule_id, occurrence_date, window_start, window_end in candidates:
+        report = reports_by_customer.get(customer_id)
+        if report is not None:
+            if (
+                report.get("native_schedule_rule_id") is None
+                or report.get("native_occurrence_date") is None
+                or int(report["native_schedule_rule_id"]) != rule_id
+                or report["native_occurrence_date"] != occurrence_date
+            ):
+                continue
+            state = str(report.get("state") or "")
+            completed_at = report.get("completed_at")
+            if (
+                state not in {"pending", "finalized"}
+                or not isinstance(completed_at, datetime)
+                or completed_at.tzinfo is None
+            ):
+                return False
+            completion = {
+                "state": state,
+                "completedAt": to_utc_iso(completed_at),
+            }
+            if state == "pending":
+                completion["idempotencyKey"] = str(report["idempotency_key"])
+            else:
+                if report.get("atlas_receipt_id") is None:
+                    return False
+                completion["receiptId"] = str(report["atlas_receipt_id"])
+            job["firstCleanCompletion"] = completion
+            continue
+        if (customer_id, site_id) not in eligible_pairs:
+            continue
+        if any(
+            isinstance(evidence.get("arrival_time"), datetime)
+            and isinstance(evidence.get("departure_time"), datetime)
+            and evidence["arrival_time"].tzinfo is not None
+            and evidence["departure_time"].tzinfo is not None
+            and window_start <= evidence["arrival_time"].astimezone(timezone.utc) < window_end
+            and evidence["arrival_time"] < evidence["departure_time"]
+            and evidence["departure_time"].astimezone(timezone.utc) <= observed_utc
+            for evidence in evidence_by_site.get(site_id, [])
+        ):
+            job["firstCleanCompletion"] = {"state": "available"}
+    return True
+
+
 def _reserve_first_clean_completion_report(
     planned_visit_id: int,
     payload: FunnelFirstCleanCompletionRequest,
@@ -39451,6 +39642,9 @@ app.include_router(
         timezone_name=TIMEZONE_NAME,
         timesheet_advisory_lock_id=TIMESHEET_PG_ADVISORY_LOCK_ID,
         append_access_log=append_access_log,
+        decorate_native_first_clean_completions=(
+            _decorate_native_first_clean_completions
+        ),
     )
 )
 

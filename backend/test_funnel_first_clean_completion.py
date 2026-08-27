@@ -796,6 +796,24 @@ def test_native_completion_materializes_one_job_and_posts_job_identity(
     key = str(uuid.uuid4())
     calls: list[dict[str, object]] = []
 
+    available_schedule = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": source["effectiveDate"],
+            "end_date": source["effectiveDate"],
+            "planning_source": "native",
+        },
+    )
+    assert available_schedule.status_code == 200, available_schedule.text
+    assert available_schedule.json()["firstCleanCompletionAvailable"] is True
+    available_job = next(
+        row
+        for row in available_schedule.json()["jobs"]
+        if row["locationId"] == source["siteId"]
+    )
+    assert available_job["firstCleanCompletion"] == {"state": "available"}
+
     def atlas_request(_path, _admin, *, payload, idempotency_key):
         calls.append({"payload": payload, "idempotencyKey": idempotency_key})
         return _native_receipt(source, payload)
@@ -883,6 +901,11 @@ def test_native_completion_materializes_one_job_and_posts_job_identity(
     assert site_jobs[0]["shiftBucket"] == "morning"
     assert site_jobs[0]["cadence"] == "weekly"
     assert site_jobs[0]["occurrenceException"] is None
+    assert site_jobs[0]["firstCleanCompletion"] == {
+        "state": "finalized",
+        "completedAt": source["completedAt"],
+        "receiptId": response.json()["receiptId"],
+    }
 
 
 def test_native_completion_remote_retry_reuses_the_same_job_and_report(
@@ -901,10 +924,30 @@ def test_native_completion_remote_retry_reuses_the_same_job_and_report(
     monkeypatch.setattr(api, "_atlas_funnel_request", atlas_request)
     path = _native_path(int(source["ruleId"]), str(source["occurrenceDate"]))
     first = client.post(path, headers=auth, json={"idempotencyKey": key})
+    pending_schedule = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": source["effectiveDate"],
+            "end_date": source["effectiveDate"],
+            "planning_source": "native",
+        },
+    )
     retried = client.post(path, headers=auth, json={"idempotencyKey": key})
     replayed = client.post(path, headers=auth, json={"idempotencyKey": key})
 
     assert first.status_code == 503
+    assert pending_schedule.status_code == 200, pending_schedule.text
+    pending_job = next(
+        row
+        for row in pending_schedule.json()["jobs"]
+        if row["locationId"] == source["siteId"]
+    )
+    assert pending_job["firstCleanCompletion"] == {
+        "state": "pending",
+        "completedAt": source["completedAt"],
+        "idempotencyKey": key,
+    }
     assert retried.status_code == 200, retried.text
     assert replayed.status_code == 200, replayed.text
     assert replayed.json()["idempotent"] is True
@@ -938,6 +981,22 @@ def test_native_completion_requires_closed_same_day_residential_evidence(
     )
 
     assert response.status_code == 409
+    schedule = client.get(
+        "/api/admin/operations/schedule",
+        headers=auth,
+        params={
+            "start_date": source["effectiveDate"],
+            "end_date": source["effectiveDate"],
+            "planning_source": "native",
+        },
+    )
+    assert schedule.status_code == 200, schedule.text
+    job = next(
+        row
+        for row in schedule.json()["jobs"]
+        if row["locationId"] == source["siteId"]
+    )
+    assert "firstCleanCompletion" not in job
     assert response.json()["code"] == "first_clean_completion_evidence_missing"
     assert _native_report(int(source["ruleId"]), str(source["occurrenceDate"])) is None
     assert db.query_one(
