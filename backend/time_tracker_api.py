@@ -2874,7 +2874,7 @@ class AtlasPostCleanOnboardingCandidateItem(BaseModel):
     # so a future additive Atlas blocker does not make the whole queue unreadable.
     blocker: Optional[str] = Field(default=None, max_length=64)
     trackerServiceKind: str = Field(min_length=1, max_length=64)
-    trackerServiceId: int
+    trackerServiceId: int = Field(gt=0, le=9_223_372_036_854_775_807)
     completedAt: datetime
     createdAt: datetime
 

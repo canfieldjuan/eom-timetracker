@@ -16,6 +16,7 @@ def _candidate(
     completion_receipt_id: str | None = None,
     blocker: str | None = None,
     tracker_service_kind: str = "planned_visit",
+    tracker_service_id: int = 42,
 ) -> dict[str, object]:
     return {
         "candidateId": candidate_id or str(uuid.uuid4()),
@@ -27,7 +28,7 @@ def _candidate(
         "recipientEmail": None if blocker == "no_email" else "candidate@example.test",
         "blocker": blocker,
         "trackerServiceKind": tracker_service_kind,
-        "trackerServiceId": 42,
+        "trackerServiceId": tracker_service_id,
         "completedAt": "2026-08-24T17:00:00Z",
         "createdAt": "2026-08-24T17:00:01Z",
         "atlasPrivateEvidence": {"must": "not relay"},
@@ -196,6 +197,29 @@ def test_unknown_atlas_classifications_are_preserved_as_opaque_codes(
     )
 
 
+def test_candidate_page_accepts_tracker_service_id_boundaries(
+    client, auth, monkeypatch
+):
+    maximum_bigint = 9_223_372_036_854_775_807
+    _install_atlas(
+        monkeypatch,
+        _page(
+            [
+                _candidate(tracker_service_id=1),
+                _candidate(tracker_service_id=maximum_bigint),
+            ]
+        ),
+    )
+
+    response = client.get(_QUEUE_PATH, headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert [item["trackerServiceId"] for item in response.json()["candidates"]] == [
+        1,
+        maximum_bigint,
+    ]
+
+
 def test_review_badge_and_endpoint_share_the_strict_catalog_predicate(
     client, auth, monkeypatch
 ):
@@ -272,6 +296,16 @@ def test_candidate_page_rejects_malformed_or_incoherent_upstream_state(
         _page([{**_candidate(), "trackerServiceKind": "   "}]),
         _page([{**_candidate(), "trackerServiceKind": ["planned_visit"]}]),
         _page([{**_candidate(), "trackerServiceId": True}]),
+        _page([{**_candidate(), "trackerServiceId": 0}]),
+        _page([{**_candidate(), "trackerServiceId": -1}]),
+        _page(
+            [
+                {
+                    **_candidate(),
+                    "trackerServiceId": 9_223_372_036_854_775_808,
+                }
+            ]
+        ),
         _page([{**_candidate(), "completedAt": "2026-08-24T17:00:00"}]),
     ]
     for page in invalid_pages:
