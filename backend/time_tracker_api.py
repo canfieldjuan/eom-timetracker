@@ -2873,7 +2873,7 @@ class AtlasPostCleanOnboardingCandidateItem(BaseModel):
     # Atlas owns this reason vocabulary. Keep it bounded and typed, but opaque,
     # so a future additive Atlas blocker does not make the whole queue unreadable.
     blocker: Optional[str] = Field(default=None, max_length=64)
-    trackerServiceKind: Literal["job", "planned_visit"]
+    trackerServiceKind: str = Field(min_length=1, max_length=64)
     trackerServiceId: int
     completedAt: datetime
     createdAt: datetime
@@ -2911,6 +2911,13 @@ class AtlasPostCleanOnboardingCandidateItem(BaseModel):
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise ValueError("must be non-blank text or null")
         return value.strip() if isinstance(value, str) else value
+
+    @field_validator("trackerServiceKind", mode="before")
+    @classmethod
+    def require_service_kind_code(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be non-blank text")
+        return value.strip()
 
     @field_validator("trackerServiceId", mode="before")
     @classmethod

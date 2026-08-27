@@ -15,6 +15,7 @@ def _candidate(
     candidate_id: str | None = None,
     completion_receipt_id: str | None = None,
     blocker: str | None = None,
+    tracker_service_kind: str = "planned_visit",
 ) -> dict[str, object]:
     return {
         "candidateId": candidate_id or str(uuid.uuid4()),
@@ -25,7 +26,7 @@ def _candidate(
         "fullName": "Test Customer",
         "recipientEmail": None if blocker == "no_email" else "candidate@example.test",
         "blocker": blocker,
-        "trackerServiceKind": "planned_visit",
+        "trackerServiceKind": tracker_service_kind,
         "trackerServiceId": 42,
         "completedAt": "2026-08-24T17:00:00Z",
         "createdAt": "2026-08-24T17:00:01Z",
@@ -170,18 +171,29 @@ def test_candidate_queue_requires_admin_authentication(client, monkeypatch):
     assert response.status_code in (401, 403), response.text
 
 
-def test_unknown_atlas_blocker_is_preserved_as_an_opaque_code(
+def test_unknown_atlas_classifications_are_preserved_as_opaque_codes(
     client, auth, monkeypatch
 ):
     _install_atlas(
         monkeypatch,
-        _page([_candidate(blocker="future_customer_policy")]),
+        _page(
+            [
+                _candidate(
+                    blocker="future_customer_policy",
+                    tracker_service_kind="future_service_source",
+                )
+            ]
+        ),
     )
 
     response = client.get(_QUEUE_PATH, headers=auth)
 
     assert response.status_code == 200, response.text
     assert response.json()["candidates"][0]["blocker"] == "future_customer_policy"
+    assert (
+        response.json()["candidates"][0]["trackerServiceKind"]
+        == "future_service_source"
+    )
 
 
 def test_review_badge_and_endpoint_share_the_strict_catalog_predicate(
@@ -257,7 +269,8 @@ def test_candidate_page_rejects_malformed_or_incoherent_upstream_state(
         _page([{**_candidate(), "status": "sent"}]),
         _page([{**_candidate(), "blocker": "   "}]),
         _page([{**_candidate(), "blocker": {"not": "a code"}}]),
-        _page([{**_candidate(), "trackerServiceKind": "browser_guess"}]),
+        _page([{**_candidate(), "trackerServiceKind": "   "}]),
+        _page([{**_candidate(), "trackerServiceKind": ["planned_visit"]}]),
         _page([{**_candidate(), "trackerServiceId": True}]),
         _page([{**_candidate(), "completedAt": "2026-08-24T17:00:00"}]),
     ]
