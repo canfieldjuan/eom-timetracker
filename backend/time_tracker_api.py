@@ -2870,9 +2870,9 @@ class AtlasPostCleanOnboardingCandidateItem(BaseModel):
     status: Literal["pending"]
     fullName: str = Field(min_length=1, max_length=256)
     recipientEmail: Optional[str] = Field(default=None, max_length=254)
-    blocker: Optional[
-        Literal["inactive_customer", "not_residential", "no_email"]
-    ] = None
+    # Atlas owns this reason vocabulary. Keep it bounded and typed, but opaque,
+    # so a future additive Atlas blocker does not make the whole queue unreadable.
+    blocker: Optional[str] = Field(default=None, max_length=64)
     trackerServiceKind: Literal["job", "planned_visit"]
     trackerServiceId: int
     completedAt: datetime
@@ -2904,6 +2904,13 @@ class AtlasPostCleanOnboardingCandidateItem(BaseModel):
         if value is not None and (not isinstance(value, str) or not value.strip()):
             raise ValueError("must be non-blank text or null")
         return value
+
+    @field_validator("blocker", mode="before")
+    @classmethod
+    def require_optional_blocker_code(cls, value: Any) -> Any:
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError("must be non-blank text or null")
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("trackerServiceId", mode="before")
     @classmethod

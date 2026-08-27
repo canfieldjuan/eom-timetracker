@@ -170,6 +170,20 @@ def test_candidate_queue_requires_admin_authentication(client, monkeypatch):
     assert response.status_code in (401, 403), response.text
 
 
+def test_unknown_atlas_blocker_is_preserved_as_an_opaque_code(
+    client, auth, monkeypatch
+):
+    _install_atlas(
+        monkeypatch,
+        _page([_candidate(blocker="future_customer_policy")]),
+    )
+
+    response = client.get(_QUEUE_PATH, headers=auth)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["candidates"][0]["blocker"] == "future_customer_policy"
+
+
 def test_review_badge_and_endpoint_share_the_strict_catalog_predicate(
     client, auth, monkeypatch
 ):
@@ -241,7 +255,8 @@ def test_candidate_page_rejects_malformed_or_incoherent_upstream_state(
             ]
         ),
         _page([{**_candidate(), "status": "sent"}]),
-        _page([{**_candidate(), "blocker": "future_unreviewed_blocker"}]),
+        _page([{**_candidate(), "blocker": "   "}]),
+        _page([{**_candidate(), "blocker": {"not": "a code"}}]),
         _page([{**_candidate(), "trackerServiceKind": "browser_guess"}]),
         _page([{**_candidate(), "trackerServiceId": True}]),
         _page([{**_candidate(), "completedAt": "2026-08-24T17:00:00"}]),
