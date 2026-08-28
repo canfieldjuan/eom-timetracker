@@ -7138,6 +7138,9 @@ def build_operations_schedule_router(
     now_provider: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     timesheet_advisory_lock_id: int,
     append_access_log: Optional[Callable[[Request, str, bool, str], None]] = None,
+    decorate_native_first_clean_completions: Optional[
+        Callable[[List[Dict[str, Any]], datetime], bool]
+    ] = None,
 ) -> APIRouter:
     router = APIRouter()
     app_timezone = ZoneInfo(timezone_name)
@@ -7689,6 +7692,10 @@ def build_operations_schedule_router(
                 if native_row is not None:
                     job["_nativeProjection"] = native_row
                     _restore_native_schedule_metadata(job)
+            first_clean_completion_available = bool(
+                decorate_native_first_clean_completions
+                and decorate_native_first_clean_completions(schedule_jobs, observed_at)
+            )
             dispatch_overhead, unmatched = _split_dispatch_overhead(unmatched)
             active_jobs = [job for job in schedule_jobs if job["includedInPlan"]]
             known_planned_hours = sum(
@@ -7723,6 +7730,7 @@ def build_operations_schedule_router(
                 "startDate": str(resolved_start),
                 "endDate": str(resolved_end),
                 "planningSource": "native",
+                "firstCleanCompletionAvailable": first_clean_completion_available,
                 "ruleCount": rule_count,
                 "issues": global_issues,
                 "summary": {
