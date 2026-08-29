@@ -2750,7 +2750,7 @@ class FunnelTermsInvitationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     contactId: UUID
-    locale: Literal["en", "es"]
+    locale: Literal["en"]
     idempotencyKey: UUID
 
 
@@ -2783,7 +2783,7 @@ class AtlasTermsDocumentsProjection(BaseModel):
 
 
 class AtlasTermsInvitationProjection(BaseModel):
-    """Bounded office projection of an Atlas invitation and delivery."""
+    """Bounded office projection, including historical bilingual records."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -2807,6 +2807,12 @@ class AtlasTermsInvitationProjection(BaseModel):
     idempotent: bool
 
 
+class AtlasEnglishTermsInvitationProjection(AtlasTermsInvitationProjection):
+    """A newly issued customer invitation, which must be English."""
+
+    locale: Literal["en"]
+
+
 class AtlasTermsSessionProjection(BaseModel):
     """Bounded, token-derived public Terms snapshot."""
 
@@ -2818,7 +2824,7 @@ class AtlasTermsSessionProjection(BaseModel):
     versionLabel: str
     contentHash: str
     audience: Literal["residential", "commercial"]
-    locale: Literal["en", "es"]
+    locale: Literal["en"]
     customerName: Optional[str] = None
     documents: Optional[AtlasTermsDocumentsProjection] = None
     expiresAt: Optional[datetime] = None
@@ -2857,7 +2863,7 @@ class AtlasTermsAcceptanceProjection(BaseModel):
     versionLabel: str
     contentHash: str
     audience: Literal["residential", "commercial"]
-    locale: Literal["en", "es"]
+    locale: Literal["en"]
     signerName: str
     termsAccepted: Literal[True]
     additionalWorkAccepted: Literal[True]
@@ -23040,7 +23046,7 @@ def admin_issue_terms_invitation(
             },
         )
         result = _project_atlas_terms_response(
-            content, AtlasTermsInvitationProjection
+            content, AtlasEnglishTermsInvitationProjection
         )
     except AtlasFunnelCapabilityUnavailable as exc:
         return _atlas_capability_unavailable_response(exc)
