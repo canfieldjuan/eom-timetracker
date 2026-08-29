@@ -2750,7 +2750,7 @@ class FunnelTermsInvitationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     contactId: UUID
-    locale: Literal["en", "es"]
+    locale: Literal["en"]
     idempotencyKey: UUID
 
 
@@ -2793,7 +2793,7 @@ class AtlasTermsInvitationProjection(BaseModel):
     versionLabel: str
     contentHash: str
     audience: Literal["residential", "commercial"]
-    locale: Literal["en", "es"]
+    locale: Literal["en"]
     recipientEmail: str
     status: Literal["issued", "accepted", "revoked", "expired"]
     issuedAt: datetime
@@ -2818,7 +2818,7 @@ class AtlasTermsSessionProjection(BaseModel):
     versionLabel: str
     contentHash: str
     audience: Literal["residential", "commercial"]
-    locale: Literal["en", "es"]
+    locale: Literal["en"]
     customerName: Optional[str] = None
     documents: Optional[AtlasTermsDocumentsProjection] = None
     expiresAt: Optional[datetime] = None
@@ -2857,7 +2857,7 @@ class AtlasTermsAcceptanceProjection(BaseModel):
     versionLabel: str
     contentHash: str
     audience: Literal["residential", "commercial"]
-    locale: Literal["en", "es"]
+    locale: Literal["en"]
     signerName: str
     termsAccepted: Literal[True]
     additionalWorkAccepted: Literal[True]

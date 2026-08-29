@@ -22,7 +22,9 @@ def _ids(count: int) -> list[str]:
     return [str(uuid.uuid4()) for _ in range(count)]
 
 
-def _invitation(*, idempotent: bool = False, status: str = "issued") -> dict[str, object]:
+def _invitation(
+    *, idempotent: bool = False, status: str = "issued", locale: str = "en"
+) -> dict[str, object]:
     invitation_id, contact_id, version_id, delivery_id = _ids(4)
     return {
         "invitationId": invitation_id,
@@ -31,7 +33,7 @@ def _invitation(*, idempotent: bool = False, status: str = "issued") -> dict[str
         "versionLabel": "2026-08-29",
         "contentHash": "a" * 64,
         "audience": "residential",
-        "locale": "en",
+        "locale": locale,
         "recipientEmail": "customer@example.test",
         "status": status,
         "issuedAt": "2026-08-29T12:00:00Z",
@@ -46,7 +48,7 @@ def _invitation(*, idempotent: bool = False, status: str = "issued") -> dict[str
     }
 
 
-def _ready_session() -> dict[str, object]:
+def _ready_session(*, locale: str = "en") -> dict[str, object]:
     invitation_id, version_id = _ids(2)
     return {
         "status": "ready",
@@ -55,7 +57,7 @@ def _ready_session() -> dict[str, object]:
         "versionLabel": "2026-08-29",
         "contentHash": "b" * 64,
         "audience": "commercial",
-        "locale": "en",
+        "locale": locale,
         "customerName": "Terms Customer",
         "documents": {
             "terms": "General terms",
@@ -68,7 +70,7 @@ def _ready_session() -> dict[str, object]:
     }
 
 
-def _accepted_session() -> dict[str, object]:
+def _accepted_session(*, locale: str = "en") -> dict[str, object]:
     invitation_id, version_id = _ids(2)
     return {
         "status": "accepted",
@@ -77,7 +79,7 @@ def _accepted_session() -> dict[str, object]:
         "versionLabel": "2026-08-29",
         "contentHash": "b" * 64,
         "audience": "commercial",
-        "locale": "en",
+        "locale": locale,
         "customerName": None,
         "documents": None,
         "expiresAt": None,
@@ -85,7 +87,7 @@ def _accepted_session() -> dict[str, object]:
     }
 
 
-def _acceptance(*, idempotent: bool = False) -> dict[str, object]:
+def _acceptance(*, idempotent: bool = False, locale: str = "en") -> dict[str, object]:
     acceptance_id, invitation_id, contact_id, version_id, delivery_id = _ids(5)
     return {
         "acceptanceId": acceptance_id,
@@ -95,7 +97,7 @@ def _acceptance(*, idempotent: bool = False) -> dict[str, object]:
         "versionLabel": "2026-08-29",
         "contentHash": "c" * 64,
         "audience": "residential",
-        "locale": "en",
+        "locale": locale,
         "signerName": "Customer Signer",
         "termsAccepted": True,
         "additionalWorkAccepted": True,
@@ -300,6 +302,34 @@ def test_issue_invitation_maps_uuid_request_key_and_preserves_replay_status(
     assert calls[0]["headers"]["X-EOM-Actor-ID"] == "1"
     assert calls[0]["headers"]["Authorization"] == "Bearer tracker-only-test-token"
     assert "Idempotency-Key" not in calls[0]["headers"]
+
+
+def test_issue_invitation_rejects_spanish_provider_projection(
+    client, auth, monkeypatch
+):
+    monkeypatch.setattr(api, "EOM_FUNNEL_APPROVER_EMPLOYEE_ID", 1)
+    monkeypatch.setattr(
+        api, "_require_atlas_funnel_capability_route", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        api.requests,
+        "post",
+        lambda *_args, **_kwargs: _AtlasResponse(
+            201, _invitation(locale="es")
+        ),
+    )
+
+    response = client.post(
+        "/api/admin/funnel/terms/invitations",
+        headers=auth,
+        json={
+            "contactId": str(uuid.uuid4()),
+            "locale": "en",
+            "idempotencyKey": str(uuid.uuid4()),
+        },
+    )
+
+    assert response.status_code == 502, response.text
 
 
 def test_dynamic_admin_terms_routes_use_exact_methods_paths_and_actor_headers(
@@ -531,6 +561,25 @@ def test_public_terms_accepted_session_keeps_state_without_internal_ids(
     assert "versionId" not in response.json()
 
 
+def test_public_terms_session_rejects_spanish_provider_projection(
+    client, monkeypatch
+):
+    monkeypatch.setattr(
+        api.requests,
+        "post",
+        lambda *_args, **_kwargs: _AtlasResponse(
+            200, _ready_session(locale="es")
+        ),
+    )
+
+    response = client.post(
+        "/api/public/terms/session", json={"token": "english-only-bearer"}
+    )
+
+    assert response.status_code == 502, response.text
+    assert "documents" not in response.json()
+
+
 def test_public_terms_accept_forwards_normalized_trusted_ip_only_on_accept(
     client, monkeypatch
 ):
@@ -579,6 +628,31 @@ def test_public_terms_accept_forwards_normalized_trusted_ip_only_on_accept(
     assert calls[0]["headers"]["X-EOM-Client-IP"] == "203.0.113.8"
     assert "X-EOM-Actor" not in calls[0]["headers"]
     assert "X-EOM-Actor-ID" not in calls[0]["headers"]
+
+
+def test_public_terms_accept_rejects_spanish_provider_projection(
+    client, monkeypatch
+):
+    monkeypatch.setattr(
+        api.requests,
+        "post",
+        lambda *_args, **_kwargs: _AtlasResponse(
+            201, _acceptance(locale="es")
+        ),
+    )
+
+    response = client.post(
+        "/api/public/terms/accept",
+        json={
+            "token": "english-only-bearer",
+            "signerName": "Customer Signer",
+            "termsAccepted": True,
+            "additionalWorkAccepted": True,
+        },
+    )
+
+    assert response.status_code == 502, response.text
+    assert "signerName" not in response.json()
 
 
 @pytest.mark.parametrize(
@@ -652,6 +726,20 @@ def test_public_terms_malformed_response_and_transport_error_stay_generic(
             "locale": "en",
             "idempotencyKey": str(uuid.uuid4()),
             "extra": True,
+        },
+        {
+            "contactId": str(uuid.uuid4()),
+            "locale": "es",
+            "idempotencyKey": str(uuid.uuid4()),
+        },
+        {
+            "contactId": str(uuid.uuid4()),
+            "idempotencyKey": str(uuid.uuid4()),
+        },
+        {
+            "contactId": str(uuid.uuid4()),
+            "locale": "fr",
+            "idempotencyKey": str(uuid.uuid4()),
         },
     ),
 )
