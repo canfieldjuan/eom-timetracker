@@ -194,6 +194,12 @@ ATLAS_FULL_CAPABILITIES = [
     "onboarding.draft.edit",
     "onboarding.draft.list",
     "onboarding.draft.revoke",
+    "terms.invitation.issue",
+    "terms.invitation.revoke",
+    "terms.readiness.read",
+    "terms.delivery.confirm_sent",
+    "terms.public.session",
+    "terms.public.accept",
 ]
 
 
@@ -266,6 +272,34 @@ def stub_atlas_funnel(setup_db, monkeypatch):
                             "/eom-funnel/customer-handoffs/{contact_id}/"
                             "first-clean-completions"
                         ),
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/eom-funnel/terms/invitations",
+                    },
+                    {
+                        "method": "POST",
+                        "path": (
+                            "/eom-funnel/terms/invitations/{invitation_id}/revoke"
+                        ),
+                    },
+                    {
+                        "method": "GET",
+                        "path": "/eom-funnel/terms/readiness/{contact_id}",
+                    },
+                    {
+                        "method": "POST",
+                        "path": (
+                            "/eom-funnel/terms/deliveries/{delivery_id}/confirm-sent"
+                        ),
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/eom-funnel/terms/public/session",
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/eom-funnel/terms/public/accept",
                     },
                 ],
             },
