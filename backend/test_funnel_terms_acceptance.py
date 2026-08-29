@@ -332,6 +332,37 @@ def test_issue_invitation_rejects_spanish_provider_projection(
     assert response.status_code == 502, response.text
 
 
+def test_revoke_historical_spanish_invitation_preserves_success(
+    client, auth, monkeypatch
+):
+    invitation_id = str(uuid.uuid4())
+    monkeypatch.setattr(api, "EOM_FUNNEL_APPROVER_EMPLOYEE_ID", 1)
+    monkeypatch.setattr(
+        api, "_require_atlas_funnel_capability_route", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        api.requests,
+        "post",
+        lambda *_args, **_kwargs: _AtlasResponse(
+            200,
+            {
+                **_invitation(status="revoked", locale="es"),
+                "internal": "strip",
+            },
+        ),
+    )
+
+    response = client.post(
+        f"/api/admin/funnel/terms/invitations/{invitation_id}/revoke",
+        headers=auth,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["locale"] == "es"
+    assert response.json()["status"] == "revoked"
+    assert "internal" not in response.json()
+
+
 def test_dynamic_admin_terms_routes_use_exact_methods_paths_and_actor_headers(
     client, auth, monkeypatch
 ):
