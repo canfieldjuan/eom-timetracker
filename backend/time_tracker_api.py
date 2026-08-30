@@ -3113,6 +3113,15 @@ class FunnelFirstCleanCompletionRequest(BaseModel):
     idempotencyKey: UUID = Field(...)
 
 
+class FunnelCardServiceCommitmentRequest(BaseModel):
+    """One explicit manager decision relayed to Atlas without local storage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    serviceCommitment: Literal["recurring", "one_time"]
+    idempotencyKey: UUID
+
+
 class AtlasPostCleanOnboardingCandidateItem(BaseModel):
     """One non-sendable Atlas candidate derived from first-clean evidence."""
 
@@ -3132,6 +3141,9 @@ class AtlasPostCleanOnboardingCandidateItem(BaseModel):
     trackerServiceId: int = Field(gt=0, le=9_223_372_036_854_775_807)
     completedAt: datetime
     createdAt: datetime
+    serviceCommitment: Optional[Literal["recurring", "one_time"]] = None
+    serviceCommitmentDecidedBy: Optional[str] = Field(default=None, max_length=128)
+    serviceCommitmentDecidedAt: Optional[datetime] = None
 
     @field_validator(
         "candidateId",
@@ -3174,6 +3186,15 @@ class AtlasPostCleanOnboardingCandidateItem(BaseModel):
             raise ValueError("must be non-blank text")
         return value.strip()
 
+    @field_validator("serviceCommitmentDecidedBy", mode="before")
+    @classmethod
+    def require_optional_deciding_actor(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be non-blank text or null")
+        return value.strip()
+
     @field_validator("trackerServiceId", mode="before")
     @classmethod
     def require_integer_service_id(cls, value: Any) -> Any:
@@ -3188,10 +3209,31 @@ class AtlasPostCleanOnboardingCandidateItem(BaseModel):
             raise ValueError("must be an ISO date-time string")
         return value
 
+    @field_validator("serviceCommitmentDecidedAt", mode="before")
+    @classmethod
+    def require_optional_decision_datetime_string(cls, value: Any) -> Any:
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError("must be an ISO date-time string or null")
+        return value
+
     @model_validator(mode="after")
     def require_timezone_aware_datetimes(self) -> "AtlasPostCleanOnboardingCandidateItem":
         if self.completedAt.tzinfo is None or self.createdAt.tzinfo is None:
             raise ValueError("candidate date-times must include a timezone")
+        commitment_values = (
+            self.serviceCommitment,
+            self.serviceCommitmentDecidedBy,
+            self.serviceCommitmentDecidedAt,
+        )
+        if not (all(value is None for value in commitment_values) or all(
+            value is not None for value in commitment_values
+        )):
+            raise ValueError("candidate service-commitment fields must be all present or null")
+        if (
+            self.serviceCommitmentDecidedAt is not None
+            and self.serviceCommitmentDecidedAt.tzinfo is None
+        ):
+            raise ValueError("service-commitment decision time must include a timezone")
         return self
 
 
@@ -3234,6 +3276,53 @@ class AtlasPostCleanOnboardingCandidatePage(BaseModel):
             raise ValueError("candidate IDs must be unique within a page")
         if len(receipt_ids) != len(self.candidates):
             raise ValueError("completion receipt IDs must be unique within a page")
+        return self
+
+
+class AtlasCardServiceCommitmentReceipt(BaseModel):
+    """Closed manager-visible projection of Atlas's immutable decision receipt."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    candidateId: UUID
+    contactId: UUID
+    serviceCommitment: Literal["recurring", "one_time"]
+    decidedByName: str = Field(min_length=1, max_length=128)
+    decidedAt: datetime
+    idempotent: bool
+
+    @field_validator("candidateId", "contactId", mode="before")
+    @classmethod
+    def require_receipt_uuid_string(cls, value: Any) -> Any:
+        if not isinstance(value, str):
+            raise ValueError("must be a UUID string")
+        return value
+
+    @field_validator("decidedByName", mode="before")
+    @classmethod
+    def require_deciding_actor(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be non-blank text")
+        return value.strip()
+
+    @field_validator("decidedAt", mode="before")
+    @classmethod
+    def require_decision_datetime_string(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be an ISO date-time string")
+        return value
+
+    @field_validator("idempotent", mode="before")
+    @classmethod
+    def require_receipt_boolean(cls, value: Any) -> Any:
+        if not isinstance(value, bool):
+            raise ValueError("must be a boolean")
+        return value
+
+    @model_validator(mode="after")
+    def require_timezone_aware_decision(self) -> "AtlasCardServiceCommitmentReceipt":
+        if self.decidedAt.tzinfo is None:
+            raise ValueError("decision time must include a timezone")
         return self
 
 
@@ -5106,6 +5195,10 @@ _ATLAS_POST_CLEAN_ONBOARDING_CANDIDATES_ROUTE = (
     "GET",
     _ATLAS_POST_CLEAN_ONBOARDING_CANDIDATES_PATH,
 )
+_ATLAS_POST_CLEAN_SERVICE_COMMITMENT_ROUTE = (
+    "POST",
+    "/eom-funnel/post-clean-onboarding-candidates/{candidate_id}/service-commitment",
+)
 _ATLAS_ONBOARDING_DRAFTS_PATH = "/eom-funnel/onboarding-drafts"
 _ATLAS_ONBOARDING_DRAFT_REVOKE_LINK_PATH = (
     "/eom-funnel/onboarding-drafts/{draft_id}/revoke-link"
@@ -5711,6 +5804,9 @@ ATLAS_FUNNEL_CAPABILITY_CUSTOMER_FIRST_CLEAN_COMPLETION_RECORD = (
 ATLAS_FUNNEL_CAPABILITY_POST_CLEAN_ONBOARDING_CANDIDATE_LIST = (
     "customer.post_clean_onboarding_candidate.list"
 )
+ATLAS_FUNNEL_CAPABILITY_POST_CLEAN_SERVICE_COMMITMENT_DECIDE = (
+    "customer.post_clean_service_commitment.decide"
+)
 # CLOSED / ENUMERATED: these two names are the exact existing Atlas
 # ``_CAPABILITY_ROUTES`` members required by the pending-draft bridge. Atlas
 # remains the canonical manifest; an absent or malformed advertised set disables
@@ -6129,6 +6225,30 @@ def _parse_atlas_post_clean_onboarding_candidate_page(
             detail="Post-clean onboarding candidate service returned an invalid response",
         ) from exc
     return page.model_dump(mode="json")
+
+
+def _parse_atlas_card_service_commitment_receipt(
+    content: Dict[str, Any],
+    *,
+    candidate_id: UUID,
+    service_commitment: str,
+) -> Dict[str, Any]:
+    """Validate and bind Atlas's immutable decision receipt to this request."""
+
+    try:
+        receipt = AtlasCardServiceCommitmentReceipt.model_validate(content)
+    except ValidationError as exc:
+        raise AtlasFunnelRequestError(
+            502, "Service commitment provider returned an invalid response"
+        ) from exc
+    if (
+        receipt.candidateId != candidate_id
+        or receipt.serviceCommitment != service_commitment
+    ):
+        raise AtlasFunnelRequestError(
+            502, "Service commitment provider returned an invalid response"
+        )
+    return receipt.model_dump(mode="json")
 
 
 def _parse_atlas_public_onboarding_issued_link_page(
@@ -23219,6 +23339,13 @@ def admin_list_funnel_review(
                 _ATLAS_POST_CLEAN_ONBOARDING_CANDIDATES_ROUTE,
             )
         ),
+        "postCleanServiceCommitmentAvailable": (
+            _atlas_funnel_manifest_supports_capability_route(
+                content,
+                ATLAS_FUNNEL_CAPABILITY_POST_CLEAN_SERVICE_COMMITMENT_DECIDE,
+                _ATLAS_POST_CLEAN_SERVICE_COMMITMENT_ROUTE,
+            )
+        ),
         # These follow-up fields are deployment proofs for the Website. The
         # local reservation list itself is Tracker-owned; the three Atlas
         # controls rely on exact registered signatures rather than copied
@@ -23498,6 +23625,75 @@ def admin_list_post_clean_onboarding_candidates(
         f"candidates={len(page['candidates'])} has_more={page['hasMore']}",
     )
     return {"success": True, **page}
+
+
+@app.post(
+    "/api/admin/funnel/post-clean-onboarding-candidates/"
+    "{candidate_id}/service-commitment"
+)
+def admin_decide_post_clean_service_commitment(
+    candidate_id: UUID,
+    payload: FunnelCardServiceCommitmentRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Relay one explicit recurring/one-time decision to Atlas authority."""
+
+    audit_action = "EOM_POST_CLEAN_SERVICE_COMMITMENT_DECIDED"
+
+    def audit_best_effort(allowed: bool, reason: str) -> None:
+        try:
+            append_access_log(request, audit_action, allowed, reason)
+        except Exception:
+            logger.exception(
+                "Could not append service-commitment audit allowed=%s", allowed
+            )
+
+    try:
+        _require_atlas_funnel_capability_route(
+            ATLAS_FUNNEL_CAPABILITY_POST_CLEAN_SERVICE_COMMITMENT_DECIDE,
+            _ATLAS_POST_CLEAN_SERVICE_COMMITMENT_ROUTE,
+            admin,
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        audit_best_effort(False, f"capability={exc.capability}")
+        return _atlas_capability_unavailable_response(exc)
+
+    try:
+        content = _atlas_funnel_request(
+            _ATLAS_POST_CLEAN_SERVICE_COMMITMENT_ROUTE[1].format(
+                candidate_id=str(candidate_id)
+            ),
+            admin,
+            payload={"serviceCommitment": payload.serviceCommitment},
+            idempotency_key=str(payload.idempotencyKey),
+        )
+        receipt = _parse_atlas_card_service_commitment_receipt(
+            content,
+            candidate_id=candidate_id,
+            service_commitment=payload.serviceCommitment,
+        )
+    except AtlasFunnelRequestError as exc:
+        audit_best_effort(False, f"status={exc.status_code}")
+        headers = {"Retry-After": "5"} if exc.status_code >= 500 else None
+        detail = (
+            "Service commitment service is temporarily unavailable"
+            if exc.status_code >= 500
+            else "Service commitment request was rejected"
+        )
+        raise HTTPException(
+            status_code=exc.status_code, detail=detail, headers=headers
+        ) from exc
+
+    audit_best_effort(
+        True,
+        f"candidate={candidate_id} commitment={payload.serviceCommitment} "
+        f"idempotent={receipt['idempotent']}",
+    )
+    return JSONResponse(
+        status_code=200 if receipt["idempotent"] else 201,
+        content=receipt,
+    )
 
 
 @app.get("/api/admin/funnel/onboarding-drafts")
