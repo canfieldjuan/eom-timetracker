@@ -3968,7 +3968,7 @@ def test_week_start_must_be_a_sunday(client, auth):
 
 
 def test_payroll_week_verification_requires_current_fingerprint_and_records_audit(client, auth):
-    week_start = date(2026, 8, 30)
+    week_start = date(2001, 1, 7)
     employee_id = _create_employee("Payroll Verification Worker")
     _delete_payroll_verification_weeks([week_start])
     try:
@@ -4326,7 +4326,7 @@ def test_legacy_payroll_hour_correction_create_remains_compatible_without_mutati
 
 
 def test_legacy_payroll_correction_create_still_requires_reopen_and_supersedes(client, auth):
-    week_start = date(2026, 8, 30)
+    week_start = date(2001, 1, 7)
     correction_date = week_start + timedelta(days=1)
     employee_id = _create_employee("Payroll Correction Reopen Worker")
     _delete_payroll_verification_weeks([week_start])
