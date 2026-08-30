@@ -27,7 +27,19 @@ from datetime import date, datetime, time as clock_time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from ipaddress import ip_address, ip_network
 from pathlib import Path
-from typing import Annotated, Any, Callable, Dict, FrozenSet, Iterable, List, Literal, Optional, Tuple
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    get_args,
+)
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -3113,12 +3125,16 @@ class FunnelFirstCleanCompletionRequest(BaseModel):
     idempotencyKey: UUID = Field(...)
 
 
+PostCleanServiceCommitment = Literal["recurring", "one_time"]
+POST_CLEAN_SERVICE_COMMITMENT_VALUES = get_args(PostCleanServiceCommitment)
+
+
 class FunnelCardServiceCommitmentRequest(BaseModel):
     """One explicit manager decision relayed to Atlas without local storage."""
 
     model_config = ConfigDict(extra="forbid")
 
-    serviceCommitment: Literal["recurring", "one_time"]
+    serviceCommitment: PostCleanServiceCommitment
     idempotencyKey: UUID
 
 
@@ -3141,7 +3157,7 @@ class AtlasPostCleanOnboardingCandidateItem(BaseModel):
     trackerServiceId: int = Field(gt=0, le=9_223_372_036_854_775_807)
     completedAt: datetime
     createdAt: datetime
-    serviceCommitment: Optional[Literal["recurring", "one_time"]] = None
+    serviceCommitment: Optional[PostCleanServiceCommitment] = None
     serviceCommitmentDecidedBy: Optional[str] = Field(default=None, max_length=128)
     serviceCommitmentDecidedAt: Optional[datetime] = None
 
@@ -3286,7 +3302,7 @@ class AtlasCardServiceCommitmentReceipt(BaseModel):
 
     candidateId: UUID
     contactId: UUID
-    serviceCommitment: Literal["recurring", "one_time"]
+    serviceCommitment: PostCleanServiceCommitment
     decidedByName: str = Field(min_length=1, max_length=128)
     decidedAt: datetime
     idempotent: bool
@@ -23345,6 +23361,13 @@ def admin_list_funnel_review(
                 ATLAS_FUNNEL_CAPABILITY_POST_CLEAN_SERVICE_COMMITMENT_DECIDE,
                 _ATLAS_POST_CLEAN_SERVICE_COMMITMENT_ROUTE,
             )
+        ),
+        # CLOSED, DERIVED semantic proof. Request admission, candidate/receipt
+        # validation, and this advertised list all consume the same Literal
+        # alias, so a future value change cannot leave a compatible-looking
+        # boolean proof behind for an older Website.
+        "postCleanServiceCommitmentValues": list(
+            POST_CLEAN_SERVICE_COMMITMENT_VALUES
         ),
         # These follow-up fields are deployment proofs for the Website. The
         # local reservation list itself is Tracker-owned; the three Atlas

@@ -162,8 +162,41 @@ def test_review_and_mutation_share_exact_capability_route_gate(
 
     assert review.status_code == 200, review.text
     assert review.json()["postCleanServiceCommitmentAvailable"] is available
+    assert review.json()["postCleanServiceCommitmentValues"] == list(
+        api.POST_CLEAN_SERVICE_COMMITMENT_VALUES
+    )
     assert mutation.status_code == (201 if available else 501), mutation.text
     assert len(provider_calls) == (1 if available else 0)
+
+
+def test_commitment_models_and_review_share_one_closed_value_contract(
+    client, auth, monkeypatch
+):
+    monkeypatch.setattr(
+        api,
+        "_atlas_funnel_read",
+        lambda *_args, **_kwargs: _manifest(),
+    )
+
+    review = client.get("/api/admin/funnel/review", headers=auth)
+    request_schema = api.FunnelCardServiceCommitmentRequest.model_json_schema()
+    receipt_schema = api.AtlasCardServiceCommitmentReceipt.model_json_schema()
+    candidate_schema = api.AtlasPostCleanOnboardingCandidateItem.model_json_schema()
+
+    assert review.status_code == 200, review.text
+    assert tuple(review.json()["postCleanServiceCommitmentValues"]) == (
+        api.POST_CLEAN_SERVICE_COMMITMENT_VALUES
+    )
+    assert tuple(request_schema["properties"]["serviceCommitment"]["enum"]) == (
+        api.POST_CLEAN_SERVICE_COMMITMENT_VALUES
+    )
+    assert tuple(receipt_schema["properties"]["serviceCommitment"]["enum"]) == (
+        api.POST_CLEAN_SERVICE_COMMITMENT_VALUES
+    )
+    candidate_value_schema = candidate_schema["properties"]["serviceCommitment"]
+    assert tuple(candidate_value_schema["anyOf"][0]["enum"]) == (
+        api.POST_CLEAN_SERVICE_COMMITMENT_VALUES
+    )
 
 
 def test_commitment_route_forwards_exact_actor_payload_and_idempotency(
