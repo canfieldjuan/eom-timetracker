@@ -2909,6 +2909,100 @@ class AtlasTermsDeliveryProjection(BaseModel):
     idempotent: bool
 
 
+class PublicCardVaultSessionRequest(BaseModel):
+    """Opaque Terms bearer forwarded only through the closed Tracker bridge."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Atlas owns the bearer grammar and token authentication. Keeping this an
+    # opaque value avoids creating a second, potentially divergent parser.
+    token: object
+
+
+class AtlasCardVaultSessionProjection(BaseModel):
+    """Browser-safe card-setup state with Atlas identifiers excluded."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["pending", "ready"]
+    checkoutUrl: Optional[str] = Field(default=None, max_length=4096)
+    checkoutExpiresAt: Optional[datetime] = None
+    providerConfirmedAt: Optional[datetime] = None
+    idempotent: bool
+
+    @model_validator(mode="after")
+    def state_has_only_its_projection(self) -> "AtlasCardVaultSessionProjection":
+        pending = (
+            self.checkoutUrl is not None
+            and self.checkoutUrl.startswith("https://")
+            and self.checkoutExpiresAt is not None
+            and self.providerConfirmedAt is None
+        )
+        ready = (
+            self.checkoutUrl is None
+            and self.checkoutExpiresAt is None
+            and self.providerConfirmedAt is not None
+        )
+        if (self.status == "pending" and not pending) or (
+            self.status == "ready" and not ready
+        ):
+            raise ValueError("Card-vault session state and projection do not match")
+        return self
+
+
+class AtlasCardVaultReadinessProjection(BaseModel):
+    """Bounded staff view of Atlas's provider-confirmed card state."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    contactId: UUID
+    audience: Literal["residential", "commercial"]
+    cardRequired: bool
+    cardReady: bool
+    reason: Literal[
+        "not_required",
+        "terms_not_ready",
+        "first_clean_not_confirmed",
+        "not_started",
+        "pending",
+        "ready",
+    ]
+    providerConfirmedAt: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def verdict_matches_projection(self) -> "AtlasCardVaultReadinessProjection":
+        not_required = (
+            self.audience == "commercial"
+            and not self.cardRequired
+            and self.cardReady
+            and self.reason == "not_required"
+            and self.providerConfirmedAt is None
+        )
+        residential_ready = (
+            self.audience == "residential"
+            and self.cardRequired
+            and self.cardReady
+            and self.reason == "ready"
+            and self.providerConfirmedAt is not None
+        )
+        residential_pending = (
+            self.audience == "residential"
+            and self.cardRequired
+            and not self.cardReady
+            and self.reason
+            in {
+                "terms_not_ready",
+                "first_clean_not_confirmed",
+                "not_started",
+                "pending",
+            }
+            and self.providerConfirmedAt is None
+        )
+        if not (not_required or residential_ready or residential_pending):
+            raise ValueError("Card-vault readiness verdict does not match projection")
+        return self
+
+
 class OfficeEstimateApprovalRequest(CustomerCreateRequest):
     """Completed-estimate facts needed for one office-created Customer/Site."""
 
@@ -5074,6 +5168,26 @@ _ATLAS_TERMS_PUBLIC_ROUTES = frozenset(
     }
 )
 
+# Atlas owns card setup and readiness. These exact signatures are separate
+# from Terms so neither bridge can accidentally admit a route from the other.
+_ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE = (
+    "POST",
+    "/eom-funnel/card-vault/public/session",
+)
+_ATLAS_CARD_VAULT_READINESS_ROUTE = (
+    "GET",
+    "/eom-funnel/card-vault/readiness/{contact_id}",
+)
+_ATLAS_CARD_VAULT_ROUTES = frozenset(
+    {
+        _ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE,
+        _ATLAS_CARD_VAULT_READINESS_ROUTE,
+    }
+)
+_ATLAS_CARD_VAULT_PUBLIC_ROUTES = frozenset(
+    {_ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE}
+)
+
 # The three office follow-up controls derive deployment proof from Atlas's
 # registered method/path signatures, not a copied capability name. The paths
 # remain closed local constants because the Tracker must never become an open
@@ -5314,6 +5428,134 @@ def _raise_terms_upstream_error(
     ) from exc
 
 
+def _atlas_card_vault_request(
+    route: Tuple[str, str],
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+    admin: Optional[Dict[str, Any]] = None,
+    path_params: Optional[Dict[str, UUID]] = None,
+) -> Dict[str, Any]:
+    """Call one exact Atlas card-vault route without exposing its credential."""
+
+    if route not in _ATLAS_CARD_VAULT_ROUTES:
+        raise RuntimeError("Invalid Atlas card-vault proxy route")
+    is_public = route in _ATLAS_CARD_VAULT_PUBLIC_ROUTES
+    if is_public and admin is not None:
+        raise RuntimeError("Public Atlas card-vault routes cannot forward an actor")
+    if not is_public and admin is None:
+        raise RuntimeError("Private Atlas card-vault routes require an actor")
+
+    method, path_template = route
+    expected_params = frozenset(re.findall(r"{([a-z_]+)}", path_template))
+    supplied_params = path_params or {}
+    if frozenset(supplied_params) != expected_params or any(
+        not isinstance(value, UUID) for value in supplied_params.values()
+    ):
+        raise RuntimeError("Invalid Atlas card-vault proxy path parameters")
+    path = path_template.format(
+        **{name: str(value) for name, value in supplied_params.items()}
+    )
+
+    if method == "GET" and payload is not None:
+        raise RuntimeError("Atlas card-vault GET routes do not accept a payload")
+    if method == "POST" and payload is None:
+        raise RuntimeError("Atlas card-vault POST routes require a payload")
+
+    _require_atlas_funnel_configuration()
+    headers = {
+        "Authorization": f"Bearer {ATLAS_FUNNEL_SERVICE_TOKEN}",
+        "Accept": "application/json",
+    }
+    if admin is not None:
+        headers["X-EOM-Actor"] = str(admin["name"])
+        headers["X-EOM-Actor-ID"] = str(admin["id"])
+
+    try:
+        if method == "GET":
+            response = requests.get(
+                f"{ATLAS_FUNNEL_BASE_URL}{path}",
+                headers=headers,
+                timeout=ATLAS_FUNNEL_TIMEOUT_SECONDS,
+            )
+        else:
+            response = requests.post(
+                f"{ATLAS_FUNNEL_BASE_URL}{path}",
+                headers=headers,
+                json=payload,
+                timeout=ATLAS_FUNNEL_TIMEOUT_SECONDS,
+            )
+    except requests.RequestException as exc:
+        raise AtlasFunnelRequestError(
+            503, "Card-vault service is temporarily unavailable"
+        ) from exc
+
+    if response.status_code in (401, 403):
+        logger.error(
+            "Atlas card-vault service credential rejected status=%s",
+            response.status_code,
+        )
+        raise AtlasFunnelRequestError(
+            502, "Card-vault service authentication failed"
+        )
+    if is_public and response.status_code in (404, 409):
+        raise AtlasFunnelRequestError(404, "Card setup link is unavailable")
+    try:
+        content = response.json()
+    except ValueError as exc:
+        raise AtlasFunnelRequestError(
+            502, "Card-vault service returned an invalid response"
+        ) from exc
+    if response.status_code >= 400:
+        raise AtlasFunnelRequestError(
+            response.status_code,
+            "Card-vault request was rejected",
+        )
+    if not isinstance(content, dict):
+        raise AtlasFunnelRequestError(
+            502, "Card-vault service returned an invalid response"
+        )
+    return content
+
+
+def _project_atlas_card_vault_response(
+    content: Dict[str, Any], projection_type: type[BaseModel]
+) -> Dict[str, Any]:
+    """Validate then emit only fields in one reviewed Tracker projection."""
+
+    try:
+        projection = projection_type.model_validate(content)
+    except ValidationError as exc:
+        raise AtlasFunnelRequestError(
+            502, "Card-vault service returned an invalid response"
+        ) from exc
+    return projection.model_dump(mode="json")
+
+
+def _raise_card_vault_upstream_error(
+    exc: AtlasFunnelRequestError, *, public: bool
+) -> None:
+    """Map untrusted Atlas failures to stable, non-reflecting errors."""
+
+    headers = {"Retry-After": "5"} if exc.status_code >= 500 else None
+    if public:
+        detail = (
+            "Card setup service is temporarily unavailable"
+            if exc.status_code >= 500
+            else "Card setup link is unavailable"
+        )
+    else:
+        detail = (
+            "Card readiness service is temporarily unavailable"
+            if exc.status_code >= 500
+            else "Card readiness request was rejected"
+        )
+    raise HTTPException(
+        status_code=exc.status_code,
+        detail=detail,
+        headers=headers,
+    ) from exc
+
+
 def _parse_atlas_public_onboarding_projection(
     content: Dict[str, Any], *, require_tracker_context: bool
 ) -> AtlasPublicOnboardingProjection:
@@ -5499,6 +5741,8 @@ ATLAS_FUNNEL_CAPABILITY_TERMS_READINESS_READ = "terms.readiness.read"
 ATLAS_FUNNEL_CAPABILITY_TERMS_DELIVERY_CONFIRM_SENT = "terms.delivery.confirm_sent"
 ATLAS_FUNNEL_CAPABILITY_TERMS_PUBLIC_SESSION = "terms.public.session"
 ATLAS_FUNNEL_CAPABILITY_TERMS_PUBLIC_ACCEPT = "terms.public.accept"
+ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_PUBLIC_SESSION = "card_vault.public.session"
+ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_READINESS_READ = "card_vault.readiness.read"
 ATLAS_FUNNEL_VISIBLE_LEAD_STAGES = frozenset({"new", "estimate_booked", "won"})
 # CLOSED / ENUMERATED: the exact kind filter the Atlas directory admits
 # (atlas_brain/eom_api/funnel.py Literal["all","lead","customer"]) and the
@@ -22226,6 +22470,28 @@ def public_terms_accept(
     )
 
 
+@app.post("/api/public/card-vault/session")
+def public_card_vault_session(
+    payload: PublicCardVaultSessionRequest,
+) -> JSONResponse:
+    """Resolve one opaque Terms bearer into Atlas's hosted card-setup state."""
+
+    try:
+        content = _atlas_card_vault_request(
+            _ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE,
+            payload={"token": payload.token},
+        )
+        result = _project_atlas_card_vault_response(
+            content, AtlasCardVaultSessionProjection
+        )
+    except AtlasFunnelRequestError as exc:
+        _raise_card_vault_upstream_error(exc, public=True)
+    return JSONResponse(
+        status_code=200 if result["idempotent"] else 201,
+        content=result,
+    )
+
+
 @app.post("/api/public/onboarding/session")
 def public_onboarding_session(
     payload: PublicOnboardingTokenRequest,
@@ -23019,6 +23285,23 @@ def admin_list_funnel_review(
                 _ATLAS_TERMS_PUBLIC_ACCEPT_ROUTE,
             )
         ),
+        # Card setup and readiness are separately deployable. Each field binds
+        # Atlas's exact capability name to its registered method/path from this
+        # one strict manifest; neither half can advertise a working bridge.
+        "cardVaultPublicSessionAvailable": (
+            _atlas_funnel_manifest_supports_capability_route(
+                content,
+                ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_PUBLIC_SESSION,
+                _ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE,
+            )
+        ),
+        "cardVaultReadinessAvailable": (
+            _atlas_funnel_manifest_supports_capability_route(
+                content,
+                ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_READINESS_READ,
+                _ATLAS_CARD_VAULT_READINESS_ROUTE,
+            )
+        ),
     }
 
 
@@ -23112,6 +23395,33 @@ def admin_get_terms_readiness(
         return _atlas_capability_unavailable_response(exc)
     except AtlasFunnelRequestError as exc:
         _raise_terms_upstream_error(exc, public=False)
+
+
+@app.get("/api/admin/funnel/card-vault/readiness/{contact_id}")
+def admin_get_card_vault_readiness(
+    contact_id: UUID,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Read Atlas's provider-confirmed card state for one contact."""
+
+    try:
+        _require_atlas_funnel_capability_route(
+            ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_READINESS_READ,
+            _ATLAS_CARD_VAULT_READINESS_ROUTE,
+            admin,
+        )
+        content = _atlas_card_vault_request(
+            _ATLAS_CARD_VAULT_READINESS_ROUTE,
+            admin=admin,
+            path_params={"contact_id": contact_id},
+        )
+        return _project_atlas_card_vault_response(
+            content, AtlasCardVaultReadinessProjection
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        return _atlas_capability_unavailable_response(exc)
+    except AtlasFunnelRequestError as exc:
+        _raise_card_vault_upstream_error(exc, public=False)
 
 
 @app.post("/api/admin/funnel/terms/deliveries/{delivery_id}/confirm-sent")
