@@ -234,6 +234,11 @@ def test_public_card_session_relays_provider_confirmed_ready_state(
     "changes",
     (
         {"checkoutUrl": "http://checkout.stripe.test/setup"},
+        {"checkoutUrl": "https://"},
+        {"checkoutUrl": "https:///setup"},
+        {"checkoutUrl": "https://?next=setup"},
+        {"checkoutUrl": "https://:443/setup"},
+        {"checkoutUrl": "https://[::1"},
         {"checkoutExpiresAt": None},
         {"providerConfirmedAt": "2026-09-01T12:45:00Z"},
         {"status": "ready"},
@@ -384,6 +389,91 @@ def test_admin_card_readiness_uses_exact_proof_actor_and_bounded_projection(
     assert readiness_call["params"] is None
 
 
+def test_admin_card_readiness_rejects_response_for_another_contact(
+    client, auth, monkeypatch
+):
+    requested_contact_id = str(uuid.uuid4())
+    monkeypatch.setattr(
+        api,
+        "_require_atlas_funnel_capability_route",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        api,
+        "_atlas_card_vault_request",
+        lambda *_args, **_kwargs: _readiness(str(uuid.uuid4())),
+    )
+
+    response = client.get(
+        f"/api/admin/funnel/card-vault/readiness/{requested_contact_id}",
+        headers=auth,
+    )
+
+    assert response.status_code == 502, response.text
+    assert "contactId" not in response.json()
+
+
+@pytest.mark.parametrize(
+    "reason", ("service_commitment_required", "future_additive_blocker")
+)
+def test_admin_card_readiness_preserves_additive_fail_closed_blockers(
+    client, auth, monkeypatch, reason
+):
+    contact_id = str(uuid.uuid4())
+    monkeypatch.setattr(
+        api,
+        "_require_atlas_funnel_capability_route",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        api,
+        "_atlas_card_vault_request",
+        lambda *_args, **_kwargs: _readiness(contact_id, reason=reason),
+    )
+
+    response = client.get(
+        f"/api/admin/funnel/card-vault/readiness/{contact_id}", headers=auth
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cardReady"] is False
+    assert response.json()["reason"] == reason
+
+
+def test_admin_card_readiness_accepts_residential_one_time_not_required(
+    client, auth, monkeypatch
+):
+    contact_id = str(uuid.uuid4())
+    body = _readiness(contact_id)
+    body.update(
+        {
+            "cardRequired": False,
+            "cardReady": True,
+            "reason": "not_required",
+        }
+    )
+    monkeypatch.setattr(
+        api,
+        "_require_atlas_funnel_capability_route",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        api,
+        "_atlas_card_vault_request",
+        lambda *_args, **_kwargs: body,
+    )
+
+    response = client.get(
+        f"/api/admin/funnel/card-vault/readiness/{contact_id}", headers=auth
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["audience"] == "residential"
+    assert response.json()["cardRequired"] is False
+    assert response.json()["cardReady"] is True
+    assert response.json()["reason"] == "not_required"
+
+
 def test_admin_card_readiness_refuses_missing_capability_before_provider(
     client, auth, monkeypatch
 ):
@@ -419,6 +509,16 @@ def test_admin_card_readiness_refuses_missing_capability_before_provider(
         {"reason": "ready"},
         {"audience": "commercial"},
         {"providerConfirmedAt": "2026-09-01T12:45:00Z"},
+        {"reason": "not_required"},
+        {"reason": ""},
+        {"reason": "UPPERCASE"},
+        {"reason": "_leading"},
+        {"reason": "a" * 129},
+        {
+            "cardReady": True,
+            "reason": "future_additive_blocker",
+            "providerConfirmedAt": "2026-09-01T12:45:00Z",
+        },
     ),
 )
 def test_admin_card_readiness_rejects_malformed_provider_verdict(

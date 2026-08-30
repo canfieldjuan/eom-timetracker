@@ -2932,9 +2932,19 @@ class AtlasCardVaultSessionProjection(BaseModel):
 
     @model_validator(mode="after")
     def state_has_only_its_projection(self) -> "AtlasCardVaultSessionProjection":
+        checkout_url_is_absolute_https = False
+        if self.checkoutUrl is not None:
+            try:
+                parsed_checkout_url = urlsplit(self.checkoutUrl)
+            except ValueError:
+                pass
+            else:
+                checkout_url_is_absolute_https = (
+                    parsed_checkout_url.scheme.lower() == "https"
+                    and bool(parsed_checkout_url.hostname)
+                )
         pending = (
-            self.checkoutUrl is not None
-            and self.checkoutUrl.startswith("https://")
+            checkout_url_is_absolute_https
             and self.checkoutExpiresAt is not None
             and self.providerConfirmedAt is None
         )
@@ -2959,21 +2969,13 @@ class AtlasCardVaultReadinessProjection(BaseModel):
     audience: Literal["residential", "commercial"]
     cardRequired: bool
     cardReady: bool
-    reason: Literal[
-        "not_required",
-        "terms_not_ready",
-        "first_clean_not_confirmed",
-        "not_started",
-        "pending",
-        "ready",
-    ]
+    reason: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_]*$")
     providerConfirmedAt: Optional[datetime] = None
 
     @model_validator(mode="after")
     def verdict_matches_projection(self) -> "AtlasCardVaultReadinessProjection":
         not_required = (
-            self.audience == "commercial"
-            and not self.cardRequired
+            not self.cardRequired
             and self.cardReady
             and self.reason == "not_required"
             and self.providerConfirmedAt is None
@@ -2989,13 +2991,7 @@ class AtlasCardVaultReadinessProjection(BaseModel):
             self.audience == "residential"
             and self.cardRequired
             and not self.cardReady
-            and self.reason
-            in {
-                "terms_not_ready",
-                "first_clean_not_confirmed",
-                "not_started",
-                "pending",
-            }
+            and self.reason not in {"not_required", "ready"}
             and self.providerConfirmedAt is None
         )
         if not (not_required or residential_ready or residential_pending):
@@ -23415,9 +23411,14 @@ def admin_get_card_vault_readiness(
             admin=admin,
             path_params={"contact_id": contact_id},
         )
-        return _project_atlas_card_vault_response(
+        result = _project_atlas_card_vault_response(
             content, AtlasCardVaultReadinessProjection
         )
+        if result["contactId"] != str(contact_id):
+            raise AtlasFunnelRequestError(
+                502, "Card-vault service returned an invalid response"
+            )
+        return result
     except AtlasFunnelCapabilityUnavailable as exc:
         return _atlas_capability_unavailable_response(exc)
     except AtlasFunnelRequestError as exc:

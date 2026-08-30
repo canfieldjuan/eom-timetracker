@@ -37,9 +37,26 @@ payment, Terms, first-clean, or onboarding-state defect.
    route proof, public success/replay/error non-reflection, malformed upstream
    state, staff authentication, and readiness projection.
 
-The proxy route set, capability names, provider response states, and emitted
-browser fields are **CLOSED, ENUMERATED**. Atlas remains the card-vault and
-Stripe authority; Tracker is a bounded relay.
+The proxy route set, capability names, public provider response states, and
+emitted browser fields are **CLOSED, ENUMERATED**. The staff readiness reason
+vocabulary is **OPEN, UPSTREAM-PROVIDED**: Atlas can add a blocker reason while
+retaining the same readiness route. Tracker accepts an unfamiliar reason only
+when the structural verdict is the fail-closed residential state
+(`cardRequired=true`, `cardReady=false`, and no provider-confirmation time).
+Ready and not-required outcomes remain closed and exact. Atlas remains the
+card-vault and Stripe authority; Tracker is a bounded relay.
+
+## Review-correction contract
+
+- Bind a staff readiness response to the contact UUID in the requested route;
+  a well-formed response for another contact is an invalid upstream response.
+- Parse pending checkout URLs and require an absolute HTTPS URL with a nonempty
+  hostname rather than accepting a string prefix.
+- Preserve additive Atlas blocker reasons only on the structurally safe
+  not-ready branch. Continue rejecting unknown reasons for ready or
+  not-required outcomes and every contradictory boolean/timestamp combination.
+- Add negative tests for a mismatched contact, hostless HTTPS URLs, the current
+  additive service-commitment blocker, and an unfamiliar fail-closed blocker.
 
 ## Explicit non-scope
 
