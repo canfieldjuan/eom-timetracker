@@ -143,6 +143,9 @@ def test_candidate_read_forwards_only_bounded_pagination_and_reprojects_safe_fie
                 "trackerServiceId": 42,
                 "completedAt": "2026-08-24T17:00:00Z",
                 "createdAt": "2026-08-24T17:00:01Z",
+                "serviceCommitment": None,
+                "serviceCommitmentDecidedBy": None,
+                "serviceCommitmentDecidedAt": None,
             }
         ],
         "limit": 2,
@@ -164,6 +167,26 @@ def test_candidate_read_forwards_only_bounded_pagination_and_reprojects_safe_fie
         },
     ]
     assert "candidate@example.test" not in repr(audit_events)
+
+
+def test_candidate_read_projects_one_coherent_service_commitment(
+    client, auth, monkeypatch
+):
+    item = {
+        **_candidate(),
+        "serviceCommitment": "one_time",
+        "serviceCommitmentDecidedBy": "  Juan Canfield  ",
+        "serviceCommitmentDecidedAt": "2026-08-30T20:00:00Z",
+    }
+    _install_atlas(monkeypatch, _page([item]))
+
+    response = client.get(_QUEUE_PATH, headers=auth)
+
+    assert response.status_code == 200, response.text
+    candidate = response.json()["candidates"][0]
+    assert candidate["serviceCommitment"] == "one_time"
+    assert candidate["serviceCommitmentDecidedBy"] == "Juan Canfield"
+    assert candidate["serviceCommitmentDecidedAt"] == "2026-08-30T20:00:00Z"
 
 
 def test_candidate_queue_requires_admin_authentication(client, monkeypatch):
@@ -307,6 +330,46 @@ def test_candidate_page_rejects_malformed_or_incoherent_upstream_state(
             ]
         ),
         _page([{**_candidate(), "completedAt": "2026-08-24T17:00:00"}]),
+        _page([{**_candidate(), "serviceCommitment": "recurring"}]),
+        _page(
+            [
+                {
+                    **_candidate(),
+                    "serviceCommitment": "recurring",
+                    "serviceCommitmentDecidedBy": "Juan Canfield",
+                }
+            ]
+        ),
+        _page(
+            [
+                {
+                    **_candidate(),
+                    "serviceCommitment": "future_value",
+                    "serviceCommitmentDecidedBy": "Juan Canfield",
+                    "serviceCommitmentDecidedAt": "2026-08-30T20:00:00Z",
+                }
+            ]
+        ),
+        _page(
+            [
+                {
+                    **_candidate(),
+                    "serviceCommitment": "one_time",
+                    "serviceCommitmentDecidedBy": "   ",
+                    "serviceCommitmentDecidedAt": "2026-08-30T20:00:00Z",
+                }
+            ]
+        ),
+        _page(
+            [
+                {
+                    **_candidate(),
+                    "serviceCommitment": "one_time",
+                    "serviceCommitmentDecidedBy": "Juan Canfield",
+                    "serviceCommitmentDecidedAt": "2026-08-30T20:00:00",
+                }
+            ]
+        ),
     ]
     for page in invalid_pages:
         _install_atlas(monkeypatch, page)
