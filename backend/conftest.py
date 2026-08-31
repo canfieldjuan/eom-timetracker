@@ -201,6 +201,7 @@ ATLAS_FULL_CAPABILITIES = [
     "terms.public.session",
     "terms.public.accept",
     "card_vault.public.session",
+    "card_vault.public.readiness",
     "card_vault.readiness.read",
 ]
 
@@ -306,6 +307,10 @@ def stub_atlas_funnel(setup_db, monkeypatch):
                     {
                         "method": "POST",
                         "path": "/eom-funnel/card-vault/public/session",
+                    },
+                    {
+                        "method": "POST",
+                        "path": "/eom-funnel/card-vault/public/readiness",
                     },
                     {
                         "method": "GET",

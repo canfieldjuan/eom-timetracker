@@ -64,11 +64,24 @@ def _readiness(
     }
 
 
+def _public_readiness(reason: str = "pending") -> dict[str, object]:
+    return {
+        "cardRequired": reason != "not_required",
+        "cardReady": reason in {"not_required", "ready"},
+        "reason": reason,
+    }
+
+
 _CARD_VAULT_PROOFS = (
     (
         "cardVaultPublicSessionAvailable",
         api.ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_PUBLIC_SESSION,
         api._ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE,
+    ),
+    (
+        "cardVaultPublicReadinessAvailable",
+        api.ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_PUBLIC_READINESS,
+        api._ATLAS_CARD_VAULT_PUBLIC_READINESS_ROUTE,
     ),
     (
         "cardVaultReadinessAvailable",
@@ -102,7 +115,7 @@ def _routes() -> list[dict[str, str]]:
     ]
 
 
-def test_review_proves_both_card_vault_routes_from_one_strict_manifest(
+def test_review_proves_all_card_vault_routes_from_one_strict_manifest(
     client, auth, monkeypatch
 ):
     monkeypatch.setattr(
@@ -231,6 +244,90 @@ def test_public_card_session_relays_provider_confirmed_ready_state(
 
 
 @pytest.mark.parametrize(
+    "reason",
+    (
+        "not_required",
+        "terms_not_ready",
+        "first_clean_not_confirmed",
+        "service_commitment_required",
+        "not_started",
+        "pending",
+        "ready",
+    ),
+)
+def test_public_card_readiness_forwards_only_the_bearer_and_closed_state(
+    client, monkeypatch, reason
+):
+    raw_token = f"eomterms1.readiness-{reason}"
+    calls: list[dict[str, object]] = []
+
+    def atlas_post(url, *, headers=None, json=None, timeout=None):
+        calls.append({"url": str(url), "headers": headers or {}, "json": json})
+        return _AtlasResponse(200, _public_readiness(reason))
+
+    monkeypatch.setattr(api.requests, "post", atlas_post)
+
+    response = client.post(
+        "/api/public/card-vault/readiness", json={"token": raw_token}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == _public_readiness(reason)
+    assert calls == [
+        {
+            "url": (
+                f"{api.ATLAS_FUNNEL_BASE_URL}"
+                "/eom-funnel/card-vault/public/readiness"
+            ),
+            "headers": {
+                "Authorization": "Bearer tracker-only-test-token",
+                "Accept": "application/json",
+            },
+            "json": {"token": raw_token},
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        {"cardRequired": False, "cardReady": False, "reason": "not_required"},
+        {"cardRequired": True, "cardReady": False, "reason": "ready"},
+        {"cardRequired": True, "cardReady": True, "reason": "pending"},
+        {
+            "cardRequired": True,
+            "cardReady": False,
+            "reason": "future_additive_blocker",
+        },
+        {"cardRequired": 1, "cardReady": False, "reason": "pending"},
+        {"cardRequired": True, "cardReady": "false", "reason": "pending"},
+        {
+            "cardRequired": True,
+            "cardReady": False,
+            "reason": "pending",
+            "contactId": str(uuid.uuid4()),
+        },
+        {"cardRequired": True, "cardReady": False},
+    ),
+)
+def test_public_card_readiness_rejects_malformed_or_overexposed_state(
+    client, monkeypatch, body
+):
+    monkeypatch.setattr(
+        api.requests,
+        "post",
+        lambda *_args, **_kwargs: _AtlasResponse(200, body),
+    )
+
+    response = client.post(
+        "/api/public/card-vault/readiness", json={"token": "opaque"}
+    )
+
+    assert response.status_code == 502, response.text
+    assert "cardRequired" not in response.json()
+
+
+@pytest.mark.parametrize(
     "changes",
     (
         {"checkoutUrl": "http://checkout.stripe.test/setup"},
@@ -320,9 +417,70 @@ def test_public_card_session_transport_and_non_json_errors_stay_generic(
     assert raw_token not in unavailable_response.text
 
 
+@pytest.mark.parametrize(
+    ("upstream_status", "expected_status"),
+    ((404, 404), (409, 404), (422, 422), (401, 502), (403, 502), (500, 500)),
+)
+def test_public_card_readiness_errors_are_generic_and_never_reflect_bearer(
+    client, monkeypatch, caplog, upstream_status, expected_status
+):
+    raw_token = f"eomterms1.readiness-secret-{upstream_status}"
+    monkeypatch.setattr(
+        api.requests,
+        "post",
+        lambda *_args, **_kwargs: _AtlasResponse(
+            upstream_status, {"detail": f"invalid {raw_token}"}
+        ),
+    )
+
+    response = client.post(
+        "/api/public/card-vault/readiness", json={"token": raw_token}
+    )
+
+    assert response.status_code == expected_status, response.text
+    assert raw_token not in response.text
+    assert raw_token not in caplog.text
+    assert response.json()["error"] in {
+        "Card setup link is unavailable",
+        "Card setup service is temporarily unavailable",
+    }
+
+
+def test_public_card_readiness_transport_and_non_json_errors_stay_generic(
+    client, monkeypatch
+):
+    raw_token = "eomterms1.readiness-diagnostic-secret"
+    monkeypatch.setattr(
+        api.requests,
+        "post",
+        lambda *_args, **_kwargs: _AtlasResponse(200, ValueError(raw_token)),
+    )
+    malformed = client.post(
+        "/api/public/card-vault/readiness", json={"token": raw_token}
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise api.requests.Timeout(raw_token)
+
+    monkeypatch.setattr(api.requests, "post", unavailable)
+    unavailable_response = client.post(
+        "/api/public/card-vault/readiness", json={"token": raw_token}
+    )
+
+    assert malformed.status_code == 502, malformed.text
+    assert raw_token not in malformed.text
+    assert unavailable_response.status_code == 503, unavailable_response.text
+    assert unavailable_response.headers["retry-after"] == "5"
+    assert raw_token not in unavailable_response.text
+
+
 @pytest.mark.parametrize("payload", ({}, {"token": "opaque", "extra": True}))
-def test_public_card_session_rejects_missing_or_extra_fields_before_network(
-    client, monkeypatch, payload
+@pytest.mark.parametrize(
+    "path",
+    ("/api/public/card-vault/session", "/api/public/card-vault/readiness"),
+)
+def test_public_card_routes_reject_missing_or_extra_fields_before_network(
+    client, monkeypatch, payload, path
 ):
     calls: list[object] = []
 
@@ -332,7 +490,7 @@ def test_public_card_session_rejects_missing_or_extra_fields_before_network(
 
     monkeypatch.setattr(api, "_atlas_card_vault_request", unexpected)
 
-    response = client.post("/api/public/card-vault/session", json=payload)
+    response = client.post(path, json=payload)
 
     assert response.status_code == 422, response.text
     assert calls == []
@@ -597,6 +755,19 @@ def test_card_vault_transport_rejects_wrong_shapes_before_configuration(
         ),
         lambda: api._atlas_card_vault_request(
             api._ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE,
+            payload={"token": "x"},
+            path_params={"contact_id": uuid.uuid4()},
+        ),
+        lambda: api._atlas_card_vault_request(
+            api._ATLAS_CARD_VAULT_PUBLIC_READINESS_ROUTE,
+            admin=admin,
+            payload={"token": "x"},
+        ),
+        lambda: api._atlas_card_vault_request(
+            api._ATLAS_CARD_VAULT_PUBLIC_READINESS_ROUTE
+        ),
+        lambda: api._atlas_card_vault_request(
+            api._ATLAS_CARD_VAULT_PUBLIC_READINESS_ROUTE,
             payload={"token": "x"},
             path_params={"contact_id": uuid.uuid4()},
         ),
