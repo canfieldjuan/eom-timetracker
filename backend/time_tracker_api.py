@@ -2972,6 +2972,35 @@ class AtlasCardVaultSessionProjection(BaseModel):
         return self
 
 
+class AtlasPublicCardVaultReadinessProjection(BaseModel):
+    """Exact customer-safe card policy and state from Atlas."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cardRequired: bool = Field(strict=True)
+    cardReady: bool = Field(strict=True)
+    reason: Literal[
+        "not_required",
+        "terms_not_ready",
+        "first_clean_not_confirmed",
+        "service_commitment_required",
+        "not_started",
+        "pending",
+        "ready",
+    ]
+
+    @model_validator(mode="after")
+    def state_matches_reason(self) -> "AtlasPublicCardVaultReadinessProjection":
+        expected = (
+            (False, True)
+            if self.reason == "not_required"
+            else (True, self.reason == "ready")
+        )
+        if (self.cardRequired, self.cardReady) != expected:
+            raise ValueError("Card-vault readiness state and reason do not match")
+        return self
+
+
 class AtlasCardVaultReadinessProjection(BaseModel):
     """Bounded staff view of Atlas's provider-confirmed card state."""
 
@@ -5279,6 +5308,10 @@ _ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE = (
     "POST",
     "/eom-funnel/card-vault/public/session",
 )
+_ATLAS_CARD_VAULT_PUBLIC_READINESS_ROUTE = (
+    "POST",
+    "/eom-funnel/card-vault/public/readiness",
+)
 _ATLAS_CARD_VAULT_READINESS_ROUTE = (
     "GET",
     "/eom-funnel/card-vault/readiness/{contact_id}",
@@ -5286,11 +5319,15 @@ _ATLAS_CARD_VAULT_READINESS_ROUTE = (
 _ATLAS_CARD_VAULT_ROUTES = frozenset(
     {
         _ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE,
+        _ATLAS_CARD_VAULT_PUBLIC_READINESS_ROUTE,
         _ATLAS_CARD_VAULT_READINESS_ROUTE,
     }
 )
 _ATLAS_CARD_VAULT_PUBLIC_ROUTES = frozenset(
-    {_ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE}
+    {
+        _ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE,
+        _ATLAS_CARD_VAULT_PUBLIC_READINESS_ROUTE,
+    }
 )
 
 # The three office follow-up controls derive deployment proof from Atlas's
@@ -5850,6 +5887,7 @@ ATLAS_FUNNEL_CAPABILITY_TERMS_DELIVERY_CONFIRM_SENT = "terms.delivery.confirm_se
 ATLAS_FUNNEL_CAPABILITY_TERMS_PUBLIC_SESSION = "terms.public.session"
 ATLAS_FUNNEL_CAPABILITY_TERMS_PUBLIC_ACCEPT = "terms.public.accept"
 ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_PUBLIC_SESSION = "card_vault.public.session"
+ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_PUBLIC_READINESS = "card_vault.public.readiness"
 ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_READINESS_READ = "card_vault.readiness.read"
 ATLAS_FUNNEL_VISIBLE_LEAD_STAGES = frozenset({"new", "estimate_booked", "won"})
 # CLOSED / ENUMERATED: the exact kind filter the Atlas directory admits
@@ -22624,6 +22662,24 @@ def public_card_vault_session(
     )
 
 
+@app.post("/api/public/card-vault/readiness")
+def public_card_vault_readiness(
+    payload: PublicCardVaultSessionRequest,
+) -> Dict[str, Any]:
+    """Read Atlas's token-bound card policy/state without starting setup."""
+
+    try:
+        content = _atlas_card_vault_request(
+            _ATLAS_CARD_VAULT_PUBLIC_READINESS_ROUTE,
+            payload={"token": payload.token},
+        )
+        return _project_atlas_card_vault_response(
+            content, AtlasPublicCardVaultReadinessProjection
+        )
+    except AtlasFunnelRequestError as exc:
+        _raise_card_vault_upstream_error(exc, public=True)
+
+
 @app.post("/api/public/onboarding/session")
 def public_onboarding_session(
     payload: PublicOnboardingTokenRequest,
@@ -23439,6 +23495,13 @@ def admin_list_funnel_review(
                 content,
                 ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_PUBLIC_SESSION,
                 _ATLAS_CARD_VAULT_PUBLIC_SESSION_ROUTE,
+            )
+        ),
+        "cardVaultPublicReadinessAvailable": (
+            _atlas_funnel_manifest_supports_capability_route(
+                content,
+                ATLAS_FUNNEL_CAPABILITY_CARD_VAULT_PUBLIC_READINESS,
+                _ATLAS_CARD_VAULT_PUBLIC_READINESS_ROUTE,
             )
         ),
         "cardVaultReadinessAvailable": (
