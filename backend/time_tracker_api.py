@@ -19460,6 +19460,56 @@ def geofence_geometry_fingerprint(**kwargs: Any) -> str:
     ).hexdigest()
 
 
+def _location_business_facts_eligible(
+    *,
+    location_type: Optional[str],
+    parent_linked: bool,
+    active: bool,
+    archived: bool,
+    parent_customer_active: Optional[bool],
+    parent_customer_archived: Optional[bool],
+) -> bool:
+    """Canonical facts shared by business eligibility and strict telemetry."""
+
+    return bool(
+        location_type in {"Residential", "Commercial"}
+        and active
+        and not archived
+        and (
+            not parent_linked
+            or (
+                parent_customer_active is True
+                and parent_customer_archived is False
+            )
+        )
+    )
+
+
+def _commercial_clock_boundary_facts_eligible(
+    *,
+    location_type: Optional[str],
+    parent_linked: bool,
+    active: bool,
+    archived: bool,
+    parent_customer_active: Optional[bool],
+    parent_customer_archived: Optional[bool],
+) -> bool:
+    """Canonical membership facts for the strict Commercial clock boundary."""
+
+    return bool(
+        location_type == "Commercial"
+        and parent_linked
+        and _location_business_facts_eligible(
+            location_type=location_type,
+            parent_linked=parent_linked,
+            active=active,
+            archived=archived,
+            parent_customer_active=parent_customer_active,
+            parent_customer_archived=parent_customer_archived,
+        )
+    )
+
+
 def _geofence_state(
     *,
     entity_type: str,
@@ -19492,13 +19542,13 @@ def _geofence_state(
     # clock resolver.
     # Residential uses the established shared resolver when broad C3 is active;
     # otherwise its clock-only fallback remains the legacy nearest-pin matcher.
-    commercial_clock_boundary_eligible = bool(
-        location_type == "Commercial"
-        and parent_linked
-        and active
-        and not archived
-        and parent_customer_active is True
-        and parent_customer_archived is False
+    commercial_clock_boundary_eligible = _commercial_clock_boundary_facts_eligible(
+        location_type=location_type,
+        parent_linked=parent_linked,
+        active=active,
+        archived=archived,
+        parent_customer_active=parent_customer_active,
+        parent_customer_archived=parent_customer_archived,
     )
     clock_boundary_applies = bool(
         entity_type == "home_base" or commercial_clock_boundary_eligible
@@ -19621,18 +19671,19 @@ def _location_business_eligible(row: Dict[str, Any]) -> bool:
     eligible. This derived predicate is shared by the readiness report and C3
     resolution so they cannot silently disagree about authorization.
     """
-    if not bool(row.get("active")):
-        return False
-    if row.get("archived_at") is not None:
-        return False
-    if row.get("location_type") not in ("Residential", "Commercial"):
-        return False
-    if row.get("customer_id") is not None:
-        if not bool(row.get("customer_active")):
-            return False
-        if row.get("customer_archived_at") is not None:
-            return False
-    return True
+    parent_linked = row.get("customer_id") is not None
+    return _location_business_facts_eligible(
+        location_type=row.get("location_type"),
+        parent_linked=parent_linked,
+        active=bool(row.get("active")),
+        archived=row.get("archived_at") is not None,
+        parent_customer_active=(
+            bool(row.get("customer_active")) if parent_linked else None
+        ),
+        parent_customer_archived=(
+            row.get("customer_archived_at") is not None if parent_linked else None
+        ),
+    )
 
 
 def _location_commercial_clock_boundary_eligible(row: Dict[str, Any]) -> bool:
@@ -19645,10 +19696,21 @@ def _location_commercial_clock_boundary_eligible(row: Dict[str, Any]) -> bool:
     fail closed instead of silently authorizing a nearest match.
     """
 
-    return bool(
-        row.get("customer_id") is not None
-        and row.get("location_type") == "Commercial"
-        and _location_business_eligible(row)
+    return _commercial_clock_boundary_facts_eligible(
+        location_type=row.get("location_type"),
+        parent_linked=row.get("customer_id") is not None,
+        active=bool(row.get("active")),
+        archived=row.get("archived_at") is not None,
+        parent_customer_active=(
+            bool(row.get("customer_active"))
+            if row.get("customer_id") is not None
+            else None
+        ),
+        parent_customer_archived=(
+            row.get("customer_archived_at") is not None
+            if row.get("customer_id") is not None
+            else None
+        ),
     )
 
 
