@@ -288,16 +288,18 @@ def test_c6_defaults_off_and_preserves_legacy_override(client, monkeypatch):
     assert response.json()["entry"]["clockInGpsMeta"]["override"] is True
 
 
-def test_effective_gate_preserves_shared_commercial_radius_when_clock_switch_is_off(
+@pytest.mark.parametrize("location_type", ["Commercial", "Residential"])
+def test_effective_gate_reports_shared_radius_separately_from_legacy_fallback(
     client,
     auth,
     monkeypatch,
+    location_type,
 ):
     employee_id, employee_auth = _create_employee(client, "shared radius compatibility")
     crew_id = _create_crew(employee_id, "shared radius compatibility crew")
     site_id = _create_site(
         "shared radius compatibility",
-        location_type="Commercial",
+        location_type=location_type,
         geofence_radius_m=15,
     )
     monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
