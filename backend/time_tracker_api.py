@@ -20201,10 +20201,16 @@ def _c3_clock_boundary_override_error(
             "This clock location is not ready for verification. "
             "Ask an administrator to repair and attest its geofence."
         )
+    strict_boundary_outside = bool(
+        reason == "clock_boundary_outside"
+        or (
+            reason == "selected_site_not_inside"
+            and (resolution or {}).get("clockBoundaryConflict")
+        )
+    )
     if (
         GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
-        and reason
-        in {"clock_boundary_outside", "selected_site_not_inside", "uncertain"}
+        and (strict_boundary_outside or reason == "uncertain")
         and not str(getattr(payload, "gpsOverrideReason", "") or "").strip()
     ):
         return (
@@ -20328,7 +20334,14 @@ def _c3_resolve_site(
             return {"state": "unresolved", "reason": "selected_site_ineligible"}
         geofence = _c3_site_geofence(selected, payload, action=action)
         if geofence["status"] != "inside":
-            return {"state": "unresolved", "reason": "selected_site_not_inside"}
+            return {
+                "state": "unresolved",
+                "reason": "selected_site_not_inside",
+                "clockBoundaryConflict": bool(
+                    clock_boundary_constraints_required
+                    and _location_commercial_clock_boundary_eligible(selected)
+                ),
+            }
         return {
             "state": "customer_site",
             "source": "explicit",

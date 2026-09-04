@@ -856,6 +856,40 @@ def test_clock_boundary_fallback_is_inert_when_its_switch_is_off(
     assert response.json()["entry"]["clockInGpsMeta"]["override"] is False
 
 
+def test_dual_switch_preserves_residential_legacy_fallback(client, monkeypatch):
+    _employee_id, employee_auth = _create_employee(
+        client,
+        "dual switch residential",
+    )
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    site_id = _create_site(
+        "dual switch residential",
+        geofence_radius_m=15,
+        location_type="Residential",
+    )
+
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": LATITUDE + 0.00027,
+            "longitude": LONGITUDE,
+            "accuracy": 1,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["entry"]["clockInGpsMeta"]["override"] is False
+
+
 @pytest.mark.parametrize(
     ("broad_resolution_enabled", "legacy_radius_m", "latitude_offset"),
     [
@@ -933,6 +967,14 @@ def test_clock_radius_prevents_legacy_match_from_bypassing_narrow_boundary(
     )
     assert blocked_start.status_code == 400, blocked_start.text
     assert "configured Commercial Site clock boundary" in blocked_start.text
+
+    selected_blocked_start = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={**point, "locationId": site_id},
+    )
+    assert selected_blocked_start.status_code == 400, selected_blocked_start.text
+    assert "configured Commercial Site clock boundary" in selected_blocked_start.text
 
     started = client.post(
         "/api/timesheet/clock-in",
