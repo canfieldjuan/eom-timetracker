@@ -17606,6 +17606,7 @@ def clock_in(
         # transaction advisory lock as Site mutations before this authoritative
         # re-read so the candidate set and following time write share one view.
         _lock_customer_site_mutations(cur)
+        provisional_resolution = site_resolution.get("resolution")
         current_resolution = _c3_resolve_site(
             "clock-in",
             payload,
@@ -17637,6 +17638,19 @@ def clock_in(
                     _timesheet_data,
                     payload,
                     current_resolution,
+                    cur=(
+                        cur
+                        if GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+                        and (
+                            _c3_resolution_involves_commercial_clock_boundary(
+                                provisional_resolution
+                            )
+                            or _c3_resolution_involves_commercial_clock_boundary(
+                                current_resolution
+                            )
+                        )
+                        else None
+                    ),
                 )
                 if override_error:
                     raise HTTPException(status_code=400, detail=override_error)
@@ -17970,6 +17984,7 @@ def clock_out(
             return
 
         _lock_customer_site_mutations(cur)
+        provisional_resolution = site_resolution.get("resolution")
         current_resolution = _c3_resolve_site(
             "clock-out",
             gate_payload,
@@ -18038,6 +18053,19 @@ def clock_out(
                 _timesheet_data,
                 gate_payload,
                 current_resolution,
+                cur=(
+                    cur
+                    if GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+                    and (
+                        _c3_resolution_involves_commercial_clock_boundary(
+                            provisional_resolution
+                        )
+                        or _c3_resolution_involves_commercial_clock_boundary(
+                            current_resolution
+                        )
+                    )
+                    else None
+                ),
             )
             if override_error:
                 raise HTTPException(status_code=400, detail=override_error)
@@ -19374,9 +19402,14 @@ def _clock_boundary_effective_geofence_radius(
     Commercial Site QR arrival/departure.
     """
 
-    resolved, source = _resolve_geofence_radius_m(configured_radius_m)
+    # Turning the dedicated switch off must preserve the pre-slice resolver for
+    # an already-active hard gate.  In particular, a deployment that already
+    # enabled the shared per-site switch must not silently replace its
+    # Commercial/Home Base boundary with the global fallback merely because
+    # the independently-managed clock switch defaults off.
     if not GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED:
-        return int(SITE_CHECK_IN_RADIUS_M), "global_fallback"
+        return _effective_geofence_radius(configured_radius_m)
+    resolved, source = _resolve_geofence_radius_m(configured_radius_m)
     if source == "per_site":
         resolved = min(int(resolved), GEOFENCE_RADIUS_MAX_M)
     return int(resolved), source
@@ -19398,7 +19431,7 @@ def _max_clock_boundary_effective_geofence_radius_m() -> int:
     """Largest radius the clock-boundary resolver can admit."""
 
     if not GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED:
-        return int(SITE_CHECK_IN_RADIUS_M)
+        return _max_effective_geofence_radius_m()
     return max(int(SITE_CHECK_IN_RADIUS_M), GEOFENCE_RADIUS_MAX_M)
 
 
@@ -19560,6 +19593,7 @@ def _geofence_state(
         ) = _clock_boundary_effective_geofence_radius(configured_radius_m)
         clock_boundary_per_site_enabled = bool(
             GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            or GEOFENCE_PER_SITE_RADIUS_ENABLED
         )
     elif GEOFENCE_SITE_RESOLUTION_ENABLED:
         (
@@ -20093,10 +20127,35 @@ def _c3_legacy_match_contains_site(row: Dict[str, Any], payload: BaseModel) -> b
     return geofence["status"] == "inside"
 
 
+def _c3_resolution_involves_commercial_clock_boundary(
+    resolution: Optional[Dict[str, Any]],
+) -> bool:
+    """Identify resolutions whose legacy fallback must use locked Site truth."""
+
+    if not isinstance(resolution, dict):
+        return False
+    if resolution.get("clockBoundaryConflict") or resolution.get("reason") in {
+        "commercial_site_unready",
+        "selected_site_unready",
+        "clock_boundary_outside",
+    }:
+        return True
+    site = resolution.get("site")
+    if isinstance(site, dict) and _location_commercial_clock_boundary_eligible(site):
+        return True
+    return any(
+        isinstance(candidate, dict)
+        and _location_commercial_clock_boundary_eligible(candidate)
+        for candidate in (resolution.get("candidates") or [])
+    )
+
+
 def _c3_clock_boundary_override_error(
     timesheet_data: Dict[str, Any],
     payload: BaseModel,
     resolution: Optional[Dict[str, Any]],
+    *,
+    cur: Optional[Any] = None,
 ) -> Optional[str]:
     """Compose legacy override support without bypassing strict clock truth."""
     if (resolution or {}).get("exactSelectionRequired"):
@@ -20115,15 +20174,6 @@ def _c3_clock_boundary_override_error(
         and reason == "selected_site_ineligible"
     ):
         return "The selected customer Site is not eligible for this clock action."
-    error = require_gps_override(
-        timesheet_data,
-        getattr(payload, "latitude", None),
-        getattr(payload, "longitude", None),
-        str(getattr(payload, "gpsOverrideReason", "") or ""),
-        str(getattr(payload, "gpsOverrideDetail", "") or ""),
-    )
-    if error:
-        return error
     if reason in {
         "home_base_unready",
         "selected_site_unready",
@@ -20133,6 +20183,40 @@ def _c3_clock_boundary_override_error(
             "This clock location is not ready for verification. "
             "Ask an administrator to repair and attest its geofence."
         )
+    if cur is not None:
+        # Final plain-time checks run after the Site-mutation advisory lock is
+        # held. Refresh the legacy matcher from that same transaction view so a
+        # Site move between the provisional read and persistence cannot be
+        # accepted from the stale timesheet snapshot.
+        cur.execute(
+            """
+            SELECT address, lat, lng
+            FROM locations
+            WHERE active = TRUE
+              AND lat IS NOT NULL
+              AND lng IS NOT NULL
+            """
+        )
+        current_location_rows = _c3_rows_from_cursor(cur)
+        timesheet_data = {
+            **timesheet_data,
+            "location_coords": {
+                str(row["address"]): {
+                    "lat": float(row["lat"]),
+                    "lng": float(row["lng"]),
+                }
+                for row in current_location_rows
+            },
+        }
+    error = require_gps_override(
+        timesheet_data,
+        getattr(payload, "latitude", None),
+        getattr(payload, "longitude", None),
+        str(getattr(payload, "gpsOverrideReason", "") or ""),
+        str(getattr(payload, "gpsOverrideDetail", "") or ""),
+    )
+    if error:
+        return error
     strict_boundary_outside = bool(
         reason == "clock_boundary_outside"
         or (
