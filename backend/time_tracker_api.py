@@ -14568,7 +14568,7 @@ def record_home_base_scan(
     policy = _active_home_base_config()
     if not policy or int(policy["home_base_id"]) != int(home_base["home_base_id"]):
         raise HTTPException(status_code=403, detail="Home Base is not active")
-    resolved_radius_m, radius_source = _clock_boundary_effective_geofence_radius(
+    resolved_radius_m, radius_source = _effective_geofence_radius(
         home_base.get("geofence_radius_m")
     )
     geofence = evaluate_site_check_in_geofence(
@@ -14638,7 +14638,7 @@ def record_home_base_scan(
         # lookup just returned rather than the one the preflight saw, or a
         # worker standing at the former location still buys paid time. Resolve the
         # radius from this same locked row too (not the preflight value).
-        current_radius_m, current_radius_source = _clock_boundary_effective_geofence_radius(
+        current_radius_m, current_radius_source = _effective_geofence_radius(
             current_home_base.get("geofence_radius_m")
         )
         current_geofence = evaluate_site_check_in_geofence(
