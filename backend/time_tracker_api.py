@@ -20397,23 +20397,19 @@ def _c3_resolve_site(
             "reason": "multiple_inside_sites",
             "candidates": [row for row, _ in inside],
         }
-    if (
-        target_policy
-        == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
-    ):
-        # A ready target always wins above. Only after proving that no ready
-        # target contains the sample do we surface an inside-but-unready target.
-        if home_base_unready_at_sample:
-            return {
-                "state": "unresolved",
-                "reason": "home_base_unready",
-                "failureTarget": {
-                    "kind": "home_base",
-                    "id": int(home_base["home_base_id"]),
-                    "label": str(home_base.get("label") or ""),
-                },
-                "geofence": home_base_geofence,
-            }
+    # A ready target always wins above. Only after proving that no ready target
+    # contains the sample do we surface an inside-but-unready target.
+    if home_base_unready_at_sample:
+        return {
+            "state": "unresolved",
+            "reason": "home_base_unready",
+            "failureTarget": {
+                "kind": "home_base",
+                "id": int(home_base["home_base_id"]),
+                "label": str(home_base.get("label") or ""),
+            },
+            "geofence": home_base_geofence,
+        }
     for row in unready_commercial_rows:
         unready_geofence = _c3_site_geofence(row, payload, action=action)
         if unready_geofence.get("status") == "inside":
