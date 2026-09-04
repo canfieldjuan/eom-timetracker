@@ -904,6 +904,7 @@ def test_clock_boundary_fallback_is_inert_when_its_switch_is_off(
     monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
     monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
     monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
     monkeypatch.setattr(
         api,
         "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
@@ -927,6 +928,20 @@ def test_clock_boundary_fallback_is_inert_when_its_switch_is_off(
 
     assert response.status_code == 200, response.text
     assert response.json()["entry"]["clockInGpsMeta"]["override"] is False
+    row = api._c3_customer_site_rows(
+        api.ClockInRequest(
+            locationId=site_id,
+            latitude=LATITUDE + 0.00027,
+            longitude=LONGITUDE,
+            accuracy=1,
+        ),
+        action="clock-in",
+        selected_location_id=site_id,
+    )[0]
+    geofence = api._c3_location_geofence_state(row)
+    assert geofence["clockBoundaryEffectiveRadiusM"] == 50
+    assert geofence["clockBoundaryRadiusSource"] == "legacy_location_match"
+    assert geofence["clockBoundaryPerSiteRadiusEnabled"] is False
 
 
 def test_unready_commercial_boundary_reports_repair_before_legacy_override(
