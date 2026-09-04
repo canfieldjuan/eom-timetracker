@@ -1012,6 +1012,63 @@ def test_commercial_home_base_clock_boundary_keeps_unready_commercial_sites_out(
     assert _hard_gate_failure(attempted)["details"]["reason"] == (
         "selected_site_unready"
     )
+    assert _hard_gate_failure(attempted)["details"]["retryable"] is False
+
+    automatic = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert automatic.status_code == 409, automatic.text
+    automatic_failure = _hard_gate_failure(automatic)
+    assert automatic_failure["details"]["reason"] == "commercial_site_unready"
+    assert automatic_failure["details"]["retryable"] is False
+    assert "administrator to repair" in automatic_failure["error"]
+
+
+def test_commercial_home_base_clock_boundary_reports_unready_home_base(
+    client,
+    auth,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "unready home base")
+    _create_site(
+        "unready home base commercial",
+        location_type="Commercial",
+    )
+    home_base_id = _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+    db.execute(
+        """
+        UPDATE home_bases
+        SET pin_attested_at = NULL,
+            pin_attestation_fingerprint = NULL
+        WHERE id = %s
+        """,
+        (home_base_id,),
+    )
+
+    attempted = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert attempted.status_code == 409, attempted.text
+    failure = _hard_gate_failure(attempted)
+    assert failure["details"]["reason"] == "home_base_unready"
+    assert failure["details"]["retryable"] is False
+    assert "administrator to attest" in failure["error"]
 
 
 def test_commercial_home_base_clock_boundary_requires_exact_choice_for_overlaps(
@@ -1470,6 +1527,12 @@ def test_c6_never_traps_departure_or_clock_out_when_scope_is_effective(
         True,
     )
     _enable_scope(client, auth, crew_id)
+    current_status = client.get(
+        "/api/timesheet/current-status",
+        headers=employee_auth,
+    )
+    assert current_status.status_code == 200, current_status.text
+    assert current_status.json()["clockOutSiteResolutionRequired"] is False
 
     clocked_in = client.post(
         "/api/timesheet/clock-in",
