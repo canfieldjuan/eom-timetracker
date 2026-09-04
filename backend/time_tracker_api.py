@@ -19595,6 +19595,20 @@ def _geofence_state(
             GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
             or GEOFENCE_PER_SITE_RADIUS_ENABLED
         )
+        # With only the shared rollout active, ordinary unscoped clock actions
+        # can still fall back to the legacy nearest-pin matcher after C3 fails
+        # to associate the Site. Report the largest reachable admission radius
+        # rather than advertising a narrower configured boundary that is not
+        # authoritative in that compatibility path. An effective hard-gate
+        # scope remains strict and is reported separately by the scope state.
+        legacy_radius_m = int(LOCATION_MATCH_RADIUS_M)
+        if (
+            not GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            and legacy_radius_m > clock_boundary_radius_m
+        ):
+            clock_boundary_radius_m = legacy_radius_m
+            clock_boundary_radius_source = "legacy_location_match"
+            clock_boundary_per_site_enabled = False
     elif GEOFENCE_SITE_RESOLUTION_ENABLED:
         (
             shared_radius_m,
