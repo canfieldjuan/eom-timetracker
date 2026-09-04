@@ -634,6 +634,24 @@ def test_clock_radius_flag_activates_commercial_clock_in_and_out(client, monkeyp
         (fingerprint, site_id),
     )
 
+    current_status = client.get(
+        "/api/timesheet/current-status",
+        headers=employee_auth,
+    )
+    assert current_status.status_code == 200, current_status.text
+    assert current_status.json()["siteResolutionEnabled"] is True
+    assert current_status.json()["clockOutSiteResolutionRequired"] is True
+
+    for action in ("clock-in", "clock-out"):
+        preflight = client.post(
+            "/api/timesheet/site-resolution",
+            headers=employee_auth,
+            json={**body, "action": action},
+        )
+        assert preflight.status_code == 200, preflight.text
+        assert preflight.json()["enabled"] is True
+        assert preflight.json()["resolution"]["state"] == "customer_site"
+
     clock_in = client.post(
         "/api/timesheet/clock-in",
         headers=employee_auth,
@@ -643,6 +661,12 @@ def test_clock_radius_flag_activates_commercial_clock_in_and_out(client, monkeyp
     assert clock_in.json()["siteResolution"]["state"] == "customer_site"
     assert clock_in.json()["entry"]["locationId"] == site_id
 
+    mutation_lock_calls = []
+    monkeypatch.setattr(
+        api,
+        "_lock_customer_site_mutations",
+        lambda _cur: mutation_lock_calls.append("locked"),
+    )
     clock_out = client.post(
         "/api/timesheet/clock-out",
         headers=employee_auth,
@@ -650,6 +674,7 @@ def test_clock_radius_flag_activates_commercial_clock_in_and_out(client, monkeyp
     )
     assert clock_out.status_code == 200, clock_out.text
     assert clock_out.json()["siteResolution"]["state"] == "customer_site"
+    assert mutation_lock_calls == ["locked"]
 
 
 def test_clock_radius_flag_preserves_existing_residential_site_resolution(client, monkeypatch):

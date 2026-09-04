@@ -17362,10 +17362,9 @@ def clock_in(
         hard_gate.clear()
         hard_gate.update(_c6_employee_scope_state(employee["id"], now_utc))
         hard_gate_action = _c6_action_scope_state(hard_gate, "clock-in")
-        site_resolution["enabled"] = bool(
-            GEOFENCE_SITE_RESOLUTION_ENABLED
-            or GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
-            or hard_gate_action["effective"]
+        site_resolution["enabled"] = _c3_action_resolution_enabled(
+            "clock-in",
+            hard_gate_action,
         )
         # Under an effective hard gate, self-service exception text stays in
         # the request/audit trail but cannot redefine this clock-in as dispatch.
@@ -17392,13 +17391,9 @@ def clock_in(
                 payload,
                 employee,
                 reference_time=now_utc,
-                target_policy=str(
-                    hard_gate_action["targetPolicy"]
-                    or (
-                        GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
-                        if GEOFENCE_SITE_RESOLUTION_ENABLED
-                        else GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
-                    )
+                target_policy=_c3_action_resolution_target_policy(
+                    "clock-in",
+                    hard_gate_action,
                 ),
             )
             site_resolution["resolution"] = provisional_resolution
@@ -17562,10 +17557,9 @@ def clock_in(
             employee["id"], now_utc, cur
         )
         final_action_scope = _c6_action_scope_state(final_scope, "clock-in")
-        site_resolution["enabled"] = bool(
-            GEOFENCE_SITE_RESOLUTION_ENABLED
-            or GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
-            or final_action_scope["effective"]
+        site_resolution["enabled"] = _c3_action_resolution_enabled(
+            "clock-in",
+            final_action_scope,
         )
         hard_gate_failure = _c6_hard_gate_failure_if_needed(
             "clock-in",
@@ -17600,13 +17594,9 @@ def clock_in(
             employee,
             cur=cur,
             reference_time=now_utc,
-            target_policy=str(
-                final_action_scope["targetPolicy"]
-                or (
-                    GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
-                    if GEOFENCE_SITE_RESOLUTION_ENABLED
-                    else GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
-                )
+            target_policy=_c3_action_resolution_target_policy(
+                "clock-in",
+                final_action_scope,
             ),
         )
         site_resolution["resolution"] = current_resolution
@@ -17754,9 +17744,9 @@ def clock_out(
         legacy_c6_end_bypass = bool(
             hard_gate["effective"] and not hard_gate_action["effective"]
         )
-        site_resolution["enabled"] = bool(
-            GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
-            or hard_gate_action["effective"]
+        site_resolution["enabled"] = _c3_action_resolution_enabled(
+            "clock-out",
+            hard_gate_action,
         )
         home_base["exception"] = (
             "" if hard_gate_action["effective"] else home_base_exception
@@ -17788,9 +17778,9 @@ def clock_out(
                 gate_payload,
                 employee,
                 reference_time=now_utc,
-                target_policy=str(
-                    hard_gate_action["targetPolicy"]
-                    or GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+                target_policy=_c3_action_resolution_target_policy(
+                    "clock-out",
+                    hard_gate_action,
                 ),
             )
             site_resolution["resolution"] = provisional_resolution
@@ -17939,9 +17929,9 @@ def clock_out(
 
         final_scope = _c6_authoritative_scope_state(employee["id"], now_utc, cur)
         final_action_scope = _c6_action_scope_state(final_scope, "clock-out")
-        site_resolution["enabled"] = bool(
-            GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
-            or final_action_scope["effective"]
+        site_resolution["enabled"] = _c3_action_resolution_enabled(
+            "clock-out",
+            final_action_scope,
         )
         if not site_resolution["enabled"]:
             snapshot = site_resolution.get("gpsMetaSnapshot")
@@ -17952,15 +17942,16 @@ def clock_out(
                     result.pop("clockOutGpsMeta", None)
             return
 
+        _lock_customer_site_mutations(cur)
         current_resolution = _c3_resolve_site(
             "clock-out",
             gate_payload,
             employee,
             cur=cur,
             reference_time=now_utc,
-            target_policy=str(
-                final_action_scope["targetPolicy"]
-                or GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+            target_policy=_c3_action_resolution_target_policy(
+                "clock-out",
+                final_action_scope,
             ),
         )
         site_resolution["resolution"] = current_resolution
@@ -18195,10 +18186,9 @@ def resolve_customer_site(
     """
     scope = _c6_employee_scope_state(int(employee["id"]), utc_now())
     action_scope = _c6_action_scope_state(scope, payload.action)
-    resolution_enabled = (
-        bool(action_scope["effective"])
-        if payload.action == "clock-out"
-        else bool(GEOFENCE_SITE_RESOLUTION_ENABLED or action_scope["effective"])
+    resolution_enabled = _c3_action_resolution_enabled(
+        payload.action,
+        action_scope,
     )
     if not resolution_enabled:
         return {"success": True, "enabled": False}
@@ -18207,9 +18197,9 @@ def resolve_customer_site(
         payload,
         employee,
         reference_time=utc_now(),
-        target_policy=str(
-            action_scope["targetPolicy"]
-            or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+        target_policy=_c3_action_resolution_target_policy(
+            payload.action,
+            action_scope,
         ),
     )
     public_resolution = _c3_public_resolution(resolution)
@@ -19910,6 +19900,45 @@ def _c3_planned_inside_location_ids(
         for location_id in eligible_location_ids
         if location_id in inside_location_ids
     }
+
+
+def _c3_action_resolution_enabled(
+    action: str,
+    action_scope: Dict[str, Any],
+) -> bool:
+    """Return whether C3 is authoritative for this time action.
+
+    The decision is shared by capability reads, preflight, provisional writes,
+    and transaction-time rechecks so a client cannot be told that C3 is off
+    while the corresponding write endpoint is enforcing it.
+    """
+    if bool(action_scope.get("effective")):
+        return True
+    if action == "clock-out":
+        return bool(GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED)
+    if action == "clock-in":
+        return bool(
+            GEOFENCE_SITE_RESOLUTION_ENABLED
+            or GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        )
+    return bool(GEOFENCE_SITE_RESOLUTION_ENABLED)
+
+
+def _c3_action_resolution_target_policy(
+    action: str,
+    action_scope: Dict[str, Any],
+) -> str:
+    """Select the same C3 target set for discovery and persistence."""
+    scoped_policy = action_scope.get("targetPolicy")
+    if scoped_policy:
+        return str(scoped_policy)
+    if (
+        action in {"clock-in", "clock-out"}
+        and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        and not (action == "clock-in" and GEOFENCE_SITE_RESOLUTION_ENABLED)
+    ):
+        return GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+    return GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
 
 
 def _c3_resolve_site(
@@ -28273,14 +28302,18 @@ def timesheet_current_status(
         # the broad C3 association rollout remains off. Older portals ignore
         # these additive capability fields; the C6 portal treats them as a
         # no-fallback hard-gate signal.
-        "siteResolutionEnabled": bool(
-            GEOFENCE_SITE_RESOLUTION_ENABLED or clock_in_gate["effective"]
+        "siteResolutionEnabled": _c3_action_resolution_enabled(
+            "clock-in",
+            clock_in_gate,
         ),
         "hardGateEnabled": bool(clock_in_gate["effective"]),
         # A dedicated capability keeps an older tracker/portal pair on the
         # legacy end-of-shift flow.  Only the individual Commercial/Home Base
         # profile treats a missing or off-site end location as a hard failure.
-        "clockOutSiteResolutionRequired": bool(clock_out_gate["effective"]),
+        "clockOutSiteResolutionRequired": _c3_action_resolution_enabled(
+            "clock-out",
+            clock_out_gate,
+        ),
         "currentlyWorking": response_rows,
         "staleOpenShift": stale_open_shift,
         "staleOpenShifts": stale_open_shifts,
