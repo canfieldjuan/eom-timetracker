@@ -641,7 +641,8 @@ def test_clock_radius_does_not_widen_arrival_residential_or_unlinked_paths(
     assert unlinked_geofence["resolvedRadiusM"] == int(api.SITE_CHECK_IN_RADIUS_M)
     unlinked_state = api._c3_location_geofence_state(unlinked_commercial)
     assert unlinked_state["clockBoundaryEffectiveRadiusM"] == 50
-    assert unlinked_state["clockBoundaryRadiusSource"] == "legacy_location_match"
+    assert unlinked_state["clockBoundaryRadiusSource"] == "global_fallback"
+    assert unlinked_state["clockBoundaryUnscopedLegacyFallbackRadiusM"] == 50
 
 
 def test_clock_radius_flag_activates_commercial_clock_in_and_out(client, monkeypatch):
@@ -939,16 +940,10 @@ def test_clock_boundary_fallback_is_inert_when_its_switch_is_off(
         selected_location_id=site_id,
     )[0]
     geofence = api._c3_location_geofence_state(row)
-    if location_type == "Commercial":
-        assert geofence["clockBoundaryEffectiveRadiusM"] == 15
-        assert geofence["clockBoundaryRadiusSource"] == "per_site"
-        assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
-        assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] == 50
-    else:
-        assert geofence["clockBoundaryEffectiveRadiusM"] == 50
-        assert geofence["clockBoundaryRadiusSource"] == "legacy_location_match"
-        assert geofence["clockBoundaryPerSiteRadiusEnabled"] is False
-        assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] is None
+    assert geofence["clockBoundaryEffectiveRadiusM"] == 15
+    assert geofence["clockBoundaryRadiusSource"] == "per_site"
+    assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
+    assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] == 50
 
 
 def test_unready_commercial_boundary_reports_repair_before_legacy_override(
@@ -1276,9 +1271,10 @@ def test_dual_switch_preserves_residential_legacy_fallback(client, monkeypatch):
         selected_location_id=site_id,
     )[0]
     geofence = api._c3_location_geofence_state(row)
-    assert geofence["clockBoundaryEffectiveRadiusM"] == 50
-    assert geofence["clockBoundaryRadiusSource"] == "legacy_location_match"
-    assert geofence["clockBoundaryPerSiteRadiusEnabled"] is False
+    assert geofence["clockBoundaryEffectiveRadiusM"] == 15
+    assert geofence["clockBoundaryRadiusSource"] == "per_site"
+    assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
+    assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] == 50
 
 
 @pytest.mark.parametrize(

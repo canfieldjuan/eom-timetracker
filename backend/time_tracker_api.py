@@ -19598,6 +19598,17 @@ def _geofence_state(
         parent_customer_active=parent_customer_active,
         parent_customer_archived=parent_customer_archived,
     )
+    location_business_eligible = bool(
+        entity_type == "location"
+        and _location_business_facts_eligible(
+            location_type=location_type,
+            parent_linked=parent_linked,
+            active=active,
+            archived=archived,
+            parent_customer_active=parent_customer_active,
+            parent_customer_archived=parent_customer_archived,
+        )
+    )
     clock_boundary_applies = bool(
         entity_type == "home_base" or commercial_clock_boundary_eligible
     )
@@ -19623,20 +19634,15 @@ def _geofence_state(
             clock_boundary_unscoped_legacy_fallback_radius_m = int(
                 LOCATION_MATCH_RADIUS_M
             )
-    elif GEOFENCE_SITE_RESOLUTION_ENABLED:
+    elif location_business_eligible:
         (
-            shared_radius_m,
-            shared_radius_source,
+            clock_boundary_radius_m,
+            clock_boundary_radius_source,
         ) = _effective_geofence_radius(configured_radius_m)
-        legacy_radius_m = int(LOCATION_MATCH_RADIUS_M)
-        if legacy_radius_m > shared_radius_m:
-            clock_boundary_radius_m = legacy_radius_m
-            clock_boundary_radius_source = "legacy_location_match"
-            clock_boundary_per_site_enabled = False
-        else:
-            clock_boundary_radius_m = shared_radius_m
-            clock_boundary_radius_source = shared_radius_source
-            clock_boundary_per_site_enabled = bool(GEOFENCE_PER_SITE_RADIUS_ENABLED)
+        clock_boundary_per_site_enabled = bool(GEOFENCE_PER_SITE_RADIUS_ENABLED)
+        clock_boundary_unscoped_legacy_fallback_radius_m = int(
+            LOCATION_MATCH_RADIUS_M
+        )
     else:
         clock_boundary_radius_m = int(LOCATION_MATCH_RADIUS_M)
         clock_boundary_radius_source = "legacy_location_match"
