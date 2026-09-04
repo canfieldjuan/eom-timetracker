@@ -337,6 +337,32 @@ def test_effective_gate_preserves_shared_commercial_radius_when_clock_switch_is_
     assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
 
 
+def test_home_base_clock_telemetry_never_uses_the_legacy_site_matcher(
+    monkeypatch,
+):
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        False,
+    )
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
+
+    geofence = api._home_base_geofence_state(
+        {
+            "home_base_id": 9001,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "geofence_radius_m": 15,
+            "active": True,
+        }
+    )
+
+    assert geofence["clockBoundaryEffectiveRadiusM"] == 15
+    assert geofence["clockBoundaryRadiusSource"] == "per_site"
+    assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
+
+
 def test_c6_individual_scope_defaults_off_without_a_scope_row(client, monkeypatch):
     employee_id, employee_auth = _create_employee(client, "individual default off")
     _create_site("individual default off")
@@ -680,6 +706,65 @@ def test_commercial_home_base_clock_boundary_reports_unready_home_base(
     assert failure["details"]["reason"] == "home_base_unready"
     assert failure["details"]["retryable"] is False
     assert "administrator to repair" in failure["error"]
+
+
+def test_non_gated_home_base_exception_survives_unready_clock_boundary(
+    client,
+    auth,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "unready home exception")
+    home_base_id = _configure_ready_home_base(client, auth)
+    db.execute(
+        "UPDATE home_bases SET geofence_radius_m = 15 WHERE id = %s",
+        (home_base_id,),
+    )
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    exception_payload = {
+        "homeBaseExceptionReason": "Office entry was inaccessible.",
+        "latitude": LATITUDE + 0.02,
+        "longitude": LONGITUDE,
+        "accuracy": 5,
+        "gpsOverrideReason": "Supervisor approved dispatch exception.",
+        "gpsOverrideDetail": "The office entry could not be used.",
+    }
+
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=exception_payload,
+    )
+    assert started.status_code == 200, started.text
+    assert started.json()["entry"]["location"] == "Dispatch exception"
+    assert started.json()["siteResolution"] == {
+        "state": "unresolved",
+        "reason": "home_base_exception",
+    }
+
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json=exception_payload,
+    )
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["siteResolution"] == {
+        "state": "unresolved",
+        "reason": "home_base_exception",
+    }
+    assert db.query_all(
+        "SELECT action, outcome FROM home_base_events "
+        "WHERE employee_id = %s ORDER BY action",
+        (employee_id,),
+    ) == [
+        {"action": "end", "outcome": "exception"},
+        {"action": "start", "outcome": "exception"},
+    ]
 
 
 def test_commercial_home_base_clock_boundary_requires_exact_choice_for_overlaps(
