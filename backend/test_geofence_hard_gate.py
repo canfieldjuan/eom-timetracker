@@ -1022,6 +1022,11 @@ def test_c6_never_traps_departure_or_clock_out_when_scope_is_effective(
     crew_id = _create_crew(employee_id, "end actions crew")
     site_id = _create_site("end actions")
     monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
     _enable_scope(client, auth, crew_id)
 
     clocked_in = client.post(
