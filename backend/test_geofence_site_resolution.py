@@ -217,10 +217,21 @@ def test_c3_is_dormant_by_default_and_advertises_that_capability(client, monkeyp
     status = client.get("/api/timesheet/current-status", headers=employee_auth)
     assert status.status_code == 200, status.text
     assert status.json()["siteResolutionEnabled"] is False
-
     resolution = _resolve(client, employee_auth)
     assert resolution.status_code == 200, resolution.text
     assert resolution.json() == {"success": True, "enabled": False}
+
+
+def test_clock_radius_env_default_is_independent_of_shared_rollout(monkeypatch):
+    monkeypatch.setenv("GEOFENCE_PER_SITE_RADIUS_ENABLED", "true")
+    monkeypatch.delenv(
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        raising=False,
+    )
+    assert api._clock_boundary_per_site_radius_enabled_from_env() is False
+
+    monkeypatch.setenv("GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED", "true")
+    assert api._clock_boundary_per_site_radius_enabled_from_env() is True
 
 
 def test_c3_resolves_eligible_sites_and_uses_schedule_only_for_overlap_ties(
@@ -818,6 +829,46 @@ def test_clock_radius_flag_preserves_existing_residential_site_resolution(client
     assert clock_in.json()["entry"]["locationId"] == site_id
 
 
+def test_clock_only_explicit_residential_selection_uses_legacy_match(
+    client,
+    monkeypatch,
+):
+    _employee_id, employee_auth = _create_employee(
+        client,
+        "clock only explicit residential",
+    )
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    site_id = _create_site(
+        "clock only explicit residential",
+        geofence_radius_m=15,
+        location_type="Residential",
+    )
+
+    clock_in = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": LATITUDE + 0.00027,
+            "longitude": LONGITUDE,
+            "accuracy": 1,
+        },
+    )
+
+    assert clock_in.status_code == 200, clock_in.text
+    assert clock_in.json()["siteResolution"]["reason"] == (
+        "selected_site_legacy_only"
+    )
+    assert clock_in.json()["entry"]["clockInGpsMeta"]["override"] is False
+
+
 @pytest.mark.parametrize("location_type", ["Residential", "Commercial"])
 def test_clock_boundary_fallback_is_inert_when_its_switch_is_off(
     client,
@@ -864,6 +915,7 @@ def test_dual_switch_preserves_residential_legacy_fallback(client, monkeypatch):
     monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
     monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
     monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
     monkeypatch.setattr(
         api,
         "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
@@ -888,6 +940,20 @@ def test_dual_switch_preserves_residential_legacy_fallback(client, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert response.json()["entry"]["clockInGpsMeta"]["override"] is False
+    row = api._c3_customer_site_rows(
+        api.ClockInRequest(
+            locationId=site_id,
+            latitude=LATITUDE + 0.00027,
+            longitude=LONGITUDE,
+            accuracy=1,
+        ),
+        action="clock-in",
+        selected_location_id=site_id,
+    )[0]
+    geofence = api._c3_location_geofence_state(row)
+    assert geofence["clockBoundaryEffectiveRadiusM"] == 50
+    assert geofence["clockBoundaryRadiusSource"] == "legacy_location_match"
+    assert geofence["clockBoundaryPerSiteRadiusEnabled"] is False
 
 
 @pytest.mark.parametrize(

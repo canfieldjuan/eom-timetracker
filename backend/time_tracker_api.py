@@ -4783,9 +4783,19 @@ SITE_CHECK_IN_MAX_ACCURACY_M = max(
 GEOFENCE_PER_SITE_RADIUS_ENABLED = parse_bool(
     os.getenv("GEOFENCE_PER_SITE_RADIUS_ENABLED"), False
 )
-GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED = parse_bool(
-    os.getenv("GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED"),
-    GEOFENCE_PER_SITE_RADIUS_ENABLED,
+
+
+def _clock_boundary_per_site_radius_enabled_from_env() -> bool:
+    """Resolve the independently managed clock-boundary rollout switch."""
+
+    return parse_bool(
+        os.getenv("GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED"),
+        False,
+    )
+
+
+GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED = (
+    _clock_boundary_per_site_radius_enabled_from_env()
 )
 # Geofence C3 (#215): resolution is separate from C6's hard gate and stays
 # disabled in production until an approved later rollout turns it on.
@@ -17748,7 +17758,7 @@ def clock_out(
         hard_gate.update(_c6_employee_scope_state(employee["id"], now_utc))
         hard_gate_action = _c6_action_scope_state(hard_gate, "clock-out")
         legacy_c6_end_bypass = bool(
-            hard_gate["effective"] and not hard_gate_action["effective"]
+            hard_gate_action.get("legacyC6EndBypass")
         )
         clock_out_target_policy = _c3_action_resolution_target_policy(
             "clock-out",
@@ -17944,7 +17954,7 @@ def clock_out(
         final_scope = _c6_authoritative_scope_state(employee["id"], now_utc, cur)
         final_action_scope = _c6_action_scope_state(final_scope, "clock-out")
         final_legacy_c6_end_bypass = bool(
-            final_scope["effective"] and not final_action_scope["effective"]
+            final_action_scope.get("legacyC6EndBypass")
         )
         site_resolution["enabled"] = _c3_action_resolution_enabled(
             "clock-out",
@@ -19358,11 +19368,10 @@ def _clock_boundary_effective_geofence_radius(
 ) -> Tuple[int, str]:
     """Resolve the radius used only by Commercial/Home Base clock boundaries.
 
-    The clock-specific switch inherits the established shared switch when its
-    environment variable is absent, preserving existing deployments. When it
-    is enabled independently, configured radii affect clock-in/out and Home
-    Base start/end only; the shared resolver above continues to govern visits,
-    Residential behavior, and Commercial Site QR arrival/departure.
+    The clock-specific switch is independently default-off. When it is enabled,
+    configured radii affect clock-in/out and Home Base start/end only; the
+    shared resolver above continues to govern visits, Residential behavior, and
+    Commercial Site QR arrival/departure.
     """
 
     resolved, source = _resolve_geofence_radius_m(configured_radius_m)
@@ -19495,10 +19504,18 @@ def _geofence_state(
         )
     elif GEOFENCE_SITE_RESOLUTION_ENABLED:
         (
-            clock_boundary_radius_m,
-            clock_boundary_radius_source,
+            shared_radius_m,
+            shared_radius_source,
         ) = _effective_geofence_radius(configured_radius_m)
-        clock_boundary_per_site_enabled = bool(GEOFENCE_PER_SITE_RADIUS_ENABLED)
+        legacy_radius_m = int(LOCATION_MATCH_RADIUS_M)
+        if legacy_radius_m > shared_radius_m:
+            clock_boundary_radius_m = legacy_radius_m
+            clock_boundary_radius_source = "legacy_location_match"
+            clock_boundary_per_site_enabled = False
+        else:
+            clock_boundary_radius_m = shared_radius_m
+            clock_boundary_radius_source = shared_radius_source
+            clock_boundary_per_site_enabled = bool(GEOFENCE_PER_SITE_RADIUS_ENABLED)
     else:
         clock_boundary_radius_m = int(LOCATION_MATCH_RADIUS_M)
         clock_boundary_radius_source = "legacy_location_match"
@@ -19942,6 +19959,8 @@ def _c3_action_resolution_enabled(
     if bool(action_scope.get("effective")):
         return True
     if action == "clock-out":
+        if action_scope.get("legacyC6EndBypass"):
+            return False
         return bool(GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED)
     if action == "clock-in":
         return bool(
@@ -20172,7 +20191,10 @@ def _c3_resolve_site(
             return {"state": "unresolved", "reason": "selected_site_unready"}
         selected = eligible_rows[0] if eligible_rows else None
         if selected is None:
-            return {"state": "unresolved", "reason": "selected_site_ineligible"}
+            return {
+                "state": "unresolved",
+                "reason": "selected_site_legacy_only",
+            }
         geofence = _c3_site_geofence(selected, payload, action=action)
         if geofence["status"] != "inside":
             return {
@@ -20531,6 +20553,11 @@ def _c6_action_scope_state(scope: Dict[str, Any], action: str) -> Dict[str, Any]
                 "effective": True,
                 "targetPolicy": GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY,
             }
+        return {
+            "effective": False,
+            "targetPolicy": None,
+            "legacyC6EndBypass": True,
+        }
     elif action == "arrive":
         if crew_scoped or generic_individual:
             return {
@@ -20722,6 +20749,11 @@ def _c6_target_decision(
         reason = "missing_gps"
     elif resolution.get("reason") == "selected_site_unready":
         reason = "selected_site_unready"
+    elif resolution.get("reason") in {
+        "home_base_unready",
+        "commercial_site_unready",
+    }:
+        reason = str(resolution["reason"])
     else:
         # The resolver's no-target result is intentionally not converted to a
         # nearest-pin authorization.  The employee must move/retry or choose a
@@ -20750,6 +20782,8 @@ def _c6_hard_gate_failure(
         "selection_required": "More than one customer Site matches your GPS. Choose the exact Site and try again.",
         "selected_site_ineligible": "The selected customer Site is not eligible for this action. Choose a current Site and try again.",
         "selected_site_unready": "The selected Commercial Site is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
+        "commercial_site_unready": "This Commercial Site is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
+        "home_base_unready": "Home Base is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
     }
     return {
         "code": GEOFENCE_HARD_GATE_BLOCK_CODE,
@@ -20760,7 +20794,7 @@ def _c6_hard_gate_failure(
             "retryable": reason
             in {
                 "missing_gps", "low_accuracy", "uncertain", "outside",
-                "selection_required", "selected_site_unready",
+                "selection_required",
             },
             "adminDirectRecordAvailable": True,
             "target": _c6_public_target(decision.get("target")),
