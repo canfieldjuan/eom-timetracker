@@ -495,12 +495,12 @@ def test_c6_failure_log_is_structured_and_coordinate_free(
         "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
         True,
     )
-    captured: list[dict] = []
+    captured: list[tuple[str, dict]] = []
     original_append = api.append_access_log
 
     def capture_failure(*args, **kwargs):
         if len(args) > 1 and args[1] == "CLOCK_IN_FAILED":
-            captured.append(dict(kwargs.get("details") or {}))
+            captured.append((str(args[3]), dict(kwargs.get("details") or {})))
         return original_append(*args, **kwargs)
 
     monkeypatch.setattr(api, "append_access_log", capture_failure)
@@ -517,7 +517,9 @@ def test_c6_failure_log_is_structured_and_coordinate_free(
     assert blocked.status_code == 409, blocked.text
     assert "_log" not in blocked.json()
     assert len(captured) == 1
-    details = captured[0]
+    reason, details = captured[0]
+    assert reason == f"{api.GEOFENCE_HARD_GATE_BLOCK_CODE}: outside"
+    assert f"{PREFIX} Site structured log" not in reason
     assert details["employeeId"] == employee_id
     assert details["action"] == "clock-in"
     assert details["reason"] == "outside"
@@ -1542,6 +1544,68 @@ def test_commercial_home_base_boundary_uses_final_customer_site_for_end_event(
     ) == {"count": 0}
 
 
+def test_commercial_site_wins_clock_out_overlap_with_unready_home_base(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "clock out overlap")
+    start_site_id = _create_site("clock out overlap start", location_type="Commercial")
+    overlap_site_id = _create_site(
+        "clock out overlap target",
+        latitude=LATITUDE + 0.02,
+        location_type="Commercial",
+    )
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": start_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert started.status_code == 200, started.text
+    arrived = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "location": "Active supplier visit",
+            "latitude": LATITUDE + 0.3,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "Dispatch requested the supplier stop.",
+        },
+    )
+    assert arrived.status_code == 200, arrived.text
+    db.execute(
+        "UPDATE home_bases SET pin_attestation_fingerprint = NULL WHERE active = true"
+    )
+
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "locationId": overlap_site_id,
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["siteResolution"]["state"] == "customer_site"
+    assert ended.json()["siteResolution"]["site"]["locationId"] == overlap_site_id
+    assert ended.json()["entry"]["clockOutGpsMeta"]["matchedLocation"] == (
+        f"{PREFIX} Site clock out overlap target"
+    )
+    assert "homeBaseEvent" not in ended.json()
+
+
 def test_c6_profile_upgrade_defaults_legacy_scope_rows(client):
     """The old scope table upgrades to a non-null historic policy by default."""
 
@@ -1743,6 +1807,15 @@ def test_c6_commit_time_recheck_blocks_a_site_that_changes_after_preflight(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(api, "_c3_resolve_site", resolve_then_unpin)
+    logged: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "CLOCK_IN_FAILED":
+            logged.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
     response = client.post(
         "/api/timesheet/clock-in",
         headers=employee_auth,
@@ -1756,6 +1829,76 @@ def test_c6_commit_time_recheck_blocks_a_site_that_changes_after_preflight(
 
     assert response.status_code == 409, response.text
     assert _hard_gate_failure(response)["details"]["reason"] == "site_unpinned"
+    assert len(logged) == 1
+    assert logged[0]["action"] == "clock-in"
+    assert logged[0]["reason"] == "site_unpinned"
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s", (employee_id,)
     ) == {"count": 0}
+
+
+def test_c6_commit_time_clock_out_recheck_is_logged(client, auth, monkeypatch):
+    employee_id, employee_auth = _create_employee(client, "clock out recheck")
+    site_id = _create_site("clock out recheck", location_type="Commercial")
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    original_resolver = api._c3_resolve_site
+    changed = False
+
+    def resolve_then_unpin(action, *args, **kwargs):
+        nonlocal changed
+        if action == "clock-out" and kwargs.get("cur") is not None and not changed:
+            changed = True
+            db.execute(
+                "UPDATE locations SET lat = NULL, lng = NULL WHERE id = %s",
+                (site_id,),
+            )
+        return original_resolver(action, *args, **kwargs)
+
+    monkeypatch.setattr(api, "_c3_resolve_site", resolve_then_unpin)
+    logged: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "CLOCK_OUT_FAILED":
+            logged.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert ended.status_code == 409, ended.text
+    assert _hard_gate_failure(ended)["details"]["reason"] == (
+        "commercial_site_unready"
+    )
+    assert len(logged) == 1
+    assert logged[0]["action"] == "clock-out"
+    assert logged[0]["reason"] == "commercial_site_unready"
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 1}

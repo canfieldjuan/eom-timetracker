@@ -17623,6 +17623,12 @@ def clock_in(
             cur=cur,
         )
         if hard_gate_failure:
+            _append_timesheet_failure_log(
+                request,
+                "CLOCK_IN_FAILED",
+                int(employee["id"]),
+                hard_gate_failure,
+            )
             raise HTTPException(
                 status_code=409,
                 detail=_public_timesheet_mutation_failure(hard_gate_failure),
@@ -17775,12 +17781,11 @@ def clock_in(
         after_response_saved=record_home_base_event,
     )
     if not ok:
-        append_access_log(
+        _append_timesheet_failure_log(
             request,
             "CLOCK_IN_FAILED",
-            False,
-            str(result),
-            details=_geofence_hard_gate_log_details(int(employee["id"]), result),
+            int(employee["id"]),
+            result,
         )
         raise_timesheet_mutation_failure(result)
 
@@ -17874,6 +17879,16 @@ def clock_out(
             )
             if hard_gate_failure:
                 return False, hard_gate_failure
+            # The strict resolver owns the clock-out target. Raw geometric
+            # Home Base overlap must not make a ready Commercial Site look
+            # like an attempt to end at Home Base while a visit is active.
+            home_base["confirmed"] = bool(
+                provisional_resolution
+                and provisional_resolution.get("state") == "home_base"
+            )
+            if home_base["confirmed"] and provisional_resolution:
+                home_base["policy"] = provisional_resolution.get("homeBase")
+                home_base["geofence"] = provisional_resolution.get("geofence")
 
         # A shift that STARTED under Home Base evidence owes its end event even
         # if the employee is no longer covered by any crew. Current GPS at Home
@@ -18032,6 +18047,12 @@ def clock_out(
             resolution=current_resolution,
         )
         if hard_gate_failure:
+            _append_timesheet_failure_log(
+                request,
+                "CLOCK_OUT_FAILED",
+                int(employee["id"]),
+                hard_gate_failure,
+            )
             raise HTTPException(
                 status_code=409,
                 detail=_public_timesheet_mutation_failure(hard_gate_failure),
@@ -18094,12 +18115,11 @@ def clock_out(
         after_response_saved=record_home_base_event,
     )
     if not ok:
-        append_access_log(
+        _append_timesheet_failure_log(
             request,
             "CLOCK_OUT_FAILED",
-            False,
-            str(result),
-            details=_geofence_hard_gate_log_details(int(employee["id"]), result),
+            int(employee["id"]),
+            result,
         )
         raise_timesheet_mutation_failure(result)
 
@@ -20767,6 +20787,33 @@ def _geofence_hard_gate_log_details(
     if not isinstance(details, dict):
         return None
     return {"employeeId": int(employee_id), **details}
+
+
+def _timesheet_failure_log_reason(failure: Any) -> str:
+    """Return a stable failure reason without serializing private target labels."""
+
+    if isinstance(failure, dict):
+        details = failure.get("_log")
+        if isinstance(details, dict):
+            code = str(details.get("code") or GEOFENCE_HARD_GATE_BLOCK_CODE)
+            reason = str(details.get("reason") or "unknown")
+            return f"{code}: {reason}"
+    return str(failure)
+
+
+def _append_timesheet_failure_log(
+    request: Request,
+    event: str,
+    employee_id: int,
+    failure: Any,
+) -> None:
+    append_access_log(
+        request,
+        event,
+        False,
+        _timesheet_failure_log_reason(failure),
+        details=_geofence_hard_gate_log_details(employee_id, failure),
+    )
 
 
 def _c6_hard_gate_failure_if_needed(
