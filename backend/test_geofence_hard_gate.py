@@ -297,7 +297,7 @@ def test_effective_gate_preserves_shared_commercial_radius_when_clock_switch_is_
     site_id = _create_site(
         "shared radius compatibility",
         location_type="Commercial",
-        geofence_radius_m=250,
+        geofence_radius_m=15,
     )
     monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
     monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
@@ -307,7 +307,21 @@ def test_effective_gate_preserves_shared_commercial_radius_when_clock_switch_is_
         False,
     )
     _enable_scope(client, auth, crew_id)
-    latitude, longitude = _destination(100)
+    outside_latitude, outside_longitude = _destination(30)
+
+    outside_response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": outside_latitude,
+            "longitude": outside_longitude,
+            "accuracy": 1,
+        },
+    )
+
+    assert outside_response.status_code == 409, outside_response.text
+    latitude, longitude = _destination(10)
 
     response = client.post(
         "/api/timesheet/clock-in",
@@ -326,15 +340,16 @@ def test_effective_gate_preserves_shared_commercial_radius_when_clock_switch_is_
             locationId=site_id,
             latitude=latitude,
             longitude=longitude,
-            accuracy=5,
+            accuracy=1,
         ),
         action="clock-in",
         selected_location_id=site_id,
     )[0]
     geofence = api._c3_location_geofence_state(row)
-    assert geofence["clockBoundaryEffectiveRadiusM"] == 250
+    assert geofence["clockBoundaryEffectiveRadiusM"] == 15
     assert geofence["clockBoundaryRadiusSource"] == "per_site"
     assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
+    assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] == 50
 
 
 def test_home_base_clock_telemetry_never_uses_the_legacy_site_matcher(
@@ -361,6 +376,7 @@ def test_home_base_clock_telemetry_never_uses_the_legacy_site_matcher(
     assert geofence["clockBoundaryEffectiveRadiusM"] == 15
     assert geofence["clockBoundaryRadiusSource"] == "per_site"
     assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
+    assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] is None
 
 
 def test_c6_individual_scope_defaults_off_without_a_scope_row(client, monkeypatch):

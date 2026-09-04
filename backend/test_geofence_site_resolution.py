@@ -939,9 +939,16 @@ def test_clock_boundary_fallback_is_inert_when_its_switch_is_off(
         selected_location_id=site_id,
     )[0]
     geofence = api._c3_location_geofence_state(row)
-    assert geofence["clockBoundaryEffectiveRadiusM"] == 50
-    assert geofence["clockBoundaryRadiusSource"] == "legacy_location_match"
-    assert geofence["clockBoundaryPerSiteRadiusEnabled"] is False
+    if location_type == "Commercial":
+        assert geofence["clockBoundaryEffectiveRadiusM"] == 15
+        assert geofence["clockBoundaryRadiusSource"] == "per_site"
+        assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
+        assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] == 50
+    else:
+        assert geofence["clockBoundaryEffectiveRadiusM"] == 50
+        assert geofence["clockBoundaryRadiusSource"] == "legacy_location_match"
+        assert geofence["clockBoundaryPerSiteRadiusEnabled"] is False
+        assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] is None
 
 
 def test_unready_commercial_boundary_reports_repair_before_legacy_override(
@@ -1187,6 +1194,42 @@ def test_final_clock_out_refreshes_legacy_coordinates_after_site_move(
         "AND clock_out IS NULL",
         (employee_id,),
     ) == {"count": 1}
+
+
+def test_final_legacy_refresh_retains_a_site_reclassified_as_residential(
+    client,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    site_id = _create_site(
+        "locked legacy category refresh",
+        location_type="Commercial",
+    )
+    timesheet_data = api._load_timesheets_from_db()
+    db.execute(
+        "UPDATE locations SET location_type = 'Residential' WHERE id = %s",
+        (site_id,),
+    )
+    payload = api.ClockInRequest(
+        latitude=LATITUDE,
+        longitude=LONGITUDE,
+        accuracy=1,
+    )
+
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            error = api._c3_clock_boundary_override_error(
+                timesheet_data,
+                payload,
+                {"state": "unresolved", "reason": "no_eligible_inside_site"},
+                cur=cur,
+            )
+
+    assert error is None
 
 
 def test_dual_switch_preserves_residential_legacy_fallback(client, monkeypatch):

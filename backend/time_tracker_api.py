@@ -19601,6 +19601,7 @@ def _geofence_state(
     clock_boundary_applies = bool(
         entity_type == "home_base" or commercial_clock_boundary_eligible
     )
+    clock_boundary_unscoped_legacy_fallback_radius_m = None
     if clock_boundary_applies:
         (
             clock_boundary_radius_m,
@@ -19612,19 +19613,16 @@ def _geofence_state(
         )
         # With only the shared rollout active, ordinary unscoped clock actions
         # can still fall back to the legacy nearest-pin matcher after C3 fails
-        # to associate the Site. Report the largest reachable admission radius
-        # rather than advertising a narrower configured boundary that is not
-        # authoritative in that compatibility path. An effective hard-gate
-        # scope remains strict and is reported separately by the scope state.
-        legacy_radius_m = int(LOCATION_MATCH_RADIUS_M)
+        # to associate a Commercial Site. Keep that conditional compatibility
+        # radius separate from the strict boundary used by an effective C6
+        # scope; one "effective" value cannot truthfully represent both paths.
         if (
             not GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
             and entity_type == "location"
-            and legacy_radius_m > clock_boundary_radius_m
         ):
-            clock_boundary_radius_m = legacy_radius_m
-            clock_boundary_radius_source = "legacy_location_match"
-            clock_boundary_per_site_enabled = False
+            clock_boundary_unscoped_legacy_fallback_radius_m = int(
+                LOCATION_MATCH_RADIUS_M
+            )
     elif GEOFENCE_SITE_RESOLUTION_ENABLED:
         (
             shared_radius_m,
@@ -19701,6 +19699,9 @@ def _geofence_state(
         "clockBoundaryEffectiveRadiusM": clock_boundary_radius_m,
         "clockBoundaryRadiusSource": clock_boundary_radius_source,
         "clockBoundaryPerSiteRadiusEnabled": clock_boundary_per_site_enabled,
+        "clockBoundaryUnscopedLegacyFallbackRadiusM": (
+            clock_boundary_unscoped_legacy_fallback_radius_m
+        ),
         "maxAccuracyPolicyM": max_accuracy_policy_m,
         "pinProvenance": pin_provenance,
         "pinConfidence": pin_confidence,
@@ -20192,35 +20193,27 @@ def _c3_clock_boundary_override_error(
         )
     if cur is not None:
         # Final plain-time checks run after the Site-mutation advisory lock is
-        # held. Refresh the legacy matcher from that same transaction view so a
-        # Site move between the provisional read and persistence cannot be
-        # accepted from the stale timesheet snapshot.
+        # held. Rebuild the complete active legacy matcher from that same
+        # transaction view so a Site move, activation change, or category
+        # reclassification between the provisional read and persistence cannot
+        # be decided from stale snapshot membership.
         cur.execute(
             """
             SELECT address, lat, lng
             FROM locations
             WHERE active = TRUE
-              AND location_type = 'Commercial'
               AND lat IS NOT NULL
               AND lng IS NOT NULL
             """
         )
         current_location_rows = _c3_rows_from_cursor(cur)
-        location_types = timesheet_data.get("location_types", {})
         current_location_coords = {
-            str(address): dict(point)
-            for address, point in timesheet_data.get("location_coords", {}).items()
-            if location_types.get(address) != "Commercial"
-        }
-        current_location_coords.update(
-            {
-                str(row["address"]): {
-                    "lat": float(row["lat"]),
-                    "lng": float(row["lng"]),
-                }
-                for row in current_location_rows
+            str(row["address"]): {
+                "lat": float(row["lat"]),
+                "lng": float(row["lng"]),
             }
-        )
+            for row in current_location_rows
+        }
         timesheet_data = {
             **timesheet_data,
             "location_coords": current_location_coords,
