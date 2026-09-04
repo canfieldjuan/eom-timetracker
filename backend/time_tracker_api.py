@@ -17412,8 +17412,10 @@ def clock_in(
         )
         if (
             home_base["confirmed"]
-            and clock_in_target_policy
-            == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+            and _c3_clock_boundary_constraints_required(
+                "clock-in",
+                clock_in_target_policy,
+            )
             and not _home_base_geofence_state(home_base["policy"]).get("ready")
         ):
             home_base["confirmed"] = False
@@ -17864,8 +17866,10 @@ def clock_out(
         home_base["confirmed"] = _home_base_gps_confirmed(home_base["geofence"])
         if (
             home_base["confirmed"]
-            and clock_out_target_policy
-            == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+            and _c3_clock_boundary_constraints_required(
+                "clock-out",
+                clock_out_target_policy,
+            )
             and not _home_base_geofence_state(home_base["policy"]).get("ready")
         ):
             home_base["confirmed"] = False
@@ -19634,8 +19638,8 @@ def _geofence_state(
     """
     resolved_radius_m, radius_source = _resolve_geofence_radius_m(configured_radius_m)
     # Only Commercial Sites and Home Base use the dedicated clock resolver.
-    # Residential clock-only fallback remains on the legacy nearest-pin matcher,
-    # whose independently configurable radius must be reported as such.
+    # Residential uses the established shared resolver when broad C3 is active;
+    # otherwise its clock-only fallback remains the legacy nearest-pin matcher.
     clock_boundary_applies = bool(
         entity_type == "home_base" or location_type == "Commercial"
     )
@@ -19644,9 +19648,19 @@ def _geofence_state(
             clock_boundary_radius_m,
             clock_boundary_radius_source,
         ) = _clock_boundary_effective_geofence_radius(configured_radius_m)
+        clock_boundary_per_site_enabled = bool(
+            GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        )
+    elif GEOFENCE_SITE_RESOLUTION_ENABLED:
+        (
+            clock_boundary_radius_m,
+            clock_boundary_radius_source,
+        ) = _effective_geofence_radius(configured_radius_m)
+        clock_boundary_per_site_enabled = bool(GEOFENCE_PER_SITE_RADIUS_ENABLED)
     else:
         clock_boundary_radius_m = int(LOCATION_MATCH_RADIUS_M)
         clock_boundary_radius_source = "legacy_location_match"
+        clock_boundary_per_site_enabled = False
     max_accuracy_policy_m = int(SITE_CHECK_IN_MAX_ACCURACY_M)
     current_fingerprint = geofence_geometry_fingerprint(
         entity_type=entity_type,
@@ -19704,10 +19718,7 @@ def _geofence_state(
         "radiusSource": radius_source,
         "clockBoundaryEffectiveRadiusM": clock_boundary_radius_m,
         "clockBoundaryRadiusSource": clock_boundary_radius_source,
-        "clockBoundaryPerSiteRadiusEnabled": bool(
-            clock_boundary_applies
-            and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
-        ),
+        "clockBoundaryPerSiteRadiusEnabled": clock_boundary_per_site_enabled,
         "maxAccuracyPolicyM": max_accuracy_policy_m,
         "pinProvenance": pin_provenance,
         "pinConfidence": pin_confidence,
@@ -20115,6 +20126,19 @@ def _c3_action_resolution_target_policy(
     return GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
 
 
+def _c3_clock_boundary_constraints_required(action: str, target_policy: str) -> bool:
+    """Return whether strict Commercial/Home Base clock rules compose here."""
+
+    return bool(
+        target_policy
+        == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+        or (
+            action in {"clock-in", "clock-out"}
+            and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        )
+    )
+
+
 def _c3_legacy_match_contains_site(row: Dict[str, Any], payload: BaseModel) -> bool:
     """Return whether the legacy pin radius would silently admit this Site."""
     latitude = getattr(payload, "latitude", None)
@@ -20154,6 +20178,11 @@ def _c3_clock_boundary_override_error(
         and getattr(payload, "accuracy", None) is None
     ):
         return "GPS accuracy is required to verify the configured clock boundary."
+    if (
+        GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        and reason == "selected_site_ineligible"
+    ):
+        return "The selected customer Site is not eligible for this clock action."
     error = require_gps_override(
         timesheet_data,
         getattr(payload, "latitude", None),
@@ -20172,13 +20201,12 @@ def _c3_clock_boundary_override_error(
             "This clock location is not ready for verification. "
             "Ask an administrator to repair and attest its geofence."
         )
-    if reason in {
-        "clock_boundary_outside",
-        "selected_site_not_inside",
-        "uncertain",
-    } and not str(
-        getattr(payload, "gpsOverrideReason", "") or ""
-    ).strip():
+    if (
+        GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        and reason
+        in {"clock_boundary_outside", "selected_site_not_inside", "uncertain"}
+        and not str(getattr(payload, "gpsOverrideReason", "") or "").strip()
+    ):
         return (
             "GPS is outside the configured Commercial Site clock boundary. "
             "Add an override reason to continue."
@@ -20219,6 +20247,10 @@ def _c3_resolve_site(
     ):
         return {"state": "unresolved", "reason": "clock_out_not_enabled"}
     reference_time = reference_time or utc_now()
+    clock_boundary_constraints_required = _c3_clock_boundary_constraints_required(
+        action,
+        target_policy,
+    )
 
     home_base_allowed = (
         (action == "clock-in" and target_policy == GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START)
@@ -20242,8 +20274,7 @@ def _c3_resolve_site(
             and _home_base_geofence_state(home_base).get("ready")
         )
         if _home_base_gps_confirmed(home_base_geofence) and (
-            target_policy == GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
-            or home_base_ready
+            not clock_boundary_constraints_required or home_base_ready
         ):
             return {
                 "state": "home_base",
@@ -20252,8 +20283,7 @@ def _c3_resolve_site(
                 "geofence": home_base_geofence,
             }
         home_base_unready_at_sample = bool(
-            target_policy
-            == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+            clock_boundary_constraints_required
             and _home_base_gps_confirmed(home_base_geofence)
             and not home_base_ready
         )
@@ -20265,18 +20295,10 @@ def _c3_resolve_site(
         selected_location_id=(int(selected_location_id) if selected_location_id else None),
         cur=cur,
     )
-    commercial_readiness_required = bool(
-        target_policy
-        == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
-        or (
-            action in {"clock-in", "clock-out"}
-            and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
-        )
-    )
     unready_commercial_rows = [
         row
         for row in rows
-        if commercial_readiness_required
+        if clock_boundary_constraints_required
         and _location_commercial_clock_boundary_eligible(row)
         and not _c3_location_geofence_state(row).get("ready")
     ]
@@ -20296,7 +20318,7 @@ def _c3_resolve_site(
         if selected_row is None or not _location_business_eligible(selected_row):
             return {"state": "unresolved", "reason": "selected_site_ineligible"}
         if (
-            commercial_readiness_required
+            clock_boundary_constraints_required
             and _location_commercial_clock_boundary_eligible(selected_row)
             and not _c3_location_geofence_state(selected_row).get("ready")
         ):
@@ -20336,9 +20358,18 @@ def _c3_resolve_site(
         # two overlapping commercial pins is the employee's actual work site.
         # Preserve C3's established planned-visit tie-break for its ordinary
         # association policy, but require an explicit exact Site there.
+        commercial_inside_count = sum(
+            1
+            for row, _geofence in inside
+            if _location_commercial_clock_boundary_eligible(row)
+        )
         if (
             target_policy
             == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+            or (
+                clock_boundary_constraints_required
+                and commercial_inside_count > 1
+            )
         ):
             return {
                 "state": "selection_required",

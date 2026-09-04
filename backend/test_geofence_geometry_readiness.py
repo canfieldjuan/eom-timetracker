@@ -211,6 +211,7 @@ def test_readiness_reports_legacy_radius_for_residential_clock_fallback(monkeypa
     )
     monkeypatch.setattr(t, "SITE_CHECK_IN_RADIUS_M", 50)
     monkeypatch.setattr(t, "LOCATION_MATCH_RADIUS_M", 80)
+    monkeypatch.setattr(t, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
     monkeypatch.setattr(t, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
     monkeypatch.setattr(
         t,
@@ -224,6 +225,22 @@ def test_readiness_reports_legacy_radius_for_residential_clock_fallback(monkeypa
     assert state["clockBoundaryEffectiveRadiusM"] == 80
     assert state["clockBoundaryRadiusSource"] == "legacy_location_match"
     assert state["clockBoundaryPerSiteRadiusEnabled"] is False
+
+
+def test_readiness_reports_shared_radius_for_broad_residential_resolution(monkeypatch):
+    row = _synthetic_location_row(
+        geofence_radius_m=250,
+        location_type="Residential",
+    )
+    monkeypatch.setattr(t, "LOCATION_MATCH_RADIUS_M", 50)
+    monkeypatch.setattr(t, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(t, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+
+    state = t._location_geofence_state(row)
+
+    assert state["clockBoundaryEffectiveRadiusM"] == 250
+    assert state["clockBoundaryRadiusSource"] == "per_site"
+    assert state["clockBoundaryPerSiteRadiusEnabled"] is True
 
 
 def _attested_row(**overrides):

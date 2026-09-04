@@ -704,14 +704,20 @@ def test_clock_radius_flag_activates_commercial_clock_in_and_out(client, monkeyp
     assert mutation_lock_calls == ["locked"]
 
 
+@pytest.mark.parametrize("broad_resolution_enabled", [False, True])
 def test_clock_radius_requires_exact_site_for_overlap_without_hard_gate(
     client,
     monkeypatch,
+    broad_resolution_enabled,
 ):
     employee_id, employee_auth = _create_employee(client, "clock radius overlap")
     monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
     monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", False)
-    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_SITE_RESOLUTION_ENABLED",
+        broad_resolution_enabled,
+    )
     monkeypatch.setattr(
         api,
         "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
@@ -773,6 +779,14 @@ def test_clock_radius_requires_exact_site_for_overlap_without_hard_gate(
         (employee_id,),
     ) == {"count": 0}
 
+    invalid_selection = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={**body, "locationId": max(site_ids) + 100_000},
+    )
+    assert invalid_selection.status_code == 400, invalid_selection.text
+    assert "selected customer Site is not eligible" in invalid_selection.text
+
     selected = client.post(
         "/api/timesheet/clock-in",
         headers=employee_auth,
@@ -802,6 +816,44 @@ def test_clock_radius_flag_preserves_existing_residential_site_resolution(client
     assert clock_in.status_code == 200, clock_in.text
     assert clock_in.json()["siteResolution"]["state"] == "customer_site"
     assert clock_in.json()["entry"]["locationId"] == site_id
+
+
+@pytest.mark.parametrize("location_type", ["Residential", "Commercial"])
+def test_clock_boundary_fallback_is_inert_when_its_switch_is_off(
+    client,
+    monkeypatch,
+    location_type,
+):
+    _employee_id, employee_auth = _create_employee(
+        client,
+        f"clock switch off {location_type}",
+    )
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        False,
+    )
+    site_id = _create_site(
+        f"clock switch off {location_type}",
+        geofence_radius_m=15,
+        location_type=location_type,
+    )
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": LATITUDE + 0.00027,
+            "longitude": LONGITUDE,
+            "accuracy": 1,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["entry"]["clockInGpsMeta"]["override"] is False
 
 
 @pytest.mark.parametrize(
