@@ -19424,8 +19424,17 @@ def _geofence_state(
     fingerprint input makes a previously-attested pin unready automatically.
     """
     resolved_radius_m, radius_source = _resolve_geofence_radius_m(configured_radius_m)
-    clock_boundary_radius_m, clock_boundary_radius_source = (
-        _clock_boundary_effective_geofence_radius(configured_radius_m)
+    # These additive fields report the radius that a clock decision for this
+    # entity type would actually use. Only Commercial Sites and Home Base use
+    # the dedicated clock resolver; Residential Sites retain the shared
+    # visit/clock behavior and must not be mislabeled when the switches differ.
+    clock_radius_resolver = (
+        _clock_boundary_effective_geofence_radius
+        if entity_type == "home_base" or location_type == "Commercial"
+        else _effective_geofence_radius
+    )
+    clock_boundary_radius_m, clock_boundary_radius_source = clock_radius_resolver(
+        configured_radius_m
     )
     max_accuracy_policy_m = int(SITE_CHECK_IN_MAX_ACCURACY_M)
     current_fingerprint = geofence_geometry_fingerprint(
