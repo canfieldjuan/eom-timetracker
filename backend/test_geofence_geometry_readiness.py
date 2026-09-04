@@ -185,6 +185,25 @@ def test_per_site_radius_isolates_from_fallback_change(monkeypatch):
     assert fp_a == fp_b  # an explicit per-site radius ignores the global fallback
 
 
+def test_readiness_reports_configured_and_effective_clock_radius(monkeypatch):
+    row = _synthetic_location_row(geofence_radius_m=250)
+    monkeypatch.setattr(t, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        t,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+
+    state = t._location_geofence_state(row)
+
+    assert state["geofenceRadiusM"] == 250
+    assert state["resolvedRadiusM"] == 250
+    assert state["radiusSource"] == "per_site"
+    assert state["clockBoundaryEffectiveRadiusM"] == 250
+    assert state["clockBoundaryRadiusSource"] == "per_site"
+    assert state["clockBoundaryPerSiteRadiusEnabled"] is True
+
+
 def _attested_row(**overrides):
     """A synthetic row whose stored fingerprint matches its current geometry."""
     row = _synthetic_location_row(**overrides)

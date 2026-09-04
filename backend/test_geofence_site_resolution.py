@@ -539,6 +539,51 @@ def test_c3_resolves_a_supported_per_site_radius_before_legacy_gate(client, monk
     assert response.json()["entry"]["locationId"] == site_id
 
 
+def test_clock_radius_does_not_widen_arrival_or_residential_paths(client, monkeypatch):
+    employee_id, _employee_auth = _create_employee(client, "clock radius isolation")
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    commercial_site_id = _create_site(
+        "clock-only wide commercial",
+        geofence_radius_m=250,
+        location_type="Commercial",
+    )
+    payload = api.ClockInRequest(
+        latitude=LATITUDE + 0.001,
+        longitude=LONGITUDE,
+        accuracy=5,
+    )
+    employee = {"id": employee_id}
+
+    clock_resolution = api._c3_resolve_site("clock-in", payload, employee)
+    assert clock_resolution["state"] == "customer_site"
+    assert int(clock_resolution["site"]["location_id"]) == commercial_site_id
+    assert clock_resolution["geofence"]["resolvedRadiusM"] == 250
+
+    arrival_resolution = api._c3_resolve_site("arrive", payload, employee)
+    assert arrival_resolution == {
+        "state": "unresolved",
+        "reason": "no_eligible_inside_site",
+    }
+
+    residential = {
+        **clock_resolution["site"],
+        "location_type": "Residential",
+    }
+    residential_geofence = api._c3_site_geofence(
+        residential,
+        payload,
+        action="clock-in",
+    )
+    assert residential_geofence["status"] == "outside"
+    assert residential_geofence["resolvedRadiusM"] == int(api.SITE_CHECK_IN_RADIUS_M)
+
+
 def test_c3_commit_recheck_serializes_with_customer_site_mutations(client, monkeypatch):
     _employee_id, employee_auth = _create_employee(client, "site mutation lock")
     monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)

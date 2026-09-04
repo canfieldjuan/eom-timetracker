@@ -301,6 +301,12 @@ SITE_CHECK_IN_MAX_ACCURACY_M = SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M
 # switch: it only chooses WHICH radius the evaluator uses, never whether an action
 # is gated. Env-resolved below.
 GEOFENCE_PER_SITE_RADIUS_ENABLED = False
+# Clock boundaries have a separate rollout switch so configured Commercial and
+# Home Base radii can govern clock-in/out without also widening Residential,
+# visit, or Site-QR arrival/departure behavior. At runtime this defaults to the
+# shared flag for backward compatibility with deployments that already enabled
+# per-site radii before the split.
+GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED = False
 # Geofence C3 (#215): resolution ships dormant. It may associate a confirmed
 # Site, but it cannot deny an unresolved clock action before C6.
 GEOFENCE_SITE_RESOLUTION_ENABLED = False
@@ -521,6 +527,8 @@ def _site_check_in_coordinate_bounds(
     latitude: float,
     longitude: float,
     accuracy: float,
+    *,
+    max_effective_radius_m: Optional[int] = None,
 ) -> Tuple[float, float, float, float, bool]:
     """Return a conservative SQL bounding box for a site-check-in geofence.
 
@@ -532,7 +540,11 @@ def _site_check_in_coordinate_bounds(
     # under the current enforcement gate, so it stays a conservative superset of the
     # exact haversine circle for every per-site radius. Gate OFF -> this equals the
     # global radius, so the box is byte-for-byte identical to pre-C2.
-    envelope_m = float(_max_effective_geofence_radius_m()) + max(float(accuracy), 0.0)
+    envelope_m = float(
+        _max_effective_geofence_radius_m()
+        if max_effective_radius_m is None
+        else max_effective_radius_m
+    ) + max(float(accuracy), 0.0)
     # This is intentionally lower than a degree's distance under the same
     # spherical radius used by ``haversine_m``.  Dividing by the lower value
     # makes the box a superset instead of allowing a boundary point to fall
@@ -4770,6 +4782,10 @@ SITE_CHECK_IN_MAX_ACCURACY_M = max(
 # Geofence C2 (#214): per-site-radius rollout switch, default OFF (see constant above).
 GEOFENCE_PER_SITE_RADIUS_ENABLED = parse_bool(
     os.getenv("GEOFENCE_PER_SITE_RADIUS_ENABLED"), False
+)
+GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED = parse_bool(
+    os.getenv("GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED"),
+    GEOFENCE_PER_SITE_RADIUS_ENABLED,
 )
 # Geofence C3 (#215): resolution is separate from C6's hard gate and stays
 # disabled in production until an approved later rollout turns it on.
@@ -10125,6 +10141,8 @@ def _active_home_base_config(*, cur: Optional[Any] = None) -> Optional[Dict[str,
 def _home_base_geofence_from_payload(
     policy: Optional[Dict[str, Any]],
     payload: Optional[BaseModel],
+    *,
+    clock_boundary: bool = False,
 ) -> Optional[Dict[str, Any]]:
     if not policy or payload is None:
         return None
@@ -10133,9 +10151,12 @@ def _home_base_geofence_from_payload(
     accuracy = getattr(payload, "accuracy", None)
     if latitude is None or longitude is None or accuracy is None:
         return None
-    resolved_radius_m, radius_source = _effective_geofence_radius(
-        policy.get("geofence_radius_m")
+    radius_resolver = (
+        _clock_boundary_effective_geofence_radius
+        if clock_boundary
+        else _effective_geofence_radius
     )
+    resolved_radius_m, radius_source = radius_resolver(policy.get("geofence_radius_m"))
     return evaluate_site_check_in_geofence(
         site_latitude=(
             float(policy["latitude"])
@@ -14503,7 +14524,7 @@ def record_home_base_scan(
     policy = _active_home_base_config()
     if not policy or int(policy["home_base_id"]) != int(home_base["home_base_id"]):
         raise HTTPException(status_code=403, detail="Home Base is not active")
-    resolved_radius_m, radius_source = _effective_geofence_radius(
+    resolved_radius_m, radius_source = _clock_boundary_effective_geofence_radius(
         home_base.get("geofence_radius_m")
     )
     geofence = evaluate_site_check_in_geofence(
@@ -14573,7 +14594,7 @@ def record_home_base_scan(
         # lookup just returned rather than the one the preflight saw, or a
         # worker standing at the former location still buys paid time. Resolve the
         # radius from this same locked row too (not the preflight value).
-        current_radius_m, current_radius_source = _effective_geofence_radius(
+        current_radius_m, current_radius_source = _clock_boundary_effective_geofence_radius(
             current_home_base.get("geofence_radius_m")
         )
         current_geofence = evaluate_site_check_in_geofence(
@@ -17332,6 +17353,7 @@ def clock_in(
         home_base["geofence"] = _home_base_geofence_from_payload(
             home_base["policy"],
             payload,
+            clock_boundary=True,
         )
         home_base["confirmed"] = _home_base_gps_confirmed(home_base["geofence"])
         # The scope check is inside the timesheet writer lock. Scope flips take
@@ -17731,6 +17753,7 @@ def clock_out(
         home_base["geofence"] = _home_base_geofence_from_payload(
             home_base["policy"],
             payload,
+            clock_boundary=True,
         )
         home_base["confirmed"] = _home_base_gps_confirmed(home_base["geofence"])
 
@@ -19275,6 +19298,26 @@ def _effective_geofence_radius(configured_radius_m: Any) -> Tuple[int, str]:
     return int(resolved), source
 
 
+def _clock_boundary_effective_geofence_radius(
+    configured_radius_m: Any,
+) -> Tuple[int, str]:
+    """Resolve the radius used only by Commercial/Home Base clock boundaries.
+
+    The clock-specific switch inherits the established shared switch when its
+    environment variable is absent, preserving existing deployments. When it
+    is enabled independently, configured radii affect clock-in/out and Home
+    Base start/end only; the shared resolver above continues to govern visits,
+    Residential behavior, and Commercial Site QR arrival/departure.
+    """
+
+    resolved, source = _resolve_geofence_radius_m(configured_radius_m)
+    if not GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED:
+        return int(SITE_CHECK_IN_RADIUS_M), "global_fallback"
+    if source == "per_site":
+        resolved = min(int(resolved), GEOFENCE_RADIUS_MAX_M)
+    return int(resolved), source
+
+
 def _max_effective_geofence_radius_m() -> int:
     """Largest radius any candidate can resolve to under the current C2 gate.
 
@@ -19283,6 +19326,14 @@ def _max_effective_geofence_radius_m() -> int:
     evaluator can decide with (which clamps a per-site override to the same max).
     """
     if not GEOFENCE_PER_SITE_RADIUS_ENABLED:
+        return int(SITE_CHECK_IN_RADIUS_M)
+    return max(int(SITE_CHECK_IN_RADIUS_M), GEOFENCE_RADIUS_MAX_M)
+
+
+def _max_clock_boundary_effective_geofence_radius_m() -> int:
+    """Largest radius the clock-boundary resolver can admit."""
+
+    if not GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED:
         return int(SITE_CHECK_IN_RADIUS_M)
     return max(int(SITE_CHECK_IN_RADIUS_M), GEOFENCE_RADIUS_MAX_M)
 
@@ -19373,6 +19424,9 @@ def _geofence_state(
     fingerprint input makes a previously-attested pin unready automatically.
     """
     resolved_radius_m, radius_source = _resolve_geofence_radius_m(configured_radius_m)
+    clock_boundary_radius_m, clock_boundary_radius_source = (
+        _clock_boundary_effective_geofence_radius(configured_radius_m)
+    )
     max_accuracy_policy_m = int(SITE_CHECK_IN_MAX_ACCURACY_M)
     current_fingerprint = geofence_geometry_fingerprint(
         entity_type=entity_type,
@@ -19428,6 +19482,11 @@ def _geofence_state(
         ),
         "resolvedRadiusM": resolved_radius_m,
         "radiusSource": radius_source,
+        "clockBoundaryEffectiveRadiusM": clock_boundary_radius_m,
+        "clockBoundaryRadiusSource": clock_boundary_radius_source,
+        "clockBoundaryPerSiteRadiusEnabled": bool(
+            GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        ),
         "maxAccuracyPolicyM": max_accuracy_policy_m,
         "pinProvenance": pin_provenance,
         "pinConfidence": pin_confidence,
@@ -19529,6 +19588,7 @@ def _c3_rows_from_cursor(cur: Any) -> List[Dict[str, Any]]:
 def _c3_customer_site_rows(
     payload: BaseModel,
     *,
+    action: Optional[str] = None,
     selected_location_id: Optional[int] = None,
     cur: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
@@ -19554,7 +19614,17 @@ def _c3_customer_site_rows(
             longitude_upper,
             crosses_date_line,
         ) = _site_check_in_coordinate_bounds(
-            float(latitude), float(longitude), float(accuracy)
+            float(latitude),
+            float(longitude),
+            float(accuracy),
+            max_effective_radius_m=(
+                max(
+                    _max_clock_boundary_effective_geofence_radius_m(),
+                    _max_effective_geofence_radius_m(),
+                )
+                if action in {"clock-in", "clock-out"}
+                else None
+            ),
         )
         longitude_predicate = (
             "(l.lng >= %s OR l.lng <= %s)"
@@ -19614,8 +19684,25 @@ def _c3_customer_site_rows(
     return rows
 
 
-def _c3_site_geofence(site: Dict[str, Any], payload: BaseModel) -> Dict[str, Any]:
-    radius_m, radius_source = _effective_geofence_radius(site.get("geofence_radius_m"))
+def _c3_site_geofence(
+    site: Dict[str, Any],
+    payload: BaseModel,
+    *,
+    action: Optional[str] = None,
+) -> Dict[str, Any]:
+    # CLOSED/ENUMERATED: only the two clock actions can use the clock resolver,
+    # and only for Commercial Sites. Every other action/type stays on the
+    # established shared resolver.
+    use_clock_boundary_radius = bool(
+        action in {"clock-in", "clock-out"}
+        and site.get("location_type") == "Commercial"
+    )
+    radius_resolver = (
+        _clock_boundary_effective_geofence_radius
+        if use_clock_boundary_radius
+        else _effective_geofence_radius
+    )
+    radius_m, radius_source = radius_resolver(site.get("geofence_radius_m"))
     return evaluate_site_check_in_geofence(
         site_latitude=(float(site["lat"]) if site.get("lat") is not None else None),
         site_longitude=(float(site["lng"]) if site.get("lng") is not None else None),
@@ -19811,7 +19898,11 @@ def _c3_resolve_site(
     )
     if home_base_allowed:
         home_base = _active_home_base_config(cur=cur)
-        home_base_geofence = _home_base_geofence_from_payload(home_base, payload)
+        home_base_geofence = _home_base_geofence_from_payload(
+            home_base,
+            payload,
+            clock_boundary=action in {"clock-in", "clock-out"},
+        )
         home_base_ready = bool(
             home_base
             and _home_base_geofence_state(home_base).get("ready")
@@ -19830,6 +19921,7 @@ def _c3_resolve_site(
     selected_location_id = getattr(payload, "locationId", None)
     rows = _c3_customer_site_rows(
         payload,
+        action=action,
         selected_location_id=(int(selected_location_id) if selected_location_id else None),
         cur=cur,
     )
@@ -19853,7 +19945,7 @@ def _c3_resolve_site(
         selected = eligible_rows[0] if eligible_rows else None
         if selected is None:
             return {"state": "unresolved", "reason": "selected_site_ineligible"}
-        geofence = _c3_site_geofence(selected, payload)
+        geofence = _c3_site_geofence(selected, payload, action=action)
         if geofence["status"] != "inside":
             return {"state": "unresolved", "reason": "selected_site_not_inside"}
         return {
@@ -19864,7 +19956,7 @@ def _c3_resolve_site(
         }
 
     inside = [
-        (row, _c3_site_geofence(row, payload))
+        (row, _c3_site_geofence(row, payload, action=action))
         for row in eligible_rows
     ]
     inside = [(row, geofence) for row, geofence in inside if geofence["status"] == "inside"]
@@ -20258,7 +20350,11 @@ def _c6_target_decision(
         return {"allowed": False, "reason": "missing_gps", "target": None}
 
     if explicit_site is not None:
-        geofence = explicit_geofence or _c3_site_geofence(explicit_site, payload)
+        geofence = explicit_geofence or _c3_site_geofence(
+            explicit_site,
+            payload,
+            action=action,
+        )
         target = {
             "kind": "site",
             "id": int(explicit_site["location_id"]),
@@ -20320,6 +20416,7 @@ def _c6_target_decision(
             }
         selected_rows = _c3_customer_site_rows(
             payload,
+            action=action,
             selected_location_id=int(selected_location_id),
             cur=cur,
         )
@@ -20338,7 +20435,7 @@ def _c6_target_decision(
                 "target": {"kind": "site", "id": int(selected_location_id)},
                 "resolution": resolution,
             }
-        geofence = _c3_site_geofence(selected, payload)
+        geofence = _c3_site_geofence(selected, payload, action=action)
         return {
             "allowed": geofence.get("status") == "inside",
             "reason": str(geofence.get("status") or "outside"),

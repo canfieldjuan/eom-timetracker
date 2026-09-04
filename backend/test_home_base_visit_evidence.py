@@ -167,6 +167,64 @@ def _configure_home_base(client, auth: dict[str, str]) -> dict:
     return body
 
 
+def test_clock_boundary_radius_applies_to_plain_and_qr_home_base_actions(
+    client,
+    auth,
+    monkeypatch,
+):
+    plain_employee_id, plain_auth = _create_employee(client, "Wide Home Base plain")
+    _enroll_in_morning_crew(plain_employee_id)
+    _configure_home_base(client, auth)
+    db.execute("UPDATE home_bases SET geofence_radius_m = 250 WHERE active = true")
+    monkeypatch.setattr(time_tracker_api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        time_tracker_api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    wide_point = {
+        "latitude": BASE_LATITUDE + 0.001,
+        "longitude": BASE_LONGITUDE,
+        "accuracy": 5,
+    }
+
+    plain_start = client.post(
+        "/api/timesheet/clock-in",
+        headers=plain_auth,
+        json={**wide_point, "idempotencyKey": str(uuid4())},
+    )
+    assert plain_start.status_code == 200, plain_start.text
+    assert plain_start.json()["entry"]["location"] == "Home Base — EOM Office Home Base"
+    plain_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=plain_auth,
+        json={**wide_point, "idempotencyKey": str(uuid4())},
+    )
+    assert plain_end.status_code == 200, plain_end.text
+
+    qr_employee_id, qr_auth = _create_employee(client, "Wide Home Base QR")
+    _enroll_in_morning_crew(qr_employee_id)
+    qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
+    assert qr.status_code == 200, qr.text
+    qr_start = client.post(
+        "/api/timesheet/home-base/scan",
+        headers=qr_auth,
+        json={
+            "token": qr.json()["token"],
+            "action": "start",
+            **wide_point,
+            "scannedAt": datetime.now(timezone.utc).isoformat(),
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert qr_start.status_code == 200, qr_start.text
+    qr_event = db.query_one(
+        "SELECT geofence_radius_m, radius_source FROM home_base_events WHERE id = %s",
+        (int(qr_start.json()["homeBaseEvent"]["id"]),),
+    )
+    assert qr_event == {"geofence_radius_m": 250, "radius_source": "per_site"}
+
+
 def test_home_base_put_honors_optional_update_token(client, auth):
     employee_id, _employee_auth = _create_employee(client, "Home Base update token")
     _enroll_in_morning_crew(employee_id)

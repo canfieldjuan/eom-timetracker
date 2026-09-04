@@ -232,3 +232,44 @@ def test_effective_radius_gate_on_honors_and_clamps(monkeypatch):
     # Clamp a grandfathered out-of-bounds override to the business max.
     assert api._effective_geofence_radius(10_000) == (api.GEOFENCE_RADIUS_MAX_M, "per_site")
     assert api._effective_geofence_radius(None) == (int(api.SITE_CHECK_IN_RADIUS_M), "global_fallback")
+
+
+def test_clock_boundary_radius_switch_is_independent_and_bounded(monkeypatch):
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        False,
+    )
+    assert api._clock_boundary_effective_geofence_radius(200) == (
+        int(api.SITE_CHECK_IN_RADIUS_M),
+        "global_fallback",
+    )
+
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    assert api._clock_boundary_effective_geofence_radius(200) == (200, "per_site")
+    assert api._clock_boundary_effective_geofence_radius(10_000) == (
+        api.GEOFENCE_RADIUS_MAX_M,
+        "per_site",
+    )
+    assert api._clock_boundary_effective_geofence_radius(None) == (
+        int(api.SITE_CHECK_IN_RADIUS_M),
+        "global_fallback",
+    )
+
+
+def test_clock_boundary_candidate_box_uses_explicit_clock_envelope(monkeypatch):
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    accuracy = 20.0
+    bounds = api._site_check_in_coordinate_bounds(
+        39.1,
+        -88.5,
+        accuracy,
+        max_effective_radius_m=api.GEOFENCE_RADIUS_MAX_M,
+    )
+    expected_lat_delta = (api.GEOFENCE_RADIUS_MAX_M + accuracy) / 110_000.0
+    assert math.isclose(bounds[1] - 39.1, expected_lat_delta, rel_tol=1e-9)
