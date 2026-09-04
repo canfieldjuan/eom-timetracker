@@ -115,6 +115,7 @@ def _create_site(
     longitude: float | None = LONGITUDE,
     ready: bool = True,
     location_type: str = "Residential",
+    geofence_radius_m: int | None = None,
 ) -> int:
     customer_name = f"{PREFIX} Customer {suffix}"
     customer = db.query_one(
@@ -126,8 +127,8 @@ def _create_site(
         """
         INSERT INTO locations (
             customer_id, address, customer_name, location_type, lat, lng,
-            pin_provenance, pin_confidence
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            pin_provenance, pin_confidence, geofence_radius_m
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -139,6 +140,7 @@ def _create_site(
             longitude,
             "gps_capture" if ready else None,
             "high" if ready else None,
+            geofence_radius_m,
         ),
     )
     assert site
@@ -284,6 +286,56 @@ def test_c6_defaults_off_and_preserves_legacy_override(client, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert response.json()["entry"]["clockInGpsMeta"]["override"] is True
+
+
+def test_effective_gate_preserves_shared_commercial_radius_when_clock_switch_is_off(
+    client,
+    auth,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "shared radius compatibility")
+    crew_id = _create_crew(employee_id, "shared radius compatibility crew")
+    site_id = _create_site(
+        "shared radius compatibility",
+        location_type="Commercial",
+        geofence_radius_m=250,
+    )
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        False,
+    )
+    _enable_scope(client, auth, crew_id)
+    latitude, longitude = _destination(100)
+
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": latitude,
+            "longitude": longitude,
+            "accuracy": 5,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    row = api._c3_customer_site_rows(
+        api.ClockInRequest(
+            locationId=site_id,
+            latitude=latitude,
+            longitude=longitude,
+            accuracy=5,
+        ),
+        action="clock-in",
+        selected_location_id=site_id,
+    )[0]
+    geofence = api._c3_location_geofence_state(row)
+    assert geofence["clockBoundaryEffectiveRadiusM"] == 250
+    assert geofence["clockBoundaryRadiusSource"] == "per_site"
+    assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
 
 
 def test_c6_individual_scope_defaults_off_without_a_scope_row(client, monkeypatch):

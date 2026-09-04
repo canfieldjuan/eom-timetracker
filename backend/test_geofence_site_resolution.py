@@ -929,6 +929,229 @@ def test_clock_boundary_fallback_is_inert_when_its_switch_is_off(
     assert response.json()["entry"]["clockInGpsMeta"]["override"] is False
 
 
+def test_unready_commercial_boundary_reports_repair_before_legacy_override(
+    client,
+    monkeypatch,
+):
+    _employee_id, employee_auth = _create_employee(
+        client,
+        "unready before legacy override",
+    )
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    _create_site(
+        "unready before legacy override",
+        geofence_radius_m=100,
+        location_type="Commercial",
+    )
+
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.00067,
+            "longitude": LONGITUDE,
+            "accuracy": 1,
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert "not ready for verification" in response.text
+    assert "Add an override reason" not in response.text
+
+
+def test_final_clock_in_refreshes_legacy_coordinates_after_site_move(
+    client,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(
+        client,
+        "locked legacy coordinate refresh",
+    )
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    site_id = _create_site(
+        "locked legacy coordinate refresh",
+        geofence_radius_m=50,
+        location_type="Commercial",
+    )
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_provenance = 'gps_capture',
+            pin_confidence = 'high',
+            pin_capture_accuracy_m = 1
+        WHERE id = %s
+        """,
+        (site_id,),
+    )
+    payload = api.ClockInRequest(
+        latitude=LATITUDE,
+        longitude=LONGITUDE,
+        accuracy=1,
+    )
+    row = api._c3_customer_site_rows(payload, action="clock-in")[0]
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_attested_at = NOW(),
+            pin_attestation_fingerprint = %s
+        WHERE id = %s
+        """,
+        (api._c3_location_geofence_state(row)["currentFingerprint"], site_id),
+    )
+    original_resolver = api._c3_resolve_site
+    clock_in_resolutions = 0
+
+    def move_site_after_provisional_resolution(action, *args, **kwargs):
+        nonlocal clock_in_resolutions
+        resolution = original_resolver(action, *args, **kwargs)
+        if action == "clock-in":
+            clock_in_resolutions += 1
+            if clock_in_resolutions == 1:
+                assert resolution["state"] == "customer_site"
+                db.execute(
+                    "UPDATE locations SET lat = %s WHERE id = %s",
+                    (LATITUDE + 0.1, site_id),
+                )
+        return resolution
+
+    monkeypatch.setattr(
+        api,
+        "_c3_resolve_site",
+        move_site_after_provisional_resolution,
+    )
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 1,
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert clock_in_resolutions == 2
+    assert "nearest saved site" in response.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+
+
+def test_final_clock_out_refreshes_legacy_coordinates_after_site_move(
+    client,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(
+        client,
+        "locked clock out coordinate refresh",
+    )
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    site_id = _create_site(
+        "locked clock out coordinate refresh",
+        geofence_radius_m=50,
+        location_type="Commercial",
+    )
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_provenance = 'gps_capture',
+            pin_confidence = 'high',
+            pin_capture_accuracy_m = 1
+        WHERE id = %s
+        """,
+        (site_id,),
+    )
+    payload = api.ClockInRequest(
+        latitude=LATITUDE,
+        longitude=LONGITUDE,
+        accuracy=1,
+    )
+    row = api._c3_customer_site_rows(payload, action="clock-in")[0]
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_attested_at = NOW(),
+            pin_attestation_fingerprint = %s
+        WHERE id = %s
+        """,
+        (api._c3_location_geofence_state(row)["currentFingerprint"], site_id),
+    )
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 1,
+        },
+    )
+    assert started.status_code == 200, started.text
+    original_resolver = api._c3_resolve_site
+    clock_out_resolutions = 0
+
+    def move_site_after_provisional_resolution(action, *args, **kwargs):
+        nonlocal clock_out_resolutions
+        resolution = original_resolver(action, *args, **kwargs)
+        if action == "clock-out":
+            clock_out_resolutions += 1
+            if clock_out_resolutions == 1:
+                assert resolution["state"] == "customer_site"
+                db.execute(
+                    "UPDATE locations SET lat = %s WHERE id = %s",
+                    (LATITUDE + 0.1, site_id),
+                )
+        return resolution
+
+    monkeypatch.setattr(
+        api,
+        "_c3_resolve_site",
+        move_site_after_provisional_resolution,
+    )
+    response = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 1,
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    assert clock_out_resolutions == 2
+    assert "nearest saved site" in response.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s "
+        "AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 1}
+
+
 def test_dual_switch_preserves_residential_legacy_fallback(client, monkeypatch):
     _employee_id, employee_auth = _create_employee(
         client,
