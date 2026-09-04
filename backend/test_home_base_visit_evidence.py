@@ -246,16 +246,22 @@ def test_clock_boundary_radius_applies_to_plain_but_not_qr_home_base_actions(
     ) == {"count": 0}
 
 
+@pytest.mark.parametrize("broad_resolution_enabled", [False, True])
 def test_clock_only_preflight_and_write_both_require_ready_home_base(
     client,
     auth,
     monkeypatch,
+    broad_resolution_enabled,
 ):
     employee_id, employee_auth = _create_employee(client, "Unready Home Base clock")
     _enroll_in_morning_crew(employee_id)
     _configure_home_base(client, auth)
     monkeypatch.setattr(time_tracker_api, "GEOFENCE_HARD_GATE_ENABLED", False)
-    monkeypatch.setattr(time_tracker_api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        time_tracker_api,
+        "GEOFENCE_SITE_RESOLUTION_ENABLED",
+        broad_resolution_enabled,
+    )
     monkeypatch.setattr(
         time_tracker_api,
         "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
