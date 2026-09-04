@@ -17897,16 +17897,16 @@ def clock_out(
             )
             if hard_gate_failure:
                 return False, hard_gate_failure
-            # The strict resolver owns the clock-out target. Raw geometric
-            # Home Base overlap must not make a ready Commercial Site look
-            # like an attempt to end at Home Base while a visit is active.
-            home_base["confirmed"] = bool(
-                provisional_resolution
-                and provisional_resolution.get("state") == "home_base"
-            )
-            if home_base["confirmed"] and provisional_resolution:
-                home_base["policy"] = provisional_resolution.get("homeBase")
-                home_base["geofence"] = provisional_resolution.get("geofence")
+            if hard_gate_action["effective"]:
+                # Only the effective strict gate owns the clock-out target.
+                # Radius-only association keeps ordinary Home Base evidence.
+                home_base["confirmed"] = bool(
+                    provisional_resolution
+                    and provisional_resolution.get("state") == "home_base"
+                )
+                if home_base["confirmed"] and provisional_resolution:
+                    home_base["policy"] = provisional_resolution.get("homeBase")
+                    home_base["geofence"] = provisional_resolution.get("geofence")
 
         c3_customer_site = bool(
             provisional_resolution
