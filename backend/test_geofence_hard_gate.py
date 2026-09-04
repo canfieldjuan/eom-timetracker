@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bcrypt
+import json
 import math
 import threading
 from datetime import date
@@ -315,6 +316,307 @@ def test_c6_individual_scope_defaults_off_without_a_scope_row(client, monkeypatc
     assert legacy.json()["entry"]["clockInGpsMeta"]["override"] is True
 
 
+def test_c6_fleet_default_inherits_strict_scope_and_explicit_disable_opts_out(
+    client,
+    auth,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "fleet default")
+    _create_site("fleet default commercial", location_type="Commercial")
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+
+    inherited = api._c6_employee_scope_state(employee_id, api.utc_now())
+    assert inherited["effective"] is True
+    assert inherited["individualScope"] is True
+    assert inherited["individualProfile"] == (
+        api.GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+    )
+    readiness = client.get("/api/admin/geofence-readiness", headers=auth)
+    assert readiness.status_code == 200, readiness.text
+    inherited_admin = next(
+        row
+        for row in readiness.json()["hardGate"]["employeeScopes"]
+        if row["employeeId"] == employee_id
+    )
+    assert inherited_admin["scopeSource"] == "fleet_default"
+    assert inherited_admin["requested"] is True
+    assert inherited_admin["effective"] is True
+
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.3,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+            "gpsOverrideReason": "Coffee stop",
+        },
+    )
+    assert blocked.status_code == 409, blocked.text
+
+    disabled = client.put(
+        f"/api/admin/geofence-hard-gate-employee-scopes/{employee_id}",
+        headers=auth,
+        json={
+            "enabled": False,
+            "profile": api.GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY,
+        },
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["scope"]["scopeSource"] == "explicit"
+    assert disabled.json()["scope"]["effective"] is False
+    opted_out = api._c6_employee_scope_state(employee_id, api.utc_now())
+    assert opted_out == {
+        "effective": False,
+        "requested": False,
+        "blockedReasons": ["employee_not_scoped"],
+        "crews": [],
+        "individualScope": False,
+    }
+    refreshed = client.get("/api/admin/geofence-readiness", headers=auth)
+    explicit_admin = next(
+        row
+        for row in refreshed.json()["hardGate"]["employeeScopes"]
+        if row["employeeId"] == employee_id
+    )
+    assert explicit_admin["scopeSource"] == "explicit"
+    assert explicit_admin["requested"] is False
+
+
+def test_c6_fleet_default_never_enrolls_an_inactive_account(client, monkeypatch):
+    employee_id, _employee_auth = _create_employee(client, "inactive fleet default")
+    db.execute("UPDATE employees SET active = false WHERE id = %s", (employee_id,))
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+
+    assert api._c6_employee_scope_state(employee_id, api.utc_now()) == {
+        "effective": False,
+        "requested": False,
+        "blockedReasons": ["employee_not_scoped"],
+        "crews": [],
+        "individualScope": False,
+    }
+
+
+def test_c6_reports_home_base_and_commercial_readiness_failures_precisely(
+    client,
+    auth,
+    monkeypatch,
+):
+    home_employee_id, home_auth = _create_employee(client, "home base unready")
+    _configure_ready_home_base(client, auth)
+    db.execute(
+        "UPDATE home_bases SET geofence_radius_m = 250 WHERE active = true"
+    )
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+
+    home_blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=home_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert home_blocked.status_code == 409, home_blocked.text
+    assert _hard_gate_failure(home_blocked)["details"]["reason"] == (
+        "home_base_unready"
+    )
+
+    ready_overlap_id = _create_site(
+        "ready overlap",
+        latitude=LATITUDE + 0.02,
+        location_type="Commercial",
+    )
+    ready_overlap = client.post(
+        "/api/timesheet/clock-in",
+        headers=home_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert ready_overlap.status_code == 200, ready_overlap.text
+    assert ready_overlap.json()["entry"]["locationId"] == ready_overlap_id
+
+    commercial_employee_id, commercial_auth = _create_employee(
+        client,
+        "commercial unready",
+    )
+    _create_site(
+        "commercial unready",
+        ready=False,
+        location_type="Commercial",
+    )
+    commercial_blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=commercial_auth,
+        json={
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert commercial_blocked.status_code == 409, commercial_blocked.text
+    assert _hard_gate_failure(commercial_blocked)["details"]["reason"] == (
+        "commercial_site_unready"
+    )
+    assert home_employee_id != commercial_employee_id
+
+
+def test_c6_failure_log_is_structured_and_coordinate_free(
+    client,
+    auth,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "structured log")
+    site_id = _create_site("structured log", location_type="Commercial")
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+    captured: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "CLOCK_IN_FAILED":
+            captured.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": LATITUDE + 0.01,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert "_log" not in blocked.json()
+    assert len(captured) == 1
+    details = captured[0]
+    assert details["employeeId"] == employee_id
+    assert details["action"] == "clock-in"
+    assert details["reason"] == "outside"
+    assert details["code"] == api.GEOFENCE_HARD_GATE_BLOCK_CODE
+    assert details["targetKind"] == "site"
+    assert details["targetId"] == site_id
+    assert details["accuracyM"] == 5
+    assert details["distanceM"] > details["effectiveRadiusM"]
+    assert details["radiusSource"] in {"global_fallback", "per_site"}
+    serialized = json.dumps(details).lower()
+    assert "latitude" not in serialized
+    assert "longitude" not in serialized
+
+
+def test_geofence_client_diagnostic_is_bounded_coordinate_free_and_rate_limited(
+    client,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "client diagnostic")
+    written: list[dict] = []
+    monkeypatch.setattr(
+        api,
+        "_append_access_log_to_postgres",
+        lambda entry, _local_date: written.append(dict(entry)),
+    )
+    monkeypatch.setattr(api, "_append_access_log_to_file", lambda *_args: None)
+    monkeypatch.setattr(api, "_maybe_prune_access_log_entries", lambda: None)
+    with api._RATE_LIMIT_LOCK:
+        api._RATE_LIMIT_BUCKETS.clear()
+
+    recorded = client.post(
+        "/api/timesheet/geofence-client-diagnostic",
+        headers={**employee_auth, "User-Agent": "geofence-test-browser"},
+        json={
+            "action": "clock-in",
+            "outcome": "timeout",
+            "sampleCount": 3,
+            "bestAccuracyM": 240.5,
+            "elapsedMs": 12_000,
+        },
+    )
+    assert recorded.status_code == 200, recorded.text
+    assert recorded.json() == {"success": True}
+    assert len(written) == 1
+    entry = written[0]
+    assert entry["action"] == "GEOFENCE_CLIENT_DIAGNOSTIC"
+    assert entry["userAgent"] == "geofence-test-browser"
+    assert entry["details"] == {
+        "employeeId": employee_id,
+        "action": "clock-in",
+        "outcome": "timeout",
+        "sampleCount": 3,
+        "bestAccuracyM": 240.5,
+        "elapsedMs": 12_000,
+    }
+    assert "latitude" not in json.dumps(entry).lower()
+    assert "longitude" not in json.dumps(entry).lower()
+
+    rejected_coordinates = client.post(
+        "/api/timesheet/geofence-client-diagnostic",
+        headers=employee_auth,
+        json={
+            "action": "clock-out",
+            "outcome": "permission_denied",
+            "sampleCount": 0,
+            "elapsedMs": 20,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+        },
+    )
+    assert rejected_coordinates.status_code == 422, rejected_coordinates.text
+
+    monkeypatch.setattr(api, "GEOFENCE_CLIENT_DIAGNOSTIC_RATE_LIMIT_MAX", 2)
+    with api._RATE_LIMIT_LOCK:
+        api._RATE_LIMIT_BUCKETS.clear()
+    payload = {
+        "action": "clock-out",
+        "outcome": "no_valid_sample",
+        "sampleCount": 0,
+        "elapsedMs": 500,
+    }
+    assert client.post(
+        "/api/timesheet/geofence-client-diagnostic",
+        headers=employee_auth,
+        json=payload,
+    ).status_code == 200
+    assert client.post(
+        "/api/timesheet/geofence-client-diagnostic",
+        headers=employee_auth,
+        json=payload,
+    ).status_code == 200
+    limited = client.post(
+        "/api/timesheet/geofence-client-diagnostic",
+        headers=employee_auth,
+        json=payload,
+    )
+    assert limited.status_code == 429, limited.text
+
+
 def test_c6_refuses_scope_enable_until_all_eligible_sites_are_ready(
     client, auth, monkeypatch
 ):
@@ -569,7 +871,7 @@ def test_commercial_home_base_clock_boundary_keeps_unready_commercial_sites_out(
     )
     assert attempted.status_code == 409, attempted.text
     assert _hard_gate_failure(attempted)["details"]["reason"] == (
-        "selected_site_unready"
+        "commercial_site_unready"
     )
 
 
@@ -773,6 +1075,7 @@ def test_c6_individual_scope_blocks_free_text_bypass_and_keeps_crew_state_empty(
         "effective": True,
         "blockedReasons": [],
         "profile": api.GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START,
+        "scopeSource": "explicit",
     }
     assert api._c6_employee_scope_state(employee_id, api.utc_now()) == {
         "effective": True,
