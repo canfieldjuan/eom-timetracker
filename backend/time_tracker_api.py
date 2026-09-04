@@ -19993,7 +19993,11 @@ def _c3_clock_boundary_override_error(
     if error:
         return error
     reason = str((resolution or {}).get("reason") or "")
-    if reason in {"home_base_unready", "selected_site_unready"}:
+    if reason in {
+        "home_base_unready",
+        "selected_site_unready",
+        "commercial_site_unready",
+    }:
         return (
             "This clock location is not ready for verification. "
             "Ask an administrator to repair and attest its geofence."
@@ -20086,10 +20090,30 @@ def _c3_resolve_site(
         selected_location_id=(int(selected_location_id) if selected_location_id else None),
         cur=cur,
     )
+    commercial_readiness_required = bool(
+        target_policy
+        == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+        or (
+            action in {"clock-in", "clock-out"}
+            and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        )
+    )
+    unready_commercial_rows = [
+        row
+        for row in rows
+        if commercial_readiness_required
+        and _location_commercial_clock_boundary_eligible(row)
+        and not _c3_location_geofence_state(row).get("ready")
+    ]
+    unready_commercial_ids = {
+        int(row["location_id"])
+        for row in unready_commercial_rows
+    }
     eligible_rows = [
         row
         for row in rows
         if _c3_target_policy_eligible(row, target_policy)
+        and int(row["location_id"]) not in unready_commercial_ids
     ]
 
     if selected_location_id is not None:
@@ -20097,8 +20121,7 @@ def _c3_resolve_site(
         if selected_row is None or not _location_business_eligible(selected_row):
             return {"state": "unresolved", "reason": "selected_site_ineligible"}
         if (
-            target_policy
-            == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+            commercial_readiness_required
             and _location_commercial_clock_boundary_eligible(selected_row)
             and not _c3_location_geofence_state(selected_row).get("ready")
         ):
@@ -20170,6 +20193,11 @@ def _c3_resolve_site(
         }
     if home_base_unready_at_sample:
         return {"state": "unresolved", "reason": "home_base_unready"}
+    if any(
+        _c3_site_geofence(row, payload, action=action).get("status") == "inside"
+        for row in unready_commercial_rows
+    ):
+        return {"state": "unresolved", "reason": "commercial_site_unready"}
     if (
         action in {"clock-in", "clock-out"}
         and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED

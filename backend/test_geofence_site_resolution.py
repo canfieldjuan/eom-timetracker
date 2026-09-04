@@ -558,6 +558,33 @@ def test_clock_radius_does_not_widen_arrival_or_residential_paths(client, monkey
         longitude=LONGITUDE,
         accuracy=5,
     )
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_provenance = 'gps_capture',
+            pin_confidence = 'high',
+            pin_capture_accuracy_m = 5
+        WHERE id = %s
+        """,
+        (commercial_site_id,),
+    )
+    commercial_row = api._c3_customer_site_rows(
+        payload,
+        action="clock-in",
+        selected_location_id=commercial_site_id,
+    )[0]
+    fingerprint = api._c3_location_geofence_state(commercial_row)[
+        "currentFingerprint"
+    ]
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_attested_at = NOW(),
+            pin_attestation_fingerprint = %s
+        WHERE id = %s
+        """,
+        (fingerprint, commercial_site_id),
+    )
     employee = {"id": employee_id}
 
     clock_resolution = api._c3_resolve_site("clock-in", payload, employee)
@@ -865,6 +892,27 @@ def test_clock_radius_prevents_legacy_match_from_bypassing_narrow_boundary(
         json={**point, "gpsOverrideReason": "Supervisor approved boundary exception."},
     )
     assert ended.status_code == 200, ended.text
+
+    _unready_employee_id, unready_auth = _create_employee(
+        client,
+        "clock unready narrow boundary",
+    )
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_attested_at = NULL,
+            pin_attestation_fingerprint = NULL
+        WHERE id = %s
+        """,
+        (site_id,),
+    )
+    unready = client.post(
+        "/api/timesheet/clock-in",
+        headers=unready_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 1},
+    )
+    assert unready.status_code == 400, unready.text
+    assert "not ready for verification" in unready.text
 
 
 def test_c3_commit_recheck_serializes_with_customer_site_mutations(client, monkeypatch):
