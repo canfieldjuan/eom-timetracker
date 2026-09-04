@@ -558,6 +558,33 @@ def test_clock_radius_does_not_widen_arrival_or_residential_paths(client, monkey
         longitude=LONGITUDE,
         accuracy=5,
     )
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_provenance = 'gps_capture',
+            pin_confidence = 'high',
+            pin_capture_accuracy_m = 5
+        WHERE id = %s
+        """,
+        (commercial_site_id,),
+    )
+    commercial_row = api._c3_customer_site_rows(
+        payload,
+        action="clock-in",
+        selected_location_id=commercial_site_id,
+    )[0]
+    fingerprint = api._c3_location_geofence_state(commercial_row)[
+        "currentFingerprint"
+    ]
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_attested_at = NOW(),
+            pin_attestation_fingerprint = %s
+        WHERE id = %s
+        """,
+        (fingerprint, commercial_site_id),
+    )
     employee = {"id": employee_id}
 
     clock_resolution = api._c3_resolve_site("clock-in", payload, employee)
