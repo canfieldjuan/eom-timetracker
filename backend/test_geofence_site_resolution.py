@@ -804,11 +804,21 @@ def test_clock_radius_flag_preserves_existing_residential_site_resolution(client
     assert clock_in.json()["entry"]["locationId"] == site_id
 
 
-@pytest.mark.parametrize("broad_resolution_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("broad_resolution_enabled", "legacy_radius_m", "latitude_offset"),
+    [
+        (False, 50, 0.00027),
+        (True, 50, 0.00027),
+        (False, 800, 0.006),
+        (True, 800, 0.006),
+    ],
+)
 def test_clock_radius_prevents_legacy_match_from_bypassing_narrow_boundary(
     client,
     monkeypatch,
     broad_resolution_enabled,
+    legacy_radius_m,
+    latitude_offset,
 ):
     _employee_id, employee_auth = _create_employee(client, "clock narrow boundary")
     monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
@@ -818,6 +828,7 @@ def test_clock_radius_prevents_legacy_match_from_bypassing_narrow_boundary(
         broad_resolution_enabled,
     )
     monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", legacy_radius_m)
     monkeypatch.setattr(
         api,
         "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
@@ -839,9 +850,9 @@ def test_clock_radius_prevents_legacy_match_from_bypassing_narrow_boundary(
         (site_id,),
     )
     point = {
-        # About 30m from the pin: inside the legacy matcher but outside the
-        # configured Commercial clock boundary.
-        "latitude": LATITUDE + 0.00027,
+        # Inside the configured legacy matcher but outside the Commercial
+        # boundary, including when the legacy radius exceeds the 500m cap.
+        "latitude": LATITUDE + latitude_offset,
         "longitude": LONGITUDE,
         "accuracy": 1,
     }
@@ -947,6 +958,74 @@ def test_clock_radius_prevents_legacy_match_from_bypassing_narrow_boundary(
     )
     assert unready.status_code == 400, unready.text
     assert "not ready for verification" in unready.text
+
+
+def test_clock_radius_requires_accuracy_before_legacy_fallback(client, monkeypatch):
+    _employee_id, employee_auth = _create_employee(client, "clock accuracy")
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    site_id = _create_site(
+        "clock accuracy commercial",
+        geofence_radius_m=15,
+        location_type="Commercial",
+    )
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_provenance = 'gps_capture',
+            pin_confidence = 'high',
+            pin_capture_accuracy_m = 1
+        WHERE id = %s
+        """,
+        (site_id,),
+    )
+    exact = {"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 1}
+    row = api._c3_customer_site_rows(
+        api.ClockInRequest(**exact),
+        action="clock-in",
+        selected_location_id=site_id,
+    )[0]
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_attested_at = NOW(),
+            pin_attestation_fingerprint = %s
+        WHERE id = %s
+        """,
+        (api._c3_location_geofence_state(row)["currentFingerprint"], site_id),
+    )
+    without_accuracy = {
+        "latitude": LATITUDE + 0.00027,
+        "longitude": LONGITUDE,
+    }
+
+    blocked_start = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=without_accuracy,
+    )
+    assert blocked_start.status_code == 400, blocked_start.text
+    assert "GPS accuracy is required" in blocked_start.text
+
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=exact,
+    )
+    assert started.status_code == 200, started.text
+
+    blocked_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json=without_accuracy,
+    )
+    assert blocked_end.status_code == 400, blocked_end.text
+    assert "GPS accuracy is required" in blocked_end.text
 
 
 def test_c3_commit_recheck_serializes_with_customer_site_mutations(client, monkeypatch):
