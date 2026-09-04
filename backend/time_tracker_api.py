@@ -19475,18 +19475,20 @@ def _geofence_state(
     fingerprint input makes a previously-attested pin unready automatically.
     """
     resolved_radius_m, radius_source = _resolve_geofence_radius_m(configured_radius_m)
-    # These additive fields report the radius that a clock decision for this
-    # entity type would actually use. Only Commercial Sites and Home Base use
-    # the dedicated clock resolver; Residential Sites retain the shared
-    # visit/clock behavior and must not be mislabeled when the switches differ.
-    clock_radius_resolver = (
-        _clock_boundary_effective_geofence_radius
-        if entity_type == "home_base" or location_type == "Commercial"
-        else _effective_geofence_radius
+    # Only Commercial Sites and Home Base use the dedicated clock resolver.
+    # Residential clock-only fallback remains on the legacy nearest-pin matcher,
+    # whose independently configurable radius must be reported as such.
+    clock_boundary_applies = bool(
+        entity_type == "home_base" or location_type == "Commercial"
     )
-    clock_boundary_radius_m, clock_boundary_radius_source = clock_radius_resolver(
-        configured_radius_m
-    )
+    if clock_boundary_applies:
+        (
+            clock_boundary_radius_m,
+            clock_boundary_radius_source,
+        ) = _clock_boundary_effective_geofence_radius(configured_radius_m)
+    else:
+        clock_boundary_radius_m = int(LOCATION_MATCH_RADIUS_M)
+        clock_boundary_radius_source = "legacy_location_match"
     max_accuracy_policy_m = int(SITE_CHECK_IN_MAX_ACCURACY_M)
     current_fingerprint = geofence_geometry_fingerprint(
         entity_type=entity_type,
@@ -19545,7 +19547,8 @@ def _geofence_state(
         "clockBoundaryEffectiveRadiusM": clock_boundary_radius_m,
         "clockBoundaryRadiusSource": clock_boundary_radius_source,
         "clockBoundaryPerSiteRadiusEnabled": bool(
-            GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            clock_boundary_applies
+            and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
         ),
         "maxAccuracyPolicyM": max_accuracy_policy_m,
         "pinProvenance": pin_provenance,
@@ -19681,6 +19684,7 @@ def _c3_customer_site_rows(
                 max(
                     _max_clock_boundary_effective_geofence_radius_m(),
                     _max_effective_geofence_radius_m(),
+                    int(LOCATION_MATCH_RADIUS_M),
                 )
                 if action in {"clock-in", "clock-out"}
                 else None
@@ -19983,6 +19987,15 @@ def _c3_clock_boundary_override_error(
     """Compose legacy override support without bypassing strict clock truth."""
     if (resolution or {}).get("exactSelectionRequired"):
         return "More than one customer Site matches your GPS. Choose the exact Site."
+    reason = str((resolution or {}).get("reason") or "")
+    if (
+        reason == "missing_gps"
+        and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        and getattr(payload, "latitude", None) is not None
+        and getattr(payload, "longitude", None) is not None
+        and getattr(payload, "accuracy", None) is None
+    ):
+        return "GPS accuracy is required to verify the configured clock boundary."
     error = require_gps_override(
         timesheet_data,
         getattr(payload, "latitude", None),
@@ -19992,7 +20005,6 @@ def _c3_clock_boundary_override_error(
     )
     if error:
         return error
-    reason = str((resolution or {}).get("reason") or "")
     if reason in {
         "home_base_unready",
         "selected_site_unready",
