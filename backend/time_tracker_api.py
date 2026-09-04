@@ -20357,7 +20357,8 @@ def _c3_resolve_site(
             return {"state": "unresolved", "reason": "uncertain"}
         if any(
             _c3_legacy_match_contains_site(row, payload)
-            for row, _geofence in evaluated
+            for row in rows
+            if _location_commercial_clock_boundary_eligible(row)
         ):
             return {"state": "unresolved", "reason": "clock_boundary_outside"}
     return {"state": "unresolved", "reason": "no_eligible_inside_site"}

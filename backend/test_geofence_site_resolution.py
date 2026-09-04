@@ -815,6 +815,28 @@ def test_clock_radius_prevents_legacy_match_from_bypassing_narrow_boundary(
     assert uncertain.status_code == 400, uncertain.text
     assert "configured Commercial Site clock boundary" in uncertain.text
 
+    _unready_employee_id, unready_auth = _create_employee(
+        client,
+        "clock unready narrow boundary",
+    )
+    db.execute(
+        """
+        UPDATE locations
+        SET geofence_radius_m = 15,
+            pin_attested_at = NULL,
+            pin_attestation_fingerprint = NULL
+        WHERE id = %s
+        """,
+        (site_id,),
+    )
+    unready = client.post(
+        "/api/timesheet/clock-in",
+        headers=unready_auth,
+        json=point,
+    )
+    assert unready.status_code == 400, unready.text
+    assert "configured Commercial Site clock boundary" in unready.text
+
 
 def test_c3_commit_recheck_serializes_with_customer_site_mutations(client, monkeypatch):
     _employee_id, employee_auth = _create_employee(client, "site mutation lock")
