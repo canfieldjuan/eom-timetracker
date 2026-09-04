@@ -873,7 +873,7 @@ def test_commercial_home_base_clock_boundary_keeps_unready_commercial_sites_out(
     )
     assert attempted.status_code == 409, attempted.text
     assert _hard_gate_failure(attempted)["details"]["reason"] == (
-        "commercial_site_unready"
+        "selected_site_unready"
     )
 
 
@@ -1892,11 +1892,11 @@ def test_c6_commit_time_clock_out_recheck_is_logged(client, auth, monkeypatch):
 
     assert ended.status_code == 409, ended.text
     assert _hard_gate_failure(ended)["details"]["reason"] == (
-        "commercial_site_unready"
+        "selected_site_unready"
     )
     assert len(logged) == 1
     assert logged[0]["action"] == "clock-out"
-    assert logged[0]["reason"] == "commercial_site_unready"
+    assert logged[0]["reason"] == "selected_site_unready"
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM shifts "
         "WHERE employee_id = %s AND clock_out IS NULL",

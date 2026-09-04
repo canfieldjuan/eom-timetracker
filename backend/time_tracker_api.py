@@ -20194,7 +20194,7 @@ def _c3_resolve_site(
             and _location_commercial_clock_boundary_eligible(selected_row)
             and not _c3_location_geofence_state(selected_row).get("ready")
         ):
-            return {"state": "unresolved", "reason": "commercial_site_unready"}
+            return {"state": "unresolved", "reason": "selected_site_unready"}
         selected = eligible_rows[0] if eligible_rows else None
         if selected is None:
             return {"state": "unresolved", "reason": "selected_site_ineligible"}
@@ -20716,10 +20716,10 @@ def _c6_target_decision(
 
     selected_location_id = getattr(payload, "locationId", None)
     if selected_location_id is not None:
-        if resolution.get("reason") == "commercial_site_unready":
+        if resolution.get("reason") == "selected_site_unready":
             return {
                 "allowed": False,
-                "reason": "commercial_site_unready",
+                "reason": "selected_site_unready",
                 "target": {"kind": "site", "id": int(selected_location_id)},
                 "resolution": resolution,
                 "accuracyM": float(accuracy),
@@ -20798,6 +20798,7 @@ def _c6_hard_gate_failure(
         "site_unpinned": "This Site does not have a usable geofence pin. Ask an administrator to repair it before retrying.",
         "selection_required": "More than one customer Site matches your GPS. Choose the exact Site and try again.",
         "selected_site_ineligible": "The selected customer Site is not eligible for this action. Choose a current Site and try again.",
+        "selected_site_unready": "The selected Commercial Site is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
         "commercial_site_unready": "This Commercial Site is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
         "home_base_unready": "Home Base is not ready for clock verification. Ask an administrator to attest its current geofence before retrying.",
     }
@@ -20810,7 +20811,8 @@ def _c6_hard_gate_failure(
             "retryable": reason
             in {
                 "missing_gps", "low_accuracy", "uncertain", "outside",
-                "selection_required", "commercial_site_unready", "home_base_unready",
+                "selection_required", "selected_site_unready",
+                "commercial_site_unready", "home_base_unready",
             },
             "adminDirectRecordAvailable": True,
             "target": _c6_public_target(decision.get("target")),
