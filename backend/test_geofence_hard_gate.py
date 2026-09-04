@@ -623,6 +623,52 @@ def test_c6_failure_log_is_structured_and_coordinate_free(
     assert "longitude" not in serialized
 
 
+def test_c6_uncertain_single_commercial_target_is_retained_in_failure_log(
+    client,
+    auth,
+    monkeypatch,
+):
+    monkeypatch.setattr(api, "SITE_CHECK_IN_RADIUS_M", 50)
+    employee_id, employee_auth = _create_employee(client, "uncertain target log")
+    site_id = _create_site("uncertain target log", location_type="Commercial")
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+    latitude, longitude = _destination(45)
+    captured: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "CLOCK_IN_FAILED":
+            captured.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": latitude,
+            "longitude": longitude,
+            "accuracy": 10,
+        },
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert _hard_gate_failure(blocked)["details"]["reason"] == "uncertain"
+    assert len(captured) == 1
+    assert captured[0]["employeeId"] == employee_id
+    assert captured[0]["targetKind"] == "site"
+    assert captured[0]["targetId"] == site_id
+    assert captured[0]["distanceM"] is not None
+    assert captured[0]["effectiveRadiusM"] == 50
+    assert captured[0]["radiusSource"] == "global_fallback"
+
+
 def test_c6_unready_failure_logs_retain_target_metadata(
     client,
     auth,
@@ -2077,6 +2123,77 @@ def test_c6_commit_time_arrival_recheck_is_logged(client, auth, monkeypatch):
     assert len(logged) == 1
     assert logged[0]["action"] == "arrive"
     assert logged[0]["reason"] == "site_unpinned"
+
+
+def test_c6_commit_time_explicit_arrival_recheck_is_logged(
+    client,
+    auth,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "explicit arrival recheck")
+    crew_id = _create_crew(employee_id, "explicit arrival recheck crew")
+    start_site_id = _create_site(
+        "explicit arrival recheck start",
+        latitude=LATITUDE + 0.01,
+    )
+    arrival_site_id = _create_site("explicit arrival recheck target")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    _enable_scope(client, auth, crew_id)
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": start_site_id,
+            "latitude": LATITUDE + 0.01,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert started.status_code == 200, started.text
+    original_resolver = api._resolve_explicit_visit_site
+    changed = False
+
+    def resolve_then_move(*args, **kwargs):
+        nonlocal changed
+        if kwargs.get("cur") is not None and not changed:
+            changed = True
+            db.execute(
+                "UPDATE locations SET lat = %s WHERE id = %s",
+                (LATITUDE + 0.1, arrival_site_id),
+            )
+        return original_resolver(*args, **kwargs)
+
+    monkeypatch.setattr(api, "_resolve_explicit_visit_site", resolve_then_move)
+    logged: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "VISIT_FAILED":
+            logged.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
+    arrived = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": arrival_site_id,
+            "evidenceMethod": "unplanned_residential",
+            "exceptionReason": "unplanned_visit",
+            "exceptionDetail": "Supervisor assigned this stop during the shift.",
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert arrived.status_code == 409, arrived.text
+    assert _hard_gate_failure(arrived)["details"]["reason"] == "outside"
+    assert len(logged) == 1
+    assert logged[0]["action"] == "arrive"
+    assert logged[0]["reason"] == "outside"
+    assert logged[0]["targetKind"] == "site"
+    assert logged[0]["targetId"] == arrival_site_id
 
 
 def test_c6_valid_home_base_inside_passes_after_scope_enable(client, auth, monkeypatch):

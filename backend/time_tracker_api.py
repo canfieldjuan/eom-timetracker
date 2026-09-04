@@ -18801,6 +18801,12 @@ def log_visit(
             explicit_geofence=current_geofence,
         )
         if hard_gate_failure:
+            _append_timesheet_failure_log(
+                request,
+                "VISIT_FAILED",
+                int(employee["id"]),
+                hard_gate_failure,
+            )
             raise HTTPException(
                 status_code=409,
                 detail=_public_timesheet_mutation_failure(hard_gate_failure),
@@ -20643,14 +20649,44 @@ def _c3_resolve_site(
         target_policy
         == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
     ):
+        uncertain_targets: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
         if (
-            home_base_geofence
+            home_base
+            and home_base_geofence
             and home_base_geofence.get("status") == "uncertain"
-        ) or any(
-            geofence.get("status") == "uncertain"
-            for _, geofence in evaluated
         ):
-            return {"state": "unresolved", "reason": "uncertain"}
+            uncertain_targets.append(
+                (
+                    {
+                        "kind": "home_base",
+                        "id": int(home_base["home_base_id"]),
+                        "label": str(home_base.get("label") or ""),
+                    },
+                    home_base_geofence,
+                )
+            )
+        uncertain_targets.extend(
+            (
+                {
+                    "kind": "site",
+                    "id": int(row["location_id"]),
+                    "label": str(row.get("address") or ""),
+                },
+                geofence,
+            )
+            for row, geofence in evaluated
+            if geofence.get("status") == "uncertain"
+        )
+        if uncertain_targets:
+            uncertain_resolution: Dict[str, Any] = {
+                "state": "unresolved",
+                "reason": "uncertain",
+            }
+            if len(uncertain_targets) == 1:
+                failure_target, uncertain_geofence = uncertain_targets[0]
+                uncertain_resolution["failureTarget"] = failure_target
+                uncertain_resolution["geofence"] = uncertain_geofence
+            return uncertain_resolution
     if (
         action in {"clock-in", "clock-out"}
         and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
