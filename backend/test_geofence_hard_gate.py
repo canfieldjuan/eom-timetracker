@@ -665,14 +665,20 @@ def test_c6_failure_log_is_structured_and_coordinate_free(
     assert "longitude" not in serialized
 
 
+@pytest.mark.parametrize("site_ready", [True, False])
 def test_c6_uncertain_single_commercial_target_is_retained_in_failure_log(
     client,
     auth,
     monkeypatch,
+    site_ready,
 ):
     monkeypatch.setattr(api, "SITE_CHECK_IN_RADIUS_M", 50)
     employee_id, employee_auth = _create_employee(client, "uncertain target log")
-    site_id = _create_site("uncertain target log", location_type="Commercial")
+    site_id = _create_site(
+        "uncertain target log",
+        location_type="Commercial",
+        ready=site_ready,
+    )
     _configure_ready_home_base(client, auth)
     monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
     monkeypatch.setattr(

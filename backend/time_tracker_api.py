@@ -20642,8 +20642,11 @@ def _c3_resolve_site(
             },
             "geofence": home_base_geofence,
         }
-    for row in unready_commercial_rows:
-        unready_geofence = _c3_site_geofence(row, payload, action=action)
+    evaluated_unready_commercial = [
+        (row, _c3_site_geofence(row, payload, action=action))
+        for row in unready_commercial_rows
+    ]
+    for row, unready_geofence in evaluated_unready_commercial:
         if unready_geofence.get("status") == "inside":
             return {
                 "state": "unresolved",
@@ -20685,6 +20688,18 @@ def _c3_resolve_site(
                 geofence,
             )
             for row, geofence in evaluated
+            if geofence.get("status") == "uncertain"
+        )
+        uncertain_targets.extend(
+            (
+                {
+                    "kind": "site",
+                    "id": int(row["location_id"]),
+                    "label": str(row.get("address") or ""),
+                },
+                geofence,
+            )
+            for row, geofence in evaluated_unready_commercial
             if geofence.get("status") == "uncertain"
         )
         if uncertain_targets:
