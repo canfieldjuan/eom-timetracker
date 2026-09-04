@@ -19658,11 +19658,20 @@ def _geofence_state(
     fingerprint input makes a previously-attested pin unready automatically.
     """
     resolved_radius_m, radius_source = _resolve_geofence_radius_m(configured_radius_m)
-    # Only Commercial Sites and Home Base use the dedicated clock resolver.
+    # Only canonical linked Commercial Sites and Home Base use the dedicated
+    # clock resolver.
     # Residential uses the established shared resolver when broad C3 is active;
     # otherwise its clock-only fallback remains the legacy nearest-pin matcher.
+    commercial_clock_boundary_eligible = bool(
+        location_type == "Commercial"
+        and parent_linked
+        and active
+        and not archived
+        and parent_customer_active is True
+        and parent_customer_archived is False
+    )
     clock_boundary_applies = bool(
-        entity_type == "home_base" or location_type == "Commercial"
+        entity_type == "home_base" or commercial_clock_boundary_eligible
     )
     if clock_boundary_applies:
         (
@@ -19953,11 +19962,11 @@ def _c3_site_geofence(
     action: Optional[str] = None,
 ) -> Dict[str, Any]:
     # CLOSED/ENUMERATED: only the two clock actions can use the clock resolver,
-    # and only for Commercial Sites. Every other action/type stays on the
-    # established shared resolver.
+    # and only for canonical linked Commercial Sites. Every other action/target
+    # stays on the established shared resolver.
     use_clock_boundary_radius = bool(
         action in {"clock-in", "clock-out"}
-        and site.get("location_type") == "Commercial"
+        and _location_commercial_clock_boundary_eligible(site)
     )
     radius_resolver = (
         _clock_boundary_effective_geofence_radius

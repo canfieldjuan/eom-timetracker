@@ -550,10 +550,15 @@ def test_c3_resolves_a_supported_per_site_radius_before_legacy_gate(client, monk
     assert response.json()["entry"]["locationId"] == site_id
 
 
-def test_clock_radius_does_not_widen_arrival_or_residential_paths(client, monkeypatch):
+def test_clock_radius_does_not_widen_arrival_residential_or_unlinked_paths(
+    client,
+    monkeypatch,
+):
     employee_id, _employee_auth = _create_employee(client, "clock radius isolation")
     monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
     monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
     monkeypatch.setattr(
         api,
         "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
@@ -620,6 +625,23 @@ def test_clock_radius_does_not_widen_arrival_or_residential_paths(client, monkey
     )
     assert residential_geofence["status"] == "outside"
     assert residential_geofence["resolvedRadiusM"] == int(api.SITE_CHECK_IN_RADIUS_M)
+
+    unlinked_commercial = {
+        **clock_resolution["site"],
+        "customer_id": None,
+        "customer_active": None,
+        "customer_archived_at": None,
+    }
+    unlinked_geofence = api._c3_site_geofence(
+        unlinked_commercial,
+        payload,
+        action="clock-in",
+    )
+    assert unlinked_geofence["status"] == "outside"
+    assert unlinked_geofence["resolvedRadiusM"] == int(api.SITE_CHECK_IN_RADIUS_M)
+    unlinked_state = api._c3_location_geofence_state(unlinked_commercial)
+    assert unlinked_state["clockBoundaryEffectiveRadiusM"] == 50
+    assert unlinked_state["clockBoundaryRadiusSource"] == "legacy_location_match"
 
 
 def test_clock_radius_flag_activates_commercial_clock_in_and_out(client, monkeypatch):
