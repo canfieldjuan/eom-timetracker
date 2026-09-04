@@ -20373,12 +20373,29 @@ def _c3_resolve_site(
         # A ready target always wins above. Only after proving that no ready
         # target contains the sample do we surface an inside-but-unready target.
         if home_base_unready_at_sample:
-            return {"state": "unresolved", "reason": "home_base_unready"}
-    if any(
-        _c3_site_geofence(row, payload, action=action).get("status") == "inside"
-        for row in unready_commercial_rows
-    ):
-        return {"state": "unresolved", "reason": "commercial_site_unready"}
+            return {
+                "state": "unresolved",
+                "reason": "home_base_unready",
+                "failureTarget": {
+                    "kind": "home_base",
+                    "id": int(home_base["home_base_id"]),
+                    "label": str(home_base.get("label") or ""),
+                },
+                "geofence": home_base_geofence,
+            }
+    for row in unready_commercial_rows:
+        unready_geofence = _c3_site_geofence(row, payload, action=action)
+        if unready_geofence.get("status") == "inside":
+            return {
+                "state": "unresolved",
+                "reason": "commercial_site_unready",
+                "failureTarget": {
+                    "kind": "site",
+                    "id": int(row["location_id"]),
+                    "label": str(row.get("address") or ""),
+                },
+                "geofence": unready_geofence,
+            }
     if (
         target_policy
         == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
@@ -20601,6 +20618,7 @@ def _c6_employee_scope_state(
     fleet_default_applied = bool(
         employee_active
         and not explicit_scope
+        and not crews
         and GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED
     )
     individually_scoped = explicit_scope_enabled or fleet_default_applied
@@ -20893,7 +20911,8 @@ def _c6_target_decision(
     return {
         "allowed": False,
         "reason": reason,
-        "target": None,
+        "target": resolution.get("failureTarget"),
+        "geofence": resolution.get("geofence"),
         "resolution": resolution,
         "accuracyM": float(accuracy),
     }
@@ -21205,23 +21224,42 @@ def _c6_admin_scope_state(
                 "blockedReasons": state["blockedReasons"],
             }
         )
+    local_day = utc_now().astimezone(APP_TIMEZONE).date()
     employee_rows = db.query_all(
         """
         SELECT employee.id AS employee_id, employee.name AS employee_name,
                scope.id AS scope_id, scope.enabled AS explicitly_enabled,
-               scope.policy_profile
+               scope.policy_profile,
+               EXISTS (
+                   SELECT 1
+                   FROM crew_memberships membership
+                   JOIN crews crew
+                     ON crew.id = membership.crew_id
+                    AND crew.active = true
+                   JOIN geofence_hard_gate_scopes crew_scope
+                     ON crew_scope.crew_id = crew.id
+                    AND crew_scope.enabled = true
+                   WHERE membership.employee_id = employee.id
+                     AND membership.effective_from <= %s
+                     AND (
+                         membership.effective_to IS NULL
+                         OR membership.effective_to > %s
+                     )
+               ) AS crew_scoped
         FROM employees employee
         LEFT JOIN geofence_hard_gate_employee_scopes scope
           ON scope.employee_id = employee.id
         WHERE employee.active = true
         ORDER BY employee.id
-        """
+        """,
+        (local_day, local_day),
     )
     employee_scopes = []
     for row in employee_rows:
         explicit_scope = row.get("scope_id") is not None
         fleet_default_applied = bool(
             not explicit_scope
+            and not row.get("crew_scoped")
             and GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED
         )
         requested = bool(

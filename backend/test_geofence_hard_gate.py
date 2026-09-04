@@ -408,6 +408,43 @@ def test_c6_fleet_default_never_enrolls_an_inactive_account(client, monkeypatch)
     }
 
 
+def test_c6_fleet_default_preserves_existing_crew_policy(client, auth, monkeypatch):
+    employee_id, employee_auth = _create_employee(client, "fleet crew precedence")
+    crew_id = _create_crew(employee_id, "fleet crew precedence")
+    site_id = _create_site("fleet crew residential", location_type="Residential")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+    _enable_scope(client, auth, crew_id)
+
+    scope = api._c6_employee_scope_state(employee_id, api.utc_now())
+    assert scope["effective"] is True
+    assert scope["crews"] == [{"id": crew_id, "name": f"{PREFIX} fleet crew precedence"}]
+    assert scope["individualScope"] is False
+    assert "individualProfile" not in scope
+
+    readiness = client.get("/api/admin/geofence-readiness", headers=auth)
+    assert readiness.status_code == 200, readiness.text
+    employee_scope = next(
+        row
+        for row in readiness.json()["hardGate"]["employeeScopes"]
+        if row["employeeId"] == employee_id
+    )
+    assert employee_scope["scopeSource"] == "none"
+    assert employee_scope["requested"] is False
+
+    clock_in = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+    assert clock_in.status_code == 200, clock_in.text
+    assert clock_in.json()["entry"]["locationId"] == site_id
+
+
 def test_c6_reports_home_base_and_commercial_readiness_failures_precisely(
     client,
     auth,
@@ -530,6 +567,80 @@ def test_c6_failure_log_is_structured_and_coordinate_free(
     assert details["distanceM"] > details["effectiveRadiusM"]
     assert details["radiusSource"] in {"global_fallback", "per_site"}
     serialized = json.dumps(details).lower()
+    assert "latitude" not in serialized
+    assert "longitude" not in serialized
+
+
+def test_c6_unready_failure_logs_retain_target_metadata(
+    client,
+    auth,
+    monkeypatch,
+):
+    commercial_employee_id, commercial_auth = _create_employee(
+        client,
+        "commercial unready log",
+    )
+    home_employee_id, home_auth = _create_employee(client, "home unready log")
+    site_id = _create_site(
+        "commercial unready log",
+        ready=False,
+        location_type="Commercial",
+    )
+    home_base_id = _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+    captured: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "CLOCK_IN_FAILED":
+            captured.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
+    commercial = client.post(
+        "/api/timesheet/clock-in",
+        headers=commercial_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+    assert commercial.status_code == 409, commercial.text
+
+    db.execute(
+        "UPDATE home_bases SET geofence_radius_m = 250 WHERE id = %s",
+        (home_base_id,),
+    )
+    home = client.post(
+        "/api/timesheet/clock-in",
+        headers=home_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert home.status_code == 409, home.text
+
+    by_reason = {item["reason"]: item for item in captured}
+    commercial_log = by_reason["commercial_site_unready"]
+    assert commercial_log["employeeId"] == commercial_employee_id
+    assert commercial_log["targetKind"] == "site"
+    assert commercial_log["targetId"] == site_id
+    assert commercial_log["distanceM"] == 0
+    assert commercial_log["effectiveRadiusM"] is not None
+    assert commercial_log["radiusSource"] in {"global_fallback", "per_site"}
+
+    home_log = by_reason["home_base_unready"]
+    assert home_log["employeeId"] == home_employee_id
+    assert home_log["targetKind"] == "home_base"
+    assert home_log["targetId"] == home_base_id
+    assert home_log["distanceM"] == 0
+    assert home_log["effectiveRadiusM"] is not None
+    assert home_log["radiusSource"] in {"global_fallback", "per_site"}
+    serialized = json.dumps(captured).lower()
     assert "latitude" not in serialized
     assert "longitude" not in serialized
 
