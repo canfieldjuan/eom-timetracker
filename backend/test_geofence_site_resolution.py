@@ -677,6 +677,84 @@ def test_clock_radius_flag_activates_commercial_clock_in_and_out(client, monkeyp
     assert mutation_lock_calls == ["locked"]
 
 
+def test_clock_radius_requires_exact_site_for_overlap_without_hard_gate(
+    client,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "clock radius overlap")
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    site_ids = [
+        _create_site(
+            f"clock overlap {suffix}",
+            geofence_radius_m=250,
+            location_type="Commercial",
+        )
+        for suffix in ("first", "second")
+    ]
+    body = {"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5}
+    for site_id in site_ids:
+        db.execute(
+            """
+            UPDATE locations
+            SET pin_provenance = 'gps_capture',
+                pin_confidence = 'high',
+                pin_capture_accuracy_m = 5
+            WHERE id = %s
+            """,
+            (site_id,),
+        )
+        row = api._c3_customer_site_rows(
+            api.ClockInRequest(**body),
+            action="clock-in",
+            selected_location_id=site_id,
+        )[0]
+        fingerprint = api._c3_location_geofence_state(row)["currentFingerprint"]
+        db.execute(
+            """
+            UPDATE locations
+            SET pin_attested_at = NOW(),
+                pin_attestation_fingerprint = %s
+            WHERE id = %s
+            """,
+            (fingerprint, site_id),
+        )
+
+    preflight = client.post(
+        "/api/timesheet/site-resolution",
+        headers=employee_auth,
+        json={**body, "action": "clock-in"},
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["resolution"]["state"] == "selection_required"
+
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=body,
+    )
+    assert blocked.status_code == 400, blocked.text
+    assert "Choose the exact Site" in blocked.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+
+    selected = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={**body, "locationId": site_ids[0]},
+    )
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["entry"]["locationId"] == site_ids[0]
+
+
 def test_clock_radius_flag_preserves_existing_residential_site_resolution(client, monkeypatch):
     _employee_id, employee_auth = _create_employee(client, "clock radius residential")
     monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
@@ -699,13 +777,19 @@ def test_clock_radius_flag_preserves_existing_residential_site_resolution(client
     assert clock_in.json()["entry"]["locationId"] == site_id
 
 
+@pytest.mark.parametrize("broad_resolution_enabled", [False, True])
 def test_clock_radius_prevents_legacy_match_from_bypassing_narrow_boundary(
     client,
     monkeypatch,
+    broad_resolution_enabled,
 ):
     _employee_id, employee_auth = _create_employee(client, "clock narrow boundary")
     monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
-    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_SITE_RESOLUTION_ENABLED",
+        broad_resolution_enabled,
+    )
     monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
     monkeypatch.setattr(
         api,

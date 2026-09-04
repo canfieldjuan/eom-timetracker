@@ -19981,6 +19981,8 @@ def _c3_clock_boundary_override_error(
     resolution: Optional[Dict[str, Any]],
 ) -> Optional[str]:
     """Compose legacy override support without bypassing strict clock truth."""
+    if (resolution or {}).get("exactSelectionRequired"):
+        return "More than one customer Site matches your GPS. Choose the exact Site."
     error = require_gps_override(
         timesheet_data,
         getattr(payload, "latitude", None),
@@ -20143,6 +20145,7 @@ def _c3_resolve_site(
             return {
                 "state": "selection_required",
                 "reason": "multiple_inside_sites",
+                "exactSelectionRequired": True,
                 "candidates": [row for row, _ in inside],
             }
         planned_ids = _c3_planned_inside_location_ids(
@@ -20168,11 +20171,12 @@ def _c3_resolve_site(
     if home_base_unready_at_sample:
         return {"state": "unresolved", "reason": "home_base_unready"}
     if (
-        target_policy
-        == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+        action in {"clock-in", "clock-out"}
+        and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
         and any(
             _c3_legacy_match_contains_site(row, payload)
-            for row, _geofence in evaluated
+            for row in rows
+            if _location_commercial_clock_boundary_eligible(row)
         )
     ):
         return {"state": "unresolved", "reason": "clock_boundary_outside"}
