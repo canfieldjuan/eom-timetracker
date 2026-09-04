@@ -17363,7 +17363,9 @@ def clock_in(
         hard_gate.update(_c6_employee_scope_state(employee["id"], now_utc))
         hard_gate_action = _c6_action_scope_state(hard_gate, "clock-in")
         site_resolution["enabled"] = bool(
-            GEOFENCE_SITE_RESOLUTION_ENABLED or hard_gate_action["effective"]
+            GEOFENCE_SITE_RESOLUTION_ENABLED
+            or GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            or hard_gate_action["effective"]
         )
         # Under an effective hard gate, self-service exception text stays in
         # the request/audit trail but cannot redefine this clock-in as dispatch.
@@ -17392,7 +17394,11 @@ def clock_in(
                 reference_time=now_utc,
                 target_policy=str(
                     hard_gate_action["targetPolicy"]
-                    or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+                    or (
+                        GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+                        if GEOFENCE_SITE_RESOLUTION_ENABLED
+                        else GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+                    )
                 ),
             )
             site_resolution["resolution"] = provisional_resolution
@@ -17557,7 +17563,9 @@ def clock_in(
         )
         final_action_scope = _c6_action_scope_state(final_scope, "clock-in")
         site_resolution["enabled"] = bool(
-            GEOFENCE_SITE_RESOLUTION_ENABLED or final_action_scope["effective"]
+            GEOFENCE_SITE_RESOLUTION_ENABLED
+            or GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            or final_action_scope["effective"]
         )
         hard_gate_failure = _c6_hard_gate_failure_if_needed(
             "clock-in",
@@ -17594,7 +17602,11 @@ def clock_in(
             reference_time=now_utc,
             target_policy=str(
                 final_action_scope["targetPolicy"]
-                or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+                or (
+                    GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+                    if GEOFENCE_SITE_RESOLUTION_ENABLED
+                    else GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+                )
             ),
         )
         site_resolution["resolution"] = current_resolution
@@ -17742,7 +17754,10 @@ def clock_out(
         legacy_c6_end_bypass = bool(
             hard_gate["effective"] and not hard_gate_action["effective"]
         )
-        site_resolution["enabled"] = bool(hard_gate_action["effective"])
+        site_resolution["enabled"] = bool(
+            GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            or hard_gate_action["effective"]
+        )
         home_base["exception"] = (
             "" if hard_gate_action["effective"] else home_base_exception
         )
@@ -17767,13 +17782,16 @@ def clock_out(
             return False, "Not currently clocked in"
 
         provisional_resolution: Optional[Dict[str, Any]] = None
-        if hard_gate_action["effective"]:
+        if site_resolution["enabled"]:
             provisional_resolution = _c3_resolve_site(
                 "clock-out",
                 gate_payload,
                 employee,
                 reference_time=now_utc,
-                target_policy=str(hard_gate_action["targetPolicy"]),
+                target_policy=str(
+                    hard_gate_action["targetPolicy"]
+                    or GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+                ),
             )
             site_resolution["resolution"] = provisional_resolution
             hard_gate_failure = _c6_hard_gate_failure_if_needed(
@@ -17786,6 +17804,11 @@ def clock_out(
             )
             if hard_gate_failure:
                 return False, hard_gate_failure
+
+        c3_customer_site = bool(
+            provisional_resolution
+            and provisional_resolution.get("state") == "customer_site"
+        )
 
         # A shift that STARTED under Home Base evidence owes its end event even
         # if the employee is no longer covered by any crew. Current GPS at Home
@@ -17813,6 +17836,7 @@ def clock_out(
             not home_base["confirmed"]
             and not hard_gate_action["effective"]
             and not legacy_c6_end_bypass
+            and not c3_customer_site
         ):
             override_error = require_gps_override(
                 timesheet_data,
@@ -17915,8 +17939,11 @@ def clock_out(
 
         final_scope = _c6_authoritative_scope_state(employee["id"], now_utc, cur)
         final_action_scope = _c6_action_scope_state(final_scope, "clock-out")
-        site_resolution["enabled"] = bool(final_action_scope["effective"])
-        if not final_action_scope["effective"]:
+        site_resolution["enabled"] = bool(
+            GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            or final_action_scope["effective"]
+        )
+        if not site_resolution["enabled"]:
             snapshot = site_resolution.get("gpsMetaSnapshot")
             if isinstance(snapshot, dict):
                 if snapshot.get("present"):
@@ -17931,7 +17958,10 @@ def clock_out(
             employee,
             cur=cur,
             reference_time=now_utc,
-            target_policy=str(final_action_scope["targetPolicy"]),
+            target_policy=str(
+                final_action_scope["targetPolicy"]
+                or GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+            ),
         )
         site_resolution["resolution"] = current_resolution
         hard_gate_failure = _c6_hard_gate_failure_if_needed(
@@ -17981,6 +18011,25 @@ def clock_out(
                 home_base_config,
                 geofence,
             )
+        elif (
+            not final_action_scope["effective"]
+            and not home_base["confirmed"]
+        ):
+            override_error = require_gps_override(
+                _timesheet_data,
+                payload.latitude if payload else None,
+                payload.longitude if payload else None,
+                payload.gpsOverrideReason if payload else "",
+                payload.gpsOverrideDetail if payload else "",
+            )
+            if override_error:
+                raise HTTPException(status_code=400, detail=override_error)
+            snapshot = site_resolution.get("gpsMetaSnapshot")
+            if isinstance(snapshot, dict):
+                if snapshot.get("present"):
+                    result["clockOutGpsMeta"] = snapshot.get("value")
+                else:
+                    result.pop("clockOutGpsMeta", None)
 
     def response_builder(
         result: Dict[str, Any],

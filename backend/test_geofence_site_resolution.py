@@ -584,6 +584,96 @@ def test_clock_radius_does_not_widen_arrival_or_residential_paths(client, monkey
     assert residential_geofence["resolvedRadiusM"] == int(api.SITE_CHECK_IN_RADIUS_M)
 
 
+def test_clock_radius_flag_activates_commercial_clock_in_and_out(client, monkeypatch):
+    _employee_id, employee_auth = _create_employee(client, "clock radius endpoint")
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    site_id = _create_site(
+        "clock endpoint wide commercial",
+        geofence_radius_m=250,
+        location_type="Commercial",
+    )
+    body = {
+        # About 111m from the pin: outside the legacy matcher but inside the
+        # configured clock-boundary radius.
+        "latitude": LATITUDE + 0.001,
+        "longitude": LONGITUDE,
+        "accuracy": 5,
+    }
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_provenance = 'gps_capture',
+            pin_confidence = 'high',
+            pin_capture_accuracy_m = 5
+        WHERE id = %s
+        """,
+        (site_id,),
+    )
+    fingerprint_row = api._c3_customer_site_rows(
+        api.ClockInRequest(**body),
+        action="clock-in",
+        selected_location_id=site_id,
+    )[0]
+    fingerprint = api._c3_location_geofence_state(fingerprint_row)[
+        "currentFingerprint"
+    ]
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_attested_at = NOW(),
+            pin_attestation_fingerprint = %s
+        WHERE id = %s
+        """,
+        (fingerprint, site_id),
+    )
+
+    clock_in = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=body,
+    )
+    assert clock_in.status_code == 200, clock_in.text
+    assert clock_in.json()["siteResolution"]["state"] == "customer_site"
+    assert clock_in.json()["entry"]["locationId"] == site_id
+
+    clock_out = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json=body,
+    )
+    assert clock_out.status_code == 200, clock_out.text
+    assert clock_out.json()["siteResolution"]["state"] == "customer_site"
+
+
+def test_clock_radius_flag_preserves_existing_residential_site_resolution(client, monkeypatch):
+    _employee_id, employee_auth = _create_employee(client, "clock radius residential")
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    site_id = _create_site("clock radius residential", location_type="Residential")
+
+    clock_in = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+
+    assert clock_in.status_code == 200, clock_in.text
+    assert clock_in.json()["siteResolution"]["state"] == "customer_site"
+    assert clock_in.json()["entry"]["locationId"] == site_id
+
+
 def test_c3_commit_recheck_serializes_with_customer_site_mutations(client, monkeypatch):
     _employee_id, employee_auth = _create_employee(client, "site mutation lock")
     monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
