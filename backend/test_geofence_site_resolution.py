@@ -982,9 +982,11 @@ def test_unready_commercial_boundary_reports_repair_before_legacy_override(
     assert "Add an override reason" not in response.text
 
 
+@pytest.mark.parametrize("move_before_provisional", [False, True])
 def test_final_clock_in_refreshes_legacy_coordinates_after_site_move(
     client,
     monkeypatch,
+    move_before_provisional,
 ):
     employee_id, employee_auth = _create_employee(
         client,
@@ -1034,10 +1036,19 @@ def test_final_clock_in_refreshes_legacy_coordinates_after_site_move(
 
     def move_site_after_provisional_resolution(action, *args, **kwargs):
         nonlocal clock_in_resolutions
+        if (
+            action == "clock-in"
+            and clock_in_resolutions == 0
+            and move_before_provisional
+        ):
+            db.execute(
+                "UPDATE locations SET lat = %s WHERE id = %s",
+                (LATITUDE + 0.1, site_id),
+            )
         resolution = original_resolver(action, *args, **kwargs)
         if action == "clock-in":
             clock_in_resolutions += 1
-            if clock_in_resolutions == 1:
+            if clock_in_resolutions == 1 and not move_before_provisional:
                 assert resolution["state"] == "customer_site"
                 db.execute(
                     "UPDATE locations SET lat = %s WHERE id = %s",
@@ -1069,9 +1080,11 @@ def test_final_clock_in_refreshes_legacy_coordinates_after_site_move(
     ) == {"count": 0}
 
 
+@pytest.mark.parametrize("move_before_provisional", [False, True])
 def test_final_clock_out_refreshes_legacy_coordinates_after_site_move(
     client,
     monkeypatch,
+    move_before_provisional,
 ):
     employee_id, employee_auth = _create_employee(
         client,
@@ -1131,10 +1144,19 @@ def test_final_clock_out_refreshes_legacy_coordinates_after_site_move(
 
     def move_site_after_provisional_resolution(action, *args, **kwargs):
         nonlocal clock_out_resolutions
+        if (
+            action == "clock-out"
+            and clock_out_resolutions == 0
+            and move_before_provisional
+        ):
+            db.execute(
+                "UPDATE locations SET lat = %s WHERE id = %s",
+                (LATITUDE + 0.1, site_id),
+            )
         resolution = original_resolver(action, *args, **kwargs)
         if action == "clock-out":
             clock_out_resolutions += 1
-            if clock_out_resolutions == 1:
+            if clock_out_resolutions == 1 and not move_before_provisional:
                 assert resolution["state"] == "customer_site"
                 db.execute(
                     "UPDATE locations SET lat = %s WHERE id = %s",
