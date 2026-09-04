@@ -18646,6 +18646,12 @@ def log_visit(
             cur=cur,
         )
         if hard_gate_failure:
+            _append_timesheet_failure_log(
+                request,
+                "VISIT_FAILED",
+                int(employee["id"]),
+                hard_gate_failure,
+            )
             raise HTTPException(
                 status_code=409,
                 detail=_public_timesheet_mutation_failure(hard_gate_failure),
@@ -18903,6 +18909,12 @@ def log_visit(
         after_response_saved=record_explicit_visit_evidence,
     )
     if not ok:
+        _append_timesheet_failure_log(
+            request,
+            "VISIT_FAILED",
+            int(employee["id"]),
+            result,
+        )
         raise_timesheet_mutation_failure(result)
 
     if not result.get("alreadyHere"):
@@ -20328,7 +20340,21 @@ def _c3_resolve_site(
             and _location_commercial_clock_boundary_eligible(selected_row)
             and not _c3_location_geofence_state(selected_row).get("ready")
         ):
-            return {"state": "unresolved", "reason": "selected_site_unready"}
+            selected_geofence = _c3_site_geofence(
+                selected_row,
+                payload,
+                action=action,
+            )
+            return {
+                "state": "unresolved",
+                "reason": "selected_site_unready",
+                "failureTarget": {
+                    "kind": "site",
+                    "id": int(selected_row["location_id"]),
+                    "label": str(selected_row.get("address") or ""),
+                },
+                "geofence": selected_geofence,
+            }
         selected = eligible_rows[0] if eligible_rows else None
         if selected is None:
             return {"state": "unresolved", "reason": "selected_site_ineligible"}
@@ -20893,7 +20919,9 @@ def _c6_target_decision(
             return {
                 "allowed": False,
                 "reason": "selected_site_unready",
-                "target": {"kind": "site", "id": int(selected_location_id)},
+                "target": resolution.get("failureTarget")
+                or {"kind": "site", "id": int(selected_location_id)},
+                "geofence": resolution.get("geofence"),
                 "resolution": resolution,
                 "accuracyM": float(accuracy),
             }

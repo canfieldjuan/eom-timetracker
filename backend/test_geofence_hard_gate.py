@@ -580,6 +580,10 @@ def test_c6_unready_failure_logs_retain_target_metadata(
         client,
         "commercial unready log",
     )
+    selected_employee_id, selected_auth = _create_employee(
+        client,
+        "selected unready log",
+    )
     home_employee_id, home_auth = _create_employee(client, "home unready log")
     site_id = _create_site(
         "commercial unready log",
@@ -609,6 +613,18 @@ def test_c6_unready_failure_logs_retain_target_metadata(
     )
     assert commercial.status_code == 409, commercial.text
 
+    selected = client.post(
+        "/api/timesheet/clock-in",
+        headers=selected_auth,
+        json={
+            "locationId": site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert selected.status_code == 409, selected.text
+
     db.execute(
         "UPDATE home_bases SET geofence_radius_m = 250 WHERE id = %s",
         (home_base_id,),
@@ -624,8 +640,9 @@ def test_c6_unready_failure_logs_retain_target_metadata(
     )
     assert home.status_code == 409, home.text
 
-    by_reason = {item["reason"]: item for item in captured}
-    commercial_log = by_reason["commercial_site_unready"]
+    by_employee = {item["employeeId"]: item for item in captured}
+    commercial_log = by_employee[commercial_employee_id]
+    assert commercial_log["reason"] == "commercial_site_unready"
     assert commercial_log["employeeId"] == commercial_employee_id
     assert commercial_log["targetKind"] == "site"
     assert commercial_log["targetId"] == site_id
@@ -633,7 +650,16 @@ def test_c6_unready_failure_logs_retain_target_metadata(
     assert commercial_log["effectiveRadiusM"] is not None
     assert commercial_log["radiusSource"] in {"global_fallback", "per_site"}
 
-    home_log = by_reason["home_base_unready"]
+    selected_log = by_employee[selected_employee_id]
+    assert selected_log["reason"] == "selected_site_unready"
+    assert selected_log["targetKind"] == "site"
+    assert selected_log["targetId"] == site_id
+    assert selected_log["distanceM"] == 0
+    assert selected_log["effectiveRadiusM"] is not None
+    assert selected_log["radiusSource"] in {"global_fallback", "per_site"}
+
+    home_log = by_employee[home_employee_id]
+    assert home_log["reason"] == "home_base_unready"
     assert home_log["employeeId"] == home_employee_id
     assert home_log["targetKind"] == "home_base"
     assert home_log["targetId"] == home_base_id
@@ -1816,6 +1842,15 @@ def test_c6_blocks_arrival_override_but_keeps_an_administrator_path(
     site_id = _create_site("arrival")
     monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
     _enable_scope(client, auth, crew_id)
+    logged: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "VISIT_FAILED":
+            logged.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
 
     clocked_in = client.post(
         "/api/timesheet/clock-in",
@@ -1841,6 +1876,9 @@ def test_c6_blocks_arrival_override_but_keeps_an_administrator_path(
     )
     assert blocked.status_code == 409, blocked.text
     assert _hard_gate_failure(blocked)["details"]["reason"] == "outside"
+    assert len(logged) == 1
+    assert logged[0]["action"] == "arrive"
+    assert logged[0]["reason"] == "outside"
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM visits WHERE shift_id = %s",
         (clocked_in.json()["entry"]["id"],),
@@ -1861,6 +1899,69 @@ def test_c6_blocks_arrival_override_but_keeps_an_administrator_path(
     )
     assert direct.status_code == 200, direct.text
     assert direct.json()["recordedSource"] == "admin_recorded"
+
+
+def test_c6_commit_time_arrival_recheck_is_logged(client, auth, monkeypatch):
+    employee_id, employee_auth = _create_employee(client, "arrival recheck")
+    crew_id = _create_crew(employee_id, "arrival recheck crew")
+    start_site_id = _create_site(
+        "arrival recheck start",
+        latitude=LATITUDE + 0.01,
+    )
+    arrival_site_id = _create_site("arrival recheck target")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    _enable_scope(client, auth, crew_id)
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": start_site_id,
+            "latitude": LATITUDE + 0.01,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    original_resolver = api._c3_resolve_site
+    changed = False
+
+    def resolve_then_unpin(action, *args, **kwargs):
+        nonlocal changed
+        if action == "arrive" and kwargs.get("cur") is not None and not changed:
+            changed = True
+            db.execute(
+                "UPDATE locations SET lat = NULL, lng = NULL WHERE id = %s",
+                (arrival_site_id,),
+            )
+        return original_resolver(action, *args, **kwargs)
+
+    monkeypatch.setattr(api, "_c3_resolve_site", resolve_then_unpin)
+    logged: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "VISIT_FAILED":
+            logged.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
+    arrived = client.post(
+        "/api/timesheet/visit",
+        headers=employee_auth,
+        json={
+            "locationId": arrival_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert arrived.status_code == 409, arrived.text
+    assert _hard_gate_failure(arrived)["details"]["reason"] == "site_unpinned"
+    assert len(logged) == 1
+    assert logged[0]["action"] == "arrive"
+    assert logged[0]["reason"] == "site_unpinned"
 
 
 def test_c6_valid_home_base_inside_passes_after_scope_enable(client, auth, monkeypatch):
