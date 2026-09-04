@@ -167,7 +167,7 @@ def _configure_home_base(client, auth: dict[str, str]) -> dict:
     return body
 
 
-def test_clock_boundary_radius_applies_to_plain_and_qr_home_base_actions(
+def test_clock_boundary_radius_applies_to_plain_but_not_qr_home_base_actions(
     client,
     auth,
     monkeypatch,
@@ -217,12 +217,11 @@ def test_clock_boundary_radius_applies_to_plain_and_qr_home_base_actions(
             "idempotencyKey": str(uuid4()),
         },
     )
-    assert qr_start.status_code == 200, qr_start.text
-    qr_event = db.query_one(
-        "SELECT geofence_radius_m, radius_source FROM home_base_events WHERE id = %s",
-        (int(qr_start.json()["homeBaseEvent"]["id"]),),
-    )
-    assert qr_event == {"geofence_radius_m": 250, "radius_source": "per_site"}
+    assert qr_start.status_code == 400, qr_start.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE employee_id = %s",
+        (qr_employee_id,),
+    ) == {"count": 0}
 
 
 def test_home_base_put_honors_optional_update_token(client, auth):
