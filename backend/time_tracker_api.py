@@ -17643,7 +17643,6 @@ def clock_in(
         cur: Any,
         result: Dict[str, Any],
         timesheet_data: Dict[str, Any],
-        snapshot: Any,
     ) -> None:
         """Reapply the complete dormant path after a final scope loss."""
         final_home_base = _active_home_base_config(cur=cur)
@@ -17680,6 +17679,7 @@ def clock_in(
             }
         )
         if final_exception:
+            _refresh_plain_time_location_metadata(cur, timesheet_data)
             result["location"] = "Dispatch exception"
             result["locationId"] = None
             result["internalHomeBase"] = True
@@ -17707,9 +17707,6 @@ def clock_in(
         )
         result.pop("internalHomeBase", None)
         result.pop("locationId", None)
-        if isinstance(snapshot, dict):
-            _c3_restore_target(result, snapshot, gps_meta_key="clockInGpsMeta")
-            return
         if has_gps:
             matched = find_nearest_location(
                 payload.latitude, payload.longitude, timesheet_data
@@ -17748,14 +17745,12 @@ def clock_in(
             "clock-in",
             final_action_scope,
         )
-        snapshot = site_resolution.get("snapshot")
         if not site_resolution["enabled"]:
             if was_resolution_enabled:
                 _lock_customer_site_mutations(cur)
-                restore_legacy_clock_in_before_persist(
-                    cur, result, _timesheet_data, snapshot
-                )
+                restore_legacy_clock_in_before_persist(cur, result, _timesheet_data)
             return
+        snapshot = site_resolution.get("snapshot")
         # The candidate query's row locks cannot cover a Site created or moved
         # into the GPS envelope after the query begins.  Use the same
         # transaction advisory lock as Site mutations before this authoritative
@@ -18269,7 +18264,7 @@ def clock_out(
         cur: Any,
         result: Dict[str, Any],
         timesheet_data: Dict[str, Any],
-        snapshot: Any,
+        legacy_c6_end_bypass: bool,
     ) -> None:
         """Reapply the complete dormant end path after a final scope loss."""
         final_home_base = _active_home_base_config(cur=cur)
@@ -18303,6 +18298,7 @@ def clock_out(
             not final_confirmed
             and home_base["started_under"]
             and not final_exception
+            and not legacy_c6_end_bypass
         ):
             raise HTTPException(
                 status_code=400,
@@ -18316,6 +18312,7 @@ def clock_out(
             )
             return
         if final_exception:
+            _refresh_plain_time_location_metadata(cur, timesheet_data)
             result["clockOutGpsMeta"] = build_gps_meta(
                 timesheet_data,
                 payload.latitude if payload else None,
@@ -18326,31 +18323,29 @@ def clock_out(
             )
             return
 
-        override_error = _c3_clock_boundary_override_error(
-            timesheet_data,
-            gate_payload,
-            None,
-            cur=cur,
-            clock_radius_enabled=False,
-        )
-        if override_error:
-            raise HTTPException(status_code=400, detail=override_error)
+        if legacy_c6_end_bypass:
+            _refresh_plain_time_location_metadata(cur, timesheet_data)
+        else:
+            override_error = _c3_clock_boundary_override_error(
+                timesheet_data,
+                gate_payload,
+                None,
+                cur=cur,
+                clock_radius_enabled=False,
+            )
+            if override_error:
+                raise HTTPException(status_code=400, detail=override_error)
         home_base.update(
             {"policy": None, "geofence": None, "confirmed": False, "exception": ""}
         )
-        if isinstance(snapshot, dict) and snapshot.get("present"):
-            result["clockOutGpsMeta"] = snapshot.get("value")
-        elif isinstance(snapshot, dict):
-            result.pop("clockOutGpsMeta", None)
-        else:
-            result["clockOutGpsMeta"] = build_gps_meta(
-                timesheet_data,
-                payload.latitude if payload else None,
-                payload.longitude if payload else None,
-                payload.gpsOverrideReason if payload else "",
-                payload.gpsOverrideDetail if payload else "",
-                payload.accuracy if payload else None,
-            )
+        result["clockOutGpsMeta"] = build_gps_meta(
+            timesheet_data,
+            payload.latitude if payload else None,
+            payload.longitude if payload else None,
+            payload.gpsOverrideReason if payload else "",
+            payload.gpsOverrideDetail if payload else "",
+            payload.accuracy if payload else None,
+        )
 
     def re_resolve_clock_out_before_persist(
         cur: Any,
@@ -18371,11 +18366,13 @@ def clock_out(
             final_action_scope,
         )
         if not site_resolution["enabled"]:
-            snapshot = site_resolution.get("gpsMetaSnapshot")
             if was_resolution_enabled:
                 _lock_customer_site_mutations(cur)
                 restore_legacy_clock_out_before_persist(
-                    cur, result, _timesheet_data, snapshot
+                    cur,
+                    result,
+                    _timesheet_data,
+                    final_legacy_c6_end_bypass,
                 )
             return
 
@@ -20802,6 +20799,35 @@ def _c3_legacy_commercial_clock_failure(
     return None
 
 
+def _refresh_plain_time_location_metadata(
+    cur: Any,
+    timesheet_data: Dict[str, Any],
+) -> None:
+    """Refresh the legacy pin and customer maps from one transaction view."""
+    cur.execute(
+        """
+        SELECT address, customer_name, lat, lng
+        FROM locations
+        WHERE active = TRUE
+        ORDER BY id
+        """
+    )
+    current_location_rows = _c3_rows_from_cursor(cur)
+    timesheet_data["location_coords"] = {
+        str(row["address"]): {
+            "lat": float(row["lat"]),
+            "lng": float(row["lng"]),
+        }
+        for row in current_location_rows
+        if row.get("lat") is not None and row.get("lng") is not None
+    }
+    timesheet_data["location_customers"] = {
+        str(row["address"]): str(row["customer_name"])
+        for row in current_location_rows
+        if row.get("customer_name")
+    }
+
+
 def _c3_clock_boundary_override_error(
     timesheet_data: Dict[str, Any],
     payload: BaseModel,
@@ -20843,33 +20869,10 @@ def _c3_clock_boundary_override_error(
         # held. Rebuild active location metadata from that same transaction view,
         # deriving the legacy matcher from its pinned subset without discarding
         # customer metadata for active unpinned Sites.
-        cur.execute(
-            """
-            SELECT address, customer_name, lat, lng
-            FROM locations
-            WHERE active = TRUE
-            ORDER BY id
-            """
-        )
-        current_location_rows = _c3_rows_from_cursor(cur)
-        current_location_coords = {
-            str(row["address"]): {
-                "lat": float(row["lat"]),
-                "lng": float(row["lng"]),
-            }
-            for row in current_location_rows
-            if row.get("lat") is not None and row.get("lng") is not None
-        }
-        current_location_customers = {
-            str(row["address"]): str(row["customer_name"])
-            for row in current_location_rows
-            if row.get("customer_name")
-        }
         # This is the request-local transaction snapshot passed through the
         # plain-time writer. Updating it in place also lets final GPS metadata
         # use the exact pin set that authorized the fallback.
-        timesheet_data["location_coords"] = current_location_coords
-        timesheet_data["location_customers"] = current_location_customers
+        _refresh_plain_time_location_metadata(cur, timesheet_data)
     error = require_gps_override(
         timesheet_data,
         getattr(payload, "latitude", None),

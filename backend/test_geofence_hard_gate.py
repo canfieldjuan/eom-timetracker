@@ -1522,17 +1522,25 @@ def test_clock_radius_scope_loss_refreshes_legacy_site_data(
     )
     _enable_commercial_clock_boundary(client, auth, employee_id)
     original_scope_read = api._c6_authoritative_scope_state
-    site_moved = False
+    site_mutation = 0
+    current_address = f"{PREFIX} Site radius stale site current"
+    current_customer = f"{PREFIX} Customer radius stale site current"
 
     def move_site_then_lose_scope(*args, **kwargs):
-        nonlocal site_moved
+        nonlocal site_mutation
         original_scope_read(*args, **kwargs)
-        if not site_moved:
+        if site_mutation == 0:
             db.execute(
                 "UPDATE locations SET lat = %s WHERE id = %s",
                 (LATITUDE + 1, site_id),
             )
-            site_moved = True
+        else:
+            db.execute(
+                "UPDATE locations SET address = %s, customer_name = %s "
+                "WHERE id = %s",
+                (current_address, current_customer, site_id),
+            )
+        site_mutation += 1
         return {"effective": False}
 
     monkeypatch.setattr(
@@ -1546,12 +1554,96 @@ def test_clock_radius_scope_loss_refreshes_legacy_site_data(
 
     assert rejected.status_code == 400, rejected.text
     assert "nearest saved site" in rejected.json()["error"]
-    assert site_moved is True
+    assert site_mutation == 1
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM shifts "
         "WHERE employee_id = %s AND clock_out IS NULL",
         (employee_id,),
     ) == {"count": 0}
+    db.execute("UPDATE locations SET lat = %s WHERE id = %s", (LATITUDE, site_id))
+    accepted = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+
+    assert accepted.status_code == 200, accepted.text
+    assert site_mutation == 2
+    assert accepted.json()["entry"]["location"] == current_address
+    assert accepted.json()["entry"]["customer"] == current_customer
+    assert accepted.json()["entry"]["clockInGpsMeta"]["matchedLocation"] == (
+        current_address
+    )
+
+
+def test_clock_radius_scope_loss_honors_final_legacy_clock_out_bypass(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "radius final end bypass")
+    site_id = _create_site(
+        "radius final end bypass",
+        location_type="Commercial",
+        geofence_radius_m=250,
+    )
+    _configure_ready_home_base(client, auth)
+    crew_id = _create_crew(employee_id, "radius final end bypass crew")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        api, "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED", True
+    )
+    monkeypatch.setattr(
+        api, "GEOFENCE_CLOCK_BOUNDARY_EMPLOYEE_SCOPE_REQUIRED", True
+    )
+    _enable_scope(client, auth, crew_id)
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert started.status_code == 200, started.text
+    assert started.json()["homeBaseEvent"]["outcome"] == "recorded"
+
+    original_scope_read = api._c6_authoritative_scope_state
+    current_address = f"{PREFIX} Site radius final end bypass current"
+    current_customer = f"{PREFIX} Customer radius final end bypass current"
+
+    def drop_individual_profile_before_persist(*args, **kwargs):
+        final_scope = original_scope_read(*args, **kwargs)
+        final_scope["individualScope"] = False
+        db.execute(
+            "UPDATE locations SET address = %s, customer_name = %s WHERE id = %s",
+            (current_address, current_customer, site_id),
+        )
+        return final_scope
+
+    monkeypatch.setattr(
+        api,
+        "_c6_authoritative_scope_state",
+        drop_individual_profile_before_persist,
+    )
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["entry"]["clockOutGpsMeta"]["matchedLocation"] == (
+        current_address
+    )
+    assert "homeBaseEvent" not in ended.json()
+    assert db.query_all(
+        "SELECT action, outcome FROM home_base_events "
+        "WHERE employee_id = %s ORDER BY action",
+        (employee_id,),
+    ) == [{"action": "start", "outcome": "recorded"}]
 
 
 def test_commercial_home_base_clock_boundary_allows_ready_targets_without_gating_visits(
