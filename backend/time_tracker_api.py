@@ -20187,6 +20187,8 @@ def _geofence_state(
         entity_type == "home_base" or commercial_clock_boundary_eligible
     )
     clock_boundary_unscoped_legacy_fallback_radius_m = None
+    clock_boundary_unscoped_clock_in_radius_m = None
+    clock_boundary_unscoped_clock_out_radius_m = None
     if clock_boundary_applies:
         (
             clock_boundary_radius_m,
@@ -20203,17 +20205,45 @@ def _geofence_state(
             GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
             and GEOFENCE_CLOCK_BOUNDARY_EMPLOYEE_SCOPE_REQUIRED
         ):
-            if entity_type == "home_base" or GEOFENCE_SITE_RESOLUTION_ENABLED:
+            if entity_type == "home_base":
                 (
-                    clock_boundary_unscoped_legacy_fallback_radius_m,
+                    unscoped_home_base_radius_m,
                     _,
                 ) = _clock_boundary_effective_geofence_radius(
                     configured_radius_m,
                     enabled=False,
                 )
+                clock_boundary_unscoped_clock_in_radius_m = int(
+                    unscoped_home_base_radius_m
+                )
+                clock_boundary_unscoped_clock_out_radius_m = int(
+                    unscoped_home_base_radius_m
+                )
             else:
-                clock_boundary_unscoped_legacy_fallback_radius_m = int(
+                if GEOFENCE_SITE_RESOLUTION_ENABLED:
+                    (
+                        unscoped_clock_in_radius_m,
+                        _,
+                    ) = _clock_boundary_effective_geofence_radius(
+                        configured_radius_m,
+                        enabled=False,
+                    )
+                    clock_boundary_unscoped_clock_in_radius_m = int(
+                        unscoped_clock_in_radius_m
+                    )
+                else:
+                    clock_boundary_unscoped_clock_in_radius_m = int(
+                        LOCATION_MATCH_RADIUS_M
+                    )
+                clock_boundary_unscoped_clock_out_radius_m = int(
                     LOCATION_MATCH_RADIUS_M
+                )
+            if (
+                clock_boundary_unscoped_clock_in_radius_m
+                == clock_boundary_unscoped_clock_out_radius_m
+            ):
+                clock_boundary_unscoped_legacy_fallback_radius_m = (
+                    clock_boundary_unscoped_clock_in_radius_m
                 )
         # With only the shared rollout active, ordinary unscoped clock actions
         # can still fall back to the legacy nearest-pin matcher after C3 fails
@@ -20300,6 +20330,12 @@ def _geofence_state(
         "clockBoundaryPerSiteRadiusEnabled": clock_boundary_per_site_enabled,
         "clockBoundaryUnscopedLegacyFallbackRadiusM": (
             clock_boundary_unscoped_legacy_fallback_radius_m
+        ),
+        "clockBoundaryUnscopedClockInRadiusM": (
+            clock_boundary_unscoped_clock_in_radius_m
+        ),
+        "clockBoundaryUnscopedClockOutRadiusM": (
+            clock_boundary_unscoped_clock_out_radius_m
         ),
         "maxAccuracyPolicyM": max_accuracy_policy_m,
         "pinProvenance": pin_provenance,
