@@ -1684,13 +1684,22 @@ def stale_shift_review_failure(
     }
 
 
+def _public_timesheet_mutation_failure(result: Any) -> Any:
+    if isinstance(result, dict):
+        return {key: value for key, value in result.items() if key != "_log"}
+    return result
+
+
 def raise_timesheet_mutation_failure(result: Any) -> None:
     if isinstance(result, dict) and result.get("code") in {
         STALE_SHIFT_REVIEW_CODE,
         "HOME_BASE_REQUIRED",
         GEOFENCE_HARD_GATE_BLOCK_CODE,
     }:
-        raise HTTPException(status_code=409, detail=result)
+        raise HTTPException(
+            status_code=409,
+            detail=_public_timesheet_mutation_failure(result),
+        )
     raise HTTPException(status_code=400, detail=str(result))
 
 
@@ -2231,7 +2240,14 @@ def build_public_current_status(
     return rows
 
 
-def append_access_log(request: Request, action: str, allowed: bool, reason: str = "") -> None:
+def append_access_log(
+    request: Request,
+    action: str,
+    allowed: bool,
+    reason: str = "",
+    *,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
     timestamp = to_utc_iso(utc_now())
     local_date_text = local_date_for_logs()
     client_ip = get_client_ip(request)
@@ -2248,6 +2264,8 @@ def append_access_log(request: Request, action: str, allowed: bool, reason: str 
         "endpoint": request.url.path,
         "method": request.method,
     }
+    if details is not None:
+        entry["details"] = details
 
     postgres_written = False
     try:
@@ -3770,8 +3788,6 @@ GEOFENCE_HARD_GATE_EMPLOYEE_SCOPE_PROFILES = (
     GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START,
     GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY,
 )
-
-
 class GeofenceHardGateScopeRequest(BaseModel):
     """Administrator-controlled, default-off C6 crew scope."""
 
@@ -3782,7 +3798,8 @@ class GeofenceHardGateEmployeeScopeRequest(GeofenceHardGateScopeRequest):
     """Additive individual C6 profile selection.
 
     ``None`` preserves a stored profile during a legacy enable/disable request.
-    A newly created scope defaults to the established all-business start policy.
+    A newly created scope preserves the employee's inherited fleet policy, when
+    one applies, and otherwise uses the established all-business start policy.
     """
 
     profile: Optional[
@@ -3791,6 +3808,29 @@ class GeofenceHardGateEmployeeScopeRequest(GeofenceHardGateScopeRequest):
             "commercial_home_base_clock_boundary",
         ]
     ] = None
+
+
+class GeofenceClientDiagnosticRequest(BaseModel):
+    """Bounded, coordinate-free browser geolocation acquisition outcome."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["clock-in", "clock-out"]
+    outcome: Literal[
+        "unsupported",
+        "permission_denied",
+        "position_unavailable",
+        "timeout",
+        "no_valid_sample",
+    ]
+    sampleCount: int = Field(ge=0, le=100)
+    bestAccuracyM: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=1_000_000,
+        allow_inf_nan=False,
+    )
+    elapsedMs: int = Field(ge=0, le=60_000)
 
 
 MAX_LOCATION_LEN            = parse_int(os.getenv("MAX_LOCATION_LEN"),            500)
@@ -4808,6 +4848,9 @@ GEOFENCE_SITE_RESOLUTION_ENABLED = parse_bool(
 GEOFENCE_HARD_GATE_ENABLED = parse_bool(
     os.getenv("GEOFENCE_HARD_GATE_ENABLED"), False
 )
+GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED = parse_bool(
+    os.getenv("GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED"), False
+)
 SITE_CHECK_IN_SCHEDULE_WINDOW_HOURS = max(
     1,
     parse_int(
@@ -4938,6 +4981,8 @@ PASSWORD_CHANGE_RATE_LIMIT_WINDOW_S = parse_int(
 REGISTER_RATE_LIMIT_MAX     = parse_int(os.getenv("REGISTER_RATE_LIMIT_MAX"),      3)
 REGISTER_RATE_LIMIT_WINDOW_S = parse_int(os.getenv("REGISTER_RATE_LIMIT_WINDOW_S"), 300)
 RATE_LIMIT_BUCKET_SOFT_CAP  = parse_int(os.getenv("RATE_LIMIT_BUCKET_SOFT_CAP"), 10000)
+GEOFENCE_CLIENT_DIAGNOSTIC_RATE_LIMIT_MAX = 30
+GEOFENCE_CLIENT_DIAGNOSTIC_RATE_LIMIT_WINDOW_S = 300
 
 # ---------------------------------------------------------------------------
 # Business-rule defaults - single source of truth for all threshold settings.
@@ -17428,6 +17473,17 @@ def clock_in(
         )
         if hard_gate_failure:
             return False, hard_gate_failure
+        if hard_gate_action["effective"]:
+            # The strict resolver, not raw geometric overlap, selects the paid
+            # target. An inside-but-unready Home Base must not overwrite a
+            # ready Commercial Site that the hard gate just authorized.
+            home_base["confirmed"] = bool(
+                provisional_resolution
+                and provisional_resolution.get("state") == "home_base"
+            )
+            if home_base["confirmed"] and provisional_resolution:
+                home_base["policy"] = provisional_resolution.get("homeBase")
+                home_base["geofence"] = provisional_resolution.get("geofence")
 
         # Preserve Home Base and documented-exception behavior exactly.  Only a
         # C3 customer Site that will actually be associated may satisfy the
@@ -17619,7 +17675,16 @@ def clock_in(
             resolution=current_resolution,
         )
         if hard_gate_failure:
-            raise HTTPException(status_code=409, detail=hard_gate_failure)
+            _append_timesheet_failure_log(
+                request,
+                "CLOCK_IN_FAILED",
+                int(employee["id"]),
+                hard_gate_failure,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=_public_timesheet_mutation_failure(hard_gate_failure),
+            )
 
         if current_resolution.get("state") == "home_base":
             home_base_config = current_resolution.get("homeBase")
@@ -17666,11 +17731,35 @@ def clock_in(
         result.pop("internalHomeBase", None)
         result.pop("locationId", None)
         if current_resolution.get("state") == "customer_site":
+            home_base.update(
+                {
+                    "policy": None,
+                    "geofence": None,
+                    "confirmed": False,
+                    "exception": "",
+                }
+            )
             _c3_apply_site_resolution(
                 result,
                 payload,
                 current_resolution,
                 gps_meta_key="clockInGpsMeta",
+            )
+        elif current_resolution.get("state") == "home_base":
+            current_home_base = current_resolution.get("homeBase")
+            current_geofence = current_resolution.get("geofence")
+            if not isinstance(current_home_base, dict) or not isinstance(
+                current_geofence,
+                dict,
+            ):
+                raise RuntimeError("Clock-in Home Base resolution was incomplete")
+            home_base.update(
+                {
+                    "policy": current_home_base,
+                    "geofence": current_geofence,
+                    "confirmed": True,
+                    "exception": "",
+                }
             )
         else:
             # C3 remains association-only outside C6. Under an effective C6
@@ -17805,7 +17894,12 @@ def clock_in(
         after_response_saved=record_home_base_event,
     )
     if not ok:
-        append_access_log(request, "CLOCK_IN_FAILED", False, str(result))
+        _append_timesheet_failure_log(
+            request,
+            "CLOCK_IN_FAILED",
+            int(employee["id"]),
+            result,
+        )
         raise_timesheet_mutation_failure(result)
 
     loc = result.get("entry", {}).get("location", "")
@@ -17914,6 +18008,21 @@ def clock_out(
             )
             if hard_gate_failure:
                 return False, hard_gate_failure
+            if hard_gate_action["effective"]:
+                # Only the effective strict gate owns the clock-out target.
+                # Radius-only association keeps ordinary Home Base evidence.
+                home_base["confirmed"] = bool(
+                    provisional_resolution
+                    and provisional_resolution.get("state") == "home_base"
+                )
+                if home_base["confirmed"] and provisional_resolution:
+                    home_base["policy"] = provisional_resolution.get("homeBase")
+                    home_base["geofence"] = provisional_resolution.get("geofence")
+
+        c3_customer_site = bool(
+            provisional_resolution
+            and provisional_resolution.get("state") == "customer_site"
+        )
 
         c3_customer_site = bool(
             provisional_resolution
@@ -18090,7 +18199,58 @@ def clock_out(
             resolution=current_resolution,
         )
         if hard_gate_failure:
-            raise HTTPException(status_code=409, detail=hard_gate_failure)
+            _append_timesheet_failure_log(
+                request,
+                "CLOCK_OUT_FAILED",
+                int(employee["id"]),
+                hard_gate_failure,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=_public_timesheet_mutation_failure(hard_gate_failure),
+            )
+
+        if home_base["policy"] and home_base["exception"]:
+            # A documented non-gated dispatch exception remains internal Home
+            # Base evidence even when C3 sees a customer Site or an unready
+            # boundary. Restore the legacy GPS metadata built by the mutator;
+            # the exception must never be reclassified as customer work.
+            snapshot = site_resolution.get("gpsMetaSnapshot")
+            if isinstance(snapshot, dict):
+                if snapshot.get("present"):
+                    result["clockOutGpsMeta"] = snapshot.get("value")
+                else:
+                    result.pop("clockOutGpsMeta", None)
+            site_resolution["resolution"] = {
+                "state": "unresolved",
+                "reason": "home_base_exception",
+            }
+            return
+
+        # The locked resolver, not the provisional browser-time read, owns the
+        # final Home Base confirmation. Clear every stale Home Base artifact
+        # before applying a non-Home-Base result or considering legacy fallback.
+        if current_resolution.get("state") != "home_base":
+            home_base.update(
+                {
+                    "policy": None,
+                    "geofence": None,
+                    "confirmed": False,
+                }
+            )
+            if (
+                not final_action_scope["effective"]
+                and not final_legacy_c6_end_bypass
+                and home_base["started_under"]
+                and not home_base["exception"]
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=_home_base_requirement_failure(
+                        home_base["started_under"],
+                        "clocking out",
+                    ),
+                )
 
         if home_base["policy"] and home_base["exception"]:
             # A documented non-gated dispatch exception remains internal Home
@@ -18220,7 +18380,12 @@ def clock_out(
         after_response_saved=record_home_base_event,
     )
     if not ok:
-        append_access_log(request, "CLOCK_OUT_FAILED", False, str(result))
+        _append_timesheet_failure_log(
+            request,
+            "CLOCK_OUT_FAILED",
+            int(employee["id"]),
+            result,
+        )
         raise_timesheet_mutation_failure(result)
 
     if not result.get("replayed"):
@@ -18395,6 +18560,41 @@ def resolve_customer_site(
         "hardGateEnabled": bool(action_scope["effective"]),
         "resolution": public_resolution,
     }
+
+
+@app.post("/api/timesheet/geofence-client-diagnostic")
+def record_geofence_client_diagnostic(
+    payload: GeofenceClientDiagnosticRequest,
+    request: Request,
+    employee: Dict[str, Any] = Depends(get_current_employee),
+) -> Dict[str, Any]:
+    """Record a bounded browser GPS acquisition failure without coordinates."""
+
+    _rate_limit_check(
+        request,
+        key_prefix="geofence-client-diagnostic",
+        max_calls=GEOFENCE_CLIENT_DIAGNOSTIC_RATE_LIMIT_MAX,
+        window_seconds=GEOFENCE_CLIENT_DIAGNOSTIC_RATE_LIMIT_WINDOW_S,
+    )
+    append_access_log(
+        request,
+        "GEOFENCE_CLIENT_DIAGNOSTIC",
+        True,
+        payload.outcome,
+        details={
+            "employeeId": int(employee["id"]),
+            "action": payload.action,
+            "outcome": payload.outcome,
+            "sampleCount": int(payload.sampleCount),
+            "bestAccuracyM": (
+                float(payload.bestAccuracyM)
+                if payload.bestAccuracyM is not None
+                else None
+            ),
+            "elapsedMs": int(payload.elapsedMs),
+        },
+    )
+    return {"success": True}
 
 
 @app.post("/api/timesheet/visit")
@@ -18655,7 +18855,16 @@ def log_visit(
             cur=cur,
         )
         if hard_gate_failure:
-            raise HTTPException(status_code=409, detail=hard_gate_failure)
+            _append_timesheet_failure_log(
+                request,
+                "VISIT_FAILED",
+                int(employee["id"]),
+                hard_gate_failure,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=_public_timesheet_mutation_failure(hard_gate_failure),
+            )
 
         visit = result.get("visit")
         snapshot = site_resolution.get("snapshot")
@@ -18763,7 +18972,16 @@ def log_visit(
             explicit_geofence=current_geofence,
         )
         if hard_gate_failure:
-            raise HTTPException(status_code=409, detail=hard_gate_failure)
+            _append_timesheet_failure_log(
+                request,
+                "VISIT_FAILED",
+                int(employee["id"]),
+                hard_gate_failure,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=_public_timesheet_mutation_failure(hard_gate_failure),
+            )
         if current_error is None and not current_action_scope["effective"]:
             current_error = _explicit_site_geofence_failure(
                 payload,
@@ -18906,6 +19124,12 @@ def log_visit(
         after_response_saved=record_explicit_visit_evidence,
     )
     if not ok:
+        _append_timesheet_failure_log(
+            request,
+            "VISIT_FAILED",
+            int(employee["id"]),
+            result,
+        )
         raise_timesheet_mutation_failure(result)
 
     if not result.get("alreadyHere"):
@@ -20388,7 +20612,7 @@ def _c3_clock_boundary_override_error(
     )
     if (
         GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
-        and strict_boundary_outside
+        and (strict_boundary_outside or reason == "uncertain")
         and not str(getattr(payload, "gpsOverrideReason", "") or "").strip()
     ):
         return (
@@ -20445,6 +20669,7 @@ def _c3_resolve_site(
         )
     )
     home_base_unready_at_sample = False
+    home_base_geofence: Optional[Dict[str, Any]] = None
     if home_base_allowed:
         home_base = _active_home_base_config(cur=cur)
         home_base_geofence = _home_base_geofence_from_payload(
@@ -20505,7 +20730,21 @@ def _c3_resolve_site(
             and _location_commercial_clock_boundary_eligible(selected_row)
             and not _c3_location_geofence_state(selected_row).get("ready")
         ):
-            return {"state": "unresolved", "reason": "selected_site_unready"}
+            selected_geofence = _c3_site_geofence(
+                selected_row,
+                payload,
+                action=action,
+            )
+            return {
+                "state": "unresolved",
+                "reason": "selected_site_unready",
+                "failureTarget": {
+                    "kind": "site",
+                    "id": int(selected_row["location_id"]),
+                    "label": str(selected_row.get("address") or ""),
+                },
+                "geofence": selected_geofence,
+            }
         selected = eligible_rows[0] if eligible_rows else None
         if selected is None:
             if (
@@ -20622,13 +20861,123 @@ def _c3_resolve_site(
             "reason": "multiple_inside_sites",
             "candidates": [row for row, _ in inside],
         }
+    # A ready target always wins above. Only after proving that no ready target
+    # contains the sample do we surface inside-but-unready targets. Aggregate
+    # Home Base and Commercial matches before attributing the failure so a
+    # mixed overlap cannot be mislabeled as one specific location.
+    inside_unready_targets: List[
+        Tuple[Dict[str, Any], Dict[str, Any], str]
+    ] = []
     if home_base_unready_at_sample:
-        return {"state": "unresolved", "reason": "home_base_unready"}
-    if any(
-        _c3_site_geofence(row, payload, action=action).get("status") == "inside"
+        inside_unready_targets.append(
+            (
+                {
+                    "kind": "home_base",
+                    "id": int(home_base["home_base_id"]),
+                    "label": str(home_base.get("label") or ""),
+                },
+                home_base_geofence,
+                "home_base_unready",
+            )
+        )
+    evaluated_unready_commercial = [
+        (row, _c3_site_geofence(row, payload, action=action))
         for row in unready_commercial_rows
+    ]
+    inside_unready_commercial = [
+        (row, geofence)
+        for row, geofence in evaluated_unready_commercial
+        if geofence.get("status") == "inside"
+    ]
+    inside_unready_targets.extend(
+        (
+            {
+                "kind": "site",
+                "id": int(row["location_id"]),
+                "label": str(row.get("address") or ""),
+            },
+            geofence,
+            "commercial_site_unready",
+        )
+        for row, geofence in inside_unready_commercial
+    )
+    uncertain_targets: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    if (
+        target_policy
+        == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
     ):
-        return {"state": "unresolved", "reason": "commercial_site_unready"}
+        if (
+            home_base
+            and home_base_geofence
+            and home_base_geofence.get("status") == "uncertain"
+        ):
+            uncertain_targets.append(
+                (
+                    {
+                        "kind": "home_base",
+                        "id": int(home_base["home_base_id"]),
+                        "label": str(home_base.get("label") or ""),
+                    },
+                    home_base_geofence,
+                )
+            )
+        uncertain_targets.extend(
+            (
+                {
+                    "kind": "site",
+                    "id": int(row["location_id"]),
+                    "label": str(row.get("address") or ""),
+                },
+                geofence,
+            )
+            for row, geofence in evaluated
+            if geofence.get("status") == "uncertain"
+        )
+        uncertain_targets.extend(
+            (
+                {
+                    "kind": "site",
+                    "id": int(row["location_id"]),
+                    "label": str(row.get("address") or ""),
+                },
+                geofence,
+            )
+            for row, geofence in evaluated_unready_commercial
+            if geofence.get("status") == "uncertain"
+        )
+    if inside_unready_targets:
+        single_inside_unready_target = len(inside_unready_targets) == 1
+        uniquely_attributable_target = (
+            single_inside_unready_target and not uncertain_targets
+        )
+        reason = (
+            inside_unready_targets[0][2]
+            if single_inside_unready_target
+            else "commercial_site_unready"
+        )
+        unready_resolution: Dict[str, Any] = {
+            "state": "unresolved",
+            "reason": reason,
+        }
+        if uniquely_attributable_target:
+            failure_target, unready_geofence, _reason = inside_unready_targets[0]
+            unready_resolution.update(
+                {
+                    "failureTarget": failure_target,
+                    "geofence": unready_geofence,
+                }
+            )
+        return unready_resolution
+    if uncertain_targets:
+        uncertain_resolution: Dict[str, Any] = {
+            "state": "unresolved",
+            "reason": "uncertain",
+        }
+        if len(uncertain_targets) == 1:
+            failure_target, uncertain_geofence = uncertain_targets[0]
+            uncertain_resolution["failureTarget"] = failure_target
+            uncertain_resolution["geofence"] = uncertain_geofence
+        return uncertain_resolution
     if (
         action in {"clock-in", "clock-out"}
         and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
@@ -20763,10 +21112,11 @@ def _c6_employee_scope_state(
 ) -> Dict[str, Any]:
     """Resolve an employee's effective C6 crew or individual scope.
 
-    The scoped-crew set is OPEN/DERIVED from effective-dated memberships.  The
-    scope tables are opt-in overlays, so a missing row, a crew outside the
-    queried membership set, and an employee without an individual scope are all
-    deliberately gate-off.
+    The scoped-crew set is OPEN/DERIVED from effective-dated memberships. An
+    explicit individual row remains authoritative. With fleet defaulting off,
+    a missing row is gate-off; with it on, an active employee with no row
+    inherits the strict Commercial/Home Base profile. An explicit disabled row
+    is the durable opt-out.
 
     When ``cur`` is supplied, the caller has already taken the C6 lock order
     (scope -> customer Site -> planned-assignment/membership) before this
@@ -20805,18 +21155,22 @@ def _c6_employee_scope_state(
         cur.execute(query, params)
         rows = _c3_rows_from_cursor(cur)
 
+    employee_query = """
+        SELECT id, active
+        FROM employees
+        WHERE id = %s
+    """ + (" FOR SHARE" if cur is not None else "")
     individual_scope_query = """
-        SELECT scope.id AS scope_id, scope.policy_profile
-        FROM geofence_hard_gate_employee_scopes scope
-        JOIN employees scoped_employee
-          ON scoped_employee.id = scope.employee_id
-         AND scoped_employee.active = true
-        WHERE scope.employee_id = %s
-          AND scope.enabled = true
-    """ + (" FOR SHARE OF scope, scoped_employee" if cur is not None else "")
+        SELECT id AS scope_id, enabled, policy_profile
+        FROM geofence_hard_gate_employee_scopes
+        WHERE employee_id = %s
+    """ + (" FOR SHARE" if cur is not None else "")
     if cur is None:
+        scoped_employee = db.query_one(employee_query, (int(employee_id),))
         individual_scope = db.query_one(individual_scope_query, (int(employee_id),))
     else:
+        cur.execute(employee_query, (int(employee_id),))
+        scoped_employee = _row_from_cursor(cur)
         cur.execute(individual_scope_query, (int(employee_id),))
         individual_scope = _row_from_cursor(cur)
 
@@ -20824,15 +21178,31 @@ def _c6_employee_scope_state(
         {"id": int(row["crew_id"]), "name": str(row.get("crew_name") or "")}
         for row in rows
     ]
-    individually_scoped = bool(individual_scope)
-    individual_profile = (
-        str(
+    employee_active = bool(scoped_employee and scoped_employee.get("active"))
+    if not employee_active:
+        crews = []
+    explicit_scope = bool(individual_scope)
+    explicit_scope_enabled = bool(
+        individual_scope and individual_scope.get("enabled")
+    )
+    fleet_default_applied = bool(
+        employee_active
+        and not explicit_scope
+        and not crews
+        and GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED
+    )
+    individually_scoped = explicit_scope_enabled or fleet_default_applied
+    if explicit_scope_enabled:
+        individual_profile = str(
             individual_scope.get("policy_profile")
             or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
         )
-        if individual_scope
-        else None
-    )
+    elif fleet_default_applied:
+        individual_profile = (
+            GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+        )
+    else:
+        individual_profile = None
     scoped = bool(crews) or individually_scoped
     state = {
         "effective": scoped,
@@ -20850,6 +21220,50 @@ def _c6_employee_scope_state(
     ):
         state["individualProfile"] = individual_profile
     return state
+
+
+def _c6_inherited_employee_scope_profile(
+    employee_id: int,
+    reference_time: datetime,
+    *,
+    cur: Any,
+) -> str:
+    """Resolve the profile for an active employee with no explicit scope row.
+
+    The effective crew set is OPEN/DERIVED from current dated memberships. A
+    crew scope remains authoritative; only an employee without one inherits the
+    operator-managed fleet default.
+    """
+
+    local_day = reference_time.astimezone(APP_TIMEZONE).date()
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM crew_memberships membership
+            JOIN crews crew
+              ON crew.id = membership.crew_id
+             AND crew.active = true
+            JOIN geofence_hard_gate_scopes crew_scope
+              ON crew_scope.crew_id = crew.id
+             AND crew_scope.enabled = true
+            WHERE membership.employee_id = %s
+              AND membership.effective_from <= %s
+              AND (
+                  membership.effective_to IS NULL
+                  OR membership.effective_to > %s
+              )
+        ) AS crew_scoped
+        """,
+        (int(employee_id), local_day, local_day),
+    )
+    row = _row_from_cursor(cur)
+    if (
+        GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED
+        and not bool(row and row.get("crew_scoped"))
+    ):
+        return GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+    return GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
 
 
 def _c6_action_scope_state(scope: Dict[str, Any], action: str) -> Dict[str, Any]:
@@ -20989,7 +21403,12 @@ def _c6_target_decision(
     longitude = getattr(payload, "longitude", None)
     accuracy = getattr(payload, "accuracy", None)
     if latitude is None or longitude is None or accuracy is None:
-        return {"allowed": False, "reason": "missing_gps", "target": None}
+        return {
+            "allowed": False,
+            "reason": "missing_gps",
+            "target": None,
+            "accuracyM": float(accuracy) if accuracy is not None else None,
+        }
 
     if explicit_site is not None:
         geofence = explicit_geofence or _c3_site_geofence(
@@ -21053,8 +21472,11 @@ def _c6_target_decision(
             return {
                 "allowed": False,
                 "reason": "selected_site_unready",
-                "target": {"kind": "site", "id": int(selected_location_id)},
+                "target": resolution.get("failureTarget")
+                or {"kind": "site", "id": int(selected_location_id)},
+                "geofence": resolution.get("geofence"),
                 "resolution": resolution,
+                "accuracyM": float(accuracy),
             }
         selected_rows = _c3_customer_site_rows(
             payload,
@@ -21076,6 +21498,7 @@ def _c6_target_decision(
                 "reason": "selected_site_ineligible",
                 "target": {"kind": "site", "id": int(selected_location_id)},
                 "resolution": resolution,
+                "accuracyM": float(accuracy),
             }
         geofence = _c3_site_geofence(selected, payload, action=action)
         return {
@@ -21096,11 +21519,11 @@ def _c6_target_decision(
         reason = "selection_required"
     elif resolution.get("reason") == "missing_gps":
         reason = "missing_gps"
-    elif resolution.get("reason") == "selected_site_unready":
-        reason = "selected_site_unready"
     elif resolution.get("reason") in {
+        "selected_site_unready",
         "home_base_unready",
         "commercial_site_unready",
+        "uncertain",
     }:
         reason = str(resolution["reason"])
     else:
@@ -21111,8 +21534,10 @@ def _c6_target_decision(
     return {
         "allowed": False,
         "reason": reason,
-        "target": None,
+        "target": resolution.get("failureTarget"),
+        "geofence": resolution.get("geofence"),
         "resolution": resolution,
+        "accuracyM": float(accuracy),
     }
 
 
@@ -21149,7 +21574,82 @@ def _c6_hard_gate_failure(
             "target": _c6_public_target(decision.get("target")),
             "scopeCrewIds": [int(crew["id"]) for crew in scope.get("crews", [])],
         },
+        "_log": {
+            "action": action,
+            "reason": reason,
+            "code": GEOFENCE_HARD_GATE_BLOCK_CODE,
+            "targetKind": (
+                str(decision["target"].get("kind"))
+                if isinstance(decision.get("target"), dict)
+                else None
+            ),
+            "targetId": (
+                int(decision["target"]["id"])
+                if isinstance(decision.get("target"), dict)
+                and decision["target"].get("id") is not None
+                else None
+            ),
+            "accuracyM": (
+                (decision.get("geofence") or {}).get("accuracyM")
+                if isinstance(decision.get("geofence"), dict)
+                else decision.get("accuracyM")
+            ),
+            "distanceM": (
+                (decision.get("geofence") or {}).get("distanceM")
+                if isinstance(decision.get("geofence"), dict)
+                else None
+            ),
+            "effectiveRadiusM": (
+                (decision.get("geofence") or {}).get("resolvedRadiusM")
+                if isinstance(decision.get("geofence"), dict)
+                else None
+            ),
+            "radiusSource": (
+                (decision.get("geofence") or {}).get("radiusSource")
+                if isinstance(decision.get("geofence"), dict)
+                else None
+            ),
+        },
     }
+
+
+def _geofence_hard_gate_log_details(
+    employee_id: int,
+    failure: Any,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(failure, dict):
+        return None
+    details = failure.get("_log")
+    if not isinstance(details, dict):
+        return None
+    return {"employeeId": int(employee_id), **details}
+
+
+def _timesheet_failure_log_reason(failure: Any) -> str:
+    """Return a stable failure reason without serializing private target labels."""
+
+    if isinstance(failure, dict):
+        details = failure.get("_log")
+        if isinstance(details, dict):
+            code = str(details.get("code") or GEOFENCE_HARD_GATE_BLOCK_CODE)
+            reason = str(details.get("reason") or "unknown")
+            return f"{code}: {reason}"
+    return str(failure)
+
+
+def _append_timesheet_failure_log(
+    request: Request,
+    event: str,
+    employee_id: int,
+    failure: Any,
+) -> None:
+    append_access_log(
+        request,
+        event,
+        False,
+        _timesheet_failure_log_reason(failure),
+        details=_geofence_hard_gate_log_details(employee_id, failure),
+    )
 
 
 def _c6_hard_gate_failure_if_needed(
@@ -21346,24 +21846,65 @@ def _c6_admin_scope_state(
                 "blockedReasons": state["blockedReasons"],
             }
         )
+    local_day = utc_now().astimezone(APP_TIMEZONE).date()
     employee_rows = db.query_all(
         """
         SELECT employee.id AS employee_id, employee.name AS employee_name,
-               COALESCE(scope.enabled, false) AS requested,
-               COALESCE(
-                   scope.policy_profile,
-                   'all_business_start'
-               ) AS policy_profile
+               scope.id AS scope_id, scope.enabled AS explicitly_enabled,
+               scope.policy_profile,
+               EXISTS (
+                   SELECT 1
+                   FROM crew_memberships membership
+                   JOIN crews crew
+                     ON crew.id = membership.crew_id
+                    AND crew.active = true
+                   JOIN geofence_hard_gate_scopes crew_scope
+                     ON crew_scope.crew_id = crew.id
+                    AND crew_scope.enabled = true
+                   WHERE membership.employee_id = employee.id
+                     AND membership.effective_from <= %s
+                     AND (
+                         membership.effective_to IS NULL
+                         OR membership.effective_to > %s
+                     )
+               ) AS crew_scoped
         FROM employees employee
         LEFT JOIN geofence_hard_gate_employee_scopes scope
           ON scope.employee_id = employee.id
         WHERE employee.active = true
         ORDER BY employee.id
-        """
+        """,
+        (local_day, local_day),
     )
     employee_scopes = []
     for row in employee_rows:
-        state = _c6_scope_effective_state(bool(row.get("requested")))
+        explicit_scope = row.get("scope_id") is not None
+        fleet_default_applied = bool(
+            not explicit_scope
+            and not row.get("crew_scoped")
+            and GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED
+        )
+        requested = bool(
+            row.get("explicitly_enabled")
+            if explicit_scope
+            else fleet_default_applied
+        )
+        scope_source = (
+            "explicit"
+            if explicit_scope
+            else "fleet_default"
+            if fleet_default_applied
+            else "none"
+        )
+        profile = str(
+            row.get("policy_profile")
+            or (
+                GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+                if fleet_default_applied
+                else GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+            )
+        )
+        state = _c6_scope_effective_state(requested)
         employee_scopes.append(
             {
                 "employeeId": int(row["employee_id"]),
@@ -21371,11 +21912,15 @@ def _c6_admin_scope_state(
                 "requested": state["requested"],
                 "effective": state["effective"],
                 "blockedReasons": state["blockedReasons"],
-                "profile": str(row.get("policy_profile") or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START),
+                "profile": profile,
+                "scopeSource": scope_source,
             }
         )
     return {
         "killSwitchEnabled": bool(GEOFENCE_HARD_GATE_ENABLED),
+        "fleetDefaultCommercialHomeBaseEnabled": bool(
+            GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED
+        ),
         "readiness": readiness,
         "profileReadiness": profile_readiness,
         "scopes": scopes,
@@ -28087,11 +28632,32 @@ def admin_put_geofence_hard_gate_employee_scope(
                     (int(employee_id),),
                 )
                 existing_scope = _row_from_cursor(cur)
-                profile = str(
-                    payload.profile
-                    or (existing_scope or {}).get("policy_profile")
-                    or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
-                )
+                site_mutations_locked = False
+                if payload.profile is not None:
+                    profile = str(payload.profile)
+                elif existing_scope:
+                    profile = str(
+                        existing_scope.get("policy_profile")
+                        or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+                    )
+                else:
+                    # Preserve the profile this employee inherited before the
+                    # first explicit opt-out row existed. Take C6's canonical
+                    # Site -> membership lock order before deriving the current
+                    # crew set so a concurrent membership replacement cannot
+                    # change that decision underneath this transaction.
+                    _lock_customer_site_mutations(cur)
+                    site_mutations_locked = True
+                    from calendar_import_store import (
+                        lock_planned_visit_assignment_mutations,
+                    )
+
+                    lock_planned_visit_assignment_mutations(cur)
+                    profile = _c6_inherited_employee_scope_profile(
+                        int(employee_id),
+                        utc_now(),
+                        cur=cur,
+                    )
                 if profile not in GEOFENCE_HARD_GATE_EMPLOYEE_SCOPE_PROFILES:
                     raise HTTPException(status_code=422, detail="Unsupported employee scope profile")
 
@@ -28103,7 +28669,8 @@ def admin_put_geofence_hard_gate_employee_scope(
                     # individual unready Commercial Sites remain rejected by
                     # the live action-time resolver instead of blocking every
                     # ready target at enable time.
-                    _lock_customer_site_mutations(cur)
+                    if not site_mutations_locked:
+                        _lock_customer_site_mutations(cur)
                     readiness = _c6_load_readiness(cur=cur, profile=profile)
                     if not readiness["ready"]:
                         _raise_conflict(
@@ -28155,6 +28722,7 @@ def admin_put_geofence_hard_gate_employee_scope(
             "effective": state["effective"],
             "blockedReasons": state["blockedReasons"],
             "profile": str(scope_row["policy_profile"]),
+            "scopeSource": "explicit",
             "updatedAt": to_utc_iso(scope_row["updated_at"]),
         },
         "readiness": readiness,

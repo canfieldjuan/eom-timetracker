@@ -1637,6 +1637,39 @@ def test_clock_radius_prevents_legacy_match_from_bypassing_narrow_boundary(
     )
     assert ended.status_code == 200, ended.text
 
+    _uncertain_employee_id, uncertain_auth = _create_employee(
+        client,
+        "clock uncertain boundary",
+    )
+    db.execute(
+        "UPDATE locations SET geofence_radius_m = 30 WHERE id = %s",
+        (site_id,),
+    )
+    uncertain_row = api._c3_customer_site_rows(
+        api.ClockInRequest(**{**point, "accuracy": 5}),
+        action="clock-in",
+        selected_location_id=site_id,
+    )[0]
+    uncertain_fingerprint = api._c3_location_geofence_state(uncertain_row)[
+        "currentFingerprint"
+    ]
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_attested_at = NOW(),
+            pin_attestation_fingerprint = %s
+        WHERE id = %s
+        """,
+        (uncertain_fingerprint, site_id),
+    )
+    uncertain = client.post(
+        "/api/timesheet/clock-in",
+        headers=uncertain_auth,
+        json={**point, "accuracy": 5},
+    )
+    assert uncertain.status_code == 400, uncertain.text
+    assert "configured Commercial Site clock boundary" in uncertain.text
+
     _unready_employee_id, unready_auth = _create_employee(
         client,
         "clock unready narrow boundary",
@@ -1644,7 +1677,8 @@ def test_clock_radius_prevents_legacy_match_from_bypassing_narrow_boundary(
     db.execute(
         """
         UPDATE locations
-        SET pin_attested_at = NULL,
+        SET geofence_radius_m = 15,
+            pin_attested_at = NULL,
             pin_attestation_fingerprint = NULL
         WHERE id = %s
         """,
