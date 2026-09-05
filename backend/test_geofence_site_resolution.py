@@ -972,6 +972,183 @@ def test_clock_only_residential_selection_cannot_hide_legacy_commercial_winner(
     )
 
 
+def test_broad_residential_selection_cannot_hide_legacy_commercial_winner(
+    client,
+    monkeypatch,
+):
+    _employee_id, employee_auth = _create_employee(
+        client,
+        "broad residential commercial winner",
+    )
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    residential_id = _create_site(
+        "broad unrelated residential",
+        latitude=LATITUDE + 0.01,
+        geofence_radius_m=15,
+        location_type="Residential",
+    )
+    commercial_id = _create_site(
+        "broad nearest commercial",
+        geofence_radius_m=15,
+        location_type="Commercial",
+    )
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_provenance = 'gps_capture',
+            pin_confidence = 'high',
+            pin_capture_accuracy_m = 1
+        WHERE id = %s
+        """,
+        (commercial_id,),
+    )
+    point = {
+        "locationId": residential_id,
+        "latitude": LATITUDE + 0.00027,
+        "longitude": LONGITUDE,
+        "accuracy": 1,
+    }
+    commercial_row = api._c3_customer_site_rows(
+        api.ClockInRequest(**point),
+        action="clock-in",
+        selected_location_id=commercial_id,
+    )[0]
+    db.execute(
+        """
+        UPDATE locations
+        SET pin_attested_at = NOW(),
+            pin_attestation_fingerprint = %s
+        WHERE id = %s
+        """,
+        (
+            api._c3_location_geofence_state(commercial_row)["currentFingerprint"],
+            commercial_id,
+        ),
+    )
+
+    _inside_employee_id, inside_employee_auth = _create_employee(
+        client,
+        "broad residential commercial winner inside",
+    )
+    inside = client.post(
+        "/api/timesheet/clock-in",
+        headers=inside_employee_auth,
+        json={
+            **point,
+            "latitude": LATITUDE + 0.00009,
+        },
+    )
+    assert inside.status_code == 200, inside.text
+    assert inside.json()["entry"]["location"] == (
+        f"{PREFIX} broad nearest commercial"
+    )
+
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=point,
+    )
+    assert blocked.status_code == 400, blocked.text
+    assert "configured Commercial Site clock boundary" in blocked.text
+
+    allowed = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={**point, "gpsOverrideReason": "Supervisor approved exception."},
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["entry"]["location"] == (
+        f"{PREFIX} broad nearest commercial"
+    )
+
+
+def test_clock_boundary_fallback_preserves_gps_less_override(client, monkeypatch):
+    _employee_id, employee_auth = _create_employee(client, "gps-less override")
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "location": "Offline dispatch",
+            "gpsOverrideReason": "No signal at the work site.",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["siteResolution"]["reason"] == "missing_gps"
+    assert response.json()["entry"]["location"] == "Offline dispatch"
+    assert response.json()["entry"]["clockInGps"] is None
+    assert response.json()["entry"]["clockInGpsMeta"] == {
+        "override": True,
+        "overrideReason": "No signal at the work site.",
+        "overrideDetail": "",
+        "matchedLocation": "",
+        "distanceM": None,
+        "withinRadius": None,
+        "accuracyM": None,
+    }
+
+
+def test_clock_boundary_refresh_retains_unpinned_customer_metadata(
+    client,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "unpinned customer metadata")
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    suffix = "unpinned customer metadata"
+    address = f"{PREFIX} {suffix}"
+    site_id = _create_site(
+        suffix,
+        latitude=None,
+        longitude=None,
+        location_type="Commercial",
+    )
+
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "location": address,
+            "latitude": 0,
+            "longitude": 0,
+            "accuracy": 1,
+            "gpsOverrideReason": "Supervisor approved the unpinned Site.",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["entry"]["location"] == address
+    assert response.json()["entry"]["customer"] == f"{PREFIX} Customer {suffix}"
+    persisted = db.query_one(
+        "SELECT location_id FROM shifts WHERE employee_id = %s ORDER BY id DESC LIMIT 1",
+        (employee_id,),
+    )
+    assert persisted
+    assert int(persisted["location_id"]) == site_id
+
+
 @pytest.mark.parametrize("location_type", ["Residential", "Commercial"])
 def test_clock_boundary_fallback_is_inert_when_its_switch_is_off(
     client,
