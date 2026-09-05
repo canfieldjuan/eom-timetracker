@@ -20228,8 +20228,9 @@ def _geofence_state(
                         configured_radius_m,
                         enabled=False,
                     )
-                    clock_boundary_unscoped_clock_in_radius_m = int(
-                        unscoped_clock_in_radius_m
+                    clock_boundary_unscoped_clock_in_radius_m = max(
+                        int(unscoped_clock_in_radius_m),
+                        int(LOCATION_MATCH_RADIUS_M),
                     )
                 else:
                     clock_boundary_unscoped_clock_in_radius_m = int(

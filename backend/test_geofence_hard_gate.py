@@ -382,8 +382,17 @@ def test_home_base_clock_telemetry_never_uses_the_legacy_site_matcher(
     assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] is None
 
 
-def test_readiness_separates_unscoped_clock_in_and_clock_out_radii(
-    client, auth, monkeypatch
+@pytest.mark.parametrize(
+    ("site_radius_m", "legacy_radius_m", "expected_singular_site_radius_m"),
+    [(80, 35, None), (35, 80, 80)],
+)
+def test_readiness_reports_full_unscoped_clock_action_radii(
+    client,
+    auth,
+    monkeypatch,
+    site_radius_m,
+    legacy_radius_m,
+    expected_singular_site_radius_m,
 ):
     site_id = _create_site(
         "unscoped action radii",
@@ -391,8 +400,8 @@ def test_readiness_separates_unscoped_clock_in_and_clock_out_radii(
         geofence_radius_m=250,
     )
     _configure_ready_home_base(client, auth)
-    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 35)
-    monkeypatch.setattr(api, "SITE_CHECK_IN_RADIUS_M", 80)
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", legacy_radius_m)
+    monkeypatch.setattr(api, "SITE_CHECK_IN_RADIUS_M", site_radius_m)
     monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
     monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
     monkeypatch.setattr(
@@ -409,13 +418,21 @@ def test_readiness_separates_unscoped_clock_in_and_clock_out_radii(
     site_geofence = next(
         row["geofence"] for row in payload["locations"] if row["id"] == site_id
     )
-    assert site_geofence["clockBoundaryUnscopedClockInRadiusM"] == 80
-    assert site_geofence["clockBoundaryUnscopedClockOutRadiusM"] == 35
-    assert site_geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] is None
+    assert site_geofence["clockBoundaryUnscopedClockInRadiusM"] == max(
+        site_radius_m, legacy_radius_m
+    )
+    assert site_geofence["clockBoundaryUnscopedClockOutRadiusM"] == legacy_radius_m
+    assert (
+        site_geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"]
+        == expected_singular_site_radius_m
+    )
     home_base_geofence = payload["homeBases"][0]["geofence"]
-    assert home_base_geofence["clockBoundaryUnscopedClockInRadiusM"] == 80
-    assert home_base_geofence["clockBoundaryUnscopedClockOutRadiusM"] == 80
-    assert home_base_geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] == 80
+    assert home_base_geofence["clockBoundaryUnscopedClockInRadiusM"] == site_radius_m
+    assert home_base_geofence["clockBoundaryUnscopedClockOutRadiusM"] == site_radius_m
+    assert (
+        home_base_geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"]
+        == site_radius_m
+    )
 
 
 def test_c6_individual_scope_defaults_off_without_a_scope_row(client, monkeypatch):
