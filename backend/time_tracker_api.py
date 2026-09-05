@@ -18024,6 +18024,11 @@ def clock_out(
             and provisional_resolution.get("state") == "customer_site"
         )
 
+        c3_customer_site = bool(
+            provisional_resolution
+            and provisional_resolution.get("state") == "customer_site"
+        )
+
         # A shift that STARTED under Home Base evidence owes its end event even
         # if the employee is no longer covered by any crew. Current GPS at Home
         # Base satisfies that; otherwise an exception is required.
@@ -18204,6 +18209,48 @@ def clock_out(
                 status_code=409,
                 detail=_public_timesheet_mutation_failure(hard_gate_failure),
             )
+
+        if home_base["policy"] and home_base["exception"]:
+            # A documented non-gated dispatch exception remains internal Home
+            # Base evidence even when C3 sees a customer Site or an unready
+            # boundary. Restore the legacy GPS metadata built by the mutator;
+            # the exception must never be reclassified as customer work.
+            snapshot = site_resolution.get("gpsMetaSnapshot")
+            if isinstance(snapshot, dict):
+                if snapshot.get("present"):
+                    result["clockOutGpsMeta"] = snapshot.get("value")
+                else:
+                    result.pop("clockOutGpsMeta", None)
+            site_resolution["resolution"] = {
+                "state": "unresolved",
+                "reason": "home_base_exception",
+            }
+            return
+
+        # The locked resolver, not the provisional browser-time read, owns the
+        # final Home Base confirmation. Clear every stale Home Base artifact
+        # before applying a non-Home-Base result or considering legacy fallback.
+        if current_resolution.get("state") != "home_base":
+            home_base.update(
+                {
+                    "policy": None,
+                    "geofence": None,
+                    "confirmed": False,
+                }
+            )
+            if (
+                not final_action_scope["effective"]
+                and not final_legacy_c6_end_bypass
+                and home_base["started_under"]
+                and not home_base["exception"]
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=_home_base_requirement_failure(
+                        home_base["started_under"],
+                        "clocking out",
+                    ),
+                )
 
         if home_base["policy"] and home_base["exception"]:
             # A documented non-gated dispatch exception remains internal Home
@@ -20449,6 +20496,37 @@ def _c3_legacy_match_contains_site(row: Dict[str, Any], payload: BaseModel) -> b
     return geofence["status"] == "inside"
 
 
+def _c3_legacy_nearest_location_row(
+    rows: List[Dict[str, Any]],
+    payload: BaseModel,
+) -> Optional[Dict[str, Any]]:
+    """Return the active row the legacy nearest-pin matcher would select."""
+
+    latitude = getattr(payload, "latitude", None)
+    longitude = getattr(payload, "longitude", None)
+    if latitude is None or longitude is None:
+        return None
+    location_coords: Dict[str, Dict[str, float]] = {}
+    rows_by_address: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if not row.get("active") or row.get("lat") is None or row.get("lng") is None:
+            continue
+        address = str(row.get("address") or "")
+        location_coords[address] = {
+            "lat": float(row["lat"]),
+            "lng": float(row["lng"]),
+        }
+        rows_by_address[address] = row
+    nearest = find_nearest_location_match(
+        float(latitude),
+        float(longitude),
+        {"location_coords": location_coords},
+    )
+    if not nearest or not nearest["withinRadius"]:
+        return None
+    return rows_by_address.get(str(nearest["location"]))
+
+
 def _c3_clock_boundary_override_error(
     timesheet_data: Dict[str, Any],
     payload: BaseModel,
@@ -20669,6 +20747,38 @@ def _c3_resolve_site(
             }
         selected = eligible_rows[0] if eligible_rows else None
         if selected is None:
+            if (
+                action in {"clock-in", "clock-out"}
+                and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            ):
+                nearby_rows = _c3_customer_site_rows(
+                    payload,
+                    action=action,
+                    selected_location_id=None,
+                    cur=cur,
+                )
+                legacy_match = _c3_legacy_nearest_location_row(
+                    nearby_rows,
+                    payload,
+                )
+                if legacy_match and _location_commercial_clock_boundary_eligible(
+                    legacy_match
+                ):
+                    if not _c3_location_geofence_state(legacy_match).get("ready"):
+                        return {
+                            "state": "unresolved",
+                            "reason": "commercial_site_unready",
+                        }
+                    if (
+                        _c3_site_geofence(legacy_match, payload, action=action).get(
+                            "status"
+                        )
+                        != "inside"
+                    ):
+                        return {
+                            "state": "unresolved",
+                            "reason": "clock_boundary_outside",
+                        }
             return {
                 "state": "unresolved",
                 "reason": "selected_site_legacy_only",
@@ -21410,6 +21520,7 @@ def _c6_target_decision(
     elif resolution.get("reason") == "missing_gps":
         reason = "missing_gps"
     elif resolution.get("reason") in {
+        "selected_site_unready",
         "home_base_unready",
         "commercial_site_unready",
         "uncertain",
@@ -21446,7 +21557,7 @@ def _c6_hard_gate_failure(
         "selected_site_ineligible": "The selected customer Site is not eligible for this action. Choose a current Site and try again.",
         "selected_site_unready": "The selected Commercial Site is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
         "commercial_site_unready": "This Commercial Site is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
-        "home_base_unready": "Home Base is not ready for clock verification. Ask an administrator to attest its current geofence before retrying.",
+        "home_base_unready": "Home Base is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
     }
     return {
         "code": GEOFENCE_HARD_GATE_BLOCK_CODE,

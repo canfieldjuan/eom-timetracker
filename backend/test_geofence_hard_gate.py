@@ -1456,7 +1456,7 @@ def test_commercial_home_base_clock_boundary_reports_unready_home_base(
     failure = _hard_gate_failure(attempted)
     assert failure["details"]["reason"] == "home_base_unready"
     assert failure["details"]["retryable"] is False
-    assert "administrator to attest" in failure["error"]
+    assert "administrator to repair" in failure["error"]
 
 
 def test_non_gated_home_base_exception_survives_unready_clock_boundary(
