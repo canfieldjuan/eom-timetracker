@@ -2763,7 +2763,10 @@ def test_occurrence_moved_outside_list_window_is_targeted_and_updated(retired_pl
     FakeGoogleClient.occurrences = [original]
     approve_current_preview(retired_planner_client, auth)
 
-    moved_start = WINDOW_START + timedelta(days=45)
+    moved_start = max(
+        WINDOW_START + timedelta(days=45),
+        datetime.now(UTC).replace(microsecond=0) + timedelta(days=1),
+    )
     moved = google_occurrence(
         "moved-instance-v2",
         start=moved_start,

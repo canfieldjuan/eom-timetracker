@@ -114,6 +114,7 @@ def _create_site(
     longitude: float | None = LONGITUDE,
     ready: bool = True,
     location_type: str = "Residential",
+    geofence_radius_m: int | None = None,
 ) -> int:
     customer_name = f"{PREFIX} Customer {suffix}"
     customer = db.query_one(
@@ -125,8 +126,8 @@ def _create_site(
         """
         INSERT INTO locations (
             customer_id, address, customer_name, location_type, lat, lng,
-            pin_provenance, pin_confidence
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            pin_provenance, pin_confidence, geofence_radius_m
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
@@ -138,6 +139,7 @@ def _create_site(
             longitude,
             "gps_capture" if ready else None,
             "high" if ready else None,
+            geofence_radius_m,
         ),
     )
     assert site
@@ -283,6 +285,100 @@ def test_c6_defaults_off_and_preserves_legacy_override(client, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert response.json()["entry"]["clockInGpsMeta"]["override"] is True
+
+
+@pytest.mark.parametrize("location_type", ["Commercial", "Residential"])
+def test_effective_gate_reports_shared_radius_separately_from_legacy_fallback(
+    client,
+    auth,
+    monkeypatch,
+    location_type,
+):
+    employee_id, employee_auth = _create_employee(client, "shared radius compatibility")
+    crew_id = _create_crew(employee_id, "shared radius compatibility crew")
+    site_id = _create_site(
+        "shared radius compatibility",
+        location_type=location_type,
+        geofence_radius_m=15,
+    )
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        False,
+    )
+    _enable_scope(client, auth, crew_id)
+    outside_latitude, outside_longitude = _destination(30)
+
+    outside_response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": outside_latitude,
+            "longitude": outside_longitude,
+            "accuracy": 1,
+        },
+    )
+
+    assert outside_response.status_code == 409, outside_response.text
+    latitude, longitude = _destination(10)
+
+    response = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": latitude,
+            "longitude": longitude,
+            "accuracy": 5,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    row = api._c3_customer_site_rows(
+        api.ClockInRequest(
+            locationId=site_id,
+            latitude=latitude,
+            longitude=longitude,
+            accuracy=1,
+        ),
+        action="clock-in",
+        selected_location_id=site_id,
+    )[0]
+    geofence = api._c3_location_geofence_state(row)
+    assert geofence["clockBoundaryEffectiveRadiusM"] == 15
+    assert geofence["clockBoundaryRadiusSource"] == "per_site"
+    assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
+    assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] == 50
+
+
+def test_home_base_clock_telemetry_never_uses_the_legacy_site_matcher(
+    monkeypatch,
+):
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        False,
+    )
+    monkeypatch.setattr(api, "LOCATION_MATCH_RADIUS_M", 50)
+
+    geofence = api._home_base_geofence_state(
+        {
+            "home_base_id": 9001,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "geofence_radius_m": 15,
+            "active": True,
+        }
+    )
+
+    assert geofence["clockBoundaryEffectiveRadiusM"] == 15
+    assert geofence["clockBoundaryRadiusSource"] == "per_site"
+    assert geofence["clockBoundaryPerSiteRadiusEnabled"] is True
+    assert geofence["clockBoundaryUnscopedLegacyFallbackRadiusM"] is None
 
 
 def test_c6_individual_scope_defaults_off_without_a_scope_row(client, monkeypatch):
@@ -571,6 +667,122 @@ def test_commercial_home_base_clock_boundary_keeps_unready_commercial_sites_out(
     assert _hard_gate_failure(attempted)["details"]["reason"] == (
         "selected_site_unready"
     )
+    assert _hard_gate_failure(attempted)["details"]["retryable"] is False
+
+    automatic = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert automatic.status_code == 409, automatic.text
+    automatic_failure = _hard_gate_failure(automatic)
+    assert automatic_failure["details"]["reason"] == "commercial_site_unready"
+    assert automatic_failure["details"]["retryable"] is False
+    assert "administrator to repair" in automatic_failure["error"]
+
+
+def test_commercial_home_base_clock_boundary_reports_unready_home_base(
+    client,
+    auth,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "unready home base")
+    _create_site(
+        "unready home base commercial",
+        location_type="Commercial",
+    )
+    home_base_id = _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+    db.execute(
+        """
+        UPDATE home_bases
+        SET pin_attested_at = NULL,
+            pin_attestation_fingerprint = NULL
+        WHERE id = %s
+        """,
+        (home_base_id,),
+    )
+
+    attempted = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert attempted.status_code == 409, attempted.text
+    failure = _hard_gate_failure(attempted)
+    assert failure["details"]["reason"] == "home_base_unready"
+    assert failure["details"]["retryable"] is False
+    assert "administrator to repair" in failure["error"]
+
+
+def test_non_gated_home_base_exception_survives_unready_clock_boundary(
+    client,
+    auth,
+    monkeypatch,
+):
+    employee_id, employee_auth = _create_employee(client, "unready home exception")
+    home_base_id = _configure_ready_home_base(client, auth)
+    db.execute(
+        "UPDATE home_bases SET geofence_radius_m = 15 WHERE id = %s",
+        (home_base_id,),
+    )
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    exception_payload = {
+        "homeBaseExceptionReason": "Office entry was inaccessible.",
+        "latitude": LATITUDE + 0.02,
+        "longitude": LONGITUDE,
+        "accuracy": 5,
+        "gpsOverrideReason": "Supervisor approved dispatch exception.",
+        "gpsOverrideDetail": "The office entry could not be used.",
+    }
+
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=exception_payload,
+    )
+    assert started.status_code == 200, started.text
+    assert started.json()["entry"]["location"] == "Dispatch exception"
+    assert started.json()["siteResolution"] == {
+        "state": "unresolved",
+        "reason": "home_base_exception",
+    }
+
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json=exception_payload,
+    )
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["siteResolution"] == {
+        "state": "unresolved",
+        "reason": "home_base_exception",
+    }
+    assert db.query_all(
+        "SELECT action, outcome FROM home_base_events "
+        "WHERE employee_id = %s ORDER BY action",
+        (employee_id,),
+    ) == [
+        {"action": "end", "outcome": "exception"},
+        {"action": "start", "outcome": "exception"},
+    ]
 
 
 def test_commercial_home_base_clock_boundary_requires_exact_choice_for_overlaps(
@@ -1022,7 +1234,18 @@ def test_c6_never_traps_departure_or_clock_out_when_scope_is_effective(
     crew_id = _create_crew(employee_id, "end actions crew")
     site_id = _create_site("end actions")
     monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
     _enable_scope(client, auth, crew_id)
+    current_status = client.get(
+        "/api/timesheet/current-status",
+        headers=employee_auth,
+    )
+    assert current_status.status_code == 200, current_status.text
+    assert current_status.json()["clockOutSiteResolutionRequired"] is False
 
     clocked_in = client.post(
         "/api/timesheet/clock-in",
@@ -1236,6 +1459,144 @@ def test_commercial_home_base_boundary_uses_final_customer_site_for_end_event(
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM home_base_events WHERE shift_id = %s",
         (int(result["entry"]["id"]),),
+    ) == {"count": 0}
+
+
+def test_clock_out_rejects_a_stale_provisional_home_base_confirmation(
+    client,
+    auth,
+    monkeypatch,
+):
+    """A final Home Base move invalidates its provisional end confirmation."""
+
+    employee_id, employee_auth = _create_employee(client, "stale office end")
+    start_site_id = _create_site(
+        "stale office end start",
+        location_type="Commercial",
+    )
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": start_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    original_resolver = api._c3_resolve_site
+    clock_out_resolutions = 0
+
+    def move_home_base_after_provisional_resolution(action, *args, **kwargs):
+        nonlocal clock_out_resolutions
+        resolution = original_resolver(action, *args, **kwargs)
+        if action == "clock-out":
+            clock_out_resolutions += 1
+            if clock_out_resolutions == 1:
+                assert resolution["state"] == "home_base"
+                db.execute(
+                    "UPDATE home_bases SET latitude = %s WHERE active = true",
+                    (LATITUDE + 0.3,),
+                )
+        return resolution
+
+    monkeypatch.setattr(
+        api,
+        "_c3_resolve_site",
+        move_home_base_after_provisional_resolution,
+    )
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert ended.status_code == 400, ended.text
+    assert clock_out_resolutions == 2
+    assert "nearest saved site" in ended.text
+    assert db.query_one(
+        "SELECT clock_out FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"clock_out": None}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events "
+        "WHERE shift_id = %s AND action = 'end'",
+        (int(started.json()["entry"]["id"]),),
+    ) == {"count": 0}
+
+
+def test_clock_in_rejects_a_stale_provisional_home_base_confirmation(
+    client,
+    auth,
+    monkeypatch,
+):
+    """A final Home Base move invalidates its provisional start confirmation."""
+
+    employee_id, employee_auth = _create_employee(client, "stale office start")
+    _create_site("stale office start fallback", location_type="Commercial")
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    original_resolver = api._c3_resolve_site
+    clock_in_resolutions = 0
+
+    def move_home_base_after_provisional_resolution(action, *args, **kwargs):
+        nonlocal clock_in_resolutions
+        resolution = original_resolver(action, *args, **kwargs)
+        if action == "clock-in":
+            clock_in_resolutions += 1
+            if clock_in_resolutions == 1:
+                assert resolution["state"] == "home_base"
+                db.execute(
+                    "UPDATE home_bases SET latitude = %s WHERE active = true",
+                    (LATITUDE + 0.3,),
+                )
+        return resolution
+
+    monkeypatch.setattr(
+        api,
+        "_c3_resolve_site",
+        move_home_base_after_provisional_resolution,
+    )
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert started.status_code == 400, started.text
+    assert clock_in_resolutions == 2
+    assert "nearest saved site" in started.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE action = 'start'"
     ) == {"count": 0}
 
 

@@ -185,6 +185,66 @@ def test_per_site_radius_isolates_from_fallback_change(monkeypatch):
     assert fp_a == fp_b  # an explicit per-site radius ignores the global fallback
 
 
+def test_readiness_reports_configured_and_effective_clock_radius(monkeypatch):
+    row = _synthetic_location_row(geofence_radius_m=250)
+    monkeypatch.setattr(t, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        t,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+
+    state = t._location_geofence_state(row)
+
+    assert state["geofenceRadiusM"] == 250
+    assert state["resolvedRadiusM"] == 250
+    assert state["radiusSource"] == "per_site"
+    assert state["clockBoundaryEffectiveRadiusM"] == 250
+    assert state["clockBoundaryRadiusSource"] == "per_site"
+    assert state["clockBoundaryPerSiteRadiusEnabled"] is True
+
+
+def test_readiness_separates_residential_strict_and_legacy_clock_radii(monkeypatch):
+    row = _synthetic_location_row(
+        geofence_radius_m=250,
+        location_type="Residential",
+    )
+    monkeypatch.setattr(t, "SITE_CHECK_IN_RADIUS_M", 50)
+    monkeypatch.setattr(t, "LOCATION_MATCH_RADIUS_M", 80)
+    monkeypatch.setattr(t, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(t, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        t,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+
+    state = t._location_geofence_state(row)
+
+    assert state["geofenceRadiusM"] == 250
+    assert state["clockBoundaryEffectiveRadiusM"] == 50
+    assert state["clockBoundaryRadiusSource"] == "global_fallback"
+    assert state["clockBoundaryPerSiteRadiusEnabled"] is False
+    assert state["clockBoundaryUnscopedLegacyFallbackRadiusM"] == 80
+
+
+def test_readiness_reports_shared_radius_for_broad_residential_resolution(monkeypatch):
+    row = _synthetic_location_row(
+        geofence_radius_m=250,
+        location_type="Residential",
+    )
+    monkeypatch.setattr(t, "LOCATION_MATCH_RADIUS_M", 50)
+    monkeypatch.setattr(t, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(t, "GEOFENCE_PER_SITE_RADIUS_ENABLED", True)
+
+    state = t._location_geofence_state(row)
+
+    assert state["clockBoundaryEffectiveRadiusM"] == 250
+    assert state["clockBoundaryRadiusSource"] == "per_site"
+    assert state["clockBoundaryPerSiteRadiusEnabled"] is True
+    assert state["clockBoundaryUnscopedLegacyFallbackRadiusM"] == 50
+
+
 def _attested_row(**overrides):
     """A synthetic row whose stored fingerprint matches its current geometry."""
     row = _synthetic_location_row(**overrides)

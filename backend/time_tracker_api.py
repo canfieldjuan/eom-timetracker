@@ -301,6 +301,12 @@ SITE_CHECK_IN_MAX_ACCURACY_M = SITE_CHECK_IN_MAX_ACCURACY_DEFAULT_M
 # switch: it only chooses WHICH radius the evaluator uses, never whether an action
 # is gated. Env-resolved below.
 GEOFENCE_PER_SITE_RADIUS_ENABLED = False
+# Clock boundaries have a separate rollout switch so configured Commercial and
+# Home Base radii can govern clock-in/out without also widening Residential,
+# visit, or Site-QR arrival/departure behavior. At runtime this defaults to the
+# shared flag for backward compatibility with deployments that already enabled
+# per-site radii before the split.
+GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED = False
 # Geofence C3 (#215): resolution ships dormant. It may associate a confirmed
 # Site, but it cannot deny an unresolved clock action before C6.
 GEOFENCE_SITE_RESOLUTION_ENABLED = False
@@ -521,6 +527,8 @@ def _site_check_in_coordinate_bounds(
     latitude: float,
     longitude: float,
     accuracy: float,
+    *,
+    max_effective_radius_m: Optional[int] = None,
 ) -> Tuple[float, float, float, float, bool]:
     """Return a conservative SQL bounding box for a site-check-in geofence.
 
@@ -532,7 +540,11 @@ def _site_check_in_coordinate_bounds(
     # under the current enforcement gate, so it stays a conservative superset of the
     # exact haversine circle for every per-site radius. Gate OFF -> this equals the
     # global radius, so the box is byte-for-byte identical to pre-C2.
-    envelope_m = float(_max_effective_geofence_radius_m()) + max(float(accuracy), 0.0)
+    envelope_m = float(
+        _max_effective_geofence_radius_m()
+        if max_effective_radius_m is None
+        else max_effective_radius_m
+    ) + max(float(accuracy), 0.0)
     # This is intentionally lower than a degree's distance under the same
     # spherical radius used by ``haversine_m``.  Dividing by the lower value
     # makes the box a superset instead of allowing a boundary point to fall
@@ -4770,6 +4782,20 @@ SITE_CHECK_IN_MAX_ACCURACY_M = max(
 # Geofence C2 (#214): per-site-radius rollout switch, default OFF (see constant above).
 GEOFENCE_PER_SITE_RADIUS_ENABLED = parse_bool(
     os.getenv("GEOFENCE_PER_SITE_RADIUS_ENABLED"), False
+)
+
+
+def _clock_boundary_per_site_radius_enabled_from_env() -> bool:
+    """Resolve the independently managed clock-boundary rollout switch."""
+
+    return parse_bool(
+        os.getenv("GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED"),
+        False,
+    )
+
+
+GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED = (
+    _clock_boundary_per_site_radius_enabled_from_env()
 )
 # Geofence C3 (#215): resolution is separate from C6's hard gate and stays
 # disabled in production until an approved later rollout turns it on.
@@ -10125,6 +10151,8 @@ def _active_home_base_config(*, cur: Optional[Any] = None) -> Optional[Dict[str,
 def _home_base_geofence_from_payload(
     policy: Optional[Dict[str, Any]],
     payload: Optional[BaseModel],
+    *,
+    clock_boundary: bool = False,
 ) -> Optional[Dict[str, Any]]:
     if not policy or payload is None:
         return None
@@ -10133,9 +10161,12 @@ def _home_base_geofence_from_payload(
     accuracy = getattr(payload, "accuracy", None)
     if latitude is None or longitude is None or accuracy is None:
         return None
-    resolved_radius_m, radius_source = _effective_geofence_radius(
-        policy.get("geofence_radius_m")
+    radius_resolver = (
+        _clock_boundary_effective_geofence_radius
+        if clock_boundary
+        else _effective_geofence_radius
     )
+    resolved_radius_m, radius_source = radius_resolver(policy.get("geofence_radius_m"))
     return evaluate_site_check_in_geofence(
         site_latitude=(
             float(policy["latitude"])
@@ -17332,6 +17363,7 @@ def clock_in(
         home_base["geofence"] = _home_base_geofence_from_payload(
             home_base["policy"],
             payload,
+            clock_boundary=True,
         )
         home_base["confirmed"] = _home_base_gps_confirmed(home_base["geofence"])
         # The scope check is inside the timesheet writer lock. Scope flips take
@@ -17340,8 +17372,22 @@ def clock_in(
         hard_gate.clear()
         hard_gate.update(_c6_employee_scope_state(employee["id"], now_utc))
         hard_gate_action = _c6_action_scope_state(hard_gate, "clock-in")
-        site_resolution["enabled"] = bool(
-            GEOFENCE_SITE_RESOLUTION_ENABLED or hard_gate_action["effective"]
+        clock_in_target_policy = _c3_action_resolution_target_policy(
+            "clock-in",
+            hard_gate_action,
+        )
+        if (
+            home_base["confirmed"]
+            and _c3_clock_boundary_constraints_required(
+                "clock-in",
+                clock_in_target_policy,
+            )
+            and not _home_base_geofence_state(home_base["policy"]).get("ready")
+        ):
+            home_base["confirmed"] = False
+        site_resolution["enabled"] = _c3_action_resolution_enabled(
+            "clock-in",
+            hard_gate_action,
         )
         # Under an effective hard gate, self-service exception text stays in
         # the request/audit trail but cannot redefine this clock-in as dispatch.
@@ -17368,10 +17414,7 @@ def clock_in(
                 payload,
                 employee,
                 reference_time=now_utc,
-                target_policy=str(
-                    hard_gate_action["targetPolicy"]
-                    or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
-                ),
+                target_policy=clock_in_target_policy,
             )
             site_resolution["resolution"] = provisional_resolution
 
@@ -17399,12 +17442,14 @@ def clock_in(
             and not home_base["confirmed"]
             and not c3_customer_site
         ):
-            override_error = require_gps_override(
+            override_error = _c3_clock_boundary_override_error(
                 timesheet_data,
-                payload.latitude,
-                payload.longitude,
-                payload.gpsOverrideReason,
-                payload.gpsOverrideDetail,
+                payload,
+                (
+                    None
+                    if home_base["policy"] and home_base["exception"]
+                    else provisional_resolution
+                ),
             )
             if override_error:
                 return False, override_error
@@ -17534,20 +17579,10 @@ def clock_in(
             employee["id"], now_utc, cur
         )
         final_action_scope = _c6_action_scope_state(final_scope, "clock-in")
-        site_resolution["enabled"] = bool(
-            GEOFENCE_SITE_RESOLUTION_ENABLED or final_action_scope["effective"]
-        )
-        hard_gate_failure = _c6_hard_gate_failure_if_needed(
+        site_resolution["enabled"] = _c3_action_resolution_enabled(
             "clock-in",
-            payload,
-            employee,
-            final_scope,
-            reference_time=now_utc,
-            cur=cur,
+            final_action_scope,
         )
-        if hard_gate_failure:
-            raise HTTPException(status_code=409, detail=hard_gate_failure)
-
         snapshot = site_resolution.get("snapshot")
         if not site_resolution["enabled"]:
             if isinstance(snapshot, dict):
@@ -17556,8 +17591,6 @@ def clock_in(
                     snapshot,
                     gps_meta_key="clockInGpsMeta",
                 )
-            return
-        if not isinstance(snapshot, dict):
             return
         # The candidate query's row locks cannot cover a Site created or moved
         # into the GPS envelope after the query begins.  Use the same
@@ -17570,12 +17603,68 @@ def clock_in(
             employee,
             cur=cur,
             reference_time=now_utc,
-            target_policy=str(
-                final_action_scope["targetPolicy"]
-                or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+            target_policy=_c3_action_resolution_target_policy(
+                "clock-in",
+                final_action_scope,
             ),
         )
         site_resolution["resolution"] = current_resolution
+        hard_gate_failure = _c6_hard_gate_failure_if_needed(
+            "clock-in",
+            payload,
+            employee,
+            final_scope,
+            reference_time=now_utc,
+            cur=cur,
+            resolution=current_resolution,
+        )
+        if hard_gate_failure:
+            raise HTTPException(status_code=409, detail=hard_gate_failure)
+
+        if current_resolution.get("state") == "home_base":
+            home_base_config = current_resolution.get("homeBase")
+            geofence = current_resolution.get("geofence")
+            if not isinstance(home_base_config, dict) or not isinstance(geofence, dict):
+                raise RuntimeError("Clock-in Home Base resolution was incomplete")
+            home_base.update(
+                {
+                    "policy": home_base_config,
+                    "geofence": geofence,
+                    "confirmed": True,
+                    "exception": "",
+                }
+            )
+            result["location"] = f"Home Base — {home_base_config['label']}"
+            result["locationId"] = None
+            result["internalHomeBase"] = True
+            result["clockInGpsMeta"] = _home_base_gps_meta(
+                home_base_config,
+                geofence,
+            )
+            return
+
+        if home_base["policy"] and home_base["exception"]:
+            # A documented non-gated dispatch exception remains internal Home
+            # Base evidence when final C3 resolution sees another target, but
+            # valid locked Home Base GPS above still takes precedence.
+            site_resolution["resolution"] = {
+                "state": "unresolved",
+                "reason": "home_base_exception",
+            }
+            return
+
+        # Any non-Home-Base final result invalidates provisional dispatch
+        # classification and evidence before Site application or fallback.
+        home_base.update(
+            {
+                "policy": None,
+                "geofence": None,
+                "confirmed": False,
+                "exception": "",
+            }
+        )
+        result.pop("internalHomeBase", None)
+        result.pop("locationId", None)
         if current_resolution.get("state") == "customer_site":
             _c3_apply_site_resolution(
                 result,
@@ -17587,24 +17676,69 @@ def clock_in(
             # C3 remains association-only outside C6. Under an effective C6
             # scope the authoritative check above already rejected every
             # non-inside target, so no free-text fallback can become a bypass.
+            legacy_fallback_rechecked = False
             if (
                 not final_action_scope["effective"]
                 and current_resolution.get("state") != "home_base"
             ):
-                override_error = require_gps_override(
+                override_error = _c3_clock_boundary_override_error(
+                    _timesheet_data,
+                    payload,
+                    (
+                        None
+                        if home_base["policy"] and home_base["exception"]
+                        else current_resolution
+                    ),
+                    cur=(
+                        cur
+                        if GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+                        else None
+                    ),
+                )
+                if override_error:
+                    raise HTTPException(status_code=400, detail=override_error)
+                legacy_fallback_rechecked = True
+            if legacy_fallback_rechecked:
+                matched = find_nearest_location(
+                    payload.latitude,
+                    payload.longitude,
+                    _timesheet_data,
+                )
+                result["location"] = (
+                    matched
+                    or payload.location.strip()
+                    or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+                )
+                result["customer"] = _resolve_customer(
+                    result["location"],
+                    _timesheet_data.get("location_customers", {}),
+                )
+            elif isinstance(snapshot, dict):
+                _c3_restore_target(
+                    result,
+                    snapshot,
+                    gps_meta_key="clockInGpsMeta",
+                )
+            else:
+                matched = find_nearest_location(
+                    payload.latitude,
+                    payload.longitude,
+                    _timesheet_data,
+                )
+                result["location"] = (
+                    matched
+                    or payload.location.strip()
+                    or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+                )
+            if legacy_fallback_rechecked:
+                result["clockInGpsMeta"] = build_gps_meta(
                     _timesheet_data,
                     payload.latitude,
                     payload.longitude,
                     payload.gpsOverrideReason,
                     payload.gpsOverrideDetail,
+                    payload.accuracy,
                 )
-                if override_error:
-                    raise HTTPException(status_code=400, detail=override_error)
-            _c3_restore_target(
-                result,
-                snapshot,
-                gps_meta_key="clockInGpsMeta",
-            )
 
     def record_home_base_event(
         cur: Any,
@@ -17718,9 +17852,16 @@ def clock_out(
         hard_gate.update(_c6_employee_scope_state(employee["id"], now_utc))
         hard_gate_action = _c6_action_scope_state(hard_gate, "clock-out")
         legacy_c6_end_bypass = bool(
-            hard_gate["effective"] and not hard_gate_action["effective"]
+            hard_gate_action.get("legacyC6EndBypass")
         )
-        site_resolution["enabled"] = bool(hard_gate_action["effective"])
+        clock_out_target_policy = _c3_action_resolution_target_policy(
+            "clock-out",
+            hard_gate_action,
+        )
+        site_resolution["enabled"] = _c3_action_resolution_enabled(
+            "clock-out",
+            hard_gate_action,
+        )
         home_base["exception"] = (
             "" if hard_gate_action["effective"] else home_base_exception
         )
@@ -17731,8 +17872,18 @@ def clock_out(
         home_base["geofence"] = _home_base_geofence_from_payload(
             home_base["policy"],
             payload,
+            clock_boundary=True,
         )
         home_base["confirmed"] = _home_base_gps_confirmed(home_base["geofence"])
+        if (
+            home_base["confirmed"]
+            and _c3_clock_boundary_constraints_required(
+                "clock-out",
+                clock_out_target_policy,
+            )
+            and not _home_base_geofence_state(home_base["policy"]).get("ready")
+        ):
+            home_base["confirmed"] = False
 
         stale_open = get_stale_open_entry(
             timesheet_data["entries"], employee["id"], now_utc
@@ -17744,13 +17895,13 @@ def clock_out(
             return False, "Not currently clocked in"
 
         provisional_resolution: Optional[Dict[str, Any]] = None
-        if hard_gate_action["effective"]:
+        if site_resolution["enabled"]:
             provisional_resolution = _c3_resolve_site(
                 "clock-out",
                 gate_payload,
                 employee,
                 reference_time=now_utc,
-                target_policy=str(hard_gate_action["targetPolicy"]),
+                target_policy=clock_out_target_policy,
             )
             site_resolution["resolution"] = provisional_resolution
             hard_gate_failure = _c6_hard_gate_failure_if_needed(
@@ -17763,6 +17914,11 @@ def clock_out(
             )
             if hard_gate_failure:
                 return False, hard_gate_failure
+
+        c3_customer_site = bool(
+            provisional_resolution
+            and provisional_resolution.get("state") == "customer_site"
+        )
 
         # A shift that STARTED under Home Base evidence owes its end event even
         # if the employee is no longer covered by any crew. Current GPS at Home
@@ -17790,13 +17946,16 @@ def clock_out(
             not home_base["confirmed"]
             and not hard_gate_action["effective"]
             and not legacy_c6_end_bypass
+            and not c3_customer_site
         ):
-            override_error = require_gps_override(
+            override_error = _c3_clock_boundary_override_error(
                 timesheet_data,
-                payload.latitude if payload else None,
-                payload.longitude if payload else None,
-                payload.gpsOverrideReason if payload else "",
-                payload.gpsOverrideDetail if payload else "",
+                gate_payload,
+                (
+                    None
+                    if home_base["policy"] and home_base["exception"]
+                    else provisional_resolution
+                ),
             )
             if override_error:
                 return False, override_error
@@ -17892,8 +18051,14 @@ def clock_out(
 
         final_scope = _c6_authoritative_scope_state(employee["id"], now_utc, cur)
         final_action_scope = _c6_action_scope_state(final_scope, "clock-out")
-        site_resolution["enabled"] = bool(final_action_scope["effective"])
-        if not final_action_scope["effective"]:
+        final_legacy_c6_end_bypass = bool(
+            final_action_scope.get("legacyC6EndBypass")
+        )
+        site_resolution["enabled"] = _c3_action_resolution_enabled(
+            "clock-out",
+            final_action_scope,
+        )
+        if not site_resolution["enabled"]:
             snapshot = site_resolution.get("gpsMetaSnapshot")
             if isinstance(snapshot, dict):
                 if snapshot.get("present"):
@@ -17902,13 +18067,17 @@ def clock_out(
                     result.pop("clockOutGpsMeta", None)
             return
 
+        _lock_customer_site_mutations(cur)
         current_resolution = _c3_resolve_site(
             "clock-out",
             gate_payload,
             employee,
             cur=cur,
             reference_time=now_utc,
-            target_policy=str(final_action_scope["targetPolicy"]),
+            target_policy=_c3_action_resolution_target_policy(
+                "clock-out",
+                final_action_scope,
+            ),
         )
         site_resolution["resolution"] = current_resolution
         hard_gate_failure = _c6_hard_gate_failure_if_needed(
@@ -17922,6 +18091,48 @@ def clock_out(
         )
         if hard_gate_failure:
             raise HTTPException(status_code=409, detail=hard_gate_failure)
+
+        if home_base["policy"] and home_base["exception"]:
+            # A documented non-gated dispatch exception remains internal Home
+            # Base evidence even when C3 sees a customer Site or an unready
+            # boundary. Restore the legacy GPS metadata built by the mutator;
+            # the exception must never be reclassified as customer work.
+            snapshot = site_resolution.get("gpsMetaSnapshot")
+            if isinstance(snapshot, dict):
+                if snapshot.get("present"):
+                    result["clockOutGpsMeta"] = snapshot.get("value")
+                else:
+                    result.pop("clockOutGpsMeta", None)
+            site_resolution["resolution"] = {
+                "state": "unresolved",
+                "reason": "home_base_exception",
+            }
+            return
+
+        # The locked resolver, not the provisional browser-time read, owns the
+        # final Home Base confirmation. Clear every stale Home Base artifact
+        # before applying a non-Home-Base result or considering legacy fallback.
+        if current_resolution.get("state") != "home_base":
+            home_base.update(
+                {
+                    "policy": None,
+                    "geofence": None,
+                    "confirmed": False,
+                }
+            )
+            if (
+                not final_action_scope["effective"]
+                and not final_legacy_c6_end_bypass
+                and home_base["started_under"]
+                and not home_base["exception"]
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=_home_base_requirement_failure(
+                        home_base["started_under"],
+                        "clocking out",
+                    ),
+                )
 
         if current_resolution.get("state") == "customer_site":
             # The Home Base event is written after persistence.  Do not let
@@ -17957,6 +18168,35 @@ def clock_out(
             result["clockOutGpsMeta"] = _home_base_gps_meta(
                 home_base_config,
                 geofence,
+            )
+        elif (
+            not final_action_scope["effective"]
+            and not final_legacy_c6_end_bypass
+            and not home_base["confirmed"]
+        ):
+            override_error = _c3_clock_boundary_override_error(
+                _timesheet_data,
+                gate_payload,
+                (
+                    None
+                    if home_base["policy"] and home_base["exception"]
+                    else current_resolution
+                ),
+                cur=(
+                    cur
+                    if GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+                    else None
+                ),
+            )
+            if override_error:
+                raise HTTPException(status_code=400, detail=override_error)
+            result["clockOutGpsMeta"] = build_gps_meta(
+                _timesheet_data,
+                payload.latitude if payload else None,
+                payload.longitude if payload else None,
+                payload.gpsOverrideReason if payload else "",
+                payload.gpsOverrideDetail if payload else "",
+                payload.accuracy if payload else None,
             )
 
     def response_builder(
@@ -18123,10 +18363,9 @@ def resolve_customer_site(
     """
     scope = _c6_employee_scope_state(int(employee["id"]), utc_now())
     action_scope = _c6_action_scope_state(scope, payload.action)
-    resolution_enabled = (
-        bool(action_scope["effective"])
-        if payload.action == "clock-out"
-        else bool(GEOFENCE_SITE_RESOLUTION_ENABLED or action_scope["effective"])
+    resolution_enabled = _c3_action_resolution_enabled(
+        payload.action,
+        action_scope,
     )
     if not resolution_enabled:
         return {"success": True, "enabled": False}
@@ -18135,9 +18374,9 @@ def resolve_customer_site(
         payload,
         employee,
         reference_time=utc_now(),
-        target_policy=str(
-            action_scope["targetPolicy"]
-            or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+        target_policy=_c3_action_resolution_target_policy(
+            payload.action,
+            action_scope,
         ),
     )
     public_resolution = _c3_public_resolution(resolution)
@@ -19275,6 +19514,30 @@ def _effective_geofence_radius(configured_radius_m: Any) -> Tuple[int, str]:
     return int(resolved), source
 
 
+def _clock_boundary_effective_geofence_radius(
+    configured_radius_m: Any,
+) -> Tuple[int, str]:
+    """Resolve the radius used only by Commercial/Home Base clock boundaries.
+
+    The clock-specific switch is independently default-off. When it is enabled,
+    configured radii affect clock-in/out and Home Base start/end only; the
+    shared resolver above continues to govern visits, Residential behavior, and
+    Commercial Site QR arrival/departure.
+    """
+
+    # Turning the dedicated switch off must preserve the pre-slice resolver for
+    # an already-active hard gate.  In particular, a deployment that already
+    # enabled the shared per-site switch must not silently replace its
+    # Commercial/Home Base boundary with the global fallback merely because
+    # the independently-managed clock switch defaults off.
+    if not GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED:
+        return _effective_geofence_radius(configured_radius_m)
+    resolved, source = _resolve_geofence_radius_m(configured_radius_m)
+    if source == "per_site":
+        resolved = min(int(resolved), GEOFENCE_RADIUS_MAX_M)
+    return int(resolved), source
+
+
 def _max_effective_geofence_radius_m() -> int:
     """Largest radius any candidate can resolve to under the current C2 gate.
 
@@ -19284,6 +19547,14 @@ def _max_effective_geofence_radius_m() -> int:
     """
     if not GEOFENCE_PER_SITE_RADIUS_ENABLED:
         return int(SITE_CHECK_IN_RADIUS_M)
+    return max(int(SITE_CHECK_IN_RADIUS_M), GEOFENCE_RADIUS_MAX_M)
+
+
+def _max_clock_boundary_effective_geofence_radius_m() -> int:
+    """Largest radius the clock-boundary resolver can admit."""
+
+    if not GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED:
+        return _max_effective_geofence_radius_m()
     return max(int(SITE_CHECK_IN_RADIUS_M), GEOFENCE_RADIUS_MAX_M)
 
 
@@ -19345,6 +19616,56 @@ def geofence_geometry_fingerprint(**kwargs: Any) -> str:
     ).hexdigest()
 
 
+def _location_business_facts_eligible(
+    *,
+    location_type: Optional[str],
+    parent_linked: bool,
+    active: bool,
+    archived: bool,
+    parent_customer_active: Optional[bool],
+    parent_customer_archived: Optional[bool],
+) -> bool:
+    """Canonical facts shared by business eligibility and strict telemetry."""
+
+    return bool(
+        location_type in {"Residential", "Commercial"}
+        and active
+        and not archived
+        and (
+            not parent_linked
+            or (
+                parent_customer_active is True
+                and parent_customer_archived is False
+            )
+        )
+    )
+
+
+def _commercial_clock_boundary_facts_eligible(
+    *,
+    location_type: Optional[str],
+    parent_linked: bool,
+    active: bool,
+    archived: bool,
+    parent_customer_active: Optional[bool],
+    parent_customer_archived: Optional[bool],
+) -> bool:
+    """Canonical membership facts for the strict Commercial clock boundary."""
+
+    return bool(
+        location_type == "Commercial"
+        and parent_linked
+        and _location_business_facts_eligible(
+            location_type=location_type,
+            parent_linked=parent_linked,
+            active=active,
+            archived=archived,
+            parent_customer_active=parent_customer_active,
+            parent_customer_archived=parent_customer_archived,
+        )
+    )
+
+
 def _geofence_state(
     *,
     entity_type: str,
@@ -19373,6 +19694,67 @@ def _geofence_state(
     fingerprint input makes a previously-attested pin unready automatically.
     """
     resolved_radius_m, radius_source = _resolve_geofence_radius_m(configured_radius_m)
+    # Only canonical linked Commercial Sites and Home Base use the dedicated
+    # clock resolver.
+    # Residential uses the established shared resolver when broad C3 is active;
+    # otherwise its clock-only fallback remains the legacy nearest-pin matcher.
+    commercial_clock_boundary_eligible = _commercial_clock_boundary_facts_eligible(
+        location_type=location_type,
+        parent_linked=parent_linked,
+        active=active,
+        archived=archived,
+        parent_customer_active=parent_customer_active,
+        parent_customer_archived=parent_customer_archived,
+    )
+    location_business_eligible = bool(
+        entity_type == "location"
+        and _location_business_facts_eligible(
+            location_type=location_type,
+            parent_linked=parent_linked,
+            active=active,
+            archived=archived,
+            parent_customer_active=parent_customer_active,
+            parent_customer_archived=parent_customer_archived,
+        )
+    )
+    clock_boundary_applies = bool(
+        entity_type == "home_base" or commercial_clock_boundary_eligible
+    )
+    clock_boundary_unscoped_legacy_fallback_radius_m = None
+    if clock_boundary_applies:
+        (
+            clock_boundary_radius_m,
+            clock_boundary_radius_source,
+        ) = _clock_boundary_effective_geofence_radius(configured_radius_m)
+        clock_boundary_per_site_enabled = bool(
+            GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            or GEOFENCE_PER_SITE_RADIUS_ENABLED
+        )
+        # With only the shared rollout active, ordinary unscoped clock actions
+        # can still fall back to the legacy nearest-pin matcher after C3 fails
+        # to associate a Commercial Site. Keep that conditional compatibility
+        # radius separate from the strict boundary used by an effective C6
+        # scope; one "effective" value cannot truthfully represent both paths.
+        if (
+            not GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            and entity_type == "location"
+        ):
+            clock_boundary_unscoped_legacy_fallback_radius_m = int(
+                LOCATION_MATCH_RADIUS_M
+            )
+    elif location_business_eligible:
+        (
+            clock_boundary_radius_m,
+            clock_boundary_radius_source,
+        ) = _effective_geofence_radius(configured_radius_m)
+        clock_boundary_per_site_enabled = bool(GEOFENCE_PER_SITE_RADIUS_ENABLED)
+        clock_boundary_unscoped_legacy_fallback_radius_m = int(
+            LOCATION_MATCH_RADIUS_M
+        )
+    else:
+        clock_boundary_radius_m = int(LOCATION_MATCH_RADIUS_M)
+        clock_boundary_radius_source = "legacy_location_match"
+        clock_boundary_per_site_enabled = False
     max_accuracy_policy_m = int(SITE_CHECK_IN_MAX_ACCURACY_M)
     current_fingerprint = geofence_geometry_fingerprint(
         entity_type=entity_type,
@@ -19428,6 +19810,12 @@ def _geofence_state(
         ),
         "resolvedRadiusM": resolved_radius_m,
         "radiusSource": radius_source,
+        "clockBoundaryEffectiveRadiusM": clock_boundary_radius_m,
+        "clockBoundaryRadiusSource": clock_boundary_radius_source,
+        "clockBoundaryPerSiteRadiusEnabled": clock_boundary_per_site_enabled,
+        "clockBoundaryUnscopedLegacyFallbackRadiusM": (
+            clock_boundary_unscoped_legacy_fallback_radius_m
+        ),
         "maxAccuracyPolicyM": max_accuracy_policy_m,
         "pinProvenance": pin_provenance,
         "pinConfidence": pin_confidence,
@@ -19462,18 +19850,19 @@ def _location_business_eligible(row: Dict[str, Any]) -> bool:
     eligible. This derived predicate is shared by the readiness report and C3
     resolution so they cannot silently disagree about authorization.
     """
-    if not bool(row.get("active")):
-        return False
-    if row.get("archived_at") is not None:
-        return False
-    if row.get("location_type") not in ("Residential", "Commercial"):
-        return False
-    if row.get("customer_id") is not None:
-        if not bool(row.get("customer_active")):
-            return False
-        if row.get("customer_archived_at") is not None:
-            return False
-    return True
+    parent_linked = row.get("customer_id") is not None
+    return _location_business_facts_eligible(
+        location_type=row.get("location_type"),
+        parent_linked=parent_linked,
+        active=bool(row.get("active")),
+        archived=row.get("archived_at") is not None,
+        parent_customer_active=(
+            bool(row.get("customer_active")) if parent_linked else None
+        ),
+        parent_customer_archived=(
+            row.get("customer_archived_at") is not None if parent_linked else None
+        ),
+    )
 
 
 def _location_commercial_clock_boundary_eligible(row: Dict[str, Any]) -> bool:
@@ -19486,10 +19875,21 @@ def _location_commercial_clock_boundary_eligible(row: Dict[str, Any]) -> bool:
     fail closed instead of silently authorizing a nearest match.
     """
 
-    return bool(
-        row.get("customer_id") is not None
-        and row.get("location_type") == "Commercial"
-        and _location_business_eligible(row)
+    return _commercial_clock_boundary_facts_eligible(
+        location_type=row.get("location_type"),
+        parent_linked=row.get("customer_id") is not None,
+        active=bool(row.get("active")),
+        archived=row.get("archived_at") is not None,
+        parent_customer_active=(
+            bool(row.get("customer_active"))
+            if row.get("customer_id") is not None
+            else None
+        ),
+        parent_customer_archived=(
+            row.get("customer_archived_at") is not None
+            if row.get("customer_id") is not None
+            else None
+        ),
     )
 
 
@@ -19529,6 +19929,7 @@ def _c3_rows_from_cursor(cur: Any) -> List[Dict[str, Any]]:
 def _c3_customer_site_rows(
     payload: BaseModel,
     *,
+    action: Optional[str] = None,
     selected_location_id: Optional[int] = None,
     cur: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
@@ -19554,7 +19955,18 @@ def _c3_customer_site_rows(
             longitude_upper,
             crosses_date_line,
         ) = _site_check_in_coordinate_bounds(
-            float(latitude), float(longitude), float(accuracy)
+            float(latitude),
+            float(longitude),
+            float(accuracy),
+            max_effective_radius_m=(
+                max(
+                    _max_clock_boundary_effective_geofence_radius_m(),
+                    _max_effective_geofence_radius_m(),
+                    int(LOCATION_MATCH_RADIUS_M),
+                )
+                if action in {"clock-in", "clock-out"}
+                else None
+            ),
         )
         longitude_predicate = (
             "(l.lng >= %s OR l.lng <= %s)"
@@ -19614,8 +20026,25 @@ def _c3_customer_site_rows(
     return rows
 
 
-def _c3_site_geofence(site: Dict[str, Any], payload: BaseModel) -> Dict[str, Any]:
-    radius_m, radius_source = _effective_geofence_radius(site.get("geofence_radius_m"))
+def _c3_site_geofence(
+    site: Dict[str, Any],
+    payload: BaseModel,
+    *,
+    action: Optional[str] = None,
+) -> Dict[str, Any]:
+    # CLOSED/ENUMERATED: only the two clock actions can use the clock resolver,
+    # and only for canonical linked Commercial Sites. Every other action/target
+    # stays on the established shared resolver.
+    use_clock_boundary_radius = bool(
+        action in {"clock-in", "clock-out"}
+        and _location_commercial_clock_boundary_eligible(site)
+    )
+    radius_resolver = (
+        _clock_boundary_effective_geofence_radius
+        if use_clock_boundary_radius
+        else _effective_geofence_radius
+    )
+    radius_m, radius_source = radius_resolver(site.get("geofence_radius_m"))
     return evaluate_site_check_in_geofence(
         site_latitude=(float(site["lat"]) if site.get("lat") is not None else None),
         site_longitude=(float(site["lng"]) if site.get("lng") is not None else None),
@@ -19767,6 +20196,208 @@ def _c3_planned_inside_location_ids(
     }
 
 
+def _c3_action_resolution_enabled(
+    action: str,
+    action_scope: Dict[str, Any],
+) -> bool:
+    """Return whether C3 is authoritative for this time action.
+
+    The decision is shared by capability reads, preflight, provisional writes,
+    and transaction-time rechecks so a client cannot be told that C3 is off
+    while the corresponding write endpoint is enforcing it.
+    """
+    if bool(action_scope.get("effective")):
+        return True
+    if action == "clock-out":
+        if action_scope.get("legacyC6EndBypass"):
+            return False
+        return bool(GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED)
+    if action == "clock-in":
+        return bool(
+            GEOFENCE_SITE_RESOLUTION_ENABLED
+            or GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        )
+    return bool(GEOFENCE_SITE_RESOLUTION_ENABLED)
+
+
+def _c3_action_resolution_target_policy(
+    action: str,
+    action_scope: Dict[str, Any],
+) -> str:
+    """Select the same C3 target set for discovery and persistence."""
+    scoped_policy = action_scope.get("targetPolicy")
+    if scoped_policy:
+        return str(scoped_policy)
+    if (
+        action in {"clock-in", "clock-out"}
+        and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        and not (action == "clock-in" and GEOFENCE_SITE_RESOLUTION_ENABLED)
+    ):
+        return GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+    return GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+
+
+def _c3_clock_boundary_constraints_required(action: str, target_policy: str) -> bool:
+    """Return whether strict Commercial/Home Base clock rules compose here."""
+
+    return bool(
+        target_policy
+        == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+        or (
+            action in {"clock-in", "clock-out"}
+            and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        )
+    )
+
+
+def _c3_legacy_match_contains_site(row: Dict[str, Any], payload: BaseModel) -> bool:
+    """Return whether the legacy pin radius would silently admit this Site."""
+    latitude = getattr(payload, "latitude", None)
+    longitude = getattr(payload, "longitude", None)
+    if (
+        latitude is None
+        or longitude is None
+        or row.get("lat") is None
+        or row.get("lng") is None
+    ):
+        return False
+    geofence = evaluate_site_check_in_geofence(
+        site_latitude=float(row["lat"]),
+        site_longitude=float(row["lng"]),
+        latitude=float(latitude),
+        longitude=float(longitude),
+        accuracy=0,
+        resolved_radius_m=LOCATION_MATCH_RADIUS_M,
+    )
+    return geofence["status"] == "inside"
+
+
+def _c3_legacy_nearest_location_row(
+    rows: List[Dict[str, Any]],
+    payload: BaseModel,
+) -> Optional[Dict[str, Any]]:
+    """Return the active row the legacy nearest-pin matcher would select."""
+
+    latitude = getattr(payload, "latitude", None)
+    longitude = getattr(payload, "longitude", None)
+    if latitude is None or longitude is None:
+        return None
+    location_coords: Dict[str, Dict[str, float]] = {}
+    rows_by_address: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if not row.get("active") or row.get("lat") is None or row.get("lng") is None:
+            continue
+        address = str(row.get("address") or "")
+        location_coords[address] = {
+            "lat": float(row["lat"]),
+            "lng": float(row["lng"]),
+        }
+        rows_by_address[address] = row
+    nearest = find_nearest_location_match(
+        float(latitude),
+        float(longitude),
+        {"location_coords": location_coords},
+    )
+    if not nearest or not nearest["withinRadius"]:
+        return None
+    return rows_by_address.get(str(nearest["location"]))
+
+
+def _c3_clock_boundary_override_error(
+    timesheet_data: Dict[str, Any],
+    payload: BaseModel,
+    resolution: Optional[Dict[str, Any]],
+    *,
+    cur: Optional[Any] = None,
+) -> Optional[str]:
+    """Compose legacy override support without bypassing strict clock truth."""
+    if (resolution or {}).get("exactSelectionRequired"):
+        return "More than one customer Site matches your GPS. Choose the exact Site."
+    reason = str((resolution or {}).get("reason") or "")
+    if (
+        reason == "missing_gps"
+        and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        and getattr(payload, "latitude", None) is not None
+        and getattr(payload, "longitude", None) is not None
+        and getattr(payload, "accuracy", None) is None
+    ):
+        return "GPS accuracy is required to verify the configured clock boundary."
+    if (
+        GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        and reason == "selected_site_ineligible"
+    ):
+        return "The selected customer Site is not eligible for this clock action."
+    if reason in {
+        "home_base_unready",
+        "selected_site_unready",
+        "commercial_site_unready",
+    }:
+        return (
+            "This clock location is not ready for verification. "
+            "Ask an administrator to repair and attest its geofence."
+        )
+    if cur is not None:
+        # Final plain-time checks run after the Site-mutation advisory lock is
+        # held. Rebuild the complete active legacy matcher from that same
+        # transaction view so a Site move, activation change, or category
+        # reclassification between the provisional read and persistence cannot
+        # be decided from stale snapshot membership.
+        cur.execute(
+            """
+            SELECT address, customer_name, lat, lng
+            FROM locations
+            WHERE active = TRUE
+              AND lat IS NOT NULL
+              AND lng IS NOT NULL
+            ORDER BY id
+            """
+        )
+        current_location_rows = _c3_rows_from_cursor(cur)
+        current_location_coords = {
+            str(row["address"]): {
+                "lat": float(row["lat"]),
+                "lng": float(row["lng"]),
+            }
+            for row in current_location_rows
+        }
+        current_location_customers = {
+            str(row["address"]): str(row["customer_name"])
+            for row in current_location_rows
+            if row.get("customer_name")
+        }
+        # This is the request-local transaction snapshot passed through the
+        # plain-time writer. Updating it in place also lets final GPS metadata
+        # use the exact pin set that authorized the fallback.
+        timesheet_data["location_coords"] = current_location_coords
+        timesheet_data["location_customers"] = current_location_customers
+    error = require_gps_override(
+        timesheet_data,
+        getattr(payload, "latitude", None),
+        getattr(payload, "longitude", None),
+        str(getattr(payload, "gpsOverrideReason", "") or ""),
+        str(getattr(payload, "gpsOverrideDetail", "") or ""),
+    )
+    if error:
+        return error
+    strict_boundary_outside = bool(
+        reason == "clock_boundary_outside"
+        or (
+            reason == "selected_site_not_inside"
+            and (resolution or {}).get("clockBoundaryConflict")
+        )
+    )
+    if (
+        GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        and strict_boundary_outside
+        and not str(getattr(payload, "gpsOverrideReason", "") or "").strip()
+    ):
+        return (
+            "GPS is outside the configured Commercial Site clock boundary. "
+            "Add an override reason to continue."
+        )
+    return None
+
+
 def _c3_resolve_site(
     action: str,
     payload: BaseModel,
@@ -19800,6 +20431,10 @@ def _c3_resolve_site(
     ):
         return {"state": "unresolved", "reason": "clock_out_not_enabled"}
     reference_time = reference_time or utc_now()
+    clock_boundary_constraints_required = _c3_clock_boundary_constraints_required(
+        action,
+        target_policy,
+    )
 
     home_base_allowed = (
         (action == "clock-in" and target_policy == GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START)
@@ -19809,16 +20444,20 @@ def _c3_resolve_site(
             == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
         )
     )
+    home_base_unready_at_sample = False
     if home_base_allowed:
         home_base = _active_home_base_config(cur=cur)
-        home_base_geofence = _home_base_geofence_from_payload(home_base, payload)
+        home_base_geofence = _home_base_geofence_from_payload(
+            home_base,
+            payload,
+            clock_boundary=action in {"clock-in", "clock-out"},
+        )
         home_base_ready = bool(
             home_base
             and _home_base_geofence_state(home_base).get("ready")
         )
         if _home_base_gps_confirmed(home_base_geofence) and (
-            target_policy == GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
-            or home_base_ready
+            not clock_boundary_constraints_required or home_base_ready
         ):
             return {
                 "state": "home_base",
@@ -19826,17 +20465,35 @@ def _c3_resolve_site(
                 "homeBase": home_base,
                 "geofence": home_base_geofence,
             }
+        home_base_unready_at_sample = bool(
+            clock_boundary_constraints_required
+            and _home_base_gps_confirmed(home_base_geofence)
+            and not home_base_ready
+        )
 
     selected_location_id = getattr(payload, "locationId", None)
     rows = _c3_customer_site_rows(
         payload,
+        action=action,
         selected_location_id=(int(selected_location_id) if selected_location_id else None),
         cur=cur,
     )
+    unready_commercial_rows = [
+        row
+        for row in rows
+        if clock_boundary_constraints_required
+        and _location_commercial_clock_boundary_eligible(row)
+        and not _c3_location_geofence_state(row).get("ready")
+    ]
+    unready_commercial_ids = {
+        int(row["location_id"])
+        for row in unready_commercial_rows
+    }
     eligible_rows = [
         row
         for row in rows
         if _c3_target_policy_eligible(row, target_policy)
+        and int(row["location_id"]) not in unready_commercial_ids
     ]
 
     if selected_location_id is not None:
@@ -19844,18 +20501,59 @@ def _c3_resolve_site(
         if selected_row is None or not _location_business_eligible(selected_row):
             return {"state": "unresolved", "reason": "selected_site_ineligible"}
         if (
-            target_policy
-            == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+            clock_boundary_constraints_required
             and _location_commercial_clock_boundary_eligible(selected_row)
             and not _c3_location_geofence_state(selected_row).get("ready")
         ):
             return {"state": "unresolved", "reason": "selected_site_unready"}
         selected = eligible_rows[0] if eligible_rows else None
         if selected is None:
-            return {"state": "unresolved", "reason": "selected_site_ineligible"}
-        geofence = _c3_site_geofence(selected, payload)
+            if (
+                action in {"clock-in", "clock-out"}
+                and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            ):
+                nearby_rows = _c3_customer_site_rows(
+                    payload,
+                    action=action,
+                    selected_location_id=None,
+                    cur=cur,
+                )
+                legacy_match = _c3_legacy_nearest_location_row(
+                    nearby_rows,
+                    payload,
+                )
+                if legacy_match and _location_commercial_clock_boundary_eligible(
+                    legacy_match
+                ):
+                    if not _c3_location_geofence_state(legacy_match).get("ready"):
+                        return {
+                            "state": "unresolved",
+                            "reason": "commercial_site_unready",
+                        }
+                    if (
+                        _c3_site_geofence(legacy_match, payload, action=action).get(
+                            "status"
+                        )
+                        != "inside"
+                    ):
+                        return {
+                            "state": "unresolved",
+                            "reason": "clock_boundary_outside",
+                        }
+            return {
+                "state": "unresolved",
+                "reason": "selected_site_legacy_only",
+            }
+        geofence = _c3_site_geofence(selected, payload, action=action)
         if geofence["status"] != "inside":
-            return {"state": "unresolved", "reason": "selected_site_not_inside"}
+            return {
+                "state": "unresolved",
+                "reason": "selected_site_not_inside",
+                "clockBoundaryConflict": bool(
+                    clock_boundary_constraints_required
+                    and _location_commercial_clock_boundary_eligible(selected)
+                ),
+            }
         return {
             "state": "customer_site",
             "source": "explicit",
@@ -19863,11 +20561,15 @@ def _c3_resolve_site(
             "geofence": geofence,
         }
 
-    inside = [
-        (row, _c3_site_geofence(row, payload))
+    evaluated = [
+        (row, _c3_site_geofence(row, payload, action=action))
         for row in eligible_rows
     ]
-    inside = [(row, geofence) for row, geofence in inside if geofence["status"] == "inside"]
+    inside = [
+        (row, geofence)
+        for row, geofence in evaluated
+        if geofence["status"] == "inside"
+    ]
     if len(inside) == 1:
         row, geofence = inside[0]
         return {
@@ -19881,13 +20583,23 @@ def _c3_resolve_site(
         # two overlapping commercial pins is the employee's actual work site.
         # Preserve C3's established planned-visit tie-break for its ordinary
         # association policy, but require an explicit exact Site there.
+        commercial_inside_count = sum(
+            1
+            for row, _geofence in inside
+            if _location_commercial_clock_boundary_eligible(row)
+        )
         if (
             target_policy
             == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+            or (
+                clock_boundary_constraints_required
+                and commercial_inside_count > 1
+            )
         ):
             return {
                 "state": "selection_required",
                 "reason": "multiple_inside_sites",
+                "exactSelectionRequired": True,
                 "candidates": [row for row, _ in inside],
             }
         planned_ids = _c3_planned_inside_location_ids(
@@ -19910,6 +20622,23 @@ def _c3_resolve_site(
             "reason": "multiple_inside_sites",
             "candidates": [row for row, _ in inside],
         }
+    if home_base_unready_at_sample:
+        return {"state": "unresolved", "reason": "home_base_unready"}
+    if any(
+        _c3_site_geofence(row, payload, action=action).get("status") == "inside"
+        for row in unready_commercial_rows
+    ):
+        return {"state": "unresolved", "reason": "commercial_site_unready"}
+    if (
+        action in {"clock-in", "clock-out"}
+        and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        and any(
+            _c3_legacy_match_contains_site(row, payload)
+            for row in rows
+            if _location_commercial_clock_boundary_eligible(row)
+        )
+    ):
+        return {"state": "unresolved", "reason": "clock_boundary_outside"}
     return {"state": "unresolved", "reason": "no_eligible_inside_site"}
 
 
@@ -20173,6 +20902,11 @@ def _c6_action_scope_state(scope: Dict[str, Any], action: str) -> Dict[str, Any]
                 "effective": True,
                 "targetPolicy": GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY,
             }
+        return {
+            "effective": False,
+            "targetPolicy": None,
+            "legacyC6EndBypass": True,
+        }
     elif action == "arrive":
         if crew_scoped or generic_individual:
             return {
@@ -20258,7 +20992,11 @@ def _c6_target_decision(
         return {"allowed": False, "reason": "missing_gps", "target": None}
 
     if explicit_site is not None:
-        geofence = explicit_geofence or _c3_site_geofence(explicit_site, payload)
+        geofence = explicit_geofence or _c3_site_geofence(
+            explicit_site,
+            payload,
+            action=action,
+        )
         target = {
             "kind": "site",
             "id": int(explicit_site["location_id"]),
@@ -20320,6 +21058,7 @@ def _c6_target_decision(
             }
         selected_rows = _c3_customer_site_rows(
             payload,
+            action=action,
             selected_location_id=int(selected_location_id),
             cur=cur,
         )
@@ -20338,7 +21077,7 @@ def _c6_target_decision(
                 "target": {"kind": "site", "id": int(selected_location_id)},
                 "resolution": resolution,
             }
-        geofence = _c3_site_geofence(selected, payload)
+        geofence = _c3_site_geofence(selected, payload, action=action)
         return {
             "allowed": geofence.get("status") == "inside",
             "reason": str(geofence.get("status") or "outside"),
@@ -20359,6 +21098,11 @@ def _c6_target_decision(
         reason = "missing_gps"
     elif resolution.get("reason") == "selected_site_unready":
         reason = "selected_site_unready"
+    elif resolution.get("reason") in {
+        "home_base_unready",
+        "commercial_site_unready",
+    }:
+        reason = str(resolution["reason"])
     else:
         # The resolver's no-target result is intentionally not converted to a
         # nearest-pin authorization.  The employee must move/retry or choose a
@@ -20387,6 +21131,8 @@ def _c6_hard_gate_failure(
         "selection_required": "More than one customer Site matches your GPS. Choose the exact Site and try again.",
         "selected_site_ineligible": "The selected customer Site is not eligible for this action. Choose a current Site and try again.",
         "selected_site_unready": "The selected Commercial Site is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
+        "commercial_site_unready": "This Commercial Site is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
+        "home_base_unready": "Home Base is not ready for clock verification. Ask an administrator to repair its geofence before retrying.",
     }
     return {
         "code": GEOFENCE_HARD_GATE_BLOCK_CODE,
@@ -20397,7 +21143,7 @@ def _c6_hard_gate_failure(
             "retryable": reason
             in {
                 "missing_gps", "low_accuracy", "uncertain", "outside",
-                "selection_required", "selected_site_unready",
+                "selection_required",
             },
             "adminDirectRecordAvailable": True,
             "target": _c6_public_target(decision.get("target")),
@@ -28118,14 +28864,18 @@ def timesheet_current_status(
         # the broad C3 association rollout remains off. Older portals ignore
         # these additive capability fields; the C6 portal treats them as a
         # no-fallback hard-gate signal.
-        "siteResolutionEnabled": bool(
-            GEOFENCE_SITE_RESOLUTION_ENABLED or clock_in_gate["effective"]
+        "siteResolutionEnabled": _c3_action_resolution_enabled(
+            "clock-in",
+            clock_in_gate,
         ),
         "hardGateEnabled": bool(clock_in_gate["effective"]),
         # A dedicated capability keeps an older tracker/portal pair on the
         # legacy end-of-shift flow.  Only the individual Commercial/Home Base
         # profile treats a missing or off-site end location as a hard failure.
-        "clockOutSiteResolutionRequired": bool(clock_out_gate["effective"]),
+        "clockOutSiteResolutionRequired": _c3_action_resolution_enabled(
+            "clock-out",
+            clock_out_gate,
+        ),
         "currentlyWorking": response_rows,
         "staleOpenShift": stale_open_shift,
         "staleOpenShifts": stale_open_shifts,

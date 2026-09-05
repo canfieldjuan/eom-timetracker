@@ -37,11 +37,14 @@ services:
       # Kill switch: set to "false" to disable without a deploy.
       - key: ENFORCE_CLOCK_HOURS
         value: "true"
-      # Geofence C6 is deliberately dormant until an operator sets both this
-      # global rollback switch and a reviewed per-crew scope. Keep the deployed
-      # environment value explicitly false for a zero-change first deploy.
+      # Geofence C6 remains operator-managed so Blueprint sync cannot overwrite
+      # an incident rollback or a reviewed activation.
       - key: GEOFENCE_HARD_GATE_ENABLED
-        value: "false"
+        sync: false
+      # Clock-only configured radii are operator-managed independently of the
+      # legacy shared switch so Residential/visit/arrival behavior stays put.
+      - key: GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+        sync: false
       - key: DATABASE_URL
         fromDatabase:
           name: eom-timetracker-db

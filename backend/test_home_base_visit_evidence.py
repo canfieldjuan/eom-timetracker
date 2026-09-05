@@ -167,6 +167,190 @@ def _configure_home_base(client, auth: dict[str, str]) -> dict:
     return body
 
 
+def test_clock_boundary_radius_applies_to_plain_but_not_qr_home_base_actions(
+    client,
+    auth,
+    monkeypatch,
+):
+    plain_employee_id, plain_auth = _create_employee(client, "Wide Home Base plain")
+    _enroll_in_morning_crew(plain_employee_id)
+    _configure_home_base(client, auth)
+    db.execute(
+        """
+        UPDATE home_bases
+        SET geofence_radius_m = 250,
+            pin_provenance = 'gps_capture',
+            pin_confidence = 'high',
+            pin_capture_accuracy_m = 5
+        WHERE active = true
+        """
+    )
+    home_base = time_tracker_api._active_home_base_config()
+    fingerprint = time_tracker_api._home_base_geofence_state(home_base)[
+        "currentFingerprint"
+    ]
+    db.execute(
+        """
+        UPDATE home_bases
+        SET pin_attested_at = NOW(),
+            pin_attestation_fingerprint = %s
+        WHERE active = true
+        """,
+        (fingerprint,),
+    )
+    monkeypatch.setattr(time_tracker_api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        time_tracker_api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    wide_point = {
+        "latitude": BASE_LATITUDE + 0.001,
+        "longitude": BASE_LONGITUDE,
+        "accuracy": 5,
+    }
+
+    plain_start = client.post(
+        "/api/timesheet/clock-in",
+        headers=plain_auth,
+        json={**wide_point, "idempotencyKey": str(uuid4())},
+    )
+    assert plain_start.status_code == 200, plain_start.text
+    assert plain_start.json()["entry"]["location"] == "Home Base — EOM Office Home Base"
+    plain_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=plain_auth,
+        json={**wide_point, "idempotencyKey": str(uuid4())},
+    )
+    assert plain_end.status_code == 200, plain_end.text
+
+    qr_employee_id, qr_auth = _create_employee(client, "Wide Home Base QR")
+    _enroll_in_morning_crew(qr_employee_id)
+    qr = client.post("/api/admin/home-base/check-in-qr", headers=auth, json={})
+    assert qr.status_code == 200, qr.text
+    qr_start = client.post(
+        "/api/timesheet/home-base/scan",
+        headers=qr_auth,
+        json={
+            "token": qr.json()["token"],
+            "action": "start",
+            **wide_point,
+            "scannedAt": datetime.now(timezone.utc).isoformat(),
+            "idempotencyKey": str(uuid4()),
+        },
+    )
+    assert qr_start.status_code == 400, qr_start.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE employee_id = %s",
+        (qr_employee_id,),
+    ) == {"count": 0}
+
+
+@pytest.mark.parametrize("broad_resolution_enabled", [False, True])
+def test_clock_only_preflight_and_write_both_require_ready_home_base(
+    client,
+    auth,
+    monkeypatch,
+    broad_resolution_enabled,
+):
+    employee_id, employee_auth = _create_employee(client, "Unready Home Base clock")
+    _enroll_in_morning_crew(employee_id)
+    _configure_home_base(client, auth)
+    monkeypatch.setattr(time_tracker_api, "GEOFENCE_HARD_GATE_ENABLED", False)
+    monkeypatch.setattr(
+        time_tracker_api,
+        "GEOFENCE_SITE_RESOLUTION_ENABLED",
+        broad_resolution_enabled,
+    )
+    monkeypatch.setattr(
+        time_tracker_api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    point = {
+        "latitude": BASE_LATITUDE,
+        "longitude": BASE_LONGITUDE,
+        "accuracy": 5,
+    }
+
+    preflight = client.post(
+        "/api/timesheet/site-resolution",
+        headers=employee_auth,
+        json={**point, "action": "clock-in"},
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["resolution"] == {
+        "state": "unresolved",
+        "reason": "home_base_unready",
+    }
+
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=point,
+    )
+    assert blocked.status_code == 400, blocked.text
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+
+    db.execute(
+        """
+        UPDATE home_bases
+        SET pin_provenance = 'gps_capture',
+            pin_confidence = 'high',
+            pin_capture_accuracy_m = 5
+        WHERE active = true
+        """
+    )
+    home_base = time_tracker_api._active_home_base_config()
+    fingerprint = time_tracker_api._home_base_geofence_state(home_base)[
+        "currentFingerprint"
+    ]
+    db.execute(
+        """
+        UPDATE home_bases
+        SET pin_attested_at = NOW(),
+            pin_attestation_fingerprint = %s
+        WHERE active = true
+        """,
+        (fingerprint,),
+    )
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=point,
+    )
+    assert started.status_code == 200, started.text
+
+    db.execute(
+        "UPDATE home_bases SET geofence_radius_m = 51 WHERE active = true"
+    )
+    end_preflight = client.post(
+        "/api/timesheet/site-resolution",
+        headers=employee_auth,
+        json={**point, "action": "clock-out"},
+    )
+    assert end_preflight.status_code == 200, end_preflight.text
+    assert end_preflight.json()["resolution"] == {
+        "state": "unresolved",
+        "reason": "home_base_unready",
+    }
+    blocked_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json=point,
+    )
+    assert blocked_end.status_code == 409, blocked_end.text
+    assert blocked_end.json()["code"] == "HOME_BASE_REQUIRED"
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 1}
+
+
 def test_home_base_put_honors_optional_update_token(client, auth):
     employee_id, _employee_auth = _create_employee(client, "Home Base update token")
     _enroll_in_morning_crew(employee_id)
