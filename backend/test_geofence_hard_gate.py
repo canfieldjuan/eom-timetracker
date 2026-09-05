@@ -667,6 +667,58 @@ def test_c6_failure_log_is_structured_and_coordinate_free(
     assert "longitude" not in serialized
 
 
+def test_c6_ineligible_selected_site_failure_log_retains_accuracy(
+    client,
+    monkeypatch,
+):
+    _employee_id, employee_auth = _create_employee(
+        client,
+        "ineligible selected log",
+    )
+    site_id = _create_site(
+        "ineligible selected log",
+        location_type="Residential",
+    )
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+    captured: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "CLOCK_IN_FAILED":
+            captured.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 7.5,
+        },
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    assert _hard_gate_failure(blocked)["details"]["reason"] == (
+        "selected_site_ineligible"
+    )
+    assert len(captured) == 1
+    assert captured[0]["reason"] == "selected_site_ineligible"
+    assert captured[0]["targetKind"] == "site"
+    assert captured[0]["targetId"] == site_id
+    assert captured[0]["accuracyM"] == 7.5
+    serialized = json.dumps(captured[0]).lower()
+    assert "latitude" not in serialized
+    assert "longitude" not in serialized
+
+
 @pytest.mark.parametrize("site_ready", [True, False])
 def test_c6_uncertain_single_commercial_target_is_retained_in_failure_log(
     client,

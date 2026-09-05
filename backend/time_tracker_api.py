@@ -21300,6 +21300,7 @@ def _c6_target_decision(
                 "reason": "selected_site_ineligible",
                 "target": {"kind": "site", "id": int(selected_location_id)},
                 "resolution": resolution,
+                "accuracyM": float(accuracy),
             }
         geofence = _c3_site_geofence(selected, payload, action=action)
         return {
