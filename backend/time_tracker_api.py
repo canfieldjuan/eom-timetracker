@@ -17788,16 +17788,19 @@ def clock_in(
                     raise HTTPException(status_code=400, detail=override_error)
                 legacy_fallback_rechecked = True
             if legacy_fallback_rechecked:
-                matched = find_nearest_location(
-                    payload.latitude,
-                    payload.longitude,
-                    _timesheet_data,
-                )
-                result["location"] = (
-                    matched
-                    or payload.location.strip()
-                    or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
-                )
+                if has_gps:
+                    matched = find_nearest_location(
+                        payload.latitude,
+                        payload.longitude,
+                        _timesheet_data,
+                    )
+                    result["location"] = (
+                        matched
+                        or payload.location.strip()
+                        or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+                    )
+                else:
+                    result["location"] = payload.location.strip() or "Unknown"
                 result["customer"] = _resolve_customer(
                     result["location"],
                     _timesheet_data.get("location_customers", {}),
@@ -20527,6 +20530,32 @@ def _c3_legacy_nearest_location_row(
     return rows_by_address.get(str(nearest["location"]))
 
 
+def _c3_legacy_commercial_clock_failure(
+    rows: List[Dict[str, Any]],
+    payload: BaseModel,
+    *,
+    action: str,
+) -> Optional[Dict[str, Any]]:
+    """Reject the Commercial winner the legacy fallback would associate."""
+
+    legacy_match = _c3_legacy_nearest_location_row(rows, payload)
+    if not legacy_match or not _location_commercial_clock_boundary_eligible(
+        legacy_match
+    ):
+        return None
+    if not _c3_location_geofence_state(legacy_match).get("ready"):
+        return {
+            "state": "unresolved",
+            "reason": "commercial_site_unready",
+        }
+    if _c3_site_geofence(legacy_match, payload, action=action).get("status") != "inside":
+        return {
+            "state": "unresolved",
+            "reason": "clock_boundary_outside",
+        }
+    return None
+
+
 def _c3_clock_boundary_override_error(
     timesheet_data: Dict[str, Any],
     payload: BaseModel,
@@ -20562,17 +20591,14 @@ def _c3_clock_boundary_override_error(
         )
     if cur is not None:
         # Final plain-time checks run after the Site-mutation advisory lock is
-        # held. Rebuild the complete active legacy matcher from that same
-        # transaction view so a Site move, activation change, or category
-        # reclassification between the provisional read and persistence cannot
-        # be decided from stale snapshot membership.
+        # held. Rebuild active location metadata from that same transaction view,
+        # deriving the legacy matcher from its pinned subset without discarding
+        # customer metadata for active unpinned Sites.
         cur.execute(
             """
             SELECT address, customer_name, lat, lng
             FROM locations
             WHERE active = TRUE
-              AND lat IS NOT NULL
-              AND lng IS NOT NULL
             ORDER BY id
             """
         )
@@ -20583,6 +20609,7 @@ def _c3_clock_boundary_override_error(
                 "lng": float(row["lng"]),
             }
             for row in current_location_rows
+            if row.get("lat") is not None and row.get("lng") is not None
         }
         current_location_customers = {
             str(row["address"]): str(row["customer_name"])
@@ -20757,34 +20784,37 @@ def _c3_resolve_site(
                     selected_location_id=None,
                     cur=cur,
                 )
-                legacy_match = _c3_legacy_nearest_location_row(
+                legacy_failure = _c3_legacy_commercial_clock_failure(
                     nearby_rows,
                     payload,
+                    action=action,
                 )
-                if legacy_match and _location_commercial_clock_boundary_eligible(
-                    legacy_match
-                ):
-                    if not _c3_location_geofence_state(legacy_match).get("ready"):
-                        return {
-                            "state": "unresolved",
-                            "reason": "commercial_site_unready",
-                        }
-                    if (
-                        _c3_site_geofence(legacy_match, payload, action=action).get(
-                            "status"
-                        )
-                        != "inside"
-                    ):
-                        return {
-                            "state": "unresolved",
-                            "reason": "clock_boundary_outside",
-                        }
+                if legacy_failure:
+                    return legacy_failure
             return {
                 "state": "unresolved",
                 "reason": "selected_site_legacy_only",
             }
         geofence = _c3_site_geofence(selected, payload, action=action)
         if geofence["status"] != "inside":
+            if (
+                action in {"clock-in", "clock-out"}
+                and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+                and not _location_commercial_clock_boundary_eligible(selected)
+            ):
+                nearby_rows = _c3_customer_site_rows(
+                    payload,
+                    action=action,
+                    selected_location_id=None,
+                    cur=cur,
+                )
+                legacy_failure = _c3_legacy_commercial_clock_failure(
+                    nearby_rows,
+                    payload,
+                    action=action,
+                )
+                if legacy_failure:
+                    return legacy_failure
             return {
                 "state": "unresolved",
                 "reason": "selected_site_not_inside",

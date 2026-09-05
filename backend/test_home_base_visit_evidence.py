@@ -86,8 +86,8 @@ def _clean_rows() -> None:
             (f"{TEST_PREFIX}%",),
         )
         cur.execute(
-            "DELETE FROM locations WHERE address LIKE %s",
-            (f"{TEST_PREFIX}%",),
+            "DELETE FROM locations WHERE address LIKE %s OR customer_name LIKE %s",
+            (f"{TEST_PREFIX}%", f"{TEST_PREFIX}%"),
         )
         cur.execute(
             "DELETE FROM customers WHERE name LIKE %s",
