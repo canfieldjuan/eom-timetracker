@@ -18054,6 +18054,7 @@ def clock_out(
         "resolution": None,
         "snapshot": None,
         "enabled": False,
+        "legacyC6EndBypass": False,
     }
     home_base_exception = _home_base_exception_reason(payload)
     exception_error = _validate_home_base_exception(home_base_exception)
@@ -18073,6 +18074,7 @@ def clock_out(
         legacy_c6_end_bypass = bool(
             hard_gate_action.get("legacyC6EndBypass")
         )
+        site_resolution["legacyC6EndBypass"] = legacy_c6_end_bypass
         clock_out_target_policy = _c3_action_resolution_target_policy(
             "clock-out",
             hard_gate_action,
@@ -18390,13 +18392,16 @@ def clock_out(
         final_legacy_c6_end_bypass = bool(
             final_action_scope.get("legacyC6EndBypass")
         )
+        legacy_bypass_disabled_before_persist = bool(
+            site_resolution.get("legacyC6EndBypass")
+        ) and not final_legacy_c6_end_bypass
         was_resolution_enabled = bool(site_resolution["enabled"])
         site_resolution["enabled"] = _c3_action_resolution_enabled(
             "clock-out",
             final_action_scope,
         )
         if not site_resolution["enabled"]:
-            if was_resolution_enabled:
+            if was_resolution_enabled or legacy_bypass_disabled_before_persist:
                 _lock_customer_site_mutations(cur)
                 restore_legacy_clock_out_before_persist(
                     cur,

@@ -1790,6 +1790,113 @@ def test_clock_radius_scope_loss_honors_final_legacy_clock_out_bypass(
     ) == [{"action": "start", "outcome": "recorded"}]
 
 
+def test_clock_radius_scope_loss_replays_checks_when_final_bypass_disappears(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(
+        client, "radius final bypass removed"
+    )
+    site_id = _create_site(
+        "radius final bypass removed",
+        location_type="Commercial",
+        geofence_radius_m=250,
+    )
+    home_base_id = _configure_ready_home_base(client, auth)
+    db.execute(
+        "UPDATE home_bases SET geofence_radius_m = 250 WHERE id = %s",
+        (home_base_id,),
+    )
+    attested = client.post(
+        "/api/admin/home-base/attest-geofence", headers=auth, json={}
+    )
+    assert attested.status_code == 200, attested.text
+    crew_id = _create_crew(employee_id, "radius final bypass removed crew")
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        api, "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED", True
+    )
+    monkeypatch.setattr(
+        api, "GEOFENCE_CLOCK_BOUNDARY_EMPLOYEE_SCOPE_REQUIRED", True
+    )
+    _enable_scope(client, auth, crew_id)
+
+    site_sample = {
+        "locationId": site_id,
+        "latitude": LATITUDE,
+        "longitude": LONGITUDE,
+        "accuracy": 5,
+    }
+    started_site = client.post(
+        "/api/timesheet/clock-in", headers=employee_auth, json=site_sample
+    )
+    assert started_site.status_code == 200, started_site.text
+
+    original_scope_read = api._c6_authoritative_scope_state
+
+    def lose_crew_scope_before_persist(*args, **kwargs):
+        original_scope_read(*args, **kwargs)
+        return {"effective": False, "crews": []}
+
+    monkeypatch.setattr(
+        api, "_c6_authoritative_scope_state", lose_crew_scope_before_persist
+    )
+    outside_legacy_sample = {
+        "latitude": LATITUDE + 0.021,
+        "longitude": LONGITUDE,
+        "accuracy": 5,
+    }
+    rejected_override = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json=outside_legacy_sample,
+    )
+    assert rejected_override.status_code == 400, rejected_override.text
+    assert "nearest saved site" in rejected_override.json()["error"]
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 1}
+    accepted_override = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            **outside_legacy_sample,
+            "gpsOverrideReason": "Supervisor approved the legacy fallback.",
+        },
+    )
+    assert accepted_override.status_code == 200, accepted_override.text
+    assert accepted_override.json()["entry"]["clockOutGpsMeta"]["override"] is True
+
+    home_center = {
+        "latitude": LATITUDE + 0.02,
+        "longitude": LONGITUDE,
+        "accuracy": 5,
+    }
+    started_home = client.post(
+        "/api/timesheet/clock-in", headers=employee_auth, json=home_center
+    )
+    assert started_home.status_code == 200, started_home.text
+    assert started_home.json()["homeBaseEvent"]["outcome"] == "recorded"
+    rejected_home_base = client.post(
+        "/api/timesheet/clock-out", headers=employee_auth, json=site_sample
+    )
+    assert rejected_home_base.status_code == 400, rejected_home_base.text
+    assert "Home Base" in rejected_home_base.json()["error"]
+    accepted_home_base = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            **site_sample,
+            "homeBaseExceptionReason": "Office entry was inaccessible.",
+        },
+    )
+    assert accepted_home_base.status_code == 200, accepted_home_base.text
+    assert accepted_home_base.json()["homeBaseEvent"]["outcome"] == "exception"
+
+
 def test_clock_radius_unscoped_broad_c3_refreshes_legacy_site_data(
     client, monkeypatch
 ):
