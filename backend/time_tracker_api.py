@@ -17698,7 +17698,22 @@ def clock_in(
                 if override_error:
                     raise HTTPException(status_code=400, detail=override_error)
                 legacy_fallback_rechecked = True
-            if isinstance(snapshot, dict):
+            if legacy_fallback_rechecked:
+                matched = find_nearest_location(
+                    payload.latitude,
+                    payload.longitude,
+                    _timesheet_data,
+                )
+                result["location"] = (
+                    matched
+                    or payload.location.strip()
+                    or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+                )
+                result["customer"] = _resolve_customer(
+                    result["location"],
+                    _timesheet_data.get("location_customers", {}),
+                )
+            elif isinstance(snapshot, dict):
                 _c3_restore_target(
                     result,
                     snapshot,
@@ -17715,9 +17730,7 @@ def clock_in(
                     or payload.location.strip()
                     or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
                 )
-            if (
-                legacy_fallback_rechecked
-            ):
+            if legacy_fallback_rechecked:
                 result["clockInGpsMeta"] = build_gps_meta(
                     _timesheet_data,
                     payload.latitude,
@@ -20300,11 +20313,12 @@ def _c3_clock_boundary_override_error(
         # be decided from stale snapshot membership.
         cur.execute(
             """
-            SELECT address, lat, lng
+            SELECT address, customer_name, lat, lng
             FROM locations
             WHERE active = TRUE
               AND lat IS NOT NULL
               AND lng IS NOT NULL
+            ORDER BY id
             """
         )
         current_location_rows = _c3_rows_from_cursor(cur)
@@ -20315,10 +20329,16 @@ def _c3_clock_boundary_override_error(
             }
             for row in current_location_rows
         }
+        current_location_customers = {
+            str(row["address"]): str(row["customer_name"])
+            for row in current_location_rows
+            if row.get("customer_name")
+        }
         # This is the request-local transaction snapshot passed through the
         # plain-time writer. Updating it in place also lets final GPS metadata
         # use the exact pin set that authorized the fallback.
         timesheet_data["location_coords"] = current_location_coords
+        timesheet_data["location_customers"] = current_location_customers
     error = require_gps_override(
         timesheet_data,
         getattr(payload, "latitude", None),
