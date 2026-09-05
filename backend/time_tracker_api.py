@@ -20693,18 +20693,29 @@ def _c3_resolve_site(
         (row, _c3_site_geofence(row, payload, action=action))
         for row in unready_commercial_rows
     ]
-    for row, unready_geofence in evaluated_unready_commercial:
-        if unready_geofence.get("status") == "inside":
-            return {
-                "state": "unresolved",
-                "reason": "commercial_site_unready",
+    inside_unready_commercial = [
+        (row, geofence)
+        for row, geofence in evaluated_unready_commercial
+        if geofence.get("status") == "inside"
+    ]
+    if inside_unready_commercial:
+        unready_resolution: Dict[str, Any] = {
+            "state": "unresolved",
+            "reason": "commercial_site_unready",
+        }
+        if len(inside_unready_commercial) == 1:
+            row, unready_geofence = inside_unready_commercial[0]
+            unready_resolution.update(
+                {
                 "failureTarget": {
                     "kind": "site",
                     "id": int(row["location_id"]),
                     "label": str(row.get("address") or ""),
                 },
                 "geofence": unready_geofence,
-            }
+                }
+            )
+        return unready_resolution
     if (
         target_policy
         == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY

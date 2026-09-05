@@ -719,6 +719,51 @@ def test_c6_uncertain_single_commercial_target_is_retained_in_failure_log(
     assert captured[0]["radiusSource"] == "global_fallback"
 
 
+def test_c6_overlapping_unready_sites_are_not_falsely_attributed(
+    client,
+    monkeypatch,
+):
+    _employee_id, employee_auth = _create_employee(client, "overlapping unready log")
+    _create_site(
+        "overlapping unready log one",
+        ready=False,
+        location_type="Commercial",
+    )
+    _create_site(
+        "overlapping unready log two",
+        ready=False,
+        location_type="Commercial",
+    )
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+    captured: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "CLOCK_IN_FAILED":
+            captured.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    failure = _hard_gate_failure(blocked)
+    assert failure["details"]["reason"] == "commercial_site_unready"
+    assert failure["details"].get("target") is None
+    assert len(captured) == 1
+    assert captured[0]["targetKind"] is None
+    assert captured[0]["targetId"] is None
+
+
 def test_c6_unready_failure_logs_retain_target_metadata(
     client,
     auth,
