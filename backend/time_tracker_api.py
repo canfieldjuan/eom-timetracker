@@ -17697,6 +17697,7 @@ def clock_in(
             timesheet_data,
             payload,
             None,
+            cur=cur,
             clock_radius_enabled=False,
         )
         if override_error:
@@ -17750,6 +17751,7 @@ def clock_in(
         snapshot = site_resolution.get("snapshot")
         if not site_resolution["enabled"]:
             if was_resolution_enabled:
+                _lock_customer_site_mutations(cur)
                 restore_legacy_clock_in_before_persist(
                     cur, result, _timesheet_data, snapshot
                 )
@@ -18279,7 +18281,10 @@ def clock_out(
         )
         final_confirmed = _home_base_gps_confirmed(final_geofence)
         final_exception = (
-            home_base_exception if final_home_base and not final_confirmed else ""
+            home_base_exception
+            if not final_confirmed
+            and (final_home_base or home_base["started_under"])
+            else ""
         )
         home_base.update(
             {
@@ -18325,6 +18330,7 @@ def clock_out(
             timesheet_data,
             gate_payload,
             None,
+            cur=cur,
             clock_radius_enabled=False,
         )
         if override_error:
@@ -18367,6 +18373,7 @@ def clock_out(
         if not site_resolution["enabled"]:
             snapshot = site_resolution.get("gpsMetaSnapshot")
             if was_resolution_enabled:
+                _lock_customer_site_mutations(cur)
                 restore_legacy_clock_out_before_persist(
                     cur, result, _timesheet_data, snapshot
                 )
@@ -20157,12 +20164,31 @@ def _geofence_state(
             GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
             or GEOFENCE_PER_SITE_RADIUS_ENABLED
         )
+        # During an employee-scoped rollout, the configured value above is the
+        # scoped path. Report the independently resolved unscoped path as well
+        # so readiness does not imply that every employee receives that radius.
+        if (
+            GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
+            and GEOFENCE_CLOCK_BOUNDARY_EMPLOYEE_SCOPE_REQUIRED
+        ):
+            if entity_type == "home_base" or GEOFENCE_SITE_RESOLUTION_ENABLED:
+                (
+                    clock_boundary_unscoped_legacy_fallback_radius_m,
+                    _,
+                ) = _clock_boundary_effective_geofence_radius(
+                    configured_radius_m,
+                    enabled=False,
+                )
+            else:
+                clock_boundary_unscoped_legacy_fallback_radius_m = int(
+                    LOCATION_MATCH_RADIUS_M
+                )
         # With only the shared rollout active, ordinary unscoped clock actions
         # can still fall back to the legacy nearest-pin matcher after C3 fails
         # to associate a Commercial Site. Keep that conditional compatibility
         # radius separate from the strict boundary used by an effective C6
         # scope; one "effective" value cannot truthfully represent both paths.
-        if (
+        elif (
             not GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
             and entity_type == "location"
         ):
