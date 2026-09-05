@@ -1646,6 +1646,55 @@ def test_clock_radius_scope_loss_honors_final_legacy_clock_out_bypass(
     ) == [{"action": "start", "outcome": "recorded"}]
 
 
+def test_clock_radius_unscoped_broad_c3_refreshes_legacy_site_data(
+    client, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "radius broad stale site")
+    site_id = _create_site(
+        "radius broad stale site",
+        location_type="Commercial",
+        geofence_radius_m=250,
+    )
+    monkeypatch.setattr(api, "_active_home_base_config", lambda *, cur=None: None)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        api, "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED", True
+    )
+    monkeypatch.setattr(
+        api, "GEOFENCE_CLOCK_BOUNDARY_EMPLOYEE_SCOPE_REQUIRED", True
+    )
+    original_scope_read = api._c6_authoritative_scope_state
+
+    def move_site_before_final_broad_resolution(*args, **kwargs):
+        final_scope = original_scope_read(*args, **kwargs)
+        db.execute(
+            "UPDATE locations SET lat = %s WHERE id = %s",
+            (LATITUDE + 1, site_id),
+        )
+        return final_scope
+
+    monkeypatch.setattr(
+        api,
+        "_c6_authoritative_scope_state",
+        move_site_before_final_broad_resolution,
+    )
+    rejected = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
+    )
+
+    assert rejected.status_code == 400, rejected.text
+    assert "nearest saved site" in rejected.json()["error"]
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 0}
+
+
 def test_commercial_home_base_clock_boundary_allows_ready_targets_without_gating_visits(
     client, auth, monkeypatch
 ):

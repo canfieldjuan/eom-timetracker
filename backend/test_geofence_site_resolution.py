@@ -2057,7 +2057,7 @@ def test_c3_clock_in_omitting_location_id_replays_a_predeploy_receipt(client, mo
     assert replay.json()["replayed"] is True
 
 
-def test_c3_rechecks_before_persist_and_falls_back_when_legacy_gps_allows_it(
+def test_c3_rechecks_before_persist_and_rejects_a_deactivated_legacy_target(
     client,
     monkeypatch,
 ):
@@ -2077,16 +2077,13 @@ def test_c3_rechecks_before_persist_and_falls_back_when_legacy_gps_allows_it(
         headers=employee_auth,
         json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 5},
     )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["siteResolution"] == {
-        "state": "unresolved",
-        "reason": "no_eligible_inside_site",
-    }
-    assert "locationId" not in body["entry"]
+    assert response.status_code == 400, response.text
+    assert "nearest saved site" in response.json()["error"]
     assert db.query_one(
-        "SELECT location_id FROM shifts WHERE id = %s", (body["entry"]["id"],)
-    ) == {"location_id": None}
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (_employee_id,),
+    ) == {"count": 0}
 
 
 def test_c3_clock_in_fallback_reapplies_the_legacy_gps_guard(client, monkeypatch):

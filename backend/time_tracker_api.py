@@ -17882,7 +17882,7 @@ def clock_in(
                         if home_base["policy"] and home_base["exception"]
                         else current_resolution
                     ),
-                    cur=(cur if clock_radius_enabled else None),
+                    cur=cur,
                     clock_radius_enabled=clock_radius_enabled,
                 )
                 if override_error:
