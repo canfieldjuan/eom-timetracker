@@ -17679,6 +17679,15 @@ def clock_in(
             }
         )
         if final_exception:
+            override_error = _c3_clock_boundary_override_error(
+                timesheet_data,
+                payload,
+                None,
+                cur=cur,
+                clock_radius_enabled=False,
+            )
+            if override_error:
+                raise HTTPException(status_code=400, detail=override_error)
             _refresh_plain_time_location_metadata(cur, timesheet_data)
             result["location"] = "Dispatch exception"
             result["locationId"] = None
@@ -18312,6 +18321,16 @@ def clock_out(
             )
             return
         if final_exception:
+            if not legacy_c6_end_bypass:
+                override_error = _c3_clock_boundary_override_error(
+                    timesheet_data,
+                    gate_payload,
+                    None,
+                    cur=cur,
+                    clock_radius_enabled=False,
+                )
+                if override_error:
+                    raise HTTPException(status_code=400, detail=override_error)
             _refresh_plain_time_location_metadata(cur, timesheet_data)
             result["clockOutGpsMeta"] = build_gps_meta(
                 timesheet_data,

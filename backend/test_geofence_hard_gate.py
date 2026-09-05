@@ -1469,6 +1469,37 @@ def test_clock_radius_scope_loss_replays_legacy_home_base_boundaries(
         "SELECT COUNT(*) AS count FROM home_base_events WHERE employee_id = %s",
         (employee_id,),
     ) == {"count": 0}
+
+    exception_sample = {
+        **home_sample,
+        "homeBaseExceptionReason": "Office entry was inaccessible.",
+    }
+    rejected_exception_start = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=exception_sample,
+    )
+    assert rejected_exception_start.status_code == 400, rejected_exception_start.text
+    assert "nearest saved site" in rejected_exception_start.json()["error"]
+    accepted_exception_start = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            **exception_sample,
+            "gpsOverrideReason": "Supervisor approved dispatch exception.",
+        },
+    )
+    assert accepted_exception_start.status_code == 200, accepted_exception_start.text
+    assert accepted_exception_start.json()["entry"]["location"] == "Dispatch exception"
+    accepted_exception_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            **exception_sample,
+            "gpsOverrideReason": "Supervisor approved dispatch exception.",
+        },
+    )
+    assert accepted_exception_end.status_code == 200, accepted_exception_end.text
     assert legacy_refresh_cursors
     assert all(cur is not None for cur in legacy_refresh_cursors)
 
@@ -1482,8 +1513,35 @@ def test_clock_radius_scope_loss_replays_legacy_home_base_boundaries(
     )
     assert started_home.status_code == 200, started_home.text
     assert started_home.json()["homeBaseEvent"]["outcome"] == "recorded"
-    db.execute("UPDATE home_bases SET active = false WHERE id = %s", (home_base_id,))
+    rejected_exception_end = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            **home_sample,
+            "homeBaseExceptionReason": "Office entry was inaccessible.",
+        },
+    )
+    assert rejected_exception_end.status_code == 400, rejected_exception_end.text
+    assert "nearest saved site" in rejected_exception_end.json()["error"]
     ended_with_exception = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            **home_sample,
+            "homeBaseExceptionReason": "Office entry was inaccessible.",
+            "gpsOverrideReason": "Supervisor approved dispatch exception.",
+        },
+    )
+    assert ended_with_exception.status_code == 200, ended_with_exception.text
+    assert ended_with_exception.json()["homeBaseEvent"]["outcome"] == "exception"
+
+    started_before_deactivation = client.post(
+        "/api/timesheet/clock-in", headers=employee_auth, json=home_center
+    )
+    assert started_before_deactivation.status_code == 200, started_before_deactivation.text
+    assert started_before_deactivation.json()["homeBaseEvent"]["outcome"] == "recorded"
+    db.execute("UPDATE home_bases SET active = false WHERE id = %s", (home_base_id,))
+    ended_after_deactivation = client.post(
         "/api/timesheet/clock-out",
         headers=employee_auth,
         json={
@@ -1491,14 +1549,18 @@ def test_clock_radius_scope_loss_replays_legacy_home_base_boundaries(
             "homeBaseExceptionReason": "Office was deactivated during the shift.",
         },
     )
-    assert ended_with_exception.status_code == 200, ended_with_exception.text
-    assert ended_with_exception.json()["homeBaseEvent"]["outcome"] == "exception"
+    assert ended_after_deactivation.status_code == 200, ended_after_deactivation.text
+    assert ended_after_deactivation.json()["homeBaseEvent"]["outcome"] == "exception"
     assert db.query_all(
         "SELECT action, outcome FROM home_base_events "
         "WHERE employee_id = %s ORDER BY action",
         (employee_id,),
     ) == [
         {"action": "end", "outcome": "exception"},
+        {"action": "end", "outcome": "exception"},
+        {"action": "end", "outcome": "exception"},
+        {"action": "start", "outcome": "exception"},
+        {"action": "start", "outcome": "recorded"},
         {"action": "start", "outcome": "recorded"},
     ]
 
