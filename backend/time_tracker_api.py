@@ -17397,6 +17397,7 @@ def clock_in(
         "resolution": None,
         "snapshot": None,
         "enabled": bool(GEOFENCE_SITE_RESOLUTION_ENABLED),
+        "clockRadiusEnabled": False,
     }
     hard_gate: Dict[str, Any] = {
         "effective": False,
@@ -17422,6 +17423,7 @@ def clock_in(
         hard_gate.update(_c6_employee_scope_state(employee["id"], now_utc))
         hard_gate_action = _c6_action_scope_state(hard_gate, "clock-in")
         clock_radius_enabled = _clock_radius_enabled_for_scope(hard_gate_action)
+        site_resolution["clockRadiusEnabled"] = clock_radius_enabled
         clock_in_target_policy = _c3_action_resolution_target_policy(
             "clock-in",
             hard_gate_action,
@@ -17749,6 +17751,9 @@ def clock_in(
         )
         final_action_scope = _c6_action_scope_state(final_scope, "clock-in")
         clock_radius_enabled = _clock_radius_enabled_for_scope(final_action_scope)
+        radius_transitioned_to_legacy = bool(
+            site_resolution.get("clockRadiusEnabled")
+        ) and not clock_radius_enabled
         was_resolution_enabled = bool(site_resolution["enabled"])
         site_resolution["enabled"] = _c3_action_resolution_enabled(
             "clock-in",
@@ -17765,6 +17770,12 @@ def clock_in(
         # transaction advisory lock as Site mutations before this authoritative
         # re-read so the candidate set and following time write share one view.
         _lock_customer_site_mutations(cur)
+        if radius_transitioned_to_legacy and home_base_exception:
+            # Broad C3 can remain enabled after an employee loses its scoped
+            # configured radius. Rebuild the non-gated Home Base exception
+            # before C3's final association pass, matching an initially
+            # unscoped request instead of retaining the scoped suppression.
+            restore_legacy_clock_in_before_persist(cur, result, _timesheet_data)
         current_resolution = _c3_resolve_site(
             "clock-in",
             payload,

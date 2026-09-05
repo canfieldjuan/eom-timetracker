@@ -1638,6 +1638,88 @@ def test_clock_radius_scope_loss_refreshes_legacy_site_data(
     )
 
 
+def test_clock_radius_scope_loss_restores_exception_while_broad_c3_stays_enabled(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(
+        client, "radius broad c3 exception"
+    )
+    _create_site(
+        "radius broad c3 exception",
+        location_type="Commercial",
+        geofence_radius_m=250,
+    )
+    home_base_id = _configure_ready_home_base(client, auth)
+    db.execute(
+        "UPDATE home_bases SET geofence_radius_m = 250 WHERE id = %s",
+        (home_base_id,),
+    )
+    attested = client.post(
+        "/api/admin/home-base/attest-geofence", headers=auth, json={}
+    )
+    assert attested.status_code == 200, attested.text
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        api, "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED", True
+    )
+    monkeypatch.setattr(
+        api, "GEOFENCE_CLOCK_BOUNDARY_EMPLOYEE_SCOPE_REQUIRED", True
+    )
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+
+    original_scope_read = api._c6_authoritative_scope_state
+
+    def lose_scope_before_persist(*args, **kwargs):
+        original_scope_read(*args, **kwargs)
+        return {"effective": False}
+
+    monkeypatch.setattr(
+        api, "_c6_authoritative_scope_state", lose_scope_before_persist
+    )
+    exception_sample = {
+        # Inside the configured 250m Home Base radius but outside legacy 50m.
+        "latitude": LATITUDE + 0.021,
+        "longitude": LONGITUDE,
+        "accuracy": 5,
+        "homeBaseExceptionReason": "Office entry was inaccessible.",
+    }
+    rejected = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json=exception_sample,
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "nearest saved site" in rejected.json()["error"]
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
+
+    accepted = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            **exception_sample,
+            "gpsOverrideReason": "Supervisor approved dispatch exception.",
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["entry"]["location"] == "Dispatch exception"
+    assert accepted.json()["entry"]["internalHomeBase"] is True
+    assert accepted.json()["siteResolution"] == {
+        "state": "unresolved",
+        "reason": "home_base_exception",
+    }
+    assert accepted.json()["homeBaseEvent"]["outcome"] == "exception"
+
+
 def test_clock_radius_scope_loss_honors_final_legacy_clock_out_bypass(
     client, auth, monkeypatch
 ):
