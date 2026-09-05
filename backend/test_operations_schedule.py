@@ -7697,7 +7697,8 @@ def test_expected_hours_baseline_rejection_is_fingerprint_scoped(client, auth):
                 site_id=int(seed["siteId"]),
                 employee_id=int(seed["employeeId"]),
                 suffix="Reject",
-                day=seed["futureDay"] - timedelta(days=2),
+                day=date.fromisoformat(baseline["observationPeriod"]["endDate"])
+                + timedelta(days=2),
                 duration=8,
             )
 
