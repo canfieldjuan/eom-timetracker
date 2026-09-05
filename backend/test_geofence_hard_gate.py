@@ -1285,6 +1285,16 @@ def test_clock_radius_canary_isolates_scoped_employee_clock_actions(
     assert "siteResolution" not in unscoped_end.json()
 
     monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", True)
+    preflight = client.post(
+        "/api/timesheet/site-resolution",
+        headers=unscoped_auth,
+        json={"action": "clock-in", **site_sample},
+    )
+    assert preflight.status_code == 200, preflight.text
+    assert preflight.json()["resolution"] == {
+        "state": "unresolved",
+        "reason": "no_eligible_inside_site",
+    }
     broad_start = client.post(
         "/api/timesheet/clock-in", headers=unscoped_auth, json=legacy_site_sample
     )
@@ -1351,6 +1361,91 @@ def test_clock_radius_canary_isolates_scoped_employee_clock_actions(
     )
     assert home_end.status_code == 200, home_end.text
     assert home_end.json()["siteResolution"]["state"] == "home_base"
+
+
+def test_clock_radius_scope_loss_replays_legacy_home_base_boundaries(
+    client, auth, monkeypatch
+):
+    employee_id, employee_auth = _create_employee(client, "radius scope loss")
+    site_id = _create_site(
+        "radius scope loss", location_type="Commercial", geofence_radius_m=250
+    )
+    home_base_id = _configure_ready_home_base(client, auth)
+    db.execute(
+        "UPDATE home_bases SET geofence_radius_m = 250 WHERE id = %s",
+        (home_base_id,),
+    )
+    attested = client.post(
+        "/api/admin/home-base/attest-geofence", headers=auth, json={}
+    )
+    assert attested.status_code == 200, attested.text
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_PER_SITE_RADIUS_ENABLED", False)
+    monkeypatch.setattr(
+        api, "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED", True
+    )
+    monkeypatch.setattr(
+        api, "GEOFENCE_CLOCK_BOUNDARY_EMPLOYEE_SCOPE_REQUIRED", True
+    )
+    _enable_commercial_clock_boundary(client, auth, employee_id)
+    site_sample = {
+        "locationId": site_id,
+        "latitude": LATITUDE,
+        "longitude": LONGITUDE,
+        "accuracy": 5,
+    }
+    started = client.post(
+        "/api/timesheet/clock-in", headers=employee_auth, json=site_sample
+    )
+    assert started.status_code == 200, started.text
+
+    original_scope_read = api._c6_authoritative_scope_state
+
+    def lose_scope_before_persist(*args, **kwargs):
+        original_scope_read(*args, **kwargs)
+        return {"effective": False}
+
+    monkeypatch.setattr(
+        api, "_c6_authoritative_scope_state", lose_scope_before_persist
+    )
+    home_sample = {
+        # Inside the configured 250m Home Base radius but outside legacy 50m.
+        "latitude": LATITUDE + 0.021,
+        "longitude": LONGITUDE,
+        "accuracy": 5,
+    }
+    rejected_end = client.post(
+        "/api/timesheet/clock-out", headers=employee_auth, json=home_sample
+    )
+    assert rejected_end.status_code == 400, rejected_end.text
+    assert "nearest saved site" in rejected_end.json()["error"]
+
+    legacy_home_sample = {
+        **home_sample,
+        "gpsOverrideReason": "Supervisor verified the legacy fallback.",
+    }
+    accepted_end = client.post(
+        "/api/timesheet/clock-out", headers=employee_auth, json=legacy_home_sample
+    )
+    assert accepted_end.status_code == 200, accepted_end.text
+    assert "homeBaseEvent" not in accepted_end.json()
+    assert accepted_end.json()["entry"]["clockOutGpsMeta"]["override"] is True
+
+    rejected_start = client.post(
+        "/api/timesheet/clock-in", headers=employee_auth, json=home_sample
+    )
+    assert rejected_start.status_code == 400, rejected_start.text
+    assert "nearest saved site" in rejected_start.json()["error"]
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts "
+        "WHERE employee_id = %s AND clock_out IS NULL",
+        (employee_id,),
+    ) == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
 
 
 def test_commercial_home_base_clock_boundary_allows_ready_targets_without_gating_visits(

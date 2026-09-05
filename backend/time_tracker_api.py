@@ -17639,6 +17639,99 @@ def clock_in(
             )
         return response
 
+    def restore_legacy_clock_in_before_persist(
+        cur: Any,
+        result: Dict[str, Any],
+        timesheet_data: Dict[str, Any],
+        snapshot: Any,
+    ) -> None:
+        """Reapply the complete dormant path after a final scope loss."""
+        final_home_base = _active_home_base_config(cur=cur)
+        final_geofence = _home_base_geofence_from_payload(
+            final_home_base,
+            payload,
+            clock_boundary=True,
+            clock_radius_enabled=False,
+        )
+        if _home_base_gps_confirmed(final_geofence):
+            home_base.update(
+                {
+                    "policy": final_home_base,
+                    "geofence": final_geofence,
+                    "confirmed": True,
+                    "exception": "",
+                }
+            )
+            result["location"] = f"Home Base — {final_home_base['label']}"
+            result["locationId"] = None
+            result["internalHomeBase"] = True
+            result["clockInGpsMeta"] = _home_base_gps_meta(
+                final_home_base, final_geofence
+            )
+            return
+
+        final_exception = home_base_exception if final_home_base else ""
+        home_base.update(
+            {
+                "policy": final_home_base,
+                "geofence": final_geofence,
+                "confirmed": False,
+                "exception": final_exception,
+            }
+        )
+        if final_exception:
+            result["location"] = "Dispatch exception"
+            result["locationId"] = None
+            result["internalHomeBase"] = True
+            result["clockInGpsMeta"] = build_gps_meta(
+                timesheet_data,
+                payload.latitude,
+                payload.longitude,
+                payload.gpsOverrideReason,
+                payload.gpsOverrideDetail,
+                payload.accuracy,
+            )
+            return
+
+        override_error = _c3_clock_boundary_override_error(
+            timesheet_data,
+            payload,
+            None,
+            clock_radius_enabled=False,
+        )
+        if override_error:
+            raise HTTPException(status_code=400, detail=override_error)
+        home_base.update(
+            {"policy": None, "geofence": None, "confirmed": False, "exception": ""}
+        )
+        result.pop("internalHomeBase", None)
+        result.pop("locationId", None)
+        if isinstance(snapshot, dict):
+            _c3_restore_target(result, snapshot, gps_meta_key="clockInGpsMeta")
+            return
+        if has_gps:
+            matched = find_nearest_location(
+                payload.latitude, payload.longitude, timesheet_data
+            )
+            result["location"] = (
+                matched
+                or payload.location.strip()
+                or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+            )
+        else:
+            result["location"] = payload.location.strip() or "Unknown"
+        result["customer"] = _resolve_customer(
+            result["location"], timesheet_data.get("location_customers", {})
+        )
+        result["clockInGpsMeta"] = build_gps_meta(
+            timesheet_data,
+            payload.latitude,
+            payload.longitude,
+            payload.gpsOverrideReason,
+            payload.gpsOverrideDetail,
+            payload.accuracy,
+        )
+
     def re_resolve_customer_site_before_persist(
         cur: Any,
         result: Dict[str, Any],
@@ -17649,17 +17742,16 @@ def clock_in(
         )
         final_action_scope = _c6_action_scope_state(final_scope, "clock-in")
         clock_radius_enabled = _clock_radius_enabled_for_scope(final_action_scope)
+        was_resolution_enabled = bool(site_resolution["enabled"])
         site_resolution["enabled"] = _c3_action_resolution_enabled(
             "clock-in",
             final_action_scope,
         )
         snapshot = site_resolution.get("snapshot")
         if not site_resolution["enabled"]:
-            if isinstance(snapshot, dict):
-                _c3_restore_target(
-                    result,
-                    snapshot,
-                    gps_meta_key="clockInGpsMeta",
+            if was_resolution_enabled:
+                restore_legacy_clock_in_before_persist(
+                    cur, result, _timesheet_data, snapshot
                 )
             return
         # The candidate query's row locks cannot cover a Site created or moved
@@ -18171,6 +18263,89 @@ def clock_out(
             ),
         )
 
+    def restore_legacy_clock_out_before_persist(
+        cur: Any,
+        result: Dict[str, Any],
+        timesheet_data: Dict[str, Any],
+        snapshot: Any,
+    ) -> None:
+        """Reapply the complete dormant end path after a final scope loss."""
+        final_home_base = _active_home_base_config(cur=cur)
+        final_geofence = _home_base_geofence_from_payload(
+            final_home_base,
+            gate_payload,
+            clock_boundary=True,
+            clock_radius_enabled=False,
+        )
+        final_confirmed = _home_base_gps_confirmed(final_geofence)
+        final_exception = (
+            home_base_exception if final_home_base and not final_confirmed else ""
+        )
+        home_base.update(
+            {
+                "policy": final_home_base,
+                "geofence": final_geofence,
+                "confirmed": final_confirmed,
+                "exception": final_exception,
+            }
+        )
+        if (final_confirmed or final_exception) and get_active_visit(result):
+            raise HTTPException(
+                status_code=400,
+                detail="Depart the active customer Site before ending at Home Base",
+            )
+        if (
+            not final_confirmed
+            and home_base["started_under"]
+            and not final_exception
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=_home_base_requirement_failure(
+                    home_base["started_under"], "clocking out"
+                ),
+            )
+        if final_confirmed:
+            result["clockOutGpsMeta"] = _home_base_gps_meta(
+                final_home_base, final_geofence
+            )
+            return
+        if final_exception:
+            result["clockOutGpsMeta"] = build_gps_meta(
+                timesheet_data,
+                payload.latitude if payload else None,
+                payload.longitude if payload else None,
+                payload.gpsOverrideReason if payload else "",
+                payload.gpsOverrideDetail if payload else "",
+                payload.accuracy if payload else None,
+            )
+            return
+
+        override_error = _c3_clock_boundary_override_error(
+            timesheet_data,
+            gate_payload,
+            None,
+            clock_radius_enabled=False,
+        )
+        if override_error:
+            raise HTTPException(status_code=400, detail=override_error)
+        home_base.update(
+            {"policy": None, "geofence": None, "confirmed": False, "exception": ""}
+        )
+        if isinstance(snapshot, dict) and snapshot.get("present"):
+            result["clockOutGpsMeta"] = snapshot.get("value")
+        elif isinstance(snapshot, dict):
+            result.pop("clockOutGpsMeta", None)
+        else:
+            result["clockOutGpsMeta"] = build_gps_meta(
+                timesheet_data,
+                payload.latitude if payload else None,
+                payload.longitude if payload else None,
+                payload.gpsOverrideReason if payload else "",
+                payload.gpsOverrideDetail if payload else "",
+                payload.accuracy if payload else None,
+            )
+
     def re_resolve_clock_out_before_persist(
         cur: Any,
         result: Dict[str, Any],
@@ -18184,17 +18359,17 @@ def clock_out(
         final_legacy_c6_end_bypass = bool(
             final_action_scope.get("legacyC6EndBypass")
         )
+        was_resolution_enabled = bool(site_resolution["enabled"])
         site_resolution["enabled"] = _c3_action_resolution_enabled(
             "clock-out",
             final_action_scope,
         )
         if not site_resolution["enabled"]:
             snapshot = site_resolution.get("gpsMetaSnapshot")
-            if isinstance(snapshot, dict):
-                if snapshot.get("present"):
-                    result["clockOutGpsMeta"] = snapshot.get("value")
-                else:
-                    result.pop("clockOutGpsMeta", None)
+            if was_resolution_enabled:
+                restore_legacy_clock_out_before_persist(
+                    cur, result, _timesheet_data, snapshot
+                )
             return
 
         _lock_customer_site_mutations(cur)
@@ -18562,6 +18737,7 @@ def resolve_customer_site(
             payload.action,
             action_scope,
         ),
+        clock_radius_enabled=_clock_radius_enabled_for_scope(action_scope),
     )
     public_resolution = _c3_public_resolution(resolution)
     append_access_log(
