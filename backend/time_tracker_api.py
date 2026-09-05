@@ -20731,18 +20731,24 @@ def _c3_resolve_site(
             "candidates": [row for row, _ in inside],
         }
     # A ready target always wins above. Only after proving that no ready target
-    # contains the sample do we surface an inside-but-unready target.
+    # contains the sample do we surface inside-but-unready targets. Aggregate
+    # Home Base and Commercial matches before attributing the failure so a
+    # mixed overlap cannot be mislabeled as one specific location.
+    inside_unready_targets: List[
+        Tuple[Dict[str, Any], Dict[str, Any], str]
+    ] = []
     if home_base_unready_at_sample:
-        return {
-            "state": "unresolved",
-            "reason": "home_base_unready",
-            "failureTarget": {
-                "kind": "home_base",
-                "id": int(home_base["home_base_id"]),
-                "label": str(home_base.get("label") or ""),
-            },
-            "geofence": home_base_geofence,
-        }
+        inside_unready_targets.append(
+            (
+                {
+                    "kind": "home_base",
+                    "id": int(home_base["home_base_id"]),
+                    "label": str(home_base.get("label") or ""),
+                },
+                home_base_geofence,
+                "home_base_unready",
+            )
+        )
     evaluated_unready_commercial = [
         (row, _c3_site_geofence(row, payload, action=action))
         for row in unready_commercial_rows
@@ -20752,21 +20758,35 @@ def _c3_resolve_site(
         for row, geofence in evaluated_unready_commercial
         if geofence.get("status") == "inside"
     ]
-    if inside_unready_commercial:
+    inside_unready_targets.extend(
+        (
+            {
+                "kind": "site",
+                "id": int(row["location_id"]),
+                "label": str(row.get("address") or ""),
+            },
+            geofence,
+            "commercial_site_unready",
+        )
+        for row, geofence in inside_unready_commercial
+    )
+    if inside_unready_targets:
+        single_unready_target = len(inside_unready_targets) == 1
+        reason = (
+            inside_unready_targets[0][2]
+            if single_unready_target
+            else "commercial_site_unready"
+        )
         unready_resolution: Dict[str, Any] = {
             "state": "unresolved",
-            "reason": "commercial_site_unready",
+            "reason": reason,
         }
-        if len(inside_unready_commercial) == 1:
-            row, unready_geofence = inside_unready_commercial[0]
+        if single_unready_target:
+            failure_target, unready_geofence, _reason = inside_unready_targets[0]
             unready_resolution.update(
                 {
-                "failureTarget": {
-                    "kind": "site",
-                    "id": int(row["location_id"]),
-                    "label": str(row.get("address") or ""),
-                },
-                "geofence": unready_geofence,
+                    "failureTarget": failure_target,
+                    "geofence": unready_geofence,
                 }
             )
         return unready_resolution

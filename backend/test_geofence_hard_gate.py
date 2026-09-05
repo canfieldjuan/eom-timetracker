@@ -816,6 +816,68 @@ def test_c6_overlapping_unready_sites_are_not_falsely_attributed(
     assert captured[0]["targetId"] is None
 
 
+def test_c6_overlapping_unready_home_base_and_site_are_not_falsely_attributed(
+    client,
+    auth,
+    monkeypatch,
+):
+    _employee_id, employee_auth = _create_employee(
+        client,
+        "mixed overlapping unready log",
+    )
+    _create_site(
+        "mixed overlapping unready log",
+        latitude=LATITUDE + 0.02,
+        ready=False,
+        location_type="Commercial",
+    )
+    home_base_id = _configure_ready_home_base(client, auth)
+    db.execute(
+        """
+        UPDATE home_bases
+        SET pin_attested_at = NULL,
+            pin_attestation_fingerprint = NULL
+        WHERE id = %s
+        """,
+        (home_base_id,),
+    )
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+    captured: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "CLOCK_IN_FAILED":
+            captured.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    failure = _hard_gate_failure(blocked)
+    assert failure["details"]["reason"] == "commercial_site_unready"
+    assert failure["details"].get("target") is None
+    assert len(captured) == 1
+    assert captured[0]["targetKind"] is None
+    assert captured[0]["targetId"] is None
+    assert captured[0]["distanceM"] is None
+    assert captured[0]["effectiveRadiusM"] is None
+    assert captured[0]["radiusSource"] is None
+
+
 def test_c6_unready_failure_logs_retain_target_metadata(
     client,
     auth,
