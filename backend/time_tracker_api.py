@@ -3798,7 +3798,8 @@ class GeofenceHardGateEmployeeScopeRequest(GeofenceHardGateScopeRequest):
     """Additive individual C6 profile selection.
 
     ``None`` preserves a stored profile during a legacy enable/disable request.
-    A newly created scope defaults to the established all-business start policy.
+    A newly created scope preserves the employee's inherited fleet policy, when
+    one applies, and otherwise uses the established all-business start policy.
     """
 
     profile: Optional[
@@ -20790,31 +20791,11 @@ def _c3_resolve_site(
         )
         for row, geofence in inside_unready_commercial
     )
-    if inside_unready_targets:
-        single_unready_target = len(inside_unready_targets) == 1
-        reason = (
-            inside_unready_targets[0][2]
-            if single_unready_target
-            else "commercial_site_unready"
-        )
-        unready_resolution: Dict[str, Any] = {
-            "state": "unresolved",
-            "reason": reason,
-        }
-        if single_unready_target:
-            failure_target, unready_geofence, _reason = inside_unready_targets[0]
-            unready_resolution.update(
-                {
-                    "failureTarget": failure_target,
-                    "geofence": unready_geofence,
-                }
-            )
-        return unready_resolution
+    uncertain_targets: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     if (
         target_policy
         == GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
     ):
-        uncertain_targets: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
         if (
             home_base
             and home_base_geofence
@@ -20854,16 +20835,39 @@ def _c3_resolve_site(
             for row, geofence in evaluated_unready_commercial
             if geofence.get("status") == "uncertain"
         )
-        if uncertain_targets:
-            uncertain_resolution: Dict[str, Any] = {
-                "state": "unresolved",
-                "reason": "uncertain",
-            }
-            if len(uncertain_targets) == 1:
-                failure_target, uncertain_geofence = uncertain_targets[0]
-                uncertain_resolution["failureTarget"] = failure_target
-                uncertain_resolution["geofence"] = uncertain_geofence
-            return uncertain_resolution
+    if inside_unready_targets:
+        single_inside_unready_target = len(inside_unready_targets) == 1
+        uniquely_attributable_target = (
+            single_inside_unready_target and not uncertain_targets
+        )
+        reason = (
+            inside_unready_targets[0][2]
+            if single_inside_unready_target
+            else "commercial_site_unready"
+        )
+        unready_resolution: Dict[str, Any] = {
+            "state": "unresolved",
+            "reason": reason,
+        }
+        if uniquely_attributable_target:
+            failure_target, unready_geofence, _reason = inside_unready_targets[0]
+            unready_resolution.update(
+                {
+                    "failureTarget": failure_target,
+                    "geofence": unready_geofence,
+                }
+            )
+        return unready_resolution
+    if uncertain_targets:
+        uncertain_resolution: Dict[str, Any] = {
+            "state": "unresolved",
+            "reason": "uncertain",
+        }
+        if len(uncertain_targets) == 1:
+            failure_target, uncertain_geofence = uncertain_targets[0]
+            uncertain_resolution["failureTarget"] = failure_target
+            uncertain_resolution["geofence"] = uncertain_geofence
+        return uncertain_resolution
     if (
         action in {"clock-in", "clock-out"}
         and GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
@@ -21106,6 +21110,50 @@ def _c6_employee_scope_state(
     ):
         state["individualProfile"] = individual_profile
     return state
+
+
+def _c6_inherited_employee_scope_profile(
+    employee_id: int,
+    reference_time: datetime,
+    *,
+    cur: Any,
+) -> str:
+    """Resolve the profile for an active employee with no explicit scope row.
+
+    The effective crew set is OPEN/DERIVED from current dated memberships. A
+    crew scope remains authoritative; only an employee without one inherits the
+    operator-managed fleet default.
+    """
+
+    local_day = reference_time.astimezone(APP_TIMEZONE).date()
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM crew_memberships membership
+            JOIN crews crew
+              ON crew.id = membership.crew_id
+             AND crew.active = true
+            JOIN geofence_hard_gate_scopes crew_scope
+              ON crew_scope.crew_id = crew.id
+             AND crew_scope.enabled = true
+            WHERE membership.employee_id = %s
+              AND membership.effective_from <= %s
+              AND (
+                  membership.effective_to IS NULL
+                  OR membership.effective_to > %s
+              )
+        ) AS crew_scoped
+        """,
+        (int(employee_id), local_day, local_day),
+    )
+    row = _row_from_cursor(cur)
+    if (
+        GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED
+        and not bool(row and row.get("crew_scoped"))
+    ):
+        return GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+    return GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
 
 
 def _c6_action_scope_state(scope: Dict[str, Any], action: str) -> Dict[str, Any]:
@@ -28473,11 +28521,32 @@ def admin_put_geofence_hard_gate_employee_scope(
                     (int(employee_id),),
                 )
                 existing_scope = _row_from_cursor(cur)
-                profile = str(
-                    payload.profile
-                    or (existing_scope or {}).get("policy_profile")
-                    or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
-                )
+                site_mutations_locked = False
+                if payload.profile is not None:
+                    profile = str(payload.profile)
+                elif existing_scope:
+                    profile = str(
+                        existing_scope.get("policy_profile")
+                        or GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+                    )
+                else:
+                    # Preserve the profile this employee inherited before the
+                    # first explicit opt-out row existed. Take C6's canonical
+                    # Site -> membership lock order before deriving the current
+                    # crew set so a concurrent membership replacement cannot
+                    # change that decision underneath this transaction.
+                    _lock_customer_site_mutations(cur)
+                    site_mutations_locked = True
+                    from calendar_import_store import (
+                        lock_planned_visit_assignment_mutations,
+                    )
+
+                    lock_planned_visit_assignment_mutations(cur)
+                    profile = _c6_inherited_employee_scope_profile(
+                        int(employee_id),
+                        utc_now(),
+                        cur=cur,
+                    )
                 if profile not in GEOFENCE_HARD_GATE_EMPLOYEE_SCOPE_PROFILES:
                     raise HTTPException(status_code=422, detail="Unsupported employee scope profile")
 
@@ -28489,7 +28558,8 @@ def admin_put_geofence_hard_gate_employee_scope(
                     # individual unready Commercial Sites remain rejected by
                     # the live action-time resolver instead of blocking every
                     # ready target at enable time.
-                    _lock_customer_site_mutations(cur)
+                    if not site_mutations_locked:
+                        _lock_customer_site_mutations(cur)
                     readiness = _c6_load_readiness(cur=cur, profile=profile)
                     if not readiness["ready"]:
                         _raise_conflict(

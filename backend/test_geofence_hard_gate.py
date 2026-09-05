@@ -412,7 +412,7 @@ def test_c6_individual_scope_defaults_off_without_a_scope_row(client, monkeypatc
     assert legacy.json()["entry"]["clockInGpsMeta"]["override"] is True
 
 
-def test_c6_fleet_default_inherits_strict_scope_and_explicit_disable_opts_out(
+def test_c6_fleet_default_profileless_opt_out_cycle_preserves_inherited_profile(
     client,
     auth,
     monkeypatch,
@@ -459,14 +459,14 @@ def test_c6_fleet_default_inherits_strict_scope_and_explicit_disable_opts_out(
     disabled = client.put(
         f"/api/admin/geofence-hard-gate-employee-scopes/{employee_id}",
         headers=auth,
-        json={
-            "enabled": False,
-            "profile": api.GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY,
-        },
+        json={"enabled": False},
     )
     assert disabled.status_code == 200, disabled.text
     assert disabled.json()["scope"]["scopeSource"] == "explicit"
     assert disabled.json()["scope"]["effective"] is False
+    assert disabled.json()["scope"]["profile"] == (
+        api.GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+    )
     opted_out = api._c6_employee_scope_state(employee_id, api.utc_now())
     assert opted_out == {
         "effective": False,
@@ -483,6 +483,20 @@ def test_c6_fleet_default_inherits_strict_scope_and_explicit_disable_opts_out(
     )
     assert explicit_admin["scopeSource"] == "explicit"
     assert explicit_admin["requested"] is False
+
+    reenabled = client.put(
+        f"/api/admin/geofence-hard-gate-employee-scopes/{employee_id}",
+        headers=auth,
+        json={"enabled": True},
+    )
+    assert reenabled.status_code == 200, reenabled.text
+    assert reenabled.json()["scope"]["profile"] == (
+        api.GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+    )
+    restored = api._c6_employee_scope_state(employee_id, api.utc_now())
+    assert restored["individualProfile"] == (
+        api.GEOFENCE_HARD_GATE_PROFILE_COMMERCIAL_HOME_BASE_CLOCK_BOUNDARY
+    )
 
 
 def test_c6_fleet_default_never_enrolls_an_inactive_account(client, monkeypatch):
@@ -531,6 +545,16 @@ def test_c6_fleet_default_preserves_existing_crew_policy(client, auth, monkeypat
     )
     assert employee_scope["scopeSource"] == "none"
     assert employee_scope["requested"] is False
+
+    explicit_crew_member = client.put(
+        f"/api/admin/geofence-hard-gate-employee-scopes/{employee_id}",
+        headers=auth,
+        json={"enabled": False},
+    )
+    assert explicit_crew_member.status_code == 200, explicit_crew_member.text
+    assert explicit_crew_member.json()["scope"]["profile"] == (
+        api.GEOFENCE_HARD_GATE_PROFILE_ALL_BUSINESS_START
+    )
 
     clock_in = client.post(
         "/api/timesheet/clock-in",
@@ -864,6 +888,63 @@ def test_c6_overlapping_unready_home_base_and_site_are_not_falsely_attributed(
             "longitude": LONGITUDE,
             "accuracy": 5,
         },
+    )
+
+    assert blocked.status_code == 409, blocked.text
+    failure = _hard_gate_failure(blocked)
+    assert failure["details"]["reason"] == "commercial_site_unready"
+    assert failure["details"].get("target") is None
+    assert len(captured) == 1
+    assert captured[0]["targetKind"] is None
+    assert captured[0]["targetId"] is None
+    assert captured[0]["distanceM"] is None
+    assert captured[0]["effectiveRadiusM"] is None
+    assert captured[0]["radiusSource"] is None
+
+
+@pytest.mark.parametrize("uncertain_site_ready", [True, False])
+def test_c6_mixed_inside_unready_and_uncertain_targets_are_not_attributed(
+    client,
+    monkeypatch,
+    uncertain_site_ready,
+):
+    monkeypatch.setattr(api, "SITE_CHECK_IN_RADIUS_M", 50)
+    _employee_id, employee_auth = _create_employee(
+        client,
+        "mixed unready uncertain log",
+    )
+    _create_site(
+        "mixed unready uncertain inside",
+        ready=False,
+        location_type="Commercial",
+    )
+    uncertain_latitude, uncertain_longitude = _destination(45)
+    _create_site(
+        "mixed unready uncertain candidate",
+        latitude=uncertain_latitude,
+        longitude=uncertain_longitude,
+        ready=uncertain_site_ready,
+        location_type="Commercial",
+    )
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", True)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED",
+        True,
+    )
+    captured: list[dict] = []
+    original_append = api.append_access_log
+
+    def capture_failure(*args, **kwargs):
+        if len(args) > 1 and args[1] == "CLOCK_IN_FAILED":
+            captured.append(dict(kwargs.get("details") or {}))
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(api, "append_access_log", capture_failure)
+    blocked = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={"latitude": LATITUDE, "longitude": LONGITUDE, "accuracy": 10},
     )
 
     assert blocked.status_code == 409, blocked.text
