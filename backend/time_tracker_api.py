@@ -17633,6 +17633,7 @@ def clock_in(
             # C3 remains association-only outside C6. Under an effective C6
             # scope the authoritative check above already rejected every
             # non-inside target, so no free-text fallback can become a bypass.
+            legacy_fallback_rechecked = False
             if (
                 not final_action_scope["effective"]
                 and current_resolution.get("state") != "home_base"
@@ -17653,11 +17654,24 @@ def clock_in(
                 )
                 if override_error:
                     raise HTTPException(status_code=400, detail=override_error)
+                legacy_fallback_rechecked = True
             _c3_restore_target(
                 result,
                 snapshot,
                 gps_meta_key="clockInGpsMeta",
             )
+            if (
+                legacy_fallback_rechecked
+                and not (home_base["policy"] and home_base["exception"])
+            ):
+                result["clockInGpsMeta"] = build_gps_meta(
+                    _timesheet_data,
+                    payload.latitude,
+                    payload.longitude,
+                    payload.gpsOverrideReason,
+                    payload.gpsOverrideDetail,
+                    payload.accuracy,
+                )
 
     def record_home_base_event(
         cur: Any,
@@ -18028,6 +18042,31 @@ def clock_out(
             }
             return
 
+        # The locked resolver, not the provisional browser-time read, owns the
+        # final Home Base confirmation. Clear every stale Home Base artifact
+        # before applying a non-Home-Base result or considering legacy fallback.
+        if current_resolution.get("state") != "home_base":
+            home_base.update(
+                {
+                    "policy": None,
+                    "geofence": None,
+                    "confirmed": False,
+                }
+            )
+            if (
+                not final_action_scope["effective"]
+                and not final_legacy_c6_end_bypass
+                and home_base["started_under"]
+                and not home_base["exception"]
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=_home_base_requirement_failure(
+                        home_base["started_under"],
+                        "clocking out",
+                    ),
+                )
+
         if current_resolution.get("state") == "customer_site":
             # The Home Base event is written after persistence.  Do not let
             # its closure retain the provisional Home Base result when the
@@ -18084,12 +18123,14 @@ def clock_out(
             )
             if override_error:
                 raise HTTPException(status_code=400, detail=override_error)
-            snapshot = site_resolution.get("gpsMetaSnapshot")
-            if isinstance(snapshot, dict):
-                if snapshot.get("present"):
-                    result["clockOutGpsMeta"] = snapshot.get("value")
-                else:
-                    result.pop("clockOutGpsMeta", None)
+            result["clockOutGpsMeta"] = build_gps_meta(
+                _timesheet_data,
+                payload.latitude if payload else None,
+                payload.longitude if payload else None,
+                payload.gpsOverrideReason if payload else "",
+                payload.gpsOverrideDetail if payload else "",
+                payload.accuracy if payload else None,
+            )
 
     def response_builder(
         result: Dict[str, Any],
@@ -20220,10 +20261,10 @@ def _c3_clock_boundary_override_error(
             }
             for row in current_location_rows
         }
-        timesheet_data = {
-            **timesheet_data,
-            "location_coords": current_location_coords,
-        }
+        # This is the request-local transaction snapshot passed through the
+        # plain-time writer. Updating it in place also lets final GPS metadata
+        # use the exact pin set that authorized the fallback.
+        timesheet_data["location_coords"] = current_location_coords
     error = require_gps_override(
         timesheet_data,
         getattr(payload, "latitude", None),

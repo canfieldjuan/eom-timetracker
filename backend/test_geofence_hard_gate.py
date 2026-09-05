@@ -1462,6 +1462,84 @@ def test_commercial_home_base_boundary_uses_final_customer_site_for_end_event(
     ) == {"count": 0}
 
 
+def test_clock_out_rejects_a_stale_provisional_home_base_confirmation(
+    client,
+    auth,
+    monkeypatch,
+):
+    """A final Home Base move invalidates its provisional end confirmation."""
+
+    employee_id, employee_auth = _create_employee(client, "stale office end")
+    start_site_id = _create_site(
+        "stale office end start",
+        location_type="Commercial",
+    )
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "locationId": start_site_id,
+            "latitude": LATITUDE,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    original_resolver = api._c3_resolve_site
+    clock_out_resolutions = 0
+
+    def move_home_base_after_provisional_resolution(action, *args, **kwargs):
+        nonlocal clock_out_resolutions
+        resolution = original_resolver(action, *args, **kwargs)
+        if action == "clock-out":
+            clock_out_resolutions += 1
+            if clock_out_resolutions == 1:
+                assert resolution["state"] == "home_base"
+                db.execute(
+                    "UPDATE home_bases SET latitude = %s WHERE active = true",
+                    (LATITUDE + 0.3,),
+                )
+        return resolution
+
+    monkeypatch.setattr(
+        api,
+        "_c3_resolve_site",
+        move_home_base_after_provisional_resolution,
+    )
+    ended = client.post(
+        "/api/timesheet/clock-out",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert ended.status_code == 400, ended.text
+    assert clock_out_resolutions == 2
+    assert "nearest saved site" in ended.text
+    assert db.query_one(
+        "SELECT clock_out FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"clock_out": None}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events "
+        "WHERE shift_id = %s AND action = 'end'",
+        (int(started.json()["entry"]["id"]),),
+    ) == {"count": 0}
+
+
 def test_c6_profile_upgrade_defaults_legacy_scope_rows(client):
     """The old scope table upgrades to a non-null historic policy by default."""
 
