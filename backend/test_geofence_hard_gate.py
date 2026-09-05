@@ -2262,7 +2262,7 @@ def test_clock_in_rejects_a_stale_provisional_home_base_confirmation(
 ):
     """A final Home Base move invalidates its provisional start confirmation."""
 
-    _employee_id, employee_auth = _create_employee(client, "stale office start")
+    employee_id, employee_auth = _create_employee(client, "stale office start")
     _create_site("stale office start fallback", location_type="Commercial")
     _configure_ready_home_base(client, auth)
     monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", False)
@@ -2306,7 +2306,10 @@ def test_clock_in_rejects_a_stale_provisional_home_base_confirmation(
     assert started.status_code == 400, started.text
     assert clock_in_resolutions == 2
     assert "nearest saved site" in started.text
-    assert db.query_one("SELECT COUNT(*) AS count FROM shifts") == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM shifts WHERE employee_id = %s",
+        (employee_id,),
+    ) == {"count": 0}
     assert db.query_one(
         "SELECT COUNT(*) AS count FROM home_base_events WHERE action = 'start'"
     ) == {"count": 0}
