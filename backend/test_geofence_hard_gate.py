@@ -2141,6 +2141,63 @@ def test_clock_out_rejects_a_stale_provisional_home_base_confirmation(
     ) == {"count": 0}
 
 
+def test_clock_in_rejects_a_stale_provisional_home_base_confirmation(
+    client,
+    auth,
+    monkeypatch,
+):
+    """A final Home Base move invalidates its provisional start confirmation."""
+
+    _employee_id, employee_auth = _create_employee(client, "stale office start")
+    _create_site("stale office start fallback", location_type="Commercial")
+    _configure_ready_home_base(client, auth)
+    monkeypatch.setattr(api, "GEOFENCE_HARD_GATE_ENABLED", False)
+    monkeypatch.setattr(api, "GEOFENCE_SITE_RESOLUTION_ENABLED", False)
+    monkeypatch.setattr(
+        api,
+        "GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED",
+        True,
+    )
+    original_resolver = api._c3_resolve_site
+    clock_in_resolutions = 0
+
+    def move_home_base_after_provisional_resolution(action, *args, **kwargs):
+        nonlocal clock_in_resolutions
+        resolution = original_resolver(action, *args, **kwargs)
+        if action == "clock-in":
+            clock_in_resolutions += 1
+            if clock_in_resolutions == 1:
+                assert resolution["state"] == "home_base"
+                db.execute(
+                    "UPDATE home_bases SET latitude = %s WHERE active = true",
+                    (LATITUDE + 0.3,),
+                )
+        return resolution
+
+    monkeypatch.setattr(
+        api,
+        "_c3_resolve_site",
+        move_home_base_after_provisional_resolution,
+    )
+    started = client.post(
+        "/api/timesheet/clock-in",
+        headers=employee_auth,
+        json={
+            "latitude": LATITUDE + 0.02,
+            "longitude": LONGITUDE,
+            "accuracy": 5,
+        },
+    )
+
+    assert started.status_code == 400, started.text
+    assert clock_in_resolutions == 2
+    assert "nearest saved site" in started.text
+    assert db.query_one("SELECT COUNT(*) AS count FROM shifts") == {"count": 0}
+    assert db.query_one(
+        "SELECT COUNT(*) AS count FROM home_base_events WHERE action = 'start'"
+    ) == {"count": 0}
+
+
 def test_c6_profile_upgrade_defaults_legacy_scope_rows(client):
     """The old scope table upgrades to a non-null historic policy by default."""
 

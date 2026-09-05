@@ -17638,26 +17638,6 @@ def clock_in(
             "clock-in",
             final_action_scope,
         )
-        hard_gate_failure = _c6_hard_gate_failure_if_needed(
-            "clock-in",
-            payload,
-            employee,
-            final_scope,
-            reference_time=now_utc,
-            cur=cur,
-        )
-        if hard_gate_failure:
-            _append_timesheet_failure_log(
-                request,
-                "CLOCK_IN_FAILED",
-                int(employee["id"]),
-                hard_gate_failure,
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=_public_timesheet_mutation_failure(hard_gate_failure),
-            )
-
         snapshot = site_resolution.get("snapshot")
         if not site_resolution["enabled"]:
             if isinstance(snapshot, dict):
@@ -17666,8 +17646,6 @@ def clock_in(
                     snapshot,
                     gps_meta_key="clockInGpsMeta",
                 )
-            return
-        if not isinstance(snapshot, dict):
             return
         # The candidate query's row locks cannot cover a Site created or moved
         # into the GPS envelope after the query begins.  Use the same
@@ -17686,6 +17664,71 @@ def clock_in(
             ),
         )
         site_resolution["resolution"] = current_resolution
+        hard_gate_failure = _c6_hard_gate_failure_if_needed(
+            "clock-in",
+            payload,
+            employee,
+            final_scope,
+            reference_time=now_utc,
+            cur=cur,
+            resolution=current_resolution,
+        )
+        if hard_gate_failure:
+            _append_timesheet_failure_log(
+                request,
+                "CLOCK_IN_FAILED",
+                int(employee["id"]),
+                hard_gate_failure,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=_public_timesheet_mutation_failure(hard_gate_failure),
+            )
+
+        if current_resolution.get("state") == "home_base":
+            home_base_config = current_resolution.get("homeBase")
+            geofence = current_resolution.get("geofence")
+            if not isinstance(home_base_config, dict) or not isinstance(geofence, dict):
+                raise RuntimeError("Clock-in Home Base resolution was incomplete")
+            home_base.update(
+                {
+                    "policy": home_base_config,
+                    "geofence": geofence,
+                    "confirmed": True,
+                    "exception": "",
+                }
+            )
+            result["location"] = f"Home Base — {home_base_config['label']}"
+            result["locationId"] = None
+            result["internalHomeBase"] = True
+            result["clockInGpsMeta"] = _home_base_gps_meta(
+                home_base_config,
+                geofence,
+            )
+            return
+
+        if home_base["policy"] and home_base["exception"]:
+            # A documented non-gated dispatch exception remains internal Home
+            # Base evidence when final C3 resolution sees another target, but
+            # valid locked Home Base GPS above still takes precedence.
+            site_resolution["resolution"] = {
+                "state": "unresolved",
+                "reason": "home_base_exception",
+            }
+            return
+
+        # Any non-Home-Base final result invalidates provisional dispatch
+        # classification and evidence before Site application or fallback.
+        home_base.update(
+            {
+                "policy": None,
+                "geofence": None,
+                "confirmed": False,
+                "exception": "",
+            }
+        )
+        result.pop("internalHomeBase", None)
+        result.pop("locationId", None)
         if current_resolution.get("state") == "customer_site":
             home_base.update(
                 {
@@ -17743,14 +17786,25 @@ def clock_in(
                 if override_error:
                     raise HTTPException(status_code=400, detail=override_error)
                 legacy_fallback_rechecked = True
-            _c3_restore_target(
-                result,
-                snapshot,
-                gps_meta_key="clockInGpsMeta",
-            )
+            if isinstance(snapshot, dict):
+                _c3_restore_target(
+                    result,
+                    snapshot,
+                    gps_meta_key="clockInGpsMeta",
+                )
+            else:
+                matched = find_nearest_location(
+                    payload.latitude,
+                    payload.longitude,
+                    _timesheet_data,
+                )
+                result["location"] = (
+                    matched
+                    or payload.location.strip()
+                    or f"GPS {payload.latitude:.5f},{payload.longitude:.5f}"
+                )
             if (
                 legacy_fallback_rechecked
-                and not (home_base["policy"] and home_base["exception"])
             ):
                 result["clockInGpsMeta"] = build_gps_meta(
                     _timesheet_data,
