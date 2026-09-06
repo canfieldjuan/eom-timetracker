@@ -45,6 +45,10 @@ services:
       # legacy shared switch so Residential/visit/arrival behavior stays put.
       - key: GEOFENCE_CLOCK_BOUNDARY_PER_SITE_RADIUS_ENABLED
         sync: false
+      # Optional canary control: when enabled, the dedicated clock-radius
+      # switch applies only to employees with an effective action scope.
+      - key: GEOFENCE_CLOCK_BOUNDARY_EMPLOYEE_SCOPE_REQUIRED
+        sync: false
       # New active accounts inherit the strict Commercial/Home Base clock
       # boundary when enabled; an explicit disabled employee row opts out.
       - key: GEOFENCE_COMMERCIAL_HOME_BASE_DEFAULT_SCOPE_ENABLED
