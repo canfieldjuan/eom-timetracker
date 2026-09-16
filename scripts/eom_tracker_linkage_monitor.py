@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -30,6 +31,25 @@ DEFAULT_STATE_FILE = Path(
 # counts. A missing or invalid member makes the measurement unavailable rather
 # than silently clean; new audit signals remain outside this proof slice.
 SIGNAL_KEYS = ("unlinkedCustomers", "staleReservations", "danglingLinks")
+
+# The tracker answers a read it could not complete upstream with HTTP 503 and
+# the literal instruction "retry this request" (time_tracker_api.py
+# _atlas_funnel_read), sending Retry-After when it relayed an upstream 5xx.
+# Honoring that contract once, for the read-only GETs, is the client behaving
+# as the API asks; it is not suppression. A second 503 is still measured as
+# unavailable, and the login POST is never replayed.
+_UNAVAILABLE_STATUS = 503
+_UNAVAILABLE_RETRY_ATTEMPTS = 2
+_UNAVAILABLE_RETRY_DEFAULT_DELAY_SECONDS = 5.0
+_UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 30.0
+# The tracker's HTTPException handler always emits {"success": false, "error":
+# <detail>} where the detail is a fixed server literal naming the failure
+# (unconfigured proxy, upstream transport failure, relayed upstream status).
+# Carrying it into the alert is what lets an operator tell those apart. The
+# bounds keep a notification short and keep an unexpected body from being
+# relayed wholesale.
+_ERROR_BODY_MAX_BYTES = 65536
+_ERROR_DETAIL_MAX_LENGTH = 200
 
 
 @dataclass(frozen=True)
@@ -90,12 +110,76 @@ def _open(request: urllib.request.Request):
     return urllib.request.urlopen(request, timeout=20)
 
 
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str | None:
+    """Return the tracker's server-authored error literal, bounded, or None."""
+    read = getattr(exc, "read", None)
+    if not callable(read):
+        return None
+    try:
+        raw = read(_ERROR_BODY_MAX_BYTES)
+    except (OSError, ValueError):
+        return None
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    detail = decoded.get("error")
+    if not isinstance(detail, str):
+        detail = decoded.get("detail")
+    if not isinstance(detail, str):
+        return None
+    text = " ".join(detail.split())
+    if not text:
+        return None
+    return text[:_ERROR_DETAIL_MAX_LENGTH]
+
+
+def _http_error_message(exc: urllib.error.HTTPError) -> str:
+    detail = _http_error_detail(exc)
+    return f"HTTP {exc.code} ({detail})" if detail else f"HTTP {exc.code}"
+
+
+def _retry_after_seconds(exc: urllib.error.HTTPError) -> float:
+    """Bounded Retry-After in seconds; the tracker's own 5s when absent/invalid."""
+    headers = getattr(exc, "headers", None)
+    value = headers.get("Retry-After") if headers is not None else None
+    if not isinstance(value, str) or not value.strip().isdigit():
+        return _UNAVAILABLE_RETRY_DEFAULT_DELAY_SECONDS
+    return min(float(value.strip()), _UNAVAILABLE_RETRY_MAX_DELAY_SECONDS)
+
+
+def _http_json_once(
+    request: urllib.request.Request,
+) -> tuple[dict[str, Any] | None, str | None, urllib.error.HTTPError | None]:
+    try:
+        with _open(request) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        return None, _http_error_message(exc), exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return None, f"request failed ({type(exc).__name__})", None
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "response was not valid JSON", None
+    if not isinstance(decoded, dict):
+        return None, "response was not a JSON object", None
+    return decoded, None, None
+
+
 def _http_json(
     url: str,
     *,
     method: str,
     payload: Mapping[str, Any] | None = None,
     headers: Mapping[str, str] | None = None,
+    retry_unavailable: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     request_headers = {"Accept": "application/json"}
@@ -106,20 +190,21 @@ def _http_json(
     request = urllib.request.Request(
         url, data=body, headers=request_headers, method=method
     )
-    try:
-        with _open(request) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as exc:
-        return None, f"HTTP {exc.code}"
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        return None, f"request failed ({type(exc).__name__})"
-    try:
-        decoded = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None, "response was not valid JSON"
-    if not isinstance(decoded, dict):
-        return None, "response was not a JSON object"
-    return decoded, None
+    attempts = _UNAVAILABLE_RETRY_ATTEMPTS if retry_unavailable else 1
+    attempt = 0
+    while True:
+        attempt += 1
+        decoded, error, http_error = _http_json_once(request)
+        if (
+            http_error is None
+            or http_error.code != _UNAVAILABLE_STATUS
+            or attempt >= attempts
+        ):
+            break
+        _sleep(_retry_after_seconds(http_error))
+    if error is not None and attempt > 1:
+        error = f"{error} after {attempt} attempts"
+    return decoded, error
 
 
 def measure(settings: Settings) -> tuple[dict[str, int] | None, str | None]:
@@ -136,6 +221,7 @@ def measure(settings: Settings) -> tuple[dict[str, int] | None, str | None]:
         f"{settings.base_url}{FUNNEL_REVIEW_PATH}",
         method="GET",
         headers={"Authorization": f"Bearer {token}"},
+        retry_unavailable=True,
     )
     if error or funnel_review is None:
         return None, f"funnel review {error or 'response missing'}"
@@ -146,6 +232,7 @@ def measure(settings: Settings) -> tuple[dict[str, int] | None, str | None]:
         f"{settings.base_url}{AUDIT_PATH}",
         method="GET",
         headers={"Authorization": f"Bearer {token}"},
+        retry_unavailable=True,
     )
     if error or audit is None:
         return None, error or "audit response missing"
