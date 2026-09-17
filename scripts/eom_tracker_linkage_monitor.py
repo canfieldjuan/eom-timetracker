@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -32,24 +33,51 @@ DEFAULT_STATE_FILE = Path(
 # than silently clean; new audit signals remain outside this proof slice.
 SIGNAL_KEYS = ("unlinkedCustomers", "staleReservations", "danglingLinks")
 
-# The tracker answers a read it could not complete upstream with HTTP 503 and
-# the literal instruction "retry this request" (time_tracker_api.py
-# _atlas_funnel_read), sending Retry-After when it relayed an upstream 5xx.
-# Honoring that contract once, for the read-only GETs, is the client behaving
-# as the API asks; it is not suppression. A second 503 is still measured as
-# unavailable, and the login POST is never replayed.
+# The tracker marks a read it could not complete upstream as retryable in two
+# ways (time_tracker_api.py _atlas_funnel_read): its own HTTP 503 whose detail
+# says "retry this request", and any relayed upstream 5xx sent with a
+# Retry-After header. Honoring that contract once, for the read-only GETs, is
+# the client behaving as the API asks; it is not suppression. A second failure
+# is still measured as unavailable, and the login POST is never replayed.
 _UNAVAILABLE_STATUS = 503
 _UNAVAILABLE_RETRY_ATTEMPTS = 2
 _UNAVAILABLE_RETRY_DEFAULT_DELAY_SECONDS = 5.0
 _UNAVAILABLE_RETRY_MAX_DELAY_SECONDS = 30.0
-# The tracker's HTTPException handler always emits {"success": false, "error":
-# <detail>} where the detail is a fixed server literal naming the failure
-# (unconfigured proxy, upstream transport failure, relayed upstream status).
-# Carrying it into the alert is what lets an operator tell those apart. The
-# bounds keep a notification short and keep an unexpected body from being
-# relayed wholesale.
+# The tracker's HTTPException handler emits {"success": false, "error":
+# <detail>}. For the three requests this monitor makes, the detail is one of
+# the fixed server literals below, and those are what let an operator tell an
+# unconfigured proxy, an upstream transport failure, and a relayed upstream
+# refusal apart. A relayed detail is copied from the upstream body, so the
+# set is CLOSED / ENUMERATED: only an exact member reaches a notification,
+# and anything else is reported as withheld. Lead data, credentials, and
+# upstream diagnostics therefore never enter ntfy through this path.
 _ERROR_BODY_MAX_BYTES = 65536
-_ERROR_DETAIL_MAX_LENGTH = 200
+_WITHHELD_DETAIL = "unrecognized error detail withheld"
+_KNOWN_ERROR_DETAILS = frozenset(
+    {
+        # Tracker: Atlas funnel proxy (time_tracker_api.py _atlas_funnel_read and
+        # _require_atlas_funnel_configuration).
+        "EOM customer handoff service is not configured",
+        "EOM lead review service is temporarily unavailable; retry this request",
+        "EOM lead review service returned an invalid response",
+        "EOM lead review service authentication failed",
+        "EOM lead review failed",
+        # Tracker: login and bearer authentication on the monitored routes.
+        "Name and password are required",
+        "Invalid name or password",
+        "Access token required",
+        "Token has expired",
+        "Invalid access token",
+        "Invalid token payload",
+        "Token has been revoked",
+        "Employee account not found",
+        "Admin access required",
+        "Too many requests; try again later",
+        # Atlas: the one refusal the leads read relays verbatim
+        # (atlas_brain/eom_api/funnel_auth.py require_eom_funnel_api).
+        "EOM funnel API is disabled",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -115,13 +143,18 @@ def _sleep(seconds: float) -> None:
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str | None:
-    """Return the tracker's server-authored error literal, bounded, or None."""
+    """Return the known server literal from an error body, withheld, or None.
+
+    Reading the body must never raise past this function: a truncated or
+    disconnected error response (http.client.IncompleteRead, socket errors)
+    degrades to the bare status code, so the unavailable alert still sends.
+    """
     read = getattr(exc, "read", None)
     if not callable(read):
         return None
     try:
         raw = read(_ERROR_BODY_MAX_BYTES)
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return None
     try:
         decoded = json.loads(raw.decode("utf-8"))
@@ -137,7 +170,7 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str | None:
     text = " ".join(detail.split())
     if not text:
         return None
-    return text[:_ERROR_DETAIL_MAX_LENGTH]
+    return text if text in _KNOWN_ERROR_DETAILS else _WITHHELD_DETAIL
 
 
 def _http_error_message(exc: urllib.error.HTTPError) -> str:
@@ -145,13 +178,25 @@ def _http_error_message(exc: urllib.error.HTTPError) -> str:
     return f"HTTP {exc.code} ({detail})" if detail else f"HTTP {exc.code}"
 
 
-def _retry_after_seconds(exc: urllib.error.HTTPError) -> float:
-    """Bounded Retry-After in seconds; the tracker's own 5s when absent/invalid."""
+def _retry_after_header(exc: urllib.error.HTTPError) -> str | None:
     headers = getattr(exc, "headers", None)
     value = headers.get("Retry-After") if headers is not None else None
-    if not isinstance(value, str) or not value.strip().isdigit():
+    return value if isinstance(value, str) else None
+
+
+def _retry_after_seconds(exc: urllib.error.HTTPError) -> float:
+    """Bounded Retry-After in seconds; the tracker's own 5s when absent/invalid."""
+    value = _retry_after_header(exc)
+    if value is None or not value.strip().isdigit():
         return _UNAVAILABLE_RETRY_DEFAULT_DELAY_SECONDS
     return min(float(value.strip()), _UNAVAILABLE_RETRY_MAX_DELAY_SECONDS)
+
+
+def _retryable(exc: urllib.error.HTTPError) -> bool:
+    """The tracker's two retry signals: its own 503, or a relayed 5xx with Retry-After."""
+    if exc.code == _UNAVAILABLE_STATUS:
+        return True
+    return 500 <= exc.code <= 599 and _retry_after_header(exc) is not None
 
 
 def _http_json_once(
@@ -195,11 +240,7 @@ def _http_json(
     while True:
         attempt += 1
         decoded, error, http_error = _http_json_once(request)
-        if (
-            http_error is None
-            or http_error.code != _UNAVAILABLE_STATUS
-            or attempt >= attempts
-        ):
+        if http_error is None or not _retryable(http_error) or attempt >= attempts:
             break
         _sleep(_retry_after_seconds(http_error))
     if error is not None and attempt > 1:

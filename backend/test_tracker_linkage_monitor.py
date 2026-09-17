@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import email.message
+import http.client
 import importlib.util
 import io
 import json
@@ -439,9 +440,9 @@ def test_unavailable_audit_read_uses_the_same_contract_retry(monkeypatch, tmp_pa
     )
 
     assert counts is None
-    assert error == (
-        "HTTP 503 (Atlas linkage audit is temporarily unavailable) after 2 attempts"
-    )
+    # An unlisted server string is never relayed; the status and attempt count
+    # still reach the alert.
+    assert error == f"HTTP 503 ({monitor._WITHHELD_DETAIL}) after 2 attempts"
     assert [request.full_url for request in requests][2:] == [audit_url, audit_url]
     # No Retry-After on this response: the tracker's own 5s default applies.
     assert sleeps == [5.0]
@@ -479,19 +480,41 @@ def test_retry_after_is_honored_and_bounded(
 
 
 @pytest.mark.parametrize(
-    ("status", "body", "expected"),
+    ("status", "headers", "body", "expected"),
     [
-        (401, {"success": False, "error": "Invalid token"}, "HTTP 401 (Invalid token)"),
+        # Bearer rejection: a 4xx is never retried, Retry-After or not.
+        (
+            401,
+            {"Retry-After": "5"},
+            {"success": False, "error": "Invalid access token"},
+            "HTTP 401 (Invalid access token)",
+        ),
+        (403, {}, {"success": False, "error": "Admin access required"}, "HTTP 403 (Admin access required)"),
+        # The tracker's own 502s carry no Retry-After: they are not transient.
         (
             502,
+            {},
             {"success": False, "error": "EOM lead review service authentication failed"},
             "HTTP 502 (EOM lead review service authentication failed)",
         ),
-        (500, {"success": False, "error": "Internal server error"}, "HTTP 500 (Internal server error)"),
+        (
+            502,
+            {},
+            {"success": False, "error": "EOM lead review service returned an invalid response"},
+            "HTTP 502 (EOM lead review service returned an invalid response)",
+        ),
+        # A bare 500 without the tracker's retry signal fails immediately, and an
+        # unlisted server string is withheld from the alert.
+        (
+            500,
+            {},
+            {"success": False, "error": "Internal server error"},
+            f"HTTP 500 ({monitor._WITHHELD_DETAIL})",
+        ),
     ],
 )
-def test_other_http_errors_fail_immediately_with_their_detail(
-    monkeypatch, tmp_path, status, body, expected
+def test_non_retryable_http_errors_fail_immediately(
+    monkeypatch, tmp_path, status, headers, body, expected
 ):
     review_url = "https://tracker.example.test" + monitor.FUNNEL_REVIEW_PATH
     counts, error, requests, sleeps = _measure_with(
@@ -499,7 +522,7 @@ def test_other_http_errors_fail_immediately_with_their_detail(
         tmp_path,
         [
             _Response({"token": "test-token"}),
-            _http_error(review_url, status, body, headers={"Retry-After": "5"}),
+            _http_error(review_url, status, body, headers=headers),
         ],
     )
 
@@ -507,6 +530,54 @@ def test_other_http_errors_fail_immediately_with_their_detail(
     assert error == f"funnel review {expected}"
     assert len(requests) == 2
     assert sleeps == []
+
+
+@pytest.mark.parametrize("status", [500, 502, 504])
+def test_relayed_upstream_5xx_with_retry_after_is_retried_once(
+    monkeypatch, tmp_path, status
+):
+    # time_tracker_api.py _atlas_funnel_read relays an upstream 5xx with its
+    # status and Retry-After: 5; that header is the tracker's retry signal.
+    review_url = "https://tracker.example.test" + monitor.FUNNEL_REVIEW_PATH
+    relayed = {"success": False, "error": "EOM lead review failed"}
+    counts, error, requests, sleeps = _measure_with(
+        monkeypatch,
+        tmp_path,
+        [
+            _Response({"token": "test-token"}),
+            _http_error(review_url, status, relayed, headers={"Retry-After": "5"}),
+            _http_error(review_url, status, relayed, headers={"Retry-After": "5"}),
+        ],
+    )
+
+    assert counts is None
+    assert error == f"funnel review HTTP {status} (EOM lead review failed) after 2 attempts"
+    assert [request.full_url for request in requests][1:] == [review_url, review_url]
+    assert sleeps == [5.0]
+
+
+def test_relayed_upstream_5xx_recovers_on_the_contract_retry(monkeypatch, tmp_path):
+    review_url = "https://tracker.example.test" + monitor.FUNNEL_REVIEW_PATH
+    counts, error, requests, sleeps = _measure_with(
+        monkeypatch,
+        tmp_path,
+        [
+            _Response({"token": "test-token"}),
+            _http_error(
+                review_url,
+                502,
+                {"success": False, "error": "EOM lead review failed"},
+                headers={"Retry-After": "7"},
+            ),
+            _Response({"success": True}),
+            _Response(_audit_payload()),
+        ],
+    )
+
+    assert error is None
+    assert counts == {key: 0 for key in monitor.SIGNAL_KEYS}
+    assert len(requests) == 4
+    assert sleeps == [7.0]
 
 
 def test_login_unavailable_is_never_replayed(monkeypatch, tmp_path):
@@ -525,7 +596,7 @@ def test_login_unavailable_is_never_replayed(monkeypatch, tmp_path):
     )
 
     assert counts is None
-    assert error == "HTTP 503 (Login is temporarily unavailable)"
+    assert error == f"HTTP 503 ({monitor._WITHHELD_DETAIL})"
     assert len(requests) == 1
     assert sleeps == []
 
@@ -559,23 +630,89 @@ def test_http_error_without_a_server_error_literal_stays_bare(
     assert error == "funnel review HTTP 503 after 2 attempts"
 
 
-def test_http_error_detail_is_whitespace_collapsed_and_bounded(monkeypatch, tmp_path):
+def test_known_detail_matches_after_whitespace_collapse(monkeypatch, tmp_path):
     review_url = "https://tracker.example.test" + monitor.FUNNEL_REVIEW_PATH
-    long_detail = "word\n\t " * 200
+    padded = "  EOM lead review service is temporarily\n\tunavailable; retry this request "
     _counts, error, _requests, _sleeps = _measure_with(
         monkeypatch,
         tmp_path,
         [
             _Response({"token": "test-token"}),
-            _http_error(review_url, 401, {"success": False, "error": long_detail}),
+            _http_error(review_url, 502, {"success": False, "error": padded}),
         ],
     )
 
-    assert error is not None
-    detail = error[len("funnel review HTTP 401 (") : -1]
-    assert "\n" not in detail and "\t" not in detail and "  " not in detail
-    assert len(detail) == monitor._ERROR_DETAIL_MAX_LENGTH
-    assert detail == ("word " * 200)[: monitor._ERROR_DETAIL_MAX_LENGTH]
+    assert error == f"funnel review HTTP 502 ({_UNAVAILABLE_DETAIL})"
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        # Content an upstream body could carry that must never reach ntfy.
+        "contact jane@example.com about 555-0100",
+        "Bearer eomf_v1_not_a_real_token",
+        "psycopg2.OperationalError: connection refused",
+        # A known literal with anything appended is no longer the literal.
+        "EOM lead review failed for contact 0c7e",
+        "eom lead review failed",
+        "x" * 5000,
+    ],
+)
+def test_unlisted_server_details_are_withheld_from_the_alert(monkeypatch, tmp_path, detail):
+    review_url = "https://tracker.example.test" + monitor.FUNNEL_REVIEW_PATH
+    _counts, error, _requests, _sleeps = _measure_with(
+        monkeypatch,
+        tmp_path,
+        [
+            _Response({"token": "test-token"}),
+            _http_error(review_url, 403, {"success": False, "error": detail}),
+        ],
+    )
+
+    assert error == f"funnel review HTTP 403 ({monitor._WITHHELD_DETAIL})"
+    for fragment in ("example.com", "555", "eomf_v1", "psycopg2", "0c7e", "xxxx"):
+        assert fragment not in error
+
+
+def test_every_allowlisted_detail_is_carried_verbatim(monkeypatch, tmp_path):
+    review_url = "https://tracker.example.test" + monitor.FUNNEL_REVIEW_PATH
+    for detail in sorted(monitor._KNOWN_ERROR_DETAILS):
+        _counts, error, _requests, _sleeps = _measure_with(
+            monkeypatch,
+            tmp_path,
+            [
+                _Response({"token": "test-token"}),
+                _http_error(review_url, 403, {"success": False, "error": detail}),
+            ],
+        )
+        assert error == f"funnel review HTTP 403 ({detail})"
+
+
+def test_truncated_error_body_still_produces_the_alert(monkeypatch, tmp_path):
+    # A chunked error response cut off mid-body raises http.client.IncompleteRead
+    # from exc.read(); that must degrade to the bare status, never escape and
+    # kill the run before the unavailable notification is sent.
+    review_url = "https://tracker.example.test" + monitor.FUNNEL_REVIEW_PATH
+
+    class _TruncatedBody(io.BytesIO):
+        def read(self, size=-1):
+            raise http.client.IncompleteRead(b'{"success": false, "err')
+
+    def truncated():
+        return urllib.error.HTTPError(
+            review_url, 503, "error", email.message.Message(), _TruncatedBody()
+        )
+
+    counts, error, requests, sleeps = _measure_with(
+        monkeypatch,
+        tmp_path,
+        [_Response({"token": "test-token"}), truncated(), truncated()],
+    )
+
+    assert counts is None
+    assert error == "funnel review HTTP 503 after 2 attempts"
+    assert len(requests) == 3
+    assert sleeps == [5.0]
 
 
 def test_http_error_body_is_read_once_and_bounded(monkeypatch, tmp_path):
@@ -593,7 +730,9 @@ def test_http_error_body_is_read_once_and_bounded(monkeypatch, tmp_path):
         401,
         "error",
         message,
-        _BoundedBody(json.dumps({"success": False, "error": "Invalid token"}).encode("utf-8")),
+        _BoundedBody(
+            json.dumps({"success": False, "error": "Invalid access token"}).encode("utf-8")
+        ),
     )
     _counts, error, _requests, _sleeps = _measure_with(
         monkeypatch,
@@ -601,7 +740,7 @@ def test_http_error_body_is_read_once_and_bounded(monkeypatch, tmp_path):
         [_Response({"token": "test-token"}), exc],
     )
 
-    assert error == "funnel review HTTP 401 (Invalid token)"
+    assert error == "funnel review HTTP 401 (Invalid access token)"
     assert reads == [monitor._ERROR_BODY_MAX_BYTES]
 
 
