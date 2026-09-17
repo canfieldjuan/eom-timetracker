@@ -117,6 +117,13 @@ def _delete_employees(employee_ids: list[int]) -> None:
         db.execute("DELETE FROM employees WHERE id = %s", (employee_id,))
 
 
+# Every fixed week in this module must already be in the past on the day the
+# suite runs. Other modules clock the seeded employees in and out at the real
+# current time, and the payroll verify gate spans every employee in the week
+# (time_tracker_api.py _ensure_payroll_snapshot_has_no_blocking_issues), so a
+# week that contains today inherits their open and overlapping shifts and
+# refuses to verify. A week that is already past can never be written into by
+# a wall-clock test, and a week per test keeps verification state isolated.
 def _delete_payroll_verification_weeks(week_starts: list[date]) -> None:
     for week_start in week_starts:
         db.execute(
@@ -4092,7 +4099,7 @@ def test_payroll_verification_blocks_issue_weeks_and_employee_role(client, auth,
 
 
 def test_payroll_verification_reports_stale_and_requires_reverify_before_finalize(client, auth):
-    week_start = date(2026, 12, 6)
+    week_start = date(2025, 12, 7)
     employee_id = _create_employee("Payroll Verification Stale Worker")
     _delete_payroll_verification_weeks([week_start])
     try:
@@ -4598,7 +4605,7 @@ def test_payroll_weekly_hours_pdf_includes_verification_and_corrections_without_
     client,
     auth,
 ):
-    week_start = date(2026, 9, 13)
+    week_start = date(2025, 9, 14)
     correction_date = week_start + timedelta(days=1)
     employee_id = _create_employee(
         "Payroll PDF Worker",
@@ -4641,7 +4648,7 @@ def test_payroll_weekly_hours_pdf_includes_verification_and_corrections_without_
         assert response.headers["cache-control"] == "no-store"
         assert response.headers["x-content-type-options"] == "nosniff"
         assert response.headers["content-disposition"] == (
-            'attachment; filename="eom_payroll_weekly_hours_2026-09-13.pdf"'
+            f'attachment; filename="eom_payroll_weekly_hours_{week_start.isoformat()}.pdf"'
         )
         _assert_valid_pdf(response.content)
 
@@ -7641,8 +7648,8 @@ def test_correction_scope_ignores_an_unrelated_sites_snapshot(client):
     not drag B into fail-closed. (Before the fix the snapshot check spanned the
     whole day, so Site A wrongly forced B to unresolved.)
     """
-    week_start = date(2026, 9, 20)
-    service_day = date(2026, 9, 21)
+    week_start = date(2025, 9, 21)
+    service_day = date(2025, 9, 22)
     _delete_payroll_labor_profitability_rows()
     _delete_payroll_verification_weeks([week_start])
     _create_employee("Payroll Labor Profitability SCOPE Payroll", role="payroll")
@@ -7709,7 +7716,7 @@ def test_correction_fails_closed_when_frozen_and_live_shifts_coexist(client):
     value that a raise could move.
     """
     allocation = _allocate_with_mixed_snapshot_shift(
-        client, week_start=date(2026, 9, 13), service_day=date(2026, 9, 14),
+        client, week_start=date(2025, 9, 14), service_day=date(2025, 9, 15),
         live_rate_after=20.00, label="Agree",
     )
     assert allocation["allocatedLaborCost"] is None
@@ -7993,7 +8000,7 @@ def test_payroll_money_verification_full_flow_and_gates(client, auth):
 
 
 def test_money_verification_staleness_is_independent_of_hours(client, auth):
-    week_start = date(2026, 9, 13)  # Sunday
+    week_start = date(2025, 9, 14)  # Sunday
     employee_id = _create_employee("Payroll Money Independent Worker")
     _delete_payroll_verification_weeks([week_start])
     try:
@@ -8063,7 +8070,7 @@ def test_money_verification_staleness_is_independent_of_hours(client, auth):
 
 
 def test_payroll_money_reopen_and_never_verified_guard(client, auth):
-    week_start = date(2026, 9, 20)  # Sunday
+    week_start = date(2025, 9, 21)  # Sunday
     employee_id = _create_employee("Payroll Money Reopen Worker")
     _delete_payroll_verification_weeks([week_start])
     try:
@@ -8124,7 +8131,7 @@ def test_money_verification_stays_fresh_when_a_stamped_shift_rate_is_edited(clie
     # A stamped shift's labor is frozen at its snapshot, so a later live-rate
     # edit must NOT reprice it -- money verification must stay fresh (no false
     # positive from the effective-rate hashing).
-    week_start = date(2026, 9, 27)  # Sunday
+    week_start = date(2025, 9, 28)  # Sunday
     employee_id = _create_employee("Payroll Stamped Rate Worker", hourly_rate=20.00)
     _delete_payroll_verification_weeks([week_start])
     try:
@@ -8166,7 +8173,7 @@ def test_money_verification_goes_stale_when_an_unstamped_shift_is_repriced(clien
     # live-rate edit reprices its payroll dollars -- money verification MUST go
     # stale while hours (which is rate-blind) stays fresh. Regression for the
     # effective-rate hashing (P1).
-    week_start = date(2026, 10, 4)  # Sunday
+    week_start = date(2025, 10, 5)  # Sunday
     employee_id = _create_employee("Payroll Unstamped Rate Worker", hourly_rate=20.00)
     _delete_payroll_verification_weeks([week_start])
     try:
@@ -8226,7 +8233,7 @@ def _verify_hours_and_money(client, auth, week_start):
 
 
 def test_finalize_requires_money_verified_then_succeeds(client, auth):
-    week_start = date(2026, 10, 11)  # Sunday
+    week_start = date(2025, 10, 12)  # Sunday
     employee_id = _create_employee("Payroll Finalize Money Worker")
     _delete_payroll_verification_weeks([week_start])
     try:
@@ -8270,7 +8277,7 @@ def test_finalize_requires_money_verified_then_succeeds(client, auth):
 
 
 def test_finalize_blocked_when_money_is_stale(client, auth):
-    week_start = date(2026, 10, 18)  # Sunday
+    week_start = date(2025, 10, 19)  # Sunday
     employee_id = _create_employee("Payroll Finalize Stale Money Worker")
     _delete_payroll_verification_weeks([week_start])
     try:
@@ -8300,7 +8307,7 @@ def test_finalize_blocked_when_money_is_stale(client, auth):
 def test_money_verify_allowed_on_a_finalized_hours_week(client, auth):
     # A week finalized BEFORE money verification existed (hours 'finalized', no
     # money batch) must be back-verifiable for money without a needless reopen.
-    week_start = date(2026, 10, 25)  # Sunday
+    week_start = date(2025, 10, 26)  # Sunday
     employee_id = _create_employee("Payroll Finalized Backverify Worker")
     _delete_payroll_verification_weeks([week_start])
     try:
@@ -8342,7 +8349,7 @@ def test_reopening_money_after_finalize_blocks_idempotent_re_finalize(client, au
     # finalize -> reopen money -> re-finalize must NOT report the week settled
     # while the dollars are explicitly unsigned; the idempotent finalized branch
     # enforces the money gate too.
-    week_start = date(2026, 11, 1)  # Sunday
+    week_start = date(2025, 11, 2)  # Sunday
     employee_id = _create_employee("Payroll Reopen-Money Finalize Worker")
     _delete_payroll_verification_weeks([week_start])
     try:
