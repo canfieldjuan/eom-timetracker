@@ -49,6 +49,8 @@ import jwt
 import psycopg2
 import psycopg2.extras
 import requests
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 import qrcode
 import qrcode.image.svg
 import arrival_policy_inventory
@@ -4985,6 +4987,21 @@ PASSWORD_CHANGE_RATE_LIMIT_MAX = parse_int(
 PASSWORD_CHANGE_RATE_LIMIT_WINDOW_S = parse_int(
     os.getenv("PASSWORD_CHANGE_RATE_LIMIT_WINDOW_S"), 300
 )
+# Connect device enrollment: an operator links a Local Connect device by proving
+# possession of its Ed25519 key over a short-lived, HMAC-signed challenge this
+# server issues. The challenge is stateless (signed, not stored); a short TTL
+# bounds its reuse window, and replaying it can only re-register the same key
+# (the signature never verifies for a different key), so no single-use store is
+# required for proof-of-possession.
+CONNECT_DEVICE_ENROLLMENT_CHALLENGE_TTL_S = parse_int(
+    os.getenv("CONNECT_DEVICE_ENROLLMENT_CHALLENGE_TTL_S"), 300
+)
+CONNECT_DEVICE_RATE_LIMIT_MAX = parse_int(
+    os.getenv("CONNECT_DEVICE_RATE_LIMIT_MAX"), 30
+)
+CONNECT_DEVICE_RATE_LIMIT_WINDOW_S = parse_int(
+    os.getenv("CONNECT_DEVICE_RATE_LIMIT_WINDOW_S"), 60
+)
 REGISTER_RATE_LIMIT_MAX     = parse_int(os.getenv("REGISTER_RATE_LIMIT_MAX"),      3)
 REGISTER_RATE_LIMIT_WINDOW_S = parse_int(os.getenv("REGISTER_RATE_LIMIT_WINDOW_S"), 300)
 RATE_LIMIT_BUCKET_SOFT_CAP  = parse_int(os.getenv("RATE_LIMIT_BUCKET_SOFT_CAP"), 10000)
@@ -8212,10 +8229,49 @@ def _ensure_first_clean_completion_report_schema() -> None:
             )
 
 
+def _ensure_connect_device_schema() -> None:
+    """Install the Connect device registry (idempotent, additive).
+
+    One row per enrolled Local Connect device: an Ed25519 public key bound to
+    exactly one operator (``employees.id``), with a closed lifecycle status.
+    The private key never leaves the device; only the public key is stored, so
+    this table cannot be used to impersonate a device. Status is a CLOSED,
+    ENUMERATED set -- the CHECK constraint below is the canonical membership,
+    and revocation is a one-way flip to 'revoked' (a revoked key is never
+    reactivated; rotation is a fresh enrollment with a new key).
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("connect_device_schema_v1",),
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS connect_devices (
+                    device_id UUID PRIMARY KEY,
+                    employee_id INTEGER NOT NULL
+                        REFERENCES employees(id) ON DELETE RESTRICT,
+                    label VARCHAR(128) NOT NULL,
+                    public_key_base64url VARCHAR(64) NOT NULL UNIQUE,
+                    status VARCHAR(16) NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'revoked')),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_seen_at TIMESTAMPTZ,
+                    revoked_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS idx_connect_devices_employee
+                    ON connect_devices(employee_id, status);
+                """
+            )
+
+
 def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
     _ensure_employee_role_schema()
+    _ensure_connect_device_schema()
     # atlas_contact_id shipped inside CREATE TABLE IF NOT EXISTS customers and
     # was never applied via ALTER, so a customers table created before that
     # revision would lack the column. Additive and idempotent.
@@ -27774,6 +27830,331 @@ def admin_create_funnel_contact(
         status_code=200 if visible["idempotent"] else 201,
         content=jsonable_encoder(visible),
     )
+
+
+# --- Connect device enrollment ------------------------------------------------
+# An operator links a Local Connect device so an off-PC provider can later act
+# on their behalf without any Atlas or tracker service credential living on the
+# device. This slice covers the device lifecycle only: enroll (with a
+# proof-of-possession over an issued challenge), list, and revoke. The
+# device-authenticated access path that actually calls the funnel is a later
+# slice; nothing here changes existing behavior.
+
+
+class ConnectDeviceEnrollRequest(BaseModel):
+    """An operator-authored request to link a Local Connect device.
+
+    ``publicKey`` is the device's Ed25519 public key (base64url, unpadded, 43
+    chars = 32 bytes). ``signature`` is that key's signature (base64url,
+    unpadded, 86 chars = 64 bytes) over the exact ``challenge`` string this
+    server issued, which proves the caller holds the matching private key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=128)
+    publicKey: str = Field(min_length=1, max_length=64)
+    challenge: str = Field(min_length=1, max_length=512)
+    signature: str = Field(min_length=1, max_length=128)
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def _normalize_label(cls, value: Any) -> Any:
+        return _strip_required_text(value)
+
+
+def _encode_connect_device_enrollment_challenge(employee_id: int) -> Tuple[str, datetime]:
+    """Issue a short-lived, HMAC-signed enrollment challenge for one operator.
+
+    Signed with the same HMAC-SHA256/JWT_SECRET construction the other opaque
+    tokens here use, so no server-side store is needed: the signature proves the
+    server issued it and binds it to this employee, and the embedded issue time
+    bounds its lifetime.
+    """
+    now = utc_now()
+    payload = json.dumps(
+        {
+            "employeeId": int(employee_id),
+            "iat": int(now.timestamp()),
+            "nonce": secrets.token_urlsafe(24),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded_payload = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(JWT_SECRET.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    expires_at = now + timedelta(seconds=CONNECT_DEVICE_ENROLLMENT_CHALLENGE_TTL_S)
+    return f"{encoded_payload}.{signature}", expires_at
+
+
+def _verify_connect_device_enrollment_challenge(challenge: str, employee_id: int) -> None:
+    """Reject a challenge that this server did not issue to this operator, or one
+    that has expired. Raises HTTPException(400) on any failure."""
+    invalid = HTTPException(status_code=400, detail="Invalid or expired enrollment challenge")
+    if not isinstance(challenge, str) or challenge.count(".") != 1:
+        raise invalid
+    encoded_payload, signature = challenge.split(".", 1)
+    if not (
+        re.fullmatch(r"[A-Za-z0-9_-]+", encoded_payload)
+        and re.fullmatch(r"[0-9a-f]{64}", signature)
+    ):
+        raise invalid
+    padded_payload = encoded_payload + ("=" * (-len(encoded_payload) % 4))
+    try:
+        payload_bytes = base64.urlsafe_b64decode(padded_payload.encode("ascii"))
+        expected_signature = hmac.new(
+            JWT_SECRET.encode("utf-8"), payload_bytes, hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected_signature):
+            raise invalid
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise invalid from exc
+    if not isinstance(payload, dict) or set(payload) != {"employeeId", "iat", "nonce"}:
+        raise invalid
+    if payload.get("employeeId") != int(employee_id):
+        raise invalid
+    issued_at = payload.get("iat")
+    if not isinstance(issued_at, int) or isinstance(issued_at, bool):
+        raise invalid
+    age_seconds = int(utc_now().timestamp()) - issued_at
+    # A small negative tolerance absorbs minor clock skew; a positive bound
+    # enforces the TTL.
+    if age_seconds < -60 or age_seconds > CONNECT_DEVICE_ENROLLMENT_CHALLENGE_TTL_S:
+        raise invalid
+
+
+def _decode_connect_device_public_key(value: str) -> bytes:
+    """Decode a base64url-unpadded Ed25519 public key to its 32 raw bytes."""
+    invalid = HTTPException(
+        status_code=422, detail="publicKey must be a base64url-encoded Ed25519 public key"
+    )
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", value):
+        raise invalid
+    try:
+        raw = base64.urlsafe_b64decode((value + "=").encode("ascii"))
+    except ValueError as exc:
+        raise invalid from exc
+    if len(raw) != 32:
+        raise invalid
+    return raw
+
+
+def _decode_connect_device_signature(value: str) -> bytes:
+    """Decode a base64url-unpadded Ed25519 signature to its 64 raw bytes."""
+    invalid = HTTPException(
+        status_code=400, detail="signature must be a base64url-encoded Ed25519 signature"
+    )
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{86}", value):
+        raise invalid
+    try:
+        raw = base64.urlsafe_b64decode((value + "==").encode("ascii"))
+    except ValueError as exc:
+        raise invalid from exc
+    if len(raw) != 64:
+        raise invalid
+    return raw
+
+
+def _verify_connect_device_possession(
+    public_key: bytes, signature: bytes, challenge: str
+) -> None:
+    """Confirm the device holds the private key by verifying its signature over
+    the exact challenge string. Raises HTTPException(400) on failure."""
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            signature, challenge.encode("ascii")
+        )
+    except InvalidSignature as exc:
+        raise HTTPException(
+            status_code=400, detail="Device possession proof failed"
+        ) from exc
+
+
+def _connect_device_view(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Closed browser projection of a device row. The public key is never
+    returned -- the caller supplied it, and it is not identity data the portal
+    needs back."""
+    return {
+        "deviceId": str(row["device_id"]),
+        "label": row["label"],
+        "status": row["status"],
+        "createdAt": to_utc_iso(row["created_at"]),
+        "lastSeenAt": to_utc_iso(row["last_seen_at"]) if row["last_seen_at"] else None,
+        "revokedAt": to_utc_iso(row["revoked_at"]) if row["revoked_at"] else None,
+    }
+
+
+@app.post("/api/admin/connect/devices/enrollment-challenge")
+def admin_connect_device_enrollment_challenge(
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Issue a short-lived challenge the operator's device signs to prove key
+    possession during enrollment."""
+    _rate_limit_check(
+        request,
+        key_prefix=f"connect-device:{admin['id']}",
+        max_calls=CONNECT_DEVICE_RATE_LIMIT_MAX,
+        window_seconds=CONNECT_DEVICE_RATE_LIMIT_WINDOW_S,
+    )
+    challenge, expires_at = _encode_connect_device_enrollment_challenge(int(admin["id"]))
+    append_access_log(request, "CONNECT_DEVICE_ENROLLMENT_CHALLENGE_ISSUED", True)
+    return JSONResponse(
+        status_code=200,
+        content={"challenge": challenge, "expiresAt": to_utc_iso(expires_at)},
+    )
+
+
+@app.post("/api/admin/connect/devices")
+def admin_enroll_connect_device(
+    payload: ConnectDeviceEnrollRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Enroll a Local Connect device against the authenticated operator.
+
+    The device proves it holds the private key by signing the issued challenge.
+    Enrolling the same active key twice by the same operator is idempotent; a
+    key already held by another operator, or previously revoked, is a 409 (a
+    revoked key is never reactivated -- rotate to a new key).
+    """
+    _rate_limit_check(
+        request,
+        key_prefix=f"connect-device:{admin['id']}",
+        max_calls=CONNECT_DEVICE_RATE_LIMIT_MAX,
+        window_seconds=CONNECT_DEVICE_RATE_LIMIT_WINDOW_S,
+    )
+    _verify_connect_device_enrollment_challenge(payload.challenge, int(admin["id"]))
+    public_key = _decode_connect_device_public_key(payload.publicKey)
+    signature = _decode_connect_device_signature(payload.signature)
+    _verify_connect_device_possession(public_key, signature, payload.challenge)
+
+    # Store and compare the CANONICAL base64url of the decoded key, never the
+    # caller's spelling: base64url has ~16 non-canonical final characters that
+    # decode to the same 32 bytes, so persisting the raw input would let the
+    # same key re-enroll under a different spelling and slip past the UNIQUE
+    # constraint that backs the revoked / cross-operator 409 guards.
+    canonical_public_key = base64.urlsafe_b64encode(public_key).decode("ascii").rstrip("=")
+
+    device_id = str(uuid4())
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO connect_devices
+                    (device_id, employee_id, label, public_key_base64url)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (public_key_base64url) DO NOTHING
+                RETURNING *
+                """,
+                (device_id, int(admin["id"]), payload.label, canonical_public_key),
+            )
+            created = cur.fetchone()
+            if created is None:
+                cur.execute(
+                    "SELECT * FROM connect_devices WHERE public_key_base64url = %s",
+                    (canonical_public_key,),
+                )
+                existing = cur.fetchone()
+                if existing is None:
+                    # The conflict row vanished between statements (a concurrent
+                    # revoke+delete does not exist here, but fail closed rather
+                    # than assert). Treat as a transient conflict.
+                    raise HTTPException(
+                        status_code=409, detail="Device enrollment conflicted; retry"
+                    )
+                if int(existing["employee_id"]) != int(admin["id"]):
+                    append_access_log(
+                        request,
+                        "CONNECT_DEVICE_ENROLL_CONFLICT",
+                        False,
+                        "key_owned_by_other_operator",
+                    )
+                    raise HTTPException(
+                        status_code=409, detail="This device key is already registered"
+                    )
+                if existing["status"] != "active":
+                    append_access_log(
+                        request,
+                        "CONNECT_DEVICE_ENROLL_CONFLICT",
+                        False,
+                        f"device={existing['device_id']} status={existing['status']}",
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This device key was revoked; enroll a new key",
+                    )
+                append_access_log(
+                    request,
+                    "CONNECT_DEVICE_ENROLL_IDEMPOTENT",
+                    True,
+                    f"device={existing['device_id']}",
+                )
+                return JSONResponse(status_code=200, content=_connect_device_view(existing))
+
+    append_access_log(request, "CONNECT_DEVICE_ENROLLED", True, f"device={device_id}")
+    return JSONResponse(status_code=201, content=_connect_device_view(created))
+
+
+@app.get("/api/admin/connect/devices")
+def admin_list_connect_devices(
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """List the authenticated operator's own enrolled devices, newest first."""
+    rows = db.query_all(
+        """
+        SELECT * FROM connect_devices
+        WHERE employee_id = %s
+        ORDER BY created_at DESC, device_id
+        """,
+        (int(admin["id"]),),
+    )
+    return JSONResponse(
+        status_code=200,
+        content={"devices": [_connect_device_view(row) for row in rows]},
+    )
+
+
+@app.post("/api/admin/connect/devices/{device_id}/revoke")
+def admin_revoke_connect_device(
+    device_id: UUID,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Revoke one of the operator's own devices. A one-way flip to 'revoked';
+    revoking an already-revoked device is idempotent."""
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT * FROM connect_devices
+                WHERE device_id = %s AND employee_id = %s
+                FOR UPDATE
+                """,
+                (str(device_id), int(admin["id"])),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Device not found")
+            if row["status"] == "revoked":
+                append_access_log(
+                    request, "CONNECT_DEVICE_REVOKE_IDEMPOTENT", True, f"device={device_id}"
+                )
+                return JSONResponse(status_code=200, content=_connect_device_view(row))
+            cur.execute(
+                """
+                UPDATE connect_devices
+                SET status = 'revoked', revoked_at = NOW(), updated_at = NOW()
+                WHERE device_id = %s
+                RETURNING *
+                """,
+                (str(device_id),),
+            )
+            updated = cur.fetchone()
+    append_access_log(request, "CONNECT_DEVICE_REVOKED", True, f"device={device_id}")
+    return JSONResponse(status_code=200, content=_connect_device_view(updated))
 
 
 @app.post("/api/admin/funnel/handoffs/{contact_id}/retry")
