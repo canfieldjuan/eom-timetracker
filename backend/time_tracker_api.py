@@ -28074,6 +28074,9 @@ def _authenticate_connect_device_blocking(
     except InvalidSignature as exc:
         raise unauthorized from exc
 
+    # Precise status for the common (non-race) case: distinguish a non-active or
+    # non-admin operator (403) from a device/proof failure (401). The final
+    # write below is what actually authorizes -- these reads only shape the code.
     employee = find_employee_by_id(load_employees()["employees"], int(row["employee_id"]))
     if not employee or not employee.get("active", True):
         raise HTTPException(status_code=403, detail="Device operator is not active")
@@ -28082,23 +28085,35 @@ def _authenticate_connect_device_blocking(
             status_code=403, detail="Device operator lacks the required role"
         )
 
-    # Stamp last_seen_at AND re-assert 'active' in the same write: the status
-    # read above ran in its own transaction, so a revoke that commits between
-    # that read and here would otherwise slip through. Gating the UPDATE on
-    # status = 'active' makes revocation authoritative -- a revoked device
-    # matches no row, the write returns nothing, and the request is rejected.
-    stamped = db.execute_returning(
-        "UPDATE connect_devices SET last_seen_at = NOW() "
-        "WHERE device_id = %s AND status = 'active' RETURNING device_id",
-        (device_id,),
+    # Single authoritative write. It stamps last_seen_at only when the device is
+    # STILL active AND its operator is STILL an active admin, and reads the actor
+    # fields back from that same joined row. Both status reads above ran in their
+    # own transactions, so a device revoke OR an operator deactivation/demotion
+    # committed between them and here would otherwise slip through; predicating
+    # the UPDATE on both, and returning the fresh operator identity, makes this
+    # write the sole point of authorization -- a stale snapshot matches no row,
+    # the write returns nothing, and the request is rejected.
+    stamped = db.query_one(
+        """
+        UPDATE connect_devices AS d
+        SET last_seen_at = NOW()
+        FROM employees AS e
+        WHERE d.device_id = %s
+          AND d.status = 'active'
+          AND e.id = d.employee_id
+          AND e.active = TRUE
+          AND e.role = %s
+        RETURNING e.id AS employee_id, e.name AS employee_name, e.role AS employee_role
+        """,
+        (device_id, ADMIN_ROLE),
     )
     if stamped is None:
         raise unauthorized
 
     return {
-        "id": int(employee["id"]),
-        "name": employee["name"],
-        "role": employee["role"],
+        "id": int(stamped["employee_id"]),
+        "name": stamped["employee_name"],
+        "role": stamped["employee_role"],
         "deviceId": device_id,
     }
 
