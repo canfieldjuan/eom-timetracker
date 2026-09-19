@@ -5020,6 +5020,14 @@ CONNECT_DEVICE_RATE_LIMIT_WINDOW_S = parse_int(
 CONNECT_DEVICE_ACCESS_PROOF_TTL_S = parse_int(
     os.getenv("CONNECT_DEVICE_ACCESS_PROOF_TTL_S"), 120
 )
+# Hard cap on the request body a device proof will buffer and hash. The device
+# primitive authenticates an unverified caller, so an application-unbounded body
+# would let a bogus device force large-buffer or slow-stream work before it is
+# rejected. A device operation body is small JSON; the current read route has no
+# body at all. Anything past this is rejected (413) before the DB or crypto work.
+CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES = parse_int(
+    os.getenv("CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES"), 65536
+)
 REGISTER_RATE_LIMIT_MAX     = parse_int(os.getenv("REGISTER_RATE_LIMIT_MAX"),      3)
 REGISTER_RATE_LIMIT_WINDOW_S = parse_int(os.getenv("REGISTER_RATE_LIMIT_WINDOW_S"), 300)
 RATE_LIMIT_BUCKET_SOFT_CAP  = parse_int(os.getenv("RATE_LIMIT_BUCKET_SOFT_CAP"), 10000)
@@ -28178,10 +28186,26 @@ async def require_connect_device(request: Request) -> Dict[str, Any]:
     except HTTPException as exc:
         raise unauthorized from exc
 
-    # Read the body so the proof binds it. For a GET this is empty, but hashing
-    # it keeps the primitive honest for the later mutation slice. Starlette
-    # caches the body, so the endpoint can still read it.
-    body = await request.body()
+    # Read the body under a hard cap so the proof binds it without letting an
+    # unverified caller force unbounded buffering/hashing. Reject on the declared
+    # Content-Length first (cheap), then enforce the same cap while streaming so
+    # a chunked or length-omitting body cannot slip past. For this GET route the
+    # body is empty; hashing it still keeps the primitive honest for the later
+    # mutation slice.
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise unauthorized from exc
+        if declared_length > CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Request body too large")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Request body too large")
+    body = bytes(body)
     signing_string = _connect_device_access_signing_string(
         device_id=device_id,
         method=request.method,

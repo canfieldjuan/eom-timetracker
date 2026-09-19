@@ -191,6 +191,18 @@ def test_proof_bound_to_request_target(client, auth):
     assert resp_ok.status_code == 200, resp_ok.text
 
 
+def test_oversized_body_rejected(client, auth):
+    # A GET device poll carries no body; an unverified caller must not be able to
+    # force unbounded buffering. A body past the cap is rejected 413 before the
+    # DB lookup or signature verification.
+    private_key, device_id = _enroll_device(client, auth)
+    headers = _proof_headers(device_id, private_key)
+    resp = client.request(
+        "GET", _READ_PATH, headers=headers, content=b"x" * 65537
+    )
+    assert resp.status_code == 413, resp.text
+
+
 def test_revoked_device_rejected(client, auth):
     private_key, device_id = _enroll_device(client, auth, label="Retire me")
     revoked = client.post(
