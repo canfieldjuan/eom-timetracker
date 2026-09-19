@@ -68,6 +68,7 @@ from time_action_registry import (
     validate_time_action_mutation_source,
 )
 from fastapi import Depends, FastAPI, Header, HTTPException, Path as FastAPIPath, Query, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -2253,7 +2254,13 @@ def append_access_log(
     reason: str = "",
     *,
     details: Optional[Dict[str, Any]] = None,
+    persist_to_file: bool = True,
 ) -> None:
+    # persist_to_file=False keeps this event out of the daily JSON file logger.
+    # That logger reads and atomically rewrites the entire day's file on every
+    # call, and DATA_DIR is a persistent disk in production, so a high-frequency
+    # automated path (e.g. a device work-queue poll) must record to PostgreSQL
+    # only -- otherwise routine polling drives ever-growing whole-file rewrites.
     timestamp = to_utc_iso(utc_now())
     local_date_text = local_date_for_logs()
     client_ip = get_client_ip(request)
@@ -2280,10 +2287,11 @@ def append_access_log(
     except Exception:
         logger.warning("access_log_postgres_write_failed", exc_info=True)
 
-    try:
-        _append_access_log_to_file(entry, local_date_text)
-    except Exception:
-        logger.warning("access_log_file_write_failed", exc_info=True)
+    if persist_to_file:
+        try:
+            _append_access_log_to_file(entry, local_date_text)
+        except Exception:
+            logger.warning("access_log_file_write_failed", exc_info=True)
 
     if not postgres_written:
         return
@@ -28031,6 +28039,70 @@ def _connect_device_access_signing_string(
     ).encode("utf-8")
 
 
+_CONNECT_DEVICE_UNAUTHORIZED_DETAIL = "Device authentication required"
+
+
+def _authenticate_connect_device_blocking(
+    device_id: str, signature: bytes, signing_string: bytes
+) -> Dict[str, Any]:
+    """The DB + crypto half of device authentication, run in a threadpool.
+
+    Every step here either issues a blocking psycopg2 query or runs Ed25519
+    verification, so it must NOT run on the ASGI event loop (a slow database
+    would stall unrelated requests). ``require_connect_device`` hands it the
+    already-parsed device id, decoded signature, and canonical signing string
+    and offloads it with ``run_in_threadpool``.
+    """
+    unauthorized = HTTPException(
+        status_code=401, detail=_CONNECT_DEVICE_UNAUTHORIZED_DETAIL
+    )
+    row = db.query_one(
+        "SELECT * FROM connect_devices WHERE device_id = %s",
+        (device_id,),
+    )
+    if row is None or row["status"] != "active":
+        raise unauthorized
+
+    try:
+        public_key = base64.urlsafe_b64decode(
+            (row["public_key_base64url"] + "=").encode("ascii")
+        )
+    except (ValueError, TypeError) as exc:
+        raise unauthorized from exc
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, signing_string)
+    except InvalidSignature as exc:
+        raise unauthorized from exc
+
+    employee = find_employee_by_id(load_employees()["employees"], int(row["employee_id"]))
+    if not employee or not employee.get("active", True):
+        raise HTTPException(status_code=403, detail="Device operator is not active")
+    if employee.get("role") != ADMIN_ROLE:
+        raise HTTPException(
+            status_code=403, detail="Device operator lacks the required role"
+        )
+
+    # Stamp last_seen_at AND re-assert 'active' in the same write: the status
+    # read above ran in its own transaction, so a revoke that commits between
+    # that read and here would otherwise slip through. Gating the UPDATE on
+    # status = 'active' makes revocation authoritative -- a revoked device
+    # matches no row, the write returns nothing, and the request is rejected.
+    stamped = db.execute_returning(
+        "UPDATE connect_devices SET last_seen_at = NOW() "
+        "WHERE device_id = %s AND status = 'active' RETURNING device_id",
+        (device_id,),
+    )
+    if stamped is None:
+        raise unauthorized
+
+    return {
+        "id": int(employee["id"]),
+        "name": employee["name"],
+        "role": employee["role"],
+        "deviceId": device_id,
+    }
+
+
 async def require_connect_device(request: Request) -> Dict[str, Any]:
     """Authenticate a Local Connect device by its per-request Ed25519 proof.
 
@@ -28048,7 +28120,7 @@ async def require_connect_device(request: Request) -> Dict[str, Any]:
     it threads straight into ``_atlas_funnel_read`` as the vouched-for operator.
     """
     unauthorized = HTTPException(
-        status_code=401, detail="Device authentication required"
+        status_code=401, detail=_CONNECT_DEVICE_UNAUTHORIZED_DETAIL
     )
 
     device_id = request.headers.get(_CONNECT_DEVICE_ID_HEADER, "")
@@ -28057,10 +28129,14 @@ async def require_connect_device(request: Request) -> Dict[str, Any]:
     if not (device_id and timestamp_raw and signature_raw):
         raise unauthorized
 
-    # Rate-limit before any DB or crypto work, keyed by the claimed device id.
+    # Rate-limit on trusted data only. The device id is attacker-controlled and
+    # unverified at this point, so keying the bucket by it would let a caller
+    # rotate the header to mint unbounded buckets and force the limiter's
+    # soft-cap scan. A constant prefix keys purely by client IP (the limiter
+    # appends it), so a flood from one source is actually capped.
     _rate_limit_check(
         request,
-        key_prefix=f"connect-device-access:{device_id}",
+        key_prefix="connect-device-access",
         max_calls=CONNECT_DEVICE_RATE_LIMIT_MAX,
         window_seconds=CONNECT_DEVICE_RATE_LIMIT_WINDOW_S,
     )
@@ -28087,20 +28163,6 @@ async def require_connect_device(request: Request) -> Dict[str, Any]:
     except HTTPException as exc:
         raise unauthorized from exc
 
-    row = db.query_one(
-        "SELECT * FROM connect_devices WHERE device_id = %s",
-        (device_id,),
-    )
-    if row is None or row["status"] != "active":
-        raise unauthorized
-
-    try:
-        public_key = base64.urlsafe_b64decode(
-            (row["public_key_base64url"] + "=").encode("ascii")
-        )
-    except (ValueError, TypeError) as exc:
-        raise unauthorized from exc
-
     # Read the body so the proof binds it. For a GET this is empty, but hashing
     # it keeps the primitive honest for the later mutation slice. Starlette
     # caches the body, so the endpoint can still read it.
@@ -28113,29 +28175,10 @@ async def require_connect_device(request: Request) -> Dict[str, Any]:
         body_sha256_hex=hashlib.sha256(body).hexdigest(),
         timestamp=timestamp,
     )
-    try:
-        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, signing_string)
-    except InvalidSignature as exc:
-        raise unauthorized from exc
-
-    employee = find_employee_by_id(load_employees()["employees"], int(row["employee_id"]))
-    if not employee or not employee.get("active", True):
-        raise HTTPException(status_code=403, detail="Device operator is not active")
-    if employee.get("role") != ADMIN_ROLE:
-        raise HTTPException(
-            status_code=403, detail="Device operator lacks the required role"
-        )
-
-    db.execute(
-        "UPDATE connect_devices SET last_seen_at = NOW() WHERE device_id = %s",
-        (device_id,),
+    # Offload the blocking DB + crypto work so it never runs on the event loop.
+    return await run_in_threadpool(
+        _authenticate_connect_device_blocking, device_id, signature, signing_string
     )
-    return {
-        "id": int(employee["id"]),
-        "name": employee["name"],
-        "role": employee["role"],
-        "deviceId": device_id,
-    }
 
 
 @app.post("/api/admin/connect/devices/enrollment-challenge")
@@ -28345,12 +28388,15 @@ def connect_device_list_funnel_leads(
         else:
             new_leads.append(_lead_with_state_token(lead, marker))
     pending_handoffs = _list_pending_office_conversion_handoffs()
+    # Postgres-only: this is an automated, high-frequency poll, so it must not
+    # drive the daily-file logger's whole-file rewrite on the persistent disk.
     append_access_log(
         request,
         "CONNECT_DEVICE_FUNNEL_REVIEW_LISTED",
         True,
         f"device={operator['deviceId']} leads={len(new_leads)} "
         f"working={len(working_leads)} pending={len(pending_handoffs)}",
+        persist_to_file=False,
     )
     return {
         "success": True,

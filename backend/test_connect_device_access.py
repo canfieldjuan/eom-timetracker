@@ -240,26 +240,56 @@ def _insert_device(device_id, employee_id, public_key_base64url, *, status="acti
         conn.close()
 
 
+def _purge_employee(name):
+    """Remove a directly-inserted operator and its devices from the shared,
+    session-scoped DB. The rate-coverage suites average the employee roster, so
+    a leaked employee row would silently skew unrelated tests -- these fixtures
+    must leave the roster exactly as they found it."""
+    conn = psycopg2.connect(TEST_DB_URL, sslmode="disable")
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM employees WHERE name = %s", (name,))
+            row = cur.fetchone()
+            if row is not None:
+                # connect_devices.employee_id is ON DELETE RESTRICT, so the
+                # device rows must go first.
+                cur.execute(
+                    "DELETE FROM connect_devices WHERE employee_id = %s", (row[0],)
+                )
+                cur.execute("DELETE FROM employees WHERE id = %s", (row[0],))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_device_for_non_admin_operator_rejected(client):
     # The per-PC device does not license the caller; a device bound to a
     # non-admin operator cannot reach an admin-scoped funnel read.
     import uuid
 
-    emp_id = _insert_employee("Access Non-Admin", "employee")
-    private_key, public_key = _new_keypair()
-    device_id = str(uuid.uuid4())
-    _insert_device(device_id, emp_id, public_key)
-    resp = client.get(_READ_PATH, headers=_proof_headers(device_id, private_key))
-    assert resp.status_code == 403, resp.text
+    name = "Access Non-Admin"
+    try:
+        emp_id = _insert_employee(name, "employee")
+        private_key, public_key = _new_keypair()
+        device_id = str(uuid.uuid4())
+        _insert_device(device_id, emp_id, public_key)
+        resp = client.get(_READ_PATH, headers=_proof_headers(device_id, private_key))
+        assert resp.status_code == 403, resp.text
+    finally:
+        _purge_employee(name)
 
 
 def test_device_for_inactive_operator_rejected(client):
     # Deactivating the bound operator immediately stops the device.
     import uuid
 
-    emp_id = _insert_employee("Access Inactive Admin", "admin", active=False)
-    private_key, public_key = _new_keypair()
-    device_id = str(uuid.uuid4())
-    _insert_device(device_id, emp_id, public_key)
-    resp = client.get(_READ_PATH, headers=_proof_headers(device_id, private_key))
-    assert resp.status_code == 403, resp.text
+    name = "Access Inactive Admin"
+    try:
+        emp_id = _insert_employee(name, "admin", active=False)
+        private_key, public_key = _new_keypair()
+        device_id = str(uuid.uuid4())
+        _insert_device(device_id, emp_id, public_key)
+        resp = client.get(_READ_PATH, headers=_proof_headers(device_id, private_key))
+        assert resp.status_code == 403, resp.text
+    finally:
+        _purge_employee(name)
