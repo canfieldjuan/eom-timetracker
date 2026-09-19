@@ -31,6 +31,19 @@ def _sign(private_key: Ed25519PrivateKey, challenge: str) -> str:
     return _b64u(private_key.sign(challenge.encode("ascii")))
 
 
+_B64U_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def _noncanonical_spelling(public_key: str) -> str:
+    """Return a different 43-char base64url spelling that decodes to the same
+    32 bytes. The canonical final character has its low two bits zero (they are
+    padding for a 32-byte value); flipping one produces a distinct string that
+    still decodes identically."""
+    last_index = _B64U_ALPHABET.index(public_key[-1])
+    assert last_index % 4 == 0, "canonical Ed25519 key spelling expected"
+    return public_key[:-1] + _B64U_ALPHABET[last_index + 1]
+
+
 def _get_challenge(client, headers) -> str:
     resp = client.post(
         "/api/admin/connect/devices/enrollment-challenge", headers=headers
@@ -192,3 +205,31 @@ def test_key_owned_by_another_operator_conflicts(client, auth):
     # The first operator cannot claim the same device key.
     _pk, _pub, resp2 = _enroll(client, auth, private_key=private_key)
     assert resp2.status_code == 409, resp2.text
+
+
+def test_noncanonical_key_spelling_resolves_to_same_device(client, auth):
+    # A different base64url spelling of the same key must not create a second
+    # device (which would slip past the revoked / cross-operator guards).
+    private_key, public_key, resp = _enroll(client, auth, label="Canonical")
+    assert resp.status_code == 201, resp.text
+    first_id = resp.json()["deviceId"]
+
+    variant = _noncanonical_spelling(public_key)
+    assert variant != public_key
+    assert base64.urlsafe_b64decode(variant + "=") == base64.urlsafe_b64decode(
+        public_key + "="
+    )
+
+    challenge = _get_challenge(client, auth)
+    resp2 = client.post(
+        "/api/admin/connect/devices",
+        headers=auth,
+        json={
+            "label": "Non-canonical spelling",
+            "publicKey": variant,
+            "challenge": challenge,
+            "signature": _sign(private_key, challenge),
+        },
+    )
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["deviceId"] == first_id

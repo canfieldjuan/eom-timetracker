@@ -28030,6 +28030,13 @@ def admin_enroll_connect_device(
     signature = _decode_connect_device_signature(payload.signature)
     _verify_connect_device_possession(public_key, signature, payload.challenge)
 
+    # Store and compare the CANONICAL base64url of the decoded key, never the
+    # caller's spelling: base64url has ~16 non-canonical final characters that
+    # decode to the same 32 bytes, so persisting the raw input would let the
+    # same key re-enroll under a different spelling and slip past the UNIQUE
+    # constraint that backs the revoked / cross-operator 409 guards.
+    canonical_public_key = base64.urlsafe_b64encode(public_key).decode("ascii").rstrip("=")
+
     device_id = str(uuid4())
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -28041,13 +28048,13 @@ def admin_enroll_connect_device(
                 ON CONFLICT (public_key_base64url) DO NOTHING
                 RETURNING *
                 """,
-                (device_id, int(admin["id"]), payload.label, payload.publicKey),
+                (device_id, int(admin["id"]), payload.label, canonical_public_key),
             )
             created = cur.fetchone()
             if created is None:
                 cur.execute(
                     "SELECT * FROM connect_devices WHERE public_key_base64url = %s",
-                    (payload.publicKey,),
+                    (canonical_public_key,),
                 )
                 existing = cur.fetchone()
                 if existing is None:
