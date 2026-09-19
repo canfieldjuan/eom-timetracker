@@ -1,8 +1,9 @@
 # Connect Device Enrollment Contract
 
-Status: implemented for the device lifecycle (enroll, list, revoke). The
-device-authenticated access path that calls the funnel on an operator's behalf
-is a separate, later slice and is not part of this contract yet.
+Status: implemented for the device lifecycle (enroll, list, revoke) and for a
+read-only device-authenticated funnel access path (see "Device-authenticated
+access" below). Confirmation-gated mutations from a device remain a separate,
+later slice.
 
 ## Purpose
 
@@ -66,6 +67,46 @@ supersedes the old device by leaving it revoked.
 The device view is a closed projection: `{deviceId, label, status, createdAt,
 lastSeenAt, revokedAt}`. The public key is never returned.
 
+## Device-authenticated access
+
+Once enrolled, a device acts on its operator's behalf with no operator bearer
+token in the request. Authentication is a per-request Ed25519 proof
+(`require_connect_device`), DPoP-style:
+
+- The device sends `X-Connect-Device` (its `device_id`), `X-Connect-Timestamp`
+  (unix seconds), and `X-Connect-Signature` (base64url Ed25519 signature).
+- It signs a canonical, newline-delimited string that binds a fixed context tag
+  (`connect-device-access-v1`), the `device_id`, the HTTP method, the request
+  path, the raw query string, the SHA-256 of the body, and the timestamp. The
+  server reconstructs the exact same string and verifies it against the stored
+  public key. Binding the method, target, and body means a captured proof cannot
+  be replayed against a different call; the timestamp freshness window
+  (`CONNECT_DEVICE_ACCESS_PROOF_TTL_S`, default 120s, with a 60s negative skew
+  tolerance) bounds replay against the same call. The context tag keeps this
+  proof disjoint from the enrollment challenge signature.
+- The bound operator is resolved from the device row and must still be an active
+  admin. The per-PC device does not license the caller: revoking the device, or
+  deactivating or demoting the operator, immediately stops access (`401` for a
+  missing/invalid/expired proof or a non-active device; `403` for an
+  inactive/non-admin bound operator). Each verified request stamps
+  `last_seen_at`.
+
+The tracker stays the sole holder of the Atlas funnel service token; the bound
+operator is vouched for through the same `X-EOM-Actor` / `X-EOM-Actor-ID`
+headers the office endpoints use, so the funnel sees the operator, never the
+device.
+
+### Read endpoint (this slice)
+
+- `GET /api/connect/device/funnel/leads` (device proof only) -> the funnel
+  work-queue poll: `{success, leads, workingLeads, pendingHandoffs, cursor,
+  hasMore, nextCursor, capabilities, capabilitiesDeclared}`. It relays the same
+  new/working overlay the office review shows plus the capability names the
+  deployed Atlas advertises, so an automation can gate an action instead of
+  invoking one Atlas will 404. It performs no mutation and intentionally omits
+  the office review's Website-only mutation-affordance flags (the device renders
+  no UI). Reads change no state, so they carry no confirmation gate.
+
 ## Production safety
 
 Additive and backward-compatible: one new table created idempotently in the
@@ -76,8 +117,11 @@ until a device is enrolled.
 
 ## Deferred to the next slice
 
-- The device-authenticated access endpoint: a device proves possession per
-  operation, the tracker verifies it against the stored public key and the
-  device's `active` status, updates `last_seen_at`, and performs the funnel call
-  with the bound operator's actor headers.
-- The per-operation confirmation gate for confirmation-required capabilities.
+- The device-authenticated MUTATION path. The read path above shares the same
+  `require_connect_device` proof, but a mutation must not be replayable within
+  the freshness window, so it needs a single-use, server-issued challenge bound
+  to the specific operation (not just a timestamp).
+- The per-operation confirmation gate for confirmation-required capabilities: a
+  capability whose flags mark it confirmation-required must not dispatch from an
+  automatic device trigger without a fresh, authorized confirmation linked to
+  that specific operation.

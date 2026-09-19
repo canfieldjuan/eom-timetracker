@@ -5002,6 +5002,16 @@ CONNECT_DEVICE_RATE_LIMIT_MAX = parse_int(
 CONNECT_DEVICE_RATE_LIMIT_WINDOW_S = parse_int(
     os.getenv("CONNECT_DEVICE_RATE_LIMIT_WINDOW_S"), 60
 )
+# Per-request device access proof (DPoP-style): an enrolled device signs a
+# canonical string binding its id, the HTTP method, the request target, a hash
+# of the body, and a timestamp with its Ed25519 private key on every device-
+# facing call. Stateless like the enrollment challenge -- nothing is stored --
+# and a short TTL bounds the replay window. Reads tolerate that window (they are
+# idempotent and change no state); the later mutation slice adds a single-use,
+# server-issued challenge so a confirmation-gated action cannot be replayed.
+CONNECT_DEVICE_ACCESS_PROOF_TTL_S = parse_int(
+    os.getenv("CONNECT_DEVICE_ACCESS_PROOF_TTL_S"), 120
+)
 REGISTER_RATE_LIMIT_MAX     = parse_int(os.getenv("REGISTER_RATE_LIMIT_MAX"),      3)
 REGISTER_RATE_LIMIT_WINDOW_S = parse_int(os.getenv("REGISTER_RATE_LIMIT_WINDOW_S"), 300)
 RATE_LIMIT_BUCKET_SOFT_CAP  = parse_int(os.getenv("RATE_LIMIT_BUCKET_SOFT_CAP"), 10000)
@@ -27985,6 +27995,149 @@ def _connect_device_view(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# Per-request device access proof. The device signs this exact canonical string
+# with its Ed25519 private key and sends the signature in the header below. The
+# context tag namespaces the signature so a proof minted for device access can
+# never be replayed as some other Ed25519 signature this system verifies (the
+# enrollment path signs a bare challenge, a disjoint input space). Each field is
+# on its own line: newline is not a legal byte in a UUID, an HTTP method, a URL
+# path/query, a hex digest, or a decimal integer, so the fields cannot be run
+# together to forge a different (method, path, body) tuple under one signature.
+_CONNECT_DEVICE_ACCESS_PROOF_CONTEXT = "connect-device-access-v1"
+_CONNECT_DEVICE_ID_HEADER = "X-Connect-Device"
+_CONNECT_DEVICE_TIMESTAMP_HEADER = "X-Connect-Timestamp"
+_CONNECT_DEVICE_SIGNATURE_HEADER = "X-Connect-Signature"
+
+
+def _connect_device_access_signing_string(
+    *,
+    device_id: str,
+    method: str,
+    path: str,
+    query: str,
+    body_sha256_hex: str,
+    timestamp: int,
+) -> bytes:
+    return "\n".join(
+        [
+            _CONNECT_DEVICE_ACCESS_PROOF_CONTEXT,
+            device_id,
+            method.upper(),
+            path,
+            query,
+            body_sha256_hex,
+            str(timestamp),
+        ]
+    ).encode("utf-8")
+
+
+async def require_connect_device(request: Request) -> Dict[str, Any]:
+    """Authenticate a Local Connect device by its per-request Ed25519 proof.
+
+    This is the SOLE authentication for device-facing endpoints -- there is no
+    operator bearer token in the request. The device proves possession of the
+    private key whose public half it enrolled, over a canonical string that
+    binds the exact method, request target, body, and a fresh timestamp, so a
+    captured proof cannot be replayed against a different call and only within
+    a short freshness window against the same one.
+
+    The bound operator is resolved from the device row and must still be an
+    active admin: a per-PC device does not license the caller, so revoking the
+    device OR deactivating/demoting the operator immediately stops the
+    automation. Returns an actor dict shaped like the office ``admin`` dict so
+    it threads straight into ``_atlas_funnel_read`` as the vouched-for operator.
+    """
+    unauthorized = HTTPException(
+        status_code=401, detail="Device authentication required"
+    )
+
+    device_id = request.headers.get(_CONNECT_DEVICE_ID_HEADER, "")
+    timestamp_raw = request.headers.get(_CONNECT_DEVICE_TIMESTAMP_HEADER, "")
+    signature_raw = request.headers.get(_CONNECT_DEVICE_SIGNATURE_HEADER, "")
+    if not (device_id and timestamp_raw and signature_raw):
+        raise unauthorized
+
+    # Rate-limit before any DB or crypto work, keyed by the claimed device id.
+    _rate_limit_check(
+        request,
+        key_prefix=f"connect-device-access:{device_id}",
+        max_calls=CONNECT_DEVICE_RATE_LIMIT_MAX,
+        window_seconds=CONNECT_DEVICE_RATE_LIMIT_WINDOW_S,
+    )
+
+    try:
+        # Normalize/validate before the parameterized lookup: a malformed value
+        # would otherwise reach psycopg2 as an invalid uuid literal.
+        UUID(device_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise unauthorized from exc
+    try:
+        timestamp = int(timestamp_raw)
+    except (TypeError, ValueError) as exc:
+        raise unauthorized from exc
+
+    # Freshness: a small negative tolerance absorbs clock skew; the positive
+    # bound is the replay window a captured proof survives.
+    age_seconds = int(utc_now().timestamp()) - timestamp
+    if age_seconds < -60 or age_seconds > CONNECT_DEVICE_ACCESS_PROOF_TTL_S:
+        raise unauthorized
+
+    try:
+        signature = _decode_connect_device_signature(signature_raw)
+    except HTTPException as exc:
+        raise unauthorized from exc
+
+    row = db.query_one(
+        "SELECT * FROM connect_devices WHERE device_id = %s",
+        (device_id,),
+    )
+    if row is None or row["status"] != "active":
+        raise unauthorized
+
+    try:
+        public_key = base64.urlsafe_b64decode(
+            (row["public_key_base64url"] + "=").encode("ascii")
+        )
+    except (ValueError, TypeError) as exc:
+        raise unauthorized from exc
+
+    # Read the body so the proof binds it. For a GET this is empty, but hashing
+    # it keeps the primitive honest for the later mutation slice. Starlette
+    # caches the body, so the endpoint can still read it.
+    body = await request.body()
+    signing_string = _connect_device_access_signing_string(
+        device_id=device_id,
+        method=request.method,
+        path=request.url.path,
+        query=request.url.query,
+        body_sha256_hex=hashlib.sha256(body).hexdigest(),
+        timestamp=timestamp,
+    )
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, signing_string)
+    except InvalidSignature as exc:
+        raise unauthorized from exc
+
+    employee = find_employee_by_id(load_employees()["employees"], int(row["employee_id"]))
+    if not employee or not employee.get("active", True):
+        raise HTTPException(status_code=403, detail="Device operator is not active")
+    if employee.get("role") != ADMIN_ROLE:
+        raise HTTPException(
+            status_code=403, detail="Device operator lacks the required role"
+        )
+
+    db.execute(
+        "UPDATE connect_devices SET last_seen_at = NOW() WHERE device_id = %s",
+        (device_id,),
+    )
+    return {
+        "id": int(employee["id"]),
+        "name": employee["name"],
+        "role": employee["role"],
+        "deviceId": device_id,
+    }
+
+
 @app.post("/api/admin/connect/devices/enrollment-challenge")
 def admin_connect_device_enrollment_challenge(
     request: Request,
@@ -28155,6 +28308,65 @@ def admin_revoke_connect_device(
             updated = cur.fetchone()
     append_access_log(request, "CONNECT_DEVICE_REVOKED", True, f"device={device_id}")
     return JSONResponse(status_code=200, content=_connect_device_view(updated))
+
+
+@app.get("/api/connect/device/funnel/leads")
+def connect_device_list_funnel_leads(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    cursor: Optional[str] = Query(default=None),
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> Dict[str, Any]:
+    """Device-facing funnel work-queue poll (read-only).
+
+    A Local Connect automation reads the funnel review queue on its bound
+    operator's behalf, authenticated purely by the device's per-request Ed25519
+    proof (``require_connect_device``). It relays the same new/working overlay
+    the office review shows plus the capability names the deployed Atlas
+    advertises, but performs no mutation and exposes no confirmation-gated
+    action -- those are a later slice. The Atlas service credential never leaves
+    the tracker; the bound operator is vouched for through the actor headers
+    ``_atlas_funnel_read`` sets. The Website-only mutation-affordance flags the
+    office review returns are intentionally omitted: the device renders no UI.
+    """
+    params: Dict[str, Any] = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    content = _atlas_funnel_read("/eom-funnel/leads", operator, params=params)
+    lead_page = _parse_atlas_lead_review_response(content)
+    leads = lead_page["leads"]
+    lead_state_markers = _list_lead_state_markers([lead["contactId"] for lead in leads])
+    new_leads: List[Dict[str, Any]] = []
+    working_leads: List[Dict[str, Any]] = []
+    for lead in leads:
+        marker = lead_state_markers.get(str(lead["contactId"]))
+        if marker and str(marker["state"]) == "working":
+            working_leads.append(_serialize_working_lead(lead, marker))
+        else:
+            new_leads.append(_lead_with_state_token(lead, marker))
+    pending_handoffs = _list_pending_office_conversion_handoffs()
+    append_access_log(
+        request,
+        "CONNECT_DEVICE_FUNNEL_REVIEW_LISTED",
+        True,
+        f"device={operator['deviceId']} leads={len(new_leads)} "
+        f"working={len(working_leads)} pending={len(pending_handoffs)}",
+    )
+    return {
+        "success": True,
+        "leads": new_leads,
+        "workingLeads": working_leads,
+        "pendingHandoffs": pending_handoffs,
+        "cursor": lead_page["cursor"],
+        "hasMore": lead_page["hasMore"],
+        "nextCursor": lead_page["nextCursor"],
+        # What the DEPLOYED Atlas advertises, so the automation can gate an
+        # action instead of invoking one Atlas will 404. `capabilitiesDeclared`
+        # false means Atlas predates the manifest and named nothing -- distinct
+        # from declaring an empty set, and both mean "do not act".
+        "capabilities": sorted(lead_page["capabilities"] or ()),
+        "capabilitiesDeclared": lead_page["capabilities"] is not None,
+    }
 
 
 @app.post("/api/admin/funnel/handoffs/{contact_id}/retry")
