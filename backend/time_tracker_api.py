@@ -5028,6 +5028,22 @@ CONNECT_DEVICE_ACCESS_PROOF_TTL_S = parse_int(
 CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES = parse_int(
     os.getenv("CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES"), 65536
 )
+# Device MUTATIONS need stronger anti-replay than a read's timestamp window and,
+# for confirmation-required capabilities, a fresh human authorization bound to
+# the exact operation. Two single-use, DB-backed, TTL-bounded tokens provide it:
+#  - an operation CHALLENGE: a server-issued nonce the device obtains and then
+#    consumes exactly once at dispatch (the per-request Ed25519 proof already
+#    binds the body that carries it), so a captured mutation cannot be replayed.
+#  - an operation CONFIRMATION: issued by an authenticated admin operator for one
+#    specific operation fingerprint, single-use, so an unattended device trigger
+#    cannot dispatch a confirmation-required operation without a fresh human OK.
+# Both are one-time and expire; being in the DB they survive a host restart.
+CONNECT_DEVICE_OPERATION_CHALLENGE_TTL_S = parse_int(
+    os.getenv("CONNECT_DEVICE_OPERATION_CHALLENGE_TTL_S"), 300
+)
+CONNECT_DEVICE_OPERATION_CONFIRMATION_TTL_S = parse_int(
+    os.getenv("CONNECT_DEVICE_OPERATION_CONFIRMATION_TTL_S"), 900
+)
 REGISTER_RATE_LIMIT_MAX     = parse_int(os.getenv("REGISTER_RATE_LIMIT_MAX"),      3)
 REGISTER_RATE_LIMIT_WINDOW_S = parse_int(os.getenv("REGISTER_RATE_LIMIT_WINDOW_S"), 300)
 RATE_LIMIT_BUCKET_SOFT_CAP  = parse_int(os.getenv("RATE_LIMIT_BUCKET_SOFT_CAP"), 10000)
@@ -8293,11 +8309,70 @@ def _ensure_connect_device_schema() -> None:
             )
 
 
+def _ensure_connect_device_operation_schema() -> None:
+    """Install the device-mutation authorization tables (idempotent, additive).
+
+    Two single-use ledgers gate a device-driven mutation:
+
+    - ``connect_device_operation_challenges``: a server-issued anti-replay nonce
+      bound to one device. The device obtains it, then references it in the
+      mutation whose body its Ed25519 proof signs; the dispatch consumes it
+      exactly once (``consumed_at``), so a captured mutation cannot be replayed.
+    - ``connect_device_operation_confirmations``: a fresh authorization an admin
+      operator issues for one exact operation (``operation_fingerprint``), bound
+      to the device and the confirming operator. A confirmation-required
+      capability cannot dispatch from the unattended device without one, and it
+      is single-use so it cannot be replayed or reused for another operation.
+
+    Both carry an ``expires_at`` and, being rows, survive a host restart. Both
+    reference ``connect_devices`` ON DELETE CASCADE: revoking/removing a device
+    takes its outstanding tokens with it.
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("connect_device_operation_schema_v1",),
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS connect_device_operation_challenges (
+                    challenge_id UUID PRIMARY KEY,
+                    device_id UUID NOT NULL
+                        REFERENCES connect_devices(device_id) ON DELETE CASCADE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    consumed_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS idx_connect_device_op_challenges_device
+                    ON connect_device_operation_challenges(device_id);
+
+                CREATE TABLE IF NOT EXISTS connect_device_operation_confirmations (
+                    confirmation_id UUID PRIMARY KEY,
+                    device_id UUID NOT NULL
+                        REFERENCES connect_devices(device_id) ON DELETE CASCADE,
+                    confirmed_by_employee_id INTEGER NOT NULL
+                        REFERENCES employees(id) ON DELETE RESTRICT,
+                    capability VARCHAR(128) NOT NULL,
+                    operation_fingerprint CHAR(64) NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    consumed_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS idx_connect_device_op_confirmations_lookup
+                    ON connect_device_operation_confirmations(
+                        device_id, operation_fingerprint
+                    );
+                """
+            )
+
+
 def _ensure_schema_migrations() -> None:
     """Idempotent schema additions for existing deployments."""
     _ensure_customer_site_schema()
     _ensure_employee_role_schema()
     _ensure_connect_device_schema()
+    _ensure_connect_device_operation_schema()
     # atlas_contact_id shipped inside CREATE TABLE IF NOT EXISTS customers and
     # was never applied via ALTER, so a customers table created before that
     # revision would lack the column. Additive and idempotent.
@@ -23793,7 +23868,15 @@ def _mark_lead_working(
     contact_id: str,
     admin: Dict[str, Any],
     expected_state_token: str,
+    *,
+    authorize: Optional[Callable[[Any], None]] = None,
 ) -> Dict[str, Any]:
+    # ``authorize``, when given, runs inside this transaction immediately before
+    # the working-state write, after every conflict/idempotency check has
+    # passed. The device path uses it to consume its single-use tokens atomically
+    # with the transition: if it raises, the whole transaction rolls back (no
+    # token spent, no state changed); if the lead was already working or a
+    # conflict fires first, it never runs, so a no-op transition burns nothing.
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_customer_site_mutations(cur)
@@ -23843,6 +23926,9 @@ def _mark_lead_working(
                     "This lead is not active; reopen it before starting the estimate",
                     {"contactId": contact_id},
                 )
+
+            if authorize is not None:
+                authorize(cur)
 
             if existing:
                 cur.execute(
@@ -28189,9 +28275,11 @@ async def require_connect_device(request: Request) -> Dict[str, Any]:
     # Read the body under a hard cap so the proof binds it without letting an
     # unverified caller force unbounded buffering/hashing. Reject on the declared
     # Content-Length first (cheap), then enforce the same cap while streaming so
-    # a chunked or length-omitting body cannot slip past. For this GET route the
-    # body is empty; hashing it still keeps the primitive honest for the later
-    # mutation slice.
+    # a chunked or length-omitting body cannot slip past. A read route has an
+    # empty body; a mutation route carries a small JSON body -- so this
+    # dependency, not a FastAPI body param, is the sole body reader (a body param
+    # would consume the stream first and collide), and it stashes the bytes on
+    # request.state for the endpoint to parse.
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -28206,6 +28294,7 @@ async def require_connect_device(request: Request) -> Dict[str, Any]:
         if len(body) > CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES:
             raise HTTPException(status_code=413, detail="Request body too large")
     body = bytes(body)
+    request.state.connect_device_body = body
     signing_string = _connect_device_access_signing_string(
         device_id=device_id,
         method=request.method,
@@ -28451,6 +28540,263 @@ def connect_device_list_funnel_leads(
         # from declaring an empty set, and both mean "do not act".
         "capabilities": sorted(lead_page["capabilities"] or ()),
         "capabilitiesDeclared": lead_page["capabilities"] is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Device-authenticated mutations: single-use challenge + per-operation
+# confirmation gate. The one representative mutation is the tracker-local
+# lead-working claim (reversible, no Atlas money path); the Atlas
+# confirmation-required capabilities wait for the local-provider slice.
+# ---------------------------------------------------------------------------
+
+# The capability names a device may perform, mapped to whether a fresh operator
+# confirmation is required to dispatch it from the unattended device. This is a
+# CLOSED set: an operation whose capability is not listed here is refused.
+CONNECT_DEVICE_MARK_WORKING_CAPABILITY = "funnel.lead.mark_working"
+_CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
+    {CONNECT_DEVICE_MARK_WORKING_CAPABILITY}
+)
+
+
+def _connect_device_operation_fingerprint(capability: str, contact_id: str) -> str:
+    """Stable identity of a device operation: its capability and target. Both the
+    operator's confirmation and the device's dispatch compute it the same way, so
+    a confirmation issued for one operation can never authorize a different one."""
+    canonical = json.dumps(
+        {"capability": capability, "contactId": str(contact_id)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_connect_operation_uuid(value: str) -> str:
+    try:
+        return str(UUID(str(value)))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid operation token id") from exc
+
+
+class ConnectDeviceOperationConfirmationRequest(BaseModel):
+    """An operator's fresh authorization for one specific device operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    capability: str = Field(min_length=1, max_length=128)
+    contactId: str = Field(min_length=1, max_length=64)
+
+
+class ConnectDeviceMarkLeadWorkingRequest(BaseModel):
+    """The device's request to claim a lead as working. ``challengeId`` is the
+    single-use anti-replay nonce; ``confirmationId`` is the operator's fresh
+    authorization for this exact operation; ``expectedStateToken`` drives the
+    tracker's existing optimistic-concurrency check."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    challengeId: str = Field(min_length=1, max_length=64)
+    confirmationId: str = Field(min_length=1, max_length=64)
+    expectedStateToken: str = Field(min_length=1, max_length=128)
+
+
+@app.post("/api/connect/device/operations/challenge")
+def connect_device_issue_operation_challenge(
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> JSONResponse:
+    """Issue a single-use, short-lived anti-replay challenge for the device.
+
+    The device references the returned ``challengeId`` in the body of the
+    mutation its Ed25519 proof signs; dispatch consumes it exactly once, so a
+    captured mutation request cannot be replayed."""
+    challenge_id = str(uuid4())
+    expires_at = utc_now() + timedelta(seconds=CONNECT_DEVICE_OPERATION_CHALLENGE_TTL_S)
+    db.execute(
+        """
+        INSERT INTO connect_device_operation_challenges
+            (challenge_id, device_id, expires_at)
+        VALUES (%s, %s, %s)
+        """,
+        (challenge_id, operator["deviceId"], expires_at),
+    )
+    append_access_log(
+        request,
+        "CONNECT_DEVICE_OPERATION_CHALLENGE_ISSUED",
+        True,
+        f"device={operator['deviceId']}",
+        persist_to_file=False,
+    )
+    return JSONResponse(
+        status_code=201,
+        content={"challengeId": challenge_id, "expiresAt": to_utc_iso(expires_at)},
+    )
+
+
+@app.post("/api/admin/connect/devices/{device_id}/operation-confirmations")
+def admin_confirm_connect_device_operation(
+    device_id: UUID,
+    payload: ConnectDeviceOperationConfirmationRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Record an operator's fresh authorization for one specific device operation.
+
+    A confirmation-required capability cannot dispatch from the unattended device
+    without a matching, unconsumed, unexpired confirmation. It is bound to the
+    device and the exact operation fingerprint and is single-use, so it cannot be
+    replayed or redirected to a different operation. The device still acts as its
+    own bound operator; this only records that a human authorized the action."""
+    if payload.capability not in _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES:
+        raise HTTPException(status_code=400, detail="Unknown device operation capability")
+    contact_id = _validate_connect_operation_uuid(payload.contactId)
+
+    device = db.query_one(
+        "SELECT status FROM connect_devices WHERE device_id = %s",
+        (str(device_id),),
+    )
+    if device is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    if device["status"] != "active":
+        raise HTTPException(
+            status_code=409, detail="Cannot confirm an operation for a revoked device"
+        )
+
+    fingerprint = _connect_device_operation_fingerprint(payload.capability, contact_id)
+    confirmation_id = str(uuid4())
+    expires_at = utc_now() + timedelta(
+        seconds=CONNECT_DEVICE_OPERATION_CONFIRMATION_TTL_S
+    )
+    db.execute(
+        """
+        INSERT INTO connect_device_operation_confirmations
+            (confirmation_id, device_id, confirmed_by_employee_id, capability,
+             operation_fingerprint, expires_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            confirmation_id,
+            str(device_id),
+            int(admin["id"]),
+            payload.capability,
+            fingerprint,
+            expires_at,
+        ),
+    )
+    append_access_log(
+        request,
+        "CONNECT_DEVICE_OPERATION_CONFIRMED",
+        True,
+        f"device={device_id} capability={payload.capability} contact={contact_id}",
+    )
+    return JSONResponse(
+        status_code=201,
+        content={
+            "confirmationId": confirmation_id,
+            "operationFingerprint": fingerprint,
+            "expiresAt": to_utc_iso(expires_at),
+        },
+    )
+
+
+def _connect_device_parse_body(request: Request, model):
+    """Parse the capped body require_connect_device stashed on request.state into
+    a Pydantic model. Device endpoints declare no body param (the dependency is
+    the sole body reader), so validation happens here."""
+    raw = getattr(request.state, "connect_device_body", b"") or b""
+    try:
+        return model.model_validate_json(raw)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
+
+
+@app.post("/api/connect/device/funnel/leads/{contact_id}/working")
+def connect_device_mark_lead_working(
+    contact_id: UUID,
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> Dict[str, Any]:
+    """Device-driven, confirmation-gated mutation: claim a lead as working on the
+    bound operator's behalf.
+
+    Faithful to the office path -- the bound operator must be the configured
+    funnel approver -- and additionally requires, because this capability is
+    confirmation-required, a single-use anti-replay challenge AND a fresh
+    operator confirmation for this exact operation. Both are consumed inside the
+    working-state transaction (see ``_mark_lead_working``'s ``authorize`` hook),
+    so a crash or conflict never leaves a token spent without the transition, and
+    a replay or restart cannot re-run it."""
+    payload = _connect_device_parse_body(request, ConnectDeviceMarkLeadWorkingRequest)
+    _require_juan_funnel_approver(operator, action="mark leads working")
+
+    contact_id_text = str(contact_id)
+    challenge_id = _validate_connect_operation_uuid(payload.challengeId)
+    confirmation_id = _validate_connect_operation_uuid(payload.confirmationId)
+    device_id = operator["deviceId"]
+    fingerprint = _connect_device_operation_fingerprint(
+        CONNECT_DEVICE_MARK_WORKING_CAPABILITY, contact_id_text
+    )
+
+    def _authorize(cur) -> None:
+        # Single-use challenge: device-bound, unconsumed, unexpired.
+        cur.execute(
+            """
+            UPDATE connect_device_operation_challenges
+            SET consumed_at = NOW()
+            WHERE challenge_id = %s AND device_id = %s
+              AND consumed_at IS NULL AND expires_at > NOW()
+            RETURNING challenge_id
+            """,
+            (challenge_id, device_id),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Operation challenge is invalid, expired, or already used",
+            )
+        # Fresh operator confirmation bound to THIS exact operation.
+        cur.execute(
+            """
+            UPDATE connect_device_operation_confirmations
+            SET consumed_at = NOW()
+            WHERE confirmation_id = %s AND device_id = %s AND capability = %s
+              AND operation_fingerprint = %s
+              AND consumed_at IS NULL AND expires_at > NOW()
+            RETURNING confirmation_id
+            """,
+            (
+                confirmation_id,
+                device_id,
+                CONNECT_DEVICE_MARK_WORKING_CAPABILITY,
+                fingerprint,
+            ),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(
+                status_code=403,
+                detail="A fresh operator confirmation for this exact operation is required",
+            )
+
+    marker = _mark_lead_working(
+        contact_id_text, operator, payload.expectedStateToken, authorize=_authorize
+    )
+    append_access_log(
+        request,
+        "CONNECT_DEVICE_FUNNEL_LEAD_MARKED_WORKING",
+        True,
+        f"device={device_id} contact={contact_id_text}",
+        persist_to_file=False,
+    )
+    return {
+        "success": True,
+        "workingLead": {
+            "contactId": contact_id_text,
+            "markedAt": to_utc_iso(marker["marked_at"]),
+            "markedByEmployeeId": int(marker["marked_by_employee_id"]),
+            "stateToken": _lead_state_token(
+                contact_id_text, int(marker["state_version"])
+            ),
+        },
     }
 
 
