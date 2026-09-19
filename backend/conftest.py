@@ -32,6 +32,12 @@ os.environ.setdefault("TOKEN_TTL_HOURS", "12")
 os.environ.setdefault("MAX_ACTIVE_SHIFT_HOURS", "24")
 os.environ.setdefault("LOGIN_RATE_LIMIT_MAX", "0")
 os.environ.setdefault("REGISTER_RATE_LIMIT_MAX", "0")
+# The connect-device enrollment and access limiters share one process-global
+# bucket map, and the test client is session-scoped, so per-IP counts accumulate
+# across every connect-device test within the window. No test asserts this
+# limiter, so disable it (0 = off) exactly as login/register above -- otherwise
+# the shared bucket fills and an unrelated later test gets a spurious 429.
+os.environ.setdefault("CONNECT_DEVICE_RATE_LIMIT_MAX", "0")
 os.environ.setdefault("ALLOW_PUBLIC_REGISTRATION", "false")
 os.environ.setdefault("ALLOWED_ORIGINS", "https://trusted.example")
 os.environ.setdefault("GOOGLE_CALENDAR_CLIENT_ID", "test-google-client")

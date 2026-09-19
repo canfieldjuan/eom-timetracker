@@ -68,6 +68,7 @@ from time_action_registry import (
     validate_time_action_mutation_source,
 )
 from fastapi import Depends, FastAPI, Header, HTTPException, Path as FastAPIPath, Query, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -2253,7 +2254,13 @@ def append_access_log(
     reason: str = "",
     *,
     details: Optional[Dict[str, Any]] = None,
+    persist_to_file: bool = True,
 ) -> None:
+    # persist_to_file=False keeps this event out of the daily JSON file logger.
+    # That logger reads and atomically rewrites the entire day's file on every
+    # call, and DATA_DIR is a persistent disk in production, so a high-frequency
+    # automated path (e.g. a device work-queue poll) must record to PostgreSQL
+    # only -- otherwise routine polling drives ever-growing whole-file rewrites.
     timestamp = to_utc_iso(utc_now())
     local_date_text = local_date_for_logs()
     client_ip = get_client_ip(request)
@@ -2280,10 +2287,11 @@ def append_access_log(
     except Exception:
         logger.warning("access_log_postgres_write_failed", exc_info=True)
 
-    try:
-        _append_access_log_to_file(entry, local_date_text)
-    except Exception:
-        logger.warning("access_log_file_write_failed", exc_info=True)
+    if persist_to_file:
+        try:
+            _append_access_log_to_file(entry, local_date_text)
+        except Exception:
+            logger.warning("access_log_file_write_failed", exc_info=True)
 
     if not postgres_written:
         return
@@ -5001,6 +5009,24 @@ CONNECT_DEVICE_RATE_LIMIT_MAX = parse_int(
 )
 CONNECT_DEVICE_RATE_LIMIT_WINDOW_S = parse_int(
     os.getenv("CONNECT_DEVICE_RATE_LIMIT_WINDOW_S"), 60
+)
+# Per-request device access proof (DPoP-style): an enrolled device signs a
+# canonical string binding its id, the HTTP method, the request target, a hash
+# of the body, and a timestamp with its Ed25519 private key on every device-
+# facing call. Stateless like the enrollment challenge -- nothing is stored --
+# and a short TTL bounds the replay window. Reads tolerate that window (they are
+# idempotent and change no state); the later mutation slice adds a single-use,
+# server-issued challenge so a confirmation-gated action cannot be replayed.
+CONNECT_DEVICE_ACCESS_PROOF_TTL_S = parse_int(
+    os.getenv("CONNECT_DEVICE_ACCESS_PROOF_TTL_S"), 120
+)
+# Hard cap on the request body a device proof will buffer and hash. The device
+# primitive authenticates an unverified caller, so an application-unbounded body
+# would let a bogus device force large-buffer or slow-stream work before it is
+# rejected. A device operation body is small JSON; the current read route has no
+# body at all. Anything past this is rejected (413) before the DB or crypto work.
+CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES = parse_int(
+    os.getenv("CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES"), 65536
 )
 REGISTER_RATE_LIMIT_MAX     = parse_int(os.getenv("REGISTER_RATE_LIMIT_MAX"),      3)
 REGISTER_RATE_LIMIT_WINDOW_S = parse_int(os.getenv("REGISTER_RATE_LIMIT_WINDOW_S"), 300)
@@ -27985,6 +28011,215 @@ def _connect_device_view(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# Per-request device access proof. The device signs this exact canonical string
+# with its Ed25519 private key and sends the signature in the header below. The
+# context tag namespaces the signature so a proof minted for device access can
+# never be replayed as some other Ed25519 signature this system verifies (the
+# enrollment path signs a bare challenge, a disjoint input space). Each field is
+# on its own line: newline is not a legal byte in a UUID, an HTTP method, a URL
+# path/query, a hex digest, or a decimal integer, so the fields cannot be run
+# together to forge a different (method, path, body) tuple under one signature.
+_CONNECT_DEVICE_ACCESS_PROOF_CONTEXT = "connect-device-access-v1"
+_CONNECT_DEVICE_ID_HEADER = "X-Connect-Device"
+_CONNECT_DEVICE_TIMESTAMP_HEADER = "X-Connect-Timestamp"
+_CONNECT_DEVICE_SIGNATURE_HEADER = "X-Connect-Signature"
+
+
+def _connect_device_access_signing_string(
+    *,
+    device_id: str,
+    method: str,
+    path: str,
+    query: str,
+    body_sha256_hex: str,
+    timestamp: int,
+) -> bytes:
+    return "\n".join(
+        [
+            _CONNECT_DEVICE_ACCESS_PROOF_CONTEXT,
+            device_id,
+            method.upper(),
+            path,
+            query,
+            body_sha256_hex,
+            str(timestamp),
+        ]
+    ).encode("utf-8")
+
+
+_CONNECT_DEVICE_UNAUTHORIZED_DETAIL = "Device authentication required"
+
+
+def _authenticate_connect_device_blocking(
+    device_id: str, signature: bytes, signing_string: bytes
+) -> Dict[str, Any]:
+    """The DB + crypto half of device authentication, run in a threadpool.
+
+    Every step here either issues a blocking psycopg2 query or runs Ed25519
+    verification, so it must NOT run on the ASGI event loop (a slow database
+    would stall unrelated requests). ``require_connect_device`` hands it the
+    already-parsed device id, decoded signature, and canonical signing string
+    and offloads it with ``run_in_threadpool``.
+    """
+    unauthorized = HTTPException(
+        status_code=401, detail=_CONNECT_DEVICE_UNAUTHORIZED_DETAIL
+    )
+    row = db.query_one(
+        "SELECT * FROM connect_devices WHERE device_id = %s",
+        (device_id,),
+    )
+    if row is None or row["status"] != "active":
+        raise unauthorized
+
+    try:
+        public_key = base64.urlsafe_b64decode(
+            (row["public_key_base64url"] + "=").encode("ascii")
+        )
+    except (ValueError, TypeError) as exc:
+        raise unauthorized from exc
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(signature, signing_string)
+    except InvalidSignature as exc:
+        raise unauthorized from exc
+
+    # Precise status for the common (non-race) case: distinguish a non-active or
+    # non-admin operator (403) from a device/proof failure (401). The final
+    # write below is what actually authorizes -- these reads only shape the code.
+    employee = find_employee_by_id(load_employees()["employees"], int(row["employee_id"]))
+    if not employee or not employee.get("active", True):
+        raise HTTPException(status_code=403, detail="Device operator is not active")
+    if employee.get("role") != ADMIN_ROLE:
+        raise HTTPException(
+            status_code=403, detail="Device operator lacks the required role"
+        )
+
+    # Single authoritative write. It stamps last_seen_at only when the device is
+    # STILL active AND its operator is STILL an active admin, and reads the actor
+    # fields back from that same joined row. Both status reads above ran in their
+    # own transactions, so a device revoke OR an operator deactivation/demotion
+    # committed between them and here would otherwise slip through; predicating
+    # the UPDATE on both, and returning the fresh operator identity, makes this
+    # write the sole point of authorization -- a stale snapshot matches no row,
+    # the write returns nothing, and the request is rejected.
+    stamped = db.query_one(
+        """
+        UPDATE connect_devices AS d
+        SET last_seen_at = NOW()
+        FROM employees AS e
+        WHERE d.device_id = %s
+          AND d.status = 'active'
+          AND e.id = d.employee_id
+          AND e.active = TRUE
+          AND e.role = %s
+        RETURNING e.id AS employee_id, e.name AS employee_name, e.role AS employee_role
+        """,
+        (device_id, ADMIN_ROLE),
+    )
+    if stamped is None:
+        raise unauthorized
+
+    return {
+        "id": int(stamped["employee_id"]),
+        "name": stamped["employee_name"],
+        "role": stamped["employee_role"],
+        "deviceId": device_id,
+    }
+
+
+async def require_connect_device(request: Request) -> Dict[str, Any]:
+    """Authenticate a Local Connect device by its per-request Ed25519 proof.
+
+    This is the SOLE authentication for device-facing endpoints -- there is no
+    operator bearer token in the request. The device proves possession of the
+    private key whose public half it enrolled, over a canonical string that
+    binds the exact method, request target, body, and a fresh timestamp, so a
+    captured proof cannot be replayed against a different call and only within
+    a short freshness window against the same one.
+
+    The bound operator is resolved from the device row and must still be an
+    active admin: a per-PC device does not license the caller, so revoking the
+    device OR deactivating/demoting the operator immediately stops the
+    automation. Returns an actor dict shaped like the office ``admin`` dict so
+    it threads straight into ``_atlas_funnel_read`` as the vouched-for operator.
+    """
+    unauthorized = HTTPException(
+        status_code=401, detail=_CONNECT_DEVICE_UNAUTHORIZED_DETAIL
+    )
+
+    device_id = request.headers.get(_CONNECT_DEVICE_ID_HEADER, "")
+    timestamp_raw = request.headers.get(_CONNECT_DEVICE_TIMESTAMP_HEADER, "")
+    signature_raw = request.headers.get(_CONNECT_DEVICE_SIGNATURE_HEADER, "")
+    if not (device_id and timestamp_raw and signature_raw):
+        raise unauthorized
+
+    # Rate-limit on trusted data only. The device id is attacker-controlled and
+    # unverified at this point, so keying the bucket by it would let a caller
+    # rotate the header to mint unbounded buckets and force the limiter's
+    # soft-cap scan. A constant prefix keys purely by client IP (the limiter
+    # appends it), so a flood from one source is actually capped.
+    _rate_limit_check(
+        request,
+        key_prefix="connect-device-access",
+        max_calls=CONNECT_DEVICE_RATE_LIMIT_MAX,
+        window_seconds=CONNECT_DEVICE_RATE_LIMIT_WINDOW_S,
+    )
+
+    try:
+        # Normalize/validate before the parameterized lookup: a malformed value
+        # would otherwise reach psycopg2 as an invalid uuid literal.
+        UUID(device_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise unauthorized from exc
+    try:
+        timestamp = int(timestamp_raw)
+    except (TypeError, ValueError) as exc:
+        raise unauthorized from exc
+
+    # Freshness: a small negative tolerance absorbs clock skew; the positive
+    # bound is the replay window a captured proof survives.
+    age_seconds = int(utc_now().timestamp()) - timestamp
+    if age_seconds < -60 or age_seconds > CONNECT_DEVICE_ACCESS_PROOF_TTL_S:
+        raise unauthorized
+
+    try:
+        signature = _decode_connect_device_signature(signature_raw)
+    except HTTPException as exc:
+        raise unauthorized from exc
+
+    # Read the body under a hard cap so the proof binds it without letting an
+    # unverified caller force unbounded buffering/hashing. Reject on the declared
+    # Content-Length first (cheap), then enforce the same cap while streaming so
+    # a chunked or length-omitting body cannot slip past. For this GET route the
+    # body is empty; hashing it still keeps the primitive honest for the later
+    # mutation slice.
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise unauthorized from exc
+        if declared_length > CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Request body too large")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > CONNECT_DEVICE_ACCESS_MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Request body too large")
+    body = bytes(body)
+    signing_string = _connect_device_access_signing_string(
+        device_id=device_id,
+        method=request.method,
+        path=request.url.path,
+        query=request.url.query,
+        body_sha256_hex=hashlib.sha256(body).hexdigest(),
+        timestamp=timestamp,
+    )
+    # Offload the blocking DB + crypto work so it never runs on the event loop.
+    return await run_in_threadpool(
+        _authenticate_connect_device_blocking, device_id, signature, signing_string
+    )
+
+
 @app.post("/api/admin/connect/devices/enrollment-challenge")
 def admin_connect_device_enrollment_challenge(
     request: Request,
@@ -28155,6 +28390,68 @@ def admin_revoke_connect_device(
             updated = cur.fetchone()
     append_access_log(request, "CONNECT_DEVICE_REVOKED", True, f"device={device_id}")
     return JSONResponse(status_code=200, content=_connect_device_view(updated))
+
+
+@app.get("/api/connect/device/funnel/leads")
+def connect_device_list_funnel_leads(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    cursor: Optional[str] = Query(default=None),
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> Dict[str, Any]:
+    """Device-facing funnel work-queue poll (read-only).
+
+    A Local Connect automation reads the funnel review queue on its bound
+    operator's behalf, authenticated purely by the device's per-request Ed25519
+    proof (``require_connect_device``). It relays the same new/working overlay
+    the office review shows plus the capability names the deployed Atlas
+    advertises, but performs no mutation and exposes no confirmation-gated
+    action -- those are a later slice. The Atlas service credential never leaves
+    the tracker; the bound operator is vouched for through the actor headers
+    ``_atlas_funnel_read`` sets. The Website-only mutation-affordance flags the
+    office review returns are intentionally omitted: the device renders no UI.
+    """
+    params: Dict[str, Any] = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    content = _atlas_funnel_read("/eom-funnel/leads", operator, params=params)
+    lead_page = _parse_atlas_lead_review_response(content)
+    leads = lead_page["leads"]
+    lead_state_markers = _list_lead_state_markers([lead["contactId"] for lead in leads])
+    new_leads: List[Dict[str, Any]] = []
+    working_leads: List[Dict[str, Any]] = []
+    for lead in leads:
+        marker = lead_state_markers.get(str(lead["contactId"]))
+        if marker and str(marker["state"]) == "working":
+            working_leads.append(_serialize_working_lead(lead, marker))
+        else:
+            new_leads.append(_lead_with_state_token(lead, marker))
+    pending_handoffs = _list_pending_office_conversion_handoffs()
+    # Postgres-only: this is an automated, high-frequency poll, so it must not
+    # drive the daily-file logger's whole-file rewrite on the persistent disk.
+    append_access_log(
+        request,
+        "CONNECT_DEVICE_FUNNEL_REVIEW_LISTED",
+        True,
+        f"device={operator['deviceId']} leads={len(new_leads)} "
+        f"working={len(working_leads)} pending={len(pending_handoffs)}",
+        persist_to_file=False,
+    )
+    return {
+        "success": True,
+        "leads": new_leads,
+        "workingLeads": working_leads,
+        "pendingHandoffs": pending_handoffs,
+        "cursor": lead_page["cursor"],
+        "hasMore": lead_page["hasMore"],
+        "nextCursor": lead_page["nextCursor"],
+        # What the DEPLOYED Atlas advertises, so the automation can gate an
+        # action instead of invoking one Atlas will 404. `capabilitiesDeclared`
+        # false means Atlas predates the manifest and named nothing -- distinct
+        # from declaring an empty set, and both mean "do not act".
+        "capabilities": sorted(lead_page["capabilities"] or ()),
+        "capabilitiesDeclared": lead_page["capabilities"] is not None,
+    }
 
 
 @app.post("/api/admin/funnel/handoffs/{contact_id}/retry")
