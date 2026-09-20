@@ -28611,6 +28611,31 @@ def _validate_connect_operation_uuid(value: str) -> str:
         raise HTTPException(status_code=422, detail="Invalid operation token id") from exc
 
 
+def _assert_connect_device_operator_active(cur, device_id: str) -> None:
+    """Within an open transaction, assert the device is still active AND its bound
+    operator is still an active admin, holding both rows (FOR UPDATE OF d, e).
+
+    Every device-operation write (challenge issuance, confirmation issuance, and
+    the mutation's final authorization) authenticates earlier in a separate
+    transaction and may then wait on locks, so each re-asserts here to serialize
+    against a revoke or an operator demotion committing in between."""
+    cur.execute(
+        """
+        SELECT 1
+        FROM connect_devices d
+        JOIN employees e ON e.id = d.employee_id
+        WHERE d.device_id = %s AND d.status = 'active'
+          AND e.active = TRUE AND e.role = %s
+        FOR UPDATE OF d, e
+        """,
+        (device_id, ADMIN_ROLE),
+    )
+    if cur.fetchone() is None:
+        raise HTTPException(
+            status_code=403, detail="Device or operator is no longer authorized"
+        )
+
+
 class ConnectDeviceOperationConfirmationRequest(BaseModel):
     """An operator's fresh authorization for one specific device operation."""
 
@@ -28712,14 +28737,20 @@ def connect_device_issue_operation_challenge(
     )
     challenge_id = str(uuid4())
     expires_at = utc_now() + timedelta(seconds=CONNECT_DEVICE_OPERATION_CHALLENGE_TTL_S)
-    db.execute(
-        """
-        INSERT INTO connect_device_operation_challenges
-            (challenge_id, device_id, expires_at)
-        VALUES (%s, %s, %s)
-        """,
-        (challenge_id, operator["deviceId"], expires_at),
-    )
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Re-assert authorization inside the insert transaction: a revoke or
+            # demotion committing between authentication and here must not mint a
+            # challenge for a device/operator no longer authorized.
+            _assert_connect_device_operator_active(cur, operator["deviceId"])
+            cur.execute(
+                """
+                INSERT INTO connect_device_operation_challenges
+                    (challenge_id, device_id, expires_at)
+                VALUES (%s, %s, %s)
+                """,
+                (challenge_id, operator["deviceId"], expires_at),
+            )
     _maybe_prune_connect_device_operation_tokens()
     append_access_log(
         request,
@@ -28780,6 +28811,21 @@ def admin_confirm_connect_device_operation(
                     status_code=409,
                     detail="Cannot confirm an operation for a revoked device",
                 )
+            # Re-assert the CONFIRMING admin is still an active admin, holding
+            # that row: get_current_admin validated the caller before this
+            # transaction, and another admin could demote or deactivate them in
+            # the gap. The confirmation records who authorized it, so a token
+            # minted by an operator whose access was concurrently withdrawn must
+            # not stand.
+            cur.execute(
+                "SELECT 1 FROM employees WHERE id = %s AND active = TRUE AND role = %s "
+                "FOR UPDATE",
+                (int(admin["id"]), ADMIN_ROLE),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(
+                    status_code=403, detail="Confirming operator is no longer authorized"
+                )
             # Retire any expired-but-unconsumed confirmation for this operation
             # first: it still occupies the partial unique index (which keys only
             # on consumed_at IS NULL), so without this a token that expired unused
@@ -28835,6 +28881,10 @@ def admin_confirm_connect_device_operation(
                     )
     confirmation_id = str(row["confirmation_id"])
     reused = confirmation_id != new_confirmation_id
+    # Also drive cleanup from this write path: an admin issuing confirmations for
+    # abandoned operations without later requesting a challenge would otherwise
+    # leave expired rows unreaped.
+    _maybe_prune_connect_device_operation_tokens()
     append_access_log(
         request,
         "CONNECT_DEVICE_OPERATION_CONFIRMED",
@@ -28894,27 +28944,12 @@ def connect_device_mark_lead_working(
 
     def _authorize(cur) -> None:
         # This hook runs inside _mark_lead_working's transaction, which has
-        # already waited on its advisory locks. Authentication (and its
-        # active-device / active-admin recheck) happened earlier in a separate
-        # transaction, so re-assert here, holding the device row, that the device
-        # is STILL active and its operator STILL an active admin: a revoke or
-        # demotion that commits during the lock wait must not let this retained
-        # authentication consume tokens and mutate.
-        cur.execute(
-            """
-            SELECT 1
-            FROM connect_devices d
-            JOIN employees e ON e.id = d.employee_id
-            WHERE d.device_id = %s AND d.status = 'active'
-              AND e.active = TRUE AND e.role = %s
-            FOR UPDATE OF d, e
-            """,
-            (device_id, ADMIN_ROLE),
-        )
-        if cur.fetchone() is None:
-            raise HTTPException(
-                status_code=403, detail="Device or operator is no longer authorized"
-            )
+        # already waited on its advisory locks. Authentication happened earlier in
+        # a separate transaction, so re-assert here (holding the device + operator
+        # rows) that the device is STILL active and its operator STILL an active
+        # admin: a revoke or demotion that commits during the lock wait must not
+        # let this retained authentication consume tokens and mutate.
+        _assert_connect_device_operator_active(cur, device_id)
         # Single-use challenge: device-bound, unconsumed, unexpired. Expiry is
         # compared against clock_timestamp() (real wall clock), NOT NOW() (which
         # is fixed at transaction start), so a token cannot outlive its TTL by
