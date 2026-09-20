@@ -429,6 +429,26 @@ def test_duplicate_confirmation_issuance_is_idempotent(client, auth, monkeypatch
     assert reissued.json()["confirmationId"] != first_id
 
 
+def test_malformed_mutation_body_returns_structured_422(client, auth, monkeypatch):
+    # A malformed body yields a structured 422 (via RequestValidationError), not
+    # a generic "Request failed": the field-level detail is preserved.
+    _set_approver(monkeypatch, client, auth)
+    private_key, device_id = _enroll_device(client, auth)
+    resp = _device_post(
+        client,
+        device_id,
+        private_key,
+        f"/api/connect/device/funnel/leads/{_fresh_contact()}/working",
+        {"challengeId": "not-a-uuid"},  # missing confirmationId + expectedStateToken
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    # The app's structured validation handler preserves field-level detail.
+    assert body.get("code") == "validation_error", body
+    fields = body.get("details", {}).get("fields", {})
+    assert "confirmationId" in fields and "expectedStateToken" in fields, body
+
+
 def test_employee_cannot_confirm(client, emp_auth):
     contact_id = _fresh_contact()
     resp = client.post(

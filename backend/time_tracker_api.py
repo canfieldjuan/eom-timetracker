@@ -28803,47 +28803,59 @@ def admin_confirm_connect_device_operation(
             # Recheck the device is present and active INSIDE this transaction,
             # holding its row, so a revoke committing between a pre-check and the
             # insert cannot leave a confirmation minted for a revoked device.
-            # Recheck the TARGET device and its bound operator, holding both rows
-            # (employee_id is a NOT NULL FK, so a null row means the device is
-            # gone). A confirmation for a revoked device, or one whose bound
-            # operator is no longer an active admin, could never dispatch, so
-            # reject issuance rather than mint a dead token.
+            # Lock the target device row and read its bound operator (employee_id
+            # is a NOT NULL FK, so a null row means the device is gone).
             cur.execute(
-                """
-                SELECT d.status AS device_status, e.active AS op_active, e.role AS op_role
-                FROM connect_devices d
-                JOIN employees e ON e.id = d.employee_id
-                WHERE d.device_id = %s
-                FOR UPDATE OF d, e
-                """,
+                "SELECT status, employee_id FROM connect_devices WHERE device_id = %s "
+                "FOR UPDATE",
                 (str(device_id),),
             )
             device = cur.fetchone()
             if device is None:
                 raise HTTPException(status_code=404, detail="Device not found")
-            if device["device_status"] != "active":
+            if device["status"] != "active":
                 raise HTTPException(
                     status_code=409,
                     detail="Cannot confirm an operation for a revoked device",
                 )
-            if not device["op_active"] or device["op_role"] != ADMIN_ROLE:
+            # Lock BOTH employee rows we validate -- the device's bound operator
+            # and the confirming admin -- in one statement ordered by id. A
+            # consistent global lock order is what prevents a deadlock when two
+            # admins concurrently cross-confirm each other's devices (each would
+            # otherwise hold one employee row and wait on the other). We reject a
+            # confirmation for a device whose bound operator is no longer an
+            # active admin, or from a confirmer who is no longer one, rather than
+            # mint a token that could never dispatch / whose authorizer is void.
+            bound_operator_id = int(device["employee_id"])
+            confirmer_id = int(admin["id"])
+            employee_ids = sorted({bound_operator_id, confirmer_id})
+            cur.execute(
+                """
+                SELECT id, active, role FROM employees
+                WHERE id = ANY(%s)
+                ORDER BY id
+                FOR UPDATE
+                """,
+                (employee_ids,),
+            )
+            employees_locked = {int(row["id"]): row for row in cur.fetchall()}
+            bound_operator = employees_locked.get(bound_operator_id)
+            if (
+                bound_operator is None
+                or not bound_operator["active"]
+                or bound_operator["role"] != ADMIN_ROLE
+            ):
                 raise HTTPException(
                     status_code=409,
                     detail="Cannot confirm an operation for a device whose operator "
                     "is not an active admin",
                 )
-            # Re-assert the CONFIRMING admin is still an active admin, holding
-            # that row: get_current_admin validated the caller before this
-            # transaction, and another admin could demote or deactivate them in
-            # the gap. The confirmation records who authorized it, so a token
-            # minted by an operator whose access was concurrently withdrawn must
-            # not stand.
-            cur.execute(
-                "SELECT 1 FROM employees WHERE id = %s AND active = TRUE AND role = %s "
-                "FOR UPDATE",
-                (int(admin["id"]), ADMIN_ROLE),
-            )
-            if cur.fetchone() is None:
+            confirmer = employees_locked.get(confirmer_id)
+            if (
+                confirmer is None
+                or not confirmer["active"]
+                or confirmer["role"] != ADMIN_ROLE
+            ):
                 raise HTTPException(
                     status_code=403, detail="Confirming operator is no longer authorized"
                 )
@@ -28932,7 +28944,11 @@ def _connect_device_parse_body(request: Request, model):
     try:
         return model.model_validate_json(raw)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
+        # Raise the request-validation type so the app's
+        # validation_exception_handler emits the same structured 422 as
+        # ordinary body params (a plain HTTPException with a list detail would
+        # be flattened to a generic "Request failed" message).
+        raise RequestValidationError(exc.errors()) from exc
 
 
 @app.post("/api/connect/device/funnel/leads/{contact_id}/working")
