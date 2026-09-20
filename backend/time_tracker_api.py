@@ -5044,6 +5044,15 @@ CONNECT_DEVICE_OPERATION_CHALLENGE_TTL_S = parse_int(
 CONNECT_DEVICE_OPERATION_CONFIRMATION_TTL_S = parse_int(
     os.getenv("CONNECT_DEVICE_OPERATION_CONFIRMATION_TTL_S"), 900
 )
+# Retention for the device operation-token ledgers. Consumed or expired tokens
+# older than this are opportunistically reaped (bounded per pass) so the tables
+# do not grow without bound; the prune runs at most once per interval.
+CONNECT_DEVICE_OPERATION_RETENTION_S = parse_int(
+    os.getenv("CONNECT_DEVICE_OPERATION_RETENTION_S"), 86400
+)
+CONNECT_DEVICE_OPERATION_PRUNE_INTERVAL_S = parse_int(
+    os.getenv("CONNECT_DEVICE_OPERATION_PRUNE_INTERVAL_S"), 3600
+)
 REGISTER_RATE_LIMIT_MAX     = parse_int(os.getenv("REGISTER_RATE_LIMIT_MAX"),      3)
 REGISTER_RATE_LIMIT_WINDOW_S = parse_int(os.getenv("REGISTER_RATE_LIMIT_WINDOW_S"), 300)
 RATE_LIMIT_BUCKET_SOFT_CAP  = parse_int(os.getenv("RATE_LIMIT_BUCKET_SOFT_CAP"), 10000)
@@ -28611,6 +28620,56 @@ class ConnectDeviceMarkLeadWorkingRequest(BaseModel):
     expectedStateToken: str = Field(min_length=1, max_length=128)
 
 
+_CONNECT_DEVICE_OP_PRUNE_LOCK = threading.Lock()
+_CONNECT_DEVICE_OP_PRUNE_LAST_AT = 0.0
+
+
+def _prune_connect_device_operation_tokens() -> None:
+    """Bounded deletion of consumed/expired device operation tokens older than
+    the retention window, so the ledgers stay bounded. Best-effort."""
+    retention = CONNECT_DEVICE_OPERATION_RETENTION_S
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM connect_device_operation_challenges
+                WHERE ctid IN (
+                    SELECT ctid FROM connect_device_operation_challenges
+                    WHERE (consumed_at IS NOT NULL OR expires_at <= clock_timestamp())
+                      AND created_at < clock_timestamp() - make_interval(secs => %s)
+                    LIMIT 500
+                )
+                """,
+                (retention,),
+            )
+            cur.execute(
+                """
+                DELETE FROM connect_device_operation_confirmations
+                WHERE ctid IN (
+                    SELECT ctid FROM connect_device_operation_confirmations
+                    WHERE (consumed_at IS NOT NULL OR expires_at <= clock_timestamp())
+                      AND created_at < clock_timestamp() - make_interval(secs => %s)
+                    LIMIT 500
+                )
+                """,
+                (retention,),
+            )
+
+
+def _maybe_prune_connect_device_operation_tokens() -> None:
+    """Run the ledger prune at most once per interval (per worker)."""
+    global _CONNECT_DEVICE_OP_PRUNE_LAST_AT
+    now = time.monotonic()
+    with _CONNECT_DEVICE_OP_PRUNE_LOCK:
+        if now - _CONNECT_DEVICE_OP_PRUNE_LAST_AT < CONNECT_DEVICE_OPERATION_PRUNE_INTERVAL_S:
+            return
+        _CONNECT_DEVICE_OP_PRUNE_LAST_AT = now
+    try:
+        _prune_connect_device_operation_tokens()
+    except Exception:
+        logger.warning("connect_device_operation_prune_failed", exc_info=True)
+
+
 @app.post("/api/connect/device/operations/challenge")
 def connect_device_issue_operation_challenge(
     request: Request,
@@ -28621,6 +28680,14 @@ def connect_device_issue_operation_challenge(
     The device references the returned ``challengeId`` in the body of the
     mutation its Ed25519 proof signs; dispatch consumes it exactly once, so a
     captured mutation request cannot be replayed."""
+    # The device is authenticated by this point, so rate-limit issuance by it to
+    # bound how fast a retry loop or a compromised device can grow the ledger.
+    _rate_limit_check(
+        request,
+        key_prefix=f"connect-device-op-challenge:{operator['deviceId']}",
+        max_calls=CONNECT_DEVICE_RATE_LIMIT_MAX,
+        window_seconds=CONNECT_DEVICE_RATE_LIMIT_WINDOW_S,
+    )
     challenge_id = str(uuid4())
     expires_at = utc_now() + timedelta(seconds=CONNECT_DEVICE_OPERATION_CHALLENGE_TTL_S)
     db.execute(
@@ -28631,6 +28698,7 @@ def connect_device_issue_operation_challenge(
         """,
         (challenge_id, operator["deviceId"], expires_at),
     )
+    _maybe_prune_connect_device_operation_tokens()
     append_access_log(
         request,
         "CONNECT_DEVICE_OPERATION_CHALLENGE_ISSUED",
@@ -28684,6 +28752,20 @@ def admin_confirm_connect_device_operation(
     # of minting a second independently-consumable token.
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Retire any expired-but-unconsumed confirmation for this operation
+            # first: it still occupies the partial unique index (which keys only
+            # on consumed_at IS NULL), so without this a token that expired unused
+            # would block every future issuance for this device/operation. Only a
+            # genuinely live (unexpired) outstanding token should dedup a retry.
+            cur.execute(
+                """
+                UPDATE connect_device_operation_confirmations
+                SET consumed_at = clock_timestamp()
+                WHERE device_id = %s AND operation_fingerprint = %s
+                  AND consumed_at IS NULL AND expires_at <= clock_timestamp()
+                """,
+                (str(device_id), fingerprint),
+            )
             cur.execute(
                 """
                 INSERT INTO connect_device_operation_confirmations
@@ -28711,14 +28793,14 @@ def admin_confirm_connect_device_operation(
                     SELECT confirmation_id, expires_at
                     FROM connect_device_operation_confirmations
                     WHERE device_id = %s AND operation_fingerprint = %s
-                      AND consumed_at IS NULL
+                      AND consumed_at IS NULL AND expires_at > clock_timestamp()
                     """,
                     (str(device_id), fingerprint),
                 )
                 row = cur.fetchone()
                 if row is None:
-                    # The outstanding row was consumed between the INSERT and this
-                    # read; a fresh attempt will now insert cleanly.
+                    # The outstanding row was consumed/expired between the INSERT
+                    # and this read; a fresh attempt will now insert cleanly.
                     raise HTTPException(
                         status_code=409,
                         detail="Confirmation issuance conflicted; retry",

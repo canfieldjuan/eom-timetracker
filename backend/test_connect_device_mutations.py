@@ -328,6 +328,51 @@ def test_expired_confirmation_is_rejected(client, auth, monkeypatch):
     assert resp.status_code == 403, resp.text
 
 
+def test_expired_outstanding_confirmation_can_be_reissued(client, auth, monkeypatch):
+    # An unused confirmation that expires must not block future issuance: the
+    # partial unique index keys on consumed_at IS NULL, so issuance retires the
+    # stale row and mints a fresh, usable confirmation.
+    _set_approver(monkeypatch, client, auth)
+    private_key, device_id = _enroll_device(client, auth)
+    contact_id = _fresh_contact()
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {"capability": _CAP, "contactId": contact_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    juan_id = next(
+        e["id"]
+        for e in client.get("/api/admin/employees", headers=auth).json()["employees"]
+        if e["name"] == "Juan Canfield"
+    )
+    conn = psycopg2.connect(TEST_DB_URL, sslmode="disable")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO connect_device_operation_confirmations
+                    (confirmation_id, device_id, confirmed_by_employee_id, capability,
+                     operation_fingerprint, expires_at)
+                VALUES (%s, %s, %s, %s, %s, NOW() - INTERVAL '1 minute')
+                """,
+                (str(uuid.uuid4()), device_id, juan_id, _CAP, fingerprint),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reissued = _issue_confirmation(client, auth, device_id, contact_id)
+    assert reissued.status_code == 201, reissued.text  # fresh, not the dead row
+    confirmation_id = reissued.json()["confirmationId"]
+    challenge_id = _issue_challenge(client, device_id, private_key)
+    ok = _mark_working(
+        client, device_id, private_key, contact_id, challenge_id, confirmation_id
+    )
+    assert ok.status_code == 200, ok.text
+
+
 def test_non_approver_operator_is_rejected(client, auth, monkeypatch):
     # The device acts as its bound operator and must clear the same funnel-approver
     # gate the office path enforces; a non-approver operator is refused.
