@@ -28803,17 +28803,34 @@ def admin_confirm_connect_device_operation(
             # Recheck the device is present and active INSIDE this transaction,
             # holding its row, so a revoke committing between a pre-check and the
             # insert cannot leave a confirmation minted for a revoked device.
+            # Recheck the TARGET device and its bound operator, holding both rows
+            # (employee_id is a NOT NULL FK, so a null row means the device is
+            # gone). A confirmation for a revoked device, or one whose bound
+            # operator is no longer an active admin, could never dispatch, so
+            # reject issuance rather than mint a dead token.
             cur.execute(
-                "SELECT status FROM connect_devices WHERE device_id = %s FOR UPDATE",
+                """
+                SELECT d.status AS device_status, e.active AS op_active, e.role AS op_role
+                FROM connect_devices d
+                JOIN employees e ON e.id = d.employee_id
+                WHERE d.device_id = %s
+                FOR UPDATE OF d, e
+                """,
                 (str(device_id),),
             )
             device = cur.fetchone()
             if device is None:
                 raise HTTPException(status_code=404, detail="Device not found")
-            if device["status"] != "active":
+            if device["device_status"] != "active":
                 raise HTTPException(
                     status_code=409,
                     detail="Cannot confirm an operation for a revoked device",
+                )
+            if not device["op_active"] or device["op_role"] != ADMIN_ROLE:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot confirm an operation for a device whose operator "
+                    "is not an active admin",
                 )
             # Re-assert the CONFIRMING admin is still an active admin, holding
             # that row: get_current_admin validated the caller before this
