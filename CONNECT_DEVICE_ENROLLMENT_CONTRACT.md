@@ -1,9 +1,11 @@
 # Connect Device Enrollment Contract
 
-Status: implemented for the device lifecycle (enroll, list, revoke) and for a
-read-only device-authenticated funnel access path (see "Device-authenticated
-access" below). Confirmation-gated mutations from a device remain a separate,
-later slice.
+Status: implemented for the device lifecycle (enroll, list, revoke), a read-only
+device-authenticated funnel access path (see "Device-authenticated access"), and
+a confirmation-gated device MUTATION path proven on the tracker-local
+lead-working claim (see "Device-authenticated mutations"). Wiring the Atlas
+confirmation-required money paths (handoff, estimate/first-clean booking,
+approve-send) through a device waits for the local-provider slice.
 
 ## Purpose
 
@@ -115,13 +117,47 @@ lock) and new endpoints under a new path prefix. No existing table, response
 shape, or code path is changed, so the change is inert to every running portal
 until a device is enrolled.
 
-## Deferred to the next slice
+## Device-authenticated mutations
 
-- The device-authenticated MUTATION path. The read path above shares the same
-  `require_connect_device` proof, but a mutation must not be replayable within
-  the freshness window, so it needs a single-use, server-issued challenge bound
-  to the specific operation (not just a timestamp).
-- The per-operation confirmation gate for confirmation-required capabilities: a
-  capability whose flags mark it confirmation-required must not dispatch from an
-  automatic device trigger without a fresh, authorized confirmation linked to
-  that specific operation.
+A device mutation reuses the `require_connect_device` proof and adds two
+single-use, DB-backed, TTL-bounded tokens (both survive a host restart; both
+reference `connect_devices` ON DELETE CASCADE):
+
+- **Operation challenge** -- the single-use anti-replay nonce a device mutation
+  needs beyond a read's timestamp window. `POST
+  /api/connect/device/operations/challenge` (device proof) mints one bound to the
+  device; the device references its `challengeId` in the mutation body its
+  Ed25519 proof signs, and dispatch consumes it exactly once.
+- **Operation confirmation** -- the per-operation human gate. `POST
+  /api/admin/connect/devices/{device_id}/operation-confirmations`
+  (`Depends(get_current_admin)`) records a fresh operator authorization bound to
+  the device and the exact operation fingerprint
+  (`sha256(capability + target)`), single-use with a short TTL. A
+  confirmation-required capability cannot dispatch from the unattended device
+  without a matching, unconsumed, unexpired confirmation, and a confirmation
+  issued for one operation can never authorize another.
+
+Capabilities a device may perform are a **CLOSED** set
+(`_CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES`); an unlisted capability is
+refused. The one implemented capability is `funnel.lead.mark_working`.
+
+### Mutation endpoint (this slice)
+
+- `POST /api/connect/device/funnel/leads/{contact_id}/working` (device proof) ->
+  claims a lead as working on the bound operator's behalf via the existing
+  tracker-local `_mark_lead_working` (reversible, no Atlas call). It is faithful
+  to the office path -- the bound operator must be the configured funnel approver
+  (`403` otherwise) -- and, being confirmation-required, requires both a valid
+  `challengeId` and a matching `confirmationId`. Both tokens are consumed inside
+  the working-state transaction (via `_mark_lead_working`'s `authorize` hook),
+  after every conflict/idempotency check has passed: a crash or a state conflict
+  never spends a token without the transition, an already-working lead is a safe
+  idempotent no-op, and a spent challenge cannot drive a new transition (`409`).
+
+## Deferred to a later slice
+
+- Wiring the Atlas confirmation-required money paths (handoff, estimate and
+  first-clean booking, approve-send) through the device, once the local provider
+  exists. The authorization machinery above is the reusable gate they will use;
+  each will register in the closed capability set with its own idempotency and
+  202-pending handling.
