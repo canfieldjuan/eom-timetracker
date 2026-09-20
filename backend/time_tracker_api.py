@@ -8363,6 +8363,17 @@ def _ensure_connect_device_operation_schema() -> None:
                     ON connect_device_operation_confirmations(
                         device_id, operation_fingerprint
                     );
+                -- At most one OUTSTANDING (unconsumed) confirmation per device and
+                -- operation: a client retry or double submit of one human approval
+                -- must not mint a second independently-consumable token. Consuming a
+                -- confirmation stamps consumed_at, dropping it from this partial
+                -- index, so the next operation still needs a fresh confirmation.
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    uq_connect_device_op_confirmations_outstanding
+                    ON connect_device_operation_confirmations(
+                        device_id, operation_fingerprint
+                    )
+                    WHERE consumed_at IS NULL;
                 """
             )
 
@@ -28663,38 +28674,70 @@ def admin_confirm_connect_device_operation(
         )
 
     fingerprint = _connect_device_operation_fingerprint(payload.capability, contact_id)
-    confirmation_id = str(uuid4())
+    new_confirmation_id = str(uuid4())
     expires_at = utc_now() + timedelta(
         seconds=CONNECT_DEVICE_OPERATION_CONFIRMATION_TTL_S
     )
-    db.execute(
-        """
-        INSERT INTO connect_device_operation_confirmations
-            (confirmation_id, device_id, confirmed_by_employee_id, capability,
-             operation_fingerprint, expires_at)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-        (
-            confirmation_id,
-            str(device_id),
-            int(admin["id"]),
-            payload.capability,
-            fingerprint,
-            expires_at,
-        ),
-    )
+    # Idempotent issuance: at most one OUTSTANDING confirmation per device and
+    # operation (enforced by the partial unique index). A retry or double submit
+    # of one human approval returns the existing outstanding confirmation instead
+    # of minting a second independently-consumable token.
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO connect_device_operation_confirmations
+                    (confirmation_id, device_id, confirmed_by_employee_id, capability,
+                     operation_fingerprint, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (device_id, operation_fingerprint)
+                    WHERE consumed_at IS NULL
+                    DO NOTHING
+                RETURNING confirmation_id, expires_at
+                """,
+                (
+                    new_confirmation_id,
+                    str(device_id),
+                    int(admin["id"]),
+                    payload.capability,
+                    fingerprint,
+                    expires_at,
+                ),
+            )
+            row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    """
+                    SELECT confirmation_id, expires_at
+                    FROM connect_device_operation_confirmations
+                    WHERE device_id = %s AND operation_fingerprint = %s
+                      AND consumed_at IS NULL
+                    """,
+                    (str(device_id), fingerprint),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    # The outstanding row was consumed between the INSERT and this
+                    # read; a fresh attempt will now insert cleanly.
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Confirmation issuance conflicted; retry",
+                    )
+    confirmation_id = str(row["confirmation_id"])
+    reused = confirmation_id != new_confirmation_id
     append_access_log(
         request,
         "CONNECT_DEVICE_OPERATION_CONFIRMED",
         True,
-        f"device={device_id} capability={payload.capability} contact={contact_id}",
+        f"device={device_id} capability={payload.capability} contact={contact_id} "
+        f"reused={reused}",
     )
     return JSONResponse(
-        status_code=201,
+        status_code=200 if reused else 201,
         content={
             "confirmationId": confirmation_id,
             "operationFingerprint": fingerprint,
-            "expiresAt": to_utc_iso(expires_at),
+            "expiresAt": to_utc_iso(row["expires_at"]),
         },
     )
 
@@ -28752,7 +28795,7 @@ def connect_device_mark_lead_working(
             JOIN employees e ON e.id = d.employee_id
             WHERE d.device_id = %s AND d.status = 'active'
               AND e.active = TRUE AND e.role = %s
-            FOR UPDATE OF d
+            FOR UPDATE OF d, e
             """,
             (device_id, ADMIN_ROLE),
         )

@@ -346,6 +346,36 @@ def test_non_approver_operator_is_rejected(client, auth, monkeypatch):
     assert resp.status_code == 403, resp.text
 
 
+def test_duplicate_confirmation_issuance_is_idempotent(client, auth, monkeypatch):
+    # A retry / double submit of one human approval must not mint a second
+    # independently-consumable token: at most one outstanding confirmation exists
+    # per device and operation.
+    _set_approver(monkeypatch, client, auth)
+    private_key, device_id = _enroll_device(client, auth)
+    contact_id = _fresh_contact()
+
+    first = _issue_confirmation(client, auth, device_id, contact_id)
+    assert first.status_code == 201, first.text
+    first_id = first.json()["confirmationId"]
+
+    dup = _issue_confirmation(client, auth, device_id, contact_id)
+    assert dup.status_code == 200, dup.text
+    assert dup.json()["confirmationId"] == first_id
+
+    # After the single outstanding confirmation is consumed, a new operation needs
+    # a fresh confirmation -- issuance mints a distinct one.
+    challenge_id = _issue_challenge(client, device_id, private_key)
+    assert (
+        _mark_working(
+            client, device_id, private_key, contact_id, challenge_id, first_id
+        ).status_code
+        == 200
+    )
+    reissued = _issue_confirmation(client, auth, device_id, contact_id)
+    assert reissued.status_code == 201, reissued.text
+    assert reissued.json()["confirmationId"] != first_id
+
+
 def test_employee_cannot_confirm(client, emp_auth):
     resp = client.post(
         f"/api/admin/connect/devices/{uuid.uuid4()}/operation-confirmations",
