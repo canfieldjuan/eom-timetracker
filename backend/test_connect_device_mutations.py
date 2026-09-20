@@ -93,17 +93,37 @@ def _issue_challenge(client, device_id, private_key) -> str:
     return resp.json()["challengeId"]
 
 
-def _issue_confirmation(client, admin_headers, device_id, contact_id, *, capability=_CAP):
+def _issue_confirmation(
+    client, admin_headers, device_id, contact_id, *, capability=_CAP, state_token=None
+):
+    if state_token is None:
+        state_token = _state_token_v0(contact_id)
     return client.post(
         f"/api/admin/connect/devices/{device_id}/operation-confirmations",
         headers=admin_headers,
-        json={"capability": capability, "contactId": contact_id},
+        json={
+            "capability": capability,
+            "contactId": contact_id,
+            "expectedStateToken": state_token,
+        },
     )
 
 
 def _state_token_v0(contact_id: str) -> str:
     return hashlib.sha256(
         f"eom-lead-working-state:v1:{contact_id}:0".encode("utf-8")
+    ).hexdigest()
+
+
+def _op_fingerprint(contact_id: str, state_token=None) -> str:
+    if state_token is None:
+        state_token = _state_token_v0(contact_id)
+    return hashlib.sha256(
+        json.dumps(
+            {"capability": _CAP, "contactId": contact_id, "expectedStateToken": state_token},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -294,13 +314,7 @@ def test_expired_confirmation_is_rejected(client, auth, monkeypatch):
 
     # Plant a confirmation whose expiry is already in the past.
     confirmation_id = str(uuid.uuid4())
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            {"capability": _CAP, "contactId": contact_id},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    fingerprint = _op_fingerprint(contact_id)
     juan_id = next(
         e["id"]
         for e in client.get("/api/admin/employees", headers=auth).json()["employees"]
@@ -335,13 +349,7 @@ def test_expired_outstanding_confirmation_can_be_reissued(client, auth, monkeypa
     _set_approver(monkeypatch, client, auth)
     private_key, device_id = _enroll_device(client, auth)
     contact_id = _fresh_contact()
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            {"capability": _CAP, "contactId": contact_id},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    fingerprint = _op_fingerprint(contact_id)
     juan_id = next(
         e["id"]
         for e in client.get("/api/admin/employees", headers=auth).json()["employees"]
@@ -422,9 +430,14 @@ def test_duplicate_confirmation_issuance_is_idempotent(client, auth, monkeypatch
 
 
 def test_employee_cannot_confirm(client, emp_auth):
+    contact_id = _fresh_contact()
     resp = client.post(
         f"/api/admin/connect/devices/{uuid.uuid4()}/operation-confirmations",
         headers=emp_auth,
-        json={"capability": _CAP, "contactId": _fresh_contact()},
+        json={
+            "capability": _CAP,
+            "contactId": contact_id,
+            "expectedStateToken": _state_token_v0(contact_id),
+        },
     )
     assert resp.status_code == 403, resp.text

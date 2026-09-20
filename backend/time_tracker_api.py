@@ -28579,12 +28579,25 @@ _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
 )
 
 
-def _connect_device_operation_fingerprint(capability: str, contact_id: str) -> str:
-    """Stable identity of a device operation: its capability and target. Both the
-    operator's confirmation and the device's dispatch compute it the same way, so
-    a confirmation issued for one operation can never authorize a different one."""
+def _connect_device_operation_fingerprint(
+    capability: str, contact_id: str, expected_state_token: str
+) -> str:
+    """Stable identity of a device operation: its capability, target, AND the
+    exact state token the operator approved against. Both the operator's
+    confirmation and the device's dispatch compute it the same way, so a
+    confirmation issued for one operation can never authorize a different one.
+
+    Binding the state token pins each confirmation to the specific lead state the
+    operator saw: once the lead transitions (mark-working, or a later lost/reopen)
+    its state token changes, so a leftover confirmation from a delayed retry --
+    still bound to the old token -- no longer matches any dispatchable operation
+    and cannot re-authorize the lead."""
     canonical = json.dumps(
-        {"capability": capability, "contactId": str(contact_id)},
+        {
+            "capability": capability,
+            "contactId": str(contact_id),
+            "expectedStateToken": str(expected_state_token),
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -28605,6 +28618,7 @@ class ConnectDeviceOperationConfirmationRequest(BaseModel):
 
     capability: str = Field(min_length=1, max_length=128)
     contactId: str = Field(min_length=1, max_length=64)
+    expectedStateToken: str = Field(min_length=1, max_length=128)
 
 
 class ConnectDeviceMarkLeadWorkingRequest(BaseModel):
@@ -28624,36 +28638,44 @@ _CONNECT_DEVICE_OP_PRUNE_LOCK = threading.Lock()
 _CONNECT_DEVICE_OP_PRUNE_LAST_AT = 0.0
 
 
+_CONNECT_DEVICE_OP_PRUNE_BATCH = 1000
+_CONNECT_DEVICE_OP_PRUNE_MAX_BATCHES = 100
+_CONNECT_DEVICE_OP_PRUNE_STATEMENTS = (
+    """
+    DELETE FROM connect_device_operation_challenges
+    WHERE ctid IN (
+        SELECT ctid FROM connect_device_operation_challenges
+        WHERE (consumed_at IS NOT NULL OR expires_at <= clock_timestamp())
+          AND created_at < clock_timestamp() - make_interval(secs => %s)
+        LIMIT %s
+    )
+    """,
+    """
+    DELETE FROM connect_device_operation_confirmations
+    WHERE ctid IN (
+        SELECT ctid FROM connect_device_operation_confirmations
+        WHERE (consumed_at IS NOT NULL OR expires_at <= clock_timestamp())
+          AND created_at < clock_timestamp() - make_interval(secs => %s)
+        LIMIT %s
+    )
+    """,
+)
+
+
 def _prune_connect_device_operation_tokens() -> None:
-    """Bounded deletion of consumed/expired device operation tokens older than
-    the retention window, so the ledgers stay bounded. Best-effort."""
+    """Delete consumed/expired device operation tokens older than the retention
+    window, so the ledgers stay bounded. Drains in bounded batches until caught
+    up (or a per-pass cap) so cleanup keeps pace with issuance rather than
+    removing a single fixed slice per pass. Best-effort."""
     retention = CONNECT_DEVICE_OPERATION_RETENTION_S
-    with db.get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                DELETE FROM connect_device_operation_challenges
-                WHERE ctid IN (
-                    SELECT ctid FROM connect_device_operation_challenges
-                    WHERE (consumed_at IS NOT NULL OR expires_at <= clock_timestamp())
-                      AND created_at < clock_timestamp() - make_interval(secs => %s)
-                    LIMIT 500
-                )
-                """,
-                (retention,),
-            )
-            cur.execute(
-                """
-                DELETE FROM connect_device_operation_confirmations
-                WHERE ctid IN (
-                    SELECT ctid FROM connect_device_operation_confirmations
-                    WHERE (consumed_at IS NOT NULL OR expires_at <= clock_timestamp())
-                      AND created_at < clock_timestamp() - make_interval(secs => %s)
-                    LIMIT 500
-                )
-                """,
-                (retention,),
-            )
+    for statement in _CONNECT_DEVICE_OP_PRUNE_STATEMENTS:
+        for _ in range(_CONNECT_DEVICE_OP_PRUNE_MAX_BATCHES):
+            with db.get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(statement, (retention, _CONNECT_DEVICE_OP_PRUNE_BATCH))
+                    deleted = cur.rowcount
+            if deleted < _CONNECT_DEVICE_OP_PRUNE_BATCH:
+                break
 
 
 def _maybe_prune_connect_device_operation_tokens() -> None:
@@ -28730,18 +28752,9 @@ def admin_confirm_connect_device_operation(
         raise HTTPException(status_code=400, detail="Unknown device operation capability")
     contact_id = _validate_connect_operation_uuid(payload.contactId)
 
-    device = db.query_one(
-        "SELECT status FROM connect_devices WHERE device_id = %s",
-        (str(device_id),),
+    fingerprint = _connect_device_operation_fingerprint(
+        payload.capability, contact_id, payload.expectedStateToken
     )
-    if device is None:
-        raise HTTPException(status_code=404, detail="Device not found")
-    if device["status"] != "active":
-        raise HTTPException(
-            status_code=409, detail="Cannot confirm an operation for a revoked device"
-        )
-
-    fingerprint = _connect_device_operation_fingerprint(payload.capability, contact_id)
     new_confirmation_id = str(uuid4())
     expires_at = utc_now() + timedelta(
         seconds=CONNECT_DEVICE_OPERATION_CONFIRMATION_TTL_S
@@ -28752,6 +28765,21 @@ def admin_confirm_connect_device_operation(
     # of minting a second independently-consumable token.
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Recheck the device is present and active INSIDE this transaction,
+            # holding its row, so a revoke committing between a pre-check and the
+            # insert cannot leave a confirmation minted for a revoked device.
+            cur.execute(
+                "SELECT status FROM connect_devices WHERE device_id = %s FOR UPDATE",
+                (str(device_id),),
+            )
+            device = cur.fetchone()
+            if device is None:
+                raise HTTPException(status_code=404, detail="Device not found")
+            if device["status"] != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Cannot confirm an operation for a revoked device",
+                )
             # Retire any expired-but-unconsumed confirmation for this operation
             # first: it still occupies the partial unique index (which keys only
             # on consumed_at IS NULL), so without this a token that expired unused
@@ -28859,7 +28887,9 @@ def connect_device_mark_lead_working(
     confirmation_id = _validate_connect_operation_uuid(payload.confirmationId)
     device_id = operator["deviceId"]
     fingerprint = _connect_device_operation_fingerprint(
-        CONNECT_DEVICE_MARK_WORKING_CAPABILITY, contact_id_text
+        CONNECT_DEVICE_MARK_WORKING_CAPABILITY,
+        contact_id_text,
+        payload.expectedStateToken,
     )
 
     def _authorize(cur) -> None:
