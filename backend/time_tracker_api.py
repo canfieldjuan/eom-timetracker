@@ -28738,13 +28738,38 @@ def connect_device_mark_lead_working(
     )
 
     def _authorize(cur) -> None:
-        # Single-use challenge: device-bound, unconsumed, unexpired.
+        # This hook runs inside _mark_lead_working's transaction, which has
+        # already waited on its advisory locks. Authentication (and its
+        # active-device / active-admin recheck) happened earlier in a separate
+        # transaction, so re-assert here, holding the device row, that the device
+        # is STILL active and its operator STILL an active admin: a revoke or
+        # demotion that commits during the lock wait must not let this retained
+        # authentication consume tokens and mutate.
+        cur.execute(
+            """
+            SELECT 1
+            FROM connect_devices d
+            JOIN employees e ON e.id = d.employee_id
+            WHERE d.device_id = %s AND d.status = 'active'
+              AND e.active = TRUE AND e.role = %s
+            FOR UPDATE OF d
+            """,
+            (device_id, ADMIN_ROLE),
+        )
+        if cur.fetchone() is None:
+            raise HTTPException(
+                status_code=403, detail="Device or operator is no longer authorized"
+            )
+        # Single-use challenge: device-bound, unconsumed, unexpired. Expiry is
+        # compared against clock_timestamp() (real wall clock), NOT NOW() (which
+        # is fixed at transaction start), so a token cannot outlive its TTL by
+        # having the transaction wait on locks past expiry.
         cur.execute(
             """
             UPDATE connect_device_operation_challenges
             SET consumed_at = NOW()
             WHERE challenge_id = %s AND device_id = %s
-              AND consumed_at IS NULL AND expires_at > NOW()
+              AND consumed_at IS NULL AND expires_at > clock_timestamp()
             RETURNING challenge_id
             """,
             (challenge_id, device_id),
@@ -28754,14 +28779,15 @@ def connect_device_mark_lead_working(
                 status_code=409,
                 detail="Operation challenge is invalid, expired, or already used",
             )
-        # Fresh operator confirmation bound to THIS exact operation.
+        # Fresh operator confirmation bound to THIS exact operation (same
+        # wall-clock expiry check).
         cur.execute(
             """
             UPDATE connect_device_operation_confirmations
             SET consumed_at = NOW()
             WHERE confirmation_id = %s AND device_id = %s AND capability = %s
               AND operation_fingerprint = %s
-              AND consumed_at IS NULL AND expires_at > NOW()
+              AND consumed_at IS NULL AND expires_at > clock_timestamp()
             RETURNING confirmation_id
             """,
             (
