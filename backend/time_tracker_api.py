@@ -28736,21 +28736,28 @@ def connect_device_issue_operation_challenge(
         window_seconds=CONNECT_DEVICE_RATE_LIMIT_WINDOW_S,
     )
     challenge_id = str(uuid4())
-    expires_at = utc_now() + timedelta(seconds=CONNECT_DEVICE_OPERATION_CHALLENGE_TTL_S)
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             # Re-assert authorization inside the insert transaction: a revoke or
             # demotion committing between authentication and here must not mint a
             # challenge for a device/operator no longer authorized.
             _assert_connect_device_operator_active(cur, operator["deviceId"])
+            # Compute the TTL from the DB clock AFTER the lock wait, so a slow
+            # lock acquisition cannot mint an already-expired token.
             cur.execute(
                 """
                 INSERT INTO connect_device_operation_challenges
                     (challenge_id, device_id, expires_at)
-                VALUES (%s, %s, %s)
+                VALUES (%s, %s, clock_timestamp() + make_interval(secs => %s))
+                RETURNING expires_at
                 """,
-                (challenge_id, operator["deviceId"], expires_at),
+                (
+                    challenge_id,
+                    operator["deviceId"],
+                    CONNECT_DEVICE_OPERATION_CHALLENGE_TTL_S,
+                ),
             )
+            expires_at = cur.fetchone()["expires_at"]
     _maybe_prune_connect_device_operation_tokens()
     append_access_log(
         request,
@@ -28787,9 +28794,6 @@ def admin_confirm_connect_device_operation(
         payload.capability, contact_id, payload.expectedStateToken
     )
     new_confirmation_id = str(uuid4())
-    expires_at = utc_now() + timedelta(
-        seconds=CONNECT_DEVICE_OPERATION_CONFIRMATION_TTL_S
-    )
     # Idempotent issuance: at most one OUTSTANDING confirmation per device and
     # operation (enforced by the partial unique index). A retry or double submit
     # of one human approval returns the existing outstanding confirmation instead
@@ -28845,7 +28849,8 @@ def admin_confirm_connect_device_operation(
                 INSERT INTO connect_device_operation_confirmations
                     (confirmation_id, device_id, confirmed_by_employee_id, capability,
                      operation_fingerprint, expires_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s,
+                        clock_timestamp() + make_interval(secs => %s))
                 ON CONFLICT (device_id, operation_fingerprint)
                     WHERE consumed_at IS NULL
                     DO NOTHING
@@ -28857,7 +28862,7 @@ def admin_confirm_connect_device_operation(
                     int(admin["id"]),
                     payload.capability,
                     fingerprint,
-                    expires_at,
+                    CONNECT_DEVICE_OPERATION_CONFIRMATION_TTL_S,
                 ),
             )
             row = cur.fetchone()
