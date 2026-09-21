@@ -56,9 +56,16 @@ per request and carries no Atlas secret:
   calls `_atlas_funnel_read("/eom-funnel/leads", operator, ...)` at `:28526`,
   so the shared Atlas token stays server-side on the tracker and the device
   authenticates with its key alone (`:28518-28520`).
-- The bound operator must resolve to an active admin on every request; a
-  revoke, deactivation, or demotion between calls makes the authorizing
-  `UPDATE ... last_seen_at` match no row and returns 401 (`:28210-28223`).
+- The bound operator must resolve to an active admin on every request, and the
+  wire contract distinguishes the failure kinds: a missing, revoked, or
+  non-active device row is `401` at the initial device lookup (`:28170-28178`); a
+  device whose bound operator is inactive or not an admin is `403` on the default
+  path, where the operator is checked before the authorizing write
+  (`:28191-28200`); and the authorizing `UPDATE ... last_seen_at` matching no row
+  returns `401` only in the narrow case where a revoke or demotion commits
+  concurrently, between those checks and the write (`:28202-28223`). So the
+  provider reads `401` as an invalid or revoked device credential and `403` as a
+  suspended or demoted operator.
 
 So the local provider's credential is its enrolled device Ed25519 private key
 plus its `device_id`. The Atlas service token stays on the tracker. The provider
@@ -132,48 +139,65 @@ private storage, the same placement the entitlement file uses:
 
 The private key is stored at rest as raw key bytes in that owner-private
 directory. No shared secret and no Atlas token is ever written to the PC. The
-store holds the current `{device_id, private_key}` and, during a rotation, a
-durable `pending_revocation` marker (the old `device_id` awaiting revoke); the
-public key lives only on the tracker.
+store holds exactly the current `{device_id, private_key}`; the public key lives
+only on the tracker.
 
 ### Rotate
 
-Key rotation is a fresh enrollment with a new keypair that supersedes the old
-device, which is the closure rule the enrollment contract already states. There
-is no shared secret to rotate: each device is a distinct key and a distinct
-revocable row. Rotation needs no new endpoint, but it is a two-step sequence
-(enroll the new device, then revoke the old one), and enrollment creates a second
-active row rather than mutating the first (registry uniqueness is on the public
-key, not the operator: `../connect-automate` is not the authority here; on the
-tracker `connect_devices` allows an operator multiple active rows). So a crash
-between the two steps would leave the old key active with no record of the intent
-to revoke it. The rotation protocol therefore is:
+Key rotation replaces the keypair and retires the old device. There is no shared
+secret to rotate: each device is a distinct key and a distinct revocable row. The
+hazard to avoid is a two-step "enroll new, then revoke old" sequence, because
+enrollment creates a second active row rather than mutating the first (registry
+uniqueness is only on `public_key_base64url`, `:28384-28395`, so the tracker
+allows an operator multiple active rows), and a crash between the two steps would
+leave the old key active. A device-authenticated revoke that let any of an
+operator's devices revoke any other would also be unsafe: an attacker holding the
+compromised old key (and the new device id) could revoke the replacement before it
+revoked the old one, and because revocation is one-way the operator could no
+longer authenticate as the replacement while the compromised old key stayed live.
 
-1. Enroll the new device and record `{new device_id, new private_key}` plus a
-   durable `pending_revocation = {old device_id}` marker in the same local write.
-2. Begin signing with the new key.
-3. Revoke the old `device_id` with the NEW device's own Ed25519 proof; on success,
-   clear the marker.
+Rotation is therefore a single atomic, bearer-authenticated operation, which is
+available because rotation is inherently interactive (enrollment already requires
+`Depends(get_current_admin)`, so the operator is present with a session):
 
-The revoke in step 3 cannot use the office admin revoke route
-(`POST /api/admin/connect/devices/{device_id}/revoke`), because that route is
-bearer-authenticated (`Depends(get_current_admin)` `:28464-28469`, which requires
-an `Authorization: Bearer` token `:2423-2430`) and no office bearer is stored on
-the PC after enrollment (see Acquire). Steady-state the PC holds only device keys.
-So the rotation revoke, and its startup reconciliation, use a device-authenticated,
-operator-scoped revoke: the new device (active, holding its key) authenticates
-with its own `require_connect_device` proof and revokes a device bound to the SAME
-operator (the old `device_id`). The tracker enforces that a device may revoke only
-devices of its own bound operator, and revocation stays the one-way idempotent
-flip. This device-authenticated revoke endpoint is a tracker-side addition the
-provider slice must add (the office bearer-authenticated revoke route stays as is
-for interactive use).
+- `POST /api/admin/connect/devices` gains an optional `supersedes: <old device_id>`.
+  In one transaction the tracker verifies the caller's operator owns the named
+  predecessor, records the new device active, and revokes the predecessor. There
+  is no window in which both are active and no separate revoke step, so a crash
+  cannot strand the old key: either the whole rotation committed (new active, old
+  revoked) or none of it did. Because the operation is bearer-gated, a PC-only
+  attacker without an office session cannot invoke it, and no device may revoke a
+  peer, so the peer-revocation attack above cannot arise.
 
-Startup reconciliation completes an interrupted rotation: if the store holds a
-`pending_revocation` marker on start, the provider re-issues that
-device-authenticated revoke (idempotent, `200` when already revoked) before it
-does any other work, so an interrupted rotation can never strand the old key
-active, and it needs no stored bearer and no interactive login to do so.
+Local-store ordering for crash safety: persist the new private key with a
+`pending_enroll` intent before the call, then on success record the returned
+`device_id` and drop the old key. If the host crashes after the call commits but
+before it records the `device_id`, startup lists the operator's devices
+(`GET /api/admin/connect/devices`) and matches the stored public key to recover
+the `device_id`; re-issuing the same enrollment is the existing idempotent
+re-enroll (`200`), so recovery is safe. No device-authenticated revoke and no
+unattended reconciliation are needed, because the retire is part of the atomic
+enrollment rather than a later step.
+
+### Revoke
+
+Two independent controls stop a device, and they differ in permanence:
+
+- **Permanent, one-way: device revocation.** The operator revokes the device
+  (`POST /api/admin/connect/devices/{device_id}/revoke` `:28464`), which flips
+  `connect_devices.status` to `revoked` with no path back (`:28490-28497`; the
+  status set is closed and a revoked key is never reactivated). The next device
+  request fails at the device-row lookup and returns `401` (`:28170-28178`).
+- **Temporary, reversible: operator suspension.** Deactivating or demoting the
+  bound operator makes the per-request recheck fail: the default path checks the
+  operator before the authorizing write and returns `403` (`:28191-28200`), and
+  a revoke or demotion racing the write returns `401` at the update-miss
+  (`:28202-28223`). Access stops immediately while the operator is inactive. But
+  this is a SUSPENSION, not revocation: the employee record can be reactivated or
+  re-promoted (`:16846-16849`), and because the device row itself is still
+  `active` (only the explicit revoke flips it), every device bound to that
+  operator becomes usable again. Deactivating an operator during a security
+  incident does not durably contain a device believed compromised.
 
 ### Revoke
 
@@ -322,16 +346,16 @@ The provider slice must still add (tracked separately, not in this document):
   `_submit_atlas_funnel_booking` `:26328`, the read allow-list
   `_ATLAS_FUNNEL_READ_PATHS` `:5883` for any new read; new reads must be added to
   that allow-list or they fail closed by design).
-- A device-authenticated, operator-scoped revoke endpoint (device proof), so a
-  device can revoke a device bound to its own operator without an office bearer.
-  This is what makes unattended rotation and its startup reconciliation possible
-  (see Rotate); the tracker enforces same-operator scoping and keeps revocation a
-  one-way idempotent flip. The office bearer-authenticated revoke route is
-  unchanged and remains for interactive use.
+- The atomic `supersedes` option on enrollment (bearer-authenticated), which in
+  one transaction records the new device and revokes the named predecessor of the
+  caller's own operator (see Rotate). This is the whole rotation retire path;
+  there is deliberately no device-authenticated revoke, so no device can revoke a
+  peer. The existing bearer-authenticated revoke route is unchanged.
 - The local Connect provider process itself (loopback registration, capability
   manifest, `job_id` idempotent submission), the adapter that signs tracker
-  requests with the device key, and the durable `pending_revocation` marker plus
-  startup reconciliation for interrupted rotations (see Rotate).
+  requests with the device key, and the local-store crash-safe rotation ordering
+  (persist the new key with a `pending_enroll` intent, recover the `device_id` by
+  listing on restart; see Rotate).
 
 ## Security properties
 
