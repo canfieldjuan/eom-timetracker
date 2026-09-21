@@ -132,35 +132,62 @@ private storage, the same placement the entitlement file uses:
 
 The private key is stored at rest as raw key bytes in that owner-private
 directory. No shared secret and no Atlas token is ever written to the PC. The
-store holds exactly `{device_id, private_key}`; the public key lives only on the
-tracker.
+store holds the current `{device_id, private_key}` and, during a rotation, a
+durable `pending_revocation` marker (the old `device_id` awaiting revoke); the
+public key lives only on the tracker.
 
 ### Rotate
 
 Key rotation is a fresh enrollment with a new keypair that supersedes the old
-device, which is the closure rule the enrollment contract already states. The
-provider enrolls a new device (new keypair), begins signing with it, then
-revokes the old `device_id`. There is no shared secret to rotate and no rotation
-window during which two copies of one secret are valid: each device is a
-distinct key and a distinct revocable row. Rotation therefore needs no new
-endpoint, only the enroll-then-revoke sequence.
+device, which is the closure rule the enrollment contract already states. There
+is no shared secret to rotate: each device is a distinct key and a distinct
+revocable row. Rotation needs no new endpoint, but it is a two-step sequence
+(enroll the new device, then revoke the old one), and enrollment creates a second
+active row rather than mutating the first (registry uniqueness is on the public
+key, not the operator: `../connect-automate` is not the authority here; on the
+tracker `connect_devices` allows an operator multiple active rows). So a crash
+between the two steps would leave the old key active with no record of the intent
+to revoke it. The rotation protocol therefore is:
+
+1. Enroll the new device and record `{new device_id, new private_key}` plus a
+   durable `pending_revocation = {old device_id}` marker in the same local write.
+2. Begin signing with the new key.
+3. Revoke the old `device_id`; on success, clear the marker.
+
+Startup reconciliation completes an interrupted rotation: if the store holds a
+`pending_revocation` marker on start, the provider re-issues the revoke (the
+revoke endpoint is idempotent, `200` when already revoked) before it does any
+other work, so an interrupted rotation can never strand the old key active. The
+tracker side is unchanged; the marker and reconciliation live in the host store.
 
 ### Revoke
 
-Revocation is immediate and one-way, and comes from two independent directions:
+Two independent controls stop a device, and they differ in permanence:
 
-- The operator revokes the device
-  (`POST /api/admin/connect/devices/{device_id}/revoke` `:28464`). The next
-  device request fails the active-device predicate and returns 401
-  (`:28210-28223`).
-- The operator's own account is deactivated or demoted below admin. The same
-  per-request recheck fails and returns 403/401, so losing the operator
-  immediately disables every device bound to them, with no revoke call needed.
+- **Permanent, one-way: device revocation.** The operator revokes the device
+  (`POST /api/admin/connect/devices/{device_id}/revoke` `:28464`), which flips
+  `connect_devices.status` to `revoked` with no path back (`:28490-28497`; the
+  status set is closed and a revoked key is never reactivated). The next device
+  request fails the active-device predicate and returns 401 (`:28210-28223`).
+- **Temporary, reversible: operator suspension.** Deactivating or demoting the
+  bound operator makes the same per-request recheck fail (it reads the operator's
+  current `active` and `role`, `:28210-28223`), so access stops immediately while
+  the operator is inactive. But this is a SUSPENSION, not revocation: the employee
+  record can be reactivated or re-promoted (`:16846-16849`), and because the
+  device row itself is still `active` (only the explicit revoke flips it), every
+  device bound to that operator becomes usable again. Deactivating an operator
+  during a security incident does not durably contain a device believed
+  compromised.
 
-Because authorization is re-evaluated inside each request's authorizing write,
-there is no cached grant to expire and no propagation delay. A compromised buyer
-PC is contained by revoking its device (or the operator), not by rotating a
-secret that has already been copied.
+So permanent containment of a compromised buyer PC requires explicitly revoking
+its device (the one-way flip); operator deactivation alone is a reversible
+suspension. Because authorization is re-evaluated inside each request's
+authorizing write, either control takes effect on the next request with no cached
+grant to expire and no propagation delay. A future hardening option is to revoke
+an operator's devices durably when the operator is deactivated or demoted, so
+account containment implies device containment; until then the two controls are
+distinct and this contract treats explicit device revocation as the permanent
+one.
 
 ## Money paths are gated twice, not just authenticated
 
@@ -188,26 +215,59 @@ consumed atomically in the transition transaction `:28983-29032`).
 
 The fingerprint must bind EVERY authorization-relevant field of the operation,
 not only its target id, or one confirmation could authorize a materially
-different action. A booking, for example, independently accepts a scheduled
-window and a client idempotency key (`scheduledStart`, `scheduledEnd`,
-`idempotencyKey`, `:3150-3184`), so a booking confirmation that hashed only the
-contact id would let a compromised device submit a different window under the same
-confirmation. The implementation therefore computes the fingerprint from a
-per-capability canonical target that includes all such fields: for mark_working
-the contact id and lead state token, for approve_send the draft id (its only
-material field), and for the booking paths the window and idempotency key. The
-device booking capability is refused unless its confirmation names exactly those
-fields, so the confirmation authorizes one concrete booking, never a family of
-them.
+different action. The implementation computes the fingerprint from a
+per-capability canonical target that includes all such fields, and each device
+money capability defines its complete target:
+
+- `mark_working`: contact id and lead state token.
+- `approve_send`: draft id (its only material field).
+- estimate / first-clean booking: contact id, scheduled window
+  (`scheduledStart`, `scheduledEnd`) and the client idempotency key
+  (`:3150-3184`), so a booking confirmation cannot be redirected to a different
+  window.
+- customer handoff: the full customer/site payload the office already fingerprints
+  for its own idempotency, `_office_conversion_fingerprint` over every
+  customer/site field excluding the retry key (`:22949-22953`), plus the contact
+  id and idempotency key. Binding the whole payload is required because the
+  handoff creates operational Customer/Site records from the request
+  (`:23068-23079`), so a confirmation that hashed only the contact id would let a
+  compromised device substitute the address, rate, or other approved details.
+
+Confirmation issuance and dispatch compute the same per-capability target, and a
+confirmation is refused unless it names exactly its capability's fields, so it
+authorizes one concrete operation, never a family of them.
+
+For a money path whose effect is an external Atlas call, consuming the tokens
+cannot share a transaction with the effect the way `mark_working` shares the
+lead-transition transaction (`:28983-29032`), and the office booking helper makes
+its Atlas call with no local transaction at all (`:26328-26360`). Consuming the
+confirmation before an ambiguous Atlas timeout would burn the authorization a
+retry needs; calling Atlas before consuming would allow concurrent dispatch.
+The money-path dispatch protocol therefore consumes the tokens in a tracker-side
+transaction that also durably records the authorized operation as a reservation:
+the operation fingerprint, the rendered canonical Atlas request, and the exact
+idempotency key, keyed so a retry finds it. The remote relay is then called
+against that frozen reservation, and every retry or reconciliation replays the
+same recorded request and idempotency key rather than re-rendering from current
+state or requiring a fresh confirmation. A crash after the reservation commits
+but before the relay leaves a durable reservation a retry resumes (never a
+replayable raw confirmation); an ambiguous timeout is reconciled by replaying the
+frozen idempotency key, which Atlas resolves idempotently. The already-shipped
+`approve_send` path uses the simpler safe variant of this (consume the tokens,
+then relay) because its idempotency key is fully Atlas-owned and derived from the
+draft id, so a re-confirmed retry cannot double-send; the booking and handoff
+paths, which carry a client idempotency key and richer state, use the durable
+reservation above.
 
 So the credential contract and the confirmation gate compose: the device key
 authenticates the channel and identifies the operator; the approver gate confirms
 the operator is allowed to move money at all; and a fresh operator confirmation,
-pinned to the full operation fingerprint, authorizes each specific money
-operation. A stolen device key alone cannot move money, because every money
-capability is approver-gated and confirmation-required, and a confirmation is
-single-use, short-lived, and pinned to one complete operation fingerprint. This
-is the closed extension point the provider slice plugs the Atlas money paths into
+pinned to the full operation fingerprint and consumed into a durable
+authorization reservation, authorizes each specific money operation exactly once.
+A stolen device key alone cannot move money, because every money capability is
+approver-gated and confirmation-required, and a confirmation is single-use,
+short-lived, and pinned to one complete operation fingerprint. This is the closed
+extension point the provider slice plugs the Atlas money paths into
 (`:28573-28575`).
 
 ## What is already built vs. what the provider slice adds
@@ -225,23 +285,32 @@ Already built and reusable as the credential substrate:
   (`../connect-automate/src/connect_automate/entitlement.py:297-315`,
   `connect_windows.py:244`).
 
-The provider slice must add (tracked separately, not in this document):
+The first device money path, `funnel.onboarding_draft.approve_send`, is
+implemented in the companion PR #273 (not on this branch) as the worked template:
+the device endpoint, its place in the closed capability set, the per-capability
+fingerprint generalization, and the approver + confirmation gates. This document
+does not depend on that PR to be correct; it references it as the concrete
+example the follow-ups mirror.
+
+The provider slice must still add (tracked separately, not in this document):
 
 - Device-authenticated tracker endpoints for the remaining Atlas money paths
   (customer handoff, estimate and first-clean booking), each registering in the
-  closed capability set with a fingerprint binding its full operation target, an
-  explicit configured-approver gate (added even where the office route has only
-  an admin-role gate, per the section above), its own idempotency key, and its
-  202-pending handling where the office path has one. These reuse the office
+  closed capability set with a fingerprint binding its full operation target
+  (per the list above), an explicit configured-approver gate (added even where
+  the office route has only an admin-role gate, per the section above), and the
+  tracker-side durable authorization reservation for its remote call (consume the
+  tokens and freeze the fingerprint, rendered request, and idempotency key in one
+  transaction; retries and reconciliation replay that reservation), plus its
+  `202`-pending handling where the office path has one. These reuse the office
   relays (`_atlas_funnel_request` `:5306`, booking helper
   `_submit_atlas_funnel_booking` `:26328`, the read allow-list
   `_ATLAS_FUNNEL_READ_PATHS` `:5883` for any new read; new reads must be added to
-  that allow-list or they fail closed by design). The first money path,
-  `funnel.onboarding_draft.approve_send`, is already implemented as the worked
-  template for these.
+  that allow-list or they fail closed by design).
 - The local Connect provider process itself (loopback registration, capability
-  manifest, `job_id` idempotent submission) and the adapter that signs tracker
-  requests with the device key.
+  manifest, `job_id` idempotent submission), the adapter that signs tracker
+  requests with the device key, and the durable `pending_revocation` marker plus
+  startup reconciliation for interrupted rotations (see Rotate).
 
 ## Security properties
 
@@ -249,8 +318,10 @@ The provider slice must add (tracked separately, not in this document):
   (`:4962`); the PC holds only a revocable per-device key.
 - No stored operator bearer on the PC. The office session is used once at
   enrollment and dropped; steady-state auth is the per-request device proof.
-- Immediate containment. Revoking the device or the operator disables access on
-  the next request with no secret to rotate (`:28210-28223`).
+- Containment on the next request, with no secret to rotate (`:28210-28223`).
+  Permanent containment is the one-way device revoke (`:28490-28497`); operator
+  deactivation is a reversible suspension (see Revoke), so a compromised device is
+  contained durably by revoking the device, not only the operator.
 - Replay resistance. Each request proof binds method, target, body, and a
   freshness window (`:28134-28153`, `:28287`); money operations add a
   single-use confirmation (`:28983-29032`).
