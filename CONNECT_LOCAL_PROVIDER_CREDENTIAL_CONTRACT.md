@@ -7,9 +7,14 @@ credential WITHOUT the shared Atlas service token ever living on a buyer PC. No
 code ships with this document; it pins the design against the current tracker
 and host source so the provider slice can be built directly from it.
 
-Citations to the tracker are `backend/time_tracker_api.py:<line>` unless noted.
-Citations to the host are relative to the companion repo
-`../connect-automate` (the vendor-neutral Connect Automate host core).
+Citations to the tracker are `backend/time_tracker_api.py:<line>` at this PR's
+head unless noted. Citations to the host are relative to the companion repo
+`../connect-automate` pinned at commit
+`bf1cd1de1491601c7570ef72d2037b83a72b63c6`; the line numbers in this document
+resolve against that revision, so the security-critical storage guarantees below
+can be verified against the exact host implementation reviewed here rather than a
+later, moved line. A future host revision that changes those primitives must be
+re-pinned here before this design relies on it.
 
 ## The problem, stated against the code
 
@@ -160,25 +165,50 @@ secret that has already been copied.
 ## Money paths are gated twice, not just authenticated
 
 Authentication (the device key) is separate from authorization of a specific
-money operation. The Atlas confirmation-required paths (customer handoff,
-estimate and first-clean booking, approve-send, revoke-link, recover) are
-office-gated today on the configured approver
-(`_require_juan_funnel_approver` `:22926-22935`, enforced on the device write
-too at `:28971`). The mutation slice (#271) added the per-operation human gate
-that an unattended device needs on top of that: a single-use, TTL-bound
-operation confirmation bound to the device and the exact operation fingerprint
+money operation. The office approver gate is NOT uniform across the money paths,
+so the device paths do not inherit it by simply mirroring the office relay: the
+handoff and approve-send routes enforce the configured approver
+(`_require_juan_funnel_approver` `:22926-22935`, enforced on the device write too
+at `:28971`), but the estimate- and first-clean-booking routes are only
+admin-role gated (`get_current_admin` `:2423-2430`) and delegate to
+`_submit_atlas_funnel_booking`, whose sole authorization check is the Atlas
+capability (`:26341-26345`, routes `:26384-26424`). Because an unattended device
+is a stronger threat than an operator sitting at the office UI, every device
+money path REQUIRES the configured approver explicitly, including the booking
+paths, a deliberate strengthening over the office booking routes rather than a
+mirror of them.
+
+The mutation slice (#271) added the per-operation human gate an unattended device
+needs on top of that: a single-use, TTL-bound operation confirmation bound to the
+device and the exact operation fingerprint
 (`_CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES` `:28577`,
 `_connect_device_operation_fingerprint` `:28582-28604`, issued by
 `POST /api/admin/connect/devices/{device_id}/operation-confirmations` `:28775`,
 consumed atomically in the transition transaction `:28983-29032`).
 
+The fingerprint must bind EVERY authorization-relevant field of the operation,
+not only its target id, or one confirmation could authorize a materially
+different action. A booking, for example, independently accepts a scheduled
+window and a client idempotency key (`scheduledStart`, `scheduledEnd`,
+`idempotencyKey`, `:3150-3184`), so a booking confirmation that hashed only the
+contact id would let a compromised device submit a different window under the same
+confirmation. The implementation therefore computes the fingerprint from a
+per-capability canonical target that includes all such fields: for mark_working
+the contact id and lead state token, for approve_send the draft id (its only
+material field), and for the booking paths the window and idempotency key. The
+device booking capability is refused unless its confirmation names exactly those
+fields, so the confirmation authorizes one concrete booking, never a family of
+them.
+
 So the credential contract and the confirmation gate compose: the device key
-authenticates the channel and identifies the operator; a fresh operator
-confirmation authorizes each money operation. A stolen device key alone cannot
-move money, because every money capability is confirmation-required and a
-confirmation is single-use, short-lived, and pinned to one operation
-fingerprint. This is the closed extension point the provider slice plugs the
-Atlas money paths into (`:28573-28575`).
+authenticates the channel and identifies the operator; the approver gate confirms
+the operator is allowed to move money at all; and a fresh operator confirmation,
+pinned to the full operation fingerprint, authorizes each specific money
+operation. A stolen device key alone cannot move money, because every money
+capability is approver-gated and confirmation-required, and a confirmation is
+single-use, short-lived, and pinned to one complete operation fingerprint. This
+is the closed extension point the provider slice plugs the Atlas money paths into
+(`:28573-28575`).
 
 ## What is already built vs. what the provider slice adds
 
@@ -197,13 +227,18 @@ Already built and reusable as the credential substrate:
 
 The provider slice must add (tracked separately, not in this document):
 
-- Device-authenticated tracker endpoints for the Atlas money paths, each
-  registering in the closed capability set with its own idempotency key and its
-  202-pending handling, mirroring the office relays
-  (`_atlas_funnel_request` `:5306`, booking helper `_submit_atlas_funnel_booking`
-  `:26328`, the read allow-list `_ATLAS_FUNNEL_READ_PATHS` `:5883` for any new
-  read). New reads must be added to that allow-list or they fail closed by
-  design.
+- Device-authenticated tracker endpoints for the remaining Atlas money paths
+  (customer handoff, estimate and first-clean booking), each registering in the
+  closed capability set with a fingerprint binding its full operation target, an
+  explicit configured-approver gate (added even where the office route has only
+  an admin-role gate, per the section above), its own idempotency key, and its
+  202-pending handling where the office path has one. These reuse the office
+  relays (`_atlas_funnel_request` `:5306`, booking helper
+  `_submit_atlas_funnel_booking` `:26328`, the read allow-list
+  `_ATLAS_FUNNEL_READ_PATHS` `:5883` for any new read; new reads must be added to
+  that allow-list or they fail closed by design). The first money path,
+  `funnel.onboarding_draft.approve_send`, is already implemented as the worked
+  template for these.
 - The local Connect provider process itself (loopback registration, capability
   manifest, `job_id` idempotent submission) and the adapter that signs tracker
   requests with the device key.
@@ -220,8 +255,11 @@ The provider slice must add (tracked separately, not in this document):
   freshness window (`:28134-28153`, `:28287`); money operations add a
   single-use confirmation (`:28983-29032`).
 - Least privilege. A device can act only as its one bound operator and only
-  through the tracker's existing gates (the approver gate `:22926-22935` applies
-  to the device identically, `:28971`).
+  through the tracker's gates. Every device money path enforces the configured
+  approver (`_require_juan_funnel_approver` `:22926-22935`, on the device path at
+  `:28971`), including the booking paths whose office routes gate only on the
+  admin role, so a device money operation always requires the one approver
+  identity in addition to a fresh per-operation confirmation.
 
 ## Production safety
 
