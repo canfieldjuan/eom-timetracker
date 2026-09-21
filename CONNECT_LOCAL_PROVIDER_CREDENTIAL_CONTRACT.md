@@ -152,13 +152,28 @@ to revoke it. The rotation protocol therefore is:
 1. Enroll the new device and record `{new device_id, new private_key}` plus a
    durable `pending_revocation = {old device_id}` marker in the same local write.
 2. Begin signing with the new key.
-3. Revoke the old `device_id`; on success, clear the marker.
+3. Revoke the old `device_id` with the NEW device's own Ed25519 proof; on success,
+   clear the marker.
+
+The revoke in step 3 cannot use the office admin revoke route
+(`POST /api/admin/connect/devices/{device_id}/revoke`), because that route is
+bearer-authenticated (`Depends(get_current_admin)` `:28464-28469`, which requires
+an `Authorization: Bearer` token `:2423-2430`) and no office bearer is stored on
+the PC after enrollment (see Acquire). Steady-state the PC holds only device keys.
+So the rotation revoke, and its startup reconciliation, use a device-authenticated,
+operator-scoped revoke: the new device (active, holding its key) authenticates
+with its own `require_connect_device` proof and revokes a device bound to the SAME
+operator (the old `device_id`). The tracker enforces that a device may revoke only
+devices of its own bound operator, and revocation stays the one-way idempotent
+flip. This device-authenticated revoke endpoint is a tracker-side addition the
+provider slice must add (the office bearer-authenticated revoke route stays as is
+for interactive use).
 
 Startup reconciliation completes an interrupted rotation: if the store holds a
-`pending_revocation` marker on start, the provider re-issues the revoke (the
-revoke endpoint is idempotent, `200` when already revoked) before it does any
-other work, so an interrupted rotation can never strand the old key active. The
-tracker side is unchanged; the marker and reconciliation live in the host store.
+`pending_revocation` marker on start, the provider re-issues that
+device-authenticated revoke (idempotent, `200` when already revoked) before it
+does any other work, so an interrupted rotation can never strand the old key
+active, and it needs no stored bearer and no interactive login to do so.
 
 ### Revoke
 
@@ -307,6 +322,12 @@ The provider slice must still add (tracked separately, not in this document):
   `_submit_atlas_funnel_booking` `:26328`, the read allow-list
   `_ATLAS_FUNNEL_READ_PATHS` `:5883` for any new read; new reads must be added to
   that allow-list or they fail closed by design).
+- A device-authenticated, operator-scoped revoke endpoint (device proof), so a
+  device can revoke a device bound to its own operator without an office bearer.
+  This is what makes unattended rotation and its startup reconciliation possible
+  (see Rotate); the tracker enforces same-operator scoping and keeps revocation a
+  one-way idempotent flip. The office bearer-authenticated revoke route is
+  unchanged and remains for interactive use.
 - The local Connect provider process itself (loopback registration, capability
   manifest, `job_id` idempotent submission), the adapter that signs tracker
   requests with the device key, and the durable `pending_revocation` marker plus
