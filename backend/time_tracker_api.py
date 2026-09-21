@@ -28574,34 +28574,83 @@ def connect_device_list_funnel_leads(
 # confirmation is required to dispatch it from the unattended device. This is a
 # CLOSED set: an operation whose capability is not listed here is refused.
 CONNECT_DEVICE_MARK_WORKING_CAPABILITY = "funnel.lead.mark_working"
+# The first Atlas money path a device may perform: approve-and-send an onboarding
+# draft. Unlike mark_working (tracker-local, reversible) this relays to Atlas with
+# the tracker's service token and sends a real customer email, so it is
+# confirmation-required and the bound operator must be the configured approver.
+CONNECT_DEVICE_APPROVE_SEND_CAPABILITY = "funnel.onboarding_draft.approve_send"
 _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
-    {CONNECT_DEVICE_MARK_WORKING_CAPABILITY}
+    {CONNECT_DEVICE_MARK_WORKING_CAPABILITY, CONNECT_DEVICE_APPROVE_SEND_CAPABILITY}
 )
 
 
 def _connect_device_operation_fingerprint(
-    capability: str, contact_id: str, expected_state_token: str
+    capability: str, target: Dict[str, str]
 ) -> str:
-    """Stable identity of a device operation: its capability, target, AND the
-    exact state token the operator approved against. Both the operator's
+    """Stable identity of a device operation: its capability plus every material
+    parameter of the exact operation the operator approved. Both the operator's
     confirmation and the device's dispatch compute it the same way, so a
     confirmation issued for one operation can never authorize a different one.
 
-    Binding the state token pins each confirmation to the specific lead state the
-    operator saw: once the lead transitions (mark-working, or a later lost/reopen)
-    its state token changes, so a leftover confirmation from a delayed retry --
-    still bound to the old token -- no longer matches any dispatchable operation
-    and cannot re-authorize the lead."""
+    ``target`` carries the capability-specific parameters that make the operation
+    concrete, so a confirmation authorizes exactly one action, never a family of
+    them. For ``funnel.lead.mark_working`` it is the contact id and the exact lead
+    state token the operator saw, pinning the confirmation to that lead state
+    (once the lead transitions its token changes, so a leftover confirmation from
+    a delayed retry no longer matches any dispatchable operation). For
+    ``funnel.onboarding_draft.approve_send`` it is the draft id, so an approval to
+    send one customer's onboarding can never send another's. The canonical form is
+    the capability merged with the target keys, sorted, so a given
+    (capability, target) always hashes identically regardless of insertion order."""
     canonical = json.dumps(
-        {
-            "capability": capability,
-            "contactId": str(contact_id),
-            "expectedStateToken": str(expected_state_token),
-        },
+        {"capability": capability, **{k: str(v) for k, v in target.items()}},
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# Which confirmation-request target fields each capability requires. The
+# confirmation request carries a superset of optional target fields; issuance and
+# dispatch both build the capability's canonical target through this map, so a
+# confirmation is refused unless it names exactly the fields its capability needs
+# and none it does not.
+_CONNECT_DEVICE_OPERATION_TARGET_FIELDS: Dict[str, Tuple[str, ...]] = {
+    CONNECT_DEVICE_MARK_WORKING_CAPABILITY: ("contactId", "expectedStateToken"),
+    CONNECT_DEVICE_APPROVE_SEND_CAPABILITY: ("draftId",),
+}
+
+
+def _connect_device_confirmation_target(
+    capability: str, payload: "ConnectDeviceOperationConfirmationRequest"
+) -> Dict[str, str]:
+    """Validate a confirmation request against its capability and return the
+    canonical operation target. Requires exactly the capability's target fields,
+    rejecting a request that omits one or carries a field from another capability,
+    so a confirmation cannot be minted for a malformed or cross-capability target.
+    The UUID-shaped id fields are normalized so the fingerprint is stable across
+    equivalent spellings."""
+    required = _CONNECT_DEVICE_OPERATION_TARGET_FIELDS.get(capability)
+    if required is None:
+        raise HTTPException(status_code=400, detail="Unknown device operation capability")
+    provided = {
+        field
+        for field in ("contactId", "expectedStateToken", "draftId")
+        if getattr(payload, field) is not None
+    }
+    if provided != set(required):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Capability {capability} requires exactly these target fields: "
+            + ", ".join(required),
+        )
+    target: Dict[str, str] = {}
+    for field in required:
+        value = str(getattr(payload, field))
+        if field in ("contactId", "draftId"):
+            value = _validate_connect_operation_uuid(value)
+        target[field] = value
+    return target
 
 
 def _validate_connect_operation_uuid(value: str) -> str:
@@ -28636,14 +28685,92 @@ def _assert_connect_device_operator_active(cur, device_id: str) -> None:
         )
 
 
+def _consume_connect_device_operation_tokens(
+    cur,
+    device_id: str,
+    challenge_id: str,
+    confirmation_id: str,
+    capability: str,
+    fingerprint: str,
+) -> None:
+    """Consume the single-use challenge and the matching confirmation inside an
+    open transaction. The caller must have already asserted the operator is active
+    (holding the device + operator rows via ``_assert_connect_device_operator_active``)
+    so this consumption serializes against a revoke or demotion committing in
+    between. Expiry is compared against ``clock_timestamp()`` (real wall clock),
+    not ``NOW()`` (fixed at transaction start), so a token cannot outlive its TTL
+    by having the transaction wait on locks past expiry. Raises 409 if the
+    challenge does not match (invalid, expired, or already used) and 403 if no
+    fresh confirmation matches this exact operation."""
+    cur.execute(
+        """
+        UPDATE connect_device_operation_challenges
+        SET consumed_at = NOW()
+        WHERE challenge_id = %s AND device_id = %s
+          AND consumed_at IS NULL AND expires_at > clock_timestamp()
+        RETURNING challenge_id
+        """,
+        (challenge_id, device_id),
+    )
+    if cur.fetchone() is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Operation challenge is invalid, expired, or already used",
+        )
+    cur.execute(
+        """
+        UPDATE connect_device_operation_confirmations
+        SET consumed_at = NOW()
+        WHERE confirmation_id = %s AND device_id = %s AND capability = %s
+          AND operation_fingerprint = %s
+          AND consumed_at IS NULL AND expires_at > clock_timestamp()
+        RETURNING confirmation_id
+        """,
+        (confirmation_id, device_id, capability, fingerprint),
+    )
+    if cur.fetchone() is None:
+        raise HTTPException(
+            status_code=403,
+            detail="A fresh operator confirmation for this exact operation is required",
+        )
+
+
+def _authorize_connect_device_operation(
+    device_id: str,
+    challenge_id: str,
+    confirmation_id: str,
+    capability: str,
+    fingerprint: str,
+) -> None:
+    """Consume a device operation's tokens in a dedicated transaction, for a
+    capability whose effect is an external call (not a local DB write it can share
+    a transaction with). Re-asserts the operator is active, then consumes the
+    challenge and the matching confirmation. Consuming BEFORE the external call is
+    fail-safe: a crash after consumption leaves no effect (never a replayable
+    authorization), and a transient external failure is retried by re-confirming,
+    with the external idempotency key preventing a double effect across retries."""
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _assert_connect_device_operator_active(cur, device_id)
+            _consume_connect_device_operation_tokens(
+                cur, device_id, challenge_id, confirmation_id, capability, fingerprint
+            )
+
+
 class ConnectDeviceOperationConfirmationRequest(BaseModel):
-    """An operator's fresh authorization for one specific device operation."""
+    """An operator's fresh authorization for one specific device operation.
+
+    ``capability`` selects which target fields are required: mark_working needs
+    ``contactId`` and ``expectedStateToken``; approve_send needs ``draftId``. The
+    other target fields must be omitted, so a confirmation cannot carry a
+    cross-capability target (enforced in ``_connect_device_confirmation_target``)."""
 
     model_config = ConfigDict(extra="forbid")
 
     capability: str = Field(min_length=1, max_length=128)
-    contactId: str = Field(min_length=1, max_length=64)
-    expectedStateToken: str = Field(min_length=1, max_length=128)
+    contactId: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    expectedStateToken: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    draftId: Optional[str] = Field(default=None, min_length=1, max_length=64)
 
 
 class ConnectDeviceMarkLeadWorkingRequest(BaseModel):
@@ -28657,6 +28784,19 @@ class ConnectDeviceMarkLeadWorkingRequest(BaseModel):
     challengeId: str = Field(min_length=1, max_length=64)
     confirmationId: str = Field(min_length=1, max_length=64)
     expectedStateToken: str = Field(min_length=1, max_length=128)
+
+
+class ConnectDeviceApproveOnboardingDraftRequest(BaseModel):
+    """The device's request to approve-and-send an onboarding draft. ``challengeId``
+    is the single-use anti-replay nonce; ``confirmationId`` is the operator's fresh
+    authorization for this exact draft. The draft id is the path parameter, and
+    Atlas's draft-id state machine (a stable idempotency key) is the send's
+    delivery-idempotency mechanism, so there is no mutable send payload here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    challengeId: str = Field(min_length=1, max_length=64)
+    confirmationId: str = Field(min_length=1, max_length=64)
 
 
 _CONNECT_DEVICE_OP_PRUNE_LOCK = threading.Lock()
@@ -28788,11 +28928,9 @@ def admin_confirm_connect_device_operation(
     own bound operator; this only records that a human authorized the action."""
     if payload.capability not in _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES:
         raise HTTPException(status_code=400, detail="Unknown device operation capability")
-    contact_id = _validate_connect_operation_uuid(payload.contactId)
+    target = _connect_device_confirmation_target(payload.capability, payload)
 
-    fingerprint = _connect_device_operation_fingerprint(
-        payload.capability, contact_id, payload.expectedStateToken
-    )
+    fingerprint = _connect_device_operation_fingerprint(payload.capability, target)
     new_confirmation_id = str(uuid4())
     # Idempotent issuance: at most one OUTSTANDING confirmation per device and
     # operation (enforced by the partial unique index). A retry or double submit
@@ -28923,8 +29061,8 @@ def admin_confirm_connect_device_operation(
         request,
         "CONNECT_DEVICE_OPERATION_CONFIRMED",
         True,
-        f"device={device_id} capability={payload.capability} contact={contact_id} "
-        f"reused={reused}",
+        f"device={device_id} capability={payload.capability} "
+        f"fingerprint={fingerprint} reused={reused}",
     )
     return JSONResponse(
         status_code=200 if reused else 201,
@@ -28976,8 +29114,10 @@ def connect_device_mark_lead_working(
     device_id = operator["deviceId"]
     fingerprint = _connect_device_operation_fingerprint(
         CONNECT_DEVICE_MARK_WORKING_CAPABILITY,
-        contact_id_text,
-        payload.expectedStateToken,
+        {
+            "contactId": contact_id_text,
+            "expectedStateToken": payload.expectedStateToken,
+        },
     )
 
     def _authorize(cur) -> None:
@@ -28986,50 +29126,19 @@ def connect_device_mark_lead_working(
         # a separate transaction, so re-assert here (holding the device + operator
         # rows) that the device is STILL active and its operator STILL an active
         # admin: a revoke or demotion that commits during the lock wait must not
-        # let this retained authentication consume tokens and mutate.
+        # let this retained authentication consume tokens and mutate. Then consume
+        # the single-use challenge and confirmation in the SAME transaction as the
+        # working-state write, so a crash or conflict never spends a token without
+        # the transition.
         _assert_connect_device_operator_active(cur, device_id)
-        # Single-use challenge: device-bound, unconsumed, unexpired. Expiry is
-        # compared against clock_timestamp() (real wall clock), NOT NOW() (which
-        # is fixed at transaction start), so a token cannot outlive its TTL by
-        # having the transaction wait on locks past expiry.
-        cur.execute(
-            """
-            UPDATE connect_device_operation_challenges
-            SET consumed_at = NOW()
-            WHERE challenge_id = %s AND device_id = %s
-              AND consumed_at IS NULL AND expires_at > clock_timestamp()
-            RETURNING challenge_id
-            """,
-            (challenge_id, device_id),
+        _consume_connect_device_operation_tokens(
+            cur,
+            device_id,
+            challenge_id,
+            confirmation_id,
+            CONNECT_DEVICE_MARK_WORKING_CAPABILITY,
+            fingerprint,
         )
-        if cur.fetchone() is None:
-            raise HTTPException(
-                status_code=409,
-                detail="Operation challenge is invalid, expired, or already used",
-            )
-        # Fresh operator confirmation bound to THIS exact operation (same
-        # wall-clock expiry check).
-        cur.execute(
-            """
-            UPDATE connect_device_operation_confirmations
-            SET consumed_at = NOW()
-            WHERE confirmation_id = %s AND device_id = %s AND capability = %s
-              AND operation_fingerprint = %s
-              AND consumed_at IS NULL AND expires_at > clock_timestamp()
-            RETURNING confirmation_id
-            """,
-            (
-                confirmation_id,
-                device_id,
-                CONNECT_DEVICE_MARK_WORKING_CAPABILITY,
-                fingerprint,
-            ),
-        )
-        if cur.fetchone() is None:
-            raise HTTPException(
-                status_code=403,
-                detail="A fresh operator confirmation for this exact operation is required",
-            )
 
     marker = _mark_lead_working(
         contact_id_text, operator, payload.expectedStateToken, authorize=_authorize
@@ -29052,6 +29161,96 @@ def connect_device_mark_lead_working(
             ),
         },
     }
+
+
+@app.post("/api/connect/device/funnel/onboarding-drafts/{draft_id}/approve-send")
+def connect_device_approve_funnel_onboarding_draft(
+    draft_id: UUID,
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> JSONResponse:
+    """Device-driven, confirmation-gated Atlas money path: approve and send an
+    onboarding draft on the bound operator's behalf.
+
+    Faithful to the office path (``admin_approve_funnel_onboarding_draft``): the
+    bound operator must be the configured funnel approver, the deployed Atlas must
+    advertise the capability, and the tracker relays with its own service token
+    (the device holds no Atlas credential). Because this is a confirmation-required
+    money capability it additionally requires a single-use anti-replay challenge
+    AND a fresh operator confirmation bound to this exact draft.
+
+    Token ordering: the tokens are consumed in their own transaction BEFORE the
+    Atlas call, which is fail-safe. Atlas's draft-id state machine (the stable
+    ``eom-onboarding-draft:{draft_id}`` idempotency key) makes the send idempotent,
+    so a transient Atlas failure is retried by re-confirming without a double-send,
+    and a crash after consuming tokens but before the send leaves no send at all
+    (an operator re-confirms) rather than a replayable authorization."""
+    payload = _connect_device_parse_body(
+        request, ConnectDeviceApproveOnboardingDraftRequest
+    )
+    _require_juan_funnel_approver(operator, action="approve and send onboarding emails")
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_ONBOARDING_DRAFT_APPROVE_SEND, operator
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "CONNECT_DEVICE_FUNNEL_ONBOARDING_DRAFT_APPROVE_SEND_CAPABILITY_UNAVAILABLE",
+            False,
+            f"device={operator['deviceId']} draft={draft_id} capability={exc.capability}",
+            persist_to_file=False,
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    draft_id_text = str(draft_id)
+    challenge_id = _validate_connect_operation_uuid(payload.challengeId)
+    confirmation_id = _validate_connect_operation_uuid(payload.confirmationId)
+    device_id = operator["deviceId"]
+    fingerprint = _connect_device_operation_fingerprint(
+        CONNECT_DEVICE_APPROVE_SEND_CAPABILITY, {"draftId": draft_id_text}
+    )
+    # Consume the single-use tokens (fail-safe, before the send) and only then
+    # relay to Atlas. See the docstring for why this ordering cannot double-send.
+    _authorize_connect_device_operation(
+        device_id,
+        challenge_id,
+        confirmation_id,
+        CONNECT_DEVICE_APPROVE_SEND_CAPABILITY,
+        fingerprint,
+    )
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_ONBOARDING_DRAFT_APPROVE_SEND_PATH.format(draft_id=draft_id_text),
+            operator,
+            payload={},
+            idempotency_key=f"eom-onboarding-draft:{draft_id_text}",
+        )
+        visible = _validate_atlas_onboarding_draft_sent_receipt(
+            atlas_result, draft_id=draft_id_text
+        )
+    except AtlasFunnelRequestError as exc:
+        append_access_log(
+            request,
+            "CONNECT_DEVICE_FUNNEL_ONBOARDING_DRAFT_APPROVE_SEND_FAILED",
+            False,
+            f"device={device_id} draft={draft_id_text} status={exc.status_code}",
+            persist_to_file=False,
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    append_access_log(
+        request,
+        "CONNECT_DEVICE_FUNNEL_ONBOARDING_DRAFT_APPROVE_SEND_SUBMITTED",
+        True,
+        f"device={device_id} draft={draft_id_text} idempotent={visible['idempotent']}",
+        persist_to_file=False,
+    )
+    return JSONResponse(
+        status_code=200 if visible["idempotent"] else 201,
+        content=jsonable_encoder(visible),
+    )
 
 
 @app.post("/api/admin/funnel/handoffs/{contact_id}/retry")

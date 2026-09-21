@@ -1,11 +1,12 @@
 # Connect Device Enrollment Contract
 
 Status: implemented for the device lifecycle (enroll, list, revoke), a read-only
-device-authenticated funnel access path (see "Device-authenticated access"), and
-a confirmation-gated device MUTATION path proven on the tracker-local
-lead-working claim (see "Device-authenticated mutations"). Wiring the Atlas
-confirmation-required money paths (handoff, estimate/first-clean booking,
-approve-send) through a device waits for the local-provider slice.
+device-authenticated funnel access path (see "Device-authenticated access"), a
+confirmation-gated tracker-local MUTATION path (the lead-working claim), and the
+first confirmation-gated Atlas MONEY path (approve-and-send an onboarding draft),
+both under "Device-authenticated mutations". Wiring the remaining Atlas
+confirmation-required money paths (customer handoff, estimate/first-clean
+booking) through a device reuses this same gate and is the next slice.
 
 ## Purpose
 
@@ -131,17 +132,20 @@ reference `connect_devices` ON DELETE CASCADE):
 - **Operation confirmation** -- the per-operation human gate. `POST
   /api/admin/connect/devices/{device_id}/operation-confirmations`
   (`Depends(get_current_admin)`) records a fresh operator authorization bound to
-  the device and the exact operation fingerprint
-  (`sha256(capability + target)`), single-use with a short TTL. A
-  confirmation-required capability cannot dispatch from the unattended device
-  without a matching, unconsumed, unexpired confirmation, and a confirmation
-  issued for one operation can never authorize another.
+  the device and the exact operation fingerprint, single-use with a short TTL.
+  The fingerprint is `sha256` of the capability merged with the operation's
+  material target parameters, so a confirmation authorizes exactly one concrete
+  operation: the contact id and lead state token for `mark_working`, the draft id
+  for `approve_send`. A confirmation-required capability cannot dispatch from the
+  unattended device without a matching, unconsumed, unexpired confirmation, and a
+  confirmation issued for one operation can never authorize another.
 
 Capabilities a device may perform are a **CLOSED** set
 (`_CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES`); an unlisted capability is
-refused. The one implemented capability is `funnel.lead.mark_working`.
+refused. The implemented capabilities are `funnel.lead.mark_working` (tracker
+local) and `funnel.onboarding_draft.approve_send` (the first Atlas money path).
 
-### Mutation endpoint (this slice)
+### Mutation endpoints
 
 - `POST /api/connect/device/funnel/leads/{contact_id}/working` (device proof) ->
   claims a lead as working on the bound operator's behalf via the existing
@@ -153,11 +157,26 @@ refused. The one implemented capability is `funnel.lead.mark_working`.
   after every conflict/idempotency check has passed: a crash or a state conflict
   never spends a token without the transition, an already-working lead is a safe
   idempotent no-op, and a spent challenge cannot drive a new transition (`409`).
+- `POST /api/connect/device/funnel/onboarding-drafts/{draft_id}/approve-send`
+  (device proof) -> approves and sends an onboarding draft on the bound
+  operator's behalf. This is a real Atlas money path: it relays to Atlas with the
+  tracker's service token (the device holds no Atlas credential), faithful to the
+  office `approve-send` (approver-gated, and refused `501` when the deployed Atlas
+  does not advertise the capability). Being confirmation-required, it needs a
+  valid `challengeId` and a `confirmationId` bound to this exact draft. Because
+  the effect is an external call rather than a local write, the tokens are
+  consumed in their own transaction BEFORE the Atlas call: this is fail-safe. A
+  crash after consumption leaves no send (the operator re-confirms), never a
+  replayable authorization; and Atlas's draft-id state machine (the stable
+  `eom-onboarding-draft:{draft_id}` idempotency key) makes the send idempotent, so
+  a transient failure is retried by re-confirming without a double-send. Returns
+  `201` on a new send and `200` on Atlas's idempotent replay.
 
 ## Deferred to a later slice
 
-- Wiring the Atlas confirmation-required money paths (handoff, estimate and
-  first-clean booking, approve-send) through the device, once the local provider
-  exists. The authorization machinery above is the reusable gate they will use;
-  each will register in the closed capability set with its own idempotency and
-  202-pending handling.
+- Wiring the remaining Atlas confirmation-required money paths (customer handoff,
+  estimate and first-clean booking) through the device. The authorization
+  machinery above is the reusable gate they will use; each registers in the closed
+  capability set with its own idempotency and, where the office path has one (the
+  handoff), its `202`-pending reconciliation. The `approve_send` path above is the
+  worked template.
