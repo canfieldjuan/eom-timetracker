@@ -147,8 +147,12 @@ private storage, the same placement the entitlement file uses:
 
 The private key is stored at rest as raw key bytes in that owner-private
 directory. No shared secret and no Atlas token is ever written to the PC. The
-store holds exactly the current `{device_id, private_key}`; the public key lives
-only on the tracker.
+store is one atomically-written record: in steady state it holds exactly the
+current `{device_id, private_key}`, and during a rotation it additionally holds a
+`pending_rotation` block (the new private and public key, the predecessor
+`device_id`, and the enrollment challenge and signature) that exists only from
+the start of a rotation until the new `device_id` is read back and the old key
+dropped (see Rotate). The public key otherwise lives only on the tracker.
 
 ### Rotate
 
@@ -185,7 +189,7 @@ available because rotation is inherently interactive (enrollment already require
   peer-revocation attack above cannot arise.
 
 Local-store ordering for crash safety: persist the new private key with a
-`pending_enroll` intent (the `publicKey`, the `supersedes` target, and the
+`pending_rotation` block (the `publicKey`, the `supersedes` target, and the
 enrollment challenge/signature) before the call, then on success record the
 returned `device_id` and drop the old key. If the host crashes after the call
 commits but before it records the `device_id`, recovery re-issues the SAME
@@ -373,7 +377,7 @@ The provider slice must still add (tracked separately, not in this document):
 - The local Connect provider process itself (loopback registration, capability
   manifest, `job_id` idempotent submission), the adapter that signs tracker
   requests with the device key, and the local-store crash-safe rotation ordering
-  (persist the new key with a `pending_enroll` intent, and on restart recover the
+  (persist the new key with a `pending_rotation` block, and on restart recover the
   `device_id` by re-issuing the same-key enrollment, not by listing devices, since
   the device view omits the public key; see Rotate).
 
