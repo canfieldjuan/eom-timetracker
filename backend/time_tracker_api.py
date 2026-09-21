@@ -28869,6 +28869,34 @@ def _serialize_connect_device_reservation(row: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+def _get_connect_device_completed_reservation(
+    device_id: str, fingerprint: str
+) -> Optional[Dict[str, Any]]:
+    """Return the frozen-receipt reservation for an already-COMPLETED device money
+    operation, or None when none exists for this device+fingerprint.
+
+    This is a read of past, already-authorized work. It lets a retry of a finished
+    booking return its cached receipt without re-running the Atlas capability gate
+    (which a capability withdrawn since the booking would fail with 501) and without
+    touching any single-use token. A still-'reserved' operation is NOT returned
+    here: that path goes through ``_reserve_or_get_connect_device_operation`` so its
+    operator re-check, token handling, and relay all run."""
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT * FROM connect_device_operation_reservations
+                WHERE device_id = %s AND operation_fingerprint = %s
+                  AND status = 'completed'
+                """,
+                (device_id, fingerprint),
+            )
+            row = cur.fetchone()
+            return (
+                _serialize_connect_device_reservation(row) if row is not None else None
+            )
+
+
 def _reserve_or_get_connect_device_operation(
     *,
     device_id: str,
@@ -28904,6 +28932,12 @@ def _reserve_or_get_connect_device_operation(
             )
             existing = cur.fetchone()
             if existing is not None:
+                # Replay of an already-authorized operation. Re-assert the operator
+                # is still active (and hold the device + operator rows) before
+                # returning, exactly as the new-operation path does: a revoke or
+                # demotion that committed since authorization must stop the retry
+                # from re-driving the frozen Atlas money call.
+                _assert_connect_device_operator_active(cur, device_id)
                 return _serialize_connect_device_reservation(existing)
             # New operation: lock+recheck operator, consume tokens, and record the
             # reservation atomically. If a concurrent request created the reservation
@@ -29532,6 +29566,38 @@ def _connect_device_submit_booking(
     Atlas resolves the frozen key idempotently, so there is no double booking."""
     payload = _connect_device_parse_body(request, ConnectDeviceBookingRequest)
     _require_juan_funnel_approver(operator, action="book estimates and first cleans")
+
+    contact_id_text = str(contact_id)
+    device_id = operator["deviceId"]
+    idempotency_key = str(payload.idempotencyKey)
+    fingerprint = _connect_device_operation_fingerprint(
+        capability,
+        {
+            "contactId": contact_id_text,
+            "scheduledStart": payload.scheduledStart,
+            "scheduledEnd": payload.scheduledEnd,
+            "idempotencyKey": idempotency_key,
+        },
+    )
+
+    # Replay of an already-completed booking returns the frozen receipt before the
+    # Atlas capability gate runs: the money already moved under this exact
+    # fingerprint, so a capability withdrawn since then must not turn a completed
+    # booking's receipt read into a 501. New and still-reserved operations run the
+    # full config + capability gate below.
+    completed = _get_connect_device_completed_reservation(device_id, fingerprint)
+    if completed is not None:
+        append_access_log(
+            request,
+            f"{audit_prefix}_REPLAYED",
+            True,
+            f"device={device_id} contact={contact_id_text}",
+            persist_to_file=False,
+        )
+        return JSONResponse(
+            status_code=200, content=jsonable_encoder(completed["receipt"])
+        )
+
     _require_atlas_funnel_configuration()
     try:
         _require_atlas_funnel_capability(atlas_capability, operator)
@@ -29545,20 +29611,8 @@ def _connect_device_submit_booking(
         )
         return _atlas_capability_unavailable_response(exc)
 
-    contact_id_text = str(contact_id)
-    device_id = operator["deviceId"]
     challenge_id = _validate_connect_operation_uuid(payload.challengeId)
     confirmation_id = _validate_connect_operation_uuid(payload.confirmationId)
-    idempotency_key = str(payload.idempotencyKey)
-    fingerprint = _connect_device_operation_fingerprint(
-        capability,
-        {
-            "contactId": contact_id_text,
-            "scheduledStart": payload.scheduledStart,
-            "scheduledEnd": payload.scheduledEnd,
-            "idempotencyKey": idempotency_key,
-        },
-    )
     reservation = _reserve_or_get_connect_device_operation(
         device_id=device_id,
         capability=capability,
@@ -29570,6 +29624,8 @@ def _connect_device_submit_booking(
         confirmation_id=confirmation_id,
     )
     if reservation["status"] == "completed":
+        # Race: the operation completed between the early completed-peek above and
+        # this reserve lookup. Return the same frozen receipt.
         append_access_log(
             request,
             f"{audit_prefix}_REPLAYED",

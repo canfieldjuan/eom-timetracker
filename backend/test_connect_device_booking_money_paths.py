@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 import time_tracker_api as api
 from test_connect_device_mutations import (
     _device_post,
@@ -223,6 +225,91 @@ def test_completed_replay_returns_frozen_receipt_without_calling_atlas(client, a
     assert replay.status_code == 200, replay.text
     assert replay.json() == first.json()
     assert calls == []
+
+
+def test_completed_replay_returns_receipt_even_when_capability_withdrawn(
+    client, auth, monkeypatch
+):
+    # A booking completes. Later the deployed Atlas withdraws the booking
+    # capability. Replaying the SAME completed booking must still return its frozen
+    # receipt (200), not a 501: the money already moved under this fingerprint, so
+    # the capability gate is not consulted for a completed reservation, and Atlas is
+    # not called again.
+    _set_approver(monkeypatch, client, auth)
+    private_key, device_id = _enroll_device(client, auth)
+    contact_id = _fresh_contact()
+    idem = str(uuid.uuid4())
+    confirmation_id = _issue_booking_confirmation(
+        client, auth, device_id, contact_id, idem
+    ).json()["confirmationId"]
+    challenge_id = _issue_challenge(client, device_id, private_key)
+
+    _stub_atlas_booking(monkeypatch, stage="estimate_booked", status="estimate_booked")
+    first = _book(client, device_id, private_key, _ESTIMATE_PATH, contact_id,
+                  challenge_id, confirmation_id, idem)
+    assert first.status_code == 201, first.text
+
+    # Capability withdrawn AND the relay forbidden: a new operation here would 501,
+    # but the completed replay bypasses both.
+    calls: list = []
+    _forbid_atlas(monkeypatch, calls)
+    monkeypatch.setattr(
+        api, "_require_atlas_funnel_capability",
+        lambda cap, _admin: (_ for _ in ()).throw(api.AtlasFunnelCapabilityUnavailable(cap)),
+    )
+    replay = _book(client, device_id, private_key, _ESTIMATE_PATH, contact_id,
+                   challenge_id, confirmation_id, idem)
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first.json()
+    assert calls == []
+
+
+def test_reserved_replay_refuses_after_device_revoked(client, auth, monkeypatch):
+    # A booking's first attempt fails at Atlas, leaving a 'reserved' reservation
+    # (tokens spent, not completed). If the device is revoked before a retry
+    # re-drives it, replaying the reservation must re-assert the operator is active
+    # and refuse (403) rather than re-drive the frozen Atlas money call.
+    _set_approver(monkeypatch, client, auth)
+    private_key, device_id = _enroll_device(client, auth)
+    contact_id = _fresh_contact()
+    idem = str(uuid.uuid4())
+    confirmation_id = _issue_booking_confirmation(
+        client, auth, device_id, contact_id, idem
+    ).json()["confirmationId"]
+    challenge_id = _issue_challenge(client, device_id, private_key)
+
+    _stub_atlas_booking(monkeypatch, stage="estimate_booked", status="estimate_booked",
+                        fail_status=503)
+    failed = _book(client, device_id, private_key, _ESTIMATE_PATH, contact_id,
+                   challenge_id, confirmation_id, idem)
+    assert failed.status_code == 503, failed.text
+
+    revoked = client.post(
+        f"/api/admin/connect/devices/{device_id}/revoke", headers=auth
+    )
+    assert revoked.status_code == 200, revoked.text
+
+    # The reserved-replay branch runs inside the reserve lock; it does not go through
+    # the endpoint's device auth (which would already reject a revoked device). Call
+    # it directly to prove the branch itself re-checks the operator. Fresh (unused)
+    # token ids: the reserved-existing branch never consumes tokens.
+    fingerprint = api._connect_device_operation_fingerprint(
+        _ESTIMATE_CAP,
+        {"contactId": contact_id, "scheduledStart": _START,
+         "scheduledEnd": _END, "idempotencyKey": idem},
+    )
+    with pytest.raises(api.HTTPException) as exc_info:
+        api._reserve_or_get_connect_device_operation(
+            device_id=device_id,
+            capability=_ESTIMATE_CAP,
+            fingerprint=fingerprint,
+            idempotency_key=idem,
+            atlas_path=f"/eom-funnel/leads/{contact_id}/estimate-bookings",
+            request_body={"scheduled_start": _START, "scheduled_end": _END},
+            challenge_id=str(uuid.uuid4()),
+            confirmation_id=str(uuid.uuid4()),
+        )
+    assert exc_info.value.status_code == 403
 
 
 def test_confirmation_for_different_window_rejected(client, auth, monkeypatch):
