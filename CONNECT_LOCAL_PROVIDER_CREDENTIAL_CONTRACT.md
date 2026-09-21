@@ -161,23 +161,33 @@ available because rotation is inherently interactive (enrollment already require
 `Depends(get_current_admin)`, so the operator is present with a session):
 
 - `POST /api/admin/connect/devices` gains an optional `supersedes: <old device_id>`.
-  In one transaction the tracker verifies the caller's operator owns the named
-  predecessor, records the new device active, and revokes the predecessor. There
-  is no window in which both are active and no separate revoke step, so a crash
-  cannot strand the old key: either the whole rotation committed (new active, old
-  revoked) or none of it did. Because the operation is bearer-gated, a PC-only
-  attacker without an office session cannot invoke it, and no device may revoke a
-  peer, so the peer-revocation attack above cannot arise.
+  In one transaction the tracker locks the predecessor row (`FOR UPDATE`),
+  verifies it belongs to the caller's operator AND is still `active`, records the
+  new device active, and revokes the predecessor with a locked compare-and-set
+  (revoke only while it reads `active`). A predecessor can therefore be superseded
+  by exactly one successor: two concurrent rotations naming the same predecessor
+  with different new keys serialize on the row lock, and the second finds it
+  already revoked and is rejected (`409`), so both successors cannot end up active.
+  A same-key retry (identical `publicKey`, same `supersedes`) stays idempotent and
+  returns `200` with the existing device. There is no window in which both rows
+  are active and no separate revoke step, so a crash cannot strand the old key:
+  either the whole rotation committed (new active, old revoked) or none of it did.
+  Because the operation is bearer-gated, a PC-only attacker without an office
+  session cannot invoke it, and no device may revoke a peer, so the
+  peer-revocation attack above cannot arise.
 
 Local-store ordering for crash safety: persist the new private key with a
-`pending_enroll` intent before the call, then on success record the returned
-`device_id` and drop the old key. If the host crashes after the call commits but
-before it records the `device_id`, startup lists the operator's devices
-(`GET /api/admin/connect/devices`) and matches the stored public key to recover
-the `device_id`; re-issuing the same enrollment is the existing idempotent
-re-enroll (`200`), so recovery is safe. No device-authenticated revoke and no
-unattended reconciliation are needed, because the retire is part of the atomic
-enrollment rather than a later step.
+`pending_enroll` intent (the `publicKey`, the `supersedes` target, and the
+enrollment challenge/signature) before the call, then on success record the
+returned `device_id` and drop the old key. If the host crashes after the call
+commits but before it records the `device_id`, recovery re-issues the SAME
+enrollment (same `publicKey`), which is the existing idempotent re-enroll and
+returns `200` with the device view carrying the new `device_id`. Recovery does not
+try to match the public key in the device list, because the device view
+deliberately omits the public key (`:28106-28117`); the idempotent re-enroll is
+the recovery path, and it needs no server-side public-key lookup. No
+device-authenticated revoke and no unattended reconciliation are needed, because
+the retire is part of the atomic enrollment rather than a later step.
 
 ### Revoke
 
@@ -347,9 +357,12 @@ The provider slice must still add (tracked separately, not in this document):
   `_ATLAS_FUNNEL_READ_PATHS` `:5883` for any new read; new reads must be added to
   that allow-list or they fail closed by design).
 - The atomic `supersedes` option on enrollment (bearer-authenticated), which in
-  one transaction records the new device and revokes the named predecessor of the
-  caller's own operator (see Rotate). This is the whole rotation retire path;
-  there is deliberately no device-authenticated revoke, so no device can revoke a
+  one transaction locks the predecessor row, verifies it is the caller operator's
+  and still active, records the new device, and revokes the predecessor with a
+  locked compare-and-set (409 if it is already revoked/superseded, 200 for a
+  same-key idempotent retry), so a predecessor gets exactly one active successor
+  (see Rotate). This is the whole rotation retire path; there is deliberately no
+  device-authenticated revoke, so no device can revoke a
   peer. The existing bearer-authenticated revoke route is unchanged.
 - The local Connect provider process itself (loopback registration, capability
   manifest, `job_id` idempotent submission), the adapter that signs tracker
