@@ -8383,6 +8383,38 @@ def _ensure_connect_device_operation_schema() -> None:
                         device_id, operation_fingerprint
                     )
                     WHERE consumed_at IS NULL;
+
+                -- Durable authorization reservation for a device money path whose
+                -- effect is an external Atlas call (bookings, later handoff). When a
+                -- device dispatches such a capability the tracker consumes the
+                -- challenge and confirmation AND records the authorized operation
+                -- here in one transaction: the frozen canonical Atlas request, its
+                -- idempotency key, and the operation fingerprint. The remote relay is
+                -- then driven from this row, so a retry after an ambiguous timeout
+                -- replays the SAME request and idempotency key (Atlas resolves it
+                -- idempotently) without burning a fresh confirmation. One reservation
+                -- per (device, operation_fingerprint); a compromised device can only
+                -- re-drive an already-authorized operation, never mint a new one.
+                CREATE TABLE IF NOT EXISTS connect_device_operation_reservations (
+                    reservation_id UUID PRIMARY KEY,
+                    device_id UUID NOT NULL
+                        REFERENCES connect_devices(device_id) ON DELETE CASCADE,
+                    capability VARCHAR(128) NOT NULL,
+                    operation_fingerprint CHAR(64) NOT NULL,
+                    idempotency_key VARCHAR(128) NOT NULL,
+                    atlas_path TEXT NOT NULL,
+                    request_body JSONB NOT NULL,
+                    status VARCHAR(16) NOT NULL DEFAULT 'reserved',
+                    receipt JSONB,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    CONSTRAINT uq_connect_device_op_reservations_operation
+                        UNIQUE (device_id, operation_fingerprint),
+                    CONSTRAINT ck_connect_device_op_reservations_status
+                        CHECK (status IN ('reserved', 'completed'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_connect_device_op_reservations_prune
+                    ON connect_device_operation_reservations(updated_at);
                 """
             )
 
@@ -28579,8 +28611,21 @@ CONNECT_DEVICE_MARK_WORKING_CAPABILITY = "funnel.lead.mark_working"
 # the tracker's service token and sends a real customer email, so it is
 # confirmation-required and the bound operator must be the configured approver.
 CONNECT_DEVICE_APPROVE_SEND_CAPABILITY = "funnel.onboarding_draft.approve_send"
+# Atlas booking money paths. Like approve_send these relay to Atlas with the
+# tracker's service token, but they carry a client idempotency key and a scheduled
+# window, so they dispatch through a durable authorization reservation (a retry
+# replays the frozen request and key without re-confirming). The bound operator
+# must be the configured approver, a deliberate strengthening over the office
+# booking routes, which are only admin-role gated.
+CONNECT_DEVICE_ESTIMATE_BOOKING_CAPABILITY = "funnel.lead.estimate_booking"
+CONNECT_DEVICE_FIRST_CLEAN_BOOKING_CAPABILITY = "funnel.lead.first_clean_booking"
 _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
-    {CONNECT_DEVICE_MARK_WORKING_CAPABILITY, CONNECT_DEVICE_APPROVE_SEND_CAPABILITY}
+    {
+        CONNECT_DEVICE_MARK_WORKING_CAPABILITY,
+        CONNECT_DEVICE_APPROVE_SEND_CAPABILITY,
+        CONNECT_DEVICE_ESTIMATE_BOOKING_CAPABILITY,
+        CONNECT_DEVICE_FIRST_CLEAN_BOOKING_CAPABILITY,
+    }
 )
 
 
@@ -28618,7 +28663,65 @@ def _connect_device_operation_fingerprint(
 _CONNECT_DEVICE_OPERATION_TARGET_FIELDS: Dict[str, Tuple[str, ...]] = {
     CONNECT_DEVICE_MARK_WORKING_CAPABILITY: ("contactId", "expectedStateToken"),
     CONNECT_DEVICE_APPROVE_SEND_CAPABILITY: ("draftId",),
+    CONNECT_DEVICE_ESTIMATE_BOOKING_CAPABILITY: (
+        "contactId",
+        "scheduledStart",
+        "scheduledEnd",
+        "idempotencyKey",
+    ),
+    CONNECT_DEVICE_FIRST_CLEAN_BOOKING_CAPABILITY: (
+        "contactId",
+        "scheduledStart",
+        "scheduledEnd",
+        "idempotencyKey",
+    ),
 }
+# Every field a confirmation request may carry, across all capabilities. The
+# target builder rejects a request unless the fields present are exactly the ones
+# its capability requires, so a confirmation can never bind a cross-capability
+# target.
+_CONNECT_DEVICE_OPERATION_ALL_TARGET_FIELDS: Tuple[str, ...] = (
+    "contactId",
+    "expectedStateToken",
+    "draftId",
+    "scheduledStart",
+    "scheduledEnd",
+    "idempotencyKey",
+)
+# UUID-shaped fields are normalized to a canonical string so issuance and dispatch
+# hash identically; datetime fields are format-validated but kept verbatim so the
+# two sides must send the identical string.
+_CONNECT_DEVICE_OPERATION_UUID_FIELDS = frozenset(
+    {"contactId", "draftId", "idempotencyKey"}
+)
+_CONNECT_DEVICE_OPERATION_DATETIME_FIELDS = frozenset(
+    {"scheduledStart", "scheduledEnd"}
+)
+
+
+def _validate_connect_operation_datetime(value: str) -> str:
+    """Validate an RFC 3339 date-time (with timezone) for a device operation
+    target, returning it verbatim. Kept unchanged so the confirmation and the
+    dispatch, which both pass the raw string through this check, hash identically."""
+    text = str(value)
+    if not _FUNNEL_BOOKING_RFC3339_PATTERN.fullmatch(text):
+        raise HTTPException(status_code=422, detail="Invalid operation date-time")
+    try:
+        parsed = _parse_funnel_booking_datetime(text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid operation date-time") from exc
+    if parsed.tzinfo is None:
+        raise HTTPException(status_code=422, detail="Operation date-time needs a timezone")
+    return text
+
+
+def _connect_device_operation_target_field(field: str, value: Any) -> str:
+    """Normalize one target field to its canonical fingerprint string."""
+    if field in _CONNECT_DEVICE_OPERATION_UUID_FIELDS:
+        return _validate_connect_operation_uuid(str(value))
+    if field in _CONNECT_DEVICE_OPERATION_DATETIME_FIELDS:
+        return _validate_connect_operation_datetime(str(value))
+    return str(value)
 
 
 def _connect_device_confirmation_target(
@@ -28628,14 +28731,14 @@ def _connect_device_confirmation_target(
     canonical operation target. Requires exactly the capability's target fields,
     rejecting a request that omits one or carries a field from another capability,
     so a confirmation cannot be minted for a malformed or cross-capability target.
-    The UUID-shaped id fields are normalized so the fingerprint is stable across
-    equivalent spellings."""
+    UUID-shaped id fields are normalized and datetime fields format-validated, both
+    the same way dispatch does, so the fingerprint is stable across the two sides."""
     required = _CONNECT_DEVICE_OPERATION_TARGET_FIELDS.get(capability)
     if required is None:
         raise HTTPException(status_code=400, detail="Unknown device operation capability")
     provided = {
         field
-        for field in ("contactId", "expectedStateToken", "draftId")
+        for field in _CONNECT_DEVICE_OPERATION_ALL_TARGET_FIELDS
         if getattr(payload, field) is not None
     }
     if provided != set(required):
@@ -28644,13 +28747,10 @@ def _connect_device_confirmation_target(
             detail=f"Capability {capability} requires exactly these target fields: "
             + ", ".join(required),
         )
-    target: Dict[str, str] = {}
-    for field in required:
-        value = str(getattr(payload, field))
-        if field in ("contactId", "draftId"):
-            value = _validate_connect_operation_uuid(value)
-        target[field] = value
-    return target
+    return {
+        field: _connect_device_operation_target_field(field, getattr(payload, field))
+        for field in required
+    }
 
 
 def _validate_connect_operation_uuid(value: str) -> str:
@@ -28757,13 +28857,110 @@ def _authorize_connect_device_operation(
             )
 
 
+def _serialize_connect_device_reservation(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a reservation row for dispatch (JSONB comes back parsed)."""
+    return {
+        "reservation_id": str(row["reservation_id"]),
+        "status": row["status"],
+        "atlas_path": row["atlas_path"],
+        "idempotency_key": row["idempotency_key"],
+        "request_body": row["request_body"],
+        "receipt": row["receipt"],
+    }
+
+
+def _reserve_or_get_connect_device_operation(
+    *,
+    device_id: str,
+    capability: str,
+    fingerprint: str,
+    idempotency_key: str,
+    atlas_path: str,
+    request_body: Dict[str, Any],
+    challenge_id: str,
+    confirmation_id: str,
+) -> Dict[str, Any]:
+    """Return the durable authorization reservation for one device money operation,
+    creating it on the first attempt and returning the existing one on a retry.
+
+    On a NEW operation (no reservation for this device+fingerprint) this consumes
+    the single-use challenge and confirmation and records the frozen Atlas request
+    in ONE transaction, after re-asserting the operator is still active and locking
+    the device+operator rows, so a revoke racing dispatch cannot mint a reservation.
+    On a RETRY (the reservation already exists, e.g. after an ambiguous Atlas
+    timeout) it returns that reservation WITHOUT touching the tokens: the operation
+    is already authorized and the caller replays the frozen request under it. So a
+    fresh confirmation is spent exactly once per operation, and a compromised device
+    can only re-drive an already-authorized operation, never mint a new one."""
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT * FROM connect_device_operation_reservations
+                WHERE device_id = %s AND operation_fingerprint = %s
+                FOR UPDATE
+                """,
+                (device_id, fingerprint),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                return _serialize_connect_device_reservation(existing)
+            # New operation: lock+recheck operator, consume tokens, and record the
+            # reservation atomically. If a concurrent request created the reservation
+            # between the SELECT and INSERT, the unique constraint aborts this
+            # transaction; the caller retries and finds the winner's reservation.
+            _assert_connect_device_operator_active(cur, device_id)
+            _consume_connect_device_operation_tokens(
+                cur, device_id, challenge_id, confirmation_id, capability, fingerprint
+            )
+            cur.execute(
+                """
+                INSERT INTO connect_device_operation_reservations
+                    (reservation_id, device_id, capability, operation_fingerprint,
+                     idempotency_key, atlas_path, request_body, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'reserved')
+                RETURNING *
+                """,
+                (
+                    str(uuid4()),
+                    device_id,
+                    capability,
+                    fingerprint,
+                    idempotency_key,
+                    atlas_path,
+                    psycopg2.extras.Json(request_body),
+                ),
+            )
+            return _serialize_connect_device_reservation(cur.fetchone())
+
+
+def _complete_connect_device_operation_reservation(
+    reservation_id: str, receipt: Dict[str, Any]
+) -> None:
+    """Freeze the validated receipt on a reservation once Atlas has confirmed the
+    effect, so a later replay returns the same receipt without re-calling Atlas.
+    Idempotent: a reservation already completed keeps its first receipt."""
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE connect_device_operation_reservations
+                SET status = 'completed', receipt = %s, updated_at = NOW()
+                WHERE reservation_id = %s AND status = 'reserved'
+                """,
+                (psycopg2.extras.Json(receipt), reservation_id),
+            )
+
+
 class ConnectDeviceOperationConfirmationRequest(BaseModel):
     """An operator's fresh authorization for one specific device operation.
 
     ``capability`` selects which target fields are required: mark_working needs
-    ``contactId`` and ``expectedStateToken``; approve_send needs ``draftId``. The
-    other target fields must be omitted, so a confirmation cannot carry a
-    cross-capability target (enforced in ``_connect_device_confirmation_target``)."""
+    ``contactId`` and ``expectedStateToken``; approve_send needs ``draftId``; the
+    booking capabilities need ``contactId``, ``scheduledStart``, ``scheduledEnd``,
+    and ``idempotencyKey``. The other target fields must be omitted, so a
+    confirmation cannot carry a cross-capability target (enforced in
+    ``_connect_device_confirmation_target``)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -28771,6 +28968,9 @@ class ConnectDeviceOperationConfirmationRequest(BaseModel):
     contactId: Optional[str] = Field(default=None, min_length=1, max_length=64)
     expectedStateToken: Optional[str] = Field(default=None, min_length=1, max_length=128)
     draftId: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    scheduledStart: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    scheduledEnd: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    idempotencyKey: Optional[str] = Field(default=None, min_length=1, max_length=64)
 
 
 class ConnectDeviceMarkLeadWorkingRequest(BaseModel):
@@ -28799,6 +28999,46 @@ class ConnectDeviceApproveOnboardingDraftRequest(BaseModel):
     confirmationId: str = Field(min_length=1, max_length=64)
 
 
+class ConnectDeviceBookingRequest(BaseModel):
+    """The device's request to book an Atlas estimate or first clean. Carries the
+    single-use ``challengeId``, the operator's ``confirmationId`` for this exact
+    booking, and the same appointment window and client ``idempotencyKey`` the
+    office booking accepts. The window and key are part of the operation
+    fingerprint, so the confirmation authorizes exactly this booking, and the key
+    is the durable idempotency identity a retry replays against Atlas."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    challengeId: str = Field(min_length=1, max_length=64)
+    confirmationId: str = Field(min_length=1, max_length=64)
+    scheduledStart: str = Field(min_length=20, max_length=64)
+    scheduledEnd: str = Field(min_length=20, max_length=64)
+    idempotencyKey: UUID = Field(...)
+
+    @field_validator("scheduledStart", "scheduledEnd", mode="before")
+    @classmethod
+    def validate_rfc3339_datetime(cls, value: Any) -> Any:
+        if not isinstance(value, str) or not _FUNNEL_BOOKING_RFC3339_PATTERN.fullmatch(
+            value
+        ):
+            raise ValueError("must be an RFC 3339 date-time string")
+        try:
+            parsed = _parse_funnel_booking_datetime(value)
+        except ValueError as exc:
+            raise ValueError("must be an RFC 3339 date-time string") from exc
+        if parsed.tzinfo is None:
+            raise ValueError("must include a timezone")
+        return value
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "ConnectDeviceBookingRequest":
+        if _parse_funnel_booking_datetime(self.scheduledEnd) <= _parse_funnel_booking_datetime(
+            self.scheduledStart
+        ):
+            raise ValueError("scheduledEnd must be after scheduledStart")
+        return self
+
+
 _CONNECT_DEVICE_OP_PRUNE_LOCK = threading.Lock()
 _CONNECT_DEVICE_OP_PRUNE_LAST_AT = 0.0
 
@@ -28821,6 +29061,18 @@ _CONNECT_DEVICE_OP_PRUNE_STATEMENTS = (
         SELECT ctid FROM connect_device_operation_confirmations
         WHERE (consumed_at IS NOT NULL OR expires_at <= clock_timestamp())
           AND created_at < clock_timestamp() - make_interval(secs => %s)
+        LIMIT %s
+    )
+    """,
+    # Reservations are pruned by inactivity: a completed reservation older than the
+    # retention window is past any useful replay, and a reserved-but-abandoned one
+    # (never completed) past the same window is a dead operation. updated_at moves
+    # on completion, so a live in-flight retry stays fresh and is not reaped.
+    """
+    DELETE FROM connect_device_operation_reservations
+    WHERE ctid IN (
+        SELECT ctid FROM connect_device_operation_reservations
+        WHERE updated_at < clock_timestamp() - make_interval(secs => %s)
         LIMIT %s
     )
     """,
@@ -29250,6 +29502,165 @@ def connect_device_approve_funnel_onboarding_draft(
     return JSONResponse(
         status_code=200 if visible["idempotent"] else 201,
         content=jsonable_encoder(visible),
+    )
+
+
+def _connect_device_submit_booking(
+    *,
+    contact_id: str,
+    request: Request,
+    operator: Dict[str, Any],
+    capability: str,
+    atlas_capability: str,
+    atlas_path: str,
+    expected_stage: str,
+    expected_status: str,
+    requires_onboarding_draft: bool,
+    audit_prefix: str,
+) -> JSONResponse:
+    """Device-driven, confirmation-gated Atlas booking money path, dispatched
+    through the durable authorization reservation.
+
+    Faithful to the office booking helper (`_submit_atlas_funnel_booking`): same
+    Atlas capability gate, same request body, same 200/201 receipt. It strengthens
+    authorization for the unattended device: the bound operator must be the
+    configured funnel approver (the office booking route is only admin-role gated),
+    and the operation needs a single-use challenge plus a confirmation bound to the
+    exact booking (contact, window, idempotency key). Tokens are consumed into a
+    durable reservation that freezes the Atlas request and idempotency key; a retry
+    after an ambiguous failure replays the reservation (no fresh confirmation), and
+    Atlas resolves the frozen key idempotently, so there is no double booking."""
+    payload = _connect_device_parse_body(request, ConnectDeviceBookingRequest)
+    _require_juan_funnel_approver(operator, action="book estimates and first cleans")
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(atlas_capability, operator)
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            f"{audit_prefix}_CAPABILITY_UNAVAILABLE",
+            False,
+            f"device={operator['deviceId']} capability={exc.capability}",
+            persist_to_file=False,
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    contact_id_text = str(contact_id)
+    device_id = operator["deviceId"]
+    challenge_id = _validate_connect_operation_uuid(payload.challengeId)
+    confirmation_id = _validate_connect_operation_uuid(payload.confirmationId)
+    idempotency_key = str(payload.idempotencyKey)
+    fingerprint = _connect_device_operation_fingerprint(
+        capability,
+        {
+            "contactId": contact_id_text,
+            "scheduledStart": payload.scheduledStart,
+            "scheduledEnd": payload.scheduledEnd,
+            "idempotencyKey": idempotency_key,
+        },
+    )
+    reservation = _reserve_or_get_connect_device_operation(
+        device_id=device_id,
+        capability=capability,
+        fingerprint=fingerprint,
+        idempotency_key=idempotency_key,
+        atlas_path=atlas_path.format(contact_id=contact_id_text),
+        request_body=_atlas_funnel_booking_body(payload),
+        challenge_id=challenge_id,
+        confirmation_id=confirmation_id,
+    )
+    if reservation["status"] == "completed":
+        append_access_log(
+            request,
+            f"{audit_prefix}_REPLAYED",
+            True,
+            f"device={device_id} contact={contact_id_text}",
+            persist_to_file=False,
+        )
+        return JSONResponse(status_code=200, content=jsonable_encoder(reservation["receipt"]))
+
+    # Reserved: drive the remote relay from the frozen request and idempotency key.
+    try:
+        atlas_result = _atlas_funnel_request(
+            reservation["atlas_path"],
+            operator,
+            payload=reservation["request_body"],
+            idempotency_key=reservation["idempotency_key"],
+        )
+        visible = _validate_atlas_funnel_booking_result(
+            atlas_result,
+            contact_id=contact_id_text,
+            expected_stage=expected_stage,
+            expected_status=expected_status,
+            requires_onboarding_draft=requires_onboarding_draft,
+        )
+    except AtlasFunnelRequestError as exc:
+        # The reservation stays 'reserved' so a later retry replays it; the frozen
+        # idempotency key keeps Atlas from double-booking across that retry.
+        append_access_log(
+            request,
+            f"{audit_prefix}_FAILED",
+            False,
+            f"device={device_id} contact={contact_id_text} status={exc.status_code}",
+            persist_to_file=False,
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    _complete_connect_device_operation_reservation(reservation["reservation_id"], visible)
+    append_access_log(
+        request,
+        f"{audit_prefix}_SUBMITTED",
+        True,
+        f"device={device_id} contact={contact_id_text} idempotent={visible['idempotent']}",
+        persist_to_file=False,
+    )
+    return JSONResponse(
+        status_code=200 if visible["idempotent"] else 201,
+        content=jsonable_encoder(visible),
+    )
+
+
+@app.post("/api/connect/device/funnel/leads/{contact_id}/estimate-bookings")
+def connect_device_create_funnel_estimate_booking(
+    contact_id: UUID,
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> JSONResponse:
+    """Device-driven, confirmation-gated Atlas estimate booking (see
+    ``_connect_device_submit_booking``)."""
+    return _connect_device_submit_booking(
+        contact_id=str(contact_id),
+        request=request,
+        operator=operator,
+        capability=CONNECT_DEVICE_ESTIMATE_BOOKING_CAPABILITY,
+        atlas_capability=ATLAS_FUNNEL_CAPABILITY_LEAD_ESTIMATE_BOOKING,
+        atlas_path=ATLAS_ESTIMATE_BOOKINGS_PATH,
+        expected_stage="estimate_booked",
+        expected_status="estimate_booked",
+        requires_onboarding_draft=False,
+        audit_prefix="CONNECT_DEVICE_FUNNEL_ESTIMATE_BOOKING",
+    )
+
+
+@app.post("/api/connect/device/funnel/leads/{contact_id}/first-clean-bookings")
+def connect_device_create_funnel_first_clean_booking(
+    contact_id: UUID,
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> JSONResponse:
+    """Device-driven, confirmation-gated Atlas first-clean booking (see
+    ``_connect_device_submit_booking``)."""
+    return _connect_device_submit_booking(
+        contact_id=str(contact_id),
+        request=request,
+        operator=operator,
+        capability=CONNECT_DEVICE_FIRST_CLEAN_BOOKING_CAPABILITY,
+        atlas_capability=ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING,
+        atlas_path=ATLAS_FIRST_CLEAN_BOOKINGS_PATH,
+        expected_stage="won",
+        expected_status="first_clean_booked",
+        requires_onboarding_draft=True,
+        audit_prefix="CONNECT_DEVICE_FUNNEL_FIRST_CLEAN_BOOKING",
     )
 
 
