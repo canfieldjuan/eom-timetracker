@@ -63,9 +63,17 @@ per request and carries no Atlas secret:
   path, where the operator is checked before the authorizing write
   (`:28191-28200`); and the authorizing `UPDATE ... last_seen_at` matching no row
   returns `401` only in the narrow case where a revoke or demotion commits
-  concurrently, between those checks and the write (`:28202-28223`). So the
-  provider reads `401` as an invalid or revoked device credential and `403` as a
-  suspended or demoted operator.
+  concurrently, between those checks and the write (`:28202-28223`). A `401`
+  therefore means an invalid or revoked device credential. A `403` does NOT
+  uniquely mean a suspended operator: the same status is returned for a device
+  whose operator is inactive or not an admin (`:28191-28200`), for a bound
+  operator who is not the configured funnel approver (`:22935-22938`), and for a
+  missing, expired, or mismatched operation confirmation on a money path
+  (`:29028-29031`). The provider must therefore classify by the error detail or a
+  structured error code, not by the bare status: only the device-authentication
+  `403` detail is operator suspension, while the approver and confirmation `403`s
+  are action-specific authorization failures to be surfaced as such, not as an
+  account state.
 
 So the local provider's credential is its enrolled device Ed25519 private key
 plus its `device_id`. The Atlas service token stays on the tracker. The provider
@@ -181,13 +189,24 @@ Local-store ordering for crash safety: persist the new private key with a
 enrollment challenge/signature) before the call, then on success record the
 returned `device_id` and drop the old key. If the host crashes after the call
 commits but before it records the `device_id`, recovery re-issues the SAME
-enrollment (same `publicKey`), which is the existing idempotent re-enroll and
-returns `200` with the device view carrying the new `device_id`. Recovery does not
-try to match the public key in the device list, because the device view
-deliberately omits the public key (`:28106-28117`); the idempotent re-enroll is
-the recovery path, and it needs no server-side public-key lookup. No
-device-authenticated revoke and no unattended reconciliation are needed, because
-the retire is part of the atomic enrollment rather than a later step.
+enrollment (same `publicKey`): once the atomic rotation has committed, re-enroll
+is the existing same-key idempotent path and returns `200` with the device view
+carrying the new `device_id`. Recovery does not try to match the public key in the
+device list, because the device view deliberately omits the public key
+(`:28106-28117`).
+
+Enrollment validates the challenge before it reaches same-key idempotency
+(`:28372-28375`, `:28398-28438`), and the enrollment challenge TTL defaults to
+300s (`CONNECT_DEVICE_ENROLLMENT_CHALLENGE_TTL_S` `:5004-5006`, checked at
+`:28052-28056`). So recovery is automatic only while the stored challenge is still
+within its TTL; a crash whose recovery starts later needs a FRESH enrollment
+challenge and signature, which is bearer-gated. That is acceptable because
+rotation is inherently interactive: the operator who initiated it obtains a fresh
+challenge on their next session and re-enrolls the same key, which is still
+idempotent (`200`) and returns the `device_id`. The retire never has to be redone,
+because the atomic rotation already revoked the predecessor; only the `device_id`
+readback remains, and it needs no device-authenticated revoke and no unattended
+reconciliation.
 
 ### Revoke
 
@@ -208,25 +227,6 @@ Two independent controls stop a device, and they differ in permanence:
   `active` (only the explicit revoke flips it), every device bound to that
   operator becomes usable again. Deactivating an operator during a security
   incident does not durably contain a device believed compromised.
-
-### Revoke
-
-Two independent controls stop a device, and they differ in permanence:
-
-- **Permanent, one-way: device revocation.** The operator revokes the device
-  (`POST /api/admin/connect/devices/{device_id}/revoke` `:28464`), which flips
-  `connect_devices.status` to `revoked` with no path back (`:28490-28497`; the
-  status set is closed and a revoked key is never reactivated). The next device
-  request fails the active-device predicate and returns 401 (`:28210-28223`).
-- **Temporary, reversible: operator suspension.** Deactivating or demoting the
-  bound operator makes the same per-request recheck fail (it reads the operator's
-  current `active` and `role`, `:28210-28223`), so access stops immediately while
-  the operator is inactive. But this is a SUSPENSION, not revocation: the employee
-  record can be reactivated or re-promoted (`:16846-16849`), and because the
-  device row itself is still `active` (only the explicit revoke flips it), every
-  device bound to that operator becomes usable again. Deactivating an operator
-  during a security incident does not durably contain a device believed
-  compromised.
 
 So permanent containment of a compromised buyer PC requires explicitly revoking
 its device (the one-way flip); operator deactivation alone is a reversible
@@ -295,7 +295,13 @@ retry needs; calling Atlas before consuming would allow concurrent dispatch.
 The money-path dispatch protocol therefore consumes the tokens in a tracker-side
 transaction that also durably records the authorized operation as a reservation:
 the operation fingerprint, the rendered canonical Atlas request, and the exact
-idempotency key, keyed so a retry finds it. The remote relay is then called
+idempotency key, keyed so a retry finds it. That transaction MUST first re-assert
+the device and operator are still authorized, calling
+`_assert_connect_device_operator_active` (`:28614-28621`) to recheck and lock the
+device and operator rows exactly as the mutation gate does inside its final
+transaction (`:28983-28990`); device authentication ran in an earlier transaction,
+so without this recheck a revoke or demotion committing in between could let a
+stale request create a durable money reservation. The remote relay is then called
 against that frozen reservation, and every retry or reconciliation replays the
 same recorded request and idempotency key rather than re-rendering from current
 state or requiring a fresh confirmation. A crash after the reservation commits
@@ -367,8 +373,9 @@ The provider slice must still add (tracked separately, not in this document):
 - The local Connect provider process itself (loopback registration, capability
   manifest, `job_id` idempotent submission), the adapter that signs tracker
   requests with the device key, and the local-store crash-safe rotation ordering
-  (persist the new key with a `pending_enroll` intent, recover the `device_id` by
-  listing on restart; see Rotate).
+  (persist the new key with a `pending_enroll` intent, and on restart recover the
+  `device_id` by re-issuing the same-key enrollment, not by listing devices, since
+  the device view omits the public key; see Rotate).
 
 ## Security properties
 
