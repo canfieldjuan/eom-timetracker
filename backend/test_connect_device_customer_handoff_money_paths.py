@@ -299,6 +299,117 @@ def test_confirmation_for_different_payload_rejected(client, auth, monkeypatch):
     assert calls == []
 
 
+def test_handoff_refused_when_capability_unavailable(client, auth, monkeypatch):
+    # If the deployed Atlas does not advertise lead.customer_handoff, the endpoint
+    # refuses (501) BEFORE reserving: no Customer/Site, no relay, and the tokens
+    # survive so the same challenge+confirmation complete once Atlas can serve it.
+    _set_approver(monkeypatch, client, auth)
+    private_key, device_id = _enroll_device(client, auth)
+    contact_id = _fresh_contact()
+    key = str(uuid.uuid4())
+    payload = _payload(contact_id, key)
+    confirmation_id = _issue_handoff_confirmation(
+        client, auth, device_id, payload
+    ).json()["confirmationId"]
+    challenge_id = _issue_challenge(client, device_id, private_key)
+
+    calls: list = []
+    _forbid_atlas(monkeypatch, calls)
+    monkeypatch.setattr(
+        api, "_require_atlas_funnel_capability",
+        lambda cap, _admin: (_ for _ in ()).throw(api.AtlasFunnelCapabilityUnavailable(cap)),
+    )
+    refused = _submit_handoff(client, device_id, private_key, contact_id, payload,
+                              challenge_id, confirmation_id)
+    assert refused.status_code == 501, refused.text
+    assert _customer_ids_for_contact(contact_id) == []
+    assert not _handoff_exists(contact_id)
+    assert calls == []
+
+    # Tokens survived: capability now available, real relay -> the SAME tokens
+    # complete the handoff.
+    monkeypatch.setattr(api, "_require_atlas_funnel_capability", lambda *_a, **_k: None)
+    _stub_atlas_handoff(monkeypatch)
+    ok = _submit_handoff(client, device_id, private_key, contact_id, payload,
+                         challenge_id, confirmation_id)
+    assert ok.status_code == 201, ok.text
+    assert ok.json()["handoff"]["status"] == "finalized"
+
+
+def test_finalized_replay_returns_receipt_even_when_capability_withdrawn(client, auth, monkeypatch):
+    # A finalized handoff replays its receipt (200) before the capability gate, so a
+    # capability withdrawn after the handoff completed cannot turn a receipt read
+    # into a 501, and Atlas is not re-called.
+    _set_approver(monkeypatch, client, auth)
+    private_key, device_id = _enroll_device(client, auth)
+    contact_id = _fresh_contact()
+    key = str(uuid.uuid4())
+    payload = _payload(contact_id, key)
+    _stub_atlas_handoff(monkeypatch)
+    confirmation_id = _issue_handoff_confirmation(
+        client, auth, device_id, payload
+    ).json()["confirmationId"]
+    challenge_id = _issue_challenge(client, device_id, private_key)
+    first = _submit_handoff(client, device_id, private_key, contact_id, payload,
+                            challenge_id, confirmation_id)
+    assert first.status_code == 201, first.text
+    first_customer_id = first.json()["handoff"]["customer"]["id"]
+
+    calls: list = []
+    _forbid_atlas(monkeypatch, calls)
+    monkeypatch.setattr(
+        api, "_require_atlas_funnel_capability",
+        lambda cap, _admin: (_ for _ in ()).throw(api.AtlasFunnelCapabilityUnavailable(cap)),
+    )
+    replay = _submit_handoff(client, device_id, private_key, contact_id, payload,
+                             challenge_id, confirmation_id)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["idempotent"] is True
+    assert replay.json()["handoff"]["customer"]["id"] == first_customer_id
+    assert calls == []
+
+
+def test_reserved_replay_refuses_after_device_revoked(client, auth, monkeypatch):
+    # A pending handoff's reservation exists (records created, tokens spent). If the
+    # device is revoked before a retry, replaying the reservation must re-assert the
+    # operator is active and refuse -- the replay branch runs the authorize hook, so
+    # a revoke committing during the advisory-lock wait cannot drive the Atlas call.
+    juan_id = _set_approver(monkeypatch, client, auth)
+    private_key, device_id = _enroll_device(client, auth)
+    contact_id = _fresh_contact()
+    key = str(uuid.uuid4())
+    payload = _payload(contact_id, key)
+    confirmation_id = _issue_handoff_confirmation(
+        client, auth, device_id, payload
+    ).json()["confirmationId"]
+    challenge_id = _issue_challenge(client, device_id, private_key)
+
+    _stub_atlas_handoff(monkeypatch, fail_status=503)
+    pending = _submit_handoff(client, device_id, private_key, contact_id, payload,
+                              challenge_id, confirmation_id)
+    assert pending.status_code == 202, pending.text
+
+    revoked = client.post(
+        f"/api/admin/connect/devices/{device_id}/revoke", headers=auth
+    )
+    assert revoked.status_code == 200, revoked.text
+
+    # The reserved-replay branch runs inside the reserve lock; it does not go through
+    # the endpoint's device auth (which would already reject a revoked device). Call
+    # reserve directly with the real operator-active check to prove the replay branch
+    # itself re-checks and refuses.
+    office_payload = api.OfficeEstimateApprovalRequest.model_validate(payload)
+
+    def _authorize(cur, *, created):
+        api._assert_connect_device_operator_active(cur, device_id)
+
+    with pytest.raises(api.HTTPException) as exc_info:
+        api._reserve_office_conversion_handoff(
+            office_payload, {"id": juan_id}, authorize=_authorize
+        )
+    assert exc_info.value.status_code == 403
+
+
 def test_non_approver_rejected_before_reservation(client, auth, monkeypatch):
     import time_tracker_api as api_mod
     monkeypatch.setattr(api_mod, "EOM_FUNNEL_APPROVER_EMPLOYEE_ID", 9_999_999)

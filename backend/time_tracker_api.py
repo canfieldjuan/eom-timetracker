@@ -5995,6 +5995,12 @@ ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION = "contact.operator_mutation"
 ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR = "contact.field_clear"
 ATLAS_FUNNEL_CAPABILITY_LEAD_ESTIMATE_BOOKING = "lead.estimate_booking"
 ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
+# The customer-handoff relay Atlas serves at POST /eom-funnel/customer-handoffs.
+# The office approve-estimate route relies on the reserve-then-202 recovery rather
+# than gating on this name; the unattended device gates on it BEFORE reserving, so
+# it never creates a Customer/Site or spends a confirmation for a handoff the
+# deployed Atlas cannot complete.
+ATLAS_FUNNEL_CAPABILITY_LEAD_CUSTOMER_HANDOFF = "lead.customer_handoff"
 # The post-clean report is separate from booking: Atlas advertises this name
 # only after its immutable first-clean completion receipt boundary is deployed.
 ATLAS_FUNNEL_CAPABILITY_CUSTOMER_FIRST_CLEAN_COMPLETION_RECORD = (
@@ -23054,13 +23060,17 @@ def _reserve_office_conversion_handoff(
 ) -> tuple[Dict[str, Any], bool]:
     """Create once or return the canonical local operation under one lock.
 
-    ``authorize``, when given, runs inside this transaction ONLY on the create
-    branch, after every conflict/idempotency check has passed and immediately
-    before the Customer/Site and handoff rows are written. The device path uses it
-    to consume its single-use tokens atomically with the reservation: if it raises,
-    the whole transaction rolls back (no token spent, no Customer/Site created); a
-    replay that returns the existing reservation never runs it, so a retry with
-    already-spent tokens still resolves to the same operation."""
+    ``authorize``, when given, runs inside this transaction on BOTH branches with a
+    ``created`` keyword: ``authorize(cur, created=True)`` on first creation (after
+    every conflict/idempotency check and immediately before the Customer/Site and
+    handoff rows are written) and ``authorize(cur, created=False)`` on a replay that
+    returns the existing reservation. The device path uses it to (a) re-assert the
+    bound device and operator are still authorized on EVERY attempt -- creation and
+    retry alike, so a revoke or demotion that commits while this transaction waits
+    on the customer/site advisory lock cannot let a retry drive the Atlas mutation
+    -- and (b) consume its single-use tokens ONLY on creation. If it raises, the
+    whole transaction rolls back (no token spent, no Customer/Site created); a retry
+    with already-spent tokens re-checks authorization without re-consuming them."""
     fingerprint = _office_conversion_fingerprint(payload)
     contact_id = str(payload.atlasContactId)
     key = str(payload.idempotencyKey)
@@ -23092,6 +23102,13 @@ def _reserve_office_conversion_handoff(
                             "This approval key was already used with different estimate details",
                             {"customerId": int(row["customer_id"]), "siteId": int(row["site_id"])},
                         )
+                    # Re-assert authorization on the replay too (a retry of a
+                    # pending handoff), holding the handoff row, before returning:
+                    # a revoke or demotion that committed while this transaction
+                    # waited on the advisory lock must stop the retry from driving
+                    # the Atlas mutation. Tokens are NOT re-consumed here.
+                    if authorize is not None:
+                        authorize(cur, created=False)
                     customer = _canonical_customer(cur, int(row["customer_id"]))
                     return {"handoff": row, "customer": customer}, False
 
@@ -23108,7 +23125,7 @@ def _reserve_office_conversion_handoff(
                     )
 
                 if authorize is not None:
-                    authorize(cur)
+                    authorize(cur, created=True)
 
                 customer_id = _insert_customer(cur, payload)
                 site_id = _insert_site(cur, customer_id, payload.name, payload.primarySite)
@@ -29891,23 +29908,60 @@ def connect_device_create_funnel_customer_handoff(
         _connect_device_handoff_target(office_payload),
     )
 
-    def _authorize(cur) -> None:
-        # Runs inside _reserve_office_conversion_handoff's transaction on the create
-        # branch only, after its conflict checks and before the Customer/Site write.
-        # Re-assert the device + operator are still authorized (authentication ran in
-        # an earlier transaction) and consume the single-use challenge + confirmation
-        # in the SAME transaction as the reservation, so a crash or conflict never
-        # spends a token without creating the reservation, and a replay (existing
-        # reservation) never re-consumes tokens.
-        _assert_connect_device_operator_active(cur, device_id)
-        _consume_connect_device_operation_tokens(
-            cur,
-            device_id,
-            challenge_id,
-            confirmation_id,
-            CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY,
-            fingerprint,
+    # A finalized handoff replays without the Atlas capability gate: the money
+    # already moved and the Customer/Site exists, so a capability withdrawn since
+    # then must not turn a finished handoff's receipt read into a 501 (mirrors the
+    # booking completed-replay). New and still-pending operations run the gate.
+    existing = _office_conversion_handoff_for_contact(contact_id_text)
+    if existing is not None and existing["handoff"]["state"] == "finalized":
+        return _drive_office_conversion_handoff(
+            existing,
+            False,
+            operator,
+            request,
+            event_replayed="CONNECT_DEVICE_CUSTOMER_HANDOFF_REPLAYED",
+            event_submitted="CONNECT_DEVICE_CUSTOMER_HANDOFF_SUBMITTED",
+            event_pending="CONNECT_DEVICE_CUSTOMER_HANDOFF_PENDING",
         )
+
+    # Refuse a handoff the deployed Atlas cannot serve BEFORE reserving, so the
+    # unattended device never creates a Customer/Site or spends a confirmation for
+    # an operation Atlas would reject (the office route relies on reserve-then-202
+    # recovery instead; the device is deliberately stricter, like its bookings).
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_LEAD_CUSTOMER_HANDOFF, operator
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY_UNAVAILABLE",
+            False,
+            f"device={device_id} capability={exc.capability}",
+            persist_to_file=False,
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    def _authorize(cur, *, created: bool) -> None:
+        # Runs inside _reserve_office_conversion_handoff's transaction on BOTH
+        # branches. Always re-assert the device + operator are still authorized
+        # (authentication ran in an earlier transaction and may have waited on the
+        # customer/site advisory lock): a revoke or demotion committing during that
+        # wait must stop even a retry from driving the Atlas mutation. Consume the
+        # single-use challenge + confirmation ONLY on first creation, in the SAME
+        # transaction as the reservation, so a crash or conflict never spends a
+        # token without creating the reservation and a retry never re-consumes
+        # already-spent tokens.
+        _assert_connect_device_operator_active(cur, device_id)
+        if created:
+            _consume_connect_device_operation_tokens(
+                cur,
+                device_id,
+                challenge_id,
+                confirmation_id,
+                CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY,
+                fingerprint,
+            )
 
     reserved, created = _reserve_office_conversion_handoff(
         office_payload, operator, authorize=_authorize
