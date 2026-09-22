@@ -3,10 +3,12 @@
 Status: implemented for the device lifecycle (enroll, list, revoke), a read-only
 device-authenticated funnel access path (see "Device-authenticated access"), a
 confirmation-gated tracker-local MUTATION path (the lead-working claim), and the
-confirmation-gated Atlas MONEY paths (approve-and-send an onboarding draft, and
-estimate / first-clean booking via a durable authorization reservation), all
-under "Device-authenticated mutations". Wiring the remaining Atlas money path
-(customer handoff) through a device reuses this same gate and is the next slice.
+confirmation-gated Atlas MONEY paths (approve-and-send an onboarding draft,
+estimate / first-clean booking via a durable authorization reservation, and the
+customer handoff that creates the operational Customer/Site and finalizes the
+Atlas lead link), all under "Device-authenticated mutations". The customer handoff
+was the last remaining money path, so the device now covers the full funnel
+money-path surface the office does.
 
 ## Purpose
 
@@ -136,17 +138,21 @@ reference `connect_devices` ON DELETE CASCADE):
   The fingerprint is `sha256` of the capability merged with the operation's
   material target parameters, so a confirmation authorizes exactly one concrete
   operation: the contact id and lead state token for `mark_working`, the draft id
-  for `approve_send`, and the contact id, scheduled window, and client idempotency
-  key for the bookings. A confirmation-required capability cannot dispatch from the
+  for `approve_send`, the contact id, scheduled window, and client idempotency
+  key for the bookings, and -- for the customer handoff -- the contact id, the
+  client idempotency key, and a server-computed fingerprint of the ENTIRE
+  Customer/Site payload, so the operator authorizes exactly the records the device
+  will create. A confirmation-required capability cannot dispatch from the
   unattended device without a matching, unconsumed, unexpired confirmation, and a
   confirmation issued for one operation can never authorize another.
 
 Capabilities a device may perform are a **CLOSED** set
 (`_CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES`); an unlisted capability is
 refused. The implemented capabilities are `funnel.lead.mark_working` (tracker
-local), `funnel.onboarding_draft.approve_send` (the first Atlas money path), and
+local), `funnel.onboarding_draft.approve_send` (the first Atlas money path),
 `funnel.lead.estimate_booking` / `funnel.lead.first_clean_booking` (the Atlas
-booking money paths).
+booking money paths), and `funnel.lead.customer_handoff` (the Customer/Site
+creation and Atlas lead-link finalization).
 
 ### Mutation endpoints
 
@@ -195,11 +201,32 @@ booking money paths).
   so a compromised device can only re-drive an already-authorized booking, never
   mint a new one; a new window or key is a new fingerprint that needs a fresh
   confirmation.
+- `POST /api/connect/device/funnel/leads/{contact_id}/customer-handoffs` (device
+  proof) -> creates the operational Customer/Site and finalizes the Atlas lead link
+  on the bound operator's behalf. This is the heaviest money path, so instead of a
+  fresh reservation table it REUSES the office conversion handoff reservation
+  (`eom_office_conversion_handoffs`) and the same Atlas relay / finalize /
+  `202`-pending reconciliation the office `approve-estimate` command uses: the
+  device produces an identical Customer/Site and handoff row and shares the retry
+  path (all three routes now drive through one shared helper). It strengthens
+  authorization for the unattended device: the bound operator must be the
+  configured approver (the office route is only admin-role gated), and, being
+  confirmation-required, the operation needs a challenge plus a confirmation bound
+  to the FULL customer/site payload (via the office conversion fingerprint), so an
+  operator authorizes exactly the Customer/Site the device will create -- an
+  automatic trigger cannot mint records. The challenge and confirmation are
+  consumed inside the reservation transaction (its `authorize` hook, which
+  re-asserts the operator is active), after every conflict/idempotency check and
+  before the Customer/Site rows are written, and ONLY on first creation: a crash or
+  conflict never spends a token without the reservation, and a retry after an
+  ambiguous Atlas failure replays the existing reservation (no fresh confirmation,
+  Atlas resolves the stable idempotency key) to reach `200`/`201` or stay `202`.
+  The body's `atlasContactId` must match the path contact (`422` otherwise).
 
-## Deferred to a later slice
+## Completed money-path surface
 
-- Wiring the customer-handoff Atlas money path through the device. It reuses the
-  durable-reservation gate above, adds the full customer/site payload to its
-  operation fingerprint (the office path already fingerprints those fields), and
-  carries the office handoff's `202`-pending reconciliation. The booking paths
-  above are the worked template for the reservation dispatch.
+The device now covers the full funnel money-path surface the office does:
+lead-working (tracker-local), approve-and-send, estimate and first-clean bookings,
+and customer handoff. There is no remaining deferred device money path. Future
+device work is provider-side (packaging the runtime and the local Connect provider
+that fronts Atlas), not new tracker money-path endpoints.

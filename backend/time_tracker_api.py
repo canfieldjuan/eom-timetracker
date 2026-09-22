@@ -5995,6 +5995,12 @@ ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION = "contact.operator_mutation"
 ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR = "contact.field_clear"
 ATLAS_FUNNEL_CAPABILITY_LEAD_ESTIMATE_BOOKING = "lead.estimate_booking"
 ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
+# The customer-handoff relay Atlas serves at POST /eom-funnel/customer-handoffs.
+# The office approve-estimate route relies on the reserve-then-202 recovery rather
+# than gating on this name; the unattended device gates on it BEFORE reserving, so
+# it never creates a Customer/Site or spends a confirmation for a handoff the
+# deployed Atlas cannot complete.
+ATLAS_FUNNEL_CAPABILITY_LEAD_CUSTOMER_HANDOFF = "lead.customer_handoff"
 # The post-clean report is separate from booking: Atlas advertises this name
 # only after its immutable first-clean completion receipt boundary is deployed.
 ATLAS_FUNNEL_CAPABILITY_CUSTOMER_FIRST_CLEAN_COMPLETION_RECORD = (
@@ -23049,8 +23055,22 @@ def _office_conversion_handoff_for_contact(contact_id: str) -> Optional[Dict[str
 def _reserve_office_conversion_handoff(
     payload: OfficeEstimateApprovalRequest,
     admin: Dict[str, Any],
+    *,
+    authorize: Optional[Callable[[Any], None]] = None,
 ) -> tuple[Dict[str, Any], bool]:
-    """Create once or return the canonical local operation under one lock."""
+    """Create once or return the canonical local operation under one lock.
+
+    ``authorize``, when given, runs inside this transaction on BOTH branches with a
+    ``created`` keyword: ``authorize(cur, created=True)`` on first creation (after
+    every conflict/idempotency check and immediately before the Customer/Site and
+    handoff rows are written) and ``authorize(cur, created=False)`` on a replay that
+    returns the existing reservation. The device path uses it to (a) re-assert the
+    bound device and operator are still authorized on EVERY attempt -- creation and
+    retry alike, so a revoke or demotion that commits while this transaction waits
+    on the customer/site advisory lock cannot let a retry drive the Atlas mutation
+    -- and (b) consume its single-use tokens ONLY on creation. If it raises, the
+    whole transaction rolls back (no token spent, no Customer/Site created); a retry
+    with already-spent tokens re-checks authorization without re-consuming them."""
     fingerprint = _office_conversion_fingerprint(payload)
     contact_id = str(payload.atlasContactId)
     key = str(payload.idempotencyKey)
@@ -23082,6 +23102,13 @@ def _reserve_office_conversion_handoff(
                             "This approval key was already used with different estimate details",
                             {"customerId": int(row["customer_id"]), "siteId": int(row["site_id"])},
                         )
+                    # Re-assert authorization on the replay too (a retry of a
+                    # pending handoff), holding the handoff row, before returning:
+                    # a revoke or demotion that committed while this transaction
+                    # waited on the advisory lock must stop the retry from driving
+                    # the Atlas mutation. Tokens are NOT re-consumed here.
+                    if authorize is not None:
+                        authorize(cur, created=False)
                     customer = _canonical_customer(cur, int(row["customer_id"]))
                     return {"handoff": row, "customer": customer}, False
 
@@ -23096,6 +23123,9 @@ def _reserve_office_conversion_handoff(
                         "An existing Atlas-linked Customer must be reconciled before approval",
                         {"customerIds": [int(match["id"]) for match in legacy_matches]},
                     )
+
+                if authorize is not None:
+                    authorize(cur, created=True)
 
                 customer_id = _insert_customer(cur, payload)
                 site_id = _insert_site(cur, customer_id, payload.name, payload.primarySite)
@@ -24959,31 +24989,36 @@ def admin_link_customer_to_atlas(
     )
 
 
-@app.post("/api/admin/funnel/approve-estimate")
-def admin_approve_estimate(
-    payload: OfficeEstimateApprovalRequest,
+def _drive_office_conversion_handoff(
+    reserved: Dict[str, Any],
+    created: bool,
+    admin: Dict[str, Any],
     request: Request,
-    admin: Dict[str, Any] = Depends(get_current_admin),
+    *,
+    event_replayed: str,
+    event_submitted: str,
+    event_pending: str,
 ) -> JSONResponse:
-    """Create one operational Customer/Site and finalize its Atlas lead link.
+    """Drive one office conversion handoff from its already-reserved local row:
+    relay to Atlas and finalize, or leave it retryable (``202``) on an ambiguous
+    Atlas failure.
 
-    This is intentionally an office command. It neither creates a job nor
-    projects a calendar event: those follow after the approved estimate through
-    their existing operational workflows.
-    """
-    _require_juan_funnel_approver(admin)
-    _require_atlas_funnel_configuration()
-    reserved, created = _reserve_office_conversion_handoff(payload, admin)
+    Shared by the office approve-estimate route, the office retry route, and the
+    device-authenticated customer-handoff route, so all three produce identical
+    Customer/Site state, idempotency, and 202-pending reconciliation. The reserve
+    step (which creates the Customer/Site once, and for the device consumes the
+    single-use operation tokens) has already run; this only drives the external
+    relay. ``created`` is False on a retry or replay, so ``idempotent`` reads True
+    and success returns ``200`` there, matching the standalone retry route."""
     handoff = reserved["handoff"]
     customer = reserved["customer"]
-    contact_id = str(payload.atlasContactId)
-    idempotency_key = str(payload.idempotencyKey)
-    _clear_working_lead_marker(contact_id)
+    contact_id = str(handoff["atlas_contact_id"])
+    idempotency_key = str(handoff["idempotency_key"])
 
     if handoff["state"] == "finalized":
         append_access_log(
             request,
-            "EOM_ESTIMATE_APPROVAL_REPLAYED",
+            event_replayed,
             True,
             f"contact={contact_id} customer={handoff['customer_id']}",
         )
@@ -25023,7 +25058,7 @@ def admin_approve_estimate(
             if finalized:
                 append_access_log(
                     request,
-                    "EOM_ESTIMATE_APPROVAL_REPLAYED",
+                    event_replayed,
                     True,
                     f"contact={contact_id} customer={finalized['handoff']['customer_id']}",
                 )
@@ -25046,7 +25081,7 @@ def admin_approve_estimate(
         visible["status"] = "atlas_pending"
         append_access_log(
             request,
-            "EOM_ESTIMATE_APPROVAL_PENDING",
+            event_pending,
             False,
             f"contact={contact_id} customer={handoff['customer_id']} status={exc.status_code}",
         )
@@ -25065,7 +25100,7 @@ def admin_approve_estimate(
     visible = _serialize_office_conversion_handoff(handoff, customer)
     append_access_log(
         request,
-        "EOM_ESTIMATE_APPROVED",
+        event_submitted,
         True,
         f"contact={contact_id} customer={handoff['customer_id']} site={handoff['site_id']}",
     )
@@ -25074,6 +25109,33 @@ def admin_approve_estimate(
         content=jsonable_encoder(
             {"success": True, "idempotent": not created, "handoff": visible}
         ),
+    )
+
+
+@app.post("/api/admin/funnel/approve-estimate")
+def admin_approve_estimate(
+    payload: OfficeEstimateApprovalRequest,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> JSONResponse:
+    """Create one operational Customer/Site and finalize its Atlas lead link.
+
+    This is intentionally an office command. It neither creates a job nor
+    projects a calendar event: those follow after the approved estimate through
+    their existing operational workflows.
+    """
+    _require_juan_funnel_approver(admin)
+    _require_atlas_funnel_configuration()
+    reserved, created = _reserve_office_conversion_handoff(payload, admin)
+    _clear_working_lead_marker(str(payload.atlasContactId))
+    return _drive_office_conversion_handoff(
+        reserved,
+        created,
+        admin,
+        request,
+        event_replayed="EOM_ESTIMATE_APPROVAL_REPLAYED",
+        event_submitted="EOM_ESTIMATE_APPROVED",
+        event_pending="EOM_ESTIMATE_APPROVAL_PENDING",
     )
 
 
@@ -28619,12 +28681,23 @@ CONNECT_DEVICE_APPROVE_SEND_CAPABILITY = "funnel.onboarding_draft.approve_send"
 # booking routes, which are only admin-role gated.
 CONNECT_DEVICE_ESTIMATE_BOOKING_CAPABILITY = "funnel.lead.estimate_booking"
 CONNECT_DEVICE_FIRST_CLEAN_BOOKING_CAPABILITY = "funnel.lead.first_clean_booking"
+# The customer-handoff money path: create the operational Customer/Site and finalize
+# the Atlas lead link on the bound operator's behalf. Unlike the bookings this is not
+# a client-idempotency-key relay: it reuses the office conversion handoff's own
+# durable reservation (eom_office_conversion_handoffs), which creates the Customer/Site
+# once and carries the 202-pending Atlas reconciliation, so the device produces
+# identical local state to the office approve-estimate command. Because it creates real
+# operational records, the confirmation binds the FULL customer/site payload (via the
+# office conversion fingerprint), not just an id, so an operator authorizes exactly the
+# Customer/Site the device will create.
+CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY = "funnel.lead.customer_handoff"
 _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
     {
         CONNECT_DEVICE_MARK_WORKING_CAPABILITY,
         CONNECT_DEVICE_APPROVE_SEND_CAPABILITY,
         CONNECT_DEVICE_ESTIMATE_BOOKING_CAPABILITY,
         CONNECT_DEVICE_FIRST_CLEAN_BOOKING_CAPABILITY,
+        CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY,
     }
 )
 
@@ -28675,6 +28748,11 @@ _CONNECT_DEVICE_OPERATION_TARGET_FIELDS: Dict[str, Tuple[str, ...]] = {
         "scheduledEnd",
         "idempotencyKey",
     ),
+    # The customer handoff binds the entire customer/site payload through the nested
+    # ``handoff`` object, not a flat id. Its canonical target is derived from that
+    # payload (see _connect_device_confirmation_target), so the confirmation
+    # authorizes exactly the Customer/Site the device will create.
+    CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY: ("handoff",),
 }
 # Every field a confirmation request may carry, across all capabilities. The
 # target builder rejects a request unless the fields present are exactly the ones
@@ -28687,6 +28765,7 @@ _CONNECT_DEVICE_OPERATION_ALL_TARGET_FIELDS: Tuple[str, ...] = (
     "scheduledStart",
     "scheduledEnd",
     "idempotencyKey",
+    "handoff",
 )
 # UUID-shaped fields are normalized to a canonical string so issuance and dispatch
 # hash identically; datetime fields are format-validated but kept verbatim so the
@@ -28747,9 +28826,32 @@ def _connect_device_confirmation_target(
             detail=f"Capability {capability} requires exactly these target fields: "
             + ", ".join(required),
         )
+    if capability == CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY:
+        # The handoff target is derived server-side from the full customer/site
+        # payload, so the operator authorizes exactly the Customer/Site the device
+        # will create. conversionFingerprint is the office conversion fingerprint
+        # over that payload (identical to what dispatch computes from the device's
+        # submitted payload); idempotencyKey and contactId come from the payload
+        # itself. This keeps canonicalization entirely on the server: the device
+        # and the confirmation must present the same payload to match.
+        return _connect_device_handoff_target(payload.handoff)
     return {
         field: _connect_device_operation_target_field(field, getattr(payload, field))
         for field in required
+    }
+
+
+def _connect_device_handoff_target(
+    office_payload: "OfficeEstimateApprovalRequest",
+) -> Dict[str, str]:
+    """Canonical device-operation target for a customer handoff, derived from the
+    full office estimate-approval payload. Both confirmation issuance and dispatch
+    build it from the same payload, so a confirmation authorizes exactly one
+    concrete Customer/Site creation, never a different one."""
+    return {
+        "contactId": str(office_payload.atlasContactId),
+        "conversionFingerprint": _office_conversion_fingerprint(office_payload),
+        "idempotencyKey": str(office_payload.idempotencyKey),
     }
 
 
@@ -29007,9 +29109,11 @@ class ConnectDeviceOperationConfirmationRequest(BaseModel):
     ``capability`` selects which target fields are required: mark_working needs
     ``contactId`` and ``expectedStateToken``; approve_send needs ``draftId``; the
     booking capabilities need ``contactId``, ``scheduledStart``, ``scheduledEnd``,
-    and ``idempotencyKey``. The other target fields must be omitted, so a
-    confirmation cannot carry a cross-capability target (enforced in
-    ``_connect_device_confirmation_target``)."""
+    and ``idempotencyKey``; customer_handoff needs the nested ``handoff`` object
+    carrying the full Customer/Site payload (the server fingerprints it, so the
+    operator authorizes exactly that Customer/Site). The other target fields must
+    be omitted, so a confirmation cannot carry a cross-capability target (enforced
+    in ``_connect_device_confirmation_target``)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -29020,6 +29124,7 @@ class ConnectDeviceOperationConfirmationRequest(BaseModel):
     scheduledStart: Optional[str] = Field(default=None, min_length=1, max_length=64)
     scheduledEnd: Optional[str] = Field(default=None, min_length=1, max_length=64)
     idempotencyKey: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    handoff: Optional[OfficeEstimateApprovalRequest] = Field(default=None)
 
 
 class ConnectDeviceMarkLeadWorkingRequest(BaseModel):
@@ -29041,6 +29146,23 @@ class ConnectDeviceApproveOnboardingDraftRequest(BaseModel):
     authorization for this exact draft. The draft id is the path parameter, and
     Atlas's draft-id state machine (a stable idempotency key) is the send's
     delivery-idempotency mechanism, so there is no mutable send payload here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    challengeId: str = Field(min_length=1, max_length=64)
+    confirmationId: str = Field(min_length=1, max_length=64)
+
+
+class ConnectDeviceCustomerHandoffRequest(OfficeEstimateApprovalRequest):
+    """The device's request to hand a lead off to an operational Customer/Site.
+
+    It IS an office estimate-approval payload (full customer/site facts, the Atlas
+    ``atlasContactId``, and the client ``idempotencyKey``) plus the device's
+    single-use ``challengeId`` and the operator's ``confirmationId`` for this exact
+    handoff. Dispatch strips the two device fields back to a plain
+    ``OfficeEstimateApprovalRequest`` before fingerprinting and reserving, so the
+    device produces the identical Customer/Site, fingerprint, and reservation the
+    office approve-estimate command does."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -29736,6 +29858,126 @@ def connect_device_create_funnel_first_clean_booking(
     )
 
 
+@app.post("/api/connect/device/funnel/leads/{contact_id}/customer-handoffs")
+def connect_device_create_funnel_customer_handoff(
+    contact_id: UUID,
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> JSONResponse:
+    """Device-driven, confirmation-gated customer handoff: create the operational
+    Customer/Site and finalize the Atlas lead link on the bound operator's behalf.
+
+    Faithful to the office ``approve-estimate`` command: it reuses the SAME durable
+    office conversion handoff reservation (``eom_office_conversion_handoffs``) and
+    the SAME Atlas relay / finalize / 202-pending reconciliation, so the device
+    produces identical local state (one Customer/Site, one handoff row) and shares
+    the retry path. It strengthens authorization for the unattended device: the
+    bound operator must be the configured approver (the office route is only
+    admin-role gated), and, being confirmation-required, the operation needs a
+    single-use challenge plus a confirmation bound to the FULL customer/site payload
+    (via the office conversion fingerprint), so an operator authorizes exactly the
+    Customer/Site the device will create -- an automatic trigger cannot mint records.
+
+    The challenge and confirmation are consumed inside the reservation transaction
+    (the ``authorize`` hook), after every conflict/idempotency check and before the
+    Customer/Site rows are written, and only on first creation: a crash or conflict
+    never spends a token without the reservation, and a retry after an ambiguous
+    Atlas failure replays the existing reservation (no fresh confirmation, Atlas
+    resolves the stable idempotency key) to reach 200/201 or stay 202-pending."""
+    payload = _connect_device_parse_body(request, ConnectDeviceCustomerHandoffRequest)
+    _require_juan_funnel_approver(operator, action="hand off customers")
+    _require_atlas_funnel_configuration()
+
+    contact_id_text = str(contact_id)
+    device_id = operator["deviceId"]
+    challenge_id = _validate_connect_operation_uuid(payload.challengeId)
+    confirmation_id = _validate_connect_operation_uuid(payload.confirmationId)
+    # Strip the two device-only fields back to a plain office estimate-approval
+    # payload, so the conversion fingerprint, the reservation, and the created
+    # Customer/Site are byte-identical to the office command's.
+    office_payload = OfficeEstimateApprovalRequest.model_validate(
+        payload.model_dump(mode="json", exclude={"challengeId", "confirmationId"})
+    )
+    if str(office_payload.atlasContactId) != contact_id_text:
+        raise HTTPException(
+            status_code=422,
+            detail="Handoff atlasContactId must match the path contact id",
+        )
+    fingerprint = _connect_device_operation_fingerprint(
+        CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY,
+        _connect_device_handoff_target(office_payload),
+    )
+
+    # A finalized handoff replays without the Atlas capability gate: the money
+    # already moved and the Customer/Site exists, so a capability withdrawn since
+    # then must not turn a finished handoff's receipt read into a 501 (mirrors the
+    # booking completed-replay). New and still-pending operations run the gate.
+    existing = _office_conversion_handoff_for_contact(contact_id_text)
+    if existing is not None and existing["handoff"]["state"] == "finalized":
+        return _drive_office_conversion_handoff(
+            existing,
+            False,
+            operator,
+            request,
+            event_replayed="CONNECT_DEVICE_CUSTOMER_HANDOFF_REPLAYED",
+            event_submitted="CONNECT_DEVICE_CUSTOMER_HANDOFF_SUBMITTED",
+            event_pending="CONNECT_DEVICE_CUSTOMER_HANDOFF_PENDING",
+        )
+
+    # Refuse a handoff the deployed Atlas cannot serve BEFORE reserving, so the
+    # unattended device never creates a Customer/Site or spends a confirmation for
+    # an operation Atlas would reject (the office route relies on reserve-then-202
+    # recovery instead; the device is deliberately stricter, like its bookings).
+    try:
+        _require_atlas_funnel_capability(
+            ATLAS_FUNNEL_CAPABILITY_LEAD_CUSTOMER_HANDOFF, operator
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY_UNAVAILABLE",
+            False,
+            f"device={device_id} capability={exc.capability}",
+            persist_to_file=False,
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    def _authorize(cur, *, created: bool) -> None:
+        # Runs inside _reserve_office_conversion_handoff's transaction on BOTH
+        # branches. Always re-assert the device + operator are still authorized
+        # (authentication ran in an earlier transaction and may have waited on the
+        # customer/site advisory lock): a revoke or demotion committing during that
+        # wait must stop even a retry from driving the Atlas mutation. Consume the
+        # single-use challenge + confirmation ONLY on first creation, in the SAME
+        # transaction as the reservation, so a crash or conflict never spends a
+        # token without creating the reservation and a retry never re-consumes
+        # already-spent tokens.
+        _assert_connect_device_operator_active(cur, device_id)
+        if created:
+            _consume_connect_device_operation_tokens(
+                cur,
+                device_id,
+                challenge_id,
+                confirmation_id,
+                CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY,
+                fingerprint,
+            )
+
+    reserved, created = _reserve_office_conversion_handoff(
+        office_payload, operator, authorize=_authorize
+    )
+    _clear_working_lead_marker(contact_id_text)
+    return _drive_office_conversion_handoff(
+        reserved,
+        created,
+        operator,
+        request,
+        event_replayed="CONNECT_DEVICE_CUSTOMER_HANDOFF_REPLAYED",
+        event_submitted="CONNECT_DEVICE_CUSTOMER_HANDOFF_SUBMITTED",
+        event_pending="CONNECT_DEVICE_CUSTOMER_HANDOFF_PENDING",
+    )
+
+
 @app.post("/api/admin/funnel/handoffs/{contact_id}/retry")
 def admin_retry_funnel_handoff(
     contact_id: UUID,
@@ -29748,103 +29990,14 @@ def admin_retry_funnel_handoff(
     reserved = _office_conversion_handoff_for_contact(contact_id_text)
     if not reserved:
         raise HTTPException(status_code=404, detail="Office conversion handoff not found")
-    handoff = reserved["handoff"]
-    customer = reserved["customer"]
-    if handoff["state"] == "finalized":
-        append_access_log(
-            request,
-            "EOM_ESTIMATE_APPROVAL_RETRY_REPLAYED",
-            True,
-            f"contact={contact_id_text} customer={handoff['customer_id']}",
-        )
-        return JSONResponse(
-            status_code=200,
-            content=jsonable_encoder(
-                {
-                    "success": True,
-                    "idempotent": True,
-                    "handoff": _serialize_office_conversion_handoff(handoff, customer),
-                }
-            ),
-        )
-
-    idempotency_key = str(handoff["idempotency_key"])
-    atlas_payload = {
-        "contact_id": contact_id_text,
-        "tracker_customer_id": int(handoff["customer_id"]),
-        "tracker_site_id": int(handoff["site_id"]),
-    }
-    try:
-        atlas_result = _atlas_funnel_request(
-            "/eom-funnel/customer-handoffs",
-            admin,
-            payload=atlas_payload,
-            idempotency_key=idempotency_key,
-        )
-        atlas_handoff_id = _validate_atlas_customer_handoff_result(
-            atlas_result,
-            contact_id=contact_id_text,
-            customer_id=int(handoff["customer_id"]),
-            site_id=int(handoff["site_id"]),
-            idempotency_key=idempotency_key,
-        )
-    except AtlasFunnelRequestError as exc:
-        if not _note_office_conversion_error(contact_id_text, idempotency_key, str(exc)):
-            finalized = _finalized_office_conversion_after_lost_error_race(contact_id_text)
-            if finalized:
-                append_access_log(
-                    request,
-                    "EOM_ESTIMATE_APPROVAL_RETRY_REPLAYED",
-                    True,
-                    f"contact={contact_id_text} customer={finalized['handoff']['customer_id']}",
-                )
-                return JSONResponse(
-                    status_code=200,
-                    content=jsonable_encoder(
-                        {
-                            "success": True,
-                            "idempotent": True,
-                            "handoff": _serialize_office_conversion_handoff(
-                                finalized["handoff"],
-                                finalized["customer"],
-                            ),
-                        }
-                    ),
-                )
-        handoff = dict(handoff)
-        handoff["last_error"] = str(exc)
-        visible = _serialize_office_conversion_handoff(handoff, customer)
-        visible["status"] = "atlas_pending"
-        append_access_log(
-            request,
-            "EOM_ESTIMATE_APPROVAL_RETRY_PENDING",
-            False,
-            f"contact={contact_id_text} customer={handoff['customer_id']} status={exc.status_code}",
-        )
-        return JSONResponse(
-            status_code=202,
-            content=jsonable_encoder(
-                {"success": False, "idempotent": True, "handoff": visible}
-            ),
-        )
-
-    handoff = _mark_office_conversion_finalized(
-        contact_id_text,
-        idempotency_key,
-        atlas_handoff_id,
-    )
-    visible = _serialize_office_conversion_handoff(handoff, customer)
-    append_access_log(
+    return _drive_office_conversion_handoff(
+        reserved,
+        False,
+        admin,
         request,
-        "EOM_ESTIMATE_APPROVAL_RETRIED",
-        True,
-        f"contact={contact_id_text} customer={handoff['customer_id']} site={handoff['site_id']}",
-    )
-    return JSONResponse(
-        status_code=200,
-        content=jsonable_encoder(
-            {"success": True, "idempotent": True, "handoff": visible}
-        ),
+        event_replayed="EOM_ESTIMATE_APPROVAL_RETRY_REPLAYED",
+        event_submitted="EOM_ESTIMATE_APPROVAL_RETRIED",
+        event_pending="EOM_ESTIMATE_APPROVAL_RETRY_PENDING",
     )
 
 
