@@ -312,6 +312,90 @@ def test_reserved_replay_refuses_after_device_revoked(client, auth, monkeypatch)
     assert exc_info.value.status_code == 403
 
 
+def _age_reservation(device_id, fingerprint, seconds):
+    with api.db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE connect_device_operation_reservations
+                SET updated_at = NOW() - make_interval(secs => %s)
+                WHERE device_id = %s AND operation_fingerprint = %s
+                """,
+                (seconds, device_id, fingerprint),
+            )
+
+
+def _reservation_exists(device_id, fingerprint):
+    with api.db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1 FROM connect_device_operation_reservations
+                WHERE device_id = %s AND operation_fingerprint = %s
+                """,
+                (device_id, fingerprint),
+            )
+            return cur.fetchone() is not None
+
+
+def test_reserved_replay_refreshes_retention_against_pruner(client, auth, monkeypatch):
+    # A still-reserved reservation replayed after aging past the retention window
+    # must have its retention clock refreshed by the claim, so the inactivity
+    # pruner cannot reap it out from under an in-flight retry (which would drop the
+    # frozen request and leave the next retry meeting spent tokens).
+    _set_approver(monkeypatch, client, auth)
+    private_key, device_id = _enroll_device(client, auth)
+    contact_id = _fresh_contact()
+    idem = str(uuid.uuid4())
+    confirmation_id = _issue_booking_confirmation(
+        client, auth, device_id, contact_id, idem
+    ).json()["confirmationId"]
+    challenge_id = _issue_challenge(client, device_id, private_key)
+
+    # First attempt fails at Atlas: a 'reserved' reservation is left behind.
+    _stub_atlas_booking(monkeypatch, stage="estimate_booked", status="estimate_booked",
+                        fail_status=503)
+    failed = _book(client, device_id, private_key, _ESTIMATE_PATH, contact_id,
+                   challenge_id, confirmation_id, idem)
+    assert failed.status_code == 503, failed.text
+
+    fingerprint = api._connect_device_operation_fingerprint(
+        _ESTIMATE_CAP,
+        {"contactId": contact_id, "scheduledStart": _START,
+         "scheduledEnd": _END, "idempotencyKey": idem},
+    )
+    # Age it well past the retention window: without the refresh it would now be
+    # prunable while a retry is mid-flight.
+    _age_reservation(device_id, fingerprint,
+                     api.CONNECT_DEVICE_OPERATION_RETENTION_S + 3600)
+
+    # Claim it for replay. The claim refreshes updated_at, so a prune that runs
+    # before completion no longer deletes it.
+    reservation = api._reserve_or_get_connect_device_operation(
+        device_id=device_id,
+        capability=_ESTIMATE_CAP,
+        fingerprint=fingerprint,
+        idempotency_key=idem,
+        atlas_path=f"/eom-funnel/leads/{contact_id}/estimate-bookings",
+        request_body={"scheduled_start": _START, "scheduled_end": _END},
+        challenge_id=str(uuid.uuid4()),
+        confirmation_id=str(uuid.uuid4()),
+    )
+    assert reservation["status"] == "reserved"
+    api._prune_connect_device_operation_tokens()
+    assert _reservation_exists(device_id, fingerprint), (
+        "replay-claim must refresh the retention clock so the pruner spares the "
+        "in-flight reservation"
+    )
+
+    # The retry then completes normally and returns the receipt.
+    _stub_atlas_booking(monkeypatch, stage="estimate_booked", status="estimate_booked")
+    ok = _book(client, device_id, private_key, _ESTIMATE_PATH, contact_id,
+               challenge_id, confirmation_id, idem)
+    assert ok.status_code == 201, ok.text
+    assert ok.json()["status"] == "estimate_booked"
+
+
 def test_confirmation_for_different_window_rejected(client, auth, monkeypatch):
     _set_approver(monkeypatch, client, auth)
     private_key, device_id = _enroll_device(client, auth)

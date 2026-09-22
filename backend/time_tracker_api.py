@@ -28938,6 +28938,21 @@ def _reserve_or_get_connect_device_operation(
                 # demotion that committed since authorization must stop the retry
                 # from re-driving the frozen Atlas money call.
                 _assert_connect_device_operator_active(cur, device_id)
+                # Refresh the retention clock while still holding the row lock, so a
+                # live retry of a still-reserved operation cannot be reaped by the
+                # inactivity pruner between this claim and the completion update. The
+                # pruner deletes by updated_at alone; without this bump a reservation
+                # older than the retention window could be deleted while the Atlas
+                # call is in flight, dropping the frozen request and receipt out from
+                # under it, so the next identical retry would meet spent tokens.
+                cur.execute(
+                    """
+                    UPDATE connect_device_operation_reservations
+                    SET updated_at = NOW()
+                    WHERE reservation_id = %s
+                    """,
+                    (existing["reservation_id"],),
+                )
                 return _serialize_connect_device_reservation(existing)
             # New operation: lock+recheck operator, consume tokens, and record the
             # reservation atomically. If a concurrent request created the reservation
@@ -29101,7 +29116,8 @@ _CONNECT_DEVICE_OP_PRUNE_STATEMENTS = (
     # Reservations are pruned by inactivity: a completed reservation older than the
     # retention window is past any useful replay, and a reserved-but-abandoned one
     # (never completed) past the same window is a dead operation. updated_at moves
-    # on completion, so a live in-flight retry stays fresh and is not reaped.
+    # on completion AND on each replay-claim (see _reserve_or_get_connect_device_
+    # operation), so a live in-flight retry stays fresh and is not reaped.
     """
     DELETE FROM connect_device_operation_reservations
     WHERE ctid IN (
