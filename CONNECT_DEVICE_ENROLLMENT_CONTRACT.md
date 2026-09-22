@@ -3,10 +3,10 @@
 Status: implemented for the device lifecycle (enroll, list, revoke), a read-only
 device-authenticated funnel access path (see "Device-authenticated access"), a
 confirmation-gated tracker-local MUTATION path (the lead-working claim), and the
-first confirmation-gated Atlas MONEY path (approve-and-send an onboarding draft),
-both under "Device-authenticated mutations". Wiring the remaining Atlas
-confirmation-required money paths (customer handoff, estimate/first-clean
-booking) through a device reuses this same gate and is the next slice.
+confirmation-gated Atlas MONEY paths (approve-and-send an onboarding draft, and
+estimate / first-clean booking via a durable authorization reservation), all
+under "Device-authenticated mutations". Wiring the remaining Atlas money path
+(customer handoff) through a device reuses this same gate and is the next slice.
 
 ## Purpose
 
@@ -136,14 +136,17 @@ reference `connect_devices` ON DELETE CASCADE):
   The fingerprint is `sha256` of the capability merged with the operation's
   material target parameters, so a confirmation authorizes exactly one concrete
   operation: the contact id and lead state token for `mark_working`, the draft id
-  for `approve_send`. A confirmation-required capability cannot dispatch from the
+  for `approve_send`, and the contact id, scheduled window, and client idempotency
+  key for the bookings. A confirmation-required capability cannot dispatch from the
   unattended device without a matching, unconsumed, unexpired confirmation, and a
   confirmation issued for one operation can never authorize another.
 
 Capabilities a device may perform are a **CLOSED** set
 (`_CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES`); an unlisted capability is
 refused. The implemented capabilities are `funnel.lead.mark_working` (tracker
-local) and `funnel.onboarding_draft.approve_send` (the first Atlas money path).
+local), `funnel.onboarding_draft.approve_send` (the first Atlas money path), and
+`funnel.lead.estimate_booking` / `funnel.lead.first_clean_booking` (the Atlas
+booking money paths).
 
 ### Mutation endpoints
 
@@ -171,12 +174,32 @@ local) and `funnel.onboarding_draft.approve_send` (the first Atlas money path).
   `eom-onboarding-draft:{draft_id}` idempotency key) makes the send idempotent, so
   a transient failure is retried by re-confirming without a double-send. Returns
   `201` on a new send and `200` on Atlas's idempotent replay.
+- `POST /api/connect/device/funnel/leads/{contact_id}/estimate-bookings` and
+  `POST /api/connect/device/funnel/leads/{contact_id}/first-clean-bookings`
+  (device proof) -> book an Atlas estimate or first clean on the bound operator's
+  behalf, relaying to Atlas with the tracker's service token. Faithful to the
+  office booking helper (same Atlas capability gate, same body, same `200`/`201`
+  receipt), and strengthened for the unattended device: the bound operator must be
+  the configured approver (the office booking route is only admin-role gated), and
+  the operation needs a challenge plus a confirmation bound to the exact booking
+  (contact, window, and client `idempotencyKey`). Unlike `approve_send`, the
+  booking's idempotency key is client-supplied and the state is richer, so dispatch
+  goes through a **durable authorization reservation**: the challenge and
+  confirmation are consumed, and the frozen Atlas request and idempotency key are
+  recorded, in one transaction (which re-asserts the operator is active first). The
+  relay is then driven from that reservation. A retry after an ambiguous Atlas
+  failure replays the reservation with the same frozen request and key -- no fresh
+  confirmation, and Atlas resolves the key idempotently, so there is no double
+  booking. A completed reservation returns its frozen receipt (`200`) without
+  re-calling Atlas. The reservation is single per `(device, operation fingerprint)`,
+  so a compromised device can only re-drive an already-authorized booking, never
+  mint a new one; a new window or key is a new fingerprint that needs a fresh
+  confirmation.
 
 ## Deferred to a later slice
 
-- Wiring the remaining Atlas confirmation-required money paths (customer handoff,
-  estimate and first-clean booking) through the device. The authorization
-  machinery above is the reusable gate they will use; each registers in the closed
-  capability set with its own idempotency and, where the office path has one (the
-  handoff), its `202`-pending reconciliation. The `approve_send` path above is the
-  worked template.
+- Wiring the customer-handoff Atlas money path through the device. It reuses the
+  durable-reservation gate above, adds the full customer/site payload to its
+  operation fingerprint (the office path already fingerprints those fields), and
+  carries the office handoff's `202`-pending reconciliation. The booking paths
+  above are the worked template for the reservation dispatch.
