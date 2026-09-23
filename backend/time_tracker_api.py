@@ -3092,9 +3092,14 @@ class OfficeEstimateApprovalRequest(CustomerCreateRequest):
     idempotencyKey: UUID = Field(...)
 
 
-# The closed set of lost-lead reason codes Atlas accepts. One source for the office
-# request, the device request, and the device confirmation target, so the three can
-# never disagree about which reasons are valid.
+# Lost-lead reason codes. Set closure: CLOSED at its owner, Atlas
+# (``EOMLeadLostRequest.reason_code``, a Literal in atlas_brain/eom_api/funnel.py),
+# and ENUMERATED here as an unenforced copy: Atlas does not publish the set, so
+# nothing detects drift. Default for a code outside this copy: rejected here with a
+# 422 before any Atlas call or confirmation, so drift fails closed (a reason Atlas
+# adds later is refused until this copy is updated; nothing is written wrongly).
+# One tracker source for the office request, the device request, and the device
+# confirmation target, so those three can never disagree with each other.
 FUNNEL_LEAD_LOST_REASON_CODE_PATTERN = (
     "^(spam|no_response|declined_after_estimate|price|other)$"
 )
