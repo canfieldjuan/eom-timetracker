@@ -28657,6 +28657,66 @@ def connect_device_list_funnel_leads(
     }
 
 
+@app.get("/api/connect/device/funnel/public-onboarding/issued-links")
+def connect_device_list_public_onboarding_issued_links(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=200),
+    cursor: Optional[str] = Query(default=None, min_length=16, max_length=512),
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> Dict[str, Any]:
+    """Device-facing issued-onboarding-link poll (read-only).
+
+    A Local Connect automation reads the same current issued-token evidence the
+    office review shows (``admin_list_public_onboarding_issued_links``) on its
+    bound operator's behalf, authenticated purely by the device's per-request
+    Ed25519 proof (``require_connect_device``). Read-only: it performs no mutation
+    and exposes no confirmation-gated action. The Atlas service credential never
+    leaves the tracker; the bound operator is vouched for through the actor headers
+    ``_atlas_funnel_read`` sets. Faithful to the office relay: same Atlas route
+    gate, same closed page parse, same 502 on a mismatched echo.
+    """
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_route(
+            _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINK_LIST_ROUTE, operator
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "CONNECT_DEVICE_PUBLIC_ONBOARDING_ISSUED_LINK_LIST_CAPABILITY_UNAVAILABLE",
+            False,
+            f"device={operator['deviceId']} capability={exc.capability}",
+            persist_to_file=False,
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    page = _parse_atlas_public_onboarding_issued_link_page(
+        _atlas_funnel_read(
+            _ATLAS_PUBLIC_ONBOARDING_ISSUED_LINKS_PATH,
+            operator,
+            params={
+                "limit": limit,
+                **({"cursor": cursor} if cursor else {}),
+            },
+        )
+    )
+    if page["limit"] != limit or page["cursor"] != cursor:
+        raise HTTPException(
+            status_code=502,
+            detail="Public onboarding service returned an invalid issued-link response",
+        )
+    # High-frequency automated poll: like the funnel-leads read, this must not
+    # drive the daily-file logger's whole-file rewrite on the persistent disk.
+    append_access_log(
+        request,
+        "CONNECT_DEVICE_PUBLIC_ONBOARDING_ISSUED_LINKS_LISTED",
+        True,
+        f"device={operator['deviceId']} links={len(page['links'])} has_more={page['hasMore']}",
+        persist_to_file=False,
+    )
+    return {"success": True, **page}
+
+
 # ---------------------------------------------------------------------------
 # Device-authenticated mutations: single-use challenge + per-operation
 # confirmation gate. The one representative mutation is the tracker-local
