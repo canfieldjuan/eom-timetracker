@@ -3092,13 +3092,23 @@ class OfficeEstimateApprovalRequest(CustomerCreateRequest):
     idempotencyKey: UUID = Field(...)
 
 
+# Lost-lead reason codes. Set closure: CLOSED at its owner, Atlas
+# (``EOMLeadLostRequest.reason_code``, a Literal in atlas_brain/eom_api/funnel.py),
+# and ENUMERATED here as an unenforced copy: Atlas does not publish the set, so
+# nothing detects drift. Default for a code outside this copy: rejected here with a
+# 422 before any Atlas call or confirmation, so drift fails closed (a reason Atlas
+# adds later is refused until this copy is updated; nothing is written wrongly).
+# One tracker source for the office request, the device request, and the device
+# confirmation target, so those three can never disagree with each other.
+FUNNEL_LEAD_LOST_REASON_CODE_PATTERN = (
+    "^(spam|no_response|declined_after_estimate|price|other)$"
+)
+
+
 class FunnelLeadLostRequest(BaseModel):
     """Office disposition for an Atlas lead that will not convert."""
 
-    reasonCode: str = Field(
-        ...,
-        pattern="^(spam|no_response|declined_after_estimate|price|other)$",
-    )
+    reasonCode: str = Field(..., pattern=FUNNEL_LEAD_LOST_REASON_CODE_PATTERN)
     note: Optional[str] = Field(default=None, max_length=1000)
     idempotencyKey: UUID = Field(...)
 
@@ -28758,6 +28768,14 @@ CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY = "funnel.lead.customer_handoff"
 # is a distinct capability from approve_send, so a confirmation to send a draft can
 # never authorize revoking that draft's link (the fingerprint binds the capability).
 CONNECT_DEVICE_REVOKE_LINK_CAPABILITY = "funnel.onboarding_draft.revoke_link"
+# Disposition a lead as lost, and its inverse, reopen a lost lead. Both relay to
+# Atlas with the tracker's service token under the operator's client idempotency
+# key, so the confirmation binds that key and the contact. Lost additionally binds
+# the reason code: an operator who approved "spam" never authorizes "price". The
+# free-text note is not bound. They are distinct capabilities, so a confirmation to
+# mark a lead lost can never authorize reopening it, and vice versa.
+CONNECT_DEVICE_LEAD_LOST_CAPABILITY = "funnel.lead.lost"
+CONNECT_DEVICE_LEAD_REOPEN_CAPABILITY = "funnel.lead.reopen"
 _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
     {
         CONNECT_DEVICE_MARK_WORKING_CAPABILITY,
@@ -28766,6 +28784,8 @@ _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
         CONNECT_DEVICE_FIRST_CLEAN_BOOKING_CAPABILITY,
         CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY,
         CONNECT_DEVICE_REVOKE_LINK_CAPABILITY,
+        CONNECT_DEVICE_LEAD_LOST_CAPABILITY,
+        CONNECT_DEVICE_LEAD_REOPEN_CAPABILITY,
     }
 )
 
@@ -28805,6 +28825,8 @@ _CONNECT_DEVICE_OPERATION_TARGET_FIELDS: Dict[str, Tuple[str, ...]] = {
     CONNECT_DEVICE_MARK_WORKING_CAPABILITY: ("contactId", "expectedStateToken"),
     CONNECT_DEVICE_APPROVE_SEND_CAPABILITY: ("draftId",),
     CONNECT_DEVICE_REVOKE_LINK_CAPABILITY: ("draftId",),
+    CONNECT_DEVICE_LEAD_LOST_CAPABILITY: ("contactId", "idempotencyKey", "reasonCode"),
+    CONNECT_DEVICE_LEAD_REOPEN_CAPABILITY: ("contactId", "idempotencyKey"),
     CONNECT_DEVICE_ESTIMATE_BOOKING_CAPABILITY: (
         "contactId",
         "scheduledStart",
@@ -28835,6 +28857,7 @@ _CONNECT_DEVICE_OPERATION_ALL_TARGET_FIELDS: Tuple[str, ...] = (
     "scheduledEnd",
     "idempotencyKey",
     "handoff",
+    "reasonCode",
 )
 # UUID-shaped fields are normalized to a canonical string so issuance and dispatch
 # hash identically; datetime fields are format-validated but kept verbatim so the
@@ -28869,6 +28892,13 @@ def _connect_device_operation_target_field(field: str, value: Any) -> str:
         return _validate_connect_operation_uuid(str(value))
     if field in _CONNECT_DEVICE_OPERATION_DATETIME_FIELDS:
         return _validate_connect_operation_datetime(str(value))
+    if field == "reasonCode":
+        # Refuse to mint a confirmation for a reason Atlas would reject, so an
+        # operator can only ever authorize a dispatchable disposition.
+        text = str(value)
+        if not re.fullmatch(FUNNEL_LEAD_LOST_REASON_CODE_PATTERN, text):
+            raise HTTPException(status_code=422, detail="Invalid lost-lead reason code")
+        return text
     return str(value)
 
 
@@ -29180,7 +29210,9 @@ class ConnectDeviceOperationConfirmationRequest(BaseModel):
     booking capabilities need ``contactId``, ``scheduledStart``, ``scheduledEnd``,
     and ``idempotencyKey``; customer_handoff needs the nested ``handoff`` object
     carrying the full Customer/Site payload (the server fingerprints it, so the
-    operator authorizes exactly that Customer/Site). The other target fields must
+    operator authorizes exactly that Customer/Site); lead lost needs ``contactId``,
+    ``idempotencyKey``, and ``reasonCode``; lead reopen needs ``contactId`` and
+    ``idempotencyKey``. The other target fields must
     be omitted, so a confirmation cannot carry a cross-capability target (enforced
     in ``_connect_device_confirmation_target``)."""
 
@@ -29194,6 +29226,7 @@ class ConnectDeviceOperationConfirmationRequest(BaseModel):
     scheduledEnd: Optional[str] = Field(default=None, min_length=1, max_length=64)
     idempotencyKey: Optional[str] = Field(default=None, min_length=1, max_length=64)
     handoff: Optional[OfficeEstimateApprovalRequest] = Field(default=None)
+    reasonCode: Optional[str] = Field(default=None, min_length=1, max_length=64)
 
 
 class ConnectDeviceMarkLeadWorkingRequest(BaseModel):
@@ -29233,6 +29266,33 @@ class ConnectDeviceRevokePublicLinkRequest(BaseModel):
 
     challengeId: str = Field(min_length=1, max_length=64)
     confirmationId: str = Field(min_length=1, max_length=64)
+
+
+class ConnectDeviceLeadLostRequest(BaseModel):
+    """The device's request to disposition a lead as lost. ``challengeId`` is the
+    single-use anti-replay nonce; ``confirmationId`` is the operator's fresh
+    authorization bound to this contact, reason code, and idempotency key. The
+    reason, note, and key carry the office request's exact constraints."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    challengeId: str = Field(min_length=1, max_length=64)
+    confirmationId: str = Field(min_length=1, max_length=64)
+    reasonCode: str = Field(..., pattern=FUNNEL_LEAD_LOST_REASON_CODE_PATTERN)
+    note: Optional[str] = Field(default=None, max_length=1000)
+    idempotencyKey: UUID = Field(...)
+
+
+class ConnectDeviceLeadReopenRequest(BaseModel):
+    """The device's request to reopen a lost lead. ``challengeId`` is the single-use
+    anti-replay nonce; ``confirmationId`` is the operator's fresh authorization
+    bound to this contact and idempotency key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    challengeId: str = Field(min_length=1, max_length=64)
+    confirmationId: str = Field(min_length=1, max_length=64)
+    idempotencyKey: UUID = Field(...)
 
 
 class ConnectDeviceCustomerHandoffRequest(OfficeEstimateApprovalRequest):
@@ -29858,6 +29918,185 @@ def connect_device_revoke_public_onboarding_link(
             "idempotent": receipt.idempotent,
         },
     )
+
+@app.post("/api/connect/device/funnel/leads/{contact_id}/lost")
+def connect_device_mark_funnel_lead_lost(
+    contact_id: UUID,
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> JSONResponse:
+    """Device-driven, confirmation-gated Atlas mutation: disposition a lead as lost
+    on the bound operator's behalf.
+
+    Faithful to the office path (``admin_mark_funnel_lead_lost``): the bound operator
+    must be the configured funnel approver, the deployed Atlas must advertise
+    ``lead.lost`` (refused before any lock), and the tracker relays with its own
+    service token under the operator's idempotency key while holding the lead
+    transition lock, then writes the same local lost marker and returns the same
+    ``{success, lead}`` body. Because it is confirmation-required it additionally
+    requires a single-use anti-replay challenge AND a fresh operator confirmation
+    bound to this contact, reason code, and idempotency key.
+
+    Token ordering mirrors approve-send: the capability gate refuses before any
+    token is spent, and the tokens are consumed BEFORE the Atlas call, which is
+    fail-safe. Atlas dedupes by the client idempotency key, so a transient Atlas
+    failure is retried by re-confirming the same key without a double effect."""
+    payload = _connect_device_parse_body(request, ConnectDeviceLeadLostRequest)
+    _require_juan_funnel_approver(operator, action="mark leads lost")
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(ATLAS_FUNNEL_CAPABILITY_LEAD_LOST, operator)
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "CONNECT_DEVICE_FUNNEL_LEAD_LOST_CAPABILITY_UNAVAILABLE",
+            False,
+            f"device={operator['deviceId']} contact={contact_id} capability={exc.capability}",
+            persist_to_file=False,
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    contact_id_text = str(contact_id)
+    idempotency_key = str(payload.idempotencyKey)
+    challenge_id = _validate_connect_operation_uuid(payload.challengeId)
+    confirmation_id = _validate_connect_operation_uuid(payload.confirmationId)
+    device_id = operator["deviceId"]
+    fingerprint = _connect_device_operation_fingerprint(
+        CONNECT_DEVICE_LEAD_LOST_CAPABILITY,
+        {
+            "contactId": contact_id_text,
+            "idempotencyKey": idempotency_key,
+            "reasonCode": payload.reasonCode,
+        },
+    )
+    # Consume the single-use tokens (fail-safe, before the disposition), then relay.
+    _authorize_connect_device_operation(
+        device_id,
+        challenge_id,
+        confirmation_id,
+        CONNECT_DEVICE_LEAD_LOST_CAPABILITY,
+        fingerprint,
+    )
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_funnel_lead_transition(cur, contact_id_text)
+            # Authorization committed before this lock wait, which can be long.
+            # Re-assert the device and its operator are still active, holding
+            # both rows through the Atlas call, so a revoke or demotion that
+            # commits during the wait stops the dispatch instead of racing it.
+            _assert_connect_device_operator_active(cur, device_id)
+            try:
+                atlas_result = _atlas_funnel_request(
+                    f"/eom-funnel/leads/{contact_id_text}/lost",
+                    operator,
+                    payload={"reason_code": payload.reasonCode, "note": payload.note},
+                    idempotency_key=idempotency_key,
+                )
+            except AtlasFunnelRequestError as exc:
+                append_access_log(
+                    request,
+                    "CONNECT_DEVICE_FUNNEL_LEAD_LOST_FAILED",
+                    False,
+                    f"device={device_id} contact={contact_id_text} status={exc.status_code}",
+                    persist_to_file=False,
+                )
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            _mark_lead_lost_locally(cur, contact_id_text, operator)
+    append_access_log(
+        request,
+        "CONNECT_DEVICE_FUNNEL_LEAD_MARKED_LOST",
+        True,
+        f"device={device_id} contact={contact_id_text} reason={payload.reasonCode}",
+        persist_to_file=False,
+    )
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder({"success": True, "lead": atlas_result}),
+    )
+
+
+@app.post("/api/connect/device/funnel/leads/{contact_id}/reopen")
+def connect_device_reopen_funnel_lead(
+    contact_id: UUID,
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> JSONResponse:
+    """Device-driven, confirmation-gated Atlas mutation: return a lost lead to its
+    pre-loss active stage on the bound operator's behalf.
+
+    Faithful to the office path (``admin_reopen_funnel_lead``) with the same gates,
+    lock, relay, idempotency key, local reopened marker, and ``{success, lead}``
+    body, plus a single-use challenge and a fresh operator confirmation bound to
+    this contact and idempotency key. Token ordering matches the lost route."""
+    payload = _connect_device_parse_body(request, ConnectDeviceLeadReopenRequest)
+    _require_juan_funnel_approver(operator, action="reopen leads")
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability(ATLAS_FUNNEL_CAPABILITY_LEAD_REOPEN, operator)
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "CONNECT_DEVICE_FUNNEL_LEAD_REOPEN_CAPABILITY_UNAVAILABLE",
+            False,
+            f"device={operator['deviceId']} contact={contact_id} capability={exc.capability}",
+            persist_to_file=False,
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    contact_id_text = str(contact_id)
+    idempotency_key = str(payload.idempotencyKey)
+    challenge_id = _validate_connect_operation_uuid(payload.challengeId)
+    confirmation_id = _validate_connect_operation_uuid(payload.confirmationId)
+    device_id = operator["deviceId"]
+    fingerprint = _connect_device_operation_fingerprint(
+        CONNECT_DEVICE_LEAD_REOPEN_CAPABILITY,
+        {"contactId": contact_id_text, "idempotencyKey": idempotency_key},
+    )
+    # Consume the single-use tokens (fail-safe, before the reopen), then relay.
+    _authorize_connect_device_operation(
+        device_id,
+        challenge_id,
+        confirmation_id,
+        CONNECT_DEVICE_LEAD_REOPEN_CAPABILITY,
+        fingerprint,
+    )
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_funnel_lead_transition(cur, contact_id_text)
+            # Authorization committed before this lock wait, which can be long.
+            # Re-assert the device and its operator are still active, holding
+            # both rows through the Atlas call, so a revoke or demotion that
+            # commits during the wait stops the dispatch instead of racing it.
+            _assert_connect_device_operator_active(cur, device_id)
+            try:
+                atlas_result = _atlas_funnel_request(
+                    f"/eom-funnel/leads/{contact_id_text}/reopen",
+                    operator,
+                    payload={},
+                    idempotency_key=idempotency_key,
+                )
+            except AtlasFunnelRequestError as exc:
+                append_access_log(
+                    request,
+                    "CONNECT_DEVICE_FUNNEL_LEAD_REOPEN_FAILED",
+                    False,
+                    f"device={device_id} contact={contact_id_text} status={exc.status_code}",
+                    persist_to_file=False,
+                )
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            _mark_lead_reopened_locally(cur, contact_id_text, operator)
+    append_access_log(
+        request,
+        "CONNECT_DEVICE_FUNNEL_LEAD_REOPENED",
+        True,
+        f"device={device_id} contact={contact_id_text}",
+        persist_to_file=False,
+    )
+    return JSONResponse(
+        status_code=200,
+        content=jsonable_encoder({"success": True, "lead": atlas_result}),
+    )
+
 
 
 def _connect_device_submit_booking(
