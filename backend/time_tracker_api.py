@@ -28751,6 +28751,13 @@ CONNECT_DEVICE_FIRST_CLEAN_BOOKING_CAPABILITY = "funnel.lead.first_clean_booking
 # office conversion fingerprint), not just an id, so an operator authorizes exactly the
 # Customer/Site the device will create.
 CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY = "funnel.lead.customer_handoff"
+# Revoke an issued public onboarding link. Like approve_send it relays to Atlas with
+# the tracker's service token and is keyed only by the draft id (Atlas's link state
+# machine plus a stable draft-scoped idempotency key make it idempotent), so it is
+# confirmation-required and the bound operator must be the configured approver. It
+# is a distinct capability from approve_send, so a confirmation to send a draft can
+# never authorize revoking that draft's link (the fingerprint binds the capability).
+CONNECT_DEVICE_REVOKE_LINK_CAPABILITY = "funnel.onboarding_draft.revoke_link"
 _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
     {
         CONNECT_DEVICE_MARK_WORKING_CAPABILITY,
@@ -28758,6 +28765,7 @@ _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
         CONNECT_DEVICE_ESTIMATE_BOOKING_CAPABILITY,
         CONNECT_DEVICE_FIRST_CLEAN_BOOKING_CAPABILITY,
         CONNECT_DEVICE_CUSTOMER_HANDOFF_CAPABILITY,
+        CONNECT_DEVICE_REVOKE_LINK_CAPABILITY,
     }
 )
 
@@ -28796,6 +28804,7 @@ def _connect_device_operation_fingerprint(
 _CONNECT_DEVICE_OPERATION_TARGET_FIELDS: Dict[str, Tuple[str, ...]] = {
     CONNECT_DEVICE_MARK_WORKING_CAPABILITY: ("contactId", "expectedStateToken"),
     CONNECT_DEVICE_APPROVE_SEND_CAPABILITY: ("draftId",),
+    CONNECT_DEVICE_REVOKE_LINK_CAPABILITY: ("draftId",),
     CONNECT_DEVICE_ESTIMATE_BOOKING_CAPABILITY: (
         "contactId",
         "scheduledStart",
@@ -29206,6 +29215,19 @@ class ConnectDeviceApproveOnboardingDraftRequest(BaseModel):
     authorization for this exact draft. The draft id is the path parameter, and
     Atlas's draft-id state machine (a stable idempotency key) is the send's
     delivery-idempotency mechanism, so there is no mutable send payload here."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    challengeId: str = Field(min_length=1, max_length=64)
+    confirmationId: str = Field(min_length=1, max_length=64)
+
+
+class ConnectDeviceRevokePublicLinkRequest(BaseModel):
+    """The device's request to revoke a draft's issued public onboarding link.
+    ``challengeId`` is the single-use anti-replay nonce; ``confirmationId`` is the
+    operator's fresh authorization for this exact draft's revocation. The draft id is
+    the path parameter, and Atlas's link state machine (with a stable draft-scoped
+    idempotency key) makes the revocation idempotent, so there is no mutable payload."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -29734,6 +29756,107 @@ def connect_device_approve_funnel_onboarding_draft(
     return JSONResponse(
         status_code=200 if visible["idempotent"] else 201,
         content=jsonable_encoder(visible),
+    )
+
+
+@app.post("/api/connect/device/funnel/onboarding-drafts/{draft_id}/revoke-link")
+def connect_device_revoke_public_onboarding_link(
+    draft_id: UUID,
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> JSONResponse:
+    """Device-driven, confirmation-gated Atlas mutation: revoke a draft's issued
+    public onboarding link on the bound operator's behalf.
+
+    Faithful to the office path (``admin_revoke_public_onboarding_link``): the bound
+    operator must be the configured funnel approver, the deployed Atlas must advertise
+    the exact revoke route, and the tracker relays with its own service token (the
+    device holds no Atlas credential) under the same stable
+    ``eom-public-onboarding-link-revoke:{draft_id}`` idempotency key and the same
+    closed receipt validation. Because revocation is confirmation-required it
+    additionally requires a single-use anti-replay challenge AND a fresh operator
+    confirmation bound to this exact draft under this capability.
+
+    Token ordering mirrors approve-send: the route gate refuses before any token is
+    spent, and the tokens are consumed BEFORE the Atlas call, which is fail-safe.
+    Atlas's link state machine makes the revocation idempotent (an already-revoked
+    link replays; a completed link conflicts), so a transient Atlas failure is retried
+    by re-confirming without a double effect."""
+    payload = _connect_device_parse_body(request, ConnectDeviceRevokePublicLinkRequest)
+    _require_juan_funnel_approver(operator, action="revoke public onboarding links")
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_route(_ATLAS_PUBLIC_ONBOARDING_LINK_REVOKE_ROUTE, operator)
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            "CONNECT_DEVICE_PUBLIC_ONBOARDING_LINK_REVOKE_CAPABILITY_UNAVAILABLE",
+            False,
+            f"device={operator['deviceId']} draft={draft_id} capability={exc.capability}",
+            persist_to_file=False,
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    draft_id_text = str(draft_id)
+    challenge_id = _validate_connect_operation_uuid(payload.challengeId)
+    confirmation_id = _validate_connect_operation_uuid(payload.confirmationId)
+    device_id = operator["deviceId"]
+    fingerprint = _connect_device_operation_fingerprint(
+        CONNECT_DEVICE_REVOKE_LINK_CAPABILITY, {"draftId": draft_id_text}
+    )
+    # Consume the single-use tokens (fail-safe, before the revocation), then relay.
+    _authorize_connect_device_operation(
+        device_id,
+        challenge_id,
+        confirmation_id,
+        CONNECT_DEVICE_REVOKE_LINK_CAPABILITY,
+        fingerprint,
+    )
+    try:
+        atlas_result = _atlas_funnel_request(
+            _ATLAS_ONBOARDING_DRAFT_REVOKE_LINK_PATH.format(draft_id=draft_id_text),
+            operator,
+            payload={},
+            idempotency_key=f"eom-public-onboarding-link-revoke:{draft_id_text}",
+        )
+        receipt = AtlasPublicOnboardingRevocationReceipt.model_validate(atlas_result)
+    except ValidationError as exc:
+        append_access_log(
+            request,
+            "CONNECT_DEVICE_PUBLIC_ONBOARDING_LINK_REVOKE_FAILED",
+            False,
+            f"device={device_id} draft={draft_id_text} invalid Atlas revocation receipt",
+            persist_to_file=False,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Public onboarding service returned an invalid revocation receipt",
+        ) from exc
+    except AtlasFunnelRequestError as exc:
+        append_access_log(
+            request,
+            "CONNECT_DEVICE_PUBLIC_ONBOARDING_LINK_REVOKE_FAILED",
+            False,
+            f"device={device_id} draft={draft_id_text} status={exc.status_code}",
+            persist_to_file=False,
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    append_access_log(
+        request,
+        "CONNECT_DEVICE_PUBLIC_ONBOARDING_LINK_REVOKED",
+        True,
+        f"device={device_id} draft={draft_id_text} idempotent={receipt.idempotent}",
+        persist_to_file=False,
+    )
+    return JSONResponse(
+        status_code=200 if receipt.idempotent else 201,
+        content={
+            "success": True,
+            "draftId": draft_id_text,
+            "status": "revoked",
+            "idempotent": receipt.idempotent,
+        },
     )
 
 
