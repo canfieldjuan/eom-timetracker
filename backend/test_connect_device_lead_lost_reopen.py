@@ -351,3 +351,46 @@ def test_confirmation_issuance_validates_reason_code(client, auth, monkeypatch):
         },
     )
     assert reopen_with_reason.status_code == 422, reopen_with_reason.text
+
+
+def test_revoke_during_lead_lock_wait_stops_dispatch(client, auth, monkeypatch):
+    # Authorization commits before the lead transition lock, and that wait can be
+    # long. A device revoked while the request waits must not dispatch to Atlas
+    # under its stale authorization.
+    _set_approver(monkeypatch, client, auth)
+    private_key, device_id = _enroll_device(client, auth)
+    contact_id = str(uuid.uuid4())
+    key = str(uuid.uuid4())
+    conf = _issue_lost_confirmation(client, auth, device_id, contact_id, key, "spam")
+    assert conf.status_code == 201, conf.text
+    challenge_id = _issue_challenge(client, device_id, private_key)
+
+    real_lock = api._lock_funnel_lead_transition
+
+    def lock_then_revoke(cur, contact):
+        # Simulates a revoke that commits (in its own transaction) while this
+        # request is waiting on the lead lock.
+        db.execute(
+            "UPDATE connect_devices SET status = 'revoked' WHERE device_id = %s",
+            (device_id,),
+        )
+        real_lock(cur, contact)
+
+    calls: list = []
+    _forbid_atlas(monkeypatch, calls)
+    monkeypatch.setattr(api, "_lock_funnel_lead_transition", lock_then_revoke)
+    resp = _lost(
+        client,
+        device_id,
+        private_key,
+        contact_id,
+        {
+            "challengeId": challenge_id,
+            "confirmationId": conf.json()["confirmationId"],
+            "reasonCode": "spam",
+            "idempotencyKey": key,
+        },
+    )
+    assert resp.status_code == 403, resp.text
+    assert calls == []
+    assert _marker(contact_id) is None

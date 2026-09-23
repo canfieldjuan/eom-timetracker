@@ -29980,6 +29980,11 @@ def connect_device_mark_funnel_lead_lost(
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_funnel_lead_transition(cur, contact_id_text)
+            # Authorization committed before this lock wait, which can be long.
+            # Re-assert the device and its operator are still active, holding
+            # both rows through the Atlas call, so a revoke or demotion that
+            # commits during the wait stops the dispatch instead of racing it.
+            _assert_connect_device_operator_active(cur, device_id)
             try:
                 atlas_result = _atlas_funnel_request(
                     f"/eom-funnel/leads/{contact_id_text}/lost",
@@ -30058,6 +30063,11 @@ def connect_device_reopen_funnel_lead(
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             _lock_funnel_lead_transition(cur, contact_id_text)
+            # Authorization committed before this lock wait, which can be long.
+            # Re-assert the device and its operator are still active, holding
+            # both rows through the Atlas call, so a revoke or demotion that
+            # commits during the wait stops the dispatch instead of racing it.
+            _assert_connect_device_operator_active(cur, device_id)
             try:
                 atlas_result = _atlas_funnel_request(
                     f"/eom-funnel/leads/{contact_id_text}/reopen",
