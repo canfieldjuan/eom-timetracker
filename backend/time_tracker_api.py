@@ -28776,6 +28776,12 @@ CONNECT_DEVICE_REVOKE_LINK_CAPABILITY = "funnel.onboarding_draft.revoke_link"
 # mark a lead lost can never authorize reopening it, and vice versa.
 CONNECT_DEVICE_LEAD_LOST_CAPABILITY = "funnel.lead.lost"
 CONNECT_DEVICE_LEAD_REOPEN_CAPABILITY = "funnel.lead.reopen"
+# Soft-archive a contact out of the active directory, and its inverse, restore it.
+# Both are pure Atlas relays keyed by the operator's client idempotency key, so the
+# confirmation binds the contact and that key. They are distinct capabilities, so a
+# confirmation to archive a contact can never authorize restoring it, and vice versa.
+CONNECT_DEVICE_CONTACT_ARCHIVE_CAPABILITY = "funnel.contact.archive"
+CONNECT_DEVICE_CONTACT_RESTORE_CAPABILITY = "funnel.contact.restore"
 _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
     {
         CONNECT_DEVICE_MARK_WORKING_CAPABILITY,
@@ -28786,6 +28792,8 @@ _CONNECT_DEVICE_CONFIRMATION_REQUIRED_CAPABILITIES = frozenset(
         CONNECT_DEVICE_REVOKE_LINK_CAPABILITY,
         CONNECT_DEVICE_LEAD_LOST_CAPABILITY,
         CONNECT_DEVICE_LEAD_REOPEN_CAPABILITY,
+        CONNECT_DEVICE_CONTACT_ARCHIVE_CAPABILITY,
+        CONNECT_DEVICE_CONTACT_RESTORE_CAPABILITY,
     }
 )
 
@@ -28827,6 +28835,8 @@ _CONNECT_DEVICE_OPERATION_TARGET_FIELDS: Dict[str, Tuple[str, ...]] = {
     CONNECT_DEVICE_REVOKE_LINK_CAPABILITY: ("draftId",),
     CONNECT_DEVICE_LEAD_LOST_CAPABILITY: ("contactId", "idempotencyKey", "reasonCode"),
     CONNECT_DEVICE_LEAD_REOPEN_CAPABILITY: ("contactId", "idempotencyKey"),
+    CONNECT_DEVICE_CONTACT_ARCHIVE_CAPABILITY: ("contactId", "idempotencyKey"),
+    CONNECT_DEVICE_CONTACT_RESTORE_CAPABILITY: ("contactId", "idempotencyKey"),
     CONNECT_DEVICE_ESTIMATE_BOOKING_CAPABILITY: (
         "contactId",
         "scheduledStart",
@@ -29211,8 +29221,8 @@ class ConnectDeviceOperationConfirmationRequest(BaseModel):
     and ``idempotencyKey``; customer_handoff needs the nested ``handoff`` object
     carrying the full Customer/Site payload (the server fingerprints it, so the
     operator authorizes exactly that Customer/Site); lead lost needs ``contactId``,
-    ``idempotencyKey``, and ``reasonCode``; lead reopen needs ``contactId`` and
-    ``idempotencyKey``. The other target fields must
+    ``idempotencyKey``, and ``reasonCode``; lead reopen, contact archive, and contact
+    restore need ``contactId`` and ``idempotencyKey``. The other target fields must
     be omitted, so a confirmation cannot carry a cross-capability target (enforced
     in ``_connect_device_confirmation_target``)."""
 
@@ -29287,6 +29297,19 @@ class ConnectDeviceLeadReopenRequest(BaseModel):
     """The device's request to reopen a lost lead. ``challengeId`` is the single-use
     anti-replay nonce; ``confirmationId`` is the operator's fresh authorization
     bound to this contact and idempotency key."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    challengeId: str = Field(min_length=1, max_length=64)
+    confirmationId: str = Field(min_length=1, max_length=64)
+    idempotencyKey: UUID = Field(...)
+
+
+class ConnectDeviceContactLifecycleRequest(BaseModel):
+    """The device's request to archive or restore one contact. ``challengeId`` is the
+    single-use anti-replay nonce; ``confirmationId`` is the operator's fresh
+    authorization bound to this contact, this idempotency key, and the specific
+    capability (archive or restore). The body carries the office request's key."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -30095,6 +30118,131 @@ def connect_device_reopen_funnel_lead(
     return JSONResponse(
         status_code=200,
         content=jsonable_encoder({"success": True, "lead": atlas_result}),
+    )
+
+
+def _connect_device_contact_lifecycle(
+    *,
+    contact_id: UUID,
+    request: Request,
+    operator: Dict[str, Any],
+    device_capability: str,
+    atlas_capability: str,
+    atlas_route: Tuple[str, str],
+    atlas_path: str,
+    expected_status: str,
+    log_event: str,
+) -> JSONResponse:
+    """Shared device relay for the contact archive and restore transitions.
+
+    Faithful to the office relays (``admin_archive_funnel_contact`` /
+    ``admin_restore_funnel_contact``): the same combined capability+route gate
+    (refused with 501 before any token is spent), the same Atlas path and client
+    idempotency key, and the same closed receipt validation
+    (``_validate_atlas_contact_lifecycle_result``), so the device sees exactly the
+    office projection. Like the office routes there is no local state, no lock, and
+    no approver gate. Because the transition is confirmation-required it
+    additionally requires a single-use challenge and a fresh operator confirmation
+    bound to this contact, key, and capability; the tokens are consumed right
+    before the relay (fail-safe; Atlas dedupes a retry by the client key)."""
+    payload = _connect_device_parse_body(request, ConnectDeviceContactLifecycleRequest)
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability_route(atlas_capability, atlas_route, operator)
+    except AtlasFunnelCapabilityUnavailable as exc:
+        append_access_log(
+            request,
+            f"{log_event}_CAPABILITY_UNAVAILABLE",
+            False,
+            f"device={operator['deviceId']} contact={contact_id} capability={exc.capability}",
+            persist_to_file=False,
+        )
+        return _atlas_capability_unavailable_response(exc)
+
+    contact_id_text = str(contact_id)
+    idempotency_key = str(payload.idempotencyKey)
+    challenge_id = _validate_connect_operation_uuid(payload.challengeId)
+    confirmation_id = _validate_connect_operation_uuid(payload.confirmationId)
+    device_id = operator["deviceId"]
+    fingerprint = _connect_device_operation_fingerprint(
+        device_capability,
+        {"contactId": contact_id_text, "idempotencyKey": idempotency_key},
+    )
+    _authorize_connect_device_operation(
+        device_id, challenge_id, confirmation_id, device_capability, fingerprint
+    )
+    try:
+        atlas_result = _atlas_funnel_request(
+            atlas_path.format(contact_id=contact_id_text),
+            operator,
+            payload={},
+            idempotency_key=idempotency_key,
+        )
+        visible = _validate_atlas_contact_lifecycle_result(
+            atlas_result, contact_id=contact_id_text, expected_status=expected_status
+        )
+    except AtlasFunnelRequestError as exc:
+        append_access_log(
+            request,
+            f"{log_event}_FAILED",
+            False,
+            f"device={device_id} contact={contact_id_text} status={exc.status_code}",
+            persist_to_file=False,
+        )
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    append_access_log(
+        request,
+        log_event,
+        True,
+        f"device={device_id} contact={contact_id_text} idempotent={visible['idempotent']}",
+        persist_to_file=False,
+    )
+    return JSONResponse(
+        status_code=200 if visible["idempotent"] else 201,
+        content=jsonable_encoder(visible),
+    )
+
+
+@app.post("/api/connect/device/funnel/contacts/{contact_id}/archive")
+def connect_device_archive_funnel_contact(
+    contact_id: UUID,
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> JSONResponse:
+    """Device-driven, confirmation-gated soft archive of one contact (see
+    ``_connect_device_contact_lifecycle``)."""
+    return _connect_device_contact_lifecycle(
+        contact_id=contact_id,
+        request=request,
+        operator=operator,
+        device_capability=CONNECT_DEVICE_CONTACT_ARCHIVE_CAPABILITY,
+        atlas_capability=ATLAS_FUNNEL_CAPABILITY_CONTACT_ARCHIVE,
+        atlas_route=_ATLAS_CONTACT_ARCHIVE_ROUTE,
+        atlas_path=ATLAS_CONTACT_ARCHIVE_PATH,
+        expected_status="archived",
+        log_event="CONNECT_DEVICE_FUNNEL_CONTACT_ARCHIVED",
+    )
+
+
+@app.post("/api/connect/device/funnel/contacts/{contact_id}/restore")
+def connect_device_restore_funnel_contact(
+    contact_id: UUID,
+    request: Request,
+    operator: Dict[str, Any] = Depends(require_connect_device),
+) -> JSONResponse:
+    """Device-driven, confirmation-gated restore of one archived contact (see
+    ``_connect_device_contact_lifecycle``)."""
+    return _connect_device_contact_lifecycle(
+        contact_id=contact_id,
+        request=request,
+        operator=operator,
+        device_capability=CONNECT_DEVICE_CONTACT_RESTORE_CAPABILITY,
+        atlas_capability=ATLAS_FUNNEL_CAPABILITY_CONTACT_RESTORE,
+        atlas_route=_ATLAS_CONTACT_RESTORE_ROUTE,
+        atlas_path=ATLAS_CONTACT_RESTORE_PATH,
+        expected_status="active",
+        log_event="CONNECT_DEVICE_FUNNEL_CONTACT_RESTORED",
     )
 
 
