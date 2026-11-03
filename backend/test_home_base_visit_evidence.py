@@ -565,6 +565,21 @@ def _depart_and_clock_out(
     assert clock_out.status_code == 200, clock_out.text
 
 
+def _expected_home_base_pin(label):
+    """The one internal pin the locations read reports for the Home Base.
+
+    pytest.approx only accepts flat numeric containers (pytest 9 raises on a
+    list of dicts), so the tolerance goes on the coordinates themselves and the
+    list and key set are still compared exactly.
+    """
+    return {
+        "kind": "home_base",
+        "name": label,
+        "latitude": pytest.approx(BASE_LATITUDE),
+        "longitude": pytest.approx(BASE_LONGITUDE),
+    }
+
+
 def test_timesheet_locations_exposes_home_base_as_internal_gps_pin(client, auth):
     employee_id, employee_auth = _create_employee(client, "Home Base location meta")
     _enroll_in_morning_crew(employee_id)
@@ -575,16 +590,7 @@ def test_timesheet_locations_exposes_home_base_as_internal_gps_pin(client, auth)
     body = response.json()
 
     label = "Home Base — EOM Office Home Base"
-    assert body["internal_locations"] == pytest.approx(
-        [
-            {
-                "kind": "home_base",
-                "name": label,
-                "latitude": BASE_LATITUDE,
-                "longitude": BASE_LONGITUDE,
-            }
-        ]
-    )
+    assert body["internal_locations"] == [_expected_home_base_pin(label)]
     assert label not in body["location_coords"]
     assert label not in body["location_customers"]
     assert label not in body["locations"]
@@ -620,16 +626,7 @@ def test_timesheet_locations_preserves_customer_site_when_home_base_label_collid
     assert body["location_customers"][label] == customer
     assert label in body["locations"]
     assert any(site["name"] == label for site in body["sites"])
-    assert body["internal_locations"] == pytest.approx(
-        [
-            {
-                "kind": "home_base",
-                "name": label,
-                "latitude": BASE_LATITUDE,
-                "longitude": BASE_LONGITUDE,
-            }
-        ]
-    )
+    assert body["internal_locations"] == [_expected_home_base_pin(label)]
 
 
 def test_home_base_scan_exception_and_server_enforced_policy(client, auth):
