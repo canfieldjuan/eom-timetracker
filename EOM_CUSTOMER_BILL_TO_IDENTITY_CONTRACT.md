@@ -71,7 +71,7 @@ drifted.
 
 - Additive migration: `contacts.billing_address TEXT NULL`, at most 500
   characters (the tracker's limit), and `contacts.bill_to_revision BIGINT NULL`
-  for the revision fence (see Concurrency). Existing rows stay null.
+  for the revision fence (Concurrency). Existing rows stay null.
 - The operator boundary admits `billing_address` (`billingAddress` on the wire)
   alongside the fields in `EOM_OPERATOR_CONTACT_FIELDS`
   (`atlas_brain/services/eom_crm_mutations.py:108`), **only on an edit that
@@ -101,31 +101,32 @@ drifted.
 
 **Slice B: tracker**
 
-- **PATCH.** When a PATCH changes `name` or `billingAddress` on a linked
-  Customer (compared with the stored values, because the deployed portal sends
-  every field on every edit), it runs the saga. It reserves the change, sends
+Every path below admits the write and runs the reservation through the
+Execution model's two rules ("Identity write admission", "Reservation
+lifecycle"); the bullets only say when each path writes.
+
+- **PATCH.** A PATCH on a linked Customer writes the identity when it changes
+  `name` or `billingAddress` (compared with the stored values, because the
+  deployed portal sends every field on every edit), or when the Customer has a
+  pending identity reservation. It sends
   `{contactId, full_name, billing_address, identityRevision}` to
-  `POST /eom-funnel/operator-contacts`,
-  and applies the **whole** PATCH locally only after Atlas confirms. A PATCH
-  that leaves both values unchanged keeps today's behavior and makes no Atlas
-  call, but only when the Customer has no pending identity reservation (see
-  Concurrency, revision fence rule 3).
-- **Office conversion.** After the handoff saga links the Customer, the same
-  identity sync runs for it. If that sync fails, the conversion still stands
-  (the handoff is its own saga), and the identity reservation stays pending and
-  visible.
+  `POST /eom-funnel/operator-contacts` and applies the **whole** PATCH locally
+  only after Atlas confirms. Otherwise it keeps today's behavior and makes no
+  Atlas call.
+- **Office conversion.** After the handoff saga links the Customer, the
+  identity sync runs for it. If the sync is pending or refused, the conversion
+  still stands (the handoff is its own saga) and the outcome is visible.
 - **Repair.** `POST /api/admin/customers/{customer_id}/atlas-identity` (new and
-  additive) sends a linked Customer's current name and billing address through
-  the same saga. An unlinked Customer gets 409 and is pointed at the existing
-  `/atlas-contact` reconcile. This is how Milano, and any Customer whose identity
-  is pending, gets fixed.
-- **Create (0C).** The create body does not carry `billing_address`. Once
-  the create has linked the Customer (after the local finalizer's ownership
-  check), the identity sync sends the name and billing address with
-  `contactId`, as for office conversion. A create that matches a contact linked
-  to another Customer therefore cannot change that contact's billing address.
+  additive) writes a linked Customer's current name and billing address. This
+  is how Milano, and any Customer whose identity is pending, gets fixed.
+- **Create (0C).** The create body does not carry `billing_address`. Once the
+  create has linked the Customer (after the local finalizer's ownership check),
+  the identity sync sends the name and billing address with `contactId`, as for
+  office conversion. A create that matches a contact linked to another Customer
+  therefore cannot change that contact's billing address.
 - **Site routes.** The single-Site PATCH and legacy bulk PUT refuse a changed
-  `customerName` for an Atlas-linked Customer (see Concurrency, "One writer").
+  `customerName` for an Atlas-linked Customer (Concurrency, "One writer for the
+  bill-to name").
 
 ### Must not change
 
@@ -141,18 +142,75 @@ drifted.
 
 ## Execution model
 
-The PATCH or repair outcome when the bill-to identity changes on a linked
-Customer:
+Every bill-to identity write (Customer PATCH, office-conversion sync,
+post-create sync, repair) goes through the same two rules below. The
+per-path bullets in Slice B refer to them and do not restate them.
+
+### Identity write admission
+
+Checked in this order, under the Customer row lock, before any reservation is
+created or Atlas is called:
+
+1. **Linked.** The Customer has an `atlasContactId`. An unlinked Customer's
+   PATCH keeps today's behavior; repair returns 409 and points at
+   `/atlas-contact`.
+2. **Sole holder.** No other Customer holds the same `atlasContactId`. Several
+   Customers can share one contact today (the linkage audit reports them as
+   duplicate groups, `backend/test_atlas_linkage.py:137-154`), and an identity
+   write to a shared contact would change the other Customer's invoice name and
+   address too. A shared contact is refused with 409
+   `customer_atlas_contact_shared`, listing the other Customer ids: nothing is
+   applied and Atlas is not called until the duplicate is resolved. The check
+   locks the other holders' rows (`SELECT ... FOR UPDATE`), which is the same
+   lock the create finalizer takes (`time_tracker_api.py:23630-23638`), so a
+   concurrent link cannot create a duplicate mid-write.
+3. **Atlas ready.** Credentials present (else 503) and the deployed Atlas
+   advertises `contact.bill_to_identity` (else 501). Nothing applied.
+
+### Reservation lifecycle
+
+An identity reservation is `pending`, `applied`, `refused`, or `superseded`.
+
+- **Created** under the Customer row lock with the next revision (see the
+  revision fence) and its own Idempotency-Key.
+- **Applied** when Atlas confirms: the tracker applies the whole PATCH in the
+  same transaction and marks every **older** pending reservation of that
+  Customer superseded. Only a successful apply supersedes anything.
+- **Pending** when Atlas is unreachable, times out, or returns 5xx: nothing is
+  applied locally and the reservation is visible on `GET /api/admin/customers`.
+- **Refused** when Atlas refuses for any reason other than a stale revision:
+  the reservation closes, nothing is applied, and older pending reservations
+  stay pending and visible.
+- **Superseded** also when Atlas refuses the reservation's revision as stale:
+  it closes and nothing is applied.
+- **Retry** sends only the Customer's **newest** pending reservation, with its
+  own key. Older pending reservations are never sent again; they close when a
+  newer one applies.
+- **No-op shortcut.** A PATCH whose name and billing address equal the stored
+  values makes no Atlas call only when the Customer has **no** pending
+  reservation. Otherwise it creates a new reservation: the last save wins.
+
+Worked sequences (each is a review-contract test):
+
+- A, then B (Atlas applies B, the response times out), then the office saves A:
+  B is pending, so the save of A is not a no-op; it applies with a higher
+  revision and supersedes B. Both systems end at A.
+- A, then B (applied in Atlas, timed out), then C refused by Atlas: C closes as
+  refused and B stays pending and visible. A later save of A creates a new
+  reservation, which applies and supersedes B. Both systems end at A.
+- B pending, then C applies: B is superseded and never retried. A delayed B
+  request that reaches Atlas after C is refused by the fence.
 
 | Outcome | Status | Local result |
 |---|---|---|
-| Atlas applied the identity | 200 | PATCH applied, reservation finalized |
-| Atlas unreachable, timed out, or 5xx | 202, `error: customer_atlas_pending` | **Nothing applied**; reservation pending, retryable with the same key |
-| Atlas refused (archived, identity owned by another contact) | 409 `customer_atlas_identity_refused`, with Atlas's reason | Nothing applied, reservation closed |
-| Atlas refused a stale `identityRevision` | 409 `customer_atlas_identity_superseded` | Nothing applied, reservation closed as superseded |
+| Atlas applied the identity | 200 | PATCH applied, older pending reservations superseded |
+| Atlas unreachable, timed out, or 5xx | 202, `error: customer_atlas_pending` | **Nothing applied**; reservation pending |
+| Atlas refused (archived, identity owned by another contact) | 409 `customer_atlas_identity_refused`, with Atlas's reason | Nothing applied, reservation refused |
+| Atlas refused a stale `identityRevision` | 409 `customer_atlas_identity_superseded` | Nothing applied, reservation superseded |
+| Contact shared with another Customer | 409 `customer_atlas_contact_shared` | Nothing applied, no reservation, no Atlas call |
 | Deployed Atlas lacks `contact.bill_to_identity` | 501 `atlas_capability_unavailable` | Nothing applied, no Atlas call |
 | Tracker has no Atlas credentials | 503 | Nothing applied |
-| Name and billing address unchanged | Today's behavior | No Atlas call |
+| Name and billing address unchanged, nothing pending | Today's behavior | No Atlas call |
 
 ### Concurrency
 
@@ -160,37 +218,22 @@ Customer:
   row lock from the read, through the Atlas response, to the local commit. 0C
   already does this for reconciliation (its review item 9). The wait is bounded
   by the Atlas client timeout. A second edit waits, then compares against the
-  committed values.
+  committed values and the pending reservations.
 - Atlas serializes per contact (`eom-operator-contact:contact:{id}`,
   `crm_provider.py:1740`).
-- **Idempotency key.** Each change gets its own reservation and key. A retry of
-  a pending change reuses its key. A new change, including a revert to an
-  earlier value, gets a new key, so Atlas cannot answer an A to B to A revert
-  with a stale replay.
-- **Revision fence.** A pending change must never be able to undo a newer one.
-  Example: Atlas applies name B but the response times out, so B stays pending;
-  the office then saves C and both systems reach C; a later retry of B would put
-  Atlas back to B. Two rules close this:
-  1. Every identity reservation takes a revision from one tracker sequence, so
-     revisions only grow for a Customer. The tracker sends it as
-     `identityRevision` alongside `contactId`. Atlas stores the highest applied
-     revision on the contact (`contacts.bill_to_revision`) inside the same
-     transaction and per-contact lock as the write. A revision that is not
-     higher than the stored one, sent under a new Idempotency-Key, is refused
-     with 409 and changes nothing. A retry under the original key still gets
-     its original receipt. `identityRevision` without `contactId` is rejected
-     (422).
-  2. Creating a reservation closes the Customer's older pending identity
-     reservations as superseded, under the Customer row lock. A superseded
-     reservation is never retried. If a stale request still reaches Atlas (for
-     example a delayed delivery), rule 1 refuses it, and the tracker closes that
-     reservation as superseded without applying anything locally.
-  3. The last save wins. While a Customer has a pending identity reservation,
-     every PATCH on it creates a new reservation, even when its name and
-     billing address equal the stored values. Example: A, then B (Atlas applies
-     B but times out, so the tracker stays at A with B pending), then the office
-     saves A: that save is not a no-op; it sends A with a higher revision and
-     supersedes B, and both systems end at A.
+- **Idempotency key.** Each reservation has its own key. A retry reuses it. A
+  new change, including a revert to an earlier value, gets a new key, so Atlas
+  cannot answer an A to B to A revert with a stale replay.
+- **Revision fence.** Every identity reservation takes a revision from one
+  tracker sequence, so revisions only grow for a Customer. The tracker sends it
+  as `identityRevision` alongside `contactId`. Atlas stores the highest applied
+  revision on the contact (`contacts.bill_to_revision`) inside the same
+  transaction and per-contact lock as the write. A revision that is not higher
+  than the stored one, sent under a new Idempotency-Key, is refused with 409
+  and changes nothing; a retry under the original key still gets its original
+  receipt. `identityRevision` without `contactId` is rejected (422). This is
+  what makes a delayed or retried older request harmless once a newer one has
+  applied.
 - **One writer for the bill-to name.** Two Site routes also rename the owning
   Customer: `PATCH /api/admin/locations/{site_id}` and the legacy bulk
   `PUT /api/admin/locations` (`time_tracker_api.py:32244` and `:32027`). For an
@@ -242,7 +285,7 @@ Customer:
    and shows the Site-route 409 `customer_identity_edit_required` as "rename
    this on the Customer". While a Customer has a pending identity change, its
    edit form starts from the pending values, so saving an unrelated field does
-   not revert the pending change (rule 3 makes that save win). This must deploy
+   not revert the pending change (the last save wins). This must deploy
    before B, or B's 202 reads as a silent success.
 3. **B (tracker):** PATCH, conversion, repair, create, supersede, and the Site
    route guard.
@@ -288,15 +331,15 @@ Tracker (slice B):
    reservation is pending.
 10. Name A, then B, then A sends three distinct keys and rising revisions, and
     Atlas ends at A.
-11. Supersede: B times out (pending), then C applies; the B reservation is
-    closed as superseded and a retry of it makes no Atlas call. A B request that
-    Atlas receives after C is refused by the fence. Both systems end at C.
-    Revert: A, then B (Atlas applies B, response times out), then a save of A
-    sends A with a higher revision and supersedes B; both systems end at A.
-    Create: the create body carries no `billing_address`; after linking, the
-    identity sync sends it. A create whose email matches a contact linked to
-    another Customer still returns the link conflict and leaves that contact's
-    `billing_address` unchanged.
+11. The three worked sequences in "Reservation lifecycle", each as a test:
+    revert after a timed-out apply; refusal of the replacement while B is
+    pending (B stays pending and visible, then a save of A applies and
+    supersedes it); and B pending then C applied (B superseded, never retried,
+    and a delayed B refused by the fence). Retry sends only the newest pending
+    reservation. Create: the create body carries no `billing_address`; after
+    linking, the identity sync sends it, and a create whose email matches a
+    contact linked to another Customer still returns the link conflict and
+    leaves that contact's `billing_address` unchanged.
 12. An office conversion sends the Customer name and billing address for the
     converted contact. A failed sync leaves a pending reservation that
     `GET /api/admin/customers` shows.
@@ -310,6 +353,11 @@ Tracker (slice B):
     `customer_identity_edit_required` and change no Customer, Site, or Atlas
     row; with the stored name, or for an unlinked Customer, they behave as
     today.
+16. Shared contact: with two Customers holding one `atlasContactId`, a PATCH
+    changing either one's name or billing address, a repair, and a conversion
+    or post-create sync each return 409 `customer_atlas_contact_shared` with the
+    other Customer id, make no Atlas call, create no reservation, and change no
+    row. A PATCH that leaves the identity unchanged still applies as today.
 
 Live settle: after A and B deploy, run the repair for Milano. Confirm in Atlas
 that `full_name` is the business name, `billing_address` is set, and `address`
