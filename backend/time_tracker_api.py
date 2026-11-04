@@ -7054,6 +7054,11 @@ GEOFENCE_HARD_GATE_SCOPE_LOCK = "eom_geofence_hard_gate_scopes_v1"
 FUNNEL_LEAD_TRANSITION_LOCK = "eom_funnel_lead_transition_v1"
 CUSTOMER_TYPE_MIRROR_LOCK = "eom_customer_type_mirror_v1"
 CUSTOMER_IDENTITY_LOCK = "eom_customer_identity_v1"
+# How long a save waits for the same Customer's in-flight identity save: one
+# whole saga (the manifest read with its retry, then the Atlas write) plus
+# margin. Past it the save is refused as busy rather than queued further.
+CUSTOMER_IDENTITY_LOCK_WAIT_SECONDS = 3 * ATLAS_FUNNEL_TIMEOUT_SECONDS + 5
+_CUSTOMER_IDENTITY_LOCK_POLL_SECONDS = 0.1
 
 
 def _lock_customer_site_mutations(cur: Any) -> None:
@@ -7091,7 +7096,7 @@ def _lock_customer_type_mirror(cur: Any, contact_id: str) -> None:
     )
 
 
-def _lock_customer_identity(cur: Any, customer_id: int) -> None:
+def _try_lock_customer_identity(cur: Any, customer_id: int) -> bool:
     """Serialize ONE Customer's bill-to identity writes, Atlas call included.
 
     Held for a whole identity saga, from the read through the Atlas response
@@ -7102,9 +7107,10 @@ def _lock_customer_identity(cur: Any, customer_id: int) -> None:
     lock by every writer that takes both, so the order cannot invert.
     """
     cur.execute(
-        "SELECT pg_advisory_xact_lock(hashtext(%s), %s)",
+        "SELECT pg_try_advisory_xact_lock(hashtext(%s), %s)",
         (CUSTOMER_IDENTITY_LOCK, int(customer_id)),
     )
+    return bool(cur.fetchone()[0])
 
 
 def _lock_funnel_lead_transition(cur: Any, contact_id: str) -> None:
@@ -24003,11 +24009,30 @@ class _CustomerIdentityLinkChanged(Exception):
 def _customer_identity_serialized(customer_id: int):
     """Hold ONE Customer's identity lock for a whole saga, on its own
     connection, so the reservation and the apply can commit while it stays
-    held across the Atlas call."""
-    with db.get_conn() as conn:
-        with conn.cursor() as cur:
-            _lock_customer_identity(cur, customer_id)
-        yield
+    held across the Atlas call.
+
+    A save that finds the lock taken waits WITHOUT a connection: it retries,
+    returning its connection between attempts. A waiter blocked inside
+    Postgres would pin a pooled connection for the length of another save's
+    Atlas call, and a few of them would exhaust the pool the holder itself
+    needs to finish.
+    """
+    deadline = time.monotonic() + CUSTOMER_IDENTITY_LOCK_WAIT_SECONDS
+    while True:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                acquired = _try_lock_customer_identity(cur, customer_id)
+            if acquired:
+                yield
+                return
+        if time.monotonic() >= deadline:
+            _raise_conflict(
+                "customer_identity_save_in_progress",
+                "Another save of this Customer is still waiting on Atlas; "
+                "retry in a moment",
+                {"customerId": int(customer_id)},
+            )
+        time.sleep(_CUSTOMER_IDENTITY_LOCK_POLL_SECONDS)
 
 
 def _serialize_customer_identity_reservation(row: Dict[str, Any]) -> Dict[str, Any]:

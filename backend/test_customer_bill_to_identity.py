@@ -13,9 +13,12 @@ written.
 
 from __future__ import annotations
 
+import os
 import threading
+import time
 import uuid
 
+import psycopg2
 import pytest
 import requests
 
@@ -374,6 +377,72 @@ def test_concurrent_identity_edits_serialize(client, auth, atlas):
     assert b["identity_revision"] < c["identity_revision"]
     assert atlas.contacts[contact]["full_name"] == f"{PREFIX} C"
     assert _row(customer_id)["name"] == f"{PREFIX} C"
+
+
+def _hold_identity_lock(customer_id):
+    """Take the Customer's identity lock from outside the app, as a save would."""
+    blocker = psycopg2.connect(os.environ["DATABASE_URL"], sslmode="disable")
+    with blocker.cursor() as cur:
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s), %s)",
+            (api.CUSTOMER_IDENTITY_LOCK, customer_id),
+        )
+    return blocker
+
+
+def test_queued_identity_saves_do_not_hold_pool_connections(client, auth, atlas):
+    """A waiter must not sit inside Postgres on a pooled connection.
+
+    Blocked in pg_advisory_lock, each queued save would pin a connection for
+    the length of another save's Atlas call, and a few of them exhaust the
+    pool (db.py maxconn=10) the holder needs to finish. Checked at the
+    mechanism: while saves wait, Postgres has no ungranted advisory lock.
+    """
+    customer_id, _ = _linked("Queued")
+    blocker = _hold_identity_lock(customer_id)
+    statuses: list[int] = []
+
+    def _save(n):
+        statuses.append(_patch(client, auth, customer_id, name=f"{PREFIX} Queued {n}").status_code)
+
+    savers = [threading.Thread(target=_save, args=(n,)) for n in range(5)]
+    try:
+        for saver in savers:
+            saver.start()
+        time.sleep(0.5)
+        assert all(saver.is_alive() for saver in savers), "they wait for the lock"
+        queued_in_postgres = db.query_one(
+            "SELECT count(*) AS n FROM pg_locks "
+            "WHERE locktype = 'advisory' AND NOT granted"
+        )["n"]
+        assert queued_in_postgres == 0
+        assert atlas.posts == []
+    finally:
+        blocker.rollback()
+        blocker.close()
+    for saver in savers:
+        saver.join(timeout=30)
+
+    assert statuses == [200] * 5
+    assert len({r["identity_revision"] for r in _reservations(customer_id)}) == 5
+
+
+def test_identity_save_gives_up_when_the_customer_stays_busy(
+    client, auth, atlas, monkeypatch
+):
+    customer_id, _ = _linked("Busy")
+    monkeypatch.setattr(api, "CUSTOMER_IDENTITY_LOCK_WAIT_SECONDS", 0.3)
+    blocker = _hold_identity_lock(customer_id)
+    try:
+        response = _patch(client, auth, customer_id, name=f"{PREFIX} Never Sent")
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "customer_identity_save_in_progress"
+    assert atlas.posts == [] and _reservations(customer_id) == []
+    assert _row(customer_id)["name"] == f"{PREFIX} Busy"
 
 
 # --- item 14: refusal and readiness -------------------------------------------
