@@ -92,9 +92,16 @@ Customer with 501.
 7. **Post-link sync** (B2) runs after every 0C link (create, its retry, and
    reconcile of an unlinked Customer) and after an office conversion
    finalizes (office approve, office retry, device handoff). It writes the
-   Customer's stored name and billing address. The create, link, and
-   conversion responses keep their shape when the sync applies; otherwise they
-   gain an additive `identitySync` key carrying the outcome.
+   Customer's stored name and billing address. The obligation is recorded as a
+   pending reservation **inside the link's own finalizing transaction** (the
+   0C finalizer, the office-conversion finalizer), after a capability read
+   taken before that lock, so a worker lost between the link and the send
+   leaves a listed, retryable reservation rather than no trace (#284 review).
+   A manifest that denies the capability, or a contact another Customer holds,
+   records nothing. The send then drives that reservation exactly like a
+   retry. The create, link, and conversion responses keep their shape when the
+   sync applies; otherwise they gain an additive `identitySync` key carrying
+   the outcome.
 8. **Repair** (B2) writes the stored identity. Like any save it supersedes
    older pending reservations when it applies; completing a pending edit
    instead is what retry is for.
