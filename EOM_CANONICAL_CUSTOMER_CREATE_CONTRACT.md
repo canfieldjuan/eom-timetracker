@@ -119,7 +119,7 @@ are deliberately not mapped: the CRM's copies come from other sources, the
 operational address lives on the tracker Site, and overwriting them here would
 be silent data loss for no gain in this slice's guarantee.
 
-Proposed amendment: the match rule above is replaced by
+Amended (accepted 2026-11-04): the match rule above is replaced by
 [`EOM_CUSTOMER_CREATE_MATCH_CONTRACT.md`](./EOM_CUSTOMER_CREATE_MATCH_CONTRACT.md)
 (issue 282). Under it, a match returns the contact unchanged, and only the
 bill-to identity follows after the link.

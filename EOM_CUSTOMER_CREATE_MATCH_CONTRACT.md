@@ -1,7 +1,7 @@
 # EOM customer create match contract
 
-Status: **proposed, awaiting operator review.** This document is the contract
-only; each slice implements it in its own PR.
+Status: **accepted by the operator on 2026-11-04.** This document is the
+contract only; each slice implements it in its own PR.
 
 Closes the gap recorded in eom-timetracker issue 282 and in the Deferred list of
 [`EOM_CUSTOMER_BILL_TO_IDENTITY_CONTRACT.md`](./EOM_CUSTOMER_BILL_TO_IDENTITY_CONTRACT.md).
