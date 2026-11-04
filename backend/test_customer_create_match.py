@@ -397,6 +397,59 @@ def test_a_reservation_from_before_the_contract_retries_its_original_request(
     assert str(_customer(name)["atlas_contact_id"]) == receipts[key][1]
 
 
+def test_reposting_a_pre_contract_key_is_gated_on_that_reservation(
+    client, auth, monkeypatch
+):
+    """The create route re-drives an existing pending reservation for its key.
+
+    That reservation sends no onMatch, so an Atlas without
+    contact.match_without_write can still serve it; refusing it with 501 would
+    break the create-replay path 0C supports.
+    """
+    from time_tracker_api import CustomerCreateRequest
+
+    name = _name("Pre Contract Repost")
+    key = str(uuid.uuid4())
+    reservation_id = str(uuid.uuid4())
+    request = CustomerCreateRequest(name=name, idempotencyKey=key)
+    stored = api._customer_atlas_stored_payload(request)
+    db.execute(
+        """
+        INSERT INTO eom_customer_atlas_reservations (
+            id, idempotency_key, request_fingerprint, payload, mode,
+            requested_by_employee_id
+        )
+        VALUES (%s, %s, %s, %s::jsonb, 'create', %s)
+        """,
+        (
+            reservation_id,
+            key,
+            api._customer_atlas_fingerprint(stored, mode="create", customer_id=None),
+            api.json.dumps(stored, sort_keys=True),
+            _employee_id(),
+        ),
+    )
+    original = {
+        "full_name": name,
+        "contact_type": "customer",
+        "source_channel": "time_tracker",
+        "source_ref": reservation_id,
+    }
+    receipts = {key: (original, str(uuid.uuid4()))}
+    _with_capabilities(monkeypatch, drop=("contact.match_without_write",))
+    calls = _receipt_atlas(monkeypatch, receipts)
+
+    response = client.post(
+        "/api/admin/customers",
+        headers=auth,
+        json={"name": name, "idempotencyKey": key},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [call["json"] for call in calls] == [original]
+    assert str(_customer(name)["atlas_contact_id"]) == receipts[key][1]
+
+
 def test_a_new_reservation_sends_return_on_its_first_attempt_and_its_retry(
     client, auth, monkeypatch
 ):

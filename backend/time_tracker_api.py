@@ -24008,6 +24008,36 @@ def _run_customer_atlas_reservation(
         return None, failure
 
 
+def _customer_atlas_reservation_on_match(
+    reservation: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """The onMatch a 0C request will carry -- the one answer every gate uses.
+
+    An existing reservation sends what it recorded, including nothing (one
+    created before the customer create match contract). Only a reservation
+    that does not exist yet takes the value every new reservation records.
+    """
+    if reservation is not None:
+        return reservation.get("atlas_on_match")
+    return ATLAS_OPERATOR_ON_MATCH_RETURN
+
+
+def _customer_atlas_reservation_for_key(key: str) -> Optional[Dict[str, Any]]:
+    """The reservation a create key already names, read without a lock.
+
+    Only used to choose the capability gate before any local write. A create
+    racing on the same key can only be new code, which records the same value
+    a missing reservation is gated on, so the unlocked read cannot pick a gate
+    the request will not need.
+    """
+    row = db.query_one(
+        "SELECT atlas_on_match FROM eom_customer_atlas_reservations "
+        "WHERE idempotency_key = %s",
+        (key,),
+    )
+    return dict(row) if row else None
+
+
 def _customer_atlas_capability_refusal(
     admin: Dict[str, Any],
     *,
@@ -24015,8 +24045,8 @@ def _customer_atlas_capability_refusal(
 ) -> Optional[JSONResponse]:
     """Refuse early only when Atlas AFFIRMS it cannot serve this mutation.
 
-    `on_match` is what the request will carry: for a new reservation the value
-    it is about to record, for a retry the value it recorded. Sending it needs
+    `on_match` is what the request will carry
+    (_customer_atlas_reservation_on_match). Sending it needs
     contact.match_without_write as well, proven by the same manifest read.
 
     The distinction matters. A manifest that says the capability is absent is a
@@ -25778,9 +25808,15 @@ def admin_create_customer(
             )
 
     # Refused before any local write, so a partially-deployed Atlas cannot
-    # leave a Customer behind. Gated on the onMatch a new reservation records.
+    # leave a Customer behind. Gated on the request this create will send: a
+    # key that already names a pending reservation re-drives THAT reservation.
+    existing = (
+        _customer_atlas_reservation_for_key(str(payload.idempotencyKey))
+        if payload.idempotencyKey is not None
+        else None
+    )
     refusal = _customer_atlas_capability_refusal(
-        admin, on_match=ATLAS_OPERATOR_ON_MATCH_RETURN
+        admin, on_match=_customer_atlas_reservation_on_match(existing)
     )
     if refusal is not None:
         append_access_log(
@@ -25881,7 +25917,7 @@ def admin_retry_customer_atlas_reservation(
     # Gated on what THIS reservation sends: one created before the match
     # contract recorded no onMatch and still needs only 0C's capability.
     refusal = _customer_atlas_capability_refusal(
-        admin, on_match=reservation.get("atlas_on_match")
+        admin, on_match=_customer_atlas_reservation_on_match(reservation)
     )
     if refusal is not None:
         return refusal
@@ -25943,8 +25979,10 @@ def admin_link_customer_to_atlas(
             },
         )
 
+    # Reconcile never re-drives a reservation (an open one is refused with
+    # customer_atlas_reservation_open), so its request is always a new one.
     refusal = _customer_atlas_capability_refusal(
-        admin, on_match=ATLAS_OPERATOR_ON_MATCH_RETURN
+        admin, on_match=_customer_atlas_reservation_on_match(None)
     )
     if refusal is not None:
         return refusal
