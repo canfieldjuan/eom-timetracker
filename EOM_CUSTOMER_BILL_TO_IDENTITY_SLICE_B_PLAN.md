@@ -50,7 +50,12 @@ Customer with 501.
    whole saga, taken before the global lock. Every Customer PATCH takes it,
    so a second edit waits, then compares against the committed values and the
    pending reservations. The reservation insert and the local apply are short
-   transactions under the global lock and the row lock, as today.
+   transactions under the global lock and the row lock, as today. A waiter
+   holds no connection: it takes the lock with `pg_try_advisory_xact_lock`
+   and returns its connection between attempts, so queued saves cannot
+   exhaust the pool the holder needs (#283 review). The wait is bounded by one
+   saga (`3 x ATLAS_FUNNEL_TIMEOUT_SECONDS + 5` s); past it the save returns
+   409 `customer_identity_save_in_progress` with nothing applied.
 2. **Unreadable manifest.** A manifest that affirms `contact.bill_to_identity`
    is absent (or lacks `POST /eom-funnel/operator-contacts`) is a 501 with no
    reservation and no Atlas call. A manifest that cannot be read is an
