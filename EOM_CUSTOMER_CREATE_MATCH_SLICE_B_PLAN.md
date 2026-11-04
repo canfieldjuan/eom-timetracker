@@ -24,9 +24,13 @@ needs Atlas's `contact.match_without_write` and is refused with 501 without it.
     carry. With one, it proves `contact.operator_mutation` and
     `contact.match_without_write` on the operator-contacts route from one
     manifest read. Without one, it checks exactly as before.
-  - Create and reconcile pass the value a new reservation records.
-  - Retry passes the reservation's own value, so a pre-slice reservation still
-    needs only 0C's capability.
+  - One owner, `_customer_atlas_reservation_on_match`, answers "what will
+    this request carry" for every gate: an existing reservation's recorded
+    value (including none), else the value a new reservation records.
+  - Create looks up the reservation its key already names before gating, so
+    reposting a pre-slice pending key re-drives that reservation and needs only
+    0C's capability (Codex P2 on PR 288). Retry passes its reservation.
+    Reconcile always makes a new reservation, because an open one is refused.
   - An unreadable manifest still reserves and attempts (0C).
 - **Leads-page customer create.**
   - `_funnel_contact_create_on_match` is the one predicate: a customer
@@ -66,7 +70,7 @@ needs Atlas's `contact.match_without_write` and is refused with 501 without it.
 | 12 | `test_each_on_match_request_needs_the_capability` (create, reconcile, Leads customer create), `test_an_unreadable_manifest_still_reserves_with_the_recorded_on_match` |
 | 13 | `backend/test_customer_atlas_creation.py::test_customer_create_sends_the_agreed_atlas_contract`, `::test_a_first_time_create_returns_the_legacy_response_shape` |
 | 14 | `test_customer_type_change_body_carries_no_on_match` |
-| 15 | `test_a_reservation_from_before_the_contract_retries_its_original_request`, `test_a_new_reservation_sends_return_on_its_first_attempt_and_its_retry`, `test_the_recorded_on_match_admits_only_return` |
+| 15 | `test_a_reservation_from_before_the_contract_retries_its_original_request`, `test_reposting_a_pre_contract_key_is_gated_on_that_reservation`, `test_a_new_reservation_sends_return_on_its_first_attempt_and_its_retry`, `test_the_recorded_on_match_admits_only_return` |
 
 Atlas-side behavior (a match writes nothing) is proven by slice A's tests;
 these tests use a fake Atlas that answers as slice A does, and assert what the
