@@ -140,9 +140,21 @@ contact unchanged, and the caller decides.
 
 **Slice B: tracker**
 
-- **Customer create and reconcile: the request.** Both 0C reservation modes send
-  `onMatch: "return"` (`_atlas_operator_contact_body`, `:23370`). Nothing else in
-  the body changes.
+- **Customer create and reconcile: the request.** The `onMatch` a reservation
+  sends is part of that reservation, not of the code that sends it.
+  - A reservation records it when it is created, in a new nullable column
+    `eom_customer_atlas_reservations.atlas_on_match` whose CHECK admits only
+    `'return'`. Every reservation created after slice B records `'return'`, in
+    both 0C modes.
+  - Every send of a reservation, its first and every retry, builds the body
+    from that column (`_atlas_operator_contact_body`, `:23370`): `onMatch:
+    "return"` when it is `'return'`, no `onMatch` at all when it is null.
+    Nothing else in the body changes.
+  - So a reservation created before slice B (null) retries exactly as it was
+    first sent. 0C's retry invariant holds across the deploy: the same key
+    carries the same request, so Atlas replays its receipt (retries reuse the
+    key and rebuild the body, `:23918-23922`), instead of refusing a changed
+    request under that key with 409.
 - **Customer create and reconcile: after Atlas answers.** On `contact_matched`
   the local flow is today's. The finalizer's ownership check
   (`_finalize_customer_atlas_reservation`, `:23657`) decides:
@@ -160,8 +172,9 @@ contact unchanged, and the caller decides.
     office to open and edit that contact. Atlas is unchanged.
   - On `contact_created` it behaves as today.
 - **Capability.** Every request that sends `onMatch` requires
-  `contact.match_without_write` as well as the route's existing capability,
-  under 0C's rule:
+  `contact.match_without_write` as well as the route's existing capability.
+  A retry of a reservation created before slice B sends none, so it needs
+  only 0C's capability. The rule is 0C's:
   - A manifest that affirms the capability is absent gets 501 before any local
     write.
   - For the 0C reservation, a manifest that cannot be read is an outage: the
@@ -182,7 +195,8 @@ contact unchanged, and the caller decides.
 - A create for which Atlas creates a new contact, on either door: the same
   fields written and the same success body.
 - 0C's statuses and response shapes for create and reconcile, including 409
-  `customer_atlas_link_conflict` and the pending-reservation rules.
+  `customer_atlas_link_conflict` and the pending-reservation rules, and its
+  retry invariant: one reservation, one key, one request.
 - The bill-to identity sync, PATCH, office conversion, repair, and every
   Leads-page lead create and edit.
 
@@ -198,6 +212,15 @@ contact unchanged, and the caller decides.
 - **Retry.** A retry reuses its key and gets the same `contact_matched`
   receipt. A reservation runs the ownership check again with the same contact,
   and a Leads-page retry returns the same 409.
+- **Across the deploy.**
+  - **A reservation created before slice B** keeps sending its original
+    request, so it keeps 0C's apply-on-match if it is still pending. The live
+    settle lists those reservations so none is left unexamined.
+  - **A Leads-page form** keeps its key in the browser. If its customer create
+    was sent before slice B and is retried after, the retry carries `onMatch`
+    under a key Atlas already holds, and Atlas refuses it with its existing
+    409 for a reused key. Nothing is written, and reopening the form issues a
+    new key.
 
 ## Decisions for operator review
 
@@ -304,12 +327,24 @@ Tracker (slice B):
 13. **New contact.** A Customer create for which Atlas creates a new contact
     keeps the legacy 201 body, and the identity sync runs as today.
 14. **Customer-type change.** Its body carries no `onMatch`.
+15. **Retry across the deploy.**
+    - A pending reservation with `atlas_on_match` null, retried by the new
+      code, sends a body with no `onMatch` and its original key. The body is
+      identical to the one the pre-slice-B code built for it.
+    - Against a fake Atlas that holds a receipt for that key and request, the
+      retry replays the receipt and finalizes, and makes no other Atlas call.
+    - A reservation created by the new code records `'return'`, and its first
+      send and its retry both carry `onMatch: "return"`.
+    - The column's CHECK refuses any other value.
 
 Live settle, after A and B deploy:
 
 - **Proof of the change.** The Atlas manifest lists `contact.match_without_write`.
   The next office Customer create shows `onMatch: "return"` in the Atlas
   request log.
+- **Reservations created before slice B.** List the pending 0C reservations
+  with `atlas_on_match` null. Each one keeps 0C's apply-on-match if retried, so
+  the office examines it before retrying, with the past-damage audit below.
 - **Past damage audit (read-only, both systems).**
   - For each tracker 0C reservation, list the Atlas `contact_updated` events
     whose `source_ref` is that reservation's id and whose `changed_fields` is
