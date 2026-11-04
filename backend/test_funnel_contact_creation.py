@@ -270,6 +270,7 @@ def test_manual_customer_create_omits_blank_optional_fields_and_never_creates_a_
             "contact_type": "customer",
             "source_channel": "time_tracker",
             "source_ref": f"portal-contact:{key}",
+            "onMatch": "return",
         }
     ]
     assert _operational_counts() == before

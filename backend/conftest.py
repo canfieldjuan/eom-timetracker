@@ -189,6 +189,9 @@ def clear_access_log_entries(setup_db):
 # `contact.operator_mutation` on any suite that creates a Customer.
 ATLAS_FULL_CAPABILITIES = [
     "contact.field_clear",
+    # Every new Customer reservation and Leads-page customer create sends
+    # onMatch "return", which needs this name beside contact.operator_mutation.
+    "contact.match_without_write",
     "contact.operator_mutation",
     "lead.customer_handoff",
     "lead.estimate_booking",
