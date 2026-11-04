@@ -148,7 +148,7 @@ per-path bullets in Slice B refer to them and do not restate them.
 
 ### Identity write admission
 
-Checked in this order, under the Customer row lock, before any reservation is
+Checked in this order, under the Customer identity lock (Concurrency), before any reservation is
 created or Atlas is called:
 
 1. **Linked.** The Customer has an `atlasContactId`. An unlinked Customer's
@@ -171,7 +171,7 @@ created or Atlas is called:
 
 An identity reservation is `pending`, `applied`, `refused`, or `superseded`.
 
-- **Created** under the Customer row lock with the next revision (see the
+- **Created** under the Customer identity lock with the next revision (see the
   revision fence) and its own Idempotency-Key.
 - **Applied** when Atlas confirms: the tracker applies the whole PATCH in the
   same transaction and marks every **older** pending reservation of that
@@ -208,17 +208,30 @@ Worked sequences (each is a review-contract test):
 | Atlas refused (archived, identity owned by another contact) | 409 `customer_atlas_identity_refused`, with Atlas's reason | Nothing applied, reservation refused |
 | Atlas refused a stale `identityRevision` | 409 `customer_atlas_identity_superseded` | Nothing applied, reservation superseded |
 | Contact shared with another Customer | 409 `customer_atlas_contact_shared` | Nothing applied, no reservation, no Atlas call |
-| Deployed Atlas lacks `contact.bill_to_identity` | 501 `atlas_capability_unavailable` | Nothing applied, no Atlas call |
+| The Customer's Atlas link changed while Atlas was called | 409 `customer_atlas_link_changed` | Nothing applied; reservation stays pending |
+| Another identity save for this Customer is still running past the bounded wait | 409 `customer_identity_save_in_progress` | Nothing applied, no reservation |
+| Deployed Atlas's manifest affirms `contact.bill_to_identity` is absent | 501 `atlas_capability_unavailable` | Nothing applied, no Atlas call. A manifest that cannot be read is an outage: the write reserves and attempts, so it ends 202 pending |
 | Tracker has no Atlas credentials | 503 | Nothing applied |
 | Name and billing address unchanged, nothing pending | Today's behavior | No Atlas call |
 
 ### Concurrency
 
-- Identity changes to one Customer are serialized by holding that Customer's
-  row lock from the read, through the Atlas response, to the local commit. 0C
-  already does this for reconciliation (its review item 9). The wait is bounded
-  by the Atlas client timeout. A second edit waits, then compares against the
-  committed values and the pending reservations.
+- **Customer identity lock.** Identity changes to one Customer are serialized
+  by a per-Customer transaction advisory lock (`eom_customer_identity_v1`,
+  customer id), held on its own connection for the whole saga, from the read,
+  through the Atlas response, to the local commit. Every Customer PATCH takes
+  it, before the global Customer/Site lock. It is deliberately not the
+  `customers` row lock: ordinary edits take the global lock first and then
+  wait on the row, so a row lock held across the Atlas call would hold every
+  Customer and Site edit for the length of that call. The reservation insert
+  and the local apply stay short transactions under the global lock and the
+  row lock, as today.
+- A second edit waits, then compares against the committed values and the
+  pending reservations. A waiter holds no connection (it retries
+  `pg_try_advisory_xact_lock` and returns its connection between attempts), so
+  queued saves cannot exhaust the pool. The wait is bounded by one saga
+  (`3 x ATLAS_FUNNEL_TIMEOUT_SECONDS + 5` seconds); past it the save returns
+  409 `customer_identity_save_in_progress` and applies nothing.
 - Atlas serializes per contact (`eom-operator-contact:contact:{id}`,
   `crm_provider.py:1740`).
 - **Idempotency key.** Each reservation has its own key. A retry reuses it. A
