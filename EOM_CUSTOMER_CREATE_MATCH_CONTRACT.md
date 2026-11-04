@@ -101,10 +101,11 @@ contact unchanged, and the caller decides.
     on an edit.
   - Each 422 is returned before the provider runs.
 - **Behavior with `"return"`.**
-  - **Resolution and refusals are unchanged.** Several matches, an archived
-    contact, or a non-editable contact or contact-type mismatch
-    (`_assert_contact_type_matches`, `:1609`) are refused with the same 409s as
-    today. Each refusal writes nothing.
+  - **Resolution and refusals are unchanged.** Several matches, or a
+    non-editable contact or contact-type mismatch
+    (`_assert_contact_type_matches`, `:1609`), are refused with the same 409s
+    as today. Each refusal writes nothing. An archived contact is never a
+    match candidate, as today (`_select_exact_matches`, `:1424`).
   - **No match.** Atlas creates the contact exactly as today (`_create_contact`,
     `:1669`). It records the `contact_created` event and returns operation
     `contact_created`.
@@ -272,9 +273,9 @@ Atlas (slice A):
    receipt and records no second event. The same key with `onMatch` changed
    returns 409. The receipt index's predicate lists exactly the operator
    receipt event types.
-6. **Refusals.** Under `"return"`, several matches, an archived match, and a
-   contact-type mismatch each return today's 409. Each leaves the contact
-   unchanged and records no event.
+6. **Refusals.** Under `"return"`, several matches and a contact-type
+   mismatch each return today's 409. Each leaves the contacts unchanged and
+   records no event.
 7. **Capability.** The manifest advertises `contact.match_without_write`.
 
 Tracker (slice B):
