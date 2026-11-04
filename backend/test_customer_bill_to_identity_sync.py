@@ -8,9 +8,11 @@ tests; this module adds the 0C create and customer-handoff routes under it.
 
 from __future__ import annotations
 
+import threading
 import uuid
 
 import pytest
+import requests
 
 import db
 import time_tracker_api as api
@@ -36,6 +38,8 @@ class _OtherRoutes:
         self.creates: list[dict] = []
         self.create_contact: str | None = None  # force create-or-return's match
         self.during_handoff = None
+        self.handoffs = 0
+        self.handoff_failures = 0
 
     def post(self, url, *, headers=None, json=None, timeout=None):
         url = str(url)
@@ -45,6 +49,10 @@ class _OtherRoutes:
             contact_id = self.create_contact or fake_atlas_contact_id(key)
             return _Response(201, {"success": True, "contactId": contact_id, "contact": {}})
         if url.endswith("/eom-funnel/customer-handoffs"):
+            self.handoffs += 1
+            if self.handoff_failures:
+                self.handoff_failures -= 1
+                raise requests.ConnectionError("Atlas is down")
             if self.during_handoff is not None:
                 self.during_handoff()
             return _Response(
@@ -364,6 +372,47 @@ def test_failed_conversion_sync_leaves_a_visible_pending_reservation(client, aut
     assert listed["atlasContactId"] == contact
     assert listed["origin"] == "conversion"
     assert listed["name"] == f"{PREFIX} Pending Business"
+
+
+def test_conversion_snapshot_waits_for_an_in_flight_identity_save(
+    client, auth, atlas, routes
+):
+    contact = str(uuid.uuid4())
+    routes.handoff_failures = 1
+    first = _approve(client, auth, contact, f"{PREFIX} Converted A")
+    assert first.status_code == 202, first.text  # handoff pending; Customer linked
+    customer_id = first.json()["handoff"]["customerId"]
+    atlas.release = threading.Event()
+    results: dict[str, int] = {}
+
+    def _rename():
+        results["patch"] = _patch(client, auth, customer_id, name=f"{PREFIX} Converted B").status_code
+
+    def _retry_handoff():
+        results["handoff"] = client.post(
+            f"/api/admin/funnel/handoffs/{contact}/retry", headers=auth
+        ).status_code
+
+    saver = threading.Thread(target=_rename)
+    saver.start()
+    assert atlas.entered.wait(timeout=10), "the rename never reached Atlas"
+    relay = threading.Thread(target=_retry_handoff)
+    relay.start()
+    relay.join(timeout=1)
+    try:
+        assert relay.is_alive(), "the conversion waits for the in-flight save"
+        assert routes.handoffs == 1, "and makes no Atlas call while it waits"
+    finally:
+        atlas.release.set()
+        saver.join(timeout=15)
+        relay.join(timeout=30)
+
+    assert results == {"patch": 200, "handoff": 200}
+    renamed, obligation = _reservations(customer_id)
+    assert (obligation["origin"], obligation["state"]) == ("conversion", "applied")
+    assert obligation["full_name"] == f"{PREFIX} Converted B", "snapshot follows the save"
+    assert atlas.contacts[contact]["full_name"] == f"{PREFIX} Converted B"
+    assert _row(customer_id)["name"] == f"{PREFIX} Converted B"
 
 
 # --- item 13: repair ----------------------------------------------------------------

@@ -24709,6 +24709,7 @@ def _post_link_identity_sync(
     request: Request,
     *,
     origin: str,
+    identity_lock_held: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Send the bill-to identity a link just obliged; the link stands anyway.
 
@@ -24729,8 +24730,13 @@ def _post_link_identity_sync(
         return {"status": "not_sent", **obligation["notSent"]}
     reservation_id = str(obligation["reservation"]["id"])
     log_detail = f"reservation={reservation_id} origin={origin}"
+    drive = (
+        _drive_customer_identity_reservation_locked
+        if identity_lock_held
+        else _drive_customer_identity_reservation
+    )
     try:
-        result = _drive_customer_identity_reservation(reservation_id, admin)
+        result = drive(reservation_id, admin)
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else {"message": exc.detail}
         append_access_log(request, "CUSTOMER_IDENTITY_SYNC_NOT_SENT", False, log_detail)
@@ -25912,7 +25918,6 @@ def _drive_office_conversion_handoff(
     handoff = reserved["handoff"]
     customer = reserved["customer"]
     contact_id = str(handoff["atlas_contact_id"])
-    idempotency_key = str(handoff["idempotency_key"])
 
     if handoff["state"] == "finalized":
         append_access_log(
@@ -25932,6 +25937,40 @@ def _drive_office_conversion_handoff(
             ),
         )
 
+    # The converted Customer is linked from the moment it is reserved, so a
+    # bill-to save of it can be in flight. The relay, the finalize that records
+    # the identity obligation, and its first send run under that Customer's
+    # identity lock: the obligation's snapshot then follows any in-flight save
+    # instead of overtaking it with an older name under a newer revision. A
+    # busy Customer is refused before any Atlas call.
+    with _customer_identity_serialized(int(handoff["customer_id"])):
+        return _relay_office_conversion_handoff(
+            reserved,
+            created,
+            admin,
+            request,
+            event_replayed=event_replayed,
+            event_submitted=event_submitted,
+            event_pending=event_pending,
+        )
+
+
+def _relay_office_conversion_handoff(
+    reserved: Dict[str, Any],
+    created: bool,
+    admin: Dict[str, Any],
+    request: Request,
+    *,
+    event_replayed: str,
+    event_submitted: str,
+    event_pending: str,
+) -> JSONResponse:
+    """_drive_office_conversion_handoff's relay; the caller holds the converted
+    Customer's identity lock."""
+    handoff = reserved["handoff"]
+    customer = reserved["customer"]
+    contact_id = str(handoff["atlas_contact_id"])
+    idempotency_key = str(handoff["idempotency_key"])
     atlas_payload = {
         "contact_id": contact_id,
         "tracker_customer_id": int(handoff["customer_id"]),
@@ -26014,7 +26053,8 @@ def _drive_office_conversion_handoff(
         "handoff": visible,
     }
     identity_sync = _post_link_identity_sync(
-        identity_obligation, admin, request, origin="conversion"
+        identity_obligation, admin, request, origin="conversion",
+        identity_lock_held=True,
     )
     if identity_sync is not None:
         body["identitySync"] = identity_sync
@@ -32214,56 +32254,64 @@ def _drive_customer_identity_reservation(
         raise HTTPException(
             status_code=404, detail="Customer identity reservation not found"
         )
-    customer_id = int(found["customer_id"])
-    with _customer_identity_serialized(customer_id):
-        reservation = _customer_identity_reservation(reservation_id)
-        if reservation["state"] != "pending":
-            customer = None
-            if reservation["state"] == "applied":
-                with db.get_conn() as conn:
-                    with conn.cursor(
-                        cursor_factory=psycopg2.extras.RealDictCursor
-                    ) as cur:
-                        customer = _canonical_customer(cur, customer_id)
-            return _CustomerIdentityOutcome(
-                reservation["state"],
-                reservation,
-                customer=customer,
-                reason=reservation.get("last_error"),
-            )
+    with _customer_identity_serialized(int(found["customer_id"])):
+        return _drive_customer_identity_reservation_locked(reservation_id, admin)
 
-        with db.get_conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                _lock_customer_site_mutations(cur)
-                newest = _pending_customer_identity_reservations(cur, customer_id)[0]
-                if str(newest["id"]) != reservation_id:
-                    _raise_conflict(
-                        "customer_atlas_identity_not_newest",
-                        "Only the newest pending bill-to change for this "
-                        "Customer can be sent",
-                        {
-                            "customerId": customer_id,
-                            "reservationId": reservation_id,
-                            "newestReservationId": str(newest["id"]),
-                        },
-                    )
-                customer = _customer_row(cur, customer_id, for_update=True)
-                linked = customer.get("atlas_contact_id") if customer else None
-                contact_id = str(reservation["atlas_contact_id"])
-                if linked is None or str(linked) != contact_id:
-                    _raise_conflict(
-                        "customer_atlas_link_changed",
-                        "This Customer's Atlas link changed after this bill-to "
-                        "change was saved; save the Customer again",
-                        {"customerId": customer_id, "reservationId": reservation_id},
-                    )
-                _require_sole_identity_holder(
-                    cur, customer_id, contact_id, for_update=True
+
+def _drive_customer_identity_reservation_locked(
+    reservation_id: str, admin: Dict[str, Any]
+) -> Any:
+    """_drive_customer_identity_reservation's body; the caller holds the
+    Customer's identity lock."""
+    reservation = _customer_identity_reservation(reservation_id)
+    customer_id = int(reservation["customer_id"])
+    if reservation["state"] != "pending":
+        customer = None
+        if reservation["state"] == "applied":
+            with db.get_conn() as conn:
+                with conn.cursor(
+                    cursor_factory=psycopg2.extras.RealDictCursor
+                ) as cur:
+                    customer = _canonical_customer(cur, customer_id)
+        return _CustomerIdentityOutcome(
+            reservation["state"],
+            reservation,
+            customer=customer,
+            reason=reservation.get("last_error"),
+        )
+
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            newest = _pending_customer_identity_reservations(cur, customer_id)[0]
+            if str(newest["id"]) != reservation_id:
+                _raise_conflict(
+                    "customer_atlas_identity_not_newest",
+                    "Only the newest pending bill-to change for this "
+                    "Customer can be sent",
+                    {
+                        "customerId": customer_id,
+                        "reservationId": reservation_id,
+                        "newestReservationId": str(newest["id"]),
+                    },
                 )
-        refusal = _customer_identity_capability_refusal(admin)
-        if refusal is not None:
-            return refusal
-        return _send_customer_identity_reservation(reservation, admin)
+            customer = _customer_row(cur, customer_id, for_update=True)
+            linked = customer.get("atlas_contact_id") if customer else None
+            contact_id = str(reservation["atlas_contact_id"])
+            if linked is None or str(linked) != contact_id:
+                _raise_conflict(
+                    "customer_atlas_link_changed",
+                    "This Customer's Atlas link changed after this bill-to "
+                    "change was saved; save the Customer again",
+                    {"customerId": customer_id, "reservationId": reservation_id},
+                )
+            _require_sole_identity_holder(
+                cur, customer_id, contact_id, for_update=True
+            )
+    refusal = _customer_identity_capability_refusal(admin)
+    if refusal is not None:
+        return refusal
+    return _send_customer_identity_reservation(reservation, admin)
 
 
 @app.post("/api/admin/customers/identity-reservations/{reservation_id}/retry")
