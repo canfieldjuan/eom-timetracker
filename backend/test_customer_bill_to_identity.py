@@ -53,6 +53,7 @@ class FakeAtlas:
         self.contacts: dict[str, dict] = {}
         self.receipts: dict[str, _Response] = {}
         self.posts: list[dict] = []
+        self.held: list[dict] = []
         self.gets = 0
         self.entered = threading.Event()
         self.release: threading.Event | None = None
@@ -107,6 +108,9 @@ class FakeAtlas:
             raise requests.ConnectionError("Atlas is down")
         if mode == "refuse":
             return _Response(409, {"detail": "Archived EOM contacts cannot be edited"})
+        if mode == "hold":
+            self.held.append(call)
+            raise requests.Timeout("request still in flight")
         response = self.deliver(headers, json)
         if mode == "lost_response":
             raise requests.Timeout("response lost after Atlas applied it")

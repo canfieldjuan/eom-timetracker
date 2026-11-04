@@ -92,9 +92,28 @@ Customer with 501.
 7. **Post-link sync** (B2) runs after every 0C link (create, its retry, and
    reconcile of an unlinked Customer) and after an office conversion
    finalizes (office approve, office retry, device handoff). It writes the
-   Customer's stored name and billing address. The create, link, and
-   conversion responses keep their shape when the sync applies; otherwise they
-   gain an additive `identitySync` key carrying the outcome.
+   Customer's stored name and billing address. The obligation is recorded as a
+   pending reservation **inside the link's own finalizing transaction** (the
+   0C finalizer, the office-conversion finalizer), after a capability read
+   taken before that lock, so a worker lost between the link and the send
+   leaves a listed, retryable reservation rather than no trace (#284 review).
+   A manifest that denies the capability, or a contact another Customer holds,
+   records nothing. The send then drives that reservation exactly like a
+   retry. An office conversion's Customer is linked from the moment it is
+   reserved, so a bill-to save of it can be in flight; the conversion relay,
+   its finalize, and the first send therefore run under that Customer's
+   identity lock, and the obligation's snapshot follows the save instead of
+   overtaking it with an older name under a newer revision (#284 review). A
+   0C reconcile's Customer is unlinked when reserved, but the legacy linkage
+   backfill can link it to the same contact while the reconcile waits on
+   Atlas, and the finalizer accepts that link; a bill-to save of it can then
+   be in flight. So the 0C run of every `link_existing` reservation (reconcile
+   and its retry), its finalize, and the first send hold that Customer's
+   identity lock too, taken before the Atlas call (#284 review). Only a 0C
+   create needs no lock: its Customer does not exist until the finalize
+   commits it. The create, link, and conversion responses keep their shape when the
+   sync applies; otherwise they gain an additive `identitySync` key carrying
+   the outcome.
 8. **Repair** (B2) writes the stored identity. Like any save it supersedes
    older pending reservations when it applies; completing a pending edit
    instead is what retry is for.

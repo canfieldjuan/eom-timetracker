@@ -333,11 +333,13 @@ def stub_atlas_funnel(setup_db, monkeypatch):
         url_value = str(url)
         key = (headers or {}).get("Idempotency-Key", "")
         if url_value.endswith(api.ATLAS_OPERATOR_CONTACTS_PATH):
+            # An edit names its contact, and Atlas answers about that contact.
+            edited = (json or {}).get("contactId")
             return _FakeAtlasResponse(
                 201,
                 {
                     "success": True,
-                    "contactId": fake_atlas_contact_id(key),
+                    "contactId": edited or fake_atlas_contact_id(key),
                     "operation": "contact_created",
                     "idempotent": False,
                     "contact": {},

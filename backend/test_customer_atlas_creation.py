@@ -24,6 +24,11 @@ TEST_PREFIX = "ZZ-0C-TEST"
 
 def _clean_test_rows() -> None:
     db.execute(
+        "DELETE FROM eom_customer_identity_reservations WHERE customer_id IN "
+        "(SELECT id FROM customers WHERE name LIKE %s)",
+        (f"{TEST_PREFIX}%",),
+    )
+    db.execute(
         "DELETE FROM eom_customer_atlas_reservations "
         "WHERE payload ->> 'name' LIKE %s",
         (f"{TEST_PREFIX}%",),
@@ -720,8 +725,23 @@ def test_a_capability_atlas_denies_is_still_refused_without_a_reservation(
     assert _reservation_rows(name) == []
 
 
-def test_a_first_time_create_returns_the_legacy_response_shape(client, auth):
-    """Existing consumers keep exactly the body they had before slice 0C."""
+def test_a_first_time_create_returns_the_legacy_response_shape(
+    client, auth, monkeypatch
+):
+    """Existing consumers keep exactly the body they had before slice 0C.
+
+    With an Atlas that serves the bill-to identity (slice A), the post-create
+    identity sync applies, and an applied sync adds nothing to the body.
+    """
+    base_get = api.requests.get
+
+    def _get_with_bill_to_identity(url, **kwargs):
+        body = base_get(url, **kwargs).json()
+        if "capabilities" in body:
+            body["capabilities"] = [*body["capabilities"], "contact.bill_to_identity"]
+        return _Response(200, body)
+
+    monkeypatch.setattr(api.requests, "get", _get_with_bill_to_identity)
     key = str(uuid.uuid4())
     name = _name("Legacy Shape")
     payload = {"name": name, "idempotencyKey": key}
