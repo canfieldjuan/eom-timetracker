@@ -104,8 +104,14 @@ Customer with 501.
    its finalize, and the first send therefore run under that Customer's
    identity lock, and the obligation's snapshot follows the save instead of
    overtaking it with an older name under a newer revision (#284 review). A
-   0C create or reconcile needs no such lock: a new Customer has no saves, and
-   an unlinked Customer's save never calls Atlas. The create, link, and conversion responses keep their shape when the
+   0C reconcile's Customer is unlinked when reserved, but the legacy linkage
+   backfill can link it to the same contact while the reconcile waits on
+   Atlas, and the finalizer accepts that link; a bill-to save of it can then
+   be in flight. So the 0C run of every `link_existing` reservation (reconcile
+   and its retry), its finalize, and the first send hold that Customer's
+   identity lock too, taken before the Atlas call (#284 review). Only a 0C
+   create needs no lock: its Customer does not exist until the finalize
+   commits it. The create, link, and conversion responses keep their shape when the
    sync applies; otherwise they gain an additive `identitySync` key carrying
    the outcome.
 8. **Repair** (B2) writes the stored identity. Like any save it supersedes
