@@ -24785,6 +24785,46 @@ def _post_link_identity_sync(
     return sync
 
 
+def _drive_customer_atlas_reservation(
+    reservation: Dict[str, Any],
+    payload: CustomerCreateRequest,
+    admin: Dict[str, Any],
+    request: Request,
+) -> tuple[
+    Optional[Dict[str, Any]],
+    Optional[AtlasFunnelRequestError],
+    Optional[Dict[str, Any]],
+]:
+    """Run one 0C reservation, then the bill-to sync its link obliges.
+
+    Returns _run_customer_atlas_reservation's pair plus the `identitySync`
+    outcome (None when the sync applied or there was nothing to send).
+
+    A `link_existing` Customer can be linked to the same contact by another
+    writer (the legacy linkage backfill) while this run waits on Atlas, and a
+    bill-to save of it can then be in flight. As for office conversion, the
+    run, the finalize that records the obligation, and its first send hold that
+    Customer's identity lock, so the obligation's snapshot follows the save
+    instead of overtaking it with an older name under a newer revision. A busy
+    Customer is refused before any Atlas call. A created Customer does not
+    exist until the finalize commits it, so it has no save to overtake.
+    """
+
+    def _run(identity_lock_held: bool):
+        result, failure = _run_customer_atlas_reservation(reservation, payload, admin)
+        if failure is not None:
+            return None, failure, None
+        return result, None, _post_link_identity_sync(
+            result.get("identityObligation"), admin, request, origin="create",
+            identity_lock_held=identity_lock_held,
+        )
+
+    if reservation["mode"] != "link_existing":
+        return _run(False)
+    with _customer_identity_serialized(int(reservation["customer_id"])):
+        return _run(True)
+
+
 def _serialize_working_lead(
     lead: Dict[str, Any],
     marker: Dict[str, Any],
@@ -25719,7 +25759,9 @@ def admin_create_customer(
             ),
         )
 
-    result, failure = _run_customer_atlas_reservation(reservation, payload, admin)
+    result, failure, identity_sync = _drive_customer_atlas_reservation(
+        reservation, payload, admin, request
+    )
     if failure is not None:
         append_access_log(
             request,
@@ -25746,9 +25788,6 @@ def admin_create_customer(
     body: Dict[str, Any] = {"success": True, "customer": customer}
     if not created:
         body["idempotent"] = True
-    identity_sync = _post_link_identity_sync(
-        result.get("identityObligation"), admin, request, origin="create"
-    )
     if identity_sync is not None:
         body["identitySync"] = identity_sync
     return JSONResponse(
@@ -25794,7 +25833,9 @@ def admin_retry_customer_atlas_reservation(
         return refusal
 
     payload = CustomerCreateRequest(**(reservation["payload"] or {}))
-    result, failure = _run_customer_atlas_reservation(reservation, payload, admin)
+    result, failure, identity_sync = _drive_customer_atlas_reservation(
+        reservation, payload, admin, request
+    )
     if failure is not None:
         append_access_log(
             request,
@@ -25815,9 +25856,6 @@ def admin_retry_customer_atlas_reservation(
     # reservation that already existed, exactly as the create route does when it
     # finds one, so both must label it the same way.
     body: Dict[str, Any] = {"success": True, "idempotent": True, "customer": customer}
-    identity_sync = _post_link_identity_sync(
-        result.get("identityObligation"), admin, request, origin="create"
-    )
     if identity_sync is not None:
         body["identitySync"] = identity_sync
     return JSONResponse(status_code=200, content=jsonable_encoder(body))
@@ -25862,7 +25900,9 @@ def admin_link_customer_to_atlas(
         None, admin, customer_id=customer_id
     )
     payload = CustomerCreateRequest(**(reservation["payload"] or {}))
-    result, failure = _run_customer_atlas_reservation(reservation, payload, admin)
+    result, failure, identity_sync = _drive_customer_atlas_reservation(
+        reservation, payload, admin, request
+    )
     if failure is not None:
         append_access_log(
             request,
@@ -25886,9 +25926,6 @@ def admin_link_customer_to_atlas(
         "idempotent": not created,
         "customer": customer,
     }
-    identity_sync = _post_link_identity_sync(
-        result.get("identityObligation"), admin, request, origin="create"
-    )
     if identity_sync is not None:
         body["identitySync"] = identity_sync
     return JSONResponse(status_code=200, content=jsonable_encoder(body))

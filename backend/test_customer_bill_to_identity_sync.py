@@ -37,6 +37,8 @@ class _OtherRoutes:
     def __init__(self):
         self.creates: list[dict] = []
         self.create_contact: str | None = None  # force create-or-return's match
+        self.create_failures = 0
+        self.during_create = None
         self.during_handoff = None
         self.handoffs = 0
         self.handoff_failures = 0
@@ -46,6 +48,11 @@ class _OtherRoutes:
         key = headers["Idempotency-Key"]
         if url.endswith(api.ATLAS_OPERATOR_CONTACTS_PATH):
             self.creates.append(dict(json))
+            if self.create_failures:
+                self.create_failures -= 1
+                raise requests.ConnectionError("Atlas is down")
+            if self.during_create is not None:
+                self.during_create()
             contact_id = self.create_contact or fake_atlas_contact_id(key)
             return _Response(201, {"success": True, "contactId": contact_id, "contact": {}})
         if url.endswith("/eom-funnel/customer-handoffs"):
@@ -302,20 +309,9 @@ def test_create_matching_a_contact_linked_elsewhere_leaves_its_billing_address(
     assert _reservations(other_id) == []
 
 
-def test_create_retry_and_reconcile_also_sync_after_linking(
-    client, auth, atlas, routes, monkeypatch
-):
+def test_create_retry_and_reconcile_also_sync_after_linking(client, auth, atlas, routes):
     # A create whose first Atlas attempt failed links on retry.
-    real_post = atlas.post
-    failing = {"left": 1}
-
-    def _create_fails_once(url, *, headers=None, json=None, timeout=None):
-        if "contactId" not in (json or {}) and failing["left"]:
-            failing["left"] -= 1
-            raise api.requests.ConnectionError("Atlas is down")
-        return real_post(url, headers=headers, json=json, timeout=timeout)
-
-    monkeypatch.setattr(api.requests, "post", _create_fails_once)
+    routes.create_failures = 1
     pending = client.post(
         "/api/admin/customers",
         headers=auth,
@@ -413,6 +409,97 @@ def test_conversion_snapshot_waits_for_an_in_flight_identity_save(
     assert obligation["full_name"] == f"{PREFIX} Converted B", "snapshot follows the save"
     assert atlas.contacts[contact]["full_name"] == f"{PREFIX} Converted B"
     assert _row(customer_id)["name"] == f"{PREFIX} Converted B"
+
+
+def _backfill_link(customer_id, contact):
+    """The legacy linkage backfill: links the Customer outside the 0C saga."""
+    db.execute(
+        "UPDATE customers SET atlas_contact_id = %s WHERE id = %s", (contact, customer_id)
+    )
+
+
+def test_reconcile_holds_the_identity_lock_when_a_backfill_links_mid_flight(
+    client, auth, atlas, routes
+):
+    contact = str(uuid.uuid4())
+    routes.create_contact = contact
+    customer_id = _customer("Reconciled A")
+    results: dict[str, int] = {}
+    seen: dict[str, int] = {}
+
+    def _rename():
+        results["patch"] = _patch(client, auth, customer_id, name=f"{PREFIX} Reconciled B").status_code
+
+    renamer = threading.Thread(target=_rename)
+
+    def _backfill_then_rename():
+        # Linked to the same contact while the reconcile waits on Atlas; an
+        # office rename of the now-linked Customer follows at once.
+        _backfill_link(customer_id, contact)
+        renamer.start()
+        renamer.join(timeout=1)
+        seen["identity_posts_during_reconcile"] = len(atlas.posts)
+
+    routes.during_create = _backfill_then_rename
+    try:
+        reconciled = client.post(f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth)
+    finally:
+        if renamer.ident is not None:
+            renamer.join(timeout=30)
+
+    assert reconciled.status_code == 200, reconciled.text
+    assert "identitySync" not in reconciled.json()
+    assert seen == {"identity_posts_during_reconcile": 0}, "the rename waits for the reconcile"
+    assert results == {"patch": 200}
+    obligation, renamed = _reservations(customer_id)
+    assert (obligation["origin"], obligation["full_name"]) == ("create", f"{PREFIX} Reconciled A")
+    assert (renamed["origin"], renamed["full_name"]) == ("patch", f"{PREFIX} Reconciled B")
+    assert atlas.contacts[contact]["full_name"] == f"{PREFIX} Reconciled B"
+    assert _row(customer_id)["name"] == f"{PREFIX} Reconciled B"
+
+
+def test_link_retry_snapshot_waits_for_an_in_flight_identity_save(
+    client, auth, atlas, routes
+):
+    contact = str(uuid.uuid4())
+    routes.create_contact = contact
+    routes.create_failures = 1
+    customer_id = _customer("Relinked A")
+    pending = client.post(f"/api/admin/customers/{customer_id}/atlas-contact", headers=auth)
+    assert pending.status_code == 202, pending.text
+    reservation_id = pending.json()["reservation"]["reservationId"]
+    _backfill_link(customer_id, contact)  # the same contact, by another writer
+    atlas.release = threading.Event()
+    results: dict[str, int] = {}
+
+    def _rename():
+        results["patch"] = _patch(client, auth, customer_id, name=f"{PREFIX} Relinked B").status_code
+
+    def _retry_link():
+        results["retry"] = client.post(
+            f"/api/admin/customers/reservations/{reservation_id}/retry", headers=auth
+        ).status_code
+
+    saver = threading.Thread(target=_rename)
+    saver.start()
+    assert atlas.entered.wait(timeout=10), "the rename never reached Atlas"
+    relink = threading.Thread(target=_retry_link)
+    relink.start()
+    relink.join(timeout=1)
+    try:
+        assert relink.is_alive(), "the retry waits for the in-flight save"
+        assert len(routes.creates) == 1, "and makes no Atlas call while it waits"
+    finally:
+        atlas.release.set()
+        saver.join(timeout=15)
+        relink.join(timeout=30)
+
+    assert results == {"patch": 200, "retry": 200}
+    renamed, obligation = _reservations(customer_id)
+    assert (obligation["origin"], obligation["state"]) == ("create", "applied")
+    assert obligation["full_name"] == f"{PREFIX} Relinked B", "snapshot follows the save"
+    assert atlas.contacts[contact]["full_name"] == f"{PREFIX} Relinked B"
+    assert _row(customer_id)["name"] == f"{PREFIX} Relinked B"
 
 
 # --- item 13: repair ----------------------------------------------------------------
