@@ -5298,11 +5298,19 @@ def _atlas_receivables_audited_write(
 
 
 class AtlasFunnelRequestError(Exception):
-    """A tracker-to-Atlas response that leaves the local handoff retryable."""
+    """A tracker-to-Atlas response that leaves the local handoff retryable.
 
-    def __init__(self, status_code: int, message: str) -> None:
+    ``code`` is Atlas's machine-readable refusal code when its detail carried
+    one (for example ``stale_identity_revision``); callers branch on it, never
+    on the message.
+    """
+
+    def __init__(
+        self, status_code: int, message: str, *, code: Optional[str] = None
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
 
 
 def _require_atlas_funnel_configuration() -> None:
@@ -5365,11 +5373,14 @@ def _atlas_funnel_request(
         )
     if response.status_code >= 400:
         detail: Any = content.get("detail", content) if isinstance(content, dict) else content
+        code: Optional[str] = None
         if isinstance(detail, dict):
+            raw_code = detail.get("code")
+            code = raw_code if isinstance(raw_code, str) and raw_code else None
             detail = detail.get("message") or detail.get("error") or "EOM customer handoff failed"
         if not isinstance(detail, str) or not detail.strip():
             detail = "EOM customer handoff failed"
-        raise AtlasFunnelRequestError(response.status_code, detail)
+        raise AtlasFunnelRequestError(response.status_code, detail, code=code)
     if not isinstance(content, dict):
         raise AtlasFunnelRequestError(
             502,
@@ -6008,6 +6019,10 @@ ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR = "contact.field_clear"
 # `identityRevision` fence. The tracker needs both before it sends either, so
 # bill-to identity writes gate on THIS name + the operator-contacts route.
 ATLAS_FUNNEL_CAPABILITY_CONTACT_BILL_TO_IDENTITY = "contact.bill_to_identity"
+# Atlas's refusal code for an identity revision that is not newer than the one
+# it already applied (atlas_brain/services/eom_crm_mutations.py
+# EOM_OPERATOR_STALE_IDENTITY_REVISION).
+ATLAS_STALE_IDENTITY_REVISION_CODE = "stale_identity_revision"
 ATLAS_FUNNEL_CAPABILITY_LEAD_ESTIMATE_BOOKING = "lead.estimate_booking"
 ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
 # The customer-handoff relay Atlas serves at POST /eom-funnel/customer-handoffs.
@@ -23995,7 +24010,7 @@ CUSTOMER_PATCH_FIELD_MAP = {
 class _CustomerIdentityOutcome:
     """How one identity reservation settled after its Atlas call."""
 
-    kind: Literal["applied", "pending", "refused", "link_changed"]
+    kind: Literal["applied", "pending", "refused", "superseded", "link_changed"]
     reservation: Dict[str, Any]
     customer: Optional[Dict[str, Any]] = None
     reason: Optional[str] = None
@@ -24384,7 +24399,8 @@ def _send_customer_identity_reservation(
 
     Pending when Atlas cannot be reached, times out, answers 5xx, or answers
     2xx without confirming this contact: nothing is applied and the same key
-    can be retried. Refused for any 4xx. Applied only once Atlas confirmed.
+    can be retried. Superseded when Atlas's fence refuses the revision as
+    stale. Refused for every other 4xx. Applied only once Atlas confirmed.
     """
     reservation_id = str(reservation["id"])
     contact_id = str(reservation["atlas_contact_id"])
@@ -24407,6 +24423,9 @@ def _send_customer_identity_reservation(
         if exc.status_code >= 500:
             _note_customer_identity_error(reservation_id, reason)
             return _CustomerIdentityOutcome("pending", reservation, reason=reason)
+        if exc.status_code == 409 and exc.code == ATLAS_STALE_IDENTITY_REVISION_CODE:
+            _close_customer_identity_reservation(reservation_id, "superseded", reason)
+            return _CustomerIdentityOutcome("superseded", reservation, reason=reason)
         _close_customer_identity_reservation(reservation_id, "refused", reason)
         return _CustomerIdentityOutcome("refused", reservation, reason=reason)
     try:
@@ -24432,6 +24451,8 @@ def _customer_identity_outcome_response(
     outcome: _CustomerIdentityOutcome,
     request: Request,
     admin: Dict[str, Any],
+    *,
+    retried: bool = False,
 ) -> Any:
     """Map a settled reservation onto the contract's outcome table."""
     reservation = outcome.reservation
@@ -24443,7 +24464,10 @@ def _customer_identity_outcome_response(
     )
     if outcome.kind == "applied":
         append_access_log(request, "CUSTOMER_UPDATED", True, log_detail)
-        return {"success": True, "customer": outcome.customer}
+        body: Dict[str, Any] = {"success": True, "customer": outcome.customer}
+        if retried:
+            body["idempotent"] = True
+        return body
     append_access_log(
         request, f"CUSTOMER_IDENTITY_{outcome.kind.upper()}", False, log_detail
     )
@@ -24456,11 +24480,18 @@ def _customer_identity_outcome_response(
             content=jsonable_encoder(
                 {
                     "success": False,
-                    "idempotent": False,
+                    "idempotent": retried,
                     "error": "customer_atlas_pending",
                     "reservation": visible,
                 }
             ),
+        )
+    if outcome.kind == "superseded":
+        _raise_conflict(
+            "customer_atlas_identity_superseded",
+            "A newer bill-to change for this Customer already reached Atlas; "
+            "nothing was changed",
+            details,
         )
     if outcome.kind == "link_changed":
         _raise_conflict(
@@ -24473,6 +24504,139 @@ def _customer_identity_outcome_response(
         f"Atlas refused this bill-to change; nothing was changed: {outcome.reason}",
         {**details, "reason": outcome.reason},
     )
+
+
+# The error code each unapplied outcome answers with, on a route of its own
+# (_customer_identity_outcome_response) or inside `identitySync`.
+_CUSTOMER_IDENTITY_OUTCOME_ERRORS = {
+    "pending": "customer_atlas_pending",
+    "refused": "customer_atlas_identity_refused",
+    "superseded": "customer_atlas_identity_superseded",
+    "link_changed": "customer_atlas_link_changed",
+}
+
+
+def _sync_stored_customer_identity(
+    customer_id: int, admin: Dict[str, Any], *, origin: str
+) -> Any:
+    """Send a linked Customer's STORED name and billing address to Atlas.
+
+    The repair action and the syncs after a link (office conversion, 0C
+    create or reconcile). Same admission and lifecycle as a PATCH, with no
+    local change to apply: like any save it supersedes older pending
+    reservations once it applies. Returns the 501 refusal or the settled
+    outcome; raises the admission 409s and the 503.
+    """
+    with _customer_identity_serialized(customer_id):
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                existing = _customer_row(cur, customer_id)
+                if not existing:
+                    raise HTTPException(status_code=404, detail="Customer not found")
+                contact_id = existing.get("atlas_contact_id")
+                if contact_id is None:
+                    _raise_conflict(
+                        "customer_atlas_unlinked",
+                        "This Customer has no Atlas contact yet; link it first",
+                        {
+                            "customerId": customer_id,
+                            "linkPath": f"/api/admin/customers/{customer_id}/atlas-contact",
+                        },
+                    )
+                contact_id = str(contact_id)
+                _require_sole_identity_holder(
+                    cur, customer_id, contact_id, for_update=False
+                )
+        refusal = _customer_identity_capability_refusal(admin)
+        if refusal is not None:
+            return refusal
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                _lock_customer_site_mutations(cur)
+                existing = _customer_row(cur, customer_id, for_update=True)
+                linked = existing.get("atlas_contact_id") if existing else None
+                if linked is None or str(linked) != contact_id:
+                    _raise_conflict(
+                        "stale_customer_update",
+                        "Customer changed after it was read; reload before retrying",
+                        {"customerId": customer_id},
+                    )
+                _require_sole_identity_holder(
+                    cur, customer_id, contact_id, for_update=True
+                )
+                reservation = _insert_customer_identity_reservation(
+                    cur, customer=existing, changes={}, origin=origin, admin=admin
+                )
+        return _send_customer_identity_reservation(reservation, admin)
+
+
+def _post_link_identity_sync(
+    customer_id: int,
+    admin: Dict[str, Any],
+    request: Request,
+    *,
+    origin: str,
+) -> Optional[Dict[str, Any]]:
+    """Send a just-linked Customer's bill-to identity; the link stands anyway.
+
+    The link is its own saga and has already committed, so nothing here can
+    undo it or turn its response into a failure. Returns None when Atlas
+    applied the identity, so the caller's response keeps its legacy shape;
+    otherwise the outcome, for an additive `identitySync` key. A pending sync
+    is also listed in `pendingIdentityReservations`.
+    """
+    try:
+        result = _sync_stored_customer_identity(customer_id, admin, origin=origin)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": exc.detail}
+        append_access_log(
+            request, "CUSTOMER_IDENTITY_SYNC_NOT_SENT", False,
+            f"customer={customer_id} origin={origin} status={exc.status_code}",
+        )
+        return {
+            "status": "not_sent",
+            "error": detail.get("code") or "atlas_unavailable",
+            "message": detail.get("message"),
+            "details": detail.get("details"),
+        }
+    except Exception:
+        logger.exception("Customer identity sync failed after a link")
+        return {
+            "status": "failed",
+            "error": "customer_identity_sync_failed",
+            "message": "The bill-to name and address were not confirmed by "
+            "Atlas; check this Customer's pending changes or repair it",
+        }
+    if isinstance(result, JSONResponse):
+        refused = json.loads(result.body)
+        append_access_log(
+            request, "CUSTOMER_IDENTITY_SYNC_NOT_SENT", False,
+            f"customer={customer_id} origin={origin} status=501",
+        )
+        return {
+            "status": "not_sent",
+            "error": refused["error"],
+            "message": refused["message"],
+            "details": {"capability": refused["capability"]},
+        }
+    reservation = result.reservation
+    log_detail = (
+        f"customer={customer_id} origin={origin} "
+        f"revision={reservation['identity_revision']}"
+    )
+    if result.kind == "applied":
+        append_access_log(request, "CUSTOMER_IDENTITY_SYNCED", True, log_detail)
+        return None
+    append_access_log(
+        request, f"CUSTOMER_IDENTITY_SYNC_{result.kind.upper()}", False, log_detail
+    )
+    current = _customer_identity_reservation(str(reservation["id"])) or reservation
+    return {
+        "status": result.kind,
+        "error": _CUSTOMER_IDENTITY_OUTCOME_ERRORS[result.kind],
+        "message": result.reason,
+        "reservation": _serialize_customer_identity_reservation(current),
+    }
 
 
 def _serialize_working_lead(
@@ -25431,10 +25595,16 @@ def admin_create_customer(
     )
     # A first-time create keeps the exact legacy body. `idempotent` appears only
     # where it carries information the status code does not -- on a replay or a
-    # recovered retry, which return 200.
+    # recovered retry, which return 200. `identitySync` likewise appears only
+    # when the bill-to sync did not apply.
     body: Dict[str, Any] = {"success": True, "customer": customer}
     if not created:
         body["idempotent"] = True
+    identity_sync = _post_link_identity_sync(
+        int(customer["id"]), admin, request, origin="create"
+    )
+    if identity_sync is not None:
+        body["identitySync"] = identity_sync
     return JSONResponse(
         status_code=201 if created else 200,
         content=jsonable_encoder(body),
@@ -25498,12 +25668,13 @@ def admin_retry_customer_atlas_reservation(
     # `idempotent` describes the operation, not the endpoint: this re-drives a
     # reservation that already existed, exactly as the create route does when it
     # finds one, so both must label it the same way.
-    return JSONResponse(
-        status_code=200,
-        content=jsonable_encoder(
-            {"success": True, "idempotent": True, "customer": customer}
-        ),
+    body: Dict[str, Any] = {"success": True, "idempotent": True, "customer": customer}
+    identity_sync = _post_link_identity_sync(
+        int(customer["id"]), admin, request, origin="create"
     )
+    if identity_sync is not None:
+        body["identitySync"] = identity_sync
+    return JSONResponse(status_code=200, content=jsonable_encoder(body))
 
 
 @app.post("/api/admin/customers/{customer_id}/atlas-contact")
@@ -25564,12 +25735,17 @@ def admin_link_customer_to_atlas(
         True,
         f"customer={customer_id} contact={result['reservation']['atlas_contact_id']}",
     )
-    return JSONResponse(
-        status_code=200,
-        content=jsonable_encoder(
-            {"success": True, "idempotent": not created, "customer": customer}
-        ),
+    body: Dict[str, Any] = {
+        "success": True,
+        "idempotent": not created,
+        "customer": customer,
+    }
+    identity_sync = _post_link_identity_sync(
+        customer_id, admin, request, origin="create"
     )
+    if identity_sync is not None:
+        body["identitySync"] = identity_sync
+    return JSONResponse(status_code=200, content=jsonable_encoder(body))
 
 
 def _drive_office_conversion_handoff(
@@ -25687,11 +25863,22 @@ def _drive_office_conversion_handoff(
         True,
         f"contact={contact_id} customer={handoff['customer_id']} site={handoff['site_id']}",
     )
+    # The lead was created under a person's name; the Customer carries the
+    # business name and billing address. The handoff stands whatever the sync
+    # does, and an unapplied sync is reported, not hidden.
+    body: Dict[str, Any] = {
+        "success": True,
+        "idempotent": not created,
+        "handoff": visible,
+    }
+    identity_sync = _post_link_identity_sync(
+        int(handoff["customer_id"]), admin, request, origin="conversion"
+    )
+    if identity_sync is not None:
+        body["identitySync"] = identity_sync
     return JSONResponse(
         status_code=201 if created else 200,
-        content=jsonable_encoder(
-            {"success": True, "idempotent": not created, "handoff": visible}
-        ),
+        content=jsonable_encoder(body),
     )
 
 
@@ -31865,6 +32052,110 @@ def _validate_customer_patch(
                     "customerType": stored_text,
                 },
             )
+
+
+@app.post("/api/admin/customers/identity-reservations/{reservation_id}/retry")
+def admin_retry_customer_identity_reservation(
+    reservation_id: UUID,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Re-send one pending bill-to change under its own key.
+
+    Only the Customer's newest pending reservation is ever sent. An older one
+    would undo the newer save if it applied, and Atlas's fence would refuse it
+    once the newer one has applied; it closes when a newer one applies.
+    """
+    found = _customer_identity_reservation(str(reservation_id))
+    if not found:
+        raise HTTPException(
+            status_code=404, detail="Customer identity reservation not found"
+        )
+    customer_id = int(found["customer_id"])
+    with _customer_identity_serialized(customer_id):
+        reservation = _customer_identity_reservation(str(reservation_id))
+        if reservation["state"] == "applied":
+            with db.get_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    customer = _canonical_customer(cur, customer_id)
+            return {"success": True, "idempotent": True, "customer": customer}
+        if reservation["state"] != "pending":
+            # Closed: answer with how it closed, and never ask Atlas again.
+            return _customer_identity_outcome_response(
+                _CustomerIdentityOutcome(
+                    reservation["state"],
+                    reservation,
+                    reason=reservation.get("last_error"),
+                ),
+                request,
+                admin,
+                retried=True,
+            )
+
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                _lock_customer_site_mutations(cur)
+                newest = _pending_customer_identity_reservations(cur, customer_id)[0]
+                if str(newest["id"]) != str(reservation_id):
+                    _raise_conflict(
+                        "customer_atlas_identity_not_newest",
+                        "Only the newest pending bill-to change for this "
+                        "Customer can be sent",
+                        {
+                            "customerId": customer_id,
+                            "reservationId": str(reservation_id),
+                            "newestReservationId": str(newest["id"]),
+                        },
+                    )
+                customer = _customer_row(cur, customer_id, for_update=True)
+                linked = customer.get("atlas_contact_id") if customer else None
+                contact_id = str(reservation["atlas_contact_id"])
+                if linked is None or str(linked) != contact_id:
+                    _raise_conflict(
+                        "customer_atlas_link_changed",
+                        "This Customer's Atlas link changed after this bill-to "
+                        "change was saved; save the Customer again",
+                        {
+                            "customerId": customer_id,
+                            "reservationId": str(reservation_id),
+                        },
+                    )
+                _require_sole_identity_holder(
+                    cur, customer_id, contact_id, for_update=True
+                )
+        refusal = _customer_identity_capability_refusal(admin)
+        if refusal is not None:
+            return refusal
+        outcome = _send_customer_identity_reservation(reservation, admin)
+        return _customer_identity_outcome_response(
+            outcome, request, admin, retried=True
+        )
+
+
+@app.post("/api/admin/customers/{customer_id}/atlas-identity")
+def admin_repair_customer_atlas_identity(
+    customer_id: int,
+    request: Request,
+    admin: Dict[str, Any] = Depends(get_current_admin),
+) -> Any:
+    """Write a linked Customer's current name and billing address to Atlas.
+
+    The fix for a Customer whose Atlas contact drifted before the bill-to
+    identity sync existed (an office conversion that kept the lead's person
+    name, a billing address that never left the tracker). It sends the STORED
+    identity; to complete a pending edit instead, retry that reservation.
+    """
+    result = _sync_stored_customer_identity(customer_id, admin, origin="repair")
+    if isinstance(result, JSONResponse):
+        append_access_log(
+            request,
+            "CUSTOMER_IDENTITY_CAPABILITY_UNAVAILABLE",
+            False,
+            f"customer={customer_id} "
+            f"capability={ATLAS_FUNNEL_CAPABILITY_CONTACT_BILL_TO_IDENTITY}",
+        )
+        return result
+    return _customer_identity_outcome_response(result, request, admin)
 
 
 @app.delete("/api/admin/customers/{customer_id}")
