@@ -114,8 +114,8 @@ contact unchanged, and the caller decides.
 - **The `contact_matched` receipt.**
   - On a match Atlas records one lifecycle event, `contact_matched`, carrying
     the operation key and today's lifecycle metadata (`eom_crm_mutations.py:441`).
-    It records no `changed_fields` and no `previous_values`, because nothing
-    changed.
+    Its `changed_fields` and `previous_values` are empty, because nothing
+    changed, and its lead stage is recorded as unchanged.
   - This event is the idempotency receipt: receipts are lifecycle events
     (`crm_provider.py:1776`). So it joins `EOM_OPERATOR_CONTACT_EVENT_TYPES`
     (`eom_crm_mutations.py:25`).
@@ -129,8 +129,13 @@ contact unchanged, and the caller decides.
   `identity_revision` rule (`eom_crm_mutations.py:423`).
 - **Capability.** The manifest advertises `contact.match_without_write` on
   `POST /eom-funnel/operator-contacts` (`atlas_brain/eom_api/funnel.py:1203`).
-- **No migration.** `eom_lead_lifecycle_events.event_type` is
-  `VARCHAR(64)` with no CHECK (migration 351).
+- **Receipt index.** The receipt lookup is index-backed by a partial index
+  that lists only `contact_created` and `contact_updated` (migration 364).
+  Once the lookup also asks for `contact_matched`, that index no longer
+  applies and every operator mutation would scan the lifecycle ledger. A new
+  index-only migration recreates it over every receipt type. No table changes
+  are needed: `eom_lead_lifecycle_events.event_type` is `VARCHAR(64)` with no
+  CHECK (migration 351).
 
 **Slice B: tracker**
 
@@ -234,8 +239,8 @@ contact unchanged, and the caller decides.
 
 ## Slices and order
 
-1. **A (Atlas):** `onMatch`, the `contact_matched` receipt, the fingerprint, and
-   the capability. Deployed to the office `atlas-api`.
+1. **A (Atlas):** `onMatch`, the `contact_matched` receipt and its index, the
+   fingerprint, and the capability. Deployed to the office `atlas-api`.
 2. **B (tracker):** Customer create, reconcile, and Leads-page customer create
    send `onMatch: "return"` and require the capability. B merges only after A is
    live, because B's capability rule would otherwise refuse those requests with
@@ -252,8 +257,8 @@ Atlas (slice A):
    leaves every column of the matched `contacts` row identical, including
    `metadata`, `updated_at`, `business_context_id`, and `bill_to_revision`. The
    response is `contact_matched` with that `contactId`. Exactly one
-   `contact_matched` event exists, carrying the operation key and no
-   `changed_fields` or `previous_values`. The test is run for a match on email
+   `contact_matched` event exists, carrying the operation key, with empty
+   `changed_fields` and `previous_values`. The test is run for a match on email
    and a match on phone last-10.
 2. **No match.** `onMatch: "return"` with no match creates the contact as today
    (`contact_created`).
@@ -265,7 +270,8 @@ Atlas (slice A):
    provider runs.
 5. **Replay.** A replay of the same key returns the same `contact_matched`
    receipt and records no second event. The same key with `onMatch` changed
-   returns 409.
+   returns 409. The receipt index's predicate lists exactly the operator
+   receipt event types.
 6. **Refusals.** Under `"return"`, several matches, an archived match, and a
    contact-type mismatch each return today's 409. Each leaves the contact
    unchanged and records no event.
