@@ -142,6 +142,11 @@ def test_legacy_put_accepts_aliases_and_current_aliases_take_precedence(client, 
     import db
 
     customer = _create_customer(client, auth, "Alias Original")
+    # The legacy PUT renames only unlinked (legacy) Customers; an Atlas-linked
+    # one is refused (bill-to identity contract, test_customer_identity_site_guard).
+    db.execute(
+        "UPDATE customers SET atlas_contact_id = NULL WHERE id = %s", (customer["id"],)
+    )
     existing = _create_site(
         client,
         auth,

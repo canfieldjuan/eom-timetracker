@@ -977,7 +977,14 @@ def test_customer_rename_syncs_all_sites_and_explicit_id_reassigns_one_site(
     client,
     auth,
 ):
+    import db
+
     original = _create_customer(client, auth, "Multi Site Original")
+    # Site routes rename only unlinked (legacy) Customers; an Atlas-linked one
+    # is refused (bill-to identity contract, test_customer_identity_site_guard).
+    db.execute(
+        "UPDATE customers SET atlas_contact_id = NULL WHERE id = %s", (original["id"],)
+    )
     first = _create_site(client, auth, original["id"], "150 Multi Site First")
     second = _create_site(client, auth, original["id"], "151 Multi Site Second")
     renamed = f"{TEST_PREFIX} Customer Multi Site Renamed"
