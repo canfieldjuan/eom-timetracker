@@ -99,7 +99,13 @@ Customer with 501.
    leaves a listed, retryable reservation rather than no trace (#284 review).
    A manifest that denies the capability, or a contact another Customer holds,
    records nothing. The send then drives that reservation exactly like a
-   retry. The create, link, and conversion responses keep their shape when the
+   retry. An office conversion's Customer is linked from the moment it is
+   reserved, so a bill-to save of it can be in flight; the conversion relay,
+   its finalize, and the first send therefore run under that Customer's
+   identity lock, and the obligation's snapshot follows the save instead of
+   overtaking it with an older name under a newer revision (#284 review). A
+   0C create or reconcile needs no such lock: a new Customer has no saves, and
+   an unlinked Customer's save never calls Atlas. The create, link, and conversion responses keep their shape when the
    sync applies; otherwise they gain an additive `identitySync` key carrying
    the outcome.
 8. **Repair** (B2) writes the stored identity. Like any save it supersedes
