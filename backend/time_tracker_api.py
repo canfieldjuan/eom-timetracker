@@ -31850,6 +31850,30 @@ def admin_create_location(
     return {"success": True, "location": location}
 
 
+def _refuse_site_route_rename_of_linked_customer(
+    customer: Dict[str, Any], requested_name: str
+) -> None:
+    """One writer for the bill-to name (bill-to identity contract, Concurrency).
+
+    The Site routes predate the Customer record and still rename the owning
+    Customer. For an Atlas-linked Customer that would change the invoice name
+    without Atlas, so the office renames it on the Customer, which writes
+    Atlas first. The stored name, and every unlinked Customer, keep today's
+    behavior. Raised before the rename is written; the request's transaction
+    then rolls back, so nothing from the request applies, earlier entries of a
+    bulk PUT included.
+    """
+    if customer.get("atlas_contact_id") is None:
+        return
+    if requested_name == str(customer["name"]):
+        return
+    _raise_conflict(
+        "customer_identity_edit_required",
+        "This Customer is linked to Atlas; rename it on the Customer, not on a Site",
+        {"customerId": int(customer["id"]), "customerName": str(customer["name"])},
+    )
+
+
 @app.put("/api/admin/locations")
 def admin_update_locations(
     payload: Dict[str, Any],
@@ -32025,6 +32049,11 @@ def admin_update_locations(
                             },
                         )
                     else:
+                        owner = _customer_row(cur, int(customer_id), for_update=True)
+                        if owner is not None:
+                            _refuse_site_route_rename_of_linked_customer(
+                                owner, customer_name
+                            )
                         cur.execute(
                             "UPDATE customers SET name = %s, updated_at = NOW() WHERE id = %s",
                             (customer_name, customer_id),
@@ -32250,6 +32279,9 @@ def admin_patch_location(
                 target_customer = _customer_row(cur, int(customer_id), for_update=True)
                 if not target_customer:
                     raise HTTPException(status_code=404, detail="Customer not found")
+                _refuse_site_route_rename_of_linked_customer(
+                    target_customer, str(payload.customerName)
+                )
                 customer_name = str(payload.customerName)
                 cur.execute(
                     """
