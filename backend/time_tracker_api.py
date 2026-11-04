@@ -6003,6 +6003,11 @@ ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION = "contact.operator_mutation"
 # semantics, so clear-bearing requests gate on this name, never on
 # contact.operator_mutation alone.
 ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR = "contact.field_clear"
+# Versions the same route again (bill-to identity contract, slice A): Atlas
+# advertises this name only from builds that admit `billingAddress` and the
+# `identityRevision` fence. The tracker needs both before it sends either, so
+# bill-to identity writes gate on THIS name + the operator-contacts route.
+ATLAS_FUNNEL_CAPABILITY_CONTACT_BILL_TO_IDENTITY = "contact.bill_to_identity"
 ATLAS_FUNNEL_CAPABILITY_LEAD_ESTIMATE_BOOKING = "lead.estimate_booking"
 ATLAS_FUNNEL_CAPABILITY_LEAD_FIRST_CLEAN_BOOKING = "lead.first_clean_booking"
 # The customer-handoff relay Atlas serves at POST /eom-funnel/customer-handoffs.
@@ -7048,6 +7053,12 @@ CUSTOMER_SITE_MUTATION_LOCK = "eom_customer_site_mutations_v1"
 GEOFENCE_HARD_GATE_SCOPE_LOCK = "eom_geofence_hard_gate_scopes_v1"
 FUNNEL_LEAD_TRANSITION_LOCK = "eom_funnel_lead_transition_v1"
 CUSTOMER_TYPE_MIRROR_LOCK = "eom_customer_type_mirror_v1"
+CUSTOMER_IDENTITY_LOCK = "eom_customer_identity_v1"
+# How long a save waits for the same Customer's in-flight identity save: one
+# whole saga (the manifest read with its retry, then the Atlas write) plus
+# margin. Past it the save is refused as busy rather than queued further.
+CUSTOMER_IDENTITY_LOCK_WAIT_SECONDS = 3 * ATLAS_FUNNEL_TIMEOUT_SECONDS + 5
+_CUSTOMER_IDENTITY_LOCK_POLL_SECONDS = 0.1
 
 
 def _lock_customer_site_mutations(cur: Any) -> None:
@@ -7083,6 +7094,23 @@ def _lock_customer_type_mirror(cur: Any, contact_id: str) -> None:
         "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
         (CUSTOMER_TYPE_MIRROR_LOCK, str(contact_id)),
     )
+
+
+def _try_lock_customer_identity(cur: Any, customer_id: int) -> bool:
+    """Serialize ONE Customer's bill-to identity writes, Atlas call included.
+
+    Held for a whole identity saga, from the read through the Atlas response
+    to the local commit, on a connection of its own. It is deliberately not a
+    `customers` row lock: an ordinary edit takes the global Customer/Site lock
+    and then waits on the row, so a row lock held across HTTP would hold every
+    Customer and Site mutation behind one Atlas call. Taken before the global
+    lock by every writer that takes both, so the order cannot invert.
+    """
+    cur.execute(
+        "SELECT pg_try_advisory_xact_lock(hashtext(%s), %s)",
+        (CUSTOMER_IDENTITY_LOCK, int(customer_id)),
+    )
+    return bool(cur.fetchone()[0])
 
 
 def _lock_funnel_lead_transition(cur: Any, contact_id: str) -> None:
@@ -7228,6 +7256,40 @@ def _ensure_customer_site_schema() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_eom_customer_atlas_reservations_state
                     ON eom_customer_atlas_reservations(state, updated_at);
+                """
+            )
+            # Bill-to identity (EOM_CUSTOMER_BILL_TO_IDENTITY_CONTRACT.md):
+            # one row per identity write sent to Atlas, committed before the
+            # call. `identity_revision` is the one tracker sequence the Atlas
+            # fence orders on; `requested_changes` is the whole PATCH (API
+            # field names) applied locally only once Atlas confirms.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eom_customer_identity_reservations (
+                    id UUID PRIMARY KEY,
+                    customer_id INTEGER NOT NULL
+                        REFERENCES customers(id) ON DELETE RESTRICT,
+                    atlas_contact_id UUID NOT NULL,
+                    idempotency_key UUID NOT NULL UNIQUE,
+                    identity_revision BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE,
+                    full_name TEXT NOT NULL,
+                    billing_address TEXT,
+                    requested_changes JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    origin VARCHAR(16) NOT NULL
+                        CHECK (origin IN ('patch', 'repair', 'conversion', 'create')),
+                    state VARCHAR(16) NOT NULL DEFAULT 'pending'
+                        CHECK (state IN ('pending', 'applied', 'refused', 'superseded')),
+                    requested_by_employee_id INTEGER NOT NULL
+                        REFERENCES employees(id) ON DELETE RESTRICT,
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    closed_at TIMESTAMPTZ,
+                    CONSTRAINT eom_customer_identity_reservations_closed_at
+                        CHECK ((state = 'pending') = (closed_at IS NULL))
+                );
+                CREATE INDEX IF NOT EXISTS idx_eom_customer_identity_reservations_customer
+                    ON eom_customer_identity_reservations(customer_id, state, identity_revision);
                 """
             )
             # A public bearer is intentionally ephemeral, but its successful
@@ -23906,6 +23968,513 @@ def _customer_atlas_pending_response(
     )
 
 
+# --- Bill-to identity: Atlas-first name and billing address ------------------
+#
+# EOM_CUSTOMER_BILL_TO_IDENTITY_CONTRACT.md, slice B: Customer `name` -> Atlas
+# `full_name`, Customer `billingAddress` -> Atlas `billing_address` (not
+# `address`, the booking location). 0C's saga shape: a reservation committed
+# before the call, the call under the reservation's own key, the local write
+# last. Revisions come from one sequence and Atlas refuses one that is not
+# newer than the last it applied, so an older write can never undo a newer one.
+
+# One map for the direct write and for a PATCH applied after Atlas confirmed
+# it. `atlasContactId` is deliberately absent: CRM linkage is system-managed
+# (Slice 0C), so an ordinary edit cannot repoint a Customer at another contact.
+CUSTOMER_PATCH_FIELD_MAP = {
+    "name": "name",
+    "primaryContactName": "primary_contact_name",
+    "primaryPhone": "primary_phone",
+    "primaryEmail": "primary_email",
+    "billingName": "billing_name",
+    "billingEmail": "billing_email",
+    "billingAddress": "billing_address",
+}
+
+
+@dataclass(frozen=True)
+class _CustomerIdentityOutcome:
+    """How one identity reservation settled after its Atlas call."""
+
+    kind: Literal["applied", "pending", "refused", "link_changed"]
+    reservation: Dict[str, Any]
+    customer: Optional[Dict[str, Any]] = None
+    reason: Optional[str] = None
+
+
+class _CustomerIdentityLinkChanged(Exception):
+    """The Customer's Atlas link moved while its identity write was in flight."""
+
+
+@contextmanager
+def _customer_identity_serialized(customer_id: int):
+    """Hold ONE Customer's identity lock for a whole saga, on its own
+    connection, so the reservation and the apply can commit while it stays
+    held across the Atlas call.
+
+    A save that finds the lock taken waits WITHOUT a connection: it retries,
+    returning its connection between attempts. A waiter blocked inside
+    Postgres would pin a pooled connection for the length of another save's
+    Atlas call, and a few of them would exhaust the pool the holder itself
+    needs to finish.
+    """
+    deadline = time.monotonic() + CUSTOMER_IDENTITY_LOCK_WAIT_SECONDS
+    while True:
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                acquired = _try_lock_customer_identity(cur, customer_id)
+            if acquired:
+                yield
+                return
+        if time.monotonic() >= deadline:
+            _raise_conflict(
+                "customer_identity_save_in_progress",
+                "Another save of this Customer is still waiting on Atlas; "
+                "retry in a moment",
+                {"customerId": int(customer_id)},
+            )
+        time.sleep(_CUSTOMER_IDENTITY_LOCK_POLL_SECONDS)
+
+
+def _serialize_customer_identity_reservation(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "reservationId": str(row["id"]),
+        "customerId": int(row["customer_id"]),
+        "atlasContactId": str(row["atlas_contact_id"]),
+        "identityRevision": int(row["identity_revision"]),
+        "origin": str(row["origin"]),
+        "status": str(row["state"]),
+        # What Atlas was sent.
+        "name": row["full_name"],
+        "billingAddress": row.get("billing_address"),
+        # The whole save, in API field names: while this is pending the
+        # portal's edit form starts from it, so saving an unrelated field does
+        # not revert the pending change.
+        "requestedChanges": dict(row.get("requested_changes") or {}),
+        "lastError": row.get("last_error"),
+        "createdAt": to_utc_iso(row["created_at"]),
+        "updatedAt": to_utc_iso(row["updated_at"]),
+    }
+
+
+def _list_pending_customer_identity_reservations(cur: Any) -> List[Dict[str, Any]]:
+    """Every pending identity reservation; read before `customers` for the
+    reason given on _list_pending_customer_atlas_reservations."""
+    cur.execute(
+        """
+        SELECT *
+        FROM eom_customer_identity_reservations
+        WHERE state = 'pending'
+        ORDER BY identity_revision DESC
+        """
+    )
+    return [
+        _serialize_customer_identity_reservation(dict(row))
+        for row in cur.fetchall()
+    ]
+
+
+def _pending_customer_identity_reservations(
+    cur: Any, customer_id: int
+) -> List[Dict[str, Any]]:
+    """One Customer's pending identity reservations, newest revision first."""
+    cur.execute(
+        """
+        SELECT *
+        FROM eom_customer_identity_reservations
+        WHERE customer_id = %s AND state = 'pending'
+        ORDER BY identity_revision DESC
+        """,
+        (int(customer_id),),
+    )
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _customer_identity_reservation(reservation_id: str) -> Optional[Dict[str, Any]]:
+    return db.query_one(
+        "SELECT * FROM eom_customer_identity_reservations WHERE id = %s",
+        (reservation_id,),
+    )
+
+
+def _customer_identity_target(
+    existing: Dict[str, Any], changes: Dict[str, Any]
+) -> Tuple[str, Optional[str]]:
+    """The (name, billing address) a save leaves the Customer with."""
+    name = changes["name"] if "name" in changes else existing["name"]
+    billing_address = (
+        changes["billingAddress"]
+        if "billingAddress" in changes
+        else existing.get("billing_address")
+    )
+    return str(name), billing_address
+
+
+def _customer_patch_identity_plan(
+    cur: Any, existing: Dict[str, Any], changes: Dict[str, Any]
+) -> Tuple[Optional[str], bool]:
+    """(linked contact id, whether this save is a bill-to identity write).
+
+    Compared with the stored values, because the deployed portal sends every
+    field on every edit. The no-op shortcut holds only while nothing is
+    pending: otherwise an echo of the stored values is a newer save than the
+    pending one, and the last save wins.
+    """
+    contact_id = existing.get("atlas_contact_id")
+    if contact_id is None:
+        return None, False
+    stored = (str(existing["name"]), existing.get("billing_address"))
+    if _customer_identity_target(existing, changes) != stored:
+        return str(contact_id), True
+    return str(contact_id), bool(
+        _pending_customer_identity_reservations(cur, int(existing["id"]))
+    )
+
+
+def _require_sole_identity_holder(
+    cur: Any, customer_id: int, contact_id: str, *, for_update: bool
+) -> None:
+    """Refuse an identity write to an Atlas contact another Customer holds.
+
+    Writing it would change the other Customer's invoice name and address too.
+    With `for_update` this takes the same row locks the create finalizer takes
+    on a contact's holders, so it orders against an in-flight link.
+    """
+    cur.execute(
+        "SELECT id FROM customers WHERE atlas_contact_id = %s AND id <> %s "
+        "ORDER BY id" + (" FOR UPDATE" if for_update else ""),
+        (contact_id, int(customer_id)),
+    )
+    others = [int(row["id"]) for row in cur.fetchall()]
+    if others:
+        _raise_conflict(
+            "customer_atlas_contact_shared",
+            "Another Customer is billed through this Atlas contact; resolve the "
+            "duplicate link before changing this bill-to name or address",
+            {
+                "customerId": int(customer_id),
+                "atlasContactId": contact_id,
+                "otherCustomerIds": others,
+            },
+        )
+
+
+def _customer_identity_capability_refusal(
+    admin: Dict[str, Any],
+) -> Optional[JSONResponse]:
+    """The "Atlas ready" admission rule: credentials (503), then capability.
+
+    The split of _customer_atlas_capability_refusal: a manifest that affirms
+    `contact.bill_to_identity` (or its route) is absent is a 501 before any
+    reservation; one that cannot be read is an outage, so the write reserves
+    and an unreachable Atlas yields the retryable 202, not a lost save.
+    """
+    _require_atlas_funnel_configuration()
+    try:
+        _require_atlas_funnel_capability_route(
+            ATLAS_FUNNEL_CAPABILITY_CONTACT_BILL_TO_IDENTITY,
+            _ATLAS_OPERATOR_CONTACTS_ROUTE,
+            admin,
+        )
+    except AtlasFunnelCapabilityUnavailable as exc:
+        return _atlas_capability_unavailable_response(exc)
+    except HTTPException as exc:
+        logger.warning(
+            "Atlas capability manifest unreadable (status=%s); reserving the "
+            "identity write anyway",
+            exc.status_code,
+        )
+    return None
+
+
+def _insert_customer_identity_reservation(
+    cur: Any,
+    *,
+    customer: Dict[str, Any],
+    changes: Dict[str, Any],
+    origin: str,
+    admin: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reserve one identity write; the caller holds the Customer row.
+
+    A fresh key per reservation, never derived from the values: a revert to an
+    earlier value must not replay that value's old Atlas receipt. The revision
+    comes from the column's identity sequence, so it only grows.
+    """
+    full_name, billing_address = _customer_identity_target(customer, changes)
+    cur.execute(
+        """
+        INSERT INTO eom_customer_identity_reservations (
+            id, customer_id, atlas_contact_id, idempotency_key, full_name,
+            billing_address, requested_changes, origin,
+            requested_by_employee_id
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+        RETURNING *
+        """,
+        (
+            str(uuid4()),
+            int(customer["id"]),
+            str(customer["atlas_contact_id"]),
+            str(uuid4()),
+            full_name,
+            billing_address,
+            json.dumps(changes, sort_keys=True),
+            origin,
+            int(admin["id"]),
+        ),
+    )
+    return dict(cur.fetchone())
+
+
+def _atlas_bill_to_identity_body(reservation: Dict[str, Any]) -> Dict[str, Any]:
+    """The operator mutation for one identity reservation.
+
+    Built from the stored reservation alone, so a retry sends exactly the body
+    Atlas fingerprinted under this key. `billing_address` is always present: a
+    Customer with none sends null, which clears Atlas's copy so invoices fall
+    back to `address`. `source_ref` is stable per contact, so Atlas records one
+    provenance entry per contact rather than one per write, and no other
+    contact can hold it. Nothing else is sent: this write owns only the
+    bill-to identity.
+    """
+    contact_id = str(reservation["atlas_contact_id"])
+    return {
+        "contactId": contact_id,
+        "full_name": reservation["full_name"],
+        "billing_address": reservation.get("billing_address"),
+        "identityRevision": int(reservation["identity_revision"]),
+        "source_channel": ATLAS_OPERATOR_SOURCE_CHANNEL,
+        "source_ref": f"bill-to-identity:{contact_id}",
+    }
+
+
+def _note_customer_identity_error(reservation_id: str, reason: str) -> None:
+    try:
+        db.execute(
+            """
+            UPDATE eom_customer_identity_reservations
+            SET last_error = %s, updated_at = NOW()
+            WHERE id = %s AND state = 'pending'
+            """,
+            (reason[:1000], reservation_id),
+        )
+    except Exception:
+        logger.exception("Could not save customer identity reservation error")
+
+
+def _close_customer_identity_reservation(
+    reservation_id: str, state: str, reason: str
+) -> None:
+    db.execute(
+        """
+        UPDATE eom_customer_identity_reservations
+        SET state = %s, last_error = %s, closed_at = NOW(), updated_at = NOW()
+        WHERE id = %s AND state = 'pending'
+        """,
+        (state, reason[:1000], reservation_id),
+    )
+
+
+def _write_customer_patch(
+    cur: Any, customer_id: int, changes: Dict[str, Any]
+) -> None:
+    """Land Customer PATCH fields; the caller holds the Customer/Site lock."""
+    assignments: List[str] = []
+    params: List[Any] = []
+    for request_field, column in CUSTOMER_PATCH_FIELD_MAP.items():
+        if request_field not in changes:
+            continue
+        assignments.append(f"{column} = %s")
+        params.append(changes[request_field])
+    if assignments:
+        assignments.append("updated_at = NOW()")
+        params.append(customer_id)
+        cur.execute(
+            f"UPDATE customers SET {', '.join(assignments)} WHERE id = %s",
+            tuple(params),
+        )
+    if "name" in changes:
+        cur.execute(
+            """
+            UPDATE locations
+            SET customer_name = %s, updated_at = NOW()
+            WHERE customer_id = %s
+            """,
+            (changes["name"], customer_id),
+        )
+
+
+def _apply_customer_identity_reservation(reservation_id: str) -> Dict[str, Any]:
+    """Write the local half once Atlas confirmed, in one transaction.
+
+    Applies the reservation's whole save, marks it applied, and supersedes
+    every older pending reservation of the Customer. Only a successful apply
+    supersedes anything. If the Customer's link moved while Atlas was being
+    called, the answer is about a contact this Customer no longer bills
+    through, so nothing is written.
+    """
+    with db.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            _lock_customer_site_mutations(cur)
+            cur.execute(
+                """
+                SELECT *
+                FROM eom_customer_identity_reservations
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (reservation_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("Customer identity reservation disappeared")
+            reservation = dict(row)
+            customer_id = int(reservation["customer_id"])
+            if reservation["state"] == "applied":
+                return _canonical_customer(cur, customer_id)
+            if reservation["state"] != "pending":
+                raise RuntimeError(
+                    f"Customer identity reservation is {reservation['state']}"
+                )
+            customer = _customer_row(cur, customer_id, for_update=True)
+            linked = (
+                str(customer["atlas_contact_id"])
+                if customer and customer.get("atlas_contact_id") is not None
+                else None
+            )
+            if linked != str(reservation["atlas_contact_id"]):
+                raise _CustomerIdentityLinkChanged(
+                    "This Customer's Atlas link changed while its bill-to "
+                    "change was in flight; nothing was changed locally"
+                )
+            _write_customer_patch(
+                cur, customer_id, dict(reservation["requested_changes"] or {})
+            )
+            cur.execute(
+                """
+                UPDATE eom_customer_identity_reservations
+                SET state = 'applied', last_error = NULL, closed_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (reservation_id,),
+            )
+            cur.execute(
+                """
+                UPDATE eom_customer_identity_reservations
+                SET state = 'superseded', closed_at = NOW(), updated_at = NOW(),
+                    last_error = %s
+                WHERE customer_id = %s
+                  AND state = 'pending'
+                  AND identity_revision < %s
+                """,
+                (
+                    f"Superseded by revision {reservation['identity_revision']}",
+                    customer_id,
+                    int(reservation["identity_revision"]),
+                ),
+            )
+            return _canonical_customer(cur, customer_id)
+
+
+def _send_customer_identity_reservation(
+    reservation: Dict[str, Any], admin: Dict[str, Any]
+) -> _CustomerIdentityOutcome:
+    """Call Atlas for one identity reservation and settle it.
+
+    Pending when Atlas cannot be reached, times out, answers 5xx, or answers
+    2xx without confirming this contact: nothing is applied and the same key
+    can be retried. Refused for any 4xx. Applied only once Atlas confirmed.
+    """
+    reservation_id = str(reservation["id"])
+    contact_id = str(reservation["atlas_contact_id"])
+    try:
+        atlas_result = _atlas_funnel_request(
+            ATLAS_OPERATOR_CONTACTS_PATH,
+            admin,
+            payload=_atlas_bill_to_identity_body(reservation),
+            idempotency_key=str(reservation["idempotency_key"]),
+        )
+        # _atlas_funnel_request accepts any JSON object below 400, so a body
+        # with success:false, or one naming another contact, is not a
+        # confirmation of THIS contact's identity.
+        if _atlas_contact_id_from_operator_result(atlas_result) != contact_id:
+            raise AtlasFunnelRequestError(
+                502, "Atlas confirmed a different contact than the one being changed"
+            )
+    except AtlasFunnelRequestError as exc:
+        reason = str(exc)
+        if exc.status_code >= 500:
+            _note_customer_identity_error(reservation_id, reason)
+            return _CustomerIdentityOutcome("pending", reservation, reason=reason)
+        _close_customer_identity_reservation(reservation_id, "refused", reason)
+        return _CustomerIdentityOutcome("refused", reservation, reason=reason)
+    try:
+        customer = _apply_customer_identity_reservation(reservation_id)
+    except _CustomerIdentityLinkChanged as exc:
+        _note_customer_identity_error(reservation_id, str(exc))
+        return _CustomerIdentityOutcome("link_changed", reservation, reason=str(exc))
+    except Exception as exc:  # local half failed; Atlas already applied it
+        logger.exception("Customer identity reservation could not be applied")
+        _note_customer_identity_error(reservation_id, str(exc))
+        return _CustomerIdentityOutcome(
+            "pending",
+            reservation,
+            reason=(
+                "Atlas accepted this bill-to change but the tracker could not "
+                "save it; retry this change"
+            ),
+        )
+    return _CustomerIdentityOutcome("applied", reservation, customer=customer)
+
+
+def _customer_identity_outcome_response(
+    outcome: _CustomerIdentityOutcome,
+    request: Request,
+    admin: Dict[str, Any],
+) -> Any:
+    """Map a settled reservation onto the contract's outcome table."""
+    reservation = outcome.reservation
+    customer_id = int(reservation["customer_id"])
+    details = {"customerId": customer_id, "reservationId": str(reservation["id"])}
+    log_detail = (
+        f"customer={customer_id} reservation={reservation['id']} "
+        f"revision={reservation['identity_revision']} by {admin['name']}"
+    )
+    if outcome.kind == "applied":
+        append_access_log(request, "CUSTOMER_UPDATED", True, log_detail)
+        return {"success": True, "customer": outcome.customer}
+    append_access_log(
+        request, f"CUSTOMER_IDENTITY_{outcome.kind.upper()}", False, log_detail
+    )
+    if outcome.kind == "pending":
+        visible = _serialize_customer_identity_reservation(reservation)
+        visible["lastError"] = outcome.reason
+        visible["status"] = "atlas_pending"
+        return JSONResponse(
+            status_code=202,
+            content=jsonable_encoder(
+                {
+                    "success": False,
+                    "idempotent": False,
+                    "error": "customer_atlas_pending",
+                    "reservation": visible,
+                }
+            ),
+        )
+    if outcome.kind == "link_changed":
+        _raise_conflict(
+            "customer_atlas_link_changed",
+            str(outcome.reason),
+            details,
+        )
+    _raise_conflict(
+        "customer_atlas_identity_refused",
+        f"Atlas refused this bill-to change; nothing was changed: {outcome.reason}",
+        {**details, "reason": outcome.reason},
+    )
+
+
 def _serialize_working_lead(
     lead: Dict[str, Any],
     marker: Dict[str, Any],
@@ -24730,6 +25299,7 @@ def admin_list_customers(
     with db.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             pending_reservations = _list_pending_customer_atlas_reservations(cur)
+            pending_identity = _list_pending_customer_identity_reservations(cur)
             cur.execute(
                 f"SELECT {CUSTOMER_SELECT_COLUMNS} FROM customers c"
                 f"{active_clause} ORDER BY lower(c.name), c.id"
@@ -24746,11 +25316,14 @@ def admin_list_customers(
     # `pendingAtlasReservations` is additive: the `customers` shape the deployed
     # portals read is unchanged. Customer creates that reached Atlas but have
     # not finalized appear here and nowhere else -- they are deliberately not
-    # Customers yet.
+    # Customers yet. `pendingIdentityReservations` (also additive) lists bill-to
+    # changes Atlas has not confirmed; the Customer row keeps its old values
+    # until it does.
     return {
         "success": True,
         "customers": customers,
         "pendingAtlasReservations": pending_reservations,
+        "pendingIdentityReservations": pending_identity,
     }
 
 
@@ -31146,108 +31719,152 @@ def admin_patch_customer(
     payload: CustomerUpdateRequest,
     request: Request,
     admin: Dict[str, Any] = Depends(get_current_admin),
-) -> Dict[str, Any]:
+) -> Any:
+    """Edit a Customer; a linked Customer's bill-to change goes to Atlas first.
+
+    Bill-to identity contract, slice B. A save that changes a linked
+    Customer's `name` or `billingAddress`, or any save while one of its
+    identity changes is pending, sends the bill-to identity to Atlas and
+    applies the WHOLE save locally only after Atlas confirms. Every other save
+    (an unlinked Customer, or an identity-neutral edit with nothing pending)
+    keeps today's behavior and makes no Atlas call.
+    """
     present = payload.model_fields_set
     if "name" in present and payload.name is None:
         _raise_validation_error("Customer name cannot be cleared", {"name": "required"})
-
-    # `atlasContactId` is deliberately absent: CRM linkage is system-managed
-    # (Slice 0C) and is set only by the reservation saga. Leaving it here would
-    # let an ordinary customer edit silently repoint a Customer at a different
-    # Atlas contact.
-    field_map = {
-        "name": "name",
-        "primaryContactName": "primary_contact_name",
-        "primaryPhone": "primary_phone",
-        "primaryEmail": "primary_email",
-        "billingName": "billing_name",
-        "billingEmail": "billing_email",
-        "billingAddress": "billing_address",
-    }
     values = payload.model_dump()
-    with db.get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            _lock_customer_site_mutations(cur)
-            existing = _customer_row(cur, customer_id, for_update=True)
-            if not existing:
-                raise HTTPException(status_code=404, detail="Customer not found")
-            _require_current_update_token(
-                "customer",
-                existing,
-                payload.expectedUpdateToken,
+    changes = {
+        field: values[field] for field in CUSTOMER_PATCH_FIELD_MAP if field in present
+    }
+
+    # A second save of the same Customer waits here for the first one's Atlas
+    # call, then compares against the committed values and pending set.
+    with _customer_identity_serialized(customer_id):
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                existing = _customer_row(cur, customer_id)
+                if not existing:
+                    raise HTTPException(status_code=404, detail="Customer not found")
+                _validate_customer_patch(existing, payload, values)
+                plan = _customer_patch_identity_plan(cur, existing, changes)
+                contact_id, identity_write = plan
+                if identity_write:
+                    _require_sole_identity_holder(
+                        cur, customer_id, str(contact_id), for_update=False
+                    )
+        # Admission order is the contract's: linked, sole holder, Atlas ready.
+        # The capability read is HTTP, so it runs before the global
+        # Customer/Site lock below, never inside it.
+        if identity_write:
+            refusal = _customer_identity_capability_refusal(admin)
+            if refusal is not None:
+                append_access_log(
+                    request,
+                    "CUSTOMER_IDENTITY_CAPABILITY_UNAVAILABLE",
+                    False,
+                    f"customer={customer_id} "
+                    f"capability={ATLAS_FUNNEL_CAPABILITY_CONTACT_BILL_TO_IDENTITY}",
+                )
+                return refusal
+
+        reservation: Optional[Dict[str, Any]] = None
+        customer: Optional[Dict[str, Any]] = None
+        with db.get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                _lock_customer_site_mutations(cur)
+                existing = _customer_row(cur, customer_id, for_update=True)
+                if not existing:
+                    raise HTTPException(status_code=404, detail="Customer not found")
+                _validate_customer_patch(existing, payload, values)
+                if _customer_patch_identity_plan(cur, existing, changes) != plan:
+                    # The link moved between the read above and this lock (a
+                    # reconcile or a linkage tool; neither takes the identity
+                    # lock). The admission already run is about other facts.
+                    _raise_conflict(
+                        "stale_customer_update",
+                        "Customer changed after it was read; reload before retrying",
+                        {"customerId": customer_id},
+                    )
+                if identity_write:
+                    _require_sole_identity_holder(
+                        cur, customer_id, str(contact_id), for_update=True
+                    )
+                    reservation = _insert_customer_identity_reservation(
+                        cur,
+                        customer=existing,
+                        changes=changes,
+                        origin="patch",
+                        admin=admin,
+                    )
+                else:
+                    _write_customer_patch(cur, customer_id, changes)
+                    customer = _canonical_customer(cur, customer_id)
+
+        if reservation is None:
+            append_access_log(
+                request,
+                "CUSTOMER_UPDATED",
+                True,
+                f"Customer {customer_id} by {admin['name']}",
             )
-            if "atlasContactId" in present:
-                # Echoing back the stored value is what the deployed portal does
-                # on every edit, so that stays a no-op. Actually CHANGING the
-                # link is refused loudly rather than ignored: a silent drop
-                # would look like a successful edit that did nothing.
-                submitted = values["atlasContactId"]
-                submitted_text = str(submitted) if submitted is not None else None
-                stored = existing.get("atlas_contact_id")
-                stored_text = str(stored) if stored is not None else None
-                if submitted_text != stored_text:
-                    _raise_conflict(
-                        "customer_atlas_link_system_managed",
-                        "The Atlas contact link is managed by Atlas and cannot "
-                        "be edited here",
-                        {
-                            "customerId": customer_id,
-                            "atlasContactId": stored_text,
-                        },
-                    )
-            if "customerType" in present:
-                # Same rule as the Atlas link above, and for the same reason:
-                # this column is a mirror of Atlas, which is the sole write
-                # authority for it. Echoing the stored value stays a no-op so a
-                # portal that round-trips the whole record keeps working;
-                # CHANGING it here is refused loudly, because a tracker-side
-                # edit would either be silently discarded on the next mirror
-                # refresh or, worse, drive billing from a value Atlas never
-                # agreed to.
-                submitted = values["customerType"]
-                submitted_text = str(submitted).strip().lower() if submitted else None
-                stored_text = str(existing.get("customer_type") or "unknown")
-                if submitted_text != stored_text:
-                    _raise_conflict(
-                        "customer_type_system_managed",
-                        "The customer type is managed by Atlas and cannot be "
-                        "edited here",
-                        {
-                            "customerId": customer_id,
-                            "customerType": stored_text,
-                        },
-                    )
-            assignments: List[str] = []
-            params: List[Any] = []
-            for request_field, column in field_map.items():
-                if request_field not in present:
-                    continue
-                assignments.append(f"{column} = %s")
-                params.append(values[request_field])
-            if assignments:
-                assignments.append("updated_at = NOW()")
-                params.append(customer_id)
-                cur.execute(
-                    f"UPDATE customers SET {', '.join(assignments)} WHERE id = %s",
-                    tuple(params),
-                )
-            if "name" in present:
-                cur.execute(
-                    """
-                    UPDATE locations
-                    SET customer_name = %s, updated_at = NOW()
-                    WHERE customer_id = %s
-                    """,
-                    (payload.name, customer_id),
-                )
-            customer = _canonical_customer(cur, customer_id)
-    append_access_log(
-        request,
-        "CUSTOMER_UPDATED",
-        True,
-        f"Customer {customer_id} by {admin['name']}",
+            return {"success": True, "customer": customer}
+        outcome = _send_customer_identity_reservation(reservation, admin)
+        return _customer_identity_outcome_response(outcome, request, admin)
+
+
+def _validate_customer_patch(
+    existing: Dict[str, Any],
+    payload: CustomerUpdateRequest,
+    values: Dict[str, Any],
+) -> None:
+    """Refuse a Customer PATCH that cannot apply, before anything is written."""
+    present = payload.model_fields_set
+    customer_id = int(existing["id"])
+    _require_current_update_token(
+        "customer",
+        existing,
+        payload.expectedUpdateToken,
     )
-    return {"success": True, "customer": customer}
+    if "atlasContactId" in present:
+        # Echoing back the stored value is what the deployed portal does on
+        # every edit, so that stays a no-op. Actually CHANGING the link is
+        # refused loudly rather than ignored: a silent drop would look like a
+        # successful edit that did nothing.
+        submitted = values["atlasContactId"]
+        submitted_text = str(submitted) if submitted is not None else None
+        stored = existing.get("atlas_contact_id")
+        stored_text = str(stored) if stored is not None else None
+        if submitted_text != stored_text:
+            _raise_conflict(
+                "customer_atlas_link_system_managed",
+                "The Atlas contact link is managed by Atlas and cannot "
+                "be edited here",
+                {
+                    "customerId": customer_id,
+                    "atlasContactId": stored_text,
+                },
+            )
+    if "customerType" in present:
+        # Same rule as the Atlas link above, and for the same reason: this
+        # column is a mirror of Atlas, which is the sole write authority for
+        # it. Echoing the stored value stays a no-op so a portal that
+        # round-trips the whole record keeps working; CHANGING it here is
+        # refused loudly, because a tracker-side edit would either be silently
+        # discarded on the next mirror refresh or, worse, drive billing from a
+        # value Atlas never agreed to.
+        submitted = values["customerType"]
+        submitted_text = str(submitted).strip().lower() if submitted else None
+        stored_text = str(existing.get("customer_type") or "unknown")
+        if submitted_text != stored_text:
+            _raise_conflict(
+                "customer_type_system_managed",
+                "The customer type is managed by Atlas and cannot be "
+                "edited here",
+                {
+                    "customerId": customer_id,
+                    "customerType": stored_text,
+                },
+            )
 
 
 @app.delete("/api/admin/customers/{customer_id}")

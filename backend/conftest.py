@@ -79,6 +79,7 @@ def _apply_schema(conn):
                 google_calendar_sources, google_calendar_connections,
                 eom_lead_working,
                 eom_public_onboarding_reservations,
+                eom_customer_identity_reservations,
                 eom_customer_atlas_reservations,
                 eom_office_conversion_handoffs,
                 receivables_operation_attempts,
