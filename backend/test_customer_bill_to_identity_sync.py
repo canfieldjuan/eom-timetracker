@@ -269,6 +269,7 @@ def test_create_reports_an_unsent_sync_when_atlas_lacks_the_capability(
     assert (sync["status"], sync["error"]) == ("not_sent", "atlas_capability_unavailable")
     assert sync["details"] == {"capability": "contact.bill_to_identity"}
     assert atlas.posts == []
+    assert _reservations(response.json()["customer"]["id"]) == []
 
 
 def test_create_matching_a_contact_linked_elsewhere_leaves_its_billing_address(
@@ -426,25 +427,23 @@ def test_shared_contact_refuses_repair_and_post_link_sync(client, auth, atlas, r
     assert sync["details"]["otherCustomerIds"] == [planted["id"]]
     assert atlas.posts == []
     assert _reservations(planted["id"]) == []
+    assert _reservations(response.json()["handoff"]["customerId"]) == []
 
 
-def test_shared_contact_found_under_the_lock_refuses_post_create_sync(
+def test_shared_contact_found_at_send_keeps_the_post_create_obligation_pending(
     client, auth, atlas, monkeypatch
 ):
     key = str(uuid.uuid4())
     contact = fake_atlas_contact_id(key)
-    reads = []
+    real_drive = api._drive_customer_identity_reservation
+    planted = {}
 
-    def _get_then_link_a_duplicate(url, **kwargs):
-        # Read 1 is the create's own capability check. Read 2 is the sync's,
-        # between its unlocked check and its locked recheck; a duplicate
-        # linked there must still be refused.
-        reads.append(url)
-        if len(reads) == 2:
-            _customer("Late Duplicate", contact=contact)
-        return atlas.get(url, **kwargs)
+    def _duplicate_then_drive(reservation_id, admin):
+        # Linked after the create committed its obligation, before the send.
+        planted["id"] = _customer("Late Duplicate", contact=contact)
+        return real_drive(reservation_id, admin)
 
-    monkeypatch.setattr(api.requests, "get", _get_then_link_a_duplicate)
+    monkeypatch.setattr(api, "_drive_customer_identity_reservation", _duplicate_then_drive)
 
     response = client.post(
         "/api/admin/customers",
@@ -455,5 +454,35 @@ def test_shared_contact_found_under_the_lock_refuses_post_create_sync(
     assert response.status_code == 201, response.text
     sync = response.json()["identitySync"]
     assert (sync["status"], sync["error"]) == ("not_sent", "customer_atlas_contact_shared")
+    assert sync["details"]["otherCustomerIds"] == [planted["id"]]
+    assert atlas.posts == [], "no Atlas call while the contact is shared"
+    [obligation] = _reservations(response.json()["customer"]["id"])
+    assert obligation["state"] == "pending", "kept for a retry once the duplicate is resolved"
+    assert sync["reservation"]["reservationId"] == str(obligation["id"])
+
+
+def test_post_create_obligation_survives_a_worker_lost_after_the_link(
+    client, auth, atlas, monkeypatch
+):
+    key = str(uuid.uuid4())
+    payload = {"name": f"{PREFIX} Lost Worker", "billingAddress": "6 Durable Dr", "idempotencyKey": key}
+    # The worker dies after the link commits, before it sends anything.
+    monkeypatch.setattr(api, "_post_link_identity_sync", lambda *args, **kwargs: None)
+
+    created = client.post("/api/admin/customers", headers=auth, json=payload)
+    replayed = client.post("/api/admin/customers", headers=auth, json=payload)
+
+    assert created.status_code == 201, created.text
+    assert replayed.status_code == 200 and replayed.json()["idempotent"] is True
     assert atlas.posts == []
-    assert _reservations(response.json()["customer"]["id"]) == []
+    [listed] = _pending_listed(client, auth)
+    assert (listed["origin"], listed["billingAddress"]) == ("create", "6 Durable Dr")
+
+    retried = client.post(
+        f"/api/admin/customers/identity-reservations/{listed['reservationId']}/retry",
+        headers=auth,
+    )
+
+    assert retried.status_code == 200, retried.text
+    assert atlas.contacts[fake_atlas_contact_id(key)]["billing_address"] == "6 Durable Dr"
+    assert _pending_listed(client, auth) == []
