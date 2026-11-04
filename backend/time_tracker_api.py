@@ -6019,6 +6019,13 @@ ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR = "contact.field_clear"
 # `identityRevision` fence. The tracker needs both before it sends either, so
 # bill-to identity writes gate on THIS name + the operator-contacts route.
 ATLAS_FUNNEL_CAPABILITY_CONTACT_BILL_TO_IDENTITY = "contact.bill_to_identity"
+# Versions the route once more (customer create match contract, slice A): Atlas
+# advertises this name only from builds that admit `onMatch`. With "return", a
+# create-or-return that matches an existing contact leaves it unchanged and
+# answers `contact_matched`, so the tracker learns who holds that contact before
+# anything is written to it. An older build rejects `onMatch` as unknown.
+ATLAS_FUNNEL_CAPABILITY_CONTACT_MATCH_WITHOUT_WRITE = "contact.match_without_write"
+ATLAS_OPERATOR_CONTACT_MATCHED = "contact_matched"
 # Atlas's refusal code for an identity revision that is not newer than the one
 # it already applied (atlas_brain/services/eom_crm_mutations.py
 # EOM_OPERATOR_STALE_IDENTITY_REVISION).
@@ -6121,6 +6128,10 @@ ATLAS_ONBOARDING_DRAFT_APPROVE_SEND_PATH = (
 # (atlas_brain/services/eom_crm_mutations.py::EOM_OPERATOR_SOURCE_CHANNELS);
 # this service is the tracker.
 ATLAS_OPERATOR_SOURCE_CHANNEL = "time_tracker"
+# The onMatch every new 0C reservation records, and a Leads-page customer create
+# sends (EOM_CUSTOMER_CREATE_MATCH_CONTRACT.md). A reservation sends what it
+# recorded, never this constant, so it retries exactly as it was first sent.
+ATLAS_OPERATOR_ON_MATCH_RETURN = "return"
 
 
 class AtlasFunnelCapabilityUnavailable(Exception):
@@ -7271,6 +7282,18 @@ def _ensure_customer_site_schema() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_eom_customer_atlas_reservations_state
                     ON eom_customer_atlas_reservations(state, updated_at);
+                """
+            )
+            # Customer create match contract: the onMatch this reservation sends
+            # on its first attempt and every retry. Null on reservations created
+            # before it, which therefore keep sending their original request
+            # under their key -- Atlas refuses a changed request for a key it
+            # already holds, so retries must never pick up a newer default.
+            cur.execute(
+                """
+                ALTER TABLE eom_customer_atlas_reservations
+                    ADD COLUMN IF NOT EXISTS atlas_on_match VARCHAR(16)
+                        CHECK (atlas_on_match IN ('return'));
                 """
             )
             # Bill-to identity (EOM_CUSTOMER_BILL_TO_IDENTITY_CONTRACT.md):
@@ -23377,6 +23400,12 @@ def _atlas_operator_contact_body(reservation: Dict[str, Any]) -> Dict[str, Any]:
     and notes are deliberately not mapped -- the CRM's copies come from other
     sources, the operational address lives on the tracker Site, and overwriting
     them here would be a silent data loss for no gain in 0C's guarantee.
+
+    A reservation that recorded onMatch "return" asks Atlas to leave a matched
+    contact unchanged instead: whether this Customer may hold that contact is
+    the finalizer's ownership check, which runs only after Atlas answers. The
+    recorded value is sent verbatim, including its absence, so every attempt
+    under the reservation's key is the same request.
     """
     stored = reservation.get("payload") or {}
     candidates = {
@@ -23390,6 +23419,8 @@ def _atlas_operator_contact_body(reservation: Dict[str, Any]) -> Dict[str, Any]:
     body["contact_type"] = "customer"
     body["source_channel"] = ATLAS_OPERATOR_SOURCE_CHANNEL
     body["source_ref"] = str(reservation["id"])
+    if reservation.get("atlas_on_match") is not None:
+        body["onMatch"] = str(reservation["atlas_on_match"])
     return body
 
 
@@ -23636,9 +23667,9 @@ def _reserve_customer_atlas_creation(
                 """
                 INSERT INTO eom_customer_atlas_reservations (
                     id, idempotency_key, request_fingerprint, payload, mode,
-                    customer_id, requested_by_employee_id
+                    customer_id, requested_by_employee_id, atlas_on_match
                 )
-                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s)
                 RETURNING *
                 """,
                 (
@@ -23649,6 +23680,7 @@ def _reserve_customer_atlas_creation(
                     mode,
                     customer_id,
                     int(admin["id"]),
+                    ATLAS_OPERATOR_ON_MATCH_RETURN,
                 ),
             )
             return dict(cur.fetchone()), True
@@ -23976,10 +24008,46 @@ def _run_customer_atlas_reservation(
         return None, failure
 
 
+def _customer_atlas_reservation_on_match(
+    reservation: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """The onMatch a 0C request will carry -- the one answer every gate uses.
+
+    An existing reservation sends what it recorded, including nothing (one
+    created before the customer create match contract). Only a reservation
+    that does not exist yet takes the value every new reservation records.
+    """
+    if reservation is not None:
+        return reservation.get("atlas_on_match")
+    return ATLAS_OPERATOR_ON_MATCH_RETURN
+
+
+def _customer_atlas_reservation_for_key(key: str) -> Optional[Dict[str, Any]]:
+    """The reservation a create key already names, read without a lock.
+
+    Only used to choose the capability gate before any local write. A create
+    racing on the same key can only be new code, which records the same value
+    a missing reservation is gated on, so the unlocked read cannot pick a gate
+    the request will not need.
+    """
+    row = db.query_one(
+        "SELECT atlas_on_match FROM eom_customer_atlas_reservations "
+        "WHERE idempotency_key = %s",
+        (key,),
+    )
+    return dict(row) if row else None
+
+
 def _customer_atlas_capability_refusal(
     admin: Dict[str, Any],
+    *,
+    on_match: Optional[str] = None,
 ) -> Optional[JSONResponse]:
     """Refuse early only when Atlas AFFIRMS it cannot serve this mutation.
+
+    `on_match` is what the request will carry
+    (_customer_atlas_reservation_on_match). Sending it needs
+    contact.match_without_write as well, proven by the same manifest read.
 
     The distinction matters. A manifest that says the capability is absent is a
     definite "no": refusing before any local write is correct, and a reservation
@@ -23999,9 +24067,19 @@ def _customer_atlas_capability_refusal(
     # rather than AtlasFunnelRequestError for this case.
     _require_atlas_funnel_configuration()
     try:
-        _require_atlas_funnel_capability(
-            ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION, admin
-        )
+        if on_match is None:
+            _require_atlas_funnel_capability(
+                ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION, admin
+            )
+        else:
+            _require_atlas_funnel_capability_routes(
+                (
+                    ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
+                    ATLAS_FUNNEL_CAPABILITY_CONTACT_MATCH_WITHOUT_WRITE,
+                ),
+                _ATLAS_OPERATOR_CONTACTS_ROUTE,
+                admin,
+            )
     except AtlasFunnelCapabilityUnavailable as exc:
         return _atlas_capability_unavailable_response(exc)
     except HTTPException as exc:
@@ -25730,14 +25808,22 @@ def admin_create_customer(
             )
 
     # Refused before any local write, so a partially-deployed Atlas cannot
-    # leave a Customer behind.
-    refusal = _customer_atlas_capability_refusal(admin)
+    # leave a Customer behind. Gated on the request this create will send: a
+    # key that already names a pending reservation re-drives THAT reservation.
+    existing = (
+        _customer_atlas_reservation_for_key(str(payload.idempotencyKey))
+        if payload.idempotencyKey is not None
+        else None
+    )
+    refusal = _customer_atlas_capability_refusal(
+        admin, on_match=_customer_atlas_reservation_on_match(existing)
+    )
     if refusal is not None:
         append_access_log(
             request,
             "CUSTOMER_CREATE_CAPABILITY_UNAVAILABLE",
             False,
-            f"capability={ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION}",
+            f"capability={json.loads(refusal.body)['capability']}",
         )
         return refusal
 
@@ -25828,7 +25914,11 @@ def admin_retry_customer_atlas_reservation(
             ),
         )
 
-    refusal = _customer_atlas_capability_refusal(admin)
+    # Gated on what THIS reservation sends: one created before the match
+    # contract recorded no onMatch and still needs only 0C's capability.
+    refusal = _customer_atlas_capability_refusal(
+        admin, on_match=_customer_atlas_reservation_on_match(reservation)
+    )
     if refusal is not None:
         return refusal
 
@@ -25889,7 +25979,11 @@ def admin_link_customer_to_atlas(
             },
         )
 
-    refusal = _customer_atlas_capability_refusal(admin)
+    # Reconcile never re-drives a reservation (an open one is refused with
+    # customer_atlas_reservation_open), so its request is always a new one.
+    refusal = _customer_atlas_capability_refusal(
+        admin, on_match=_customer_atlas_reservation_on_match(None)
+    )
     if refusal is not None:
         return refusal
 
@@ -27243,7 +27337,27 @@ def _atlas_funnel_contact_create_body(
             "source_ref": _portal_contact_source_ref(payload.idempotencyKey),
         }
     )
+    on_match = _funnel_contact_create_on_match(payload)
+    if on_match is not None:
+        body["onMatch"] = on_match
     return body
+
+
+def _funnel_contact_create_on_match(
+    payload: FunnelContactCreateRequest,
+) -> Optional[str]:
+    """The onMatch a Leads-page request sends (customer create match contract).
+
+    A customer create without contactId can resolve to a contact a tracker
+    Customer already holds, and this route links nothing, so nothing would
+    ever notice it was overwritten. With "return" Atlas leaves a match
+    unchanged and the route refuses it instead. A lead create can only match a
+    lead (Atlas refuses a customer match on contact type), and an edit names
+    its contact, so both keep today's request.
+    """
+    if payload.contactId is None and payload.contactType == "customer":
+        return ATLAS_OPERATOR_ON_MATCH_RETURN
+    return None
 
 
 def _validate_atlas_funnel_contact_create_result(
@@ -28976,6 +29090,7 @@ def admin_create_funnel_contact(
     """
     _require_atlas_funnel_configuration()
     clear_fields = _requested_clear_fields(payload)
+    on_match = _funnel_contact_create_on_match(payload)
     try:
         # The strict gate (capability name through the strict extractor AND
         # the exact registered route) -- the same standard the advertised
@@ -28984,6 +29099,12 @@ def admin_create_funnel_contact(
         required_capabilities: Tuple[str, ...] = (
             ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
         )
+        if on_match is not None:
+            # An older Atlas rejects onMatch as unknown and, worse, would
+            # overwrite the matched contact if the field were dropped.
+            required_capabilities += (
+                ATLAS_FUNNEL_CAPABILITY_CONTACT_MATCH_WITHOUT_WRITE,
+            )
         if clear_fields:
             # A clear-bearing edit additionally needs the semantics version:
             # the mutation route existing does not prove the deployed Atlas
@@ -28992,10 +29113,7 @@ def admin_create_funnel_contact(
             # forwarding anyway could silently drop the operator's delete.
             # Both names are proven from ONE manifest read: a pair spanning
             # two fetches is not a pair (consecutive reads can disagree).
-            required_capabilities = (
-                ATLAS_FUNNEL_CAPABILITY_CONTACT_OPERATOR_MUTATION,
-                ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR,
-            )
+            required_capabilities += (ATLAS_FUNNEL_CAPABILITY_CONTACT_FIELD_CLEAR,)
         _require_atlas_funnel_capability_routes(
             required_capabilities,
             _ATLAS_OPERATOR_CONTACTS_ROUTE,
@@ -29017,14 +29135,21 @@ def admin_create_funnel_contact(
             payload=_atlas_funnel_contact_create_body(payload),
             idempotency_key=str(payload.idempotencyKey),
         )
-        visible = _validate_atlas_funnel_contact_create_result(
-            atlas_result,
-            requested_contact_type=payload.contactType,
-            requested_contact_id=(
-                str(payload.contactId) if payload.contactId is not None else None
-            ),
-            requested_clear_fields=clear_fields,
-        )
+        matched_contact_id: Optional[str] = None
+        if (
+            on_match is not None
+            and atlas_result.get("operation") == ATLAS_OPERATOR_CONTACT_MATCHED
+        ):
+            matched_contact_id = _atlas_contact_id_from_operator_result(atlas_result)
+        else:
+            visible = _validate_atlas_funnel_contact_create_result(
+                atlas_result,
+                requested_contact_type=payload.contactType,
+                requested_contact_id=(
+                    str(payload.contactId) if payload.contactId is not None else None
+                ),
+                requested_clear_fields=clear_fields,
+            )
     except AtlasFunnelRequestError as exc:
         append_access_log(
             request,
@@ -29033,6 +29158,23 @@ def admin_create_funnel_contact(
             f"status={exc.status_code}",
         )
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    if matched_contact_id is not None:
+        # Atlas left the existing contact unchanged. Updating it is an edit of
+        # that contact, which the office makes on purpose by opening it.
+        matched = atlas_result.get("contact")
+        name = matched.get("fullName") if isinstance(matched, dict) else None
+        name = name if isinstance(name, str) and name.strip() else None
+        append_access_log(
+            request, "EOM_FUNNEL_CONTACT_EXISTS", False, f"contact={matched_contact_id}"
+        )
+        _raise_conflict(
+            "funnel_contact_exists",
+            (f"This matches the existing contact {name}." if name else
+             "This matches an existing contact.")
+            + " Nothing was changed. Open that contact to edit it.",
+            {"contactId": matched_contact_id, "fullName": name},
+        )
 
     append_access_log(
         request,

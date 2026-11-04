@@ -161,10 +161,13 @@ def test_customer_create_sends_the_agreed_atlas_contract(client, auth, monkeypat
         "contact_type",
         "source_channel",
         "source_ref",
+        "onMatch",
     }
     assert body["full_name"] == name
     assert body["contact_type"] == "customer"
     assert body["source_channel"] == "time_tracker"
+    # A match is returned unchanged; the finalizer's ownership check decides.
+    assert body["onMatch"] == "return"
     # sourceRef is the reservation id, which is what makes a replay resolve to
     # the same Atlas contact.
     assert body["source_ref"] == str(_reservation_rows(name)[0]["id"])
@@ -193,6 +196,7 @@ def test_customer_create_omits_fields_the_operator_left_blank(
         "contact_type",
         "source_channel",
         "source_ref",
+        "onMatch",
     }
 
 
