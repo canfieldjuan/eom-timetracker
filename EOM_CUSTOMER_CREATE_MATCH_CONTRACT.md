@@ -137,6 +137,14 @@ contact unchanged, and the caller decides.
   index-only migration recreates it over every receipt type. No table changes
   are needed: `eom_lead_lifecycle_events.event_type` is `VARCHAR(64)` with no
   CHECK (migration 351).
+  - **Applied by the operator, not at startup.** Atlas migration 394 gave
+    that table to the guard owner `atlas_eom_handoff_owner`, so the runtime
+    role cannot change its indexes. The migration is therefore a controlled DBA
+    migration (ATLAS #2549), applied with
+    `./ops db controlled eom-operator-contact-receipt-index apply` and the
+    protected superuser DSN (ATLAS issue 2550).
+  - **Correct without it.** Atlas is correct before the operator applies it;
+    the receipt lookup is only unindexed until then.
 
 **Slice B: tracker**
 
@@ -342,6 +350,9 @@ Live settle, after A and B deploy:
 - **Proof of the change.** The Atlas manifest lists `contact.match_without_write`.
   The next office Customer create shows `onMatch: "return"` in the Atlas
   request log.
+- **Receipt index.** The controlled preflight for
+  `eom-operator-contact-receipt-index` reports migration 401 recorded (ATLAS
+  issue 2550).
 - **Reservations created before slice B.** List the pending 0C reservations
   with `atlas_on_match` null. Each one keeps 0C's apply-on-match if retried, so
   the office examines it before retrying, with the past-damage audit below.
