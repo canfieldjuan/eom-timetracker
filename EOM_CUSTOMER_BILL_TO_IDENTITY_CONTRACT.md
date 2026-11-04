@@ -288,7 +288,8 @@ Worked sequences (each is a review-contract test):
   create-or-return writes `full_name` onto a matched contact before the
   tracker detects the link conflict. This contract keeps the billing address
   out of that path; the name path predates it and needs its own decision
-  (eom-timetracker issue 282).
+  (eom-timetracker issue 282). Proposed in
+  [`EOM_CUSTOMER_CREATE_MATCH_CONTRACT.md`](./EOM_CUSTOMER_CREATE_MATCH_CONTRACT.md).
 
 ## Slices and order
 
